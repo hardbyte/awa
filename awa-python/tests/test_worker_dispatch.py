@@ -57,7 +57,7 @@ async def test_worker_dispatch_completes_jobs(client):
     # Start workers and let them run briefly
     client.start([(queue, 5)])
     await asyncio.sleep(1.0)  # Give workers time to process
-    client.shutdown()
+    await client.shutdown()
 
     # Verify all jobs completed
     tx = await client.transaction()
@@ -85,7 +85,7 @@ async def test_worker_dispatch_retries_on_error(client):
 
     client.start([(queue, 2)])
     await asyncio.sleep(0.5)
-    client.shutdown()
+    await client.shutdown()
 
     # Job should be retryable (not completed)
     tx = await client.transaction()
@@ -113,7 +113,7 @@ async def test_worker_dispatch_handles_cancel(client):
 
     client.start([(queue, 2)])
     await asyncio.sleep(0.5)
-    client.shutdown()
+    await client.shutdown()
 
     tx = await client.transaction()
     row = await tx.fetch_one(
@@ -135,7 +135,14 @@ async def test_worker_dispatch_shutdown_is_clean(client):
 
     client.start([(queue, 2)])
     await asyncio.sleep(0.1)
-    client.shutdown()  # Should not raise
+    await client.shutdown()  # Should not raise
+
+
+@pytest.mark.asyncio
+async def test_worker_dispatch_requires_registered_workers(client):
+    """start fails fast when no Python handlers are registered."""
+    with pytest.raises(RuntimeError, match="no Python workers registered"):
+        client.start([("dispatch_missing_worker", 1)])
 
 
 @pytest.mark.asyncio

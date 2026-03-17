@@ -2,7 +2,7 @@
 
 **Postgres-native background job queue for Rust and Python.**
 
-Awa (Māori: river) provides durable, transactional job enqueueing with typed handlers in both Rust and Python. The Rust runtime handles all queue machinery — polling, heartbeating, crash recovery, dispatch — while Python workers run as callbacks via PyO3, getting Rust-grade queue reliability with Python-native ergonomics.
+Awa (Māori: river) provides durable, transactional job enqueueing with typed handlers in both Rust and Python. The Rust runtime handles all queue machinery — polling, LISTEN/NOTIFY wakeups, heartbeating, crash recovery, dispatch — while Python workers run as callbacks via PyO3 on that same runtime, getting Rust-grade queue reliability with Python-native ergonomics.
 
 ## Features
 
@@ -56,7 +56,7 @@ tx.commit().await?;
 let client = Client::builder(pool)
     .queue("default", QueueConfig::default())
     .register_worker(SendEmail { to: String::new(), subject: String::new() })
-    .build();
+    .build()?;
 client.start().await?;
 ```
 

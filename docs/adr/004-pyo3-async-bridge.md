@@ -84,7 +84,7 @@ async def handle(job):
     send_email(job.args["to"], job.args["subject"])
 ```
 
-The decorator stores the handler and args type in a `HashMap<String, WorkerEntry>`. When the Rust runtime dispatches a job, it looks up the handler by kind and calls it via `pyo3_async_runtimes::tokio::into_future`.
+The decorator stores the handler and args type in a `HashMap<String, WorkerEntry>`. `awa-python` then builds a normal `awa-worker::Client` and registers a thin adapter `Worker` per Python kind. When the Rust runtime dispatches a job, that adapter looks up the Python handler by kind and calls it via `pyo3_async_runtimes::tokio::into_future`.
 
 ### Type Bridging
 
@@ -101,7 +101,7 @@ The same CamelCase-to-snake_case kind derivation runs in the Python bridge (`awa
 ### Positive
 
 - **Zero-copy data path:** Job args pass from Postgres (sqlx) through Rust to Python without serialization round-trips to a subprocess or network.
-- **Shared heartbeat and crash recovery:** Python jobs benefit from the exact same heartbeat and deadline mechanisms as Rust jobs, with no additional infrastructure.
+- **Shared heartbeat and crash recovery:** Python jobs benefit from the exact same dispatcher, LISTEN/NOTIFY wakeup, heartbeat, deadline, and maintenance mechanisms as Rust jobs, with no duplicate queue loop.
 - **Single deployment artifact:** One process runs both Rust and Python workers. No sidecar, no RPC service, no process manager.
 - **Transactional enqueue from Python:** `PyTransaction` wraps a real Postgres transaction, enabling atomic enqueue from Python with the same guarantees as Rust.
 - **Sub-millisecond dispatch overhead:** PyO3 function call overhead is measured in microseconds, negligible compared to I/O-bound job handlers.

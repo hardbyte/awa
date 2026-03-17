@@ -7,7 +7,7 @@ pub mod maintenance;
 pub mod metrics;
 
 // Re-exports
-pub use client::{Client, ClientBuilder, HealthCheck, QueueHealth};
+pub use client::{BuildError, Client, ClientBuilder, HealthCheck, QueueHealth};
 pub use context::JobContext;
 pub use dispatcher::QueueConfig;
 pub use executor::{JobError, JobResult, Worker};

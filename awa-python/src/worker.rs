@@ -1,22 +1,17 @@
-//! Python worker dispatch runtime.
+//! Python worker integration on top of the shared Rust runtime.
 
 use crate::client::{PyCancel, PyRetryAfter, PySnooze, WorkerEntry};
-use crate::job::{json_to_py, PyJob};
+use crate::job::json_to_py;
 use awa_model::JobRow;
+use awa_worker::{BuildError, Client, JobContext, JobError, JobResult, QueueConfig, Worker};
 use pyo3::prelude::*;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
 
-/// Acquire the GIL on background threads.
-///
-/// SAFETY: We're called from a Python extension module — the interpreter
-/// is always initialized. `attach_unchecked` bypasses the `Py_IsInitialized`
-/// check which incorrectly fails on extension-module background threads.
+/// SAFETY: Extension module - interpreter is always initialized.
 fn with_gil<F, R>(f: F) -> R
 where
     F: for<'py> FnOnce(Python<'py>) -> R,
@@ -24,214 +19,241 @@ where
     unsafe { Python::attach_unchecked(f) }
 }
 
-/// Run the worker dispatch loop.
-pub async fn run_workers(
+pub async fn build_runtime_client(
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
+    registered_kinds: Vec<String>,
     queues: Vec<(String, u32)>,
-    cancel: CancellationToken,
     poll_interval: Duration,
-) -> PyResult<()> {
-    info!(queues = queues.len(), "Python worker dispatch started");
+) -> PyResult<Client> {
+    let mut builder = Client::builder(pool).state(PythonWorkerRegistry::new(workers));
 
-    let semaphores: HashMap<String, Arc<tokio::sync::Semaphore>> = queues
-        .iter()
-        .map(|(q, max)| (q.clone(), Arc::new(tokio::sync::Semaphore::new(*max as usize))))
-        .collect();
-
-    loop {
-        if cancel.is_cancelled() {
-            break;
-        }
-
-        let mut claimed_any = false;
-
-        for (queue, _) in &queues {
-            let sem = match semaphores.get(queue) {
-                Some(s) => s.clone(),
-                None => continue,
-            };
-            if sem.available_permits() == 0 {
-                continue;
-            }
-
-            let batch = sem.available_permits().min(10) as i32;
-            let jobs: Vec<JobRow> = match sqlx::query_as(
-                r#"
-                WITH c AS (
-                    SELECT id FROM awa.jobs
-                    WHERE state = 'available' AND queue = $1 AND run_at <= now()
-                      AND NOT EXISTS (SELECT 1 FROM awa.queue_meta WHERE queue = $1 AND paused = TRUE)
-                    ORDER BY
-                      GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / 60)::int) ASC,
-                      run_at ASC, id ASC
-                    LIMIT $2 FOR UPDATE SKIP LOCKED
-                )
-                UPDATE awa.jobs SET state = 'running', attempt = attempt + 1,
-                    attempted_at = now(), heartbeat_at = now(),
-                    deadline_at = now() + interval '5 minutes'
-                FROM c WHERE awa.jobs.id = c.id RETURNING awa.jobs.*
-                "#,
-            )
-            .bind(queue)
-            .bind(batch)
-            .fetch_all(&pool)
-            .await
-            {
-                Ok(j) => j,
-                Err(e) => { warn!(error = %e, "claim failed"); continue; }
-            };
-
-            if !jobs.is_empty() {
-                claimed_any = true;
-                debug!(queue, count = jobs.len(), "claimed");
-            }
-
-            for job in jobs {
-                let permit = match sem.clone().acquire_owned().await {
-                    Ok(p) => p,
-                    Err(_) => break,
-                };
-                let pool = pool.clone();
-                let workers = workers.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = dispatch(&pool, &workers, &job).await {
-                        error!(job_id = job.id, error = %e, "dispatch error");
-                    }
-                    drop(permit);
-                });
-            }
-        }
-
-        if !claimed_any {
-            tokio::select! {
-                _ = cancel.cancelled() => break,
-                _ = tokio::time::sleep(poll_interval) => {},
-            }
-        }
+    for (name, max_workers) in queues {
+        builder = builder.queue(
+            name,
+            QueueConfig {
+                max_workers,
+                poll_interval,
+                ..Default::default()
+            },
+        );
     }
 
-    info!("Python worker dispatch stopped");
-    Ok(())
+    for kind in registered_kinds {
+        builder = builder.register_worker(PythonWorker::new(kind));
+    }
+
+    builder.build().map_err(map_build_error)
 }
 
-async fn dispatch(
-    pool: &PgPool,
-    workers: &Arc<RwLock<HashMap<String, WorkerEntry>>>,
-    job: &JobRow,
-) -> PyResult<()> {
-    // Handlers are registered by kind (globally unique per PRD §9.2).
-    // The queue parameter on @client.worker controls which queue to poll,
-    // but dispatch is always by kind — matching Rust worker behavior.
-    let (handler, args_type) = {
-        let guard = workers.read().await;
-        match guard.get(&job.kind) {
-            Some(e) => with_gil(|py| (e.handler.clone_ref(py), e.args_type.clone_ref(py))),
-            None => {
-                let _ = sqlx::query("UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1")
-                    .bind(job.id).execute(pool).await;
-                return Ok(());
-            }
+fn map_build_error(error: BuildError) -> PyErr {
+    pyo3::exceptions::PyRuntimeError::new_err(error.to_string())
+}
+
+#[derive(Clone)]
+struct PythonWorkerRegistry {
+    workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
+}
+
+impl PythonWorkerRegistry {
+    fn new(workers: Arc<RwLock<HashMap<String, WorkerEntry>>>) -> Self {
+        Self { workers }
+    }
+
+    async fn lookup(&self, kind: &str) -> Option<WorkerEntry> {
+        let guard = self.workers.read().await;
+        guard.get(kind).map(clone_worker_entry)
+    }
+}
+
+fn clone_worker_entry(entry: &WorkerEntry) -> WorkerEntry {
+    with_gil(|py| WorkerEntry {
+        kind: entry.kind.clone(),
+        handler: entry.handler.clone_ref(py),
+        args_type: entry.args_type.clone_ref(py),
+        queue: entry.queue.clone(),
+    })
+}
+
+struct PythonWorker {
+    kind: &'static str,
+}
+
+impl PythonWorker {
+    fn new(kind: String) -> Self {
+        Self {
+            kind: Box::leak(kind.into_boxed_str()),
         }
-    };
+    }
+}
 
-    // Run Python handler on blocking thread (holds GIL)
-    let job_data = job.clone();
-    let result: Result<Py<PyAny>, PyErr> = tokio::task::spawn_blocking(move || {
+#[async_trait::async_trait]
+impl Worker for PythonWorker {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let registry = ctx
+            .extract::<PythonWorkerRegistry>()
+            .ok_or_else(|| JobError::terminal("python worker registry missing"))?;
+
+        let entry = registry.lookup(&job_row.kind).await.ok_or_else(|| {
+            JobError::terminal(format!("unknown python job kind: {}", job_row.kind))
+        })?;
+
+        run_python_handler(entry, job_row, ctx)
+    }
+}
+
+fn run_python_handler(
+    entry: WorkerEntry,
+    job_row: &JobRow,
+    ctx: &JobContext,
+) -> Result<JobResult, JobError> {
+    let job = job_row.clone();
+    let cancelled = ctx.is_cancelled();
+
+    tokio::task::block_in_place(|| {
         with_gil(|py| {
-            let pj = PyJob::from(job_data);
-            let args_json = json_to_py(py, &pj.args_json)?;
+            let args_json = json_to_py(py, &job.args)
+                .map_err(|err| JobError::terminal(format!("args deserialization failed: {err}")))?;
 
-            let args_inst = if args_type.bind(py).hasattr("model_validate")? {
-                args_type.call_method1(py, "model_validate", (args_json,))?
-            } else if args_type.bind(py).hasattr("__dataclass_fields__")? {
-                let kw = args_json.bind(py).cast::<pyo3::types::PyDict>().map_err(|_| {
-                    pyo3::exceptions::PyTypeError::new_err("expected dict")
-                })?;
-                args_type.call(py, (), Some(kw))?
+            let args_inst = if entry
+                .args_type
+                .bind(py)
+                .hasattr("model_validate")
+                .unwrap_or(false)
+            {
+                entry
+                    .args_type
+                    .call_method1(py, "model_validate", (args_json.clone_ref(py),))
+                    .map_err(classify_py_error)?
+            } else if entry
+                .args_type
+                .bind(py)
+                .hasattr("__dataclass_fields__")
+                .unwrap_or(false)
+            {
+                match args_json.bind(py).cast::<pyo3::types::PyDict>() {
+                    Ok(kwargs) => entry
+                        .args_type
+                        .call(py, (), Some(kwargs))
+                        .map_err(classify_py_error)?,
+                    Err(_) => args_json,
+                }
             } else {
                 args_json
             };
 
-            let d = pyo3::types::PyDict::new(py);
-            d.set_item("args", args_inst)?;
-            d.set_item("id", pj.id)?;
-            d.set_item("kind", &pj.kind)?;
-            d.set_item("queue", &pj.queue)?;
-            d.set_item("attempt", pj.attempt)?;
-            d.set_item("max_attempts", pj.max_attempts)?;
+            let namespace = build_job_namespace(py, &job, args_inst, cancelled)?;
+            let result = entry
+                .handler
+                .call1(py, (namespace,))
+                .map_err(classify_py_error)?;
 
-            let ns = py.import("types")?.getattr("SimpleNamespace")?.call((), Some(&d))?;
-            let r = handler.call1(py, (ns,))?;
+            let inspect = py.import("inspect").map_err(classify_py_error)?;
+            let is_coroutine = inspect
+                .call_method1("iscoroutine", (&result,))
+                .and_then(|value| value.extract::<bool>())
+                .map_err(classify_py_error)?;
 
-            let inspect = py.import("inspect")?;
-            if inspect.call_method1("iscoroutine", (r.bind(py),))?.extract::<bool>()? {
-                Ok(py.import("asyncio")?.call_method1("run", (r.bind(py),))?.unbind())
+            if is_coroutine {
+                let asyncio = py.import("asyncio").map_err(classify_py_error)?;
+                let runner = asyncio.getattr("run").map_err(classify_py_error)?;
+                let awaited = runner.call1((result,)).map_err(classify_py_error)?;
+                classify_return_value(awaited.unbind())
             } else {
-                Ok(r)
+                classify_return_value(result)
             }
         })
     })
-    .await
-    .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+}
 
-    // Update DB based on result
-    match result {
-        Ok(val) => {
-            let state = with_gil(|py| {
-                let r = val.bind(py);
-                if r.is_none() { "completed" }
-                else if r.is_instance_of::<PyRetryAfter>() { "retry_after" }
-                else if r.is_instance_of::<PySnooze>() { "snooze" }
-                else if r.is_instance_of::<PyCancel>() { "cancel" }
-                else { "completed" }
-            });
+fn build_job_namespace(
+    py: Python<'_>,
+    job_row: &JobRow,
+    args_inst: Py<PyAny>,
+    cancelled: bool,
+) -> Result<Py<PyAny>, JobError> {
+    let dict = pyo3::types::PyDict::new(py);
+    dict.set_item("args", args_inst)
+        .map_err(classify_py_error)?;
+    dict.set_item("id", job_row.id).map_err(classify_py_error)?;
+    dict.set_item("kind", &job_row.kind)
+        .map_err(classify_py_error)?;
+    dict.set_item("queue", &job_row.queue)
+        .map_err(classify_py_error)?;
+    dict.set_item("attempt", job_row.attempt)
+        .map_err(classify_py_error)?;
+    dict.set_item("max_attempts", job_row.max_attempts)
+        .map_err(classify_py_error)?;
+    dict.set_item("priority", job_row.priority)
+        .map_err(classify_py_error)?;
+    dict.set_item(
+        "metadata",
+        json_to_py(py, &job_row.metadata).map_err(classify_py_error)?,
+    )
+    .map_err(classify_py_error)?;
+    dict.set_item("tags", &job_row.tags)
+        .map_err(classify_py_error)?;
+    dict.set_item(
+        "deadline",
+        job_row.deadline_at.map(|deadline| deadline.to_rfc3339()),
+    )
+    .map_err(classify_py_error)?;
+    dict.set_item("is_cancelled", cancelled)
+        .map_err(classify_py_error)?;
 
-            match state {
-                "completed" => {
-                    sqlx::query("UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1")
-                        .bind(job.id).execute(pool).await
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                }
-                "retry_after" => {
-                    let s: f64 = with_gil(|py| val.bind(py).getattr("seconds")?.extract())?;
-                    sqlx::query("UPDATE awa.jobs SET state = 'retryable', run_at = now() + make_interval(secs => $2), finalized_at = now() WHERE id = $1")
-                        .bind(job.id).bind(s).execute(pool).await
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                }
-                "snooze" => {
-                    let s: f64 = with_gil(|py| val.bind(py).getattr("seconds")?.extract())?;
-                    sqlx::query("UPDATE awa.jobs SET state = 'scheduled', run_at = now() + make_interval(secs => $2), attempt = attempt - 1 WHERE id = $1")
-                        .bind(job.id).bind(s).execute(pool).await
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                }
-                "cancel" => {
-                    sqlx::query("UPDATE awa.jobs SET state = 'cancelled', finalized_at = now() WHERE id = $1")
-                        .bind(job.id).execute(pool).await
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-                }
-                _ => {}
-            }
+    py.import("types")
+        .and_then(|module| module.getattr("SimpleNamespace"))
+        .and_then(|cls| cls.call((), Some(&dict)))
+        .map(|namespace| namespace.unbind())
+        .map_err(classify_py_error)
+}
+
+fn classify_return_value(value: Py<PyAny>) -> Result<JobResult, JobError> {
+    with_gil(|py| {
+        let value = value.bind(py);
+
+        if value.is_none() {
+            Ok(JobResult::Completed)
+        } else if value.is_instance_of::<PyRetryAfter>() {
+            let seconds = value
+                .getattr("seconds")
+                .and_then(|v| v.extract::<f64>())
+                .unwrap_or(60.0);
+            Ok(JobResult::RetryAfter(Duration::from_secs_f64(seconds)))
+        } else if value.is_instance_of::<PySnooze>() {
+            let seconds = value
+                .getattr("seconds")
+                .and_then(|v| v.extract::<f64>())
+                .unwrap_or(60.0);
+            Ok(JobResult::Snooze(Duration::from_secs_f64(seconds)))
+        } else if value.is_instance_of::<PyCancel>() {
+            let reason = value
+                .getattr("reason")
+                .and_then(|v| v.extract::<String>())
+                .unwrap_or_else(|_| "cancelled by handler".to_string());
+            Ok(JobResult::Cancel(reason))
+        } else {
+            Ok(JobResult::Completed)
         }
-        Err(err) => {
-            let msg = with_gil(|py| err.value(py).to_string());
-            let is_terminal = with_gil(|py| {
-                py.import("awa")
-                    .and_then(|m| m.getattr("TerminalError"))
-                    .map(|t| err.get_type(py).is_subclass(&t).unwrap_or(false))
-                    .unwrap_or(false)
-            });
-            let ej = serde_json::json!({"error": msg, "attempt": job.attempt, "terminal": is_terminal});
+    })
+}
 
-            if is_terminal || job.attempt >= job.max_attempts {
-                let _ = sqlx::query("UPDATE awa.jobs SET state = 'failed', finalized_at = now(), errors = errors || $2::jsonb WHERE id = $1")
-                    .bind(job.id).bind(&ej).execute(pool).await;
-            } else {
-                let _ = sqlx::query("UPDATE awa.jobs SET state = 'retryable', run_at = now() + awa.backoff_duration($2, $3), finalized_at = now(), errors = errors || $4::jsonb WHERE id = $1")
-                    .bind(job.id).bind(job.attempt).bind(job.max_attempts).bind(&ej).execute(pool).await;
-            }
+fn classify_py_error(err: PyErr) -> JobError {
+    with_gil(|py| {
+        let is_terminal = py
+            .import("awa")
+            .and_then(|module| module.getattr("TerminalError"))
+            .map(|terminal| err.get_type(py).is_subclass(&terminal).unwrap_or(false))
+            .unwrap_or(false);
+
+        if is_terminal {
+            JobError::terminal(err.value(py).to_string())
+        } else {
+            JobError::retryable(std::io::Error::other(err.value(py).to_string()))
         }
-    }
-
-    Ok(())
+    })
 }

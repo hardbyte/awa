@@ -19,3 +19,4 @@ tokio = { version = "1", features = ["full"] }
 chrono = { version = "0.4", features = ["serde"] }
 tracing = "0.1"
 tokio-util = "0.7"
+async-trait = "0.1"

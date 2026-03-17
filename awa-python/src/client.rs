@@ -71,7 +71,7 @@ pub struct WorkerEntry {
 pub struct PyClient {
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
-    cancel: tokio_util::sync::CancellationToken,
+    runtime: Arc<std::sync::Mutex<Option<Arc<awa_worker::Client>>>>,
 }
 
 #[pymethods]
@@ -92,7 +92,7 @@ impl PyClient {
         Ok(Self {
             pool,
             workers: Arc::new(RwLock::new(HashMap::new())),
-            cancel: tokio_util::sync::CancellationToken::new(),
+            runtime: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 
@@ -336,24 +336,57 @@ impl PyClient {
         })
     }
 
-    /// Start the worker dispatch loop in the background.
+    /// Start the shared Rust worker runtime in the background.
     ///
-    /// Spawns a background tokio task that polls registered queues, claims jobs,
-    /// and dispatches to handler functions. Returns immediately.
-    ///
-    /// Call `client.shutdown()` to stop the loop.
+    /// This reuses the same `awa-worker` dispatcher, heartbeat, LISTEN/NOTIFY,
+    /// and maintenance machinery as native Rust workers.
     #[pyo3(signature = (queues, *, poll_interval_ms=200))]
-    fn start(&mut self, _py: Python<'_>, queues: Vec<(String, u32)>, poll_interval_ms: u64) -> PyResult<()> {
-        // Create a fresh cancel token so start() works after a previous shutdown().
-        self.cancel = tokio_util::sync::CancellationToken::new();
+    fn start(
+        &mut self,
+        _py: Python<'_>,
+        queues: Vec<(String, u32)>,
+        poll_interval_ms: u64,
+    ) -> PyResult<()> {
+        if self
+            .runtime
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_some()
+        {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "worker runtime already started",
+            ));
+        }
 
         let pool = self.pool.clone();
         let workers = self.workers.clone();
-        let cancel = self.cancel.clone();
+        let registered_kinds: Vec<String> =
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let guard = workers.read().await;
+                guard.keys().cloned().collect()
+            });
         let poll_interval = std::time::Duration::from_millis(poll_interval_ms);
 
+        if registered_kinds.is_empty() {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "no Python workers registered",
+            ));
+        }
+
+        let runtime = pyo3_async_runtimes::tokio::get_runtime().block_on(
+            crate::worker::build_runtime_client(
+                pool,
+                workers,
+                registered_kinds,
+                queues,
+                poll_interval,
+            ),
+        )?;
+        let runtime = Arc::new(runtime);
+        *self.runtime.lock().expect("runtime mutex poisoned") = Some(runtime.clone());
+
         pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
-            if let Err(err) = crate::worker::run_workers(pool, workers, queues, cancel, poll_interval).await {
+            if let Err(err) = runtime.start().await {
                 tracing::error!(error = %err, "Worker dispatch loop failed");
             }
         });
@@ -361,11 +394,23 @@ impl PyClient {
         Ok(())
     }
 
-    /// Gracefully shut down the worker dispatch loop.
-    #[pyo3(signature = (timeout_ms=2000))]
-    fn shutdown(&self, _py: Python<'_>, timeout_ms: u64) -> PyResult<()> {
-        self.cancel.cancel();
-        std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(5000)));
-        Ok(())
+    /// Gracefully shut down the worker runtime.
+    #[pyo3(signature = (timeout_ms=5000))]
+    fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
+        let runtime = self.runtime.clone();
+        let timeout = std::time::Duration::from_millis(timeout_ms);
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let client = { runtime.lock().expect("runtime mutex poisoned").clone() };
+
+            if let Some(client) = client {
+                client
+                    .shutdown(timeout.min(std::time::Duration::from_secs(5)))
+                    .await;
+                *runtime.lock().expect("runtime mutex poisoned") = None;
+            }
+
+            Ok(())
+        })
     }
 }

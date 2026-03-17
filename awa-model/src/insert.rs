@@ -75,11 +75,16 @@ where
     .fetch_one(executor)
     .await
     .map_err(|err| {
-        // Check for unique constraint violation
         if let sqlx::Error::Database(ref db_err) = err {
             if db_err.code().as_deref() == Some("23505") {
-                // Try to extract the existing ID from the error
-                return AwaError::UniqueConflict { existing_id: 0 };
+                // Unique constraint violation. The conflicting row ID isn't
+                // available from the PG error message directly — callers can
+                // query by unique_key if they need it.
+                return AwaError::UniqueConflict {
+                    existing_id: db_err
+                        .constraint()
+                        .map(|c| c.to_string()),
+                };
             }
         }
         AwaError::Database(err)

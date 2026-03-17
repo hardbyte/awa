@@ -215,9 +215,10 @@ async with await client.transaction() as tx:
 
 Key design decisions:
 
-- **Async bridge:** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. Python `async def` handlers are converted to Rust futures via `into_future`.
-- **Heartbeats survive GIL blocks:** Heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL. Even if a Python handler blocks the GIL (e.g., CPU-bound work in a sync call), heartbeats continue uninterrupted.
-- **Type bridging:** Python dataclasses and pydantic BaseModels are serialized to `serde_json::Value` via `model_dump(mode="json")` or `dataclasses.asdict()`. The same CamelCase-to-snake_case kind derivation algorithm runs in all three locations (proc-macro, `awa-model::kind`, `awa-python::args`).
+- **Shared runtime path:** `awa-python` builds an `awa-worker::Client` and registers a thin adapter worker per Python kind, so Python execution uses the same dispatcher, LISTEN/NOTIFY wakeup, heartbeat service, maintenance leader, and queue configuration as Rust workers.
+- **Async bridge:** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables for the public API. Python `async def` handlers are converted to Rust futures via `into_future` inside the adapter worker.
+- **Heartbeats survive GIL blocks:** Heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL. Even if a Python handler blocks the GIL (e.g., CPU-bound work in a sync call), heartbeats continue uninterrupted because in-flight tracking lives in `awa-worker`.
+- **Type bridging:** Python dataclasses and pydantic BaseModels are serialized to `serde_json::Value` via `model_dump(mode="json")` or `dataclasses.asdict()`. At dispatch time the adapter reconstructs the Python args object and exposes it on a lightweight job namespace.
 
 ## Observability
 

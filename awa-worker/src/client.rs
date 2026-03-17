@@ -13,6 +13,13 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+/// Errors returned when building a worker client.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BuildError {
+    #[error("at least one queue must be configured")]
+    NoQueuesConfigured,
+}
+
 /// Health check result.
 #[derive(Debug, Clone)]
 pub struct HealthCheck {
@@ -99,14 +106,14 @@ impl ClientBuilder {
     }
 
     /// Build the client.
-    pub fn build(self) -> Client {
+    pub fn build(self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
-            panic!("At least one queue must be configured");
+            return Err(BuildError::NoQueuesConfigured);
         }
 
         let metrics = crate::metrics::AwaMetrics::from_global();
 
-        Client {
+        Ok(Client {
             pool: self.pool,
             queues: self.queues,
             workers: Arc::new(self.workers),
@@ -115,7 +122,7 @@ impl ClientBuilder {
             cancel: CancellationToken::new(),
             handles: RwLock::new(Vec::new()),
             metrics,
-        }
+        })
     }
 }
 
