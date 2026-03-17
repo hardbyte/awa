@@ -39,8 +39,20 @@ where
         )
     });
 
-    let unique_states_bits: Option<String> =
-        opts.unique.as_ref().map(|u| format!("{:08b}", u.states));
+    let unique_states_bits: Option<String> = opts.unique.as_ref().map(|u| {
+        // Build a bit string where PG bit position N (leftmost = 0) corresponds
+        // to Rust bit N (least-significant = 0). PostgreSQL's get_bit(bitmask, N)
+        // reads from the left, so we place Rust bit 0 at the leftmost position.
+        let mut bit_string = String::with_capacity(8);
+        for bit_position in 0..8 {
+            if u.states & (1 << bit_position) != 0 {
+                bit_string.push('1');
+            } else {
+                bit_string.push('0');
+            }
+        }
+        bit_string
+    });
 
     let row = sqlx::query_as::<_, JobRow>(
         r#"
@@ -76,7 +88,10 @@ where
     Ok(row)
 }
 
-/// Insert multiple jobs in a single transaction.
+/// Insert multiple jobs in a single statement.
+///
+/// Supports uniqueness constraints — jobs with `unique` opts will have their
+/// `unique_key` and `unique_states` computed and included.
 pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -85,46 +100,84 @@ where
         return Ok(Vec::new());
     }
 
-    // Build a bulk INSERT using UNNEST for efficiency
     let count = jobs.len();
-    let mut kinds: Vec<String> = Vec::with_capacity(count);
-    let mut queues: Vec<String> = Vec::with_capacity(count);
-    let mut args_list: Vec<serde_json::Value> = Vec::with_capacity(count);
-    let mut states: Vec<JobState> = Vec::with_capacity(count);
-    let mut priorities: Vec<i16> = Vec::with_capacity(count);
-    let mut max_attempts_list: Vec<i16> = Vec::with_capacity(count);
-    let mut run_ats: Vec<Option<chrono::DateTime<chrono::Utc>>> = Vec::with_capacity(count);
-    let mut metadata_list: Vec<serde_json::Value> = Vec::with_capacity(count);
-    let mut tags_list: Vec<Vec<String>> = Vec::with_capacity(count);
 
-    for job in jobs {
-        kinds.push(job.kind.clone());
-        queues.push(job.opts.queue.clone());
-        args_list.push(job.args.clone());
-        states.push(if job.opts.run_at.is_some() {
-            JobState::Scheduled
-        } else {
-            JobState::Available
-        });
-        priorities.push(job.opts.priority);
-        max_attempts_list.push(job.opts.max_attempts);
-        run_ats.push(job.opts.run_at);
-        metadata_list.push(job.opts.metadata.clone());
-        tags_list.push(job.opts.tags.clone());
+    // Pre-compute all values including unique keys
+    struct RowValues {
+        kind: String,
+        queue: String,
+        args: serde_json::Value,
+        state: JobState,
+        priority: i16,
+        max_attempts: i16,
+        run_at: Option<chrono::DateTime<chrono::Utc>>,
+        metadata: serde_json::Value,
+        tags: Vec<String>,
+        unique_key: Option<Vec<u8>>,
+        unique_states: Option<String>,
     }
 
-    // Build a multi-row INSERT with parameterized VALUES.
+    let rows: Vec<RowValues> = jobs
+        .iter()
+        .map(|job| {
+            let unique_key = job.opts.unique.as_ref().map(|u| {
+                compute_unique_key(
+                    &job.kind,
+                    if u.by_queue {
+                        Some(job.opts.queue.as_str())
+                    } else {
+                        None
+                    },
+                    if u.by_args { Some(&job.args) } else { None },
+                    u.by_period,
+                )
+            });
+
+            let unique_states = job.opts.unique.as_ref().map(|u| {
+                let mut bit_string = String::with_capacity(8);
+                for bit_position in 0..8 {
+                    if u.states & (1 << bit_position) != 0 {
+                        bit_string.push('1');
+                    } else {
+                        bit_string.push('0');
+                    }
+                }
+                bit_string
+            });
+
+            RowValues {
+                kind: job.kind.clone(),
+                queue: job.opts.queue.clone(),
+                args: job.args.clone(),
+                state: if job.opts.run_at.is_some() {
+                    JobState::Scheduled
+                } else {
+                    JobState::Available
+                },
+                priority: job.opts.priority,
+                max_attempts: job.opts.max_attempts,
+                run_at: job.opts.run_at,
+                metadata: job.opts.metadata.clone(),
+                tags: job.opts.tags.clone(),
+                unique_key,
+                unique_states,
+            }
+        })
+        .collect();
+
+    // Build multi-row INSERT with all columns including unique_key/unique_states
     let mut query = String::from(
-        "INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags) VALUES ",
+        "INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) VALUES ",
     );
 
+    let params_per_row = 11u32;
     let mut param_index = 1u32;
     for i in 0..count {
         if i > 0 {
             query.push_str(", ");
         }
         query.push_str(&format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, COALESCE(${}, now()), ${}, ${})",
+            "(${}, ${}, ${}, ${}, ${}, ${}, COALESCE(${}, now()), ${}, ${}, ${}, ${}::bit(8))",
             param_index,
             param_index + 1,
             param_index + 2,
@@ -134,24 +187,28 @@ where
             param_index + 6,
             param_index + 7,
             param_index + 8,
+            param_index + 9,
+            param_index + 10,
         ));
-        param_index += 9;
+        param_index += params_per_row;
     }
     query.push_str(" RETURNING *");
 
     let mut sql_query = sqlx::query_as::<_, JobRow>(&query);
 
-    for i in 0..count {
+    for row in &rows {
         sql_query = sql_query
-            .bind(&kinds[i])
-            .bind(&queues[i])
-            .bind(&args_list[i])
-            .bind(states[i])
-            .bind(priorities[i])
-            .bind(max_attempts_list[i])
-            .bind(run_ats[i])
-            .bind(&metadata_list[i])
-            .bind(&tags_list[i]);
+            .bind(&row.kind)
+            .bind(&row.queue)
+            .bind(&row.args)
+            .bind(row.state)
+            .bind(row.priority)
+            .bind(row.max_attempts)
+            .bind(row.run_at)
+            .bind(&row.metadata)
+            .bind(&row.tags)
+            .bind(&row.unique_key)
+            .bind(&row.unique_states);
     }
 
     let results = sql_query.fetch_all(executor).await?;

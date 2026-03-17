@@ -60,11 +60,6 @@ pub fn serialize_args(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_
     ))
 }
 
-/// Get the class name from a Python args object.
-pub fn get_class_name(obj: &Bound<'_, PyAny>) -> PyResult<String> {
-    obj.get_type().qualname().map(|s| s.to_string())
-}
-
 /// Get the class name from a Python type.
 pub fn get_type_class_name(obj: &Bound<'_, PyAny>) -> PyResult<String> {
     obj.getattr("__name__")?.extract::<String>()

@@ -40,9 +40,11 @@ impl PyTransaction {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
-            let tx_ref = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Transaction already committed or rolled back"))?;
+            let tx_ref = guard.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "Transaction already committed or rolled back",
+                )
+            })?;
 
             let mut q = sqlx::query(&query);
             for arg in &json_args {
@@ -74,9 +76,11 @@ impl PyTransaction {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
-            let tx_ref = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Transaction already committed or rolled back"))?;
+            let tx_ref = guard.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "Transaction already committed or rolled back",
+                )
+            })?;
 
             let mut q = sqlx::query(&query);
             for arg in &json_args {
@@ -94,6 +98,7 @@ impl PyTransaction {
 
     /// Insert a job within this transaction.
     #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![]))]
+    #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
         py: Python<'py>,
@@ -111,7 +116,7 @@ impl PyTransaction {
             let kind_str = match kind {
                 Some(k) => k,
                 None => {
-                    let class_name = get_type_class_name(&args_bound.get_type().as_any())?;
+                    let class_name = get_type_class_name(args_bound.get_type().as_any())?;
                     derive_kind(&class_name)
                 }
             };
@@ -121,9 +126,11 @@ impl PyTransaction {
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
-            let tx_ref = guard
-                .as_mut()
-                .ok_or_else(|| pyo3::exceptions::PyRuntimeError::new_err("Transaction already committed or rolled back"))?;
+            let tx_ref = guard.as_mut().ok_or_else(|| {
+                pyo3::exceptions::PyRuntimeError::new_err(
+                    "Transaction already committed or rolled back",
+                )
+            })?;
 
             let row = sqlx::query_as::<_, awa_model::JobRow>(
                 r#"
@@ -214,12 +221,16 @@ impl PyTransaction {
 }
 
 /// Bind a serde_json::Value to a sqlx query.
+///
+/// Uses untyped NULL to avoid Postgres type mismatch errors when the caller
+/// passes None for non-text columns (e.g. timestamptz, bigint).
 fn bind_json_arg<'q>(
     query: sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments>,
     value: &'q serde_json::Value,
 ) -> sqlx::query::Query<'q, Postgres, sqlx::postgres::PgArguments> {
     match value {
-        serde_json::Value::Null => query.bind(None::<String>),
+        // Bind NULL without a type hint — PG will infer from context
+        serde_json::Value::Null => query.bind(None::<serde_json::Value>),
         serde_json::Value::Bool(b) => query.bind(*b),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
@@ -236,27 +247,96 @@ fn bind_json_arg<'q>(
 }
 
 /// Convert a PgRow to a Python dict.
+///
+/// Supports common Postgres types. Falls back to string representation
+/// for unsupported types rather than silently returning None.
 fn row_to_py_dict(row: &sqlx::postgres::PgRow) -> PyResult<Py<PyAny>> {
+    use sqlx::TypeInfo;
+
     Python::attach(|py| {
         let dict = PyDict::new(py);
         let columns = row.columns();
         for col in columns {
             let name = col.name();
-            // Try common types
-            if let Ok(val) = row.try_get::<String, _>(name) {
-                dict.set_item(name, val)?;
-            } else if let Ok(val) = row.try_get::<i64, _>(name) {
-                dict.set_item(name, val)?;
-            } else if let Ok(val) = row.try_get::<i32, _>(name) {
-                dict.set_item(name, val)?;
-            } else if let Ok(val) = row.try_get::<f64, _>(name) {
-                dict.set_item(name, val)?;
-            } else if let Ok(val) = row.try_get::<bool, _>(name) {
-                dict.set_item(name, val)?;
-            } else if let Ok(val) = row.try_get::<serde_json::Value, _>(name) {
-                dict.set_item(name, json_to_py(py, &val)?)?;
-            } else {
-                dict.set_item(name, py.None())?;
+            let type_name = col.type_info().name();
+
+            match type_name {
+                "BOOL" => {
+                    let val: Option<bool> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "INT2" => {
+                    let val: Option<i16> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "INT4" => {
+                    let val: Option<i32> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "INT8" => {
+                    let val: Option<i64> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "FLOAT4" => {
+                    let val: Option<f32> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "FLOAT8" | "NUMERIC" => {
+                    let val: Option<f64> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "TEXT" | "VARCHAR" | "CHAR" | "NAME" | "BPCHAR" => {
+                    let val: Option<String> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "TIMESTAMPTZ" => {
+                    let val: Option<chrono::DateTime<chrono::Utc>> = row.try_get(name).ok();
+                    dict.set_item(name, val.map(|v| v.to_rfc3339()))?;
+                }
+                "TIMESTAMP" => {
+                    let val: Option<chrono::NaiveDateTime> = row.try_get(name).ok();
+                    dict.set_item(name, val.map(|v| v.to_string()))?;
+                }
+                "JSONB" | "JSON" => {
+                    if let Ok(val) = row.try_get::<serde_json::Value, _>(name) {
+                        dict.set_item(name, json_to_py(py, &val)?)?;
+                    } else {
+                        dict.set_item(name, py.None())?;
+                    }
+                }
+                "BYTEA" => {
+                    let val: Option<Vec<u8>> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "TEXT[]" => {
+                    let val: Option<Vec<String>> = row.try_get(name).ok();
+                    dict.set_item(name, val)?;
+                }
+                "JSONB[]" => {
+                    // Array of JSONB — common for errors column
+                    if let Ok(val) = row.try_get::<Vec<serde_json::Value>, _>(name) {
+                        let list = pyo3::types::PyList::empty(py);
+                        for item in &val {
+                            list.append(json_to_py(py, item)?)?;
+                        }
+                        dict.set_item(name, list)?;
+                    } else {
+                        dict.set_item(name, py.None())?;
+                    }
+                }
+                _ => {
+                    // Fallback: try string, then None
+                    if let Ok(val) = row.try_get::<String, _>(name) {
+                        dict.set_item(name, val)?;
+                    } else {
+                        tracing::warn!(
+                            column = name,
+                            pg_type = type_name,
+                            "Unsupported column type in row_to_py_dict, returning None"
+                        );
+                        dict.set_item(name, py.None())?;
+                    }
+                }
             }
         }
         Ok(dict.into_any().unbind())

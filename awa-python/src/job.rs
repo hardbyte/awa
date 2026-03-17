@@ -124,7 +124,9 @@ impl From<JobRow> for PyJob {
 pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
-        serde_json::Value::Bool(b) => Ok(b.into_pyobject(py).unwrap().to_owned().into_any().unbind()),
+        serde_json::Value::Bool(b) => {
+            Ok(b.into_pyobject(py).unwrap().to_owned().into_any().unbind())
+        }
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
                 Ok(i.into_pyobject(py).unwrap().into_any().unbind())
@@ -152,6 +154,7 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
     }
 }
 
+#[allow(clippy::only_used_in_recursion)]
 /// Convert a Python object to serde_json::Value.
 pub fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
     if obj.is_none() {

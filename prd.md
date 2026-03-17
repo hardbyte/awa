@@ -12,7 +12,7 @@ The Rust runtime handles all queue machinery — polling, heartbeating, crash re
 
 **Positioning:** Postgres-native job execution for Rust and Python. One queue engine, two first-class languages.
 
-**Inspirations:** River (Go), Oban (Elixir), GoodJob (Ruby). All three converged on the same core design — Postgres as the only dependency, `SKIP LOCKED` for dispatch, transactional enqueue as the killer feature. None of them provide first-class multi-language *worker* support — River's Python/Ruby clients are insert-only. Awa's Python workers are full participants.
+**Inspirations:** River (Go), Oban (Elixir), GoodJob (Ruby). All three converged on the same core design — Postgres as the only dependency, `SKIP LOCKED` for dispatch, transactional enqueue as the killer feature. None of them provide first-class multi-language *worker execution* — River's Python/Ruby clients are insert-only, Oban has a Python insert library but no workers. Awa's Python workers are full participants backed by a Rust runtime.
 
 ---
 
@@ -24,22 +24,31 @@ Existing Rust Postgres job queues are fragmented and incomplete:
 
 | Library | Status | Weakness |
 |---|---|---|
-| **sqlxmq** | Unmaintained (~2 years) | Best API design but abandoned |
+| **sqlxmq** | Low activity (sqlx 0.8 update 2024, no new features since) | Best API design but stagnant |
 | **fang** | Active | Multi-backend dilutes PG depth, `typetag` dynamic dispatch |
 | **graphile_worker_rs** | Active | Port of Node.js system, inherits non-Rust conventions |
 | **PGMQ** | Active | Message queue primitive, not a job framework — no workers, retries, cron |
+| **apalis** | Active | Framework-heavy, multi-backend (Redis/Postgres/SQLite) dilutes PG depth |
 
 ### 2.2 Python
 
-Python's job queue ecosystem is mature (Celery, RQ, Dramatiq, ARQ) but none are Postgres-native. They all require Redis or RabbitMQ as a broker:
+Python's most popular job queues (Celery, RQ, Dramatiq, ARQ) require Redis or RabbitMQ. Postgres-native alternatives exist but are pure Python — their queue engine performance is bounded by CPython:
 
-- No transactional enqueue (can't enqueue a job inside a database transaction atomically)
-- Extra infrastructure to operate
-- Backup/restore of in-flight jobs is separate from the database
+| Library | Status | Weakness |
+|---|---|---|
+| **Procrastinate** | Active, mature (v3.7) | Pure Python queue engine. Heartbeats compete with handler for event loop. No cross-language interop. |
+| **PgQueuer** | Active | Newer, less battle-tested. Pure Python. LISTEN/NOTIFY + SKIP LOCKED. |
+| **django-postgres-queue** | Active | Django-only. |
+| **pq** | Low activity | Minimal feature set. psycopg2 only. |
 
-Procrastinate and django-pgq exist for Postgres, but they're Django-coupled and lack the queue engine performance of a Rust runtime.
+The common limitations of pure-Python Postgres queues:
 
-**Awa's pitch to Python users:** keep your Postgres, skip Redis, get transactional enqueue, and let Rust handle the queue plumbing.
+- **Heartbeats die when the GIL blocks.** If a handler does CPU work or calls a blocking C extension, the Python event loop stalls and heartbeats stop — other workers think the job is dead and reclaim it.
+- **Poll loops compete with handler code for CPU.** The queue engine and handlers share the same interpreter, so a busy handler degrades queue throughput.
+- **Throughput is fundamentally limited by the interpreter.** JSON serialization, SQL parameter binding, and job dispatch all run in Python.
+- **No cross-language worker interop.** A Rust service cannot process jobs enqueued by a Python service (or vice versa) through the same queue library.
+
+**Awa's pitch:** keep your Postgres, skip Redis, and let a Rust runtime handle the queue plumbing. Heartbeats run on tokio (not the Python event loop), so they survive GIL-blocked handlers. Rust and Python workers are first-class participants on the same queues. Transactional enqueue works in both languages.
 
 ---
 
@@ -624,7 +633,7 @@ RETURNING awa.jobs.*;
 | Infinite loop in handler | No | **Yes** |
 | Deadlocked external call | No | **Yes** |
 
-**Python advantage:** Heartbeat runs on the Rust tokio runtime, not the Python event loop. If Python handler code blocks the event loop, heartbeats continue. Awa preserves queue liveness even when Python handlers misbehave. This does NOT solve bad handler throughput or CPU-bound Python code.
+**Python advantage (assuming async workers — see Phase 0):** Heartbeat runs on the Rust tokio runtime, not the Python event loop. If Python handler code blocks the event loop, heartbeats continue. Awa preserves queue liveness even when Python handlers misbehave. This does NOT solve bad handler throughput or CPU-bound Python code.
 
 **Heartbeat write amplification:** At 50 concurrent jobs, the batch heartbeat is one UPDATE touching 50 rows every 30 seconds (~1.7 writes/sec). Negligible. At 500 concurrent, it's still one query per 30s. Batches are capped at 500 IDs; larger in-flight counts split across multiple UPDATEs.
 

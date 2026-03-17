@@ -68,7 +68,10 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("UniqueConflict", m.py().get_type::<UniqueConflict>())?;
     m.add("SchemaNotMigrated", m.py().get_type::<SchemaNotMigrated>())?;
     m.add("UnknownJobKind", m.py().get_type::<UnknownJobKind>())?;
-    m.add("SerializationError", m.py().get_type::<SerializationError>())?;
+    m.add(
+        "SerializationError",
+        m.py().get_type::<SerializationError>(),
+    )?;
     m.add("TerminalError", m.py().get_type::<TerminalError>())?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
 

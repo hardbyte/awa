@@ -16,17 +16,14 @@ Usage:
 
 from __future__ import annotations
 
-import asyncio
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable, Generic, TypeVar
+from typing import Any, Callable, Awaitable
 
 import pytest_asyncio
 
 import awa
 from awa._awa import derive_kind
-
-T = TypeVar("T")
 
 # Default test database URL
 DEFAULT_DATABASE_URL = "postgres://postgres:test@localhost:5432/awa_test"
@@ -38,11 +35,61 @@ def get_database_url() -> str:
 
 
 @dataclass
-class WorkResult:
-    """Result of executing a single job via work_one."""
+class JobRow:
+    """Lightweight representation of a job row from the database.
 
-    job: awa.Job
-    outcome: str  # "completed", "retryable", "failed", "cancelled", "snoozed"
+    Used instead of awa.Job (a Rust/PyO3 struct that cannot be constructed
+    from Python) to carry job metadata through WorkResult.
+    """
+
+    id: int
+    kind: str
+    queue: str
+    args: dict[str, Any]
+    attempt: int
+    max_attempts: int
+    priority: int
+    tags: list[str]
+    state: str | None = None
+
+    @classmethod
+    def from_row(cls, row: dict[str, Any]) -> JobRow:
+        return cls(
+            id=row["id"],
+            kind=row["kind"],
+            queue=row["queue"],
+            args=row["args"],
+            attempt=row["attempt"],
+            max_attempts=row["max_attempts"],
+            priority=row["priority"],
+            tags=row.get("tags") or [],
+            state=row.get("state"),
+        )
+
+
+class _NoJob:
+    """Sentinel indicating no job was available to claim."""
+
+    def __repr__(self) -> str:
+        return "NoJob"
+
+    def __bool__(self) -> bool:
+        return False
+
+
+NoJob = _NoJob()
+"""Singleton sentinel used as WorkResult.job when no job was found."""
+
+
+@dataclass
+class WorkResult:
+    """Result of executing a single job via work_one.
+
+    When no job is available, outcome is "no_job" and job is the NoJob sentinel.
+    """
+
+    job: JobRow | _NoJob
+    outcome: str  # "completed", "retryable", "failed", "cancelled", "snoozed", "no_job"
     error: str | None = None
 
     def is_completed(self) -> bool:
@@ -59,6 +106,9 @@ class WorkResult:
 
     def is_snoozed(self) -> bool:
         return self.outcome == "snoozed"
+
+    def is_no_job(self) -> bool:
+        return self.outcome == "no_job"
 
 
 class AwaTestClient:
@@ -100,42 +150,52 @@ class AwaTestClient:
     ) -> WorkResult:
         """Claim and execute a single job of the given type.
 
-        Claims one available job matching the kind, deserializes args,
-        calls the handler, and updates the job state.
+        Claims one available job matching the kind and queue, deserializes
+        args, calls the handler, and updates the job state.
+
+        Returns a WorkResult with outcome="no_job" if no matching job is
+        available, rather than raising.
         """
         kind_str = kind or derive_kind(args_type.__name__)
 
-        # Claim one job within a transaction
+        # Claim one job within a transaction.
+        # Use try/except to handle the case where no rows match (fetch_one
+        # raises when zero rows are returned).
         tx = await self._client.transaction()
-        row = await tx.fetch_one(
-            """
-            WITH claimed AS (
-                SELECT id FROM awa.jobs
-                WHERE state = 'available' AND kind = $1
-                ORDER BY run_at ASC, id ASC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+        try:
+            row = await tx.fetch_one(
+                """
+                WITH claimed AS (
+                    SELECT id FROM awa.jobs
+                    WHERE state = 'available' AND kind = $1 AND queue = $2
+                    ORDER BY run_at ASC, id ASC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE awa.jobs
+                SET state = 'running',
+                    attempt = attempt + 1,
+                    attempted_at = now(),
+                    heartbeat_at = now(),
+                    deadline_at = now() + interval '5 minutes'
+                FROM claimed
+                WHERE awa.jobs.id = claimed.id
+                RETURNING awa.jobs.id, awa.jobs.kind, awa.jobs.queue,
+                          awa.jobs.args, awa.jobs.attempt, awa.jobs.max_attempts,
+                          awa.jobs.priority, awa.jobs.tags, awa.jobs.state::text AS state
+                """,
+                [kind_str, queue],
             )
-            UPDATE awa.jobs
-            SET state = 'running',
-                attempt = attempt + 1,
-                attempted_at = now(),
-                heartbeat_at = now(),
-                deadline_at = now() + interval '5 minutes'
-            FROM claimed
-            WHERE awa.jobs.id = claimed.id
-            RETURNING awa.jobs.id, awa.jobs.kind, awa.jobs.queue,
-                      awa.jobs.args, awa.jobs.attempt, awa.jobs.max_attempts,
-                      awa.jobs.priority, awa.jobs.tags
-            """,
-            [kind_str],
-        )
+        except Exception:
+            # No matching job available — fetch_one raises when 0 rows
+            await tx.rollback()
+            return WorkResult(job=NoJob, outcome="no_job")
         await tx.commit()
 
-        if row is None:
-            raise RuntimeError(f"No available job found for kind '{kind_str}'")
-
-        job_id = row["id"]
+        # Capture the claimed job row so we can pass it through to WorkResult
+        # without re-fetching (avoids the old placeholder bug).
+        claimed_job = JobRow.from_row(row)
+        job_id = claimed_job.id
 
         # Deserialize args
         args_data = row["args"]
@@ -148,19 +208,11 @@ class AwaTestClient:
         else:
             args_instance = args_data
 
-        # Build a minimal job-like object for the handler
-        # Get the full Job object
-        tx2 = await self._client.transaction()
-        full_row = await tx2.fetch_one(
-            "SELECT * FROM awa.jobs WHERE id = $1", [job_id]
-        )
-        await tx2.commit()
-
         # Execute handler
         try:
             result = await handler(args_instance)
         except awa.TerminalError as e:
-            # Terminal error → failed
+            # Terminal error -> failed
             tx3 = await self._client.transaction()
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
@@ -220,14 +272,19 @@ class AwaTestClient:
             raise TypeError(f"Unexpected handler return type: {type(result)}")
 
 
-async def _get_job(client: awa.Client, job_id: int) -> awa.Job:
-    """Fetch a job by ID."""
+async def _get_job(client: awa.Client, job_id: int) -> JobRow:
+    """Fetch a job by ID and return a JobRow with its current state."""
     tx = await client.transaction()
-    row = await tx.fetch_one("SELECT id, kind, queue FROM awa.jobs WHERE id = $1", [job_id])
+    row = await tx.fetch_one(
+        """
+        SELECT id, kind, queue, args, attempt, max_attempts,
+               priority, tags, state::text AS state
+        FROM awa.jobs WHERE id = $1
+        """,
+        [job_id],
+    )
     await tx.commit()
-    # Return a minimal representation — in practice we'd return a full PyJob
-    # but for testing the WorkResult is what matters
-    return await client.insert({"_placeholder": True}, kind="_test_internal")  # placeholder
+    return JobRow.from_row(row)
 
 
 @pytest_asyncio.fixture

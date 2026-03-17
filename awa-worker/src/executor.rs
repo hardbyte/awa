@@ -62,6 +62,7 @@ pub struct JobExecutor {
     workers: Arc<HashMap<String, BoxedWorker>>,
     in_flight: Arc<RwLock<HashSet<i64>>>,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
+    metrics: crate::metrics::AwaMetrics,
 }
 
 impl JobExecutor {
@@ -70,12 +71,14 @@ impl JobExecutor {
         workers: Arc<HashMap<String, BoxedWorker>>,
         in_flight: Arc<RwLock<HashSet<i64>>>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
+        metrics: crate::metrics::AwaMetrics,
     ) -> Self {
         Self {
             pool,
             workers,
             in_flight,
             state,
+            metrics,
         }
     }
 
@@ -85,7 +88,10 @@ impl JobExecutor {
         let workers = self.workers.clone();
         let in_flight = self.in_flight.clone();
         let state = self.state.clone();
+        let metrics = self.metrics.clone();
         let job_id = job.id;
+        let job_kind = job.kind.clone();
+        let job_queue = job.queue.clone();
 
         tokio::spawn(async move {
             // Register as in-flight
@@ -93,7 +99,9 @@ impl JobExecutor {
                 let mut guard = in_flight.write().await;
                 guard.insert(job_id);
             }
+            metrics.record_in_flight_change(&job_queue, 1);
 
+            let start = std::time::Instant::now();
             let ctx = JobContext::new(job.clone(), cancel, state);
 
             let result = match workers.get(&job.kind) {
@@ -107,6 +115,34 @@ impl JobExecutor {
                 }
             };
 
+            let duration = start.elapsed();
+
+            // Record metrics based on outcome
+            match &result {
+                Ok(JobResult::Completed) => {
+                    metrics.record_job_completed(&job_kind, &job_queue, duration);
+                }
+                Ok(JobResult::RetryAfter(_)) => {
+                    metrics.record_job_retried(&job_kind, &job_queue);
+                }
+                Ok(JobResult::Cancel(_)) => {
+                    metrics.jobs_cancelled.add(
+                        1,
+                        &[
+                            opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
+                            opentelemetry::KeyValue::new("awa.job.queue", job_queue.clone()),
+                        ],
+                    );
+                }
+                Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
+                Err(JobError::Terminal(_)) => {
+                    metrics.record_job_failed(&job_kind, &job_queue, true);
+                }
+                Err(JobError::Retryable(_)) => {
+                    metrics.record_job_retried(&job_kind, &job_queue);
+                }
+            }
+
             // Complete the job based on the result
             if let Err(err) = complete_job(&pool, &job, result).await {
                 error!(job_id, error = %err, "Failed to complete job");
@@ -117,6 +153,7 @@ impl JobExecutor {
                 let mut guard = in_flight.write().await;
                 guard.remove(&job_id);
             }
+            metrics.record_in_flight_change(&job_queue, -1);
         })
     }
 }

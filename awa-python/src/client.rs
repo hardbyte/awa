@@ -57,7 +57,8 @@ impl PyCancel {
     }
 }
 
-/// Worker registration entry.
+/// Worker registration entry (used when worker dispatch is started).
+#[allow(dead_code)]
 pub struct WorkerEntry {
     pub kind: String,
     pub handler: Py<PyAny>,
@@ -98,6 +99,7 @@ impl PyClient {
     /// If args is a dataclass/BaseModel, kind is auto-derived from the class name.
     /// If args is a dict, kind must be provided.
     #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None))]
+    #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
         py: Python<'py>,
@@ -117,7 +119,7 @@ impl PyClient {
                 let kind_str = match kind {
                     Some(k) => k,
                     None => {
-                        let class_name = get_type_class_name(&args_bound.get_type().as_any())?;
+                        let class_name = get_type_class_name(args_bound.get_type().as_any())?;
                         derive_kind(&class_name)
                     }
                 };
@@ -208,7 +210,7 @@ impl PyClient {
 
         let kind_str = kind.unwrap_or_else(|| {
             Python::attach(|py| {
-                let class_name = get_type_class_name(&args_type.bind(py).as_any())
+                let class_name = get_type_class_name(args_type.bind(py).as_any())
                     .unwrap_or_else(|_| "unknown".to_string());
                 derive_kind(&class_name)
             })

@@ -3,7 +3,7 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{admin, insert, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
-use awa::{JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
+use awa::{AwaError, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -444,6 +444,48 @@ async fn test_transactional_insert() {
 
     let after_commit = client.get_job(job.id).await.unwrap();
     assert_eq!(after_commit.kind, "send_email");
+}
+
+#[tokio::test]
+async fn test_unique_conflict_rejects_duplicate() {
+    let client = setup().await;
+
+    let opts = InsertOpts {
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    };
+
+    // First insert should succeed
+    let job1 = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "unique@example.com".into(),
+            subject: "First".into(),
+        },
+        opts.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert!(job1.unique_key.is_some());
+    assert_eq!(job1.state, JobState::Available);
+
+    // Second insert with the same kind + args should be rejected as a unique conflict
+    let result = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "unique@example.com".into(),
+            subject: "First".into(),
+        },
+        opts.clone(),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(AwaError::UniqueConflict { .. })),
+        "Expected UniqueConflict error, got: {:?}",
+        result
+    );
 }
 
 #[tokio::test]

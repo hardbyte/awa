@@ -104,6 +104,8 @@ impl ClientBuilder {
             panic!("At least one queue must be configured");
         }
 
+        let metrics = crate::metrics::AwaMetrics::from_global();
+
         Client {
             pool: self.pool,
             queues: self.queues,
@@ -112,6 +114,7 @@ impl ClientBuilder {
             heartbeat_interval: self.heartbeat_interval,
             cancel: CancellationToken::new(),
             handles: RwLock::new(Vec::new()),
+            metrics,
         }
     }
 }
@@ -161,6 +164,7 @@ pub struct Client {
     heartbeat_interval: Duration,
     cancel: CancellationToken,
     handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    metrics: crate::metrics::AwaMetrics,
 }
 
 impl Client {
@@ -179,12 +183,13 @@ impl Client {
 
         let in_flight: Arc<RwLock<HashSet<i64>>> = Arc::new(RwLock::new(HashSet::new()));
 
-        // Create executor
+        // Create executor with metrics
         let executor = Arc::new(JobExecutor::new(
             self.pool.clone(),
             self.workers.clone(),
             in_flight.clone(),
             self.state.clone(),
+            self.metrics.clone(),
         ));
 
         let mut handles = self.handles.write().await;

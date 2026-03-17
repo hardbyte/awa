@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import pytest
 
 import awa
-from awa.testing import AwaTestClient, WorkResult
+from awa.testing import AwaTestClient, JobRow, NoJob, WorkResult
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -46,6 +46,11 @@ async def test_work_one_completed(tc):
     result = await tc.work_one(SendEmail, handler=handler)
     assert result.is_completed()
     assert result.outcome == "completed"
+    # Verify the job is a real JobRow, not a placeholder
+    assert isinstance(result.job, JobRow)
+    assert result.job.kind == "send_email"
+    assert result.job.queue == "default"
+    assert result.job.state == "completed"
 
 
 @pytest.mark.asyncio
@@ -96,6 +101,40 @@ async def test_work_one_snooze(tc):
 
     result = await tc.work_one(SendEmail, handler=handler)
     assert result.is_snoozed()
+
+
+@pytest.mark.asyncio
+async def test_work_one_no_job(tc):
+    """work_one returns no_job result when no matching job exists."""
+    # Don't insert anything — the queue is empty after clean()
+    async def handler(args: SendEmail):
+        return None
+
+    result = await tc.work_one(SendEmail, handler=handler)
+    assert result.is_no_job()
+    assert result.outcome == "no_job"
+    assert result.job is NoJob
+    assert not result.job  # NoJob is falsy
+
+
+@pytest.mark.asyncio
+async def test_work_one_filters_by_queue(tc):
+    """work_one only claims jobs from the specified queue."""
+    # Insert a job into a non-default queue
+    await tc.insert(SendEmail(to="other@test.com", subject="Other"), queue="emails")
+
+    async def handler(args: SendEmail):
+        return None
+
+    # Trying to work from the default queue should find nothing
+    result_default = await tc.work_one(SendEmail, handler=handler, queue="default")
+    assert result_default.is_no_job()
+
+    # Working from the correct queue should find the job
+    result_emails = await tc.work_one(SendEmail, handler=handler, queue="emails")
+    assert result_emails.is_completed()
+    assert isinstance(result_emails.job, JobRow)
+    assert result_emails.job.queue == "emails"
 
 
 @pytest.mark.asyncio
