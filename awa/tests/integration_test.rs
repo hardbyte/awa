@@ -1,0 +1,498 @@
+//! Integration tests for Awa — requires a running Postgres instance.
+//!
+//! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+
+use awa::model::{admin, insert, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
+use awa::{JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
+use awa_testing::{TestClient, WorkResult};
+use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
+
+async fn setup() -> TestClient {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url())
+        .await
+        .expect("Failed to connect to database");
+
+    let client = TestClient::from_pool(pool).await;
+    client.migrate().await.expect("Failed to run migrations");
+    client.clean().await.expect("Failed to clean database");
+    client
+}
+
+// -- Job types for testing --
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct SendEmail {
+    pub to: String,
+    pub subject: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct ProcessPayment {
+    pub order_id: i64,
+    pub amount_cents: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+#[awa(kind = "custom_job_kind")]
+struct CustomKindJob {
+    pub data: String,
+}
+
+// -- Worker implementations --
+
+struct SendEmailWorker;
+
+#[async_trait::async_trait]
+impl Worker for SendEmailWorker {
+    fn kind(&self) -> &'static str {
+        "send_email"
+    }
+
+    async fn perform(&self, job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: SendEmail = serde_json::from_value(job_row.args.clone())
+            .map_err(|e| JobError::Terminal(e.to_string()))?;
+        assert!(!args.to.is_empty());
+        Ok(JobResult::Completed)
+    }
+}
+
+struct FailingWorker;
+
+#[async_trait::async_trait]
+impl Worker for FailingWorker {
+    fn kind(&self) -> &'static str {
+        "process_payment"
+    }
+
+    async fn perform(&self, _job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        Err(JobError::retryable(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "payment gateway unavailable",
+        )))
+    }
+}
+
+// -- Tests --
+
+#[tokio::test]
+async fn test_migrations() {
+    let client = setup().await;
+    let version = migrations::current_version(client.pool()).await.unwrap();
+    assert_eq!(version, 1);
+}
+
+#[tokio::test]
+async fn test_insert_and_retrieve() {
+    let client = setup().await;
+
+    let job = insert(
+        client.pool(),
+        &SendEmail {
+            to: "alice@example.com".into(),
+            subject: "Welcome".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(job.kind, "send_email");
+    assert_eq!(job.queue, "default");
+    assert_eq!(job.state, JobState::Available);
+    assert_eq!(job.priority, 2);
+    assert_eq!(job.attempt, 0);
+    assert_eq!(job.max_attempts, 25);
+
+    let args: SendEmail = serde_json::from_value(job.args).unwrap();
+    assert_eq!(args.to, "alice@example.com");
+    assert_eq!(args.subject, "Welcome");
+}
+
+#[tokio::test]
+async fn test_insert_with_custom_opts() {
+    let client = setup().await;
+
+    let job = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "bob@example.com".into(),
+            subject: "Alert".into(),
+        },
+        InsertOpts {
+            queue: "email".into(),
+            priority: 1,
+            max_attempts: 3,
+            tags: vec!["urgent".into(), "email".into()],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(job.queue, "email");
+    assert_eq!(job.priority, 1);
+    assert_eq!(job.max_attempts, 3);
+    assert_eq!(job.tags, vec!["urgent", "email"]);
+}
+
+#[tokio::test]
+async fn test_insert_with_future_run_at() {
+    let client = setup().await;
+
+    let future_time = chrono::Utc::now() + chrono::Duration::hours(1);
+    let job = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "future@example.com".into(),
+            subject: "Later".into(),
+        },
+        InsertOpts {
+            run_at: Some(future_time),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(job.state, JobState::Scheduled);
+}
+
+#[tokio::test]
+async fn test_insert_many() {
+    let client = setup().await;
+
+    let jobs_params = vec![
+        awa::model::insert::params(&SendEmail {
+            to: "a@b.com".into(),
+            subject: "One".into(),
+        })
+        .unwrap(),
+        awa::model::insert::params(&SendEmail {
+            to: "c@d.com".into(),
+            subject: "Two".into(),
+        })
+        .unwrap(),
+    ];
+
+    let jobs = insert_many(client.pool(), &jobs_params).await.unwrap();
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].kind, "send_email");
+    assert_eq!(jobs[1].kind, "send_email");
+}
+
+#[tokio::test]
+async fn test_custom_kind() {
+    let client = setup().await;
+
+    let job = insert(
+        client.pool(),
+        &CustomKindJob {
+            data: "test".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(job.kind, "custom_job_kind");
+}
+
+#[tokio::test]
+async fn test_kind_derivation() {
+    assert_eq!(SendEmail::kind(), "send_email");
+    assert_eq!(ProcessPayment::kind(), "process_payment");
+    assert_eq!(CustomKindJob::kind(), "custom_job_kind");
+}
+
+#[tokio::test]
+async fn test_work_one_completed() {
+    let client = setup().await;
+
+    insert(
+        client.pool(),
+        &SendEmail {
+            to: "worker@example.com".into(),
+            subject: "Test".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let worker = SendEmailWorker;
+    let result = client.work_one(&worker).await.unwrap();
+    assert!(
+        result.is_completed(),
+        "Expected completed, got: {:?}",
+        result
+    );
+}
+
+#[tokio::test]
+async fn test_work_one_retryable() {
+    let client = setup().await;
+
+    insert(
+        client.pool(),
+        &ProcessPayment {
+            order_id: 42,
+            amount_cents: 9999,
+        },
+    )
+    .await
+    .unwrap();
+
+    let worker = FailingWorker;
+    let result = client.work_one(&worker).await.unwrap();
+    assert!(
+        matches!(result, WorkResult::Retryable(_)),
+        "Expected retryable, got: {:?}",
+        result
+    );
+}
+
+#[tokio::test]
+async fn test_work_one_no_job() {
+    let client = setup().await;
+
+    let worker = SendEmailWorker;
+    let result = client.work_one(&worker).await.unwrap();
+    assert!(result.is_no_job());
+}
+
+#[tokio::test]
+async fn test_admin_retry() {
+    let client = setup().await;
+
+    let job = insert(
+        client.pool(),
+        &ProcessPayment {
+            order_id: 1,
+            amount_cents: 100,
+        },
+    )
+    .await
+    .unwrap();
+
+    // Set to failed directly
+    sqlx::query("UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1")
+        .bind(job.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // Retry
+    let retried = admin::retry(client.pool(), job.id).await.unwrap();
+    assert!(retried.is_some());
+
+    let retried_job = client.get_job(job.id).await.unwrap();
+    assert_eq!(retried_job.state, JobState::Available);
+    assert_eq!(retried_job.attempt, 0);
+}
+
+#[tokio::test]
+async fn test_admin_cancel() {
+    let client = setup().await;
+
+    let job = insert(
+        client.pool(),
+        &SendEmail {
+            to: "cancel@example.com".into(),
+            subject: "Cancel me".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    admin::cancel(client.pool(), job.id).await.unwrap();
+
+    let cancelled = client.get_job(job.id).await.unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+}
+
+#[tokio::test]
+async fn test_admin_pause_resume_queue() {
+    let client = setup().await;
+
+    admin::pause_queue(client.pool(), "test_pause", Some("test"))
+        .await
+        .unwrap();
+
+    let is_paused: bool =
+        sqlx::query_scalar("SELECT paused FROM awa.queue_meta WHERE queue = 'test_pause'")
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+    assert!(is_paused);
+
+    admin::resume_queue(client.pool(), "test_pause")
+        .await
+        .unwrap();
+
+    let is_paused: bool =
+        sqlx::query_scalar("SELECT paused FROM awa.queue_meta WHERE queue = 'test_pause'")
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
+    assert!(!is_paused);
+}
+
+#[tokio::test]
+async fn test_admin_drain_queue() {
+    let client = setup().await;
+
+    for i in 0..5 {
+        insert_with(
+            client.pool(),
+            &SendEmail {
+                to: format!("drain{i}@example.com"),
+                subject: "Drain test".into(),
+            },
+            InsertOpts {
+                queue: "drain_test".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let drained = admin::drain_queue(client.pool(), "drain_test")
+        .await
+        .unwrap();
+    assert_eq!(drained, 5);
+
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs WHERE queue = 'drain_test' AND state = 'available'",
+    )
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(remaining, 0);
+}
+
+#[tokio::test]
+async fn test_admin_queue_stats() {
+    let client = setup().await;
+
+    for _ in 0..3 {
+        insert_with(
+            client.pool(),
+            &SendEmail {
+                to: "stats@example.com".into(),
+                subject: "Stats test".into(),
+            },
+            InsertOpts {
+                queue: "stats_test".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    let stats = admin::queue_stats(client.pool()).await.unwrap();
+    let stat = stats.iter().find(|s| s.queue == "stats_test").unwrap();
+    assert_eq!(stat.available, 3);
+}
+
+#[tokio::test]
+async fn test_admin_list_jobs() {
+    let client = setup().await;
+
+    insert(
+        client.pool(),
+        &SendEmail {
+            to: "list@example.com".into(),
+            subject: "List test".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    let filter = admin::ListJobsFilter {
+        state: Some(JobState::Available),
+        ..Default::default()
+    };
+    let jobs = admin::list_jobs(client.pool(), &filter).await.unwrap();
+    assert!(!jobs.is_empty());
+    assert!(jobs.iter().all(|j| j.state == JobState::Available));
+}
+
+#[tokio::test]
+async fn test_transactional_insert() {
+    let client = setup().await;
+
+    let mut tx = client.pool().begin().await.unwrap();
+
+    let job = insert(
+        &mut *tx,
+        &SendEmail {
+            to: "tx@example.com".into(),
+            subject: "Transactional".into(),
+        },
+    )
+    .await
+    .unwrap();
+
+    tx.commit().await.unwrap();
+
+    let after_commit = client.get_job(job.id).await.unwrap();
+    assert_eq!(after_commit.kind, "send_email");
+}
+
+#[tokio::test]
+async fn test_unique_key_insert() {
+    let client = setup().await;
+
+    let opts = InsertOpts {
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    };
+
+    let job1 = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "unique@example.com".into(),
+            subject: "First".into(),
+        },
+        opts.clone(),
+    )
+    .await
+    .unwrap();
+
+    assert!(job1.unique_key.is_some());
+}
+
+#[tokio::test]
+async fn test_job_state_lifecycle() {
+    let client = setup().await;
+
+    // Insert → available
+    let job = insert(
+        client.pool(),
+        &SendEmail {
+            to: "lifecycle@example.com".into(),
+            subject: "Lifecycle".into(),
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(job.state, JobState::Available);
+
+    // Work → completed
+    let worker = SendEmailWorker;
+    let result = client.work_one(&worker).await.unwrap();
+    assert!(result.is_completed());
+
+    // Verify final state
+    let final_job = client.get_job(job.id).await.unwrap();
+    assert_eq!(final_job.state, JobState::Completed);
+    assert_eq!(final_job.attempt, 1);
+    assert!(final_job.finalized_at.is_some());
+}

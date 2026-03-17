@@ -1,0 +1,6 @@
+/target
+/spike/**/target
+/spike/**/.venv
+/spike/**/__pycache__
+*.pyc
+.env
