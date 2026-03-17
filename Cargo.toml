@@ -8,6 +8,7 @@ members = [
     "awa-testing",
     "awa-cli",
 ]
+exclude = ["awa-python", "spike"]
 
 [workspace.package]
 version = "0.1.0"
