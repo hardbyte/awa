@@ -343,7 +343,10 @@ impl PyClient {
     ///
     /// Call `client.shutdown()` to stop the loop.
     #[pyo3(signature = (queues, *, poll_interval_ms=200))]
-    fn start(&self, _py: Python<'_>, queues: Vec<(String, u32)>, poll_interval_ms: u64) -> PyResult<()> {
+    fn start(&mut self, _py: Python<'_>, queues: Vec<(String, u32)>, poll_interval_ms: u64) -> PyResult<()> {
+        // Create a fresh cancel token so start() works after a previous shutdown().
+        self.cancel = tokio_util::sync::CancellationToken::new();
+
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let cancel = self.cancel.clone();

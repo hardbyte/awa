@@ -62,7 +62,9 @@ pub async fn run_workers(
                     SELECT id FROM awa.jobs
                     WHERE state = 'available' AND queue = $1 AND run_at <= now()
                       AND NOT EXISTS (SELECT 1 FROM awa.queue_meta WHERE queue = $1 AND paused = TRUE)
-                    ORDER BY priority ASC, run_at ASC, id ASC
+                    ORDER BY
+                      GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / 60)::int) ASC,
+                      run_at ASC, id ASC
                     LIMIT $2 FOR UPDATE SKIP LOCKED
                 )
                 UPDATE awa.jobs SET state = 'running', attempt = attempt + 1,
@@ -118,6 +120,9 @@ async fn dispatch(
     workers: &Arc<RwLock<HashMap<String, WorkerEntry>>>,
     job: &JobRow,
 ) -> PyResult<()> {
+    // Handlers are registered by kind (globally unique per PRD §9.2).
+    // The queue parameter on @client.worker controls which queue to poll,
+    // but dispatch is always by kind — matching Rust worker behavior.
     let (handler, args_type) = {
         let guard = workers.read().await;
         match guard.get(&job.kind) {
