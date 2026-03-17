@@ -64,6 +64,7 @@ client.start().await?;
 
 ```python
 import awa
+import asyncio
 from dataclasses import dataclass
 
 @dataclass
@@ -86,6 +87,13 @@ async with await client.transaction() as tx:
 @client.worker(SendEmail, queue="email")
 async def handle(job):
     await send_email(job.args.to, job.args.subject)
+
+client.start([("email", 10)])
+health = await client.health_check()
+assert health.heartbeat_alive
+
+await asyncio.sleep(10)
+await client.shutdown()
 ```
 
 > **Note:** `async with await client.transaction()` uses a double-await because
@@ -129,25 +137,28 @@ awa --database-url $DATABASE_URL job list --state failed
 ## Architecture
 
 ```
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│ Rust Service  │  │ Python Svc   │  │ Any Language  │
-│ (awa-model)   │  │ (pip awa)    │  │ (raw INSERT)  │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │                 │                  │
-       ▼                 ▼                  ▼
- ┌────────────────────────────────────────────────┐
- │              PostgreSQL — awa.jobs              │
- └───────────────────────┬────────────────────────┘
+┌────────────────────┐      ┌────────────────────┐
+│ Rust producers     │      │ Python producers   │
+│ `awa-model` / `awa`│      │ `pip install awa`  │
+└─────────┬──────────┘      └─────────┬──────────┘
+          │                           │
+          └──────────────┬────────────┘
+                         ▼
+              ┌──────────────────────┐
+              │ PostgreSQL `awa.jobs`│
+              └──────────┬───────────┘
                          │
-          ┌──────────────┼──────────────┐
-          │              │              │
-    ┌─────▼─────┐  ┌────▼────┐  ┌─────▼─────┐
-    │Rust Worker │  │Py Worker│  │Py Worker  │
-    │(awa-worker)│  │(pip awa)│  │(pip awa)  │
-    └───────────┘  └─────────┘  └───────────┘
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│ Rust runtime  │ │ Rust runtime  │ │ Rust runtime  │
+│ + Rust worker │ │ + Python cb   │ │ + Python cb   │
+│ `awa-worker`  │ │ via PyO3      │ │ via PyO3      │
+└───────────────┘ └───────────────┘ └───────────────┘
 ```
 
-All coordination happens through Postgres. Workers are stateless. Deploy as many as you need. Mixed Rust and Python workers coexist on the same queues — jobs inserted from any language are workable by any language.
+All coordination happens through Postgres, and the Rust runtime owns polling, heartbeats, shutdown, and crash recovery for both Rust and Python handlers. Mixed Rust and Python workers coexist on the same queues — jobs inserted from any language are workable by any language.
 
 ## Workspace
 

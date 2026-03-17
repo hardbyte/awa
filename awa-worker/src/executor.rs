@@ -2,8 +2,8 @@ use crate::context::JobContext;
 use awa_model::{AwaError, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
-use std::collections::{HashMap, HashSet};
-use std::sync::atomic::AtomicBool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -60,7 +60,8 @@ pub(crate) type BoxedWorker = Box<dyn Worker>;
 pub struct JobExecutor {
     pool: PgPool,
     workers: Arc<HashMap<String, BoxedWorker>>,
-    in_flight: Arc<RwLock<HashSet<i64>>>,
+    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
     metrics: crate::metrics::AwaMetrics,
 }
@@ -69,7 +70,8 @@ impl JobExecutor {
     pub fn new(
         pool: PgPool,
         workers: Arc<HashMap<String, BoxedWorker>>,
-        in_flight: Arc<RwLock<HashSet<i64>>>,
+        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         metrics: crate::metrics::AwaMetrics,
     ) -> Self {
@@ -77,6 +79,7 @@ impl JobExecutor {
             pool,
             workers,
             in_flight,
+            queue_in_flight,
             state,
             metrics,
         }
@@ -87,6 +90,7 @@ impl JobExecutor {
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let in_flight = self.in_flight.clone();
+        let queue_in_flight = self.queue_in_flight.clone();
         let state = self.state.clone();
         let metrics = self.metrics.clone();
         let job_id = job.id;
@@ -97,7 +101,10 @@ impl JobExecutor {
             // Register as in-flight
             {
                 let mut guard = in_flight.write().await;
-                guard.insert(job_id);
+                guard.insert(job_id, cancel.clone());
+            }
+            if let Some(counter) = queue_in_flight.get(&job_queue) {
+                counter.fetch_add(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, 1);
 
@@ -152,6 +159,9 @@ impl JobExecutor {
             {
                 let mut guard = in_flight.write().await;
                 guard.remove(&job_id);
+            }
+            if let Some(counter) = queue_in_flight.get(&job_queue) {
+                counter.fetch_sub(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, -1);
         })

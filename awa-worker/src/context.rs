@@ -34,6 +34,11 @@ impl JobContext {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    /// Clone the shared cancellation flag for language bridges.
+    pub fn cancellation_flag(&self) -> Arc<AtomicBool> {
+        self.cancelled.clone()
+    }
+
     /// Signal cancellation for this job.
     pub fn cancel(&self) {
         self.cancelled.store(true, Ordering::SeqCst);

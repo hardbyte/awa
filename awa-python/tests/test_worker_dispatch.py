@@ -141,8 +141,69 @@ async def test_worker_dispatch_shutdown_is_clean(client):
 @pytest.mark.asyncio
 async def test_worker_dispatch_requires_registered_workers(client):
     """start fails fast when no Python handlers are registered."""
-    with pytest.raises(RuntimeError, match="no Python workers registered"):
+    with pytest.raises(
+        RuntimeError, match="register at least one worker before starting the runtime"
+    ):
         client.start([("dispatch_missing_worker", 1)])
+
+
+@pytest.mark.asyncio
+async def test_worker_dispatch_shutdown_signals_cancellation(client):
+    """Shutdown flips job.is_cancelled() for an in-flight Python handler."""
+    queue = "dispatch_cancel_signal"
+    started = asyncio.Event()
+    observed = asyncio.Event()
+
+    @client.worker(DispatchEmail, queue=queue)
+    async def handle(job):
+        started.set()
+        while not job.is_cancelled():
+            await asyncio.sleep(0.02)
+        observed.set()
+        return awa.Cancel(reason="shutdown")
+
+    await client.insert(
+        DispatchEmail(to="signal@test.com", subject="Signal"),
+        queue=queue,
+    )
+
+    client.start([(queue, 1)])
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await client.shutdown(timeout_ms=500)
+    await asyncio.wait_for(observed.wait(), timeout=1.0)
+
+
+@pytest.mark.asyncio
+async def test_worker_dispatch_health_check(client):
+    """Health check reflects the Rust runtime state while workers are running."""
+    queue = "dispatch_health"
+
+    @client.worker(DispatchEmail, queue=queue)
+    async def handle(job):
+        await asyncio.sleep(0.05)
+        return None
+
+    client.start([(queue, 2)])
+    health = await client.health_check()
+    await client.shutdown()
+
+    assert health.postgres_connected is True
+    assert health.poll_loop_alive is True
+    assert health.heartbeat_alive is True
+    assert queue in health.queues
+    assert health.queues[queue].max_workers == 2
+
+
+@pytest.mark.asyncio
+async def test_worker_dispatch_validates_registered_queue(client):
+    """start() rejects configurations that ignore @client.worker queue declarations."""
+
+    @client.worker(DispatchEmail, queue="dispatch_declared")
+    async def handle(job):
+        return None
+
+    with pytest.raises(ValueError):
+        client.start([("different_queue", 1)])
 
 
 @pytest.mark.asyncio

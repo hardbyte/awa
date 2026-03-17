@@ -195,30 +195,33 @@ Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, clean
 The `awa-python` crate provides a native Python module (`_awa`) built with PyO3 and maturin:
 
 ```
-Python (asyncio)                    Rust (tokio)
-─────────────────                   ────────────
+Python process                         Rust runtime inside `awa-python`
+──────────────────────────────────     ─────────────────────────────────────
 
-client = Client(url)   ──────►     PgPool::connect()
-await client.insert(args)  ───►    awa_model::insert()
-await client.migrate()  ──────►    awa_model::migrations::run()
+client = awa.Client(url)        ───►   PgPool::connect()
+await client.insert(...)        ───►   raw INSERT / migration helpers
+await client.health_check()     ───►   awa_worker::Client::health_check()
 
-@client.worker(SendEmail)
-async def handle(job):             # Registered in workers HashMap
+@client.worker(SendEmail, queue="email")
+async def handle(job):                  handler + task locals registered
     ...
 
-# Transaction support:
-async with await client.transaction() as tx:
-    await tx.insert(args)          # INSERT within PG transaction
-    await tx.execute(sql, args)    # Raw SQL
-    # auto-commit on success, rollback on exception
+client.start([("email", 10)])    ───►   awa_worker::Client::start()
+                                         ├── Dispatcher (`SKIP LOCKED` + LISTEN/NOTIFY)
+                                         ├── HeartbeatService
+                                         ├── MaintenanceService
+                                         └── PythonWorker bridge
+                                             └── into_future_with_locals(...)
+
+await client.shutdown()          ───►   graceful drain + cancellation
 ```
 
 Key design decisions:
 
-- **Shared runtime path:** `awa-python` builds an `awa-worker::Client` and registers a thin adapter worker per Python kind, so Python execution uses the same dispatcher, LISTEN/NOTIFY wakeup, heartbeat service, maintenance leader, and queue configuration as Rust workers.
-- **Async bridge:** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables for the public API. Python `async def` handlers are converted to Rust futures via `into_future` inside the adapter worker.
-- **Heartbeats survive GIL blocks:** Heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL. Even if a Python handler blocks the GIL (e.g., CPU-bound work in a sync call), heartbeats continue uninterrupted because in-flight tracking lives in `awa-worker`.
-- **Type bridging:** Python dataclasses and pydantic BaseModels are serialized to `serde_json::Value` via `model_dump(mode="json")` or `dataclasses.asdict()`. At dispatch time the adapter reconstructs the Python args object and exposes it on a lightweight job namespace.
+- **Single runtime:** Python workers do not run a separate poller. They register callbacks, then delegate polling, heartbeats, maintenance, and shutdown to `awa-worker`.
+- **Async bridge:** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. Registered Python handlers are driven from Rust via `into_future_with_locals`, using task-local event loop state captured when the handler is registered.
+- **Heartbeats survive GIL blocks:** Heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL. Even if a Python handler blocks the GIL (e.g., CPU-bound work in a sync call), heartbeats continue uninterrupted.
+- **Type bridging:** Python dataclasses and pydantic BaseModels are serialized to `serde_json::Value` via `model_dump(mode="json")` or `dataclasses.asdict()`. On dispatch, the bridge reconstructs the typed args object before invoking the handler and exposes `job.is_cancelled()` from the shared Rust cancellation flag.
 
 ## Observability
 

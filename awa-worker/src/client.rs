@@ -6,7 +6,8 @@ use awa_model::{JobArgs, JobRow};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::RwLock;
@@ -112,6 +113,18 @@ impl ClientBuilder {
         }
 
         let metrics = crate::metrics::AwaMetrics::from_global();
+        let queue_in_flight = Arc::new(
+            self.queues
+                .iter()
+                .map(|(name, _)| (name.clone(), Arc::new(AtomicU32::new(0))))
+                .collect(),
+        );
+        let dispatcher_alive = Arc::new(
+            self.queues
+                .iter()
+                .map(|(name, _)| (name.clone(), Arc::new(AtomicBool::new(false))))
+                .collect(),
+        );
 
         Ok(Client {
             pool: self.pool,
@@ -121,6 +134,11 @@ impl ClientBuilder {
             heartbeat_interval: self.heartbeat_interval,
             cancel: CancellationToken::new(),
             handles: RwLock::new(Vec::new()),
+            in_flight: Arc::new(RwLock::new(HashMap::new())),
+            queue_in_flight,
+            dispatcher_alive,
+            heartbeat_alive: Arc::new(AtomicBool::new(false)),
+            leader: Arc::new(AtomicBool::new(false)),
             metrics,
         })
     }
@@ -171,6 +189,11 @@ pub struct Client {
     heartbeat_interval: Duration,
     cancel: CancellationToken,
     handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
+    dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
+    heartbeat_alive: Arc<AtomicBool>,
+    leader: Arc<AtomicBool>,
     metrics: crate::metrics::AwaMetrics,
 }
 
@@ -188,13 +211,12 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
-        let in_flight: Arc<RwLock<HashSet<i64>>> = Arc::new(RwLock::new(HashSet::new()));
-
         // Create executor with metrics
         let executor = Arc::new(JobExecutor::new(
             self.pool.clone(),
             self.workers.clone(),
-            in_flight.clone(),
+            self.in_flight.clone(),
+            self.queue_in_flight.clone(),
             self.state.clone(),
             self.metrics.clone(),
         ));
@@ -204,8 +226,9 @@ impl Client {
         // Start heartbeat service
         let heartbeat = HeartbeatService::new(
             self.pool.clone(),
-            in_flight.clone(),
+            self.in_flight.clone(),
             self.heartbeat_interval,
+            self.heartbeat_alive.clone(),
             self.cancel.clone(),
         );
         handles.push(tokio::spawn(async move {
@@ -213,7 +236,8 @@ impl Client {
         }));
 
         // Start maintenance service
-        let maintenance = MaintenanceService::new(self.pool.clone(), self.cancel.clone());
+        let maintenance =
+            MaintenanceService::new(self.pool.clone(), self.leader.clone(), self.cancel.clone());
         handles.push(tokio::spawn(async move {
             maintenance.run().await;
         }));
@@ -225,7 +249,11 @@ impl Client {
                 config.clone(),
                 self.pool.clone(),
                 executor.clone(),
-                in_flight.clone(),
+                self.in_flight.clone(),
+                self.dispatcher_alive
+                    .get(queue_name)
+                    .cloned()
+                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
                 self.cancel.clone(),
             );
             handles.push(tokio::spawn(async move {
@@ -243,6 +271,12 @@ impl Client {
 
         // Signal all tasks to stop
         self.cancel.cancel();
+        {
+            let guard = self.in_flight.read().await;
+            for flag in guard.values() {
+                flag.store(true, Ordering::SeqCst);
+            }
+        }
 
         // Wait for handles with timeout
         let handles: Vec<_> = {
@@ -277,17 +311,54 @@ impl Client {
     /// Health check.
     pub async fn health_check(&self) -> HealthCheck {
         let postgres_connected = sqlx::query("SELECT 1").execute(&self.pool).await.is_ok();
-
+        let poll_loop_alive = self
+            .dispatcher_alive
+            .values()
+            .all(|alive| alive.load(Ordering::SeqCst));
+        let heartbeat_alive = self.heartbeat_alive.load(Ordering::SeqCst);
         let shutting_down = self.cancel.is_cancelled();
+        let leader = self.leader.load(Ordering::SeqCst);
+        let available_rows = sqlx::query_as::<_, (String, i64)>(
+            r#"
+            SELECT queue, count(*)::bigint AS available
+            FROM awa.jobs
+            WHERE state = 'available'
+            GROUP BY queue
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .unwrap_or_default();
+        let available_by_queue: HashMap<_, _> = available_rows.into_iter().collect();
+        let queues = self
+            .queues
+            .iter()
+            .map(|(queue, config)| {
+                let in_flight = self
+                    .queue_in_flight
+                    .get(queue)
+                    .map(|counter| counter.load(Ordering::SeqCst))
+                    .unwrap_or(0);
+                let available = available_by_queue.get(queue).copied().unwrap_or(0).max(0) as u64;
+                (
+                    queue.clone(),
+                    QueueHealth {
+                        in_flight,
+                        max_workers: config.max_workers,
+                        available,
+                    },
+                )
+            })
+            .collect();
 
         HealthCheck {
-            healthy: postgres_connected && !shutting_down,
+            healthy: postgres_connected && poll_loop_alive && heartbeat_alive && !shutting_down,
             postgres_connected,
-            poll_loop_alive: !shutting_down,
-            heartbeat_alive: !shutting_down,
+            poll_loop_alive,
+            heartbeat_alive,
             shutting_down,
-            leader: false,          // Would need to check advisory lock
-            queues: HashMap::new(), // Would aggregate from dispatchers
+            leader,
+            queues,
         }
     }
 }

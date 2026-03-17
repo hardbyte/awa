@@ -6,6 +6,8 @@ from awa._awa import (
     # Job types
     Job,
     JobState,
+    HealthCheck,
+    QueueHealth,
     # Transaction
     Transaction,
     # Handler return types
@@ -30,6 +32,8 @@ __all__ = [
     "Client",
     "Job",
     "JobState",
+    "HealthCheck",
+    "QueueHealth",
     "Transaction",
     "RetryAfter",
     "Snooze",

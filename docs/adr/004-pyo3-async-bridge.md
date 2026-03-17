@@ -24,7 +24,7 @@ Use PyO3 with `pyo3-async-runtimes` for in-process Python integration.
 A proof-of-concept spike (`spike/pyo3-async/`) validated four critical requirements before committing to this approach:
 
 1. **Rust tokio can call a Python `async def` and await its result.**
-   `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. `pyo3_async_runtimes::tokio::into_future` converts Python coroutines to Rust futures. Round-trip latency is sub-microsecond.
+   `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. `pyo3_async_runtimes::into_future_with_locals` converts Python coroutines to Rust futures when the worker is executing on a Rust background task. Round-trip latency is sub-microsecond.
 
 2. **A Rust background task can heartbeat while a Python handler runs.**
    The heartbeat task runs as a separate tokio task that never acquires the GIL. The spike proved that heartbeat increments continue accumulating while a Python handler is blocked in `asyncio.sleep`.
@@ -80,11 +80,11 @@ Worker registration uses a decorator pattern:
 ```python
 @client.worker(SendEmail, queue="email")
 async def handle(job):
-    # job.args is a dict
-    send_email(job.args["to"], job.args["subject"])
+    # job.args is the reconstructed dataclass / pydantic instance
+    send_email(job.args.to, job.args.subject)
 ```
 
-The decorator stores the handler and args type in a `HashMap<String, WorkerEntry>`. `awa-python` then builds a normal `awa-worker::Client` and registers a thin adapter `Worker` per Python kind. When the Rust runtime dispatches a job, that adapter looks up the Python handler by kind and calls it via `pyo3_async_runtimes::tokio::into_future`.
+The decorator stores the handler, args type, declared queue, and Python task locals in a `HashMap<String, WorkerEntry>`. When the Rust runtime dispatches a job, it looks up the handler by kind and calls it via `pyo3_async_runtimes::into_future_with_locals`, preserving the Python event loop context captured at registration time.
 
 ### Type Bridging
 

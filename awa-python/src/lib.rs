@@ -58,6 +58,8 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyRetryAfter>()?;
     m.add_class::<client::PySnooze>()?;
     m.add_class::<client::PyCancel>()?;
+    m.add_class::<client::PyQueueHealth>()?;
+    m.add_class::<client::PyHealthCheck>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;

@@ -130,6 +130,18 @@ async def test_insert_with_opts(client):
 
 
 @pytest.mark.asyncio
+async def test_insert_with_future_run_at(client):
+    """Insert with a future run_at creates a scheduled job."""
+    future_time = "2030-01-02T03:04:05+00:00"
+    job = await client.insert(
+        SendEmail(to="later@example.com", subject="Later"),
+        queue="scheduled_py",
+        run_at=future_time,
+    )
+    assert job.state == awa.JobState.Scheduled
+
+
+@pytest.mark.asyncio
 async def test_insert_with_custom_kind(client):
     """Insert with an explicit kind override."""
     job = await client.insert(
@@ -218,6 +230,50 @@ async def test_transaction_execute_and_fetch(client):
     await tx.commit()
 
 
+@pytest.mark.asyncio
+async def test_transaction_fetch_optional_and_fetch_all(client):
+    """Transaction fetch_optional/fetch_all return dicts and None appropriately."""
+    tx = await client.transaction()
+    await tx.insert(SendEmail(to="opt@example.com", subject="Optional"), queue="tx_fetch")
+    present = await tx.fetch_optional(
+        "SELECT kind FROM awa.jobs WHERE queue = $1", ["tx_fetch"]
+    )
+    missing = await tx.fetch_optional(
+        "SELECT kind FROM awa.jobs WHERE queue = $1", ["missing_tx_fetch"]
+    )
+    rows = await tx.fetch_all(
+        "SELECT kind FROM awa.jobs WHERE queue = $1", ["tx_fetch"]
+    )
+    await tx.commit()
+
+    assert present["kind"] == "send_email"
+    assert missing is None
+    assert len(rows) == 1
+    assert rows[0]["kind"] == "send_email"
+
+
+@pytest.mark.asyncio
+async def test_transaction_insert_many(client):
+    """Transaction insert_many inserts multiple jobs atomically."""
+    tx = await client.transaction()
+    jobs = await tx.insert_many(
+        [
+            SendEmail(to="bulk1@example.com", subject="One"),
+            SendEmail(to="bulk2@example.com", subject="Two"),
+        ],
+        queue="tx_bulk",
+    )
+    await tx.commit()
+
+    assert len(jobs) == 2
+    tx2 = await client.transaction()
+    row = await tx2.fetch_one(
+        "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1", ["tx_bulk"]
+    )
+    await tx2.commit()
+    assert row["cnt"] == 2
+
+
 # -- Admin tests --
 
 
@@ -246,6 +302,33 @@ async def test_admin_retry(client):
     result = await client.retry(job.id)
     assert result is not None
     assert result.state == awa.JobState.Available
+
+
+@pytest.mark.asyncio
+async def test_admin_retry_failed_and_discard_failed(client):
+    """retry_failed and discard_failed cover the PRD admin surfaces."""
+    failed_a = await client.insert(SendEmail(to="a@example.com", subject="A"), queue="admin_py")
+    failed_b = await client.insert(SendEmail(to="b@example.com", subject="B"), queue="admin_py")
+
+    tx = await client.transaction()
+    await tx.execute(
+        "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1 OR id = $2",
+        [failed_a.id, failed_b.id],
+    )
+    await tx.commit()
+
+    retried = await client.retry_failed(queue="admin_py")
+    assert len(retried) == 2
+
+    tx2 = await client.transaction()
+    await tx2.execute(
+        "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+        [failed_a.id],
+    )
+    await tx2.commit()
+
+    discarded = await client.discard_failed("send_email")
+    assert discarded >= 1
 
 
 @pytest.mark.asyncio
@@ -281,6 +364,16 @@ async def test_admin_queue_stats(client):
     assert stat["available"] == 1
 
 
+@pytest.mark.asyncio
+async def test_admin_list_jobs(client):
+    """List jobs with filters via the Python client."""
+    await client.insert(SendEmail(to="list@example.com", subject="List"), queue="list_py")
+    jobs = await client.list_jobs(queue="list_py", state="available")
+    assert len(jobs) == 1
+    assert jobs[0].queue == "list_py"
+    assert jobs[0].state == awa.JobState.Available
+
+
 # -- Worker registration tests --
 
 
@@ -294,6 +387,15 @@ async def test_worker_registration(client):
 
     # The handler should still be callable
     assert callable(handle_send_email)
+
+
+@pytest.mark.asyncio
+async def test_health_check_without_runtime(client):
+    """Health check is exposed even before workers are started."""
+    health = await client.health_check()
+    assert health.postgres_connected is True
+    assert health.poll_loop_alive is False
+    assert health.heartbeat_alive is False
 
 
 # -- Error handling tests --

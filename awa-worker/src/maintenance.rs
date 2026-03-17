@@ -1,6 +1,8 @@
 use awa_model::JobRow;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -11,6 +13,7 @@ use tracing::{debug, error, info, warn};
 pub struct MaintenanceService {
     pool: PgPool,
     cancel: CancellationToken,
+    leader: Arc<AtomicBool>,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     promote_interval: Duration,
@@ -21,10 +24,11 @@ pub struct MaintenanceService {
 }
 
 impl MaintenanceService {
-    pub fn new(pool: PgPool, cancel: CancellationToken) -> Self {
+    pub fn new(pool: PgPool, leader: Arc<AtomicBool>, cancel: CancellationToken) -> Self {
         Self {
             pool,
             cancel,
+            leader,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_secs(5),
@@ -38,6 +42,7 @@ impl MaintenanceService {
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
+        self.leader.store(false, Ordering::SeqCst);
 
         loop {
             // Try to acquire advisory lock for leader election.
@@ -49,6 +54,7 @@ impl MaintenanceService {
                     tokio::select! {
                         _ = self.cancel.cancelled() => {
                             debug!("Maintenance service shutting down (not leader)");
+                            self.leader.store(false, Ordering::SeqCst);
                             return;
                         }
                         _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
@@ -59,6 +65,7 @@ impl MaintenanceService {
                     tokio::select! {
                         _ = self.cancel.cancelled() => {
                             debug!("Maintenance service shutting down (leader check failed)");
+                            self.leader.store(false, Ordering::SeqCst);
                             return;
                         }
                         _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
@@ -67,6 +74,7 @@ impl MaintenanceService {
             };
 
             debug!("Elected as maintenance leader");
+            self.leader.store(true, Ordering::SeqCst);
 
             // Run maintenance tasks as leader
             let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
@@ -84,6 +92,7 @@ impl MaintenanceService {
                 tokio::select! {
                     _ = self.cancel.cancelled() => {
                         debug!("Maintenance service shutting down");
+                        self.leader.store(false, Ordering::SeqCst);
                         // Release leader lock on the same connection that acquired it.
                         // If this fails, dropping the connection will release the lock anyway.
                         let _ = Self::release_leader(&mut leader_conn).await;

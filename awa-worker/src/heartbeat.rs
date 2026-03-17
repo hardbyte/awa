@@ -1,5 +1,6 @@
 use sqlx::PgPool;
-use std::collections::HashSet;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -9,17 +10,19 @@ use tracing::{debug, warn};
 /// for all in-flight jobs.
 pub struct HeartbeatService {
     pool: PgPool,
-    in_flight: Arc<RwLock<HashSet<i64>>>,
+    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     interval: std::time::Duration,
     batch_size: usize,
+    alive: Arc<AtomicBool>,
     cancel: CancellationToken,
 }
 
 impl HeartbeatService {
     pub fn new(
         pool: PgPool,
-        in_flight: Arc<RwLock<HashSet<i64>>>,
+        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
         interval: std::time::Duration,
+        alive: Arc<AtomicBool>,
         cancel: CancellationToken,
     ) -> Self {
         Self {
@@ -27,12 +30,14 @@ impl HeartbeatService {
             in_flight,
             interval,
             batch_size: 500,
+            alive,
             cancel,
         }
     }
 
     /// Run the heartbeat loop. Returns when cancelled.
     pub async fn run(&self) {
+        self.alive.store(true, Ordering::SeqCst);
         debug!(
             interval_ms = self.interval.as_millis(),
             "Heartbeat service started"
@@ -51,12 +56,14 @@ impl HeartbeatService {
                 }
             }
         }
+
+        self.alive.store(false, Ordering::SeqCst);
     }
 
     async fn heartbeat_once(&self) {
         let job_ids: Vec<i64> = {
             let guard = self.in_flight.read().await;
-            guard.iter().copied().collect()
+            guard.keys().copied().collect()
         };
 
         if job_ids.is_empty() {

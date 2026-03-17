@@ -1,8 +1,8 @@
 use crate::executor::JobExecutor;
 use awa_model::JobRow;
 use sqlx::PgPool;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -35,8 +35,9 @@ pub struct Dispatcher {
     config: QueueConfig,
     pool: PgPool,
     executor: Arc<JobExecutor>,
-    _in_flight: Arc<RwLock<HashSet<i64>>>,
+    _in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     semaphore: Arc<Semaphore>,
+    alive: Arc<AtomicBool>,
     cancel: CancellationToken,
 }
 
@@ -46,7 +47,8 @@ impl Dispatcher {
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
-        in_flight: Arc<RwLock<HashSet<i64>>>,
+        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        alive: Arc<AtomicBool>,
         cancel: CancellationToken,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_workers as usize));
@@ -57,12 +59,14 @@ impl Dispatcher {
             executor,
             _in_flight: in_flight,
             semaphore,
+            alive,
             cancel,
         }
     }
 
     /// Run the poll loop. Returns when cancelled.
     pub async fn run(&self) {
+        self.alive.store(true, Ordering::SeqCst);
         info!(
             queue = %self.queue,
             max_workers = self.config.max_workers,
@@ -78,6 +82,7 @@ impl Dispatcher {
                 error!(error = %err, "Failed to create PG listener, falling back to polling only");
                 // Fall back to poll-only mode
                 self.poll_loop_only().await;
+                self.alive.store(false, Ordering::SeqCst);
                 return;
             }
         };
@@ -85,6 +90,7 @@ impl Dispatcher {
         if let Err(err) = listener.listen(&notify_channel).await {
             warn!(error = %err, channel = %notify_channel, "Failed to LISTEN, falling back to polling");
             self.poll_loop_only().await;
+            self.alive.store(false, Ordering::SeqCst);
             return;
         }
 
@@ -114,6 +120,8 @@ impl Dispatcher {
                 }
             }
         }
+
+        self.alive.store(false, Ordering::SeqCst);
     }
 
     /// Poll-only fallback (no LISTEN/NOTIFY).
