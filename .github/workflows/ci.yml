@@ -1,0 +1,175 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
+jobs:
+  # ─── Rust ───────────────────────────────────────────────
+  rust-lint:
+    name: Rust lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  rust-build:
+    name: Rust build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: cargo build
+        run: cargo build --workspace
+
+  rust-test:
+    name: Rust tests
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Run tests
+        run: cargo test --workspace
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
+  # ─── Python (awa-python) ────────────────────────────────
+  python-build-test:
+    name: Python build + test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: awa-python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "awa-python -> awa-python/target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Create venv and install deps
+        run: |
+          uv venv .venv
+          uv pip install maturin pytest pytest-asyncio
+      - name: Build extension (maturin develop)
+        run: .venv/bin/maturin develop
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Run Python tests
+        run: .venv/bin/pytest tests/ -v
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
+  # ─── Phase 0 spike ──────────────────────────────────────
+  pyo3-spike:
+    name: Phase 0 PyO3 spike
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: spike/pyo3-async
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "spike/pyo3-async -> spike/pyo3-async/target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Create venv and install deps
+        run: |
+          uv venv .venv
+          uv pip install maturin pytest pytest-asyncio
+      - name: Build extension
+        run: .venv/bin/maturin develop
+      - name: Run spike tests
+        run: .venv/bin/pytest test_spike.py -v
+
+  # ─── CLI smoke test ─────────────────────────────────────
+  cli-smoke:
+    name: CLI smoke test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Build CLI
+        run: cargo build -p awa-cli
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Run migrations via CLI
+        run: ./target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test migrate
+      - name: List jobs (empty)
+        run: ./target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test job list
+      - name: Queue stats (empty)
+        run: ./target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test queue stats

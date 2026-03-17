@@ -163,6 +163,38 @@ impl PyTransaction {
         })
     }
 
+    /// Async context manager entry.
+    fn __aenter__(slf: Py<Self>, py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
+        // Return a future that resolves to self
+        pyo3_async_runtimes::tokio::future_into_py(py, async move { Ok(slf) })
+    }
+
+    /// Async context manager exit — commits on success, rolls back on exception.
+    #[pyo3(signature = (exc_type, _exc_val, _exc_tb))]
+    fn __aexit__<'py>(
+        &self,
+        py: Python<'py>,
+        exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let tx = self.tx.clone();
+        let has_exception = exc_type.is_some();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let mut guard = tx.lock().await;
+            if let Some(tx) = guard.take() {
+                if has_exception {
+                    let _ = tx.rollback().await;
+                } else {
+                    tx.commit()
+                        .await
+                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                }
+            }
+            Ok(false) // Don't suppress exceptions
+        })
+    }
+
     /// Roll back the transaction.
     fn rollback<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();

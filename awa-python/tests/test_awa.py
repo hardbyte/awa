@@ -342,3 +342,64 @@ def test_cancel():
 def test_cancel_default():
     c = awa.Cancel()
     assert "cancelled" in c.reason.lower()
+
+
+# -- Transaction context manager --
+
+
+@pytest.mark.asyncio
+async def test_transaction_context_manager_commit(client):
+    """Transaction as async context manager commits on clean exit."""
+    tx = await client.transaction()
+    async with tx:
+        job = await tx.insert(SendEmail(to="ctx@example.com", subject="Context"))
+
+    # Job should be committed
+    tx2 = await client.transaction()
+    row = await tx2.fetch_one(
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job.id]
+    )
+    await tx2.commit()
+    assert row["cnt"] == 1
+
+
+@pytest.mark.asyncio
+async def test_transaction_context_manager_rollback_on_error(client):
+    """Transaction rolls back when exception occurs in context manager."""
+    job_id = None
+    try:
+        tx = await client.transaction()
+        async with tx:
+            job = await tx.insert(SendEmail(to="err@example.com", subject="Error"))
+            job_id = job.id
+            raise ValueError("simulated error")
+    except ValueError:
+        pass
+
+    # Job should NOT exist
+    tx2 = await client.transaction()
+    row = await tx2.fetch_one(
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job_id]
+    )
+    await tx2.commit()
+    assert row["cnt"] == 0
+
+
+# -- Pydantic support --
+
+
+@pytest.mark.asyncio
+async def test_insert_pydantic_model(client):
+    """Insert a pydantic BaseModel if pydantic is available."""
+    pytest.importorskip("pydantic")
+    from pydantic import BaseModel
+
+    class PydanticEmail(BaseModel):
+        to: str
+        subject: str
+        urgent: bool = False
+
+    job = await client.insert(PydanticEmail(to="pydantic@example.com", subject="Pydantic", urgent=True))
+    assert job.kind == "pydantic_email"
+    assert job.args["to"] == "pydantic@example.com"
+    assert job.args["urgent"] is True
