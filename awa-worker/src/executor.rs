@@ -187,13 +187,13 @@ async fn complete_job(
                 r#"
                 UPDATE awa.jobs
                 SET state = 'retryable',
-                    run_at = now() + ($2 || ' seconds')::interval,
+                    run_at = now() + make_interval(secs => $2),
                     finalized_at = now()
                 WHERE id = $1
                 "#,
             )
             .bind(job.id)
-            .bind(seconds.to_string())
+            .bind(seconds)
             .execute(pool)
             .await?;
         }
@@ -212,7 +212,7 @@ async fn complete_job(
                 r#"
                 UPDATE awa.jobs
                 SET state = 'scheduled',
-                    run_at = now() + ($2 || ' seconds')::interval,
+                    run_at = now() + make_interval(secs => $2),
                     attempt = attempt - 1,
                     heartbeat_at = NULL,
                     deadline_at = NULL
@@ -220,7 +220,7 @@ async fn complete_job(
                 "#,
             )
             .bind(job.id)
-            .bind(seconds.to_string())
+            .bind(seconds)
             .execute(pool)
             .await?;
         }

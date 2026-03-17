@@ -167,9 +167,27 @@ pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAn
     }
 }
 
-#[allow(clippy::only_used_in_recursion)]
 /// Convert a Python object to serde_json::Value.
+///
+/// Recurses into lists and dicts with a depth limit to prevent stack overflow
+/// from circular Python references.
 pub fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_json::Value> {
+    py_to_json_inner(py, obj, 0)
+}
+
+const MAX_JSON_DEPTH: usize = 64;
+
+fn py_to_json_inner(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    depth: usize,
+) -> PyResult<serde_json::Value> {
+    if depth > MAX_JSON_DEPTH {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "JSON nesting too deep (max 64 levels)",
+        ));
+    }
+
     if obj.is_none() {
         Ok(serde_json::Value::Null)
     } else if let Ok(b) = obj.extract::<bool>() {
@@ -183,20 +201,20 @@ pub fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_json
     } else if let Ok(list) = obj.cast::<pyo3::types::PyList>() {
         let mut arr = Vec::new();
         for item in list.iter() {
-            arr.push(py_to_json(py, &item)?);
+            arr.push(py_to_json_inner(py, &item, depth + 1)?);
         }
         Ok(serde_json::Value::Array(arr))
     } else if let Ok(dict) = obj.cast::<pyo3::types::PyDict>() {
         let mut map = serde_json::Map::new();
         for (k, v) in dict.iter() {
             let key: String = k.extract()?;
-            map.insert(key, py_to_json(py, &v)?);
+            map.insert(key, py_to_json_inner(py, &v, depth + 1)?);
         }
         Ok(serde_json::Value::Object(map))
     } else {
         // Try to use __dict__ for dataclass-like objects
         if let Ok(dict) = obj.getattr("__dict__") {
-            py_to_json(py, &dict)
+            py_to_json_inner(py, &dict, depth + 1)
         } else {
             Err(pyo3::exceptions::PyTypeError::new_err(format!(
                 "Cannot convert {} to JSON",

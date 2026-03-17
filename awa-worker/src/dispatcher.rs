@@ -140,8 +140,8 @@ impl Dispatcher {
         }
 
         let batch_size = available.min(10) as i32; // Claim in small batches
-        let deadline_str = format!("{} seconds", self.config.deadline_duration.as_secs());
-        let aging_secs = self.config.priority_aging_interval.as_secs() as f64;
+        let deadline_secs = self.config.deadline_duration.as_secs_f64();
+        let aging_secs = self.config.priority_aging_interval.as_secs_f64();
 
         let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
             r#"
@@ -167,7 +167,7 @@ impl Dispatcher {
                 attempt = attempt + 1,
                 attempted_at = now(),
                 heartbeat_at = now(),
-                deadline_at = now() + $3::interval
+                deadline_at = now() + make_interval(secs => $3)
             FROM claimed
             WHERE awa.jobs.id = claimed.id
             RETURNING awa.jobs.*
@@ -175,7 +175,7 @@ impl Dispatcher {
         )
         .bind(&self.queue)
         .bind(batch_size)
-        .bind(&deadline_str)
+        .bind(deadline_secs)
         .bind(aging_secs)
         .fetch_all(&self.pool)
         .await
