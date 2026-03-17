@@ -71,6 +71,7 @@ pub struct WorkerEntry {
 pub struct PyClient {
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
+    cancel: tokio_util::sync::CancellationToken,
 }
 
 #[pymethods]
@@ -91,6 +92,7 @@ impl PyClient {
         Ok(Self {
             pool,
             workers: Arc::new(RwLock::new(HashMap::new())),
+            cancel: tokio_util::sync::CancellationToken::new(),
         })
     }
 
@@ -332,5 +334,35 @@ impl PyClient {
                 Ok(list.unbind())
             })
         })
+    }
+
+    /// Start the worker dispatch loop in the background.
+    ///
+    /// Spawns a background tokio task that polls registered queues, claims jobs,
+    /// and dispatches to handler functions. Returns immediately.
+    ///
+    /// Call `client.shutdown()` to stop the loop.
+    #[pyo3(signature = (queues, *, poll_interval_ms=200))]
+    fn start(&self, _py: Python<'_>, queues: Vec<(String, u32)>, poll_interval_ms: u64) -> PyResult<()> {
+        let pool = self.pool.clone();
+        let workers = self.workers.clone();
+        let cancel = self.cancel.clone();
+        let poll_interval = std::time::Duration::from_millis(poll_interval_ms);
+
+        pyo3_async_runtimes::tokio::get_runtime().spawn(async move {
+            if let Err(err) = crate::worker::run_workers(pool, workers, queues, cancel, poll_interval).await {
+                tracing::error!(error = %err, "Worker dispatch loop failed");
+            }
+        });
+
+        Ok(())
+    }
+
+    /// Gracefully shut down the worker dispatch loop.
+    #[pyo3(signature = (timeout_ms=2000))]
+    fn shutdown(&self, _py: Python<'_>, timeout_ms: u64) -> PyResult<()> {
+        self.cancel.cancel();
+        std::thread::sleep(std::time::Duration::from_millis(timeout_ms.min(5000)));
+        Ok(())
     }
 }

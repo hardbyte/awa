@@ -2,6 +2,7 @@ mod args;
 mod client;
 mod job;
 mod transaction;
+mod worker;
 
 use pyo3::prelude::*;
 
