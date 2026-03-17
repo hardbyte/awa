@@ -180,6 +180,9 @@ class AwaTestClient:
                     deadline_at = now() + interval '5 minutes'
                 FROM claimed
                 WHERE awa.jobs.id = claimed.id
+                -- Cast state to text: awa.job_state is a PG custom enum.
+                -- sqlx's row_to_py_dict can't deserialize custom enums
+                -- without explicit registration, so we cast to text.
                 RETURNING awa.jobs.id, awa.jobs.kind, awa.jobs.queue,
                           awa.jobs.args, awa.jobs.attempt, awa.jobs.max_attempts,
                           awa.jobs.priority, awa.jobs.tags, awa.jobs.state::text AS state

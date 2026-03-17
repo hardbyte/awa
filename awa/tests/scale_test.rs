@@ -32,6 +32,21 @@ async fn setup() -> sqlx::PgPool {
     pool
 }
 
+/// Clean only jobs and queue_meta for a specific queue.
+/// Call this at the start of each test to remove leftovers from previous runs.
+async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
+    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue jobs");
+    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue meta");
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct ScaleJob {
     pub index: i64,
@@ -43,6 +58,7 @@ struct ScaleJob {
 async fn test_bulk_insert_1000_jobs() {
     let pool = setup().await;
     let queue = "scale_bulk_1000";
+    clean_queue(&pool, queue).await;
 
     let params: Vec<_> = (0..1000)
         .map(|i| {
@@ -83,6 +99,7 @@ async fn test_bulk_insert_1000_jobs() {
 async fn test_concurrent_claim_no_double_dispatch() {
     let pool = setup().await;
     let queue = "scale_contention";
+    clean_queue(&pool, queue).await;
 
     // Insert 100 jobs
     let params: Vec<_> = (0..100)
@@ -163,6 +180,7 @@ async fn test_concurrent_claim_no_double_dispatch() {
 async fn test_priority_aging_reorders_jobs() {
     let pool = setup().await;
     let queue = "scale_aging";
+    clean_queue(&pool, queue).await;
 
     // Insert a low-priority job with old run_at (should age up)
     let old_time = chrono::Utc::now() - chrono::Duration::seconds(300);
@@ -231,6 +249,7 @@ async fn test_priority_aging_reorders_jobs() {
 async fn test_stale_heartbeat_rescue() {
     let pool = setup().await;
     let queue = "scale_stale_hb";
+    clean_queue(&pool, queue).await;
 
     let job = insert_with(
         &pool,
@@ -286,6 +305,7 @@ async fn test_stale_heartbeat_rescue() {
 async fn test_deadline_exceeded_rescue() {
     let pool = setup().await;
     let queue = "scale_deadline";
+    clean_queue(&pool, queue).await;
 
     let job = insert_with(
         &pool,
@@ -337,6 +357,8 @@ async fn test_deadline_exceeded_rescue() {
 #[tokio::test]
 async fn test_queue_isolation_under_load() {
     let pool = setup().await;
+    clean_queue(&pool, "scale_iso_a").await;
+    clean_queue(&pool, "scale_iso_b").await;
 
     // Insert 50 jobs in queue_a, 50 in queue_b (unique names)
     for i in 0..50 {
@@ -399,10 +421,14 @@ async fn test_queue_isolation_under_load() {
 #[tokio::test]
 async fn test_unique_constraint_prevents_duplicates() {
     let pool = setup().await;
+    clean_queue(&pool, "scale_unique").await;
 
     let opts = InsertOpts {
         queue: "scale_unique".into(),
-        unique: Some(UniqueOpts::default()),
+        unique: Some(UniqueOpts {
+            by_queue: true,
+            ..UniqueOpts::default()
+        }),
         ..Default::default()
     };
 
@@ -425,6 +451,7 @@ async fn test_unique_constraint_prevents_duplicates() {
 async fn test_concurrent_insert_and_claim() {
     let pool = setup().await;
     let queue = "scale_concurrent";
+    clean_queue(&pool, queue).await;
 
     let inserted = Arc::new(AtomicU64::new(0));
     let claimed = Arc::new(AtomicU64::new(0));
@@ -516,6 +543,7 @@ async fn test_concurrent_insert_and_claim() {
 async fn test_scheduled_jobs_become_available() {
     let pool = setup().await;
     let queue = "scale_scheduled";
+    clean_queue(&pool, queue).await;
 
     // Insert a job scheduled in the past (should be promoted)
     let past = chrono::Utc::now() - chrono::Duration::seconds(10);

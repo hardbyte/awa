@@ -124,19 +124,32 @@ impl From<JobRow> for PyJob {
 pub fn json_to_py(py: Python<'_>, value: &serde_json::Value) -> PyResult<Py<PyAny>> {
     match value {
         serde_json::Value::Null => Ok(py.None()),
-        serde_json::Value::Bool(b) => {
-            Ok(b.into_pyobject(py).unwrap().to_owned().into_any().unbind())
-        }
+        serde_json::Value::Bool(b) => Ok(b
+            .into_pyobject(py)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .to_owned()
+            .into_any()
+            .unbind()),
         serde_json::Value::Number(n) => {
             if let Some(i) = n.as_i64() {
-                Ok(i.into_pyobject(py).unwrap().into_any().unbind())
+                Ok(i.into_pyobject(py)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                    .into_any()
+                    .unbind())
             } else if let Some(f) = n.as_f64() {
-                Ok(f.into_pyobject(py).unwrap().into_any().unbind())
+                Ok(f.into_pyobject(py)
+                    .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+                    .into_any()
+                    .unbind())
             } else {
                 Ok(py.None())
             }
         }
-        serde_json::Value::String(s) => Ok(s.into_pyobject(py).unwrap().into_any().unbind()),
+        serde_json::Value::String(s) => Ok(s
+            .into_pyobject(py)
+            .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?
+            .into_any()
+            .unbind()),
         serde_json::Value::Array(arr) => {
             let list = pyo3::types::PyList::empty(py);
             for item in arr {

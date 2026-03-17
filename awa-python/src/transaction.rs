@@ -325,7 +325,9 @@ fn row_to_py_dict(row: &sqlx::postgres::PgRow) -> PyResult<Py<PyAny>> {
                     }
                 }
                 _ => {
-                    // Fallback: try string, then None
+                    // Fallback for custom enums and other types:
+                    // Try string extraction (works for PG enums since they
+                    // serialize as text over the wire), then None.
                     if let Ok(val) = row.try_get::<String, _>(name) {
                         dict.set_item(name, val)?;
                     } else {
