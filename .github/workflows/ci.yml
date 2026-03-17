@@ -109,7 +109,11 @@ jobs:
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
       - name: Run Python tests
-        run: .venv/bin/pytest tests/ -v
+        run: .venv/bin/pytest tests/ -v -m "not chaos"
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+      - name: Run Python chaos recovery test
+        run: .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 

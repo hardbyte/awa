@@ -87,14 +87,19 @@ async def test_worker_dispatch_retries_on_error(client):
     await asyncio.sleep(0.5)
     await client.shutdown()
 
-    # Job should be retryable (not completed)
-    tx = await client.transaction()
-    row = await tx.fetch_one(
-        "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1 AND state::text = 'retryable'",
-        queue,
-    )
-    await tx.commit()
-    assert row["cnt"] >= 1, "Failed job should be retryable"
+    deadline = asyncio.get_running_loop().time() + 2.0
+    while True:
+        tx = await client.transaction()
+        row = await tx.fetch_one(
+            "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1 AND state::text = 'retryable'",
+            queue,
+        )
+        await tx.commit()
+        if row["cnt"] >= 1:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            raise AssertionError("Failed job should be retryable")
+        await asyncio.sleep(0.05)
 
 
 @pytest.mark.asyncio

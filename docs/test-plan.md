@@ -12,6 +12,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | # | Test | Category | Status |
 |---|---|---|---|
 | T1 | No duplicate processing (100k jobs) | Correctness | Implemented |
+| T4 | `kill -9` crash recovery | Crash recovery | Implemented |
 | T5 | Deadline rescue (hung job) | Crash recovery | Implemented |
 | T6 | Transactional atomicity (Rust) | Correctness | Implemented |
 | T7 | Transactional atomicity (Python) | Correctness | Implemented |
@@ -39,6 +40,9 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --work
 
 # Python tests
 cd awa-python && .venv/bin/pytest tests/ -v
+
+# Chaos recovery only (same test CI runs as a dedicated step)
+cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
 
 # Repeat 20 times to detect flakes
 for i in $(seq 1 20); do echo "=== Run $i ===" && cargo test --workspace 2>&1 | tail -1; done
