@@ -79,7 +79,7 @@ await client.insert(SendEmail(to="alice@example.com", subject="Welcome"))
 
 # Transactional insert — atomic with your business logic
 async with await client.transaction() as tx:
-    await tx.execute("INSERT INTO orders (id, total) VALUES ($1, $2)", [order_id, total])
+    await tx.execute("INSERT INTO orders (id, total) VALUES ($1, $2)", order_id, total)
     await tx.insert(SendEmail(to="alice@example.com", subject="Order confirmed"))
     # Commits on success, rolls back on exception
 

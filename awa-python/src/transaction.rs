@@ -1,9 +1,11 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
+use crate::errors::{map_awa_error, map_sqlx_error, state_error, validation_error};
 use crate::job::{json_to_py, py_to_json, PyJob};
 use awa_model::{InsertOpts, JobRow, JobState};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
+use pyo3::types::PyTuple;
 use sqlx::{Column, PgExecutor, Postgres, Row, Transaction};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -24,14 +26,15 @@ impl PyTransaction {
 
 #[pymethods]
 impl PyTransaction {
+    #[pyo3(signature = (query, *args))]
     fn execute<'py>(
         &self,
         py: Python<'py>,
         query: String,
-        args: Vec<Py<PyAny>>,
+        args: &Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
-        let json_args = to_json_args(py, &args)?;
+        let json_args = to_json_args(py, args)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
@@ -39,19 +42,20 @@ impl PyTransaction {
             let result = bind_json_args(sqlx::query(&query), &json_args)
                 .execute(&mut **tx_ref)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             Ok(result.rows_affected() as i64)
         })
     }
 
+    #[pyo3(signature = (query, *args))]
     fn fetch_one<'py>(
         &self,
         py: Python<'py>,
         query: String,
-        args: Vec<Py<PyAny>>,
+        args: &Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
-        let json_args = to_json_args(py, &args)?;
+        let json_args = to_json_args(py, args)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
@@ -59,19 +63,20 @@ impl PyTransaction {
             let row = bind_json_args(sqlx::query(&query), &json_args)
                 .fetch_one(&mut **tx_ref)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             row_to_py_dict(&row)
         })
     }
 
+    #[pyo3(signature = (query, *args))]
     fn fetch_optional<'py>(
         &self,
         py: Python<'py>,
         query: String,
-        args: Vec<Py<PyAny>>,
+        args: &Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
-        let json_args = to_json_args(py, &args)?;
+        let json_args = to_json_args(py, args)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
@@ -79,7 +84,7 @@ impl PyTransaction {
             let row = bind_json_args(sqlx::query(&query), &json_args)
                 .fetch_optional(&mut **tx_ref)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             match row {
                 Some(row) => row_to_py_dict(&row),
                 None => Ok(Python::attach(|py| py.None())),
@@ -87,14 +92,15 @@ impl PyTransaction {
         })
     }
 
+    #[pyo3(signature = (query, *args))]
     fn fetch_all<'py>(
         &self,
         py: Python<'py>,
         query: String,
-        args: Vec<Py<PyAny>>,
+        args: &Bound<'_, PyTuple>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
-        let json_args = to_json_args(py, &args)?;
+        let json_args = to_json_args(py, args)?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
@@ -102,7 +108,7 @@ impl PyTransaction {
             let rows = bind_json_args(sqlx::query(&query), &json_args)
                 .fetch_all(&mut **tx_ref)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_sqlx_error)?;
             Python::attach(|py| {
                 let list = pyo3::types::PyList::empty(py);
                 for row in &rows {
@@ -150,7 +156,7 @@ impl PyTransaction {
                 },
             )
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
         })
     }
@@ -204,7 +210,7 @@ impl PyTransaction {
                     },
                 )
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
                 inserted.push(PyJob::from(row));
             }
             Ok(inserted)
@@ -215,14 +221,10 @@ impl PyTransaction {
         let tx = self.tx.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
-            let tx = guard.take().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "Transaction already committed or rolled back",
-                )
-            })?;
-            tx.commit()
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let tx = guard
+                .take()
+                .ok_or_else(|| state_error("Transaction already committed or rolled back"))?;
+            tx.commit().await.map_err(map_sqlx_error)?;
             Ok(())
         })
     }
@@ -247,9 +249,7 @@ impl PyTransaction {
                 if has_exception {
                     let _ = tx.rollback().await;
                 } else {
-                    tx.commit()
-                        .await
-                        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                    tx.commit().await.map_err(map_sqlx_error)?;
                 }
             }
             Ok(false)
@@ -260,14 +260,10 @@ impl PyTransaction {
         let tx = self.tx.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = tx.lock().await;
-            let tx = guard.take().ok_or_else(|| {
-                pyo3::exceptions::PyRuntimeError::new_err(
-                    "Transaction already committed or rolled back",
-                )
-            })?;
-            tx.rollback()
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let tx = guard
+                .take()
+                .ok_or_else(|| state_error("Transaction already committed or rolled back"))?;
+            tx.rollback().await.map_err(map_sqlx_error)?;
             Ok(())
         })
     }
@@ -313,14 +309,14 @@ fn prepare_insert(
 fn tx_ref<'a>(
     guard: &'a mut Option<Transaction<'static, Postgres>>,
 ) -> PyResult<&'a mut Transaction<'static, Postgres>> {
-    guard.as_mut().ok_or_else(|| {
-        pyo3::exceptions::PyRuntimeError::new_err("Transaction already committed or rolled back")
-    })
+    guard
+        .as_mut()
+        .ok_or_else(|| state_error("Transaction already committed or rolled back"))
 }
 
-fn to_json_args(py: Python<'_>, args: &[Py<PyAny>]) -> PyResult<Vec<serde_json::Value>> {
+fn to_json_args(py: Python<'_>, args: &Bound<'_, PyTuple>) -> PyResult<Vec<serde_json::Value>> {
     args.iter()
-        .map(|arg| py_to_json(py, arg.bind(py)))
+        .map(|arg| py_to_json(py, &arg))
         .collect::<PyResult<Vec<_>>>()
 }
 
@@ -329,7 +325,11 @@ pub fn parse_run_at(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<DateT
         return parse_datetime_str(&s);
     }
 
-    let iso = value.call_method0("isoformat")?.extract::<String>()?;
+    let iso = value
+        .call_method0("isoformat")
+        .map_err(|_| validation_error("run_at must be a datetime or RFC3339 string"))?
+        .extract::<String>()
+        .map_err(|_| validation_error("run_at must be a datetime or RFC3339 string"))?;
     parse_datetime_str(&iso)
 }
 
@@ -339,7 +339,7 @@ fn parse_datetime_str(value: &str) -> PyResult<DateTime<Utc>> {
     }
     let naive = NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
         .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
-        .map_err(|err| pyo3::exceptions::PyValueError::new_err(err.to_string()))?;
+        .map_err(|err| validation_error(err.to_string()))?;
     Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 

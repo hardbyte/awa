@@ -1,4 +1,5 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
+use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error};
 use crate::job::{py_to_json, PyJob};
 use crate::transaction::{insert_raw_job, parse_run_at, PyTransaction};
 use crate::worker::PythonWorker;
@@ -142,7 +143,7 @@ impl PyClient {
                     .connect(&database_url)
                     .await
             })
-            .map_err(|e| pyo3::exceptions::PyConnectionError::new_err(e.to_string()))?;
+            .map_err(map_connect_error)?;
 
         Ok(Self {
             pool,
@@ -209,7 +210,7 @@ impl PyClient {
                 },
             )
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(map_awa_error)?;
 
             Ok(PyJob::from(row))
         })
@@ -220,7 +221,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             awa_model::migrations::run(&pool)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(())
         })
     }
@@ -228,10 +229,7 @@ impl PyClient {
     fn transaction<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let tx = pool
-                .begin()
-                .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            let tx = pool.begin().await.map_err(map_sqlx_error)?;
             Ok(PyTransaction::new(tx))
         })
     }
@@ -291,7 +289,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let row = awa_model::admin::retry(&pool, job_id)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(row.map(PyJob::from))
         })
     }
@@ -301,7 +299,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let row = awa_model::admin::cancel(&pool, job_id)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(row.map(PyJob::from))
         })
     }
@@ -328,7 +326,7 @@ impl PyClient {
                 (None, Some(queue)) => awa_model::admin::retry_failed_by_queue(&pool, &queue).await,
                 _ => unreachable!(),
             }
-            .map_err(|err| pyo3::exceptions::PyRuntimeError::new_err(err.to_string()))?;
+            .map_err(map_awa_error)?;
 
             Python::attach(|py| {
                 let list = pyo3::types::PyList::empty(py);
@@ -345,7 +343,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let count = awa_model::admin::discard_failed(&pool, &kind)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(count)
         })
     }
@@ -361,7 +359,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             awa_model::admin::pause_queue(&pool, &queue, paused_by.as_deref())
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(())
         })
     }
@@ -371,7 +369,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             awa_model::admin::resume_queue(&pool, &queue)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(())
         })
     }
@@ -381,7 +379,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let count = awa_model::admin::drain_queue(&pool, &queue)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Ok(count)
         })
     }
@@ -391,7 +389,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let stats = awa_model::admin::queue_stats(&pool)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Python::attach(|py| {
                 let list = pyo3::types::PyList::empty(py);
                 for stat in &stats {
@@ -429,7 +427,7 @@ impl PyClient {
             };
             let jobs = awa_model::admin::list_jobs(&pool, &filter)
                 .await
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+                .map_err(map_awa_error)?;
             Python::attach(|py| {
                 let list = pyo3::types::PyList::empty(py);
                 for job in jobs {
@@ -472,9 +470,7 @@ impl PyClient {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
             if guard.is_some() {
-                return Err(pyo3::exceptions::PyRuntimeError::new_err(
-                    "worker runtime is already running",
-                ));
+                return Err(state_error("worker runtime is already running"));
             }
         }
 
@@ -487,7 +483,7 @@ impl PyClient {
                 .collect::<Vec<_>>()
         });
         if entries.is_empty() {
-            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+            return Err(state_error(
                 "register at least one worker before starting the runtime",
             ));
         }
@@ -508,14 +504,10 @@ impl PyClient {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
         }
 
-        let runtime = Arc::new(
-            builder
-                .build()
-                .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?,
-        );
+        let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
         pyo3_async_runtimes::tokio::get_runtime()
             .block_on(runtime.start())
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(map_awa_error)?;
         *self.runtime.lock().expect("runtime mutex poisoned") = Some(runtime);
         Ok(())
     }

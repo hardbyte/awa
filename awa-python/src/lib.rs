@@ -1,5 +1,6 @@
 mod args;
 mod client;
+mod errors;
 mod job;
 mod transaction;
 mod worker;
@@ -12,6 +13,7 @@ pyo3::create_exception!(_awa, UniqueConflict, AwaError);
 pyo3::create_exception!(_awa, SchemaNotMigrated, AwaError);
 pyo3::create_exception!(_awa, UnknownJobKind, AwaError);
 pyo3::create_exception!(_awa, SerializationError, AwaError);
+pyo3::create_exception!(_awa, ValidationError, AwaError);
 pyo3::create_exception!(_awa, TerminalError, AwaError);
 pyo3::create_exception!(_awa, DatabaseError, AwaError);
 
@@ -29,11 +31,11 @@ fn migrate<'py>(py: Python<'py>, database_url: String) -> PyResult<Bound<'py, Py
             .max_connections(2)
             .connect(&database_url)
             .await
-            .map_err(|e| pyo3::exceptions::PyConnectionError::new_err(e.to_string()))?;
+            .map_err(errors::map_connect_error)?;
 
         awa_model::migrations::run(&pool)
             .await
-            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+            .map_err(errors::map_awa_error)?;
 
         Ok(())
     })
@@ -75,6 +77,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
         "SerializationError",
         m.py().get_type::<SerializationError>(),
     )?;
+    m.add("ValidationError", m.py().get_type::<ValidationError>())?;
     m.add("TerminalError", m.py().get_type::<TerminalError>())?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
 

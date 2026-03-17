@@ -18,7 +18,7 @@ async def client():
     c = awa.Client(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'dispatch_%'", [])
+    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'dispatch_%'")
     await tx.commit()
     return c
 
@@ -63,7 +63,7 @@ async def test_worker_dispatch_completes_jobs(client):
     tx = await client.transaction()
     row = await tx.fetch_one(
         "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1 AND state::text = 'completed'",
-        [queue],
+        queue,
     )
     await tx.commit()
     assert row["cnt"] == 5, f"Expected 5 completed, got {row['cnt']}"
@@ -91,7 +91,7 @@ async def test_worker_dispatch_retries_on_error(client):
     tx = await client.transaction()
     row = await tx.fetch_one(
         "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1 AND state::text = 'retryable'",
-        [queue],
+        queue,
     )
     await tx.commit()
     assert row["cnt"] >= 1, "Failed job should be retryable"
@@ -118,7 +118,7 @@ async def test_worker_dispatch_handles_cancel(client):
     tx = await client.transaction()
     row = await tx.fetch_one(
         "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1 AND state::text = 'cancelled'",
-        [queue],
+        queue,
     )
     await tx.commit()
     assert row["cnt"] == 1
@@ -142,7 +142,7 @@ async def test_worker_dispatch_shutdown_is_clean(client):
 async def test_worker_dispatch_requires_registered_workers(client):
     """start fails fast when no Python handlers are registered."""
     with pytest.raises(
-        RuntimeError, match="register at least one worker before starting the runtime"
+        awa.AwaError, match="register at least one worker before starting the runtime"
     ):
         client.start([("dispatch_missing_worker", 1)])
 

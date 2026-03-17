@@ -26,7 +26,8 @@ Option 2: Narrow raw SQL surface (`AwaTransaction`).
 async with await client.transaction() as tx:
     await tx.execute(
         "INSERT INTO orders (id, total) VALUES ($1, $2)",
-        [order_id, total]
+        order_id,
+        total,
     )
     await tx.insert(SendConfirmationEmail(order_id=order_id))
     # Commits on clean exit, rolls back on exception

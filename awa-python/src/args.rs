@@ -1,6 +1,7 @@
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
+use crate::errors::validation_error;
 use crate::job::py_to_json;
 
 /// Derive the kind string from a Python class name using the same algorithm as Rust.
@@ -55,7 +56,7 @@ pub fn serialize_args(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_
         return py_to_json(py, dict.as_any());
     }
 
-    Err(pyo3::exceptions::PyTypeError::new_err(
+    Err(validation_error(
         "Job args must be a dataclass, pydantic BaseModel, or dict",
     ))
 }

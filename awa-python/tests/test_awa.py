@@ -24,8 +24,8 @@ async def client():
     # Clean up jobs from previous tests
     # We use a raw transaction for this
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs", [])
-    await tx.execute("DELETE FROM awa.queue_meta", [])
+    await tx.execute("DELETE FROM awa.jobs")
+    await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
     return c
 
@@ -195,15 +195,13 @@ async def test_transaction_rollback(client):
 
     # Job should not exist after rollback - verify via a new transaction
     tx2 = await client.transaction()
-    result = await tx2.execute(
-        "SELECT count(*) FROM awa.jobs WHERE id = $1", [job_id]
-    )
+    result = await tx2.execute("SELECT count(*) FROM awa.jobs WHERE id = $1", job_id)
     await tx2.commit()
     # execute returns affected rows for non-SELECT, but for SELECT we'd need fetch_one
     # Let's use fetch_one instead
     tx3 = await client.transaction()
     row = await tx3.fetch_one(
-        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job_id]
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job_id
     )
     await tx3.commit()
     assert row["cnt"] == 0
@@ -221,7 +219,7 @@ async def test_transaction_execute_and_fetch(client):
 
     # Fetch it back with raw SQL
     row = await tx.fetch_one(
-        "SELECT id, kind, queue FROM awa.jobs WHERE id = $1", [job.id]
+        "SELECT id, kind, queue FROM awa.jobs WHERE id = $1", job.id
     )
     assert row["id"] == job.id
     assert row["kind"] == "process_payment"
@@ -236,13 +234,13 @@ async def test_transaction_fetch_optional_and_fetch_all(client):
     tx = await client.transaction()
     await tx.insert(SendEmail(to="opt@example.com", subject="Optional"), queue="tx_fetch")
     present = await tx.fetch_optional(
-        "SELECT kind FROM awa.jobs WHERE queue = $1", ["tx_fetch"]
+        "SELECT kind FROM awa.jobs WHERE queue = $1", "tx_fetch"
     )
     missing = await tx.fetch_optional(
-        "SELECT kind FROM awa.jobs WHERE queue = $1", ["missing_tx_fetch"]
+        "SELECT kind FROM awa.jobs WHERE queue = $1", "missing_tx_fetch"
     )
     rows = await tx.fetch_all(
-        "SELECT kind FROM awa.jobs WHERE queue = $1", ["tx_fetch"]
+        "SELECT kind FROM awa.jobs WHERE queue = $1", "tx_fetch"
     )
     await tx.commit()
 
@@ -268,7 +266,7 @@ async def test_transaction_insert_many(client):
     assert len(jobs) == 2
     tx2 = await client.transaction()
     row = await tx2.fetch_one(
-        "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1", ["tx_bulk"]
+        "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1", "tx_bulk"
     )
     await tx2.commit()
     assert row["cnt"] == 2
@@ -295,7 +293,7 @@ async def test_admin_retry(client):
     tx = await client.transaction()
     await tx.execute(
         "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
-        [job.id],
+        job.id,
     )
     await tx.commit()
 
@@ -313,7 +311,8 @@ async def test_admin_retry_failed_and_discard_failed(client):
     tx = await client.transaction()
     await tx.execute(
         "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1 OR id = $2",
-        [failed_a.id, failed_b.id],
+        failed_a.id,
+        failed_b.id,
     )
     await tx.commit()
 
@@ -323,7 +322,7 @@ async def test_admin_retry_failed_and_discard_failed(client):
     tx2 = await client.transaction()
     await tx2.execute(
         "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
-        [failed_a.id],
+        failed_a.id,
     )
     await tx2.commit()
 
@@ -404,11 +403,24 @@ async def test_health_check_without_runtime(client):
 @pytest.mark.asyncio
 async def test_insert_dict_without_kind_fails(client):
     """Inserting a dict without kind should fail."""
-    # Dicts don't have a class name to derive kind from - but "dict" → "dict"
-    # which is valid SQL-wise, just not meaningful. This test verifies
-    # the kind derivation doesn't crash.
-    job = await client.insert({"data": "test"}, kind="explicit_kind")
-    assert job.kind == "explicit_kind"
+    with pytest.raises(awa.ValidationError):
+        await client.insert(object(), kind="explicit_kind")
+
+
+@pytest.mark.asyncio
+async def test_insert_invalid_run_at_raises_validation_error(client):
+    """Invalid run_at values raise ValidationError."""
+    with pytest.raises(awa.ValidationError):
+        await client.insert(
+            SendEmail(to="bad-date@example.com", subject="Bad"),
+            run_at="not-a-date",
+        )
+
+
+def test_client_connection_errors_use_database_error():
+    """Connection failures surface as awa.DatabaseError."""
+    with pytest.raises(awa.DatabaseError):
+        awa.Client("postgres://postgres:test@localhost:1/awa_test")
 
 
 # -- Job repr --
@@ -459,7 +471,7 @@ async def test_transaction_context_manager_commit(client):
     # Job should be committed
     tx2 = await client.transaction()
     row = await tx2.fetch_one(
-        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job.id]
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job.id
     )
     await tx2.commit()
     assert row["cnt"] == 1
@@ -481,7 +493,7 @@ async def test_transaction_context_manager_rollback_on_error(client):
     # Job should NOT exist
     tx2 = await client.transaction()
     row = await tx2.fetch_one(
-        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job_id]
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job_id
     )
     await tx2.commit()
     assert row["cnt"] == 0

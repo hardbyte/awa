@@ -24,6 +24,7 @@ from awa._awa import (
     SchemaNotMigrated,
     UnknownJobKind,
     SerializationError,
+    ValidationError,
     TerminalError,
     DatabaseError,
 )
@@ -46,6 +47,7 @@ __all__ = [
     "SchemaNotMigrated",
     "UnknownJobKind",
     "SerializationError",
+    "ValidationError",
     "TerminalError",
     "DatabaseError",
 ]
