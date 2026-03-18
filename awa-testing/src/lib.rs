@@ -50,13 +50,26 @@ impl TestClient {
     }
 
     /// Claim and execute a single job of type T using the given worker.
+    ///
+    /// This overload does NOT filter by queue, so it may pick up jobs from any
+    /// queue. Prefer `work_one_in_queue` for test isolation.
     pub async fn work_one<W: Worker>(&self, worker: &W) -> Result<WorkResult, AwaError> {
+        self.work_one_in_queue(worker, None).await
+    }
+
+    /// Claim and execute a single job, optionally filtered by queue.
+    pub async fn work_one_in_queue<W: Worker>(
+        &self,
+        worker: &W,
+        queue: Option<&str>,
+    ) -> Result<WorkResult, AwaError> {
         // Claim one job
         let jobs: Vec<JobRow> = sqlx::query_as::<_, JobRow>(
             r#"
             WITH claimed AS (
                 SELECT id FROM awa.jobs
                 WHERE state = 'available' AND kind = $1
+                  AND ($2::text IS NULL OR queue = $2)
                 ORDER BY run_at ASC, id ASC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -73,6 +86,7 @@ impl TestClient {
             "#,
         )
         .bind(worker.kind())
+        .bind(queue)
         .fetch_all(&self.pool)
         .await?;
 

@@ -1,0 +1,12 @@
+# Runtime Dockerfile — uses pre-built binaries from CI.
+# Multi-arch: the correct binary is selected via TARGETARCH.
+
+FROM alpine:3.21 AS selector
+ARG TARGETARCH
+COPY dist/ /tmp/dist/
+RUN cp /tmp/dist/awa-${TARGETARCH} /tmp/awa && chmod +x /tmp/awa
+
+FROM cgr.dev/chainguard/static:latest
+COPY --from=selector /tmp/awa /usr/local/bin/awa
+USER 65534
+ENTRYPOINT ["awa"]

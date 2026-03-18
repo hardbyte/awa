@@ -2,5 +2,11 @@
 /spike/**/target
 /spike/**/.venv
 /spike/**/__pycache__
+/awa-python/target
+/awa-python/.venv
+/awa-python/__pycache__
 *.pyc
+*.so
+*.pyd
+*.dll
 .env

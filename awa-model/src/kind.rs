@@ -1,5 +1,9 @@
 /// Convert CamelCase to snake_case for kind derivation.
 ///
+/// NOTE: This is intentionally duplicated from `awa-macros` because proc-macro
+/// crates cannot be used as library dependencies. Both copies are validated by
+/// the same golden test suite (PRD §9.2) to ensure they stay in sync.
+///
 /// Algorithm (from PRD §9.2):
 /// 1. Insert `_` before each uppercase letter following a lowercase letter or digit.
 /// 2. Insert `_` before an uppercase letter followed by a lowercase letter, if preceded by uppercase.

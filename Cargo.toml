@@ -8,6 +8,7 @@ members = [
     "awa-testing",
     "awa-cli",
 ]
+exclude = ["awa-python", "spike"]
 
 [workspace.package]
 version = "0.1.0"
@@ -41,9 +42,11 @@ blake3 = "1"
 # Time
 chrono = { version = "0.4", features = ["serde"] }
 
-# Logging
+# Logging / Observability
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+opentelemetry = { version = "0.29", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
@@ -52,3 +55,8 @@ clap = { version = "4", features = ["derive", "env"] }
 syn = { version = "2", features = ["full"] }
 quote = "1"
 proc-macro2 = "1"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
+codegen-units = 1
