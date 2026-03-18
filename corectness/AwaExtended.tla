@@ -1,11 +1,10 @@
 ---- MODULE AwaExtended ----
 EXTENDS FiniteSets, Sequences, Integers
 
+Instances == {"i1", "i2"}
 Jobs == {"j1", "j2", "j3"}
-Workers == {"w1", "w2"}
 Queues == {"q1", "q2"}
 QueueOf == [j \in Jobs |-> IF j = "j3" THEN "q2" ELSE "q1"]
-WorkerQueue == [w \in Workers |-> IF w = "w2" THEN "q2" ELSE "q1"]
 QueueSeq == <<"q1", "q2">>
 MinWorkers == [q \in Queues |-> 1]
 Weight == [q \in Queues |-> IF q = "q1" THEN 3 ELSE 1]
@@ -14,21 +13,21 @@ BatchMax == 2
 RateMax == 1
 MaxAttempts == 2
 
-JobStates == {"available", "running", "retryable", "completed", "failed", "cancelled"}
+JobStates == {"available", "running", "retryable", "completed"}
 FinalStates == {"retryable", "completed"}
 PermitKinds == {"none", "local", "overflow"}
-NoWorker == "no_worker"
+ShutdownPhases == {"running", "stop_claim", "draining", "stopped"}
+NoInstance == "no_instance"
 
 VARIABLES
     jobState,
     attempt,
     lease,
     dbOwner,
-    taskWorker,
-    taskLease,
     permitHolder,
     permitKind,
     inFlight,
+    taskLease,
     cancelRequested,
     heartbeatFresh,
     deadlineExpired,
@@ -36,13 +35,14 @@ VARIABLES
     shutdownPhase,
     dispatchersAlive,
     heartbeatAlive,
-    maintenanceAlive
+    maintenanceAlive,
+    leader
 
 vars ==
-    <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-      permitHolder, permitKind, inFlight, cancelRequested,
-      heartbeatFresh, deadlineExpired, rateBudget,
-      shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+    <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+      inFlight, taskLease, cancelRequested, heartbeatFresh, deadlineExpired,
+      rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
+      maintenanceAlive, leader>>
 
 RECURSIVE SumSeq(_)
 SumSeq(seq) ==
@@ -55,455 +55,584 @@ JobsInQueue(q) == {j \in Jobs : QueueOf[j] = q}
 UnreservedAvailableInQueue(q) ==
     \E j \in JobsInQueue(q) :
         /\ jobState[j] = "available"
-        /\ permitHolder[j] = NoWorker
+        /\ permitHolder[j] = NoInstance
 
-HeldJobs(q, kind) ==
-    {j \in JobsInQueue(q) : permitHolder[j] \in Workers /\ permitKind[j] = kind}
+HeldJobs(i, q, kind) ==
+    {j \in JobsInQueue(q) : permitHolder[j] = i /\ permitKind[j] = kind}
 
-HeldByWorker(w) ==
-    Cardinality({j \in Jobs : permitHolder[j] = w})
+HeldByInstance(i) ==
+    Cardinality({j \in Jobs : permitHolder[j] = i})
 
-LocalHeld(q) ==
-    Cardinality(HeldJobs(q, "local"))
+LocalHeld(i, q) ==
+    Cardinality(HeldJobs(i, q, "local"))
 
-OverflowHeld(q) ==
-    Cardinality(HeldJobs(q, "overflow"))
+OverflowHeld(i, q) ==
+    Cardinality(HeldJobs(i, q, "overflow"))
 
-TotalHeldPermits ==
-    Cardinality({j \in Jobs : permitHolder[j] \in Workers})
+TotalOverflowHeld(i) ==
+    Cardinality({j \in Jobs : permitHolder[j] = i /\ permitKind[j] = "overflow"})
 
-TotalOverflowHeld ==
-    Cardinality({j \in Jobs : permitHolder[j] \in Workers /\ permitKind[j] = "overflow"})
+InFlightJobs(i) ==
+    {j \in Jobs : inFlight[i][j]}
 
-InFlightJobs ==
-    {j \in Jobs : inFlight[j]}
+TrackedRunningJobs(i) ==
+    {j \in Jobs :
+        /\ jobState[j] = "running"
+        /\ (permitHolder[j] = i \/ dbOwner[j] = i \/ inFlight[i][j])}
 
-RunningJobs ==
-    {j \in Jobs : jobState[j] = "running"}
-
-NeedsOverflow(q) ==
-    /\ dispatchersAlive
-    /\ rateBudget[q] > 0
+NeedsOverflow(i, q) ==
+    /\ dispatchersAlive[i]
+    /\ HeldByInstance(i) < BatchMax
+    /\ rateBudget[i][q] > 0
     /\ UnreservedAvailableInQueue(q)
-    /\ LocalHeld(q) >= MinWorkers[q]
+    /\ LocalHeld(i, q) >= MinWorkers[q]
 
-Contending(q) ==
-    NeedsOverflow(q) \/ OverflowHeld(q) > 0
+Contending(i, q) ==
+    NeedsOverflow(i, q) \/ OverflowHeld(i, q) > 0
 
-ContendingWeight ==
-    SumSeq([i \in 1..Len(QueueSeq) |->
-        IF Contending(QueueSeq[i]) THEN Weight[QueueSeq[i]] ELSE 0
+ContendingWeight(i) ==
+    SumSeq([k \in 1..Len(QueueSeq) |->
+        IF Contending(i, QueueSeq[k]) THEN Weight[QueueSeq[k]] ELSE 0
     ])
 
-FairShare(q) ==
-    IF ContendingWeight = 0
+FairShare(i, q) ==
+    IF ContendingWeight(i) = 0
     THEN 0
-    ELSE (GlobalOverflow * Weight[q] + ContendingWeight - 1) \div ContendingWeight
+    ELSE (GlobalOverflow * Weight[q] + ContendingWeight(i) - 1) \div ContendingWeight(i)
+
+OwnerAbandoned(j) ==
+    /\ dbOwner[j] \in Instances
+    /\ shutdownPhase[dbOwner[j]] = "stopped"
+
+UnownedAbandoned(j) ==
+    /\ dbOwner[j] = NoInstance
+    /\ permitHolder[j] = NoInstance
+    /\ \E i \in Instances : shutdownPhase[i] = "stopped"
+
+Abandoned(j) ==
+    /\ jobState[j] = "running"
+    /\ (OwnerAbandoned(j) \/ UnownedAbandoned(j))
+
+RecoverableAbandoned(j) ==
+    /\ Abandoned(j)
+    /\ \E i \in Instances :
+        /\ maintenanceAlive[i]
+        /\ shutdownPhase[i] = "running"
 
 Init ==
     /\ jobState = [j \in Jobs |-> "available"]
     /\ attempt = [j \in Jobs |-> 0]
     /\ lease = [j \in Jobs |-> 0]
-    /\ dbOwner = [j \in Jobs |-> NoWorker]
-    /\ taskWorker = [j \in Jobs |-> NoWorker]
-    /\ taskLease = [j \in Jobs |-> 0]
-    /\ permitHolder = [j \in Jobs |-> NoWorker]
+    /\ dbOwner = [j \in Jobs |-> NoInstance]
+    /\ permitHolder = [j \in Jobs |-> NoInstance]
     /\ permitKind = [j \in Jobs |-> "none"]
-    /\ inFlight = [j \in Jobs |-> FALSE]
-    /\ cancelRequested = [j \in Jobs |-> FALSE]
+    /\ inFlight = [i \in Instances |-> [j \in Jobs |-> FALSE]]
+    /\ taskLease = [i \in Instances |-> [j \in Jobs |-> 0]]
+    /\ cancelRequested = [i \in Instances |-> [j \in Jobs |-> FALSE]]
     /\ heartbeatFresh = [j \in Jobs |-> FALSE]
     /\ deadlineExpired = [j \in Jobs |-> FALSE]
-    /\ rateBudget = [q \in Queues |-> RateMax]
-    /\ shutdownPhase = "running"
-    /\ dispatchersAlive = TRUE
-    /\ heartbeatAlive = TRUE
-    /\ maintenanceAlive = TRUE
+    /\ rateBudget = [i \in Instances |-> [q \in Queues |-> RateMax]]
+    /\ shutdownPhase = [i \in Instances |-> "running"]
+    /\ dispatchersAlive = [i \in Instances |-> TRUE]
+    /\ heartbeatAlive = [i \in Instances |-> TRUE]
+    /\ maintenanceAlive = [i \in Instances |-> TRUE]
+    /\ leader = "i1"
 
-ReserveLocal(w, j) ==
-    LET q == WorkerQueue[w] IN
-    /\ dispatchersAlive
-    /\ jobState[j] = "available"
-    /\ permitHolder[j] = NoWorker
-    /\ HeldByWorker(w) < BatchMax
-    /\ QueueOf[j] = q
-    /\ LocalHeld(q) < MinWorkers[q]
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = w]
-    /\ permitKind' = [permitKind EXCEPT ![j] = "local"]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  inFlight, heartbeatFresh, deadlineExpired, rateBudget,
-                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
-
-ReserveOverflow(w, j) ==
-    LET q == WorkerQueue[w] IN
-    /\ dispatchersAlive
-    /\ jobState[j] = "available"
-    /\ permitHolder[j] = NoWorker
-    /\ HeldByWorker(w) < BatchMax
-    /\ QueueOf[j] = q
-    /\ NeedsOverflow(q)
-    /\ TotalOverflowHeld < GlobalOverflow
-    /\ OverflowHeld(q) < FairShare(q)
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = w]
-    /\ permitKind' = [permitKind EXCEPT ![j] = "overflow"]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  inFlight, heartbeatFresh, deadlineExpired, rateBudget,
-                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
-
-ReleaseReservation(w, j) ==
-    /\ permitHolder[j] = w
-    /\ jobState[j] = "available"
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
-    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  inFlight, cancelRequested, heartbeatFresh, deadlineExpired,
-                  rateBudget, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive>>
-
-ClaimReserved(w, j) ==
+ReserveLocal(i, j) ==
     LET q == QueueOf[j] IN
-    /\ dispatchersAlive
+    /\ dispatchersAlive[i]
     /\ jobState[j] = "available"
-    /\ permitHolder[j] = w
+    /\ permitHolder[j] = NoInstance
+    /\ HeldByInstance(i) < BatchMax
+    /\ LocalHeld(i, q) < MinWorkers[q]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = i]
+    /\ permitKind' = [permitKind EXCEPT ![j] = "local"]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
+                  heartbeatFresh, deadlineExpired, rateBudget,
+                  shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
+
+ReserveOverflow(i, j) ==
+    LET q == QueueOf[j] IN
+    /\ dispatchersAlive[i]
+    /\ jobState[j] = "available"
+    /\ permitHolder[j] = NoInstance
+    /\ HeldByInstance(i) < BatchMax
+    /\ NeedsOverflow(i, q)
+    /\ TotalOverflowHeld(i) < GlobalOverflow
+    /\ OverflowHeld(i, q) < FairShare(i, q)
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = i]
+    /\ permitKind' = [permitKind EXCEPT ![j] = "overflow"]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
+                  heartbeatFresh, deadlineExpired, rateBudget,
+                  shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
+
+ReleaseReservation(i, j) ==
+    /\ permitHolder[j] = i
+    /\ jobState[j] = "available"
+    /\ ~inFlight[i][j]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoInstance]
+    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
+                  cancelRequested, heartbeatFresh, deadlineExpired,
+                  rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
+
+ClaimReserved(i, j) ==
+    LET q == QueueOf[j] IN
+    /\ dispatchersAlive[i]
+    /\ jobState[j] = "available"
+    /\ permitHolder[j] = i
     /\ permitKind[j] \in {"local", "overflow"}
     /\ attempt[j] < MaxAttempts
-    /\ rateBudget[q] > 0
+    /\ rateBudget[i][q] > 0
     /\ jobState' = [jobState EXCEPT ![j] = "running"]
     /\ attempt' = [attempt EXCEPT ![j] = @ + 1]
     /\ lease' = [lease EXCEPT ![j] = @ + 1]
-    /\ rateBudget' = [rateBudget EXCEPT ![q] = @ - 1]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = FALSE]
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<dbOwner, taskWorker, taskLease, permitHolder, permitKind,
-                  inFlight, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive>>
+    /\ rateBudget' = [rateBudget EXCEPT ![i][q] = @ - 1]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
+    /\ UNCHANGED <<dbOwner, permitHolder, permitKind, inFlight, taskLease,
+                  shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
 
-StartExecution(w, j) ==
+StartExecution(i, j) ==
     /\ jobState[j] = "running"
-    /\ permitHolder[j] = w
-    /\ dbOwner[j] = NoWorker
-    /\ taskWorker[j] = NoWorker
-    /\ ~inFlight[j]
-    /\ dbOwner' = [dbOwner EXCEPT ![j] = w]
-    /\ taskWorker' = [taskWorker EXCEPT ![j] = w]
-    /\ taskLease' = [taskLease EXCEPT ![j] = lease[j]]
-    /\ inFlight' = [inFlight EXCEPT ![j] = TRUE]
+    /\ permitHolder[j] = i
+    /\ dbOwner[j] = NoInstance
+    /\ ~inFlight[i][j]
+    /\ dbOwner' = [dbOwner EXCEPT ![j] = i]
+    /\ inFlight' = [inFlight EXCEPT ![i][j] = TRUE]
+    /\ taskLease' = [taskLease EXCEPT ![i][j] = lease[j]]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = TRUE]
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
     /\ UNCHANGED <<jobState, attempt, lease, permitHolder, permitKind,
-                  cancelRequested, rateBudget, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+                  rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
 
-HeartbeatPulse(j) ==
-    /\ heartbeatAlive
-    /\ inFlight[j]
+HeartbeatPulse(i, j) ==
+    /\ heartbeatAlive[i]
+    /\ inFlight[i][j]
     /\ jobState[j] = "running"
+    /\ dbOwner[j] = i
+    /\ taskLease[i][j] = lease[j]
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
-                  deadlineExpired, rateBudget, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, deadlineExpired,
+                  rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
 
 HeartbeatBecomesStale(j) ==
-    /\ inFlight[j]
     /\ jobState[j] = "running"
+    /\ dbOwner[j] \in Instances
     /\ heartbeatFresh[j]
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
-                  deadlineExpired, rateBudget, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, deadlineExpired,
+                  rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
 
 DeadlineExpires(j) ==
-    /\ inFlight[j]
     /\ jobState[j] = "running"
+    /\ dbOwner[j] \in Instances
     /\ ~deadlineExpired[j]
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
-                  heartbeatFresh, rateBudget, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  rateBudget, shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
 
-Finalize(w, j, toState) ==
+Finalize(i, j, toState) ==
     /\ toState \in FinalStates
-    /\ inFlight[j]
+    /\ inFlight[i][j]
     /\ jobState[j] = "running"
-    /\ dbOwner[j] = w
-    /\ taskWorker[j] = w
-    /\ taskLease[j] = lease[j]
+    /\ dbOwner[j] = i
+    /\ taskLease[i][j] = lease[j]
     /\ jobState' = [jobState EXCEPT ![j] = toState]
-    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoWorker]
-    /\ taskWorker' = [taskWorker EXCEPT ![j] = NoWorker]
-    /\ taskLease' = [taskLease EXCEPT ![j] = 0]
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
+    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoInstance]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoInstance]
     /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
-    /\ inFlight' = [inFlight EXCEPT ![j] = FALSE]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
+    /\ inFlight' = [inFlight EXCEPT ![i][j] = FALSE]
+    /\ taskLease' = [taskLease EXCEPT ![i][j] = 0]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = FALSE]
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
     /\ UNCHANGED <<attempt, lease, rateBudget, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
 
-FinalizeRejected(w, j, toState) ==
+FinalizeRejected(i, j, toState) ==
     /\ toState \in FinalStates
-    /\ inFlight[j]
-    /\ taskWorker[j] = w
+    /\ inFlight[i][j]
     /\ (jobState[j] # "running"
-        \/ dbOwner[j] # w
-        \/ taskLease[j] # lease[j])
-    /\ taskWorker' = [taskWorker EXCEPT ![j] = NoWorker]
-    /\ taskLease' = [taskLease EXCEPT ![j] = 0]
-    /\ inFlight' = [inFlight EXCEPT ![j] = FALSE]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
-    /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = FALSE]
-    /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
-                  rateBudget, shutdownPhase, dispatchersAlive,
-                  heartbeatAlive, maintenanceAlive>>
+        \/ dbOwner[j] # i
+        \/ taskLease[i][j] # lease[j])
+    /\ inFlight' = [inFlight EXCEPT ![i][j] = FALSE]
+    /\ taskLease' = [taskLease EXCEPT ![i][j] = 0]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i][j] = FALSE]
+    /\ permitHolder' =
+        IF permitHolder[j] = i /\ lease[j] = taskLease[i][j]
+        THEN [permitHolder EXCEPT ![j] = NoInstance]
+        ELSE permitHolder
+    /\ permitKind' =
+        IF permitHolder[j] = i /\ lease[j] = taskLease[i][j]
+        THEN [permitKind EXCEPT ![j] = "none"]
+        ELSE permitKind
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
 
-RescueByHeartbeat(j) ==
-    /\ maintenanceAlive
-    /\ inFlight[j]
+RescueByHeartbeat(i, j) ==
+    /\ leader = i
+    /\ maintenanceAlive[i]
     /\ jobState[j] = "running"
+    /\ dbOwner[j] \in Instances
     /\ ~heartbeatFresh[j]
     /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
-    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoWorker]
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
-    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<attempt, lease, taskWorker, taskLease, inFlight,
-                  heartbeatFresh, deadlineExpired, rateBudget,
-                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
-
-RescueByDeadline(j) ==
-    /\ maintenanceAlive
-    /\ inFlight[j]
-    /\ jobState[j] = "running"
-    /\ deadlineExpired[j]
-    /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
-    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoWorker]
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
-    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = TRUE]
-    /\ UNCHANGED <<attempt, lease, taskWorker, taskLease, inFlight,
-                  heartbeatFresh, deadlineExpired, rateBudget,
-                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
-
-AdminCancel(j) ==
-    /\ jobState[j] \in {"available", "running", "retryable"}
-    /\ jobState' = [jobState EXCEPT ![j] = "cancelled"]
-    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoWorker]
-    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
+    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoInstance]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoInstance]
     /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
     /\ cancelRequested' =
-        IF inFlight[j]
-        THEN [cancelRequested EXCEPT ![j] = TRUE]
-        ELSE [cancelRequested EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<attempt, lease, taskWorker, taskLease, inFlight,
-                  heartbeatFresh, deadlineExpired, rateBudget,
-                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+        [cancelRequested EXCEPT ![i][j] = cancelRequested[i][j] \/ inFlight[i][j]]
+    /\ UNCHANGED <<attempt, lease, inFlight, taskLease, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
+
+RescueByDeadline(i, j) ==
+    /\ leader = i
+    /\ maintenanceAlive[i]
+    /\ jobState[j] = "running"
+    /\ dbOwner[j] \in Instances
+    /\ deadlineExpired[j]
+    /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
+    /\ dbOwner' = [dbOwner EXCEPT ![j] = NoInstance]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoInstance]
+    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
+    /\ cancelRequested' =
+        [cancelRequested EXCEPT ![i][j] = cancelRequested[i][j] \/ inFlight[i][j]]
+    /\ UNCHANGED <<attempt, lease, inFlight, taskLease, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive, leader>>
 
 PromoteRetryable(j) ==
     /\ jobState[j] = "retryable"
-    /\ ~inFlight[j]
     /\ jobState' = [jobState EXCEPT ![j] = "available"]
-    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
     /\ heartbeatFresh' = [heartbeatFresh EXCEPT ![j] = FALSE]
     /\ deadlineExpired' = [deadlineExpired EXCEPT ![j] = FALSE]
-    /\ UNCHANGED <<attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, rateBudget,
-                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+    /\ UNCHANGED <<attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, rateBudget,
+                  shutdownPhase, dispatchersAlive, heartbeatAlive,
+                  maintenanceAlive, leader>>
 
-RefillBudget(q, n) ==
+RefillBudget(i, q, n) ==
+    /\ i \in Instances
     /\ q \in Queues
     /\ n \in 1..RateMax
-    /\ rateBudget' = [rateBudget EXCEPT ![q] =
-          IF @ + n < RateMax THEN @ + n ELSE RateMax]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
-                  heartbeatFresh, deadlineExpired, shutdownPhase,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+    /\ rateBudget' =
+        [rateBudget EXCEPT ![i][q] =
+            IF @ + n < RateMax THEN @ + n ELSE RateMax]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, shutdownPhase, dispatchersAlive,
+                  heartbeatAlive, maintenanceAlive, leader>>
 
-ShutdownBegin ==
-    /\ shutdownPhase = "running"
-    /\ shutdownPhase' = "stop_claim"
-    /\ dispatchersAlive' = FALSE
-    /\ maintenanceAlive' = FALSE
+AcquireLeadership(i) ==
+    /\ leader = NoInstance
+    /\ maintenanceAlive[i]
+    /\ shutdownPhase[i] # "stopped"
+    /\ leader' = i
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
+                  heartbeatAlive, maintenanceAlive>>
+
+RelinquishLeadership(i) ==
+    /\ leader = i
+    /\ leader' = NoInstance
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
+                  heartbeatAlive, maintenanceAlive>>
+
+ShutdownBegin(i) ==
+    /\ shutdownPhase[i] = "running"
+    /\ shutdownPhase' = [shutdownPhase EXCEPT ![i] = "stop_claim"]
+    /\ dispatchersAlive' = [dispatchersAlive EXCEPT ![i] = FALSE]
     /\ permitHolder' =
         [j \in Jobs |->
-            IF jobState[j] = "available" THEN NoWorker ELSE permitHolder[j]]
+            IF permitHolder[j] = i /\ jobState[j] = "available"
+            THEN NoInstance
+            ELSE permitHolder[j]]
     /\ permitKind' =
         [j \in Jobs |->
-            IF jobState[j] = "available" THEN "none" ELSE permitKind[j]]
+            IF permitHolder[j] = i /\ jobState[j] = "available"
+            THEN "none"
+            ELSE permitKind[j]]
     /\ cancelRequested' =
-        [j \in Jobs |-> cancelRequested[j] \/ inFlight[j]]
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  inFlight, heartbeatFresh,
-                  deadlineExpired, rateBudget, heartbeatAlive>>
-
-EnterDraining ==
-    /\ shutdownPhase = "stop_claim"
-    /\ shutdownPhase' = "draining"
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
+        [cancelRequested EXCEPT ![i] =
+            [j \in Jobs |-> cancelRequested[i][j] \/ inFlight[i][j]]]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, inFlight, taskLease,
                   heartbeatFresh, deadlineExpired, rateBudget,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+                  heartbeatAlive, maintenanceAlive, leader>>
 
-StopHeartbeat ==
-    /\ heartbeatAlive
-    /\ shutdownPhase = "draining"
-    /\ RunningJobs = {}
-    /\ InFlightJobs = {}
-    /\ heartbeatAlive' = FALSE
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
-                  heartbeatFresh, deadlineExpired, rateBudget,
-                  shutdownPhase, dispatchersAlive, maintenanceAlive>>
+EnterDraining(i) ==
+    /\ shutdownPhase[i] = "stop_claim"
+    /\ shutdownPhase' = [shutdownPhase EXCEPT ![i] = "draining"]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, rateBudget, dispatchersAlive,
+                  heartbeatAlive, maintenanceAlive, leader>>
 
-FinishShutdown ==
-    /\ shutdownPhase = "draining"
-    /\ ~heartbeatAlive
-    /\ RunningJobs = {}
-    /\ InFlightJobs = {}
-    /\ TotalHeldPermits = 0
-    /\ shutdownPhase' = "stopped"
-    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, taskWorker, taskLease,
-                  permitHolder, permitKind, inFlight, cancelRequested,
-                  heartbeatFresh, deadlineExpired, rateBudget,
-                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+StopHeartbeat(i) ==
+    /\ heartbeatAlive[i]
+    /\ shutdownPhase[i] = "draining"
+    /\ TrackedRunningJobs(i) = {}
+    /\ InFlightJobs(i) = {}
+    /\ heartbeatAlive' = [heartbeatAlive EXCEPT ![i] = FALSE]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
+                  maintenanceAlive, leader>>
+
+StopMaintenance(i) ==
+    /\ maintenanceAlive[i]
+    /\ shutdownPhase[i] = "draining"
+    /\ ~heartbeatAlive[i]
+    /\ maintenanceAlive' = [maintenanceAlive EXCEPT ![i] = FALSE]
+    /\ leader' = IF leader = i THEN NoInstance ELSE leader
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, rateBudget, shutdownPhase, dispatchersAlive,
+                  heartbeatAlive>>
+
+DrainTimeout(i) ==
+    /\ shutdownPhase[i] = "draining"
+    /\ InFlightJobs(i) # {}
+    /\ shutdownPhase' = [shutdownPhase EXCEPT ![i] = "stopped"]
+    /\ heartbeatAlive' = [heartbeatAlive EXCEPT ![i] = FALSE]
+    /\ maintenanceAlive' = [maintenanceAlive EXCEPT ![i] = FALSE]
+    /\ dispatchersAlive' = [dispatchersAlive EXCEPT ![i] = FALSE]
+    /\ inFlight' = [inFlight EXCEPT ![i] = [j \in Jobs |-> FALSE]]
+    /\ taskLease' = [taskLease EXCEPT ![i] = [j \in Jobs |-> 0]]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![i] = [j \in Jobs |-> FALSE]]
+    /\ permitHolder' =
+        [j \in Jobs |->
+            IF permitHolder[j] = i THEN NoInstance ELSE permitHolder[j]]
+    /\ permitKind' =
+        [j \in Jobs |->
+            IF permitHolder[j] = i THEN "none" ELSE permitKind[j]]
+    /\ leader' = IF leader = i THEN NoInstance ELSE leader
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, heartbeatFresh,
+                  deadlineExpired, rateBudget>>
+
+FinishShutdown(i) ==
+    /\ shutdownPhase[i] = "draining"
+    /\ ~heartbeatAlive[i]
+    /\ ~maintenanceAlive[i]
+    /\ InFlightJobs(i) = {}
+    /\ HeldByInstance(i) = 0
+    /\ shutdownPhase' = [shutdownPhase EXCEPT ![i] = "stopped"]
+    /\ UNCHANGED <<jobState, attempt, lease, dbOwner, permitHolder, permitKind,
+                  inFlight, taskLease, cancelRequested, heartbeatFresh,
+                  deadlineExpired, rateBudget, dispatchersAlive,
+                  heartbeatAlive, maintenanceAlive, leader>>
 
 AnyFinalize ==
-    \E w \in Workers, j \in Jobs, s \in FinalStates : Finalize(w, j, s)
+    \E i \in Instances, j \in Jobs, s \in FinalStates : Finalize(i, j, s)
 
 AnyFinalizeRejected ==
-    \E w \in Workers, j \in Jobs, s \in FinalStates : FinalizeRejected(w, j, s)
+    \E i \in Instances, j \in Jobs, s \in FinalStates : FinalizeRejected(i, j, s)
+
+AnyReserveOverflow ==
+    \E i \in Instances, j \in Jobs : ReserveOverflow(i, j)
 
 AnyStartExecution ==
-    \E w \in Workers, j \in Jobs : StartExecution(w, j)
+    \E i \in Instances, j \in Jobs : StartExecution(i, j)
 
 AnyPromoteRetryable ==
     \E j \in Jobs : PromoteRetryable(j)
 
 AnyHeartbeatPulse ==
-    \E j \in Jobs : HeartbeatPulse(j)
+    \E i \in Instances, j \in Jobs : HeartbeatPulse(i, j)
+
+AnyHeartbeatBecomesStale ==
+    \E j \in Jobs : HeartbeatBecomesStale(j)
 
 AnyRefill ==
-    \E q \in Queues, n \in 1..RateMax : RefillBudget(q, n)
+    \E i \in Instances, q \in Queues, n \in 1..RateMax : RefillBudget(i, q, n)
+
+AnyAcquireLeadership ==
+    \E i \in Instances : AcquireLeadership(i)
+
+AnyEnterDraining ==
+    \E i \in Instances : EnterDraining(i)
+
+AnyStopHeartbeat ==
+    \E i \in Instances : StopHeartbeat(i)
+
+AnyStopMaintenance ==
+    \E i \in Instances : StopMaintenance(i)
+
+AnyFinishShutdown ==
+    \E i \in Instances : FinishShutdown(i)
+
+AnyDrainTimeout ==
+    \E i \in Instances : DrainTimeout(i)
+
+AnyRescueByHeartbeat ==
+    \E i \in Instances, j \in Jobs : RescueByHeartbeat(i, j)
+
+AnyRescueByDeadline ==
+    \E i \in Instances, j \in Jobs : RescueByDeadline(i, j)
 
 Next ==
-    \/ \E w \in Workers, j \in Jobs : ReserveLocal(w, j)
-    \/ \E w \in Workers, j \in Jobs : ReserveOverflow(w, j)
-    \/ \E w \in Workers, j \in Jobs : ReleaseReservation(w, j)
-    \/ \E w \in Workers, j \in Jobs : ClaimReserved(w, j)
-    \/ \E w \in Workers, j \in Jobs : StartExecution(w, j)
+    \/ \E i \in Instances, j \in Jobs : ReserveLocal(i, j)
+    \/ \E i \in Instances, j \in Jobs : ReserveOverflow(i, j)
+    \/ \E i \in Instances, j \in Jobs : ReleaseReservation(i, j)
+    \/ \E i \in Instances, j \in Jobs : ClaimReserved(i, j)
+    \/ AnyStartExecution
     \/ AnyFinalize
     \/ AnyFinalizeRejected
-    \/ \E j \in Jobs : HeartbeatBecomesStale(j)
-    \/ \E j \in Jobs : DeadlineExpires(j)
     \/ AnyHeartbeatPulse
-    \/ \E j \in Jobs : RescueByHeartbeat(j)
-    \/ \E j \in Jobs : RescueByDeadline(j)
+    \/ AnyHeartbeatBecomesStale
+    \/ \E j \in Jobs : DeadlineExpires(j)
+    \/ AnyRescueByHeartbeat
+    \/ AnyRescueByDeadline
     \/ AnyPromoteRetryable
     \/ AnyRefill
-    \/ ShutdownBegin
-    \/ EnterDraining
-    \/ StopHeartbeat
-    \/ FinishShutdown
+    \/ AnyAcquireLeadership
+    \/ \E i \in Instances : ShutdownBegin(i)
+    \/ AnyEnterDraining
+    \/ AnyStopHeartbeat
+    \/ AnyStopMaintenance
+    \/ AnyDrainTimeout
+    \/ AnyFinishShutdown
 
 TypeOK ==
     /\ jobState \in [Jobs -> JobStates]
-    /\ attempt \in [Jobs -> Nat]
-    /\ lease \in [Jobs -> Nat]
-    /\ dbOwner \in [Jobs -> Workers \cup {NoWorker}]
-    /\ taskWorker \in [Jobs -> Workers \cup {NoWorker}]
-    /\ taskLease \in [Jobs -> Nat]
-    /\ permitHolder \in [Jobs -> Workers \cup {NoWorker}]
+    /\ attempt \in [Jobs -> 0..MaxAttempts]
+    /\ lease \in [Jobs -> 0..MaxAttempts]
+    /\ dbOwner \in [Jobs -> Instances \cup {NoInstance}]
+    /\ permitHolder \in [Jobs -> Instances \cup {NoInstance}]
     /\ permitKind \in [Jobs -> PermitKinds]
-    /\ inFlight \in [Jobs -> BOOLEAN]
-    /\ cancelRequested \in [Jobs -> BOOLEAN]
+    /\ inFlight \in [Instances -> [Jobs -> BOOLEAN]]
+    /\ taskLease \in [Instances -> [Jobs -> 0..MaxAttempts]]
+    /\ cancelRequested \in [Instances -> [Jobs -> BOOLEAN]]
     /\ heartbeatFresh \in [Jobs -> BOOLEAN]
     /\ deadlineExpired \in [Jobs -> BOOLEAN]
-    /\ rateBudget \in [Queues -> 0..RateMax]
-    /\ shutdownPhase \in {"running", "stop_claim", "draining", "stopped"}
-    /\ dispatchersAlive \in BOOLEAN
-    /\ heartbeatAlive \in BOOLEAN
-    /\ maintenanceAlive \in BOOLEAN
+    /\ rateBudget \in [Instances -> [Queues -> 0..RateMax]]
+    /\ shutdownPhase \in [Instances -> ShutdownPhases]
+    /\ dispatchersAlive \in [Instances -> BOOLEAN]
+    /\ heartbeatAlive \in [Instances -> BOOLEAN]
+    /\ maintenanceAlive \in [Instances -> BOOLEAN]
+    /\ leader \in Instances \cup {NoInstance}
 
 RunningHasPermit ==
     \A j \in Jobs :
-        jobState[j] = "running" =>
-            permitHolder[j] \in Workers /\ permitKind[j] \in {"local", "overflow"}
+        jobState[j] = "running" /\ ~Abandoned(j) =>
+            permitHolder[j] \in Instances /\ permitKind[j] \in {"local", "overflow"}
 
-InFlightMatchesTaskWorker ==
+DBOwnerRequiresRunning ==
     \A j \in Jobs :
-        inFlight[j] <=> taskWorker[j] \in Workers
-
-InFlightStateConsistent ==
-    \A j \in Jobs :
-        inFlight[j] =>
-            /\ jobState[j] \in {"running", "retryable", "cancelled"}
-            /\ taskLease[j] > 0
+        dbOwner[j] \in Instances => jobState[j] = "running"
 
 CurrentOwnerConsistent ==
     \A j \in Jobs :
-        dbOwner[j] \in Workers =>
-            /\ jobState[j] = "running"
+        dbOwner[j] \in Instances /\ shutdownPhase[dbOwner[j]] # "stopped" =>
             /\ permitHolder[j] = dbOwner[j]
+            /\ inFlight[dbOwner[j]][j]
+            /\ taskLease[dbOwner[j]][j] = lease[j]
 
-AttemptAndLeaseMonotone ==
-    \A j \in Jobs :
-        /\ lease[j] <= attempt[j]
-        /\ taskLease[j] <= lease[j]
+TaskLeaseBounded ==
+    \A i \in Instances, j \in Jobs :
+        inFlight[i][j] =>
+            /\ taskLease[i][j] > 0
+            /\ taskLease[i][j] <= lease[j]
 
 TerminalReleasesPermit ==
     \A j \in Jobs :
-        jobState[j] \in {"completed", "failed", "cancelled", "retryable"} /\ ~inFlight[j]
-        => permitHolder[j] = NoWorker /\ permitKind[j] = "none"
+        jobState[j] \in FinalStates =>
+            /\ dbOwner[j] = NoInstance
+            /\ permitHolder[j] = NoInstance
+            /\ permitKind[j] = "none"
 
 LocalCapacitySafe ==
-    \A q \in Queues : LocalHeld(q) <= MinWorkers[q]
+    \A i \in Instances, q \in Queues : LocalHeld(i, q) <= MinWorkers[q]
 
 OverflowCapacitySafe ==
-    TotalOverflowHeld <= GlobalOverflow
+    \A i \in Instances : TotalOverflowHeld(i) <= GlobalOverflow
 
 BatchBounded ==
-    \A w \in Workers : HeldByWorker(w) <= BatchMax
+    \A i \in Instances : HeldByInstance(i) <= BatchMax
 
 RateBudgetBounded ==
-    \A q \in Queues : rateBudget[q] \in 0..RateMax
+    rateBudget \in [Instances -> [Queues -> 0..RateMax]]
 
 NoClaimAfterStopClaim ==
-    shutdownPhase \in {"stop_claim", "draining", "stopped"} => ~dispatchersAlive
+    \A i \in Instances :
+        shutdownPhase[i] \in {"stop_claim", "draining", "stopped"} =>
+            ~dispatchersAlive[i]
 
 HeartbeatUntilDrained ==
-    ((shutdownPhase \in {"stop_claim", "draining"}) /\ RunningJobs # {})
-    => heartbeatAlive
+    \A i \in Instances :
+        ((shutdownPhase[i] \in {"stop_claim", "draining"})
+         /\ TrackedRunningJobs(i) # {})
+        => heartbeatAlive[i]
 
 ServicePhaseConsistency ==
-    /\ dispatchersAlive => shutdownPhase = "running"
-    /\ maintenanceAlive => shutdownPhase = "running"
-    /\ ~heartbeatAlive => shutdownPhase \in {"draining", "stopped"}
+    \A i \in Instances :
+        /\ dispatchersAlive[i] => shutdownPhase[i] = "running"
+        /\ ~heartbeatAlive[i] => shutdownPhase[i] \in {"draining", "stopped"}
+        /\ ~maintenanceAlive[i] => shutdownPhase[i] \in {"draining", "stopped"}
+
+LeaderConsistent ==
+    leader = NoInstance
+    \/ (leader \in Instances
+        /\ maintenanceAlive[leader]
+        /\ shutdownPhase[leader] # "stopped")
+
+StoppedInstancesQuiescent ==
+    \A i \in Instances :
+        shutdownPhase[i] = "stopped" =>
+            /\ ~dispatchersAlive[i]
+            /\ ~heartbeatAlive[i]
+            /\ ~maintenanceAlive[i]
+            /\ InFlightJobs(i) = {}
+            /\ HeldByInstance(i) = 0
 
 Spec == Init /\ [][Next]_vars
 
 FairSpec ==
     Spec
-    /\ WF_vars(EnterDraining)
-    /\ WF_vars(StopHeartbeat)
-    /\ WF_vars(FinishShutdown)
+    /\ WF_vars(AnyAcquireLeadership)
+    /\ WF_vars(AnyEnterDraining)
+    /\ WF_vars(AnyStopHeartbeat)
+    /\ WF_vars(AnyStopMaintenance)
+    /\ WF_vars(AnyFinishShutdown)
+    /\ WF_vars(AnyDrainTimeout)
+    /\ WF_vars(AnyReserveOverflow)
     /\ WF_vars(AnyStartExecution)
     /\ WF_vars(AnyFinalize)
     /\ WF_vars(AnyFinalizeRejected)
     /\ WF_vars(AnyPromoteRetryable)
     /\ WF_vars(AnyHeartbeatPulse)
+    /\ WF_vars(AnyHeartbeatBecomesStale)
+    /\ WF_vars(AnyRescueByHeartbeat)
+    /\ WF_vars(AnyRescueByDeadline)
     /\ WF_vars(AnyRefill)
 
-DrainEventuallyStops ==
-    (shutdownPhase = "stop_claim") ~> (shutdownPhase = "stopped")
+I1DrainEventuallyStops ==
+    (shutdownPhase["i1"] = "stop_claim") ~> (shutdownPhase["i1"] = "stopped")
 
-Q2OverflowProgress ==
-    NeedsOverflow("q2") ~> (OverflowHeld("q2") > 0 \/ ~NeedsOverflow("q2"))
+I1Q1OverflowProgress ==
+    NeedsOverflow("i1", "q1")
+    ~> (OverflowHeld("i1", "q1") > 0 \/ ~NeedsOverflow("i1", "q1"))
+
+AbandonedJobsEventuallyLeaveRunning ==
+    \A j \in Jobs : RecoverableAbandoned(j) ~> (jobState[j] # "running")
 
 ====
