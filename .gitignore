@@ -10,3 +10,4 @@
 *.pyd
 *.dll
 .env
+awa-python/python/awa/lib_awa.dylib.dSYM/
