@@ -2,7 +2,8 @@ use crate::error::AwaError;
 use crate::job::{InsertOpts, InsertParams, JobRow, JobState};
 use crate::unique::compute_unique_key;
 use crate::JobArgs;
-use sqlx::PgExecutor;
+use sqlx::postgres::PgConnection;
+use sqlx::{PgExecutor, PgPool};
 
 /// Insert a job with default options.
 pub async fn insert<'e, E>(executor: E, args: &impl JobArgs) -> Result<JobRow, AwaError>
@@ -82,7 +83,7 @@ where
                 // available from the PG error message directly — callers can
                 // query by unique_key if they need it.
                 return AwaError::UniqueConflict {
-                    existing_id: db_err
+                    constraint: db_err
                         .constraint()
                         .map(|c| c.to_string()),
                 };
@@ -94,38 +95,24 @@ where
     Ok(row)
 }
 
-/// Insert multiple jobs in a single statement.
-///
-/// Supports uniqueness constraints — jobs with `unique` opts will have their
-/// `unique_key` and `unique_states` computed and included.
-#[tracing::instrument(skip(executor, jobs), fields(job.count = jobs.len()))]
-pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    if jobs.is_empty() {
-        return Ok(Vec::new());
-    }
+/// Pre-computed values for a single job row, shared by `insert_many` and `insert_many_copy`.
+struct RowValues {
+    kind: String,
+    queue: String,
+    args: serde_json::Value,
+    state: JobState,
+    priority: i16,
+    max_attempts: i16,
+    run_at: Option<chrono::DateTime<chrono::Utc>>,
+    metadata: serde_json::Value,
+    tags: Vec<String>,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+}
 
-    let count = jobs.len();
-
-    // Pre-compute all values including unique keys
-    struct RowValues {
-        kind: String,
-        queue: String,
-        args: serde_json::Value,
-        state: JobState,
-        priority: i16,
-        max_attempts: i16,
-        run_at: Option<chrono::DateTime<chrono::Utc>>,
-        metadata: serde_json::Value,
-        tags: Vec<String>,
-        unique_key: Option<Vec<u8>>,
-        unique_states: Option<String>,
-    }
-
-    let rows: Vec<RowValues> = jobs
-        .iter()
+/// Pre-compute all row values including unique keys from InsertParams.
+fn precompute_row_values(jobs: &[InsertParams]) -> Vec<RowValues> {
+    jobs.iter()
         .map(|job| {
             let unique_key = job.opts.unique.as_ref().map(|u| {
                 compute_unique_key(
@@ -170,7 +157,24 @@ where
                 unique_states,
             }
         })
-        .collect();
+        .collect()
+}
+
+/// Insert multiple jobs in a single statement.
+///
+/// Supports uniqueness constraints — jobs with `unique` opts will have their
+/// `unique_key` and `unique_states` computed and included.
+#[tracing::instrument(skip(executor, jobs), fields(job.count = jobs.len()))]
+pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let count = jobs.len();
+    let rows = precompute_row_values(jobs);
 
     // Build multi-row INSERT with all columns including unique_key/unique_states
     let mut query = String::from(
@@ -221,6 +225,262 @@ where
     let results = sql_query.fetch_all(executor).await?;
 
     Ok(results)
+}
+
+/// Insert many jobs using COPY for high throughput.
+///
+/// Uses a temp staging table with no constraints for fast COPY ingestion,
+/// then INSERT...SELECT into `awa.jobs` with ON CONFLICT DO NOTHING for
+/// unique jobs. Accepts `&mut PgConnection` so callers can use pool
+/// connections or transactions (Transaction derefs to PgConnection).
+#[tracing::instrument(skip(conn, jobs), fields(job.count = jobs.len()))]
+pub async fn insert_many_copy(
+    conn: &mut PgConnection,
+    jobs: &[InsertParams],
+) -> Result<Vec<JobRow>, AwaError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let rows = precompute_row_values(jobs);
+
+    // 1. Create temp staging table (dropped on transaction commit)
+    sqlx::query(
+        r#"
+        CREATE TEMP TABLE awa_copy_staging (
+            kind        TEXT NOT NULL,
+            queue       TEXT NOT NULL,
+            args        JSONB NOT NULL,
+            state       TEXT NOT NULL,
+            priority    SMALLINT NOT NULL,
+            max_attempts SMALLINT NOT NULL,
+            run_at      TEXT,
+            metadata    JSONB NOT NULL,
+            tags        TEXT NOT NULL,
+            unique_key  TEXT,
+            unique_states TEXT
+        ) ON COMMIT DROP
+        "#,
+    )
+    .execute(&mut *conn)
+    .await?;
+
+    // 2. COPY data into staging table via CSV
+    let mut csv_buf = Vec::with_capacity(rows.len() * 256);
+    for row in &rows {
+        write_csv_row(&mut csv_buf, row);
+    }
+
+    let mut copy_in = conn
+        .copy_in_raw(
+            "COPY awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+        )
+        .await?;
+    copy_in.send(csv_buf).await?;
+    copy_in.finish().await?;
+
+    // 3. INSERT...SELECT from staging into real table
+    let has_unique = rows.iter().any(|r| r.unique_key.is_some());
+
+    let insert_sql = if has_unique {
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
+        SELECT
+            s.kind,
+            s.queue,
+            s.args,
+            s.state::awa.job_state,
+            s.priority,
+            s.max_attempts,
+            CASE WHEN s.run_at = '\N' OR s.run_at IS NULL THEN now() ELSE s.run_at::timestamptz END,
+            s.metadata,
+            s.tags::text[],
+            CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
+            CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
+        FROM awa_copy_staging s
+        ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
+            AND unique_states IS NOT NULL
+            AND awa.job_state_in_bitmask(unique_states, state)
+        DO NOTHING
+        RETURNING *
+        "#
+    } else {
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
+        SELECT
+            s.kind,
+            s.queue,
+            s.args,
+            s.state::awa.job_state,
+            s.priority,
+            s.max_attempts,
+            CASE WHEN s.run_at = '\N' OR s.run_at IS NULL THEN now() ELSE s.run_at::timestamptz END,
+            s.metadata,
+            s.tags::text[],
+            CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
+            CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
+        FROM awa_copy_staging s
+        RETURNING *
+        "#
+    };
+
+    let results = sqlx::query_as::<_, JobRow>(insert_sql)
+        .fetch_all(&mut *conn)
+        .await?;
+
+    Ok(results)
+}
+
+/// Convenience wrapper that acquires a connection from the pool.
+///
+/// Wraps the operation in a transaction so the ON COMMIT DROP staging table
+/// is cleaned up automatically.
+#[tracing::instrument(skip(pool, jobs), fields(job.count = jobs.len()))]
+pub async fn insert_many_copy_from_pool(
+    pool: &PgPool,
+    jobs: &[InsertParams],
+) -> Result<Vec<JobRow>, AwaError> {
+    if jobs.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut tx = pool.begin().await?;
+    let results = insert_many_copy(&mut tx, jobs).await?;
+    tx.commit().await?;
+
+    Ok(results)
+}
+
+// ── CSV serialization helpers ────────────────────────────────────────
+
+/// Write one RowValues as a CSV line to the buffer.
+fn write_csv_row(buf: &mut Vec<u8>, row: &RowValues) {
+    // kind
+    write_csv_field(buf, &row.kind);
+    buf.push(b',');
+    // queue
+    write_csv_field(buf, &row.queue);
+    buf.push(b',');
+    // args (JSONB as text)
+    let args_str = serde_json::to_string(&row.args).expect("JSON serialization should not fail");
+    write_csv_field(buf, &args_str);
+    buf.push(b',');
+    // state
+    write_csv_field(buf, &row.state.to_string());
+    buf.push(b',');
+    // priority
+    buf.extend_from_slice(row.priority.to_string().as_bytes());
+    buf.push(b',');
+    // max_attempts
+    buf.extend_from_slice(row.max_attempts.to_string().as_bytes());
+    buf.push(b',');
+    // run_at (TIMESTAMPTZ as RFC 3339, or \N for NULL)
+    match &row.run_at {
+        Some(dt) => write_csv_field(buf, &dt.to_rfc3339()),
+        None => buf.extend_from_slice(b"\\N"),
+    }
+    buf.push(b',');
+    // metadata (JSONB as text)
+    let metadata_str =
+        serde_json::to_string(&row.metadata).expect("JSON serialization should not fail");
+    write_csv_field(buf, &metadata_str);
+    buf.push(b',');
+    // tags (Postgres text[] literal)
+    write_pg_text_array(buf, &row.tags);
+    buf.push(b',');
+    // unique_key (hex-encoded bytes, or \N for NULL)
+    match &row.unique_key {
+        Some(key) => {
+            // Encode as hex string (no \x prefix — we use decode(hex) in SQL)
+            let hex = hex::encode(key);
+            write_csv_field(buf, &hex);
+        }
+        None => buf.extend_from_slice(b"\\N"),
+    }
+    buf.push(b',');
+    // unique_states (bit string, or \N for NULL)
+    match &row.unique_states {
+        Some(bits) => write_csv_field(buf, bits),
+        None => buf.extend_from_slice(b"\\N"),
+    }
+    buf.push(b'\n');
+}
+
+/// Write a CSV field, quoting if it contains special characters.
+fn write_csv_field(buf: &mut Vec<u8>, value: &str) {
+    if value.contains(',')
+        || value.contains('"')
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.contains('\\')
+    {
+        buf.push(b'"');
+        for byte in value.bytes() {
+            if byte == b'"' {
+                buf.push(b'"');
+            }
+            buf.push(byte);
+        }
+        buf.push(b'"');
+    } else {
+        buf.extend_from_slice(value.as_bytes());
+    }
+}
+
+/// Write a Postgres text[] array literal: `{elem1,"elem with , comma"}`.
+/// The entire literal is CSV-quoted because it always contains braces.
+fn write_pg_text_array(buf: &mut Vec<u8>, values: &[String]) {
+    buf.push(b'"');
+    buf.push(b'{');
+    for (i, val) in values.iter().enumerate() {
+        if i > 0 {
+            buf.push(b',');
+        }
+        // Postgres array elements need quoting if they contain special chars
+        if val.is_empty()
+            || val.contains(',')
+            || val.contains('"')
+            || val.contains('\\')
+            || val.contains('{')
+            || val.contains('}')
+            || val.contains(' ')
+            || val.eq_ignore_ascii_case("NULL")
+        {
+            // Double-quote the element inside the Postgres array literal.
+            // Inside CSV, the outer " are already handled; we need to
+            // double-quote for both Postgres and CSV escaping.
+            buf.push(b'"');
+            buf.push(b'"');
+            for ch in val.chars() {
+                match ch {
+                    '"' => {
+                        // Postgres array: \" but inside CSV: "" per quote
+                        // So we emit \""  → but CSV sees \"" which is wrong.
+                        // Correct approach: inside a CSV-quoted field,
+                        // literal " becomes "". Inside PG array, " becomes \".
+                        // Combined: \\\"\"  ... this gets complex.
+                        // Simpler: PG array uses \"  and CSV doubles " to "".
+                        // PG inside CSV: \""  (PG backslash-quote, CSV double-quote)
+                        buf.extend_from_slice(b"\\\"\"");
+                    }
+                    '\\' => {
+                        // PG array backslash: \\, but inside CSV " is doubled
+                        buf.extend_from_slice(b"\\\\");
+                    }
+                    _ => {
+                        let mut utf8_buf = [0u8; 4];
+                        buf.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
+                    }
+                }
+            }
+            buf.push(b'"');
+            buf.push(b'"');
+        } else {
+            buf.extend_from_slice(val.as_bytes());
+        }
+    }
+    buf.push(b'}');
+    buf.push(b'"');
 }
 
 /// Convenience: create InsertParams from a JobArgs impl.

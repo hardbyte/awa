@@ -1,6 +1,6 @@
 # AWA — Validation Test Plan
 
-Run after Phase 2 (Rust core + Python client complete). Pass all = ship v0.1.
+Run after Phase 2 (Rust core + Python client complete). Pass all = ship.
 
 Tests run against real Postgres 15+ (not managed services). Dedicated test database.
 All tests are automated and run in CI.
@@ -34,6 +34,69 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T31 | Throughput >= 3,000 jobs/sec (Rust workers, debug build) | Benchmark | Implemented |
 | T32 | Pickup latency p50 < 50ms (LISTEN/NOTIFY) | Benchmark | Implemented |
 | T33 | Insert throughput >= 10,000 inserts/sec | Benchmark | Implemented |
+| T34 | V2 migration creates `awa.cron_jobs` table | Migration | Implemented |
+| T35 | UPSERT sync: inserts new, updates changed, does NOT delete others | Cron | Implemented |
+| T36 | Atomic CTE: mark + insert succeeds, returns job row | Cron | Implemented |
+| T37 | Atomic CTE: second call returns 0 rows (dedup) | Cron | Implemented |
+| T38 | Multi-deployment: disjoint schedules coexist (no orphan deletion) | Cron | Implemented |
+| T39 | No backfill: only latest missed fire enqueued | Cron | Implemented |
+| T40 | End-to-end: register periodic + start → job appears with cron metadata | Cron | Implemented |
+| T41 | Tags and metadata propagate from schedule to enqueued job | Cron | Implemented |
+| T42 | Cron expression validation at build time | Cron (unit) | Implemented |
+| T43 | Timezone validation at build time | Cron (unit) | Implemented |
+| T44 | DST spring-forward: at most one fire | Cron (unit) | Implemented |
+| T45 | DST fall-back: exactly one fire | Cron (unit) | Implemented |
+| T46 | First registration (NULL last_enqueued_at): enqueues most recent past fire | Cron (unit) | Implemented |
+| T47 | COPY: empty input returns empty vec | COPY | Implemented |
+| T48 | COPY: single job matches single insert | COPY | Implemented |
+| T49 | COPY: 1000 jobs all inserted with correct kind/queue/state | COPY | Implemented |
+| T50 | COPY: args with special chars (JSON quotes, newlines, commas, tabs, backslashes, unicode) round-trip | COPY | Implemented |
+| T51 | COPY: tags with pathological values (commas, quotes, braces, backslashes, whitespace, NULL, empty) round-trip | COPY | Implemented |
+| T52 | COPY: unique constraint handled via DO NOTHING | COPY | Implemented |
+| T53 | COPY: mixed run_at (NULL=available, future=scheduled) | COPY | Implemented |
+| T54 | COPY: metadata with special chars round-trips | COPY | Implemented |
+| T55 | COPY: atomic (transaction rollback discards all) | COPY | Implemented |
+| T56 | COPY: within caller-managed transaction | COPY | Implemented |
+| T57 | COPY benchmark: 10K jobs vs chunked INSERT | COPY (bench) | Implemented |
+| T58 | Python: insert_sync returns Job directly | Sync | Implemented |
+| T59 | Python: migrate_sync idempotent | Sync | Implemented |
+| T60 | Python: cancel_sync / retry_sync | Sync | Implemented |
+| T61 | Python: retry_failed_sync | Sync | Implemented |
+| T62 | Python: discard_failed_sync | Sync | Implemented |
+| T63 | Python: pause/resume/drain_queue_sync | Sync | Implemented |
+| T64 | Python: list_jobs_sync with filters | Sync | Implemented |
+| T65 | Python: queue_stats_sync | Sync | Implemented |
+| T66 | Python: health_check_sync | Sync | Implemented |
+| T67 | Python: transaction_sync context manager commit | Sync | Implemented |
+| T68 | Python: transaction_sync context manager rollback on exception | Sync | Implemented |
+| T69 | Python: sync methods work from non-async context | Sync | Implemented |
+| T70 | Python: insert_many_copy_sync | Sync | Implemented |
+| B1 | Late completion after rescue is no-op (state guard) | Bug fix | Implemented |
+| B2 | Late completion after cancel is no-op (state guard) | Bug fix | Implemented |
+| B3 | Shutdown waits for in-flight jobs | Bug fix | Implemented |
+| B4 | Heartbeat alive during shutdown drain | Bug fix | Implemented |
+| B5 | Deadline rescue signals ctx.is_cancelled() | Bug fix | Implemented |
+| B6 | UniqueConflict.constraint field has constraint name | Bug fix | Implemented |
+| RL1 | No rate limit — fast dispatch | Rate limit | Implemented |
+| RL2 | Rate limit throttles dispatch (10/sec, 30 jobs) | Rate limit | Implemented |
+| RL3 | Burst 20, rate 5/sec — burst then throttle | Rate limit | Implemented |
+| RL4 | Rate limit + low max_workers — concurrency is bottleneck | Rate limit | Implemented |
+| RL5 | Invalid rate limit (max_rate <= 0) rejected | Rate limit | Implemented |
+| RL6 | Zero weight rejected | Rate limit | Implemented |
+| W5 | Hard-reserved backward compat | Weighted | Implemented |
+| W6 | Idle overflow to loaded queue | Weighted | Implemented |
+| W7 | Floor guarantee under load (min_workers) | Weighted | Implemented |
+| W8 | Global cap not exceeded (global_max_workers) | Weighted | Implemented |
+| W9 | min_workers sum > global rejected (BuildError) | Weighted | Implemented |
+| W10 | Weight proportionality (3:1 ratio) | Weighted | Implemented |
+| W11 | Permit-before-claim — no orphan running jobs | Weighted | Implemented |
+| W12 | Health check reports weighted capacity | Weighted | Implemented |
+| W13 | Health check reports hard-reserved capacity | Weighted | Implemented |
+| P12 | Python: Dict config with rate_limit starts | Python config | Implemented |
+| P13 | Python: global_max_workers weighted mode | Python config | Implemented |
+| P14 | Python: Backward compat tuple form | Python config | Implemented |
+| P15 | Python: tuple + global_max_workers raises | Python config | Implemented |
+| P16 | Python: both max_workers and min_workers raises | Python config | Implemented |
 
 ## Running Tests
 
@@ -50,8 +113,29 @@ cd awa-python && .venv/bin/pytest tests/ -v
 # Chaos recovery only (same test CI runs as a dedicated step)
 cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
 
+# COPY integration tests
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test copy_test -- --nocapture
+
+# Python sync tests
+cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test .venv/bin/pytest tests/test_sync.py -v
+
 # Benchmark tests (throughput + latency, requires Postgres)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test benchmark_test -- --ignored --nocapture
+
+# COPY benchmark
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test benchmark_test test_throughput_copy_insert -- --ignored --nocapture
+
+# Bug fix tests (state guard, unique conflict field)
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test executor_guard_test -- --nocapture
+
+# Rate limiting tests
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test rate_limit_test -- --nocapture
+
+# Weighted concurrency tests
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test weighted_test -- --nocapture
+
+# Python start() config validation tests
+cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_start_config.py -v
 
 # Repeat 20 times to detect flakes
 for i in $(seq 1 20); do echo "=== Run $i ===" && cargo test --workspace 2>&1 | tail -1; done

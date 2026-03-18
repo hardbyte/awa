@@ -18,6 +18,8 @@ tokio-util.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
 tracing.workspace = true
 opentelemetry.workspace = true
 

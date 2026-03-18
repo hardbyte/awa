@@ -51,9 +51,15 @@ class QueueHealth:
     @property
     def in_flight(self) -> int: ...
     @property
-    def max_workers(self) -> int: ...
-    @property
     def available(self) -> int: ...
+    @property
+    def max_workers(self) -> int | None: ...
+    @property
+    def min_workers(self) -> int | None: ...
+    @property
+    def weight(self) -> int | None: ...
+    @property
+    def overflow_held(self) -> int | None: ...
 
 class HealthCheck:
     @property
@@ -96,7 +102,7 @@ class Transaction:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> Job[dict[str, Any]]: ...
@@ -108,7 +114,7 @@ class Transaction:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
@@ -122,10 +128,50 @@ class Transaction:
         exc_tb: Any | None,
     ) -> bool: ...
 
+class SyncTransaction:
+    def execute(self, query: str, *args: Any) -> int: ...
+    def fetch_one(self, query: str, *args: Any) -> dict[str, Any]: ...
+    def fetch_optional(self, query: str, *args: Any) -> dict[str, Any] | None: ...
+    def fetch_all(self, query: str, *args: Any) -> list[dict[str, Any]]: ...
+    def insert(
+        self,
+        args: Any,
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> Job[dict[str, Any]]: ...
+    def insert_many(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> list[Job[dict[str, Any]]]: ...
+    def commit(self) -> None: ...
+    def rollback(self) -> None: ...
+    def __enter__(self) -> SyncTransaction: ...
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: Any | None,
+    ) -> bool: ...
+
 class Client:
     def __init__(
         self, database_url: str, max_connections: int = 10
     ) -> None: ...
+    # Async methods
     async def insert(
         self,
         args: Any,
@@ -134,7 +180,7 @@ class Client:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> Job[dict[str, Any]]: ...
@@ -168,13 +214,88 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     async def health_check(self) -> HealthCheck: ...
+    async def insert_many_copy(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> list[Job[dict[str, Any]]]: ...
+    def periodic(
+        self,
+        name: str,
+        cron_expr: str,
+        args_type: type[T],
+        args: T,
+        *,
+        timezone: str = "UTC",
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+    ) -> None: ...
     def start(
         self,
-        queues: list[tuple[str, int]] | None = None,
+        queues: list[tuple[str, int]] | list[dict[str, Any]] | None = None,
         *,
         poll_interval_ms: int = 200,
+        global_max_workers: int | None = None,
     ) -> None: ...
     async def shutdown(self, timeout_ms: int = 2000) -> None: ...
+    # Sync methods
+    def insert_sync(
+        self,
+        args: Any,
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> Job[dict[str, Any]]: ...
+    def migrate_sync(self) -> None: ...
+    def transaction_sync(self) -> SyncTransaction: ...
+    def retry_sync(self, job_id: int) -> Job[dict[str, Any]] | None: ...
+    def cancel_sync(self, job_id: int) -> Job[dict[str, Any]] | None: ...
+    def retry_failed_sync(
+        self, *, kind: str | None = None, queue: str | None = None
+    ) -> list[Job[dict[str, Any]]]: ...
+    def discard_failed_sync(self, kind: str) -> int: ...
+    def pause_queue_sync(
+        self, queue: str, paused_by: str | None = None
+    ) -> None: ...
+    def resume_queue_sync(self, queue: str) -> None: ...
+    def drain_queue_sync(self, queue: str) -> int: ...
+    def queue_stats_sync(self) -> list[dict[str, Any]]: ...
+    def list_jobs_sync(
+        self,
+        *,
+        state: str | None = None,
+        kind: str | None = None,
+        queue: str | None = None,
+        limit: int = 100,
+    ) -> list[Job[dict[str, Any]]]: ...
+    def health_check_sync(self) -> HealthCheck: ...
+    def insert_many_copy_sync(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> list[Job[dict[str, Any]]]: ...
 
 # Functions
 def derive_kind(name: str) -> str: ...

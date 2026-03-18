@@ -1,10 +1,10 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
 use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error};
 use crate::job::{py_to_json, PyJob};
-use crate::transaction::{insert_raw_job, parse_run_at, PyTransaction};
+use crate::transaction::{insert_raw_job, parse_run_at, PySyncTransaction, PyTransaction};
 use crate::worker::PythonWorker;
 use awa_model::admin::ListJobsFilter;
-use awa_model::{InsertOpts, JobState};
+use awa_model::{InsertOpts, InsertParams, JobState, PeriodicJob};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sqlx::postgres::PgPoolOptions;
@@ -67,9 +67,19 @@ pub struct PyQueueHealth {
     #[pyo3(get)]
     pub in_flight: u32,
     #[pyo3(get)]
-    pub max_workers: u32,
-    #[pyo3(get)]
     pub available: u64,
+    /// Hard-reserved mode only: maximum workers for this queue.
+    #[pyo3(get)]
+    pub max_workers: Option<u32>,
+    /// Weighted mode only: minimum guaranteed workers.
+    #[pyo3(get)]
+    pub min_workers: Option<u32>,
+    /// Weighted mode only: queue weight for overflow allocation.
+    #[pyo3(get)]
+    pub weight: Option<u32>,
+    /// Weighted mode only: current overflow permits held.
+    #[pyo3(get)]
+    pub overflow_held: Option<u32>,
 }
 
 #[pyclass(frozen, name = "HealthCheck", skip_from_py_object)]
@@ -128,6 +138,7 @@ impl Clone for WorkerEntry {
 pub struct PyClient {
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
+    periodic_jobs: Arc<Mutex<Vec<PeriodicJob>>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
 }
 
@@ -148,6 +159,7 @@ impl PyClient {
         Ok(Self {
             pool,
             workers: Arc::new(RwLock::new(HashMap::new())),
+            periodic_jobs: Arc::new(Mutex::new(Vec::new())),
             runtime: Arc::new(Mutex::new(None)),
         })
     }
@@ -282,6 +294,56 @@ impl PyClient {
         )?;
 
         Ok(decorator.into_any().unbind())
+    }
+
+    /// Register a periodic (cron) job schedule.
+    ///
+    /// The schedule is synced to the database by the leader and evaluated
+    /// every second to enqueue jobs when they're due.
+    #[pyo3(signature = (name, cron_expr, args_type, args, *, timezone="UTC".to_string(), queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn periodic(
+        &self,
+        py: Python<'_>,
+        name: String,
+        cron_expr: String,
+        args_type: Py<PyAny>,
+        args: Py<PyAny>,
+        timezone: String,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let args_bound = args.bind(py);
+        let kind = {
+            let class_name = get_type_class_name(args_type.bind(py).as_any())?;
+            derive_kind(&class_name)
+        };
+        let args_json = serialize_args(py, args_bound)?;
+        let metadata_json = metadata
+            .as_ref()
+            .map(|value| py_to_json(py, value.bind(py)))
+            .transpose()?
+            .unwrap_or(serde_json::json!({}));
+
+        let periodic_job = PeriodicJob::builder(&name, &cron_expr)
+            .timezone(&timezone)
+            .queue(&queue)
+            .priority(priority)
+            .max_attempts(max_attempts)
+            .tags(tags)
+            .metadata(metadata_json)
+            .build_raw(kind, args_json)
+            .map_err(map_awa_error)?;
+
+        self.periodic_jobs
+            .lock()
+            .expect("periodic_jobs mutex poisoned")
+            .push(periodic_job);
+
+        Ok(())
     }
 
     fn retry<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
@@ -460,12 +522,13 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None))]
     fn start(
         &self,
-        _py: Python<'_>,
-        queues: Option<Vec<(String, u32)>>,
+        py: Python<'_>,
+        queues: Option<Py<PyAny>>,
         poll_interval_ms: u64,
+        global_max_workers: Option<u32>,
     ) -> PyResult<()> {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
@@ -488,20 +551,38 @@ impl PyClient {
             ));
         }
 
-        let queue_configs = normalize_queue_configs(queues, &entries)?;
+        let parsed_configs = parse_queue_configs(py, queues.as_ref(), global_max_workers)?;
+        let queue_configs = normalize_queue_configs(parsed_configs, &entries, global_max_workers)?;
+
         let mut builder = awa_worker::Client::builder(self.pool.clone());
-        for (queue, max_workers) in &queue_configs {
+        for config in &queue_configs {
             builder = builder.queue(
-                queue.clone(),
+                config.name.clone(),
                 awa_worker::QueueConfig {
-                    max_workers: *max_workers,
+                    max_workers: config.max_workers,
                     poll_interval: Duration::from_millis(poll_interval_ms),
+                    rate_limit: config.rate_limit.clone(),
+                    min_workers: config.min_workers,
+                    weight: config.weight,
                     ..Default::default()
                 },
             );
         }
+        if let Some(global_max) = global_max_workers {
+            builder = builder.global_max_workers(global_max);
+        }
         for entry in &entries {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
+        }
+
+        // Register periodic jobs
+        let periodic_jobs = self
+            .periodic_jobs
+            .lock()
+            .expect("periodic_jobs mutex poisoned")
+            .clone();
+        for job in periodic_jobs {
+            builder = builder.periodic(job);
         }
 
         let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
@@ -522,26 +603,558 @@ impl PyClient {
             Ok(())
         })
     }
+
+    // ── COPY batch insert (async + sync) ────────────────────────────
+
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_many_copy<'py>(
+        &self,
+        py: Python<'py>,
+        jobs: Vec<Py<PyAny>>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let insert_params = prepare_insert_many_params(
+            py,
+            &jobs,
+            kind,
+            &queue,
+            priority,
+            max_attempts,
+            &tags,
+            metadata.as_ref(),
+            run_at.as_ref(),
+        )?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let results = awa_model::insert_many_copy_from_pool(&pool, &insert_params)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                let list = pyo3::types::PyList::empty(py);
+                for row in results {
+                    list.append(Py::new(py, PyJob::from(row))?)?;
+                }
+                Ok(list.unbind())
+            })
+        })
+    }
+
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_many_copy_sync(
+        &self,
+        py: Python<'_>,
+        jobs: Vec<Py<PyAny>>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+    ) -> PyResult<Vec<PyJob>> {
+        let pool = self.pool.clone();
+        let insert_params = prepare_insert_many_params(
+            py,
+            &jobs,
+            kind,
+            &queue,
+            priority,
+            max_attempts,
+            &tags,
+            metadata.as_ref(),
+            run_at.as_ref(),
+        )?;
+
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let results = awa_model::insert_many_copy_from_pool(&pool, &insert_params)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(results.into_iter().map(PyJob::from).collect())
+            })
+        })
+    }
+
+    // ── Sync counterparts ───────────────────────────────────────────
+
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_sync(
+        &self,
+        py: Python<'_>,
+        args: Py<PyAny>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+    ) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        let args_bound = args.bind(py);
+        let kind_str = match kind {
+            Some(k) => k,
+            None => {
+                let class_name = get_type_class_name(args_bound.get_type().as_any())?;
+                derive_kind(&class_name)
+            }
+        };
+        let metadata_json = metadata
+            .as_ref()
+            .map(|value| py_to_json(py, value.bind(py)))
+            .transpose()?
+            .unwrap_or(serde_json::json!({}));
+        let run_at_dt = run_at
+            .as_ref()
+            .map(|value| parse_run_at(py, value.bind(py)))
+            .transpose()?;
+        let args_json = serialize_args(py, args_bound)?;
+
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = insert_raw_job(
+                    &pool,
+                    &kind_str,
+                    &args_json,
+                    InsertOpts {
+                        queue,
+                        priority,
+                        max_attempts,
+                        run_at: run_at_dt,
+                        metadata: metadata_json,
+                        tags,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
+        })
+    }
+
+    fn migrate_sync(&self, py: Python<'_>) -> PyResult<()> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::migrations::run(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(())
+            })
+        })
+    }
+
+    fn transaction_sync(&self, py: Python<'_>) -> PyResult<PySyncTransaction> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let tx = pool.begin().await.map_err(map_sqlx_error)?;
+                Ok(PySyncTransaction::new(tx))
+            })
+        })
+    }
+
+    fn retry_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<Option<PyJob>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::admin::retry(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(row.map(PyJob::from))
+            })
+        })
+    }
+
+    fn cancel_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<Option<PyJob>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::admin::cancel(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(row.map(PyJob::from))
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None))]
+    fn retry_failed_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+    ) -> PyResult<Vec<PyJob>> {
+        match (&kind, &queue) {
+            (Some(_), None) | (None, Some(_)) => {}
+            _ => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Specify exactly one of kind or queue",
+                ));
+            }
+        }
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let jobs = match (kind, queue) {
+                    (Some(kind), None) => {
+                        awa_model::admin::retry_failed_by_kind(&pool, &kind).await
+                    }
+                    (None, Some(queue)) => {
+                        awa_model::admin::retry_failed_by_queue(&pool, &queue).await
+                    }
+                    _ => unreachable!(),
+                }
+                .map_err(map_awa_error)?;
+                Ok(jobs.into_iter().map(PyJob::from).collect())
+            })
+        })
+    }
+
+    fn discard_failed_sync(&self, py: Python<'_>, kind: String) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let count = awa_model::admin::discard_failed(&pool, &kind)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(count)
+            })
+        })
+    }
+
+    #[pyo3(signature = (queue, paused_by=None))]
+    fn pause_queue_sync(
+        &self,
+        py: Python<'_>,
+        queue: String,
+        paused_by: Option<String>,
+    ) -> PyResult<()> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::admin::pause_queue(&pool, &queue, paused_by.as_deref())
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(())
+            })
+        })
+    }
+
+    fn resume_queue_sync(&self, py: Python<'_>, queue: String) -> PyResult<()> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::admin::resume_queue(&pool, &queue)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(())
+            })
+        })
+    }
+
+    fn drain_queue_sync(&self, py: Python<'_>, queue: String) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let count = awa_model::admin::drain_queue(&pool, &queue)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(count)
+            })
+        })
+    }
+
+    fn queue_stats_sync(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let stats = awa_model::admin::queue_stats(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| {
+                    let list = pyo3::types::PyList::empty(py);
+                    for stat in &stats {
+                        let dict = PyDict::new(py);
+                        dict.set_item("queue", &stat.queue)?;
+                        dict.set_item("available", stat.available)?;
+                        dict.set_item("running", stat.running)?;
+                        dict.set_item("failed", stat.failed)?;
+                        dict.set_item("completed_last_hour", stat.completed_last_hour)?;
+                        dict.set_item("lag_seconds", stat.lag_seconds)?;
+                        list.append(dict)?;
+                    }
+                    Ok(list.into_any().unbind())
+                })
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, state=None, kind=None, queue=None, limit=100))]
+    fn list_jobs_sync(
+        &self,
+        py: Python<'_>,
+        state: Option<String>,
+        kind: Option<String>,
+        queue: Option<String>,
+        limit: i64,
+    ) -> PyResult<Vec<PyJob>> {
+        let pool = self.pool.clone();
+        let parsed_state = state.as_deref().map(parse_job_state).transpose()?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let filter = ListJobsFilter {
+                    state: parsed_state,
+                    kind,
+                    queue,
+                    limit: Some(limit),
+                };
+                let jobs = awa_model::admin::list_jobs(&pool, &filter)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(jobs.into_iter().map(PyJob::from).collect())
+            })
+        })
+    }
+
+    fn health_check_sync(&self, py: Python<'_>) -> PyResult<PyHealthCheck> {
+        let pool = self.pool.clone();
+        let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                if let Some(runtime) = runtime {
+                    let health = runtime.health_check().await;
+                    return Ok(map_health_check(health));
+                }
+                let postgres_connected = sqlx::query("SELECT 1").execute(&pool).await.is_ok();
+                Ok(PyHealthCheck {
+                    healthy: false,
+                    postgres_connected,
+                    poll_loop_alive: false,
+                    heartbeat_alive: false,
+                    shutting_down: false,
+                    leader: false,
+                    queues: HashMap::new(),
+                })
+            })
+        })
+    }
+}
+
+/// Convert a list of Python job args into InsertParams for the COPY path.
+#[allow(clippy::too_many_arguments)]
+fn prepare_insert_many_params(
+    py: Python<'_>,
+    jobs: &[Py<PyAny>],
+    kind: Option<String>,
+    queue: &str,
+    priority: i16,
+    max_attempts: i16,
+    tags: &[String],
+    metadata: Option<&Py<PyAny>>,
+    run_at: Option<&Py<PyAny>>,
+) -> PyResult<Vec<InsertParams>> {
+    let metadata_json = metadata
+        .map(|value| py_to_json(py, value.bind(py)))
+        .transpose()?
+        .unwrap_or(serde_json::json!({}));
+    let run_at_dt = run_at
+        .map(|value| parse_run_at(py, value.bind(py)))
+        .transpose()?;
+
+    jobs.iter()
+        .map(|job| {
+            let bound = job.bind(py);
+            let kind_str = match &kind {
+                Some(k) => k.clone(),
+                None => {
+                    let class_name = get_type_class_name(bound.get_type().as_any())?;
+                    Ok::<_, PyErr>(derive_kind(&class_name))
+                }?,
+            };
+            let args_json = serialize_args(py, bound)?;
+            Ok(InsertParams {
+                kind: kind_str,
+                args: args_json,
+                opts: InsertOpts {
+                    queue: queue.to_string(),
+                    priority,
+                    max_attempts,
+                    run_at: run_at_dt,
+                    metadata: metadata_json.clone(),
+                    tags: tags.to_vec(),
+                    ..Default::default()
+                },
+            })
+        })
+        .collect()
+}
+
+/// Parsed queue configuration from Python input.
+struct ParsedQueueConfig {
+    name: String,
+    max_workers: u32,
+    min_workers: u32,
+    weight: u32,
+    rate_limit: Option<awa_worker::RateLimit>,
+}
+
+/// Parse queue configs from Python input (list of tuples or dicts).
+fn parse_queue_configs(
+    py: Python<'_>,
+    queues: Option<&Py<PyAny>>,
+    global_max_workers: Option<u32>,
+) -> PyResult<Option<Vec<ParsedQueueConfig>>> {
+    let queues = match queues {
+        Some(q) => q,
+        None => {
+            if global_max_workers.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "weighted mode requires explicit queue configs (global_max_workers set but queues=None)",
+                ));
+            }
+            return Ok(None);
+        }
+    };
+
+    let bound = queues.bind(py);
+    let list: Vec<Bound<'_, PyAny>> = bound.extract()?;
+    let mut configs = Vec::new();
+
+    for item in &list {
+        // Try tuple form first: (name, max_workers)
+        if let Ok(tuple) = item.extract::<(String, u32)>() {
+            if global_max_workers.is_some() {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "tuple queue config is not supported with global_max_workers; use dict form with min_workers/weight",
+                ));
+            }
+            configs.push(ParsedQueueConfig {
+                name: tuple.0,
+                max_workers: tuple.1,
+                min_workers: 0,
+                weight: 1,
+                rate_limit: None,
+            });
+            continue;
+        }
+
+        // Dict form
+        let dict: &Bound<'_, PyDict> = item.cast().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "queue config must be a (name, max_workers) tuple or a dict",
+            )
+        })?;
+
+        let name: String = dict
+            .get_item("name")?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err("queue config dict must have 'name' key")
+            })?
+            .extract()?;
+
+        let has_max = dict.get_item("max_workers")?.is_some();
+        let has_min = dict.get_item("min_workers")?.is_some();
+
+        if has_max && has_min {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "use max_workers for hard-reserved mode or min_workers for weighted mode, not both",
+            ));
+        }
+
+        let max_workers = if has_max {
+            dict.get_item("max_workers")?.unwrap().extract()?
+        } else if global_max_workers.is_none() && !has_min {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "max_workers required in hard-reserved mode (no global_max_workers set)",
+            ));
+        } else {
+            50 // default, unused in weighted mode
+        };
+
+        let min_workers: u32 = dict
+            .get_item("min_workers")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(0);
+
+        let weight: u32 = dict
+            .get_item("weight")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(1);
+
+        if weight == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "weight must be > 0",
+            ));
+        }
+
+        let rate_limit = if let Some(rl_val) = dict.get_item("rate_limit")? {
+            if rl_val.is_none() {
+                None
+            } else {
+                let (max_rate, burst): (f64, u32) = rl_val.extract().map_err(|_| {
+                    pyo3::exceptions::PyTypeError::new_err(
+                        "rate_limit must be a (max_rate: float, burst: int) tuple or None",
+                    )
+                })?;
+                Some(awa_worker::RateLimit { max_rate, burst })
+            }
+        } else {
+            None
+        };
+
+        configs.push(ParsedQueueConfig {
+            name,
+            max_workers,
+            min_workers,
+            weight,
+            rate_limit,
+        });
+    }
+
+    Ok(Some(configs))
 }
 
 fn normalize_queue_configs(
-    queues: Option<Vec<(String, u32)>>,
+    parsed: Option<Vec<ParsedQueueConfig>>,
     entries: &[WorkerEntry],
-) -> PyResult<Vec<(String, u32)>> {
-    let configured = if let Some(queues) = queues {
-        queues
+    global_max_workers: Option<u32>,
+) -> PyResult<Vec<ParsedQueueConfig>> {
+    let configured = if let Some(configs) = parsed {
+        configs
     } else {
+        // Infer from registered workers
         let mut inferred = Vec::new();
         let mut seen = HashSet::new();
         for entry in entries {
             if seen.insert(entry.queue.clone()) {
-                inferred.push((entry.queue.clone(), 10));
+                let default_max = if global_max_workers.is_some() { 50 } else { 10 };
+                inferred.push(ParsedQueueConfig {
+                    name: entry.queue.clone(),
+                    max_workers: default_max,
+                    min_workers: 0,
+                    weight: 1,
+                    rate_limit: None,
+                });
             }
         }
         inferred
     };
 
-    let configured_names: HashSet<_> = configured.iter().map(|(queue, _)| queue.clone()).collect();
+    let configured_names: HashSet<_> = configured.iter().map(|c| c.name.clone()).collect();
     let missing: Vec<_> = entries
         .iter()
         .filter(|entry| !configured_names.contains(&entry.queue))
@@ -569,12 +1182,25 @@ fn map_health_check(health: awa_worker::HealthCheck) -> PyHealthCheck {
             .queues
             .into_iter()
             .map(|(queue, stats)| {
+                let (max_workers, min_workers, weight, overflow_held) = match stats.capacity {
+                    awa_worker::QueueCapacity::HardReserved { max_workers } => {
+                        (Some(max_workers), None, None, None)
+                    }
+                    awa_worker::QueueCapacity::Weighted {
+                        min_workers,
+                        weight,
+                        overflow_held,
+                    } => (None, Some(min_workers), Some(weight), Some(overflow_held)),
+                };
                 (
                     queue,
                     PyQueueHealth {
                         in_flight: stats.in_flight,
-                        max_workers: stats.max_workers,
                         available: stats.available,
+                        max_workers,
+                        min_workers,
+                        weight,
+                        overflow_held,
                     },
                 )
             })

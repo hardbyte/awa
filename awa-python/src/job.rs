@@ -226,6 +226,7 @@ pub fn py_to_json(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<serde_json
 
 const MAX_JSON_DEPTH: usize = 64;
 
+#[allow(clippy::only_used_in_recursion)]
 fn py_to_json_inner(
     py: Python<'_>,
     obj: &Bound<'_, PyAny>,

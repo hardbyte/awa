@@ -11,15 +11,15 @@ The Rust runtime owns all queue machinery -- polling, heartbeating, crash recove
 ```
 awa (workspace)
 ├── awa-macros        proc-macro crate: #[derive(JobArgs)] and CamelCase→snake_case
-├── awa-model         Core types, SQL, migrations, insert/admin APIs
-│   └── depends on: awa-macros, sqlx, blake3, serde, chrono
+├── awa-model         Core types, SQL, migrations, insert/admin/cron APIs
+│   └── depends on: awa-macros, sqlx, blake3, serde, chrono, chrono-tz, croner
 ├── awa-worker        Runtime: Client, Dispatcher, Executor, Heartbeat, Maintenance, Metrics
-│   └── depends on: awa-model, sqlx, tokio, opentelemetry
+│   └── depends on: awa-model, sqlx, tokio, opentelemetry, croner, chrono-tz
 ├── awa               Facade crate re-exporting awa-model + awa-worker
 │   └── depends on: awa-model, awa-macros, awa-worker
 ├── awa-testing       Test utilities (TestClient, WorkResult)
 │   └── depends on: awa-model, awa-worker
-├── awa-cli           CLI binary: migrations, job/queue admin
+├── awa-cli           CLI binary: migrations, job/queue/cron admin
 │   └── depends on: awa-model, clap
 └── awa-python        PyO3 cdylib: Python bindings (separate Cargo workspace)
     └── depends on: awa-model, awa-worker, pyo3, pyo3-async-runtimes
@@ -100,6 +100,21 @@ INSERT INTO awa.jobs (...) VALUES (...)
 
 Insert accepts a `PgExecutor`, so it works inside an existing transaction -- the job becomes visible only when the outer transaction commits. This is the "transactional enqueue" pattern (PRD section 1).
 
+### Batch Insert via COPY
+
+For high-throughput ingestion (10K+ jobs), `insert_many_copy` uses PostgreSQL's COPY protocol via a staging table approach (see ADR-008):
+
+```
+insert_many_copy(conn, jobs)
+    │
+    ├── CREATE TEMP TABLE awa_copy_staging (...) ON COMMIT DROP
+    ├── COPY awa_copy_staging FROM STDIN (CSV)       ◄── no triggers, no constraints
+    ├── INSERT INTO awa.jobs SELECT ... FROM staging  ◄── ON CONFLICT DO NOTHING for unique
+    └── RETURNING *
+```
+
+Accepts `&mut PgConnection`, so it works within caller-managed transactions. `insert_many_copy_from_pool` is a convenience wrapper that manages its own transaction.
+
 ### Poll and Claim (Dispatcher)
 
 Each queue has a `Dispatcher` that runs a poll loop:
@@ -111,11 +126,13 @@ Dispatcher::run()
     │
     └── loop:
         ├── Wait for NOTIFY or poll_interval (default 200ms)
-        ├── Check semaphore permits (max_workers limit)
         └── poll_once():
             │
+            ├── Pre-acquire permits (non-blocking: semaphore or overflow pool)
+            ├── Apply rate limit (truncate if throttled)
+            │
             ▼
-            CTE claim query (claim.sql):
+            CTE claim query:
               WITH claimed AS (
                 SELECT id FROM awa.jobs
                 WHERE state='available' AND queue=$1 AND run_at<=now()
@@ -125,11 +142,13 @@ Dispatcher::run()
               )
               UPDATE awa.jobs SET state='running', attempt=attempt+1, ...
             │
+            ├── Release excess permits (if DB returned fewer jobs)
+            ├── Consume rate limit tokens
             ▼
-            For each claimed job → executor.execute(job)
+            For each claimed job + permit → executor.execute(job)
 ```
 
-`FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job (PRD section 6.2).
+Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job (PRD section 6.2).
 
 ### Execute (Executor)
 
@@ -144,7 +163,11 @@ tokio::spawn(async {
     worker.perform(&job, &ctx)         ◄── dispatch to registered handler
     │
     ▼
-    complete_job(pool, job, result)     ◄── UPDATE state based on outcome
+    complete_job(pool, job, &result)    ◄── UPDATE state + 'AND state = running' guard
+    │
+    ├── Ok(true):  state transitioned → record metrics
+    ├── Ok(false): already rescued/cancelled → skip metrics
+    └── Err:       DB error → log error
     │
     ├── Ok(Completed)    → state = 'completed'
     ├── Ok(RetryAfter)   → state = 'retryable', run_at = now() + duration
@@ -160,6 +183,10 @@ tokio::spawn(async {
 
 Backoff uses a database-side function `awa.backoff_duration(attempt, max_attempts)` implementing exponential backoff with jitter, capped at 24 hours (PRD section 6.3).
 
+### State Guard on Completion
+
+All `UPDATE` statements in `complete_job()` include `AND state = 'running'` to prevent late completions from overwriting rescued/cancelled state. If `rows_affected() == 0`, the job was already rescued by maintenance or cancelled by an admin — the handler's result is silently discarded. Metrics are only recorded when the state transition succeeds.
+
 ### Complete and Retry
 
 When a retryable job's backoff elapses, the maintenance service promotes it back to `available`:
@@ -168,6 +195,91 @@ When a retryable job's backoff elapses, the maintenance service promotes it back
 UPDATE awa.jobs SET state = 'available'
 WHERE state = 'retryable' AND run_at <= now()
 ```
+
+## Queue Concurrency Modes
+
+Awa supports two concurrency modes, selected at build time (see ADR-011):
+
+### Hard-Reserved (Default)
+
+Each queue owns an independent semaphore with `max_workers` permits. Simple and predictable — queues cannot interfere with each other.
+
+### Weighted (Global Pool)
+
+Enabled by `ClientBuilder::global_max_workers(N)`. Each queue gets a guaranteed `min_workers` local semaphore plus access to a shared `OverflowPool` for additional capacity. Overflow is allocated proportionally to per-queue `weight` values using a work-conserving weighted fair-share algorithm.
+
+The dispatcher uses a **permit-before-claim** flow: permits are pre-acquired (non-blocking) before claiming jobs from the database, ensuring every job marked `running` has a reserved execution slot.
+
+### Per-Queue Rate Limiting
+
+An optional token bucket rate limiter can be configured per queue (see ADR-010). When set, the dispatcher gates the batch size by available tokens, preventing downstream systems from being overwhelmed. Rate limiting composes with both concurrency modes.
+
+## Graceful Shutdown
+
+Shutdown uses a phased lifecycle with separate cancellation domains:
+
+1. **Stop dispatchers** (`dispatch_cancel`) — no new jobs are claimed
+2. **Signal in-flight cancellation** — handlers see `ctx.is_cancelled() == true`
+3. **Wait for dispatchers** to exit their poll loops
+4. **Drain in-flight jobs** via `JoinSet` — heartbeat and maintenance remain alive during drain to prevent false rescue
+5. **Stop services** (`service_cancel`) — heartbeat and maintenance shut down
+
+This ensures in-flight jobs complete (or timeout) with heartbeats still running, preventing other workers from rescuing jobs that are still actively executing.
+
+## Periodic/Cron Jobs
+
+Awa supports periodic job scheduling via the `PeriodicJob` API. Schedules are defined in application code, synced to an `awa.cron_jobs` table, and evaluated by the maintenance leader. See ADR-007 for design rationale.
+
+### Registration
+
+```rust
+let client = Client::builder(pool)
+    .queue("default", QueueConfig::default())
+    .register::<DailyReport, _, _>(handle_daily_report)
+    .periodic(
+        PeriodicJob::builder("daily_report", "0 9 * * *")
+            .timezone("Pacific/Auckland")
+            .build(&DailyReport { format: "pdf".into() })?
+    )
+    .build()?;
+```
+
+```python
+client.periodic(
+    name="daily_report",
+    cron_expr="0 9 * * *",
+    args_type=DailyReport,
+    args=DailyReport(format="pdf"),
+    timezone="Pacific/Auckland",
+)
+```
+
+Cron expressions and timezones are validated eagerly at registration time via the `croner` crate and `chrono-tz`.
+
+### Scheduler Flow (Leader-Only)
+
+```
+MaintenanceService (leader)
+    │
+    ├── Every 60s: sync_periodic_jobs_to_db()
+    │   └── UPSERT all registered schedules (additive, no deletes)
+    │
+    ├── Every 1s: evaluate_cron_schedules()
+    │   ├── SELECT * FROM awa.cron_jobs
+    │   ├── For each: compute latest fire time ≤ now, after last_enqueued_at
+    │   └── If due: atomic CTE (mark last_enqueued_at + INSERT INTO awa.jobs)
+    │
+    └── Every 30s: leader liveness check
+        └── SELECT 1 on leader connection (break to re-election if dead)
+```
+
+### Crash Safety
+
+The atomic enqueue CTE combines the schedule update and job insertion into a single statement. If the process crashes mid-transaction, Postgres rolls back both. The `IS NOT DISTINCT FROM` clause on `last_enqueued_at` acts as a compare-and-swap, preventing double-fires across leader failovers.
+
+### Multi-Deployment Safety
+
+Sync is additive (UPSERT only). Multiple deployments sharing the same database will not delete each other's schedules. Stale schedules can be removed via `awa cron remove <name>`.
 
 ## Crash Recovery Model
 
@@ -178,17 +290,19 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 - The `HeartbeatService` runs on every worker instance (not leader-elected).
 - Every 30 seconds (configurable), it batch-updates `heartbeat_at = now()` for all in-flight job IDs on this worker.
 - The maintenance leader (leader-elected via `pg_try_advisory_lock`) periodically scans for running jobs where `heartbeat_at < now() - 90s` and transitions them to `retryable`.
+- After rescue, the maintenance service signals cancellation (`ctx.is_cancelled() == true`) for any rescued jobs still running on this worker instance.
 - **Catches:** Worker process crash, OOM kill, network partition, pod eviction.
 
 ### 2. Hard Deadline (Runaway Protection)
 
 - At claim time, `deadline_at = now() + deadline_duration` is set (default: 5 minutes).
 - The maintenance leader periodically scans for running jobs where `deadline_at < now()` and transitions them to `retryable`.
+- After rescue, the maintenance service signals cancellation to the in-flight handler via `ctx.is_cancelled()`, so long-running handlers can observe the deadline and exit gracefully.
 - **Catches:** Infinite loops, hung I/O, deadlocks, GIL-blocked Python handlers that prevent heartbeat updates.
 
 ### Leader Election
 
-Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds.
+Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup, cron evaluation) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds. The leader verifies its connection is still alive every 30 seconds; if the ping fails, it re-enters the election loop.
 
 ## Python Integration via PyO3
 
@@ -206,20 +320,29 @@ await client.health_check()     ───►   awa_worker::Client::health_check(
 async def handle(job):                  handler + task locals registered
     ...
 
-client.start([("email", 10)])    ───►   awa_worker::Client::start()
-                                         ├── Dispatcher (`SKIP LOCKED` + LISTEN/NOTIFY)
-                                         ├── HeartbeatService
-                                         ├── MaintenanceService
-                                         └── PythonWorker bridge
-                                             └── into_future_with_locals(...)
+client.periodic(                 ───►   PeriodicJob registered
+    name="report", cron_expr="0 9 * * *",
+    args_type=Report, args=Report(...),
+    timezone="Pacific/Auckland",
+)
 
-await client.shutdown()          ───►   graceful drain + cancellation
+client.start([("email", 10)])    ───►   awa_worker::Client::start()
+# or dict form:                          ├── Dispatcher (`SKIP LOCKED` + LISTEN/NOTIFY)
+# client.start(                          ├── HeartbeatService
+#   [{"name":"email",                    ├── MaintenanceService
+#     "min_workers":5,                   └── PythonWorker bridge
+#     "weight":2,                            └── into_future_with_locals(...)
+#     "rate_limit":(10.0, 20)}],
+#   global_max_workers=30)
+
+await client.shutdown()          ───►   phased drain + cancellation
 ```
 
 Key design decisions:
 
 - **Single runtime:** Python workers do not run a separate poller. They register callbacks, then delegate polling, heartbeats, maintenance, and shutdown to `awa-worker`.
 - **Async bridge:** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. Registered Python handlers are driven from Rust via `into_future_with_locals`, using task-local event loop state captured when the handler is registered.
+- **Sync support:** Every async database method has a `_sync` counterpart using `py.detach(|| block_on(...))` for Django/Flask handlers (see ADR-009). `SyncTransaction` provides `__enter__`/`__exit__` context manager support.
 - **Heartbeats survive GIL blocks:** Heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL. Even if a Python handler blocks the GIL (e.g., CPU-bound work in a sync call), heartbeats continue uninterrupted.
 - **Type bridging:** Python dataclasses and pydantic BaseModels are serialized to `serde_json::Value` via `model_dump(mode="json")` or `dataclasses.asdict()`. On dispatch, the bridge reconstructs the typed args object before invoking the handler and exposes `job.is_cancelled()` from the shared Rust cancellation flag.
 
@@ -234,7 +357,7 @@ All components emit structured tracing spans via the `tracing` crate with `#[ins
 | `job.execute` | executor.rs | `job.id`, `job.kind`, `job.queue`, `job.attempt`, `otel.status_code` |
 | `insert_with` | insert.rs | `job.kind`, `job.queue` |
 | `insert_many` | insert.rs | `job.count` |
-| `run` (dispatcher) | dispatcher.rs | `queue`, `max_workers` |
+| `run` (dispatcher) | dispatcher.rs | `queue` |
 | `poll_once` | dispatcher.rs | `queue` |
 | `run` (heartbeat) | heartbeat.rs | `interval_ms` |
 | `heartbeat_once` | heartbeat.rs | — |
@@ -242,6 +365,8 @@ All components emit structured tracing spans via the `tracing` crate with `#[ins
 | `maintenance.rescue_deadline` | maintenance.rs | — |
 | `maintenance.promote` | maintenance.rs | — |
 | `maintenance.cleanup` | maintenance.rs | — |
+| `maintenance.cron_sync` | maintenance.rs | — |
+| `maintenance.cron_eval` | maintenance.rs | — |
 
 The `job.execute` span records `otel.status_code = "OK"` on success or `"ERROR"` on terminal failure, compatible with OpenTelemetry trace semantics.
 
@@ -296,6 +421,6 @@ Awa workers are stateless processes. All state lives in Postgres.
 
 - **Horizontal scaling:** Add more worker pods. `SKIP LOCKED` ensures no double dispatch.
 - **Leader election:** Only one pod runs maintenance tasks at a time via `pg_try_advisory_lock`. If the leader dies, another pod acquires the lock within 10 seconds.
-- **Graceful shutdown:** `Client::shutdown(timeout)` cancels all tasks and waits for in-flight jobs to complete. In Kubernetes, set `terminationGracePeriodSeconds` to match the drain timeout.
+- **Graceful shutdown:** `Client::shutdown(timeout)` uses a phased approach: stops dispatchers first (no new claims), then drains in-flight jobs while heartbeat and maintenance remain alive to prevent false rescue, then shuts down background services. In Kubernetes, set `terminationGracePeriodSeconds` to match the drain timeout.
 - **No sticky state:** Workers can be rescheduled to any node. The Postgres connection pool is the only external dependency.
 - **Queue assignment:** Different deployments can handle different queues by configuring `ClientBuilder::queue()`, enabling workload isolation (e.g., CPU-heavy jobs on dedicated node pools).

@@ -23,8 +23,8 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::JobNotFound { id } => {
             PyAwaError::new_err(format!("job not found: {id}"))
         }
-        awa_model::AwaError::UniqueConflict { existing_id } => {
-            let detail = existing_id
+        awa_model::AwaError::UniqueConflict { constraint } => {
+            let detail = constraint
                 .map(|value| format!(" ({value})"))
                 .unwrap_or_default();
             UniqueConflict::new_err(format!("unique conflict{detail}"))
@@ -35,6 +35,7 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::UnknownJobKind { kind } => {
             UnknownJobKind::new_err(format!("unknown job kind: {kind}"))
         }
+        awa_model::AwaError::Validation(msg) => ValidationError::new_err(msg),
         awa_model::AwaError::Serialization(err) => SerializationError::new_err(err.to_string()),
         awa_model::AwaError::Database(err) => map_sqlx_error(err),
     }

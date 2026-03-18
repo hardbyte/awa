@@ -10,6 +10,7 @@ from awa._awa import (
     QueueHealth,
     # Transaction
     Transaction,
+    SyncTransaction,
     # Handler return types
     RetryAfter,
     Snooze,
@@ -36,6 +37,7 @@ __all__ = [
     "HealthCheck",
     "QueueHealth",
     "Transaction",
+    "SyncTransaction",
     "RetryAfter",
     "Snooze",
     "Cancel",
