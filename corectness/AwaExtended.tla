@@ -15,11 +15,22 @@ MaxDemand == 2
 JobStates == {"available", "running", "retryable", "completed", "failed", "cancelled"}
 FinalStates == {"retryable", "completed", "failed", "cancelled"}
 PermitKinds == {"none", "local", "overflow"}
-NoOwner == "no_owner"
+NoWorker == "no_worker"
 
-VARIABLES jobState, owner, permitKind, cancelFlag, demand, shutdownPhase, heartbeatMode
+VARIABLES
+    jobState,
+    owner,
+    permitHolder,
+    permitKind,
+    cancelRequested,
+    shutdownPhase,
+    dispatchersAlive,
+    heartbeatAlive,
+    maintenanceAlive
 
-vars == <<jobState, owner, permitKind, cancelFlag, demand, shutdownPhase, heartbeatMode>>
+vars ==
+    <<jobState, owner, permitHolder, permitKind, cancelRequested,
+      shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 RECURSIVE SumSeq(_)
 SumSeq(seq) ==
@@ -29,20 +40,34 @@ SumSeq(seq) ==
 
 JobsInQueue(q) == {j \in Jobs : QueueOf[j] = q}
 
-AvailableInQueue(q) ==
-    \E j \in JobsInQueue(q) : jobState[j] = "available"
+UnreservedAvailableInQueue(q) ==
+    \E j \in JobsInQueue(q) : jobState[j] = "available" /\ permitHolder[j] = NoWorker
 
-LocalRunning(q) ==
-    Cardinality({j \in JobsInQueue(q) : jobState[j] = "running" /\ permitKind[j] = "local"})
+RunningJobs ==
+    {j \in Jobs : jobState[j] = "running"}
 
-OverflowRunning(q) ==
-    Cardinality({j \in JobsInQueue(q) : jobState[j] = "running" /\ permitKind[j] = "overflow"})
+HeldJobs(q, kind) ==
+    {j \in JobsInQueue(q) : permitHolder[j] \in Workers /\ permitKind[j] = kind}
 
-TotalOverflowRunning ==
-    Cardinality({j \in Jobs : jobState[j] = "running" /\ permitKind[j] = "overflow"})
+LocalHeld(q) ==
+    Cardinality(HeldJobs(q, "local"))
+
+OverflowHeld(q) ==
+    Cardinality(HeldJobs(q, "overflow"))
+
+TotalHeldPermits ==
+    Cardinality({j \in Jobs : permitHolder[j] \in Workers})
+
+TotalOverflowHeld ==
+    Cardinality({j \in Jobs : permitHolder[j] \in Workers /\ permitKind[j] = "overflow"})
+
+NeedsOverflow(q) ==
+    /\ dispatchersAlive
+    /\ UnreservedAvailableInQueue(q)
+    /\ LocalHeld(q) >= MinWorkers[q]
 
 Contending(q) ==
-    demand[q] > 0 \/ OverflowRunning(q) > 0
+    NeedsOverflow(q) \/ OverflowHeld(q) > 0
 
 ContendingWeight ==
     SumSeq([i \in 1..Len(QueueSeq) |->
@@ -56,117 +81,153 @@ FairShare(q) ==
 
 Init ==
     /\ jobState = [j \in Jobs |-> "available"]
-    /\ owner = [j \in Jobs |-> NoOwner]
+    /\ owner = [j \in Jobs |-> NoWorker]
+    /\ permitHolder = [j \in Jobs |-> NoWorker]
     /\ permitKind = [j \in Jobs |-> "none"]
-    /\ cancelFlag = [w \in Workers |-> FALSE]
-    /\ demand = [q \in Queues |-> 0]
+    /\ cancelRequested = [j \in Jobs |-> FALSE]
     /\ shutdownPhase = "running"
-    /\ heartbeatMode = "alive"
+    /\ dispatchersAlive = TRUE
+    /\ heartbeatAlive = TRUE
+    /\ maintenanceAlive = TRUE
 
-SetDemand(q, d) ==
-    /\ q \in Queues
-    /\ d \in 0..MaxDemand
-    /\ ~AvailableInQueue(q) => d = 0
-    /\ demand' = [demand EXCEPT ![q] = d]
-    /\ UNCHANGED <<jobState, owner, permitKind, cancelFlag, shutdownPhase, heartbeatMode>>
-
-ClaimLocal(w, j) ==
+ReserveLocal(w, j) ==
     LET q == WorkerQueue[w] IN
-    /\ shutdownPhase = "running"
+    /\ dispatchersAlive
     /\ jobState[j] = "available"
+    /\ permitHolder[j] = NoWorker
     /\ QueueOf[j] = q
-    /\ LocalRunning(q) < MinWorkers[q]
-    /\ jobState' = [jobState EXCEPT ![j] = "running"]
-    /\ owner' = [owner EXCEPT ![j] = w]
+    /\ LocalHeld(q) < MinWorkers[q]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = w]
     /\ permitKind' = [permitKind EXCEPT ![j] = "local"]
-    /\ UNCHANGED <<cancelFlag, demand, shutdownPhase, heartbeatMode>>
+    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
+    /\ UNCHANGED <<jobState, owner, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
-ClaimOverflow(w, j) ==
+ReserveOverflow(w, j) ==
     LET q == WorkerQueue[w] IN
-    /\ shutdownPhase = "running"
-    /\ heartbeatMode = "alive"
+    /\ dispatchersAlive
     /\ jobState[j] = "available"
+    /\ permitHolder[j] = NoWorker
     /\ QueueOf[j] = q
-    /\ LocalRunning(q) >= MinWorkers[q]
-    /\ demand[q] > 0
-    /\ TotalOverflowRunning < GlobalOverflow
-    /\ OverflowRunning(q) < FairShare(q)
-    /\ jobState' = [jobState EXCEPT ![j] = "running"]
-    /\ owner' = [owner EXCEPT ![j] = w]
+    /\ NeedsOverflow(q)
+    /\ TotalOverflowHeld < GlobalOverflow
+    /\ OverflowHeld(q) < FairShare(q)
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = w]
     /\ permitKind' = [permitKind EXCEPT ![j] = "overflow"]
-    /\ UNCHANGED <<cancelFlag, demand, shutdownPhase, heartbeatMode>>
+    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
+    /\ UNCHANGED <<jobState, owner, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+
+ReleaseReservation(w, j) ==
+    /\ permitHolder[j] = w
+    /\ jobState[j] = "available"
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
+    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
+    /\ UNCHANGED <<jobState, owner, cancelRequested, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+
+ClaimReserved(w, j) ==
+    /\ dispatchersAlive
+    /\ jobState[j] = "available"
+    /\ permitHolder[j] = w
+    /\ permitKind[j] \in {"local", "overflow"}
+    /\ jobState' = [jobState EXCEPT ![j] = "running"]
+    /\ UNCHANGED <<owner, permitHolder, permitKind, cancelRequested,
+                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+
+StartExecution(w, j) ==
+    /\ jobState[j] = "running"
+    /\ permitHolder[j] = w
+    /\ owner[j] = NoWorker
+    /\ owner' = [owner EXCEPT ![j] = w]
+    /\ UNCHANGED <<jobState, permitHolder, permitKind, cancelRequested,
+                  shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 Finalize(w, j, toState) ==
     /\ toState \in FinalStates
     /\ jobState[j] = "running"
     /\ owner[j] = w
     /\ jobState' = [jobState EXCEPT ![j] = toState]
-    /\ owner' = [owner EXCEPT ![j] = NoOwner]
+    /\ owner' = [owner EXCEPT ![j] = NoWorker]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
     /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
-    /\ UNCHANGED <<cancelFlag, demand, shutdownPhase, heartbeatMode>>
+    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
+    /\ UNCHANGED <<shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 Rescue(j) ==
-    LET w == owner[j] IN
+    LET w == permitHolder[j] IN
+    /\ maintenanceAlive
     /\ jobState[j] = "running"
     /\ w \in Workers
     /\ jobState' = [jobState EXCEPT ![j] = "retryable"]
-    /\ owner' = [owner EXCEPT ![j] = NoOwner]
+    /\ owner' = [owner EXCEPT ![j] = NoWorker]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
     /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
-    /\ cancelFlag' = [x \in Workers |-> cancelFlag[x] \/ x = w]
-    /\ UNCHANGED <<demand, shutdownPhase, heartbeatMode>>
+    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = TRUE]
+    /\ UNCHANGED <<shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 AdminCancel(j) ==
-    LET w == owner[j] IN
     /\ jobState[j] \in {"available", "running", "retryable"}
     /\ jobState' = [jobState EXCEPT ![j] = "cancelled"]
-    /\ owner' =
+    /\ owner' = [owner EXCEPT ![j] = NoWorker]
+    /\ permitHolder' = [permitHolder EXCEPT ![j] = NoWorker]
+    /\ permitKind' = [permitKind EXCEPT ![j] = "none"]
+    /\ cancelRequested' =
         IF jobState[j] = "running"
-        THEN [owner EXCEPT ![j] = NoOwner]
-        ELSE owner
-    /\ permitKind' =
-        IF jobState[j] = "running"
-        THEN [permitKind EXCEPT ![j] = "none"]
-        ELSE permitKind
-    /\ cancelFlag' =
-        IF jobState[j] = "running"
-        THEN [x \in Workers |-> cancelFlag[x] \/ x = w]
-        ELSE cancelFlag
-    /\ UNCHANGED <<demand, shutdownPhase, heartbeatMode>>
+        THEN [cancelRequested EXCEPT ![j] = TRUE]
+        ELSE cancelRequested
+    /\ UNCHANGED <<shutdownPhase, dispatchersAlive, heartbeatAlive, maintenanceAlive>>
+
+PromoteRetryable(j) ==
+    /\ jobState[j] = "retryable"
+    /\ jobState' = [jobState EXCEPT ![j] = "available"]
+    /\ cancelRequested' = [cancelRequested EXCEPT ![j] = FALSE]
+    /\ UNCHANGED <<owner, permitHolder, permitKind, shutdownPhase,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 ShutdownBegin ==
     /\ shutdownPhase = "running"
     /\ shutdownPhase' = "stop_claim"
-    /\ UNCHANGED <<jobState, owner, permitKind, cancelFlag, demand, heartbeatMode>>
+    /\ dispatchersAlive' = FALSE
+    /\ maintenanceAlive' = FALSE
+    /\ UNCHANGED <<jobState, owner, permitHolder, permitKind, cancelRequested, heartbeatAlive>>
 
 EnterDraining ==
     /\ shutdownPhase = "stop_claim"
     /\ shutdownPhase' = "draining"
-    /\ UNCHANGED <<jobState, owner, permitKind, cancelFlag, demand, heartbeatMode>>
+    /\ UNCHANGED <<jobState, owner, permitHolder, permitKind, cancelRequested,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 StopHeartbeat ==
-    /\ heartbeatMode = "alive"
-    /\ shutdownPhase \in {"draining", "stopped"}
-    /\ \A j \in Jobs : jobState[j] # "running"
-    /\ heartbeatMode' = "stopped"
-    /\ UNCHANGED <<jobState, owner, permitKind, cancelFlag, demand, shutdownPhase>>
+    /\ heartbeatAlive
+    /\ shutdownPhase = "draining"
+    /\ RunningJobs = {}
+    /\ heartbeatAlive' = FALSE
+    /\ UNCHANGED <<jobState, owner, permitHolder, permitKind, cancelRequested,
+                  shutdownPhase, dispatchersAlive, maintenanceAlive>>
 
 FinishShutdown ==
     /\ shutdownPhase = "draining"
-    /\ heartbeatMode = "stopped"
-    /\ \A j \in Jobs : jobState[j] # "running"
+    /\ ~heartbeatAlive
+    /\ RunningJobs = {}
+    /\ TotalHeldPermits = 0
     /\ shutdownPhase' = "stopped"
-    /\ UNCHANGED <<jobState, owner, permitKind, cancelFlag, demand, heartbeatMode>>
+    /\ UNCHANGED <<jobState, owner, permitHolder, permitKind, cancelRequested,
+                  dispatchersAlive, heartbeatAlive, maintenanceAlive>>
 
 Stutter ==
     UNCHANGED vars
 
 Next ==
-    \/ \E q \in Queues, d \in 0..MaxDemand : SetDemand(q, d)
-    \/ \E w \in Workers, j \in Jobs : ClaimLocal(w, j)
-    \/ \E w \in Workers, j \in Jobs : ClaimOverflow(w, j)
+    \/ \E w \in Workers, j \in Jobs : ReserveLocal(w, j)
+    \/ \E w \in Workers, j \in Jobs : ReserveOverflow(w, j)
+    \/ \E w \in Workers, j \in Jobs : ReleaseReservation(w, j)
+    \/ \E w \in Workers, j \in Jobs : ClaimReserved(w, j)
+    \/ \E w \in Workers, j \in Jobs : StartExecution(w, j)
     \/ \E w \in Workers, j \in Jobs, s \in FinalStates : Finalize(w, j, s)
     \/ \E j \in Jobs : Rescue(j)
     \/ \E j \in Jobs : AdminCancel(j)
+    \/ \E j \in Jobs : PromoteRetryable(j)
     \/ ShutdownBegin
     \/ EnterDraining
     \/ StopHeartbeat
@@ -175,39 +236,48 @@ Next ==
 
 TypeOK ==
     /\ jobState \in [Jobs -> JobStates]
-    /\ owner \in [Jobs -> Workers \cup {NoOwner}]
+    /\ owner \in [Jobs -> Workers \cup {NoWorker}]
+    /\ permitHolder \in [Jobs -> Workers \cup {NoWorker}]
     /\ permitKind \in [Jobs -> PermitKinds]
-    /\ cancelFlag \in [Workers -> BOOLEAN]
-    /\ demand \in [Queues -> 0..MaxDemand]
+    /\ cancelRequested \in [Jobs -> BOOLEAN]
     /\ shutdownPhase \in {"running", "stop_claim", "draining", "stopped"}
-    /\ heartbeatMode \in {"alive", "stopped"}
+    /\ dispatchersAlive \in BOOLEAN
+    /\ heartbeatAlive \in BOOLEAN
+    /\ maintenanceAlive \in BOOLEAN
 
 RunningOwned ==
-    \A j \in Jobs : jobState[j] = "running" => owner[j] \in Workers
+    \A j \in Jobs : owner[j] \in Workers => jobState[j] = "running"
 
 NonRunningUnowned ==
-    \A j \in Jobs : jobState[j] # "running" => owner[j] = NoOwner
+    \A j \in Jobs : jobState[j] # "running" => owner[j] = NoWorker
 
 RunningHasPermit ==
-    \A j \in Jobs : jobState[j] = "running" => permitKind[j] \in {"local", "overflow"}
+    \A j \in Jobs : jobState[j] = "running" => permitHolder[j] \in Workers /\ permitKind[j] \in {"local", "overflow"}
 
 NonRunningHasNoPermit ==
-    \A j \in Jobs : jobState[j] # "running" => permitKind[j] = "none"
+    \A j \in Jobs : jobState[j] \in {"completed", "failed", "cancelled", "retryable"} =>
+        permitHolder[j] = NoWorker /\ permitKind[j] = "none"
 
 LocalCapacitySafe ==
-    \A q \in Queues : LocalRunning(q) <= MinWorkers[q]
+    \A q \in Queues : LocalHeld(q) <= MinWorkers[q]
 
 OverflowCapacitySafe ==
-    TotalOverflowRunning <= GlobalOverflow
+    TotalOverflowHeld <= GlobalOverflow
 
 NoClaimAfterStopClaim ==
-    shutdownPhase \in {"stop_claim", "draining", "stopped"}
-    => \A j \in Jobs : jobState[j] = "available" \/ jobState[j] # "available"
+    shutdownPhase \in {"stop_claim", "draining", "stopped"} => ~dispatchersAlive
 
 HeartbeatUntilDrained ==
-    ((shutdownPhase = "stop_claim")
-      \/ (shutdownPhase = "draining" /\ \E j \in Jobs : jobState[j] = "running"))
-    => heartbeatMode = "alive"
+    ((shutdownPhase \in {"stop_claim", "draining"}) /\ RunningJobs # {})
+    => heartbeatAlive
+
+ServicePhaseConsistency ==
+    /\ dispatchersAlive => shutdownPhase = "running"
+    /\ maintenanceAlive => shutdownPhase = "running"
+    /\ ~heartbeatAlive => shutdownPhase \in {"draining", "stopped"}
+
+ExecutingHasOwner ==
+    \A j \in Jobs : owner[j] \in Workers => permitHolder[j] = owner[j]
 
 Spec == Init /\ [][Next]_vars
 

@@ -15,9 +15,10 @@ What is modeled:
 
 - abstract job states
 - worker ownership of a running attempt
-- shutdown phases
-- cancellation flags exposed via `ctx.is_cancelled()`
-- local permits plus weighted overflow permits
+- reservation vs claim vs execution as separate protocol stages
+- service lifecycles for dispatchers, heartbeat, and maintenance
+- attempt-scoped cancellation signals
+- local permits plus weighted overflow permits with derived contention
 
 What is intentionally not modeled:
 
@@ -31,7 +32,7 @@ What is intentionally not modeled:
 - `AwaCore.tla` / `AwaCore.cfg`: focused model for rescue, admin cancel, and
   stale completion protection
 - `AwaExtended.tla` / `AwaExtended.cfg`: extends the protocol with shutdown
-  phases, heartbeat sequencing, and weighted overflow capacity
+  sequencing, split permit/claim/execute stages, and weighted overflow capacity
 - `Dockerfile`: Docker-first TLC environment
 - `run-tlc.sh`: convenience wrapper for running TLC from the repo root
 
@@ -61,14 +62,17 @@ completion becomes impossible in the model.
 
 `AwaExtended` adds:
 
+- `dispatchersAlive`, `heartbeatAlive`, and `maintenanceAlive`
 - `shutdownPhase = "running" | "stop_claim" | "draining" | "stopped"`
-- `heartbeatMode = "alive" | "stopped"`
+- `permitHolder[j]` distinct from `owner[j]`
+- `cancelRequested[j]` as an attempt-scoped cancellation signal
 - local permit floors via `MinWorkers`
-- weighted overflow via `Weight`, `GlobalOverflow`, and per-queue `demand`
+- weighted overflow via `Weight`, `GlobalOverflow`, and derived queue contention
 
-The weighted allocator is modeled as a transition rule, not a full liveness
-proof. The model checks safety properties such as capacity bounds and
-permit-before-claim. It does not attempt to prove strong fairness or real-time
+The weighted allocator is still modeled as a safety-oriented transition rule,
+not a full fairness proof. The model now derives overflow contention from
+backlog plus local saturation instead of treating demand as an unconstrained
+input action. It still does not attempt to prove strong fairness or real-time
 throughput behavior.
 
 ## Checked Invariants
@@ -88,17 +92,18 @@ throughput behavior.
 - `NonRunningHasNoPermit`
 - `LocalCapacitySafe`
 - `OverflowCapacitySafe`
+- `NoClaimAfterStopClaim`
 - `HeartbeatUntilDrained`
-
-`NoClaimAfterStopClaim` is encoded in the transition relation: the claim actions
-require `shutdownPhase = "running"`.
+- `ServicePhaseConsistency`
+- `ExecutingHasOwner`
 
 ## Mapping Back To The Rust Runtime
 
 - `owner[j]` corresponds to the worker attempt allowed to call
   `complete_job()`
-- `cancelFlag[w]` corresponds to what `ctx.is_cancelled()` should observe
-- `permitKind[j]` mirrors whether a running job consumed local or overflow
-  capacity
-- `shutdownPhase` captures the intended ordering:
-  stop claims -> drain jobs -> stop heartbeat
+- `permitHolder[j]` is the reserved capacity backing a claim or execution
+- `cancelRequested[j]` approximates the in-flight cancellation signal that a
+  handler observes through `ctx.is_cancelled()`
+- `shutdownPhase` plus the service booleans capture the intended ordering:
+  stop dispatchers and maintenance -> drain with heartbeat alive ->
+  stop heartbeat only after running jobs are gone
