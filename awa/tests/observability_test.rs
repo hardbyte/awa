@@ -115,10 +115,15 @@ impl<S: Subscriber + for<'a> LookupSpan<'a>> Layer<S> for SpanCaptureLayer {
             fields: HashMap::new(),
         };
         attrs.record(&mut visitor);
-        self.spans.lock().unwrap().push(CapturedSpan {
-            name: attrs.metadata().name().to_string(),
-            fields: visitor.fields,
-        });
+        // Use unwrap_or_else to recover from a poisoned mutex (can happen if
+        // another test panicked while holding the lock in the same process).
+        self.spans
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(CapturedSpan {
+                name: attrs.metadata().name().to_string(),
+                fields: visitor.fields,
+            });
     }
 }
 
@@ -229,46 +234,41 @@ async fn test_job_execution_emits_tracing_spans() {
     // Shutdown the client
     client.shutdown(Duration::from_secs(5)).await;
 
-    // Assert "job.execute" span was captured with correct fields
-    let spans = captured_spans.lock().unwrap();
-    let execute_spans: Vec<_> = spans.iter().filter(|s| s.name == "job.execute").collect();
+    // Assert "job.execute" span was captured with correct fields.
+    // Since the global subscriber captures spans from all tests in the process,
+    // we filter by both span name AND this test's job.id to avoid cross-test interference.
+    let spans = captured_spans.lock().unwrap_or_else(|e| e.into_inner());
+    let job_id_str = job.id.to_string();
+    let execute_span = spans.iter().find(|s| {
+        s.name == "job.execute" && s.fields.get("job.id").map(|v| v.as_str()) == Some(&job_id_str)
+    });
 
     assert!(
-        !execute_spans.is_empty(),
-        "Expected at least one 'job.execute' span, found none. All spans: {:?}",
-        spans.iter().map(|s| &s.name).collect::<Vec<_>>()
+        execute_span.is_some(),
+        "Expected a 'job.execute' span with job.id={}, found spans: {:?}",
+        job.id,
+        spans
+            .iter()
+            .filter(|s| s.name == "job.execute")
+            .map(|s| s.fields.get("job.id"))
+            .collect::<Vec<_>>()
     );
 
-    let execute_span = &execute_spans[0];
-
-    // Verify job.id field is present and matches
-    assert!(
-        execute_span.fields.contains_key("job.id"),
-        "Expected 'job.id' field in span, found fields: {:?}",
-        execute_span.fields
-    );
-    assert_eq!(
-        execute_span.fields.get("job.id").unwrap(),
-        &job.id.to_string(),
-        "job.id should match the inserted job"
-    );
+    let execute_span = execute_span.unwrap();
 
     // Verify job.kind field
-    assert!(
-        execute_span.fields.contains_key("job.kind"),
-        "Expected 'job.kind' field in span"
-    );
     assert_eq!(
-        execute_span.fields.get("job.kind").unwrap(),
-        "observable_job"
+        execute_span.fields.get("job.kind").map(|s| s.as_str()),
+        Some("observable_job"),
+        "Expected job.kind = observable_job"
     );
 
     // Verify job.queue field
-    assert!(
-        execute_span.fields.contains_key("job.queue"),
-        "Expected 'job.queue' field in span"
+    assert_eq!(
+        execute_span.fields.get("job.queue").map(|s| s.as_str()),
+        Some(queue),
+        "Expected job.queue = {queue}"
     );
-    assert_eq!(execute_span.fields.get("job.queue").unwrap(), queue);
 }
 
 #[tokio::test(flavor = "multi_thread")]
