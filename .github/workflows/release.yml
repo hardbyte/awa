@@ -204,7 +204,6 @@ jobs:
   python-wheels:
     name: Python wheels — ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
-    continue-on-error: ${{ matrix.emulated || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -215,7 +214,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64
             manylinux: auto
-            emulated: true
+            zig: true
           - os: macos-latest
             target: x86_64
           - os: macos-latest
@@ -232,7 +231,9 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --manifest-path awa-python/Cargo.toml
+          args: >-
+            --release --out dist --manifest-path awa-python/Cargo.toml
+            ${{ matrix.zig && '--zig' || '' }}
           before-script-linux: |
             # Install Postgres dev headers for sqlx compilation
             apt-get update && apt-get install -y libpq-dev || true

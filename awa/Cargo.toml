@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 description.workspace = true
 repository.workspace = true
+readme.workspace = true
 
 [dependencies]
 awa-model.workspace = true
@@ -12,7 +13,7 @@ awa-macros.workspace = true
 awa-worker.workspace = true
 
 [dev-dependencies]
-awa-testing = { path = "../awa-testing", version = "0.1.4" }
+awa-testing = { path = "../awa-testing", version = "0.1.5" }
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true

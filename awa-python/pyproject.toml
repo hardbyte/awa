@@ -5,13 +5,25 @@ build-backend = "maturin"
 [project]
 name = "awa-pg"
 requires-python = ">=3.10"
-version = "0.1.4"
+version = "0.1.5"
 description = "Postgres-native background job queue for Rust and Python"
+readme = {file = "../README.md", content-type = "text/markdown"}
+license = {text = "MIT OR Apache-2.0"}
+authors = [{name = "Brian Thorne"}]
+keywords = ["postgres", "job-queue", "background-jobs", "pyo3", "async"]
 classifiers = [
     "Programming Language :: Rust",
     "Programming Language :: Python :: Implementation :: CPython",
     "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Database",
+    "Topic :: System :: Distributed Computing",
+    "Framework :: AsyncIO",
 ]
+[project.urls]
+Repository = "https://github.com/hardbyte/awa"
+Documentation = "https://github.com/hardbyte/awa#readme"
 
 [tool.maturin]
 features = ["pyo3/extension-module"]
