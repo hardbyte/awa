@@ -211,10 +211,9 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             manylinux: auto
-          - os: ubuntu-latest
+          - os: ubuntu-24.04-arm
             target: aarch64
             manylinux: auto
-            zig: true
           - os: macos-latest
             target: x86_64
           - os: macos-latest
@@ -231,9 +230,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: >-
-            --release --out dist --manifest-path awa-python/Cargo.toml
-            ${{ matrix.zig && '--zig' || '' }}
+          args: --release --out dist --manifest-path awa-python/Cargo.toml
           before-script-linux: |
             # Install Postgres dev headers for sqlx compilation
             apt-get update && apt-get install -y libpq-dev || true
