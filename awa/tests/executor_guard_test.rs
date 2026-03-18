@@ -357,9 +357,10 @@ async fn test_deadline_rescue_signals_cancellation() {
             _job: &awa_model::JobRow,
             ctx: &JobContext,
         ) -> Result<JobResult, JobError> {
-            // Wait for deadline rescue to fire (deadline is 1s, maintenance checks every ~30s,
-            // but we'll check the flag in a loop)
-            for _ in 0..40 {
+            // Wait for deadline rescue to fire. Deadline is 1s, but maintenance
+            // only checks every 30s and leader election can take up to 10s.
+            // We poll for up to 50s to cover worst-case timing.
+            for _ in 0..500 {
                 if ctx.is_cancelled() {
                     self.saw_cancelled.store(true, Ordering::SeqCst);
                     return Ok(JobResult::Completed);
@@ -403,25 +404,22 @@ async fn test_deadline_rescue_signals_cancellation() {
 
     client.start().await.unwrap();
 
-    // Wait for the job to be claimed + deadline to expire + maintenance to rescue
-    // Maintenance checks every 30s by default, so this test is only reliable if
-    // this worker instance is the leader AND the deadline_rescue_interval fires.
-    // We give it up to 40s to allow for leader election + rescue cycle.
+    // Wait for the job to be claimed + deadline to expire + maintenance to rescue.
+    // Leader election can take up to 10s, deadline rescue interval is 30s.
+    // Worst case: ~45s (10s election + 1s deadline + 30s rescue interval + margin).
     let start = std::time::Instant::now();
     loop {
         if saw_cancelled.load(Ordering::SeqCst) {
             break;
         }
-        if start.elapsed() > Duration::from_secs(40) {
+        if start.elapsed() > Duration::from_secs(50) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 
-    client.shutdown(Duration::from_secs(2)).await;
+    client.shutdown(Duration::from_secs(5)).await;
 
-    // Note: this test may not always pass in CI environments where leader election
-    // takes longer than expected. It's inherently timing-dependent.
     assert!(
         saw_cancelled.load(Ordering::SeqCst),
         "Handler should have seen ctx.is_cancelled() == true after deadline rescue"
