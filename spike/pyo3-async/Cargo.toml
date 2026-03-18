@@ -1,0 +1,14 @@
+[package]
+name = "pyo3-async-spike"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "pyo3_async_spike"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.28", features = ["macros"] }
+pyo3-async-runtimes = { version = "0.28", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7" }

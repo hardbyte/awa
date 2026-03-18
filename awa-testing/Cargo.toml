@@ -1,0 +1,14 @@
+[package]
+name = "awa-testing"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+awa-model.workspace = true
+awa-worker.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
