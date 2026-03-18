@@ -14,6 +14,8 @@ exclude = ["awa-python", "spike"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT OR Apache-2.0"
+description = "Postgres-native background job queue for Rust and Python"
+repository = "https://github.com/hardbyte/awa"
 
 [workspace.dependencies]
 # Internal crates

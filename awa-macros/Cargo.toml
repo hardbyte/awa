@@ -2,6 +2,9 @@
 name = "awa-macros"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Derive macros for the Awa job queue"
+repository.workspace = true
 
 [lib]
 proc-macro = true

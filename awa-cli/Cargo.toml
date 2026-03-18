@@ -2,6 +2,9 @@
 name = "awa-cli"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "CLI for the Awa job queue"
+repository.workspace = true
 
 [[bin]]
 name = "awa"

@@ -2,6 +2,9 @@
 name = "awa-model"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Core types, queries, and migrations for the Awa job queue"
+repository.workspace = true
 
 [dependencies]
 awa-macros.workspace = true

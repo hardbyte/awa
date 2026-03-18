@@ -2,6 +2,9 @@
 name = "awa-worker"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+description = "Worker runtime for the Awa job queue"
+repository.workspace = true
 
 [dependencies]
 awa-model.workspace = true
