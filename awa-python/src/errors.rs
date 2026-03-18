@@ -23,8 +23,8 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::JobNotFound { id } => {
             PyAwaError::new_err(format!("job not found: {id}"))
         }
-        awa_model::AwaError::UniqueConflict { existing_id } => {
-            let detail = existing_id
+        awa_model::AwaError::UniqueConflict { constraint } => {
+            let detail = constraint
                 .map(|value| format!(" ({value})"))
                 .unwrap_or_default();
             UniqueConflict::new_err(format!("unique conflict{detail}"))

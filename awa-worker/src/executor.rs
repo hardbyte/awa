@@ -135,35 +135,48 @@ impl JobExecutor {
 
                 let duration = start.elapsed();
 
-                // Record metrics based on outcome
-                match &result {
-                    Ok(JobResult::Completed) => {
-                        metrics.record_job_completed(&job_kind, &job_queue, duration);
+                // Complete the job based on the result, then record metrics
+                // only if the state transition actually happened (not stale).
+                match complete_job(&pool, &job, &result).await {
+                    Ok(true) => {
+                        // State transition succeeded — record metrics
+                        match &result {
+                            Ok(JobResult::Completed) => {
+                                metrics.record_job_completed(&job_kind, &job_queue, duration);
+                            }
+                            Ok(JobResult::RetryAfter(_)) => {
+                                metrics.record_job_retried(&job_kind, &job_queue);
+                            }
+                            Ok(JobResult::Cancel(_)) => {
+                                metrics.jobs_cancelled.add(
+                                    1,
+                                    &[
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.kind",
+                                            job_kind.clone(),
+                                        ),
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.queue",
+                                            job_queue.clone(),
+                                        ),
+                                    ],
+                                );
+                            }
+                            Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
+                            Err(JobError::Terminal(_)) => {
+                                metrics.record_job_failed(&job_kind, &job_queue, true);
+                            }
+                            Err(JobError::Retryable(_)) => {
+                                metrics.record_job_retried(&job_kind, &job_queue);
+                            }
+                        }
                     }
-                    Ok(JobResult::RetryAfter(_)) => {
-                        metrics.record_job_retried(&job_kind, &job_queue);
+                    Ok(false) => {
+                        // Job was already rescued/cancelled — no metrics
                     }
-                    Ok(JobResult::Cancel(_)) => {
-                        metrics.jobs_cancelled.add(
-                            1,
-                            &[
-                                opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
-                                opentelemetry::KeyValue::new("awa.job.queue", job_queue.clone()),
-                            ],
-                        );
+                    Err(err) => {
+                        error!(job_id, error = %err, "Failed to complete job");
                     }
-                    Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
-                    Err(JobError::Terminal(_)) => {
-                        metrics.record_job_failed(&job_kind, &job_queue, true);
-                    }
-                    Err(JobError::Retryable(_)) => {
-                        metrics.record_job_retried(&job_kind, &job_queue);
-                    }
-                }
-
-                // Complete the job based on the result
-                if let Err(err) = complete_job(&pool, &job, result).await {
-                    error!(job_id, error = %err, "Failed to complete job");
                 }
 
                 // Remove from in-flight
@@ -182,21 +195,31 @@ impl JobExecutor {
 }
 
 /// Update job state in the database based on handler result.
+///
+/// Returns `true` if the state transition happened, `false` if the job was
+/// already rescued/cancelled by maintenance (stale completion).
 async fn complete_job(
     pool: &PgPool,
     job: &JobRow,
-    result: Result<JobResult, JobError>,
-) -> Result<(), AwaError> {
+    result: &Result<JobResult, JobError>,
+) -> Result<bool, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");
             info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
-            sqlx::query(
-                "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1",
+            let result = sqlx::query(
+                "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1 AND state = 'running'",
             )
             .bind(job.id)
             .execute(pool)
             .await?;
+            if result.rows_affected() == 0 {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, completion ignored"
+                );
+                return Ok(false);
+            }
         }
 
         Ok(JobResult::RetryAfter(duration)) => {
@@ -207,19 +230,26 @@ async fn complete_job(
                 retry_after_secs = seconds,
                 "Job requested retry after duration"
             );
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
                 SET state = 'retryable',
                     run_at = now() + make_interval(secs => $2),
                     finalized_at = now()
-                WHERE id = $1
+                WHERE id = $1 AND state = 'running'
                 "#,
             )
             .bind(job.id)
             .bind(seconds)
             .execute(pool)
             .await?;
+            if result.rows_affected() == 0 {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, retry ignored"
+                );
+                return Ok(false);
+            }
         }
 
         Ok(JobResult::Snooze(duration)) => {
@@ -232,7 +262,7 @@ async fn complete_job(
             );
             // Snooze: back to available with new run_at, decrement attempt
             // (since it was already incremented at claim time)
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
                 SET state = 'scheduled',
@@ -240,13 +270,20 @@ async fn complete_job(
                     attempt = attempt - 1,
                     heartbeat_at = NULL,
                     deadline_at = NULL
-                WHERE id = $1
+                WHERE id = $1 AND state = 'running'
                 "#,
             )
             .bind(job.id)
             .bind(seconds)
             .execute(pool)
             .await?;
+            if result.rows_affected() == 0 {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, snooze ignored"
+                );
+                return Ok(false);
+            }
         }
 
         Ok(JobResult::Cancel(reason)) => {
@@ -256,13 +293,13 @@ async fn complete_job(
                 reason = %reason,
                 "Job cancelled by handler"
             );
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
                 SET state = 'cancelled',
                     finalized_at = now(),
                     errors = errors || $2::jsonb
-                WHERE id = $1
+                WHERE id = $1 AND state = 'running'
                 "#,
             )
             .bind(job.id)
@@ -273,6 +310,13 @@ async fn complete_job(
             }))
             .execute(pool)
             .await?;
+            if result.rows_affected() == 0 {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, cancel ignored"
+                );
+                return Ok(false);
+            }
         }
 
         Err(JobError::Terminal(msg)) => {
@@ -283,24 +327,31 @@ async fn complete_job(
                 error = %msg,
                 "Job failed terminally"
             );
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
                 SET state = 'failed',
                     finalized_at = now(),
                     errors = errors || $2::jsonb
-                WHERE id = $1
+                WHERE id = $1 AND state = 'running'
                 "#,
             )
             .bind(job.id)
             .bind(serde_json::json!({
-                "error": msg,
+                "error": msg.to_string(),
                 "attempt": job.attempt,
                 "at": chrono::Utc::now().to_rfc3339(),
                 "terminal": true
             }))
             .execute(pool)
             .await?;
+            if result.rows_affected() == 0 {
+                warn!(
+                    job_id = job.id,
+                    "Job already rescued/cancelled, terminal failure ignored"
+                );
+                return Ok(false);
+            }
         }
 
         Err(JobError::Retryable(err)) => {
@@ -315,13 +366,13 @@ async fn complete_job(
                     error = %error_msg,
                     "Job failed (max attempts exhausted)"
                 );
-                sqlx::query(
+                let result = sqlx::query(
                     r#"
                     UPDATE awa.jobs
                     SET state = 'failed',
                         finalized_at = now(),
                         errors = errors || $2::jsonb
-                    WHERE id = $1
+                    WHERE id = $1 AND state = 'running'
                     "#,
                 )
                 .bind(job.id)
@@ -332,6 +383,13 @@ async fn complete_job(
                 }))
                 .execute(pool)
                 .await?;
+                if result.rows_affected() == 0 {
+                    warn!(
+                        job_id = job.id,
+                        "Job already rescued/cancelled, failure ignored"
+                    );
+                    return Ok(false);
+                }
             } else {
                 warn!(
                     job_id = job.id,
@@ -341,7 +399,7 @@ async fn complete_job(
                     "Job failed (will retry)"
                 );
                 // Use database-side backoff calculation
-                sqlx::query(
+                let result = sqlx::query(
                     r#"
                     UPDATE awa.jobs
                     SET state = 'retryable',
@@ -350,7 +408,7 @@ async fn complete_job(
                         heartbeat_at = NULL,
                         deadline_at = NULL,
                         errors = errors || $4::jsonb
-                    WHERE id = $1
+                    WHERE id = $1 AND state = 'running'
                     "#,
                 )
                 .bind(job.id)
@@ -363,9 +421,16 @@ async fn complete_job(
                 }))
                 .execute(pool)
                 .await?;
+                if result.rows_affected() == 0 {
+                    warn!(
+                        job_id = job.id,
+                        "Job already rescued/cancelled, retry ignored"
+                    );
+                    return Ok(false);
+                }
             }
         }
     }
 
-    Ok(())
+    Ok(true)
 }

@@ -1,4 +1,4 @@
-use crate::dispatcher::{Dispatcher, QueueConfig};
+use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
 use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::MaintenanceService;
@@ -10,7 +10,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -19,6 +20,12 @@ use tracing::{info, warn};
 pub enum BuildError {
     #[error("at least one queue must be configured")]
     NoQueuesConfigured,
+    #[error("sum of min_workers ({total_min}) exceeds global_max_workers ({global_max})")]
+    MinWorkersExceedGlobal { total_min: u32, global_max: u32 },
+    #[error("rate_limit max_rate must be > 0.0")]
+    InvalidRateLimit,
+    #[error("queue weight must be > 0")]
+    InvalidWeight,
 }
 
 /// Health check result.
@@ -37,8 +44,22 @@ pub struct HealthCheck {
 #[derive(Debug, Clone)]
 pub struct QueueHealth {
     pub in_flight: u32,
-    pub max_workers: u32,
     pub available: u64,
+    /// Capacity interpretation depends on mode.
+    pub capacity: QueueCapacity,
+}
+
+/// Capacity information for a queue, mode-dependent.
+#[derive(Debug, Clone)]
+pub enum QueueCapacity {
+    /// Hard-reserved: fixed max.
+    HardReserved { max_workers: u32 },
+    /// Weighted: min guaranteed + current overflow.
+    Weighted {
+        min_workers: u32,
+        weight: u32,
+        overflow_held: u32,
+    },
 }
 
 /// Builder for the Awa worker client.
@@ -49,6 +70,7 @@ pub struct ClientBuilder {
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
     periodic_jobs: Vec<PeriodicJob>,
+    global_max_workers: Option<u32>,
 }
 
 impl ClientBuilder {
@@ -60,6 +82,7 @@ impl ClientBuilder {
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
             periodic_jobs: Vec::new(),
+            global_max_workers: None,
         }
     }
 
@@ -108,6 +131,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Set a global maximum worker count across all queues (enables weighted mode).
+    ///
+    /// When set, each queue gets `min_workers` guaranteed permits plus a share
+    /// of the remaining overflow capacity based on `weight`.
+    pub fn global_max_workers(mut self, max: u32) -> Self {
+        self.global_max_workers = Some(max);
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -122,6 +154,38 @@ impl ClientBuilder {
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
         }
+
+        // Validate rate limits and weights
+        for (_, config) in &self.queues {
+            if let Some(rl) = &config.rate_limit {
+                if rl.max_rate <= 0.0 {
+                    return Err(BuildError::InvalidRateLimit);
+                }
+            }
+            if config.weight == 0 {
+                return Err(BuildError::InvalidWeight);
+            }
+        }
+
+        // Validate weighted mode constraints
+        let overflow_pool = if let Some(global_max) = self.global_max_workers {
+            let total_min: u32 = self.queues.iter().map(|(_, c)| c.min_workers).sum();
+            if total_min > global_max {
+                return Err(BuildError::MinWorkersExceedGlobal {
+                    total_min,
+                    global_max,
+                });
+            }
+            let overflow_capacity = global_max - total_min;
+            let weights: HashMap<String, u32> = self
+                .queues
+                .iter()
+                .map(|(name, c)| (name.clone(), c.weight.max(1)))
+                .collect();
+            Some(Arc::new(OverflowPool::new(overflow_capacity, weights)))
+        } else {
+            None
+        };
 
         let metrics = crate::metrics::AwaMetrics::from_global();
         let queue_in_flight = Arc::new(
@@ -144,13 +208,17 @@ impl ClientBuilder {
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
             periodic_jobs: Arc::new(self.periodic_jobs),
-            cancel: CancellationToken::new(),
-            handles: RwLock::new(Vec::new()),
+            dispatch_cancel: CancellationToken::new(),
+            service_cancel: CancellationToken::new(),
+            dispatcher_handles: RwLock::new(Vec::new()),
+            service_handles: RwLock::new(Vec::new()),
+            job_set: Arc::new(Mutex::new(JoinSet::new())),
             in_flight: Arc::new(RwLock::new(HashMap::new())),
             queue_in_flight,
             dispatcher_alive,
             heartbeat_alive: Arc::new(AtomicBool::new(false)),
             leader: Arc::new(AtomicBool::new(false)),
+            overflow_pool,
             metrics,
         })
     }
@@ -200,13 +268,23 @@ pub struct Client {
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
-    cancel: CancellationToken,
-    handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    /// Cancellation token for dispatchers only — stops claiming new jobs.
+    dispatch_cancel: CancellationToken,
+    /// Cancellation token for heartbeat + maintenance — kept alive during drain.
+    service_cancel: CancellationToken,
+    /// Handles for dispatcher tasks.
+    dispatcher_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    /// Handles for service tasks (heartbeat + maintenance).
+    service_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    /// JoinSet tracking in-flight job tasks for graceful drain.
+    job_set: Arc<Mutex<JoinSet<()>>>,
     in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
+    /// Shared overflow pool for weighted mode (None in hard-reserved mode).
+    overflow_pool: Option<Arc<OverflowPool>>,
     metrics: crate::metrics::AwaMetrics,
 }
 
@@ -234,46 +312,75 @@ impl Client {
             self.metrics.clone(),
         ));
 
-        let mut handles = self.handles.write().await;
+        let mut service_handles = self.service_handles.write().await;
 
-        // Start heartbeat service
+        // Start heartbeat service (uses service_cancel — stays alive during drain)
         let heartbeat = HeartbeatService::new(
             self.pool.clone(),
             self.in_flight.clone(),
             self.heartbeat_interval,
             self.heartbeat_alive.clone(),
-            self.cancel.clone(),
+            self.service_cancel.clone(),
         );
-        handles.push(tokio::spawn(async move {
+        service_handles.push(tokio::spawn(async move {
             heartbeat.run().await;
         }));
 
-        // Start maintenance service
+        // Start maintenance service (uses service_cancel — stays alive during drain)
         let maintenance = MaintenanceService::new(
             self.pool.clone(),
             self.leader.clone(),
-            self.cancel.clone(),
+            self.service_cancel.clone(),
             self.periodic_jobs.clone(),
+            self.in_flight.clone(),
         );
-        handles.push(tokio::spawn(async move {
+        service_handles.push(tokio::spawn(async move {
             maintenance.run().await;
         }));
 
-        // Start a dispatcher per queue
+        // Start a dispatcher per queue (uses dispatch_cancel — stops claiming first)
+        let mut dispatcher_handles = self.dispatcher_handles.write().await;
         for (queue_name, config) in &self.queues {
-            let dispatcher = Dispatcher::new(
-                queue_name.clone(),
-                config.clone(),
-                self.pool.clone(),
-                executor.clone(),
-                self.in_flight.clone(),
-                self.dispatcher_alive
-                    .get(queue_name)
-                    .cloned()
-                    .unwrap_or_else(|| Arc::new(AtomicBool::new(false))),
-                self.cancel.clone(),
-            );
-            handles.push(tokio::spawn(async move {
+            let alive = self
+                .dispatcher_alive
+                .get(queue_name)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+
+            let dispatcher = if let Some(overflow_pool) = &self.overflow_pool {
+                // Weighted mode
+                let concurrency = ConcurrencyMode::Weighted {
+                    local_semaphore: Arc::new(tokio::sync::Semaphore::new(
+                        config.min_workers as usize,
+                    )),
+                    overflow_pool: overflow_pool.clone(),
+                    queue_name: queue_name.clone(),
+                };
+                Dispatcher::with_concurrency(
+                    queue_name.clone(),
+                    config.clone(),
+                    self.pool.clone(),
+                    executor.clone(),
+                    self.in_flight.clone(),
+                    alive,
+                    self.dispatch_cancel.clone(),
+                    self.job_set.clone(),
+                    concurrency,
+                )
+            } else {
+                // Hard-reserved mode (default)
+                Dispatcher::new(
+                    queue_name.clone(),
+                    config.clone(),
+                    self.pool.clone(),
+                    executor.clone(),
+                    self.in_flight.clone(),
+                    alive,
+                    self.dispatch_cancel.clone(),
+                    self.job_set.clone(),
+                )
+            };
+            dispatcher_handles.push(tokio::spawn(async move {
                 dispatcher.run().await;
             }));
         }
@@ -283,11 +390,20 @@ impl Client {
     }
 
     /// Graceful shutdown with drain timeout.
+    ///
+    /// Phased lifecycle:
+    /// 1. Stop dispatchers (no new jobs claimed)
+    /// 2. Signal in-flight jobs to cancel
+    /// 3. Wait for dispatchers to exit
+    /// 4. Drain in-flight jobs (heartbeat + maintenance still alive!)
+    /// 5. Stop heartbeat + maintenance
     pub async fn shutdown(&self, timeout: Duration) {
         info!("Initiating graceful shutdown");
 
-        // Signal all tasks to stop
-        self.cancel.cancel();
+        // Phase 1: Stop claiming new jobs
+        self.dispatch_cancel.cancel();
+
+        // Phase 2: Signal in-flight cancellation flags
         {
             let guard = self.in_flight.read().await;
             for flag in guard.values() {
@@ -295,26 +411,35 @@ impl Client {
             }
         }
 
-        // Wait for handles with timeout
-        let handles: Vec<_> = {
-            let mut guard = self.handles.write().await;
+        // Phase 3: Wait for dispatchers to exit their poll loops
+        let dispatcher_handles: Vec<_> = {
+            let mut guard = self.dispatcher_handles.write().await;
             std::mem::take(&mut *guard)
         };
+        for handle in dispatcher_handles {
+            let _ = handle.await;
+        }
 
-        let shutdown_future = async {
-            for handle in handles {
-                let _ = handle.await;
-            }
+        // Phase 4: Drain in-flight jobs (heartbeat + maintenance still alive)
+        let drain = async {
+            let mut set = self.job_set.lock().await;
+            while set.join_next().await.is_some() {}
         };
-
-        if tokio::time::timeout(timeout, shutdown_future)
-            .await
-            .is_err()
-        {
+        if tokio::time::timeout(timeout, drain).await.is_err() {
             warn!(
                 timeout_secs = timeout.as_secs(),
-                "Shutdown timeout exceeded, some tasks may not have completed"
+                "Shutdown drain timeout exceeded, some jobs may not have completed"
             );
+        }
+
+        // Phase 5: Stop background services (heartbeat + maintenance)
+        self.service_cancel.cancel();
+        let service_handles: Vec<_> = {
+            let mut guard = self.service_handles.write().await;
+            std::mem::take(&mut *guard)
+        };
+        for handle in service_handles {
+            let _ = handle.await;
         }
 
         info!("Awa worker runtime stopped");
@@ -333,7 +458,7 @@ impl Client {
             .values()
             .all(|alive| alive.load(Ordering::SeqCst));
         let heartbeat_alive = self.heartbeat_alive.load(Ordering::SeqCst);
-        let shutting_down = self.cancel.is_cancelled();
+        let shutting_down = self.dispatch_cancel.is_cancelled();
         let leader = self.leader.load(Ordering::SeqCst);
         let available_rows = sqlx::query_as::<_, (String, i64)>(
             r#"
@@ -357,12 +482,23 @@ impl Client {
                     .map(|counter| counter.load(Ordering::SeqCst))
                     .unwrap_or(0);
                 let available = available_by_queue.get(queue).copied().unwrap_or(0).max(0) as u64;
+                let capacity = if let Some(overflow_pool) = &self.overflow_pool {
+                    QueueCapacity::Weighted {
+                        min_workers: config.min_workers,
+                        weight: config.weight,
+                        overflow_held: overflow_pool.held(queue),
+                    }
+                } else {
+                    QueueCapacity::HardReserved {
+                        max_workers: config.max_workers,
+                    }
+                };
                 (
                     queue.clone(),
                     QueueHealth {
                         in_flight,
-                        max_workers: config.max_workers,
                         available,
+                        capacity,
                     },
                 )
             })

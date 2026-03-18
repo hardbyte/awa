@@ -6,7 +6,7 @@ pub enum AwaError {
     JobNotFound { id: i64 },
 
     #[error("unique conflict")]
-    UniqueConflict { existing_id: Option<String> },
+    UniqueConflict { constraint: Option<String> },
 
     #[error("schema not migrated: expected version {expected}, found {found}")]
     SchemaNotMigrated { expected: i32, found: i32 },

@@ -4,9 +4,11 @@ use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -19,6 +21,9 @@ pub struct MaintenanceService {
     cancel: CancellationToken,
     leader: Arc<AtomicBool>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
+    /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
+    /// to running handlers on this worker instance.
+    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     promote_interval: Duration,
@@ -37,12 +42,14 @@ impl MaintenanceService {
         leader: Arc<AtomicBool>,
         cancel: CancellationToken,
         periodic_jobs: Arc<Vec<PeriodicJob>>,
+        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     ) -> Self {
         Self {
             pool,
             cancel,
             leader,
             periodic_jobs,
+            in_flight,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_secs(5),
@@ -294,6 +301,8 @@ impl MaintenanceService {
         {
             Ok(rescued) if !rescued.is_empty() => {
                 warn!(count = rescued.len(), "Rescued stale heartbeat jobs");
+                // Signal cancellation to any rescued jobs still running on this instance
+                self.signal_cancellation(&rescued).await;
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
@@ -333,11 +342,24 @@ impl MaintenanceService {
         {
             Ok(rescued) if !rescued.is_empty() => {
                 warn!(count = rescued.len(), "Rescued deadline-expired jobs");
+                // Signal cancellation so handlers see ctx.is_cancelled() == true
+                self.signal_cancellation(&rescued).await;
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
             }
             _ => {}
+        }
+    }
+
+    /// Signal cancellation to any rescued jobs that are still running on this instance.
+    async fn signal_cancellation(&self, rescued_jobs: &[JobRow]) {
+        let guard = self.in_flight.read().await;
+        for job in rescued_jobs {
+            if let Some(flag) = guard.get(&job.id) {
+                flag.store(true, Ordering::SeqCst);
+                debug!(job_id = job.id, "Signalled cancellation for rescued job");
+            }
         }
     }
 
