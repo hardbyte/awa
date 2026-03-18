@@ -485,10 +485,12 @@ async fn test_concurrent_insert_and_claim() {
     // Give inserters a head start
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    // Spawn 5 claimers
+    // Spawn 5 claimers — they only exit once all 500 jobs have been inserted
+    // AND there are no more available jobs to claim.
     for _ in 0..5 {
         let pool = pool.clone();
         let count = claimed.clone();
+        let inserted_count = inserted.clone();
         let q = queue.to_string();
         handles.push(tokio::spawn(async move {
             loop {
@@ -511,16 +513,21 @@ async fn test_concurrent_insert_and_claim() {
                 .unwrap();
 
                 if jobs.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(10)).await;
-                    let remaining: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM awa.jobs WHERE state = 'available' AND queue = $1",
-                    )
-                    .bind(&q)
-                    .fetch_one(&pool)
-                    .await
-                    .unwrap();
-                    if remaining == 0 {
-                        break;
+                    // Only exit if all inserters are done AND nothing is available
+                    if inserted_count.load(Ordering::SeqCst) >= 500 {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        let remaining: i64 = sqlx::query_scalar(
+                            "SELECT count(*) FROM awa.jobs WHERE state = 'available' AND queue = $1",
+                        )
+                        .bind(&q)
+                        .fetch_one(&pool)
+                        .await
+                        .unwrap();
+                        if remaining == 0 {
+                            break;
+                        }
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
                     }
                 } else {
                     count.fetch_add(jobs.len() as u64, Ordering::SeqCst);
