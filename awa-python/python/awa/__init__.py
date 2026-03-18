@@ -6,6 +6,8 @@ from awa._awa import (
     # Job types
     Job,
     JobState,
+    HealthCheck,
+    QueueHealth,
     # Transaction
     Transaction,
     # Handler return types
@@ -22,6 +24,7 @@ from awa._awa import (
     SchemaNotMigrated,
     UnknownJobKind,
     SerializationError,
+    ValidationError,
     TerminalError,
     DatabaseError,
 )
@@ -30,6 +33,8 @@ __all__ = [
     "Client",
     "Job",
     "JobState",
+    "HealthCheck",
+    "QueueHealth",
     "Transaction",
     "RetryAfter",
     "Snooze",
@@ -42,6 +47,7 @@ __all__ = [
     "SchemaNotMigrated",
     "UnknownJobKind",
     "SerializationError",
+    "ValidationError",
     "TerminalError",
     "DatabaseError",
 ]

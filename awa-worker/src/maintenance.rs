@@ -1,5 +1,8 @@
 use awa_model::JobRow;
-use sqlx::PgPool;
+use sqlx::pool::PoolConnection;
+use sqlx::{PgPool, Postgres};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -10,6 +13,7 @@ use tracing::{debug, error, info, warn};
 pub struct MaintenanceService {
     pool: PgPool,
     cancel: CancellationToken,
+    leader: Arc<AtomicBool>,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     promote_interval: Duration,
@@ -20,10 +24,11 @@ pub struct MaintenanceService {
 }
 
 impl MaintenanceService {
-    pub fn new(pool: PgPool, cancel: CancellationToken) -> Self {
+    pub fn new(pool: PgPool, leader: Arc<AtomicBool>, cancel: CancellationToken) -> Self {
         Self {
             pool,
             cancel,
+            leader,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_secs(5),
@@ -37,29 +42,39 @@ impl MaintenanceService {
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
+        self.leader.store(false, Ordering::SeqCst);
 
         loop {
-            // Try to acquire advisory lock for leader election
-            let is_leader = match self.try_become_leader().await {
-                Ok(leader) => leader,
+            // Try to acquire advisory lock for leader election.
+            // We get back a dedicated connection that holds the lock.
+            let mut leader_conn = match self.try_become_leader().await {
+                Ok(Some(conn)) => conn,
+                Ok(None) => {
+                    // Not leader — back off and try again
+                    tokio::select! {
+                        _ = self.cancel.cancelled() => {
+                            debug!("Maintenance service shutting down (not leader)");
+                            self.leader.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                    }
+                }
                 Err(err) => {
                     warn!(error = %err, "Failed to check leader status");
-                    false
+                    tokio::select! {
+                        _ = self.cancel.cancelled() => {
+                            debug!("Maintenance service shutting down (leader check failed)");
+                            self.leader.store(false, Ordering::SeqCst);
+                            return;
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                    }
                 }
             };
 
-            if !is_leader {
-                // Not leader — back off and try again
-                tokio::select! {
-                    _ = self.cancel.cancelled() => {
-                        debug!("Maintenance service shutting down (not leader)");
-                        return;
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
-                }
-            }
-
             debug!("Elected as maintenance leader");
+            self.leader.store(true, Ordering::SeqCst);
 
             // Run maintenance tasks as leader
             let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
@@ -77,8 +92,10 @@ impl MaintenanceService {
                 tokio::select! {
                     _ = self.cancel.cancelled() => {
                         debug!("Maintenance service shutting down");
-                        // Release leader lock
-                        let _ = self.release_leader().await;
+                        self.leader.store(false, Ordering::SeqCst);
+                        // Release leader lock on the same connection that acquired it.
+                        // If this fails, dropping the connection will release the lock anyway.
+                        let _ = Self::release_leader(&mut leader_conn).await;
                         return;
                     }
                     _ = heartbeat_rescue_timer.tick() => {
@@ -98,28 +115,41 @@ impl MaintenanceService {
         }
     }
 
+    /// Advisory lock key for Awa maintenance leader election.
+    const LOCK_KEY: i64 = 0x_4157_415f_4d41_494e; // "AWA_MAIN" in hex-ish
+
     /// Try to acquire the advisory lock for leader election.
-    async fn try_become_leader(&self) -> Result<bool, sqlx::Error> {
-        // Use a well-known advisory lock key for Awa maintenance
-        let lock_key: i64 = 0x_4157_415f_4d41_494e; // "AWA_MAIN" in hex-ish
+    ///
+    /// Returns a dedicated connection holding the lock on success, or `None` if
+    /// another instance already holds the lock. The lock is session-scoped in
+    /// PostgreSQL, so it stays held as long as this connection is alive.
+    async fn try_become_leader(&self) -> Result<Option<PoolConnection<Postgres>>, sqlx::Error> {
+        let mut conn = self.pool.acquire().await?;
         let result: (bool,) = sqlx::query_as("SELECT pg_try_advisory_lock($1)")
-            .bind(lock_key)
-            .fetch_one(&self.pool)
+            .bind(Self::LOCK_KEY)
+            .fetch_one(&mut *conn)
             .await?;
-        Ok(result.0)
+        if result.0 {
+            Ok(Some(conn))
+        } else {
+            Ok(None)
+        }
     }
 
-    /// Release the advisory lock.
-    async fn release_leader(&self) -> Result<(), sqlx::Error> {
-        let lock_key: i64 = 0x_4157_415f_4d41_494e;
+    /// Release the advisory lock on the same connection that acquired it.
+    ///
+    /// Dropping the connection also releases the lock (PG session-scoped behavior),
+    /// so this is a best-effort explicit release.
+    async fn release_leader(conn: &mut PoolConnection<Postgres>) -> Result<(), sqlx::Error> {
         sqlx::query("SELECT pg_advisory_unlock($1)")
-            .bind(lock_key)
-            .execute(&self.pool)
+            .bind(Self::LOCK_KEY)
+            .execute(&mut **conn)
             .await?;
         Ok(())
     }
 
     /// Rescue jobs with stale heartbeats (crash detection).
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
         let staleness_str = format!("{} seconds", self.heartbeat_staleness.as_secs());
         match sqlx::query_as::<_, JobRow>(
@@ -159,6 +189,7 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs that exceeded their hard deadline.
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
     async fn rescue_expired_deadlines(&self) {
         match sqlx::query_as::<_, JobRow>(
             r#"
@@ -197,6 +228,7 @@ impl MaintenanceService {
     }
 
     /// Promote scheduled jobs that are now due.
+    #[tracing::instrument(skip(self), name = "maintenance.promote")]
     async fn promote_scheduled(&self) {
         match sqlx::query(
             "UPDATE awa.jobs SET state = 'available' WHERE state = 'scheduled' AND run_at <= now()",
@@ -234,6 +266,7 @@ impl MaintenanceService {
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup")]
     async fn cleanup_completed(&self) {
         let completed_retention = format!("{} seconds", self.completed_retention.as_secs());
         let failed_retention = format!("{} seconds", self.failed_retention.as_secs());

@@ -7,7 +7,7 @@ pub async fn retry<'e, E>(executor: E, job_id: i64) -> Result<Option<JobRow>, Aw
 where
     E: PgExecutor<'e>,
 {
-    let row = sqlx::query_as::<_, JobRow>(
+    sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
         SET state = 'available', attempt = 0, run_at = now(),
@@ -18,12 +18,9 @@ where
     )
     .bind(job_id)
     .fetch_optional(executor)
-    .await?;
-
-    match row {
-        Some(row) => Ok(Some(row)),
-        None => Err(AwaError::JobNotFound { id: job_id }),
-    }
+    .await?
+    .ok_or(AwaError::JobNotFound { id: job_id })
+    .map(Some)
 }
 
 /// Cancel a single non-terminal job.
@@ -31,7 +28,7 @@ pub async fn cancel<'e, E>(executor: E, job_id: i64) -> Result<Option<JobRow>, A
 where
     E: PgExecutor<'e>,
 {
-    let row = sqlx::query_as::<_, JobRow>(
+    sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
         SET state = 'cancelled', finalized_at = now()
@@ -41,12 +38,9 @@ where
     )
     .bind(job_id)
     .fetch_optional(executor)
-    .await?;
-
-    match row {
-        Some(row) => Ok(Some(row)),
-        None => Err(AwaError::JobNotFound { id: job_id }),
-    }
+    .await?
+    .ok_or(AwaError::JobNotFound { id: job_id })
+    .map(Some)
 }
 
 /// Retry all failed jobs of a given kind.

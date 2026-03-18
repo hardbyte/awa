@@ -83,6 +83,7 @@ dependencies = [
 name = "awa-python"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "awa-model",
  "awa-worker",
  "chrono",
@@ -92,6 +93,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 
@@ -103,6 +105,7 @@ dependencies = [
  "awa-macros",
  "awa-model",
  "chrono",
+ "opentelemetry",
  "serde",
  "serde_json",
  "sqlx",
@@ -863,6 +866,20 @@ name = "once_cell"
 version = "1.21.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
+
+[[package]]
+name = "opentelemetry"
+version = "0.29.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9e87237e2775f74896f9ad219d26a2081751187eb7c9f5c58dde20a23b95d16c"
+dependencies = [
+ "futures-core",
+ "futures-sink",
+ "js-sys",
+ "pin-project-lite",
+ "thiserror",
+ "tracing",
+]
 
 [[package]]
 name = "parking"

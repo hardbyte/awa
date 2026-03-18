@@ -15,6 +15,7 @@ async-trait.workspace = true
 thiserror.workspace = true
 chrono.workspace = true
 tracing.workspace = true
+opentelemetry.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

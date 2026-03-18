@@ -18,8 +18,10 @@ pub fn compute_unique_key(
 
     if let Some(args) = args {
         hasher.update(b"\x00");
-        // serde_json sorts keys by default for BTreeMap-backed values,
-        // but Value uses insertion order. Use canonical JSON for determinism.
+        // serde_json::Value uses Map<String, Value> backed by BTreeMap,
+        // so keys iterate in sorted order. This is an implementation detail
+        // of serde_json, not a guarantee. Python uses json.dumps(sort_keys=True)
+        // explicitly. Cross-language golden tests verify consistency.
         let canonical = serde_json::to_vec(args).expect("JSON serialization should not fail");
         hasher.update(&canonical);
     }

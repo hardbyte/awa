@@ -1,8 +1,8 @@
 use crate::executor::JobExecutor;
 use awa_model::JobRow;
 use sqlx::PgPool;
-use std::collections::HashSet;
-use std::sync::atomic::AtomicBool;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{RwLock, Semaphore};
@@ -35,8 +35,9 @@ pub struct Dispatcher {
     config: QueueConfig,
     pool: PgPool,
     executor: Arc<JobExecutor>,
-    _in_flight: Arc<RwLock<HashSet<i64>>>,
+    _in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     semaphore: Arc<Semaphore>,
+    alive: Arc<AtomicBool>,
     cancel: CancellationToken,
 }
 
@@ -46,7 +47,8 @@ impl Dispatcher {
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
-        in_flight: Arc<RwLock<HashSet<i64>>>,
+        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        alive: Arc<AtomicBool>,
         cancel: CancellationToken,
     ) -> Self {
         let semaphore = Arc::new(Semaphore::new(config.max_workers as usize));
@@ -57,12 +59,15 @@ impl Dispatcher {
             executor,
             _in_flight: in_flight,
             semaphore,
+            alive,
             cancel,
         }
     }
 
     /// Run the poll loop. Returns when cancelled.
+    #[tracing::instrument(skip(self), fields(queue = %self.queue, max_workers = self.config.max_workers))]
     pub async fn run(&self) {
+        self.alive.store(true, Ordering::SeqCst);
         info!(
             queue = %self.queue,
             max_workers = self.config.max_workers,
@@ -78,6 +83,7 @@ impl Dispatcher {
                 error!(error = %err, "Failed to create PG listener, falling back to polling only");
                 // Fall back to poll-only mode
                 self.poll_loop_only().await;
+                self.alive.store(false, Ordering::SeqCst);
                 return;
             }
         };
@@ -85,6 +91,7 @@ impl Dispatcher {
         if let Err(err) = listener.listen(&notify_channel).await {
             warn!(error = %err, channel = %notify_channel, "Failed to LISTEN, falling back to polling");
             self.poll_loop_only().await;
+            self.alive.store(false, Ordering::SeqCst);
             return;
         }
 
@@ -114,6 +121,8 @@ impl Dispatcher {
                 }
             }
         }
+
+        self.alive.store(false, Ordering::SeqCst);
     }
 
     /// Poll-only fallback (no LISTEN/NOTIFY).
@@ -132,6 +141,7 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: claim available jobs up to the semaphore limit.
+    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
     async fn poll_once(&self) {
         // How many workers are available?
         let available = self.semaphore.available_permits();
@@ -140,8 +150,8 @@ impl Dispatcher {
         }
 
         let batch_size = available.min(10) as i32; // Claim in small batches
-        let deadline_str = format!("{} seconds", self.config.deadline_duration.as_secs());
-        let aging_secs = self.config.priority_aging_interval.as_secs() as f64;
+        let deadline_secs = self.config.deadline_duration.as_secs_f64();
+        let aging_secs = self.config.priority_aging_interval.as_secs_f64();
 
         let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
             r#"
@@ -167,7 +177,7 @@ impl Dispatcher {
                 attempt = attempt + 1,
                 attempted_at = now(),
                 heartbeat_at = now(),
-                deadline_at = now() + $3::interval
+                deadline_at = now() + make_interval(secs => $3)
             FROM claimed
             WHERE awa.jobs.id = claimed.id
             RETURNING awa.jobs.*
@@ -175,7 +185,7 @@ impl Dispatcher {
         )
         .bind(&self.queue)
         .bind(batch_size)
-        .bind(&deadline_str)
+        .bind(deadline_secs)
         .bind(aging_secs)
         .fetch_all(&self.pool)
         .await
