@@ -3,7 +3,7 @@ requires = ["maturin>=1.0,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "awa"
+name = "awa-pg"
 requires-python = ">=3.10"
 version = "0.1.4"
 description = "Postgres-native background job queue for Rust and Python"
