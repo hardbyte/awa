@@ -101,10 +101,6 @@ RunningOwned ==
 NonRunningUnowned ==
     \A j \in Jobs : jobState[j] # "running" => owner[j] = NoOwner
 
-NoClaimAfterStopClaim ==
-    shutdownPhase \in {"stop_claim", "draining", "stopped"}
-    => \A j \in Jobs : jobState[j] = "running" => TRUE
-
 Spec == Init /\ [][Next]_vars
 
 ====
