@@ -115,7 +115,7 @@ awa --database-url $DATABASE_URL migrate
 
 ```toml
 [dependencies]
-awa = "0.1"
+awa = "0.2"
 ```
 
 ### Python
@@ -137,16 +137,17 @@ awa --database-url $DATABASE_URL job list --state failed
 ## Architecture
 
 ```
-┌────────────────────┐      ┌────────────────────┐
-│ Rust producers     │      │ Python producers   │
-│ `awa-model` / `awa`│      │ `pip install awa-pg`  │
-└─────────┬──────────┘      └─────────┬──────────┘
-          │                           │
-          └──────────────┬────────────┘
+┌──────────────────────┐    ┌──────────────────────┐
+│  Rust producers      │    │  Python producers    │
+│  awa-model / awa     │    │  pip install awa-pg  │
+└──────────┬───────────┘    └──────────┬───────────┘
+           │                           │
+           └─────────────┬─────────────┘
                          ▼
-              ┌──────────────────────┐
-              │ PostgreSQL `awa.jobs`│
-              └──────────┬───────────┘
+              ┌─────────────────────┐
+              │  PostgreSQL         │
+              │  awa.jobs           │
+              └──────────┬──────────┘
                          │
         ┌────────────────┼────────────────┐
         │                │                │
@@ -154,7 +155,7 @@ awa --database-url $DATABASE_URL job list --state failed
 ┌───────────────┐ ┌───────────────┐ ┌───────────────┐
 │ Rust runtime  │ │ Rust runtime  │ │ Rust runtime  │
 │ + Rust worker │ │ + Python cb   │ │ + Python cb   │
-│ `awa-worker`  │ │ via PyO3      │ │ via PyO3      │
+│ awa-worker    │ │ via PyO3      │ │ via PyO3      │
 └───────────────┘ └───────────────┘ └───────────────┘
 ```
 
@@ -181,7 +182,13 @@ All coordination happens through Postgres, and the Rust runtime owns polling, he
 - [ADR-004: PyO3 async bridge](docs/adr/004-pyo3-async-bridge.md)
 - [ADR-005: Priority aging](docs/adr/005-priority-aging.md)
 - [ADR-006: AwaTransaction as narrow SQL surface](docs/adr/006-awa-transaction.md)
+- [ADR-007: Periodic cron jobs](docs/adr/007-periodic-cron-jobs.md)
+- [ADR-008: COPY batch ingestion](docs/adr/008-copy-batch-ingestion.md)
+- [ADR-009: Python sync support](docs/adr/009-python-sync-support.md)
+- [ADR-010: Per-queue rate limiting](docs/adr/010-rate-limiting.md)
+- [ADR-011: Weighted concurrency](docs/adr/011-weighted-concurrency.md)
 - [Validation test plan](docs/test-plan.md)
+- [TLA+ correctness models](corectness/README.md)
 
 ## License
 
