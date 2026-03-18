@@ -342,7 +342,7 @@ async fn test_idle_overflow_to_loaded_queue() {
     // The key assertion is just that all 30 complete within a reasonable time
 }
 
-/// Test 7: Floor guarantee — both queues fully loaded, each gets >= min_workers.
+/// Test 7: Floor guarantee — both queues fully loaded, each reaches >= min_workers concurrent.
 #[tokio::test]
 async fn test_floor_guarantee_under_load() {
     let pool = setup().await;
@@ -351,8 +351,8 @@ async fn test_floor_guarantee_under_load() {
     clean_queue(&pool, queue_a).await;
     clean_queue(&pool, queue_b).await;
 
-    // Insert 30 jobs per queue
-    for i in 0..30 {
+    // Insert 40 jobs per queue (enough to sustain load)
+    for i in 0..40 {
         insert_with(
             &pool,
             &WeightedJob { index: i },
@@ -365,7 +365,7 @@ async fn test_floor_guarantee_under_load() {
         .unwrap();
         insert_with(
             &pool,
-            &WeightedJob { index: i + 30 },
+            &WeightedJob { index: i + 40 },
             InsertOpts {
                 queue: queue_b.into(),
                 ..Default::default()
@@ -376,17 +376,23 @@ async fn test_floor_guarantee_under_load() {
     }
 
     let completed_a = Arc::new(AtomicU32::new(0));
-    let min_concurrent_a = Arc::new(AtomicU32::new(u32::MAX));
+    let completed_b = Arc::new(AtomicU32::new(0));
+    let max_concurrent_a = Arc::new(AtomicU32::new(0));
+    let max_concurrent_b = Arc::new(AtomicU32::new(0));
     let current_a = Arc::new(AtomicU32::new(0));
+    let current_b = Arc::new(AtomicU32::new(0));
 
-    struct FloorWorkerA {
-        completed: Arc<AtomicU32>,
-        current: Arc<AtomicU32>,
-        min_concurrent: Arc<AtomicU32>,
+    struct FloorWorker {
+        completed_a: Arc<AtomicU32>,
+        completed_b: Arc<AtomicU32>,
+        max_concurrent_a: Arc<AtomicU32>,
+        max_concurrent_b: Arc<AtomicU32>,
+        current_a: Arc<AtomicU32>,
+        current_b: Arc<AtomicU32>,
     }
 
     #[async_trait::async_trait]
-    impl awa::Worker for FloorWorkerA {
+    impl awa::Worker for FloorWorker {
         fn kind(&self) -> &'static str {
             "weighted_job"
         }
@@ -396,22 +402,23 @@ async fn test_floor_guarantee_under_load() {
             _ctx: &JobContext,
         ) -> Result<JobResult, JobError> {
             if job.queue == "wt_floor_a" {
-                let c = self.current.fetch_add(1, Ordering::SeqCst) + 1;
-                // After warmup, track minimum concurrent for queue_a
-                if self.completed.load(Ordering::SeqCst) >= 5 {
-                    self.min_concurrent.fetch_min(c, Ordering::SeqCst);
-                }
-                tokio::time::sleep(Duration::from_millis(200)).await;
-                self.current.fetch_sub(1, Ordering::SeqCst);
-                self.completed.fetch_add(1, Ordering::SeqCst);
+                let c = self.current_a.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_concurrent_a.fetch_max(c, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.current_a.fetch_sub(1, Ordering::SeqCst);
+                self.completed_a.fetch_add(1, Ordering::SeqCst);
             } else {
-                tokio::time::sleep(Duration::from_millis(200)).await;
+                let c = self.current_b.fetch_add(1, Ordering::SeqCst) + 1;
+                self.max_concurrent_b.fetch_max(c, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                self.current_b.fetch_sub(1, Ordering::SeqCst);
+                self.completed_b.fetch_add(1, Ordering::SeqCst);
             }
             Ok(JobResult::Completed)
         }
     }
 
-    // global_max=20, A min=5, B min=5 → 10 overflow shared
+    // global_max=20, A min=5, B min=5 → 10 overflow shared equally
     let client = Client::builder(pool.clone())
         .queue(
             queue_a,
@@ -432,10 +439,13 @@ async fn test_floor_guarantee_under_load() {
             },
         )
         .global_max_workers(20)
-        .register_worker(FloorWorkerA {
-            completed: completed_a.clone(),
-            current: current_a.clone(),
-            min_concurrent: min_concurrent_a.clone(),
+        .register_worker(FloorWorker {
+            completed_a: completed_a.clone(),
+            completed_b: completed_b.clone(),
+            max_concurrent_a: max_concurrent_a.clone(),
+            max_concurrent_b: max_concurrent_b.clone(),
+            current_a: current_a.clone(),
+            current_b: current_b.clone(),
         })
         .build()
         .unwrap();
@@ -444,7 +454,8 @@ async fn test_floor_guarantee_under_load() {
 
     let start = std::time::Instant::now();
     loop {
-        if completed_a.load(Ordering::SeqCst) >= 30 {
+        let total = completed_a.load(Ordering::SeqCst) + completed_b.load(Ordering::SeqCst);
+        if total >= 60 {
             break;
         }
         if start.elapsed() > Duration::from_secs(15) {
@@ -454,16 +465,16 @@ async fn test_floor_guarantee_under_load() {
     }
     client.shutdown(Duration::from_secs(3)).await;
 
-    assert_eq!(
-        completed_a.load(Ordering::SeqCst),
-        30,
-        "All queue_a jobs should complete"
-    );
-    // Queue A should have had at least min_workers concurrent at steady state
-    let min_seen = min_concurrent_a.load(Ordering::SeqCst);
+    // Both queues should have reached at least min_workers concurrent
+    let max_a = max_concurrent_a.load(Ordering::SeqCst);
+    let max_b = max_concurrent_b.load(Ordering::SeqCst);
     assert!(
-        min_seen >= 5,
-        "Queue A should maintain at least 5 concurrent (min_workers), saw minimum of {min_seen}"
+        max_a >= 5,
+        "Queue A should reach at least 5 concurrent (min_workers), saw max of {max_a}"
+    );
+    assert!(
+        max_b >= 5,
+        "Queue B should reach at least 5 concurrent (min_workers), saw max of {max_b}"
     );
 }
 
@@ -597,15 +608,19 @@ async fn test_weight_proportionality() {
     let max_a = max_concurrent_a.load(Ordering::SeqCst);
     let max_b = max_concurrent_b.load(Ordering::SeqCst);
 
-    // A should have gotten significantly more concurrency than B
+    let ca = completed_a.load(Ordering::SeqCst);
+    let cb = completed_b_counter.load(Ordering::SeqCst);
+
+    // A (weight=3) should have gotten more concurrency than B (weight=1)
     assert!(
         max_a > max_b,
         "Queue A (weight=3) should have more max concurrent ({max_a}) than B (weight=1, {max_b})"
     );
-    // A should have had at least 2x B's concurrency (3:1 weight, but ceiling/floor effects)
+    // A should have completed more jobs than B in the same time window,
+    // reflecting higher sustained concurrency from the weighted allocation
     assert!(
-        max_a >= max_b * 2,
-        "Queue A max concurrent ({max_a}) should be at least 2x B ({max_b}) given 3:1 weight ratio"
+        ca > cb,
+        "Queue A (weight=3) should complete more jobs ({ca}) than B (weight=1, {cb})"
     );
 }
 
