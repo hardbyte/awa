@@ -116,7 +116,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "awa"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "awa-model",
  "chrono",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -159,11 +159,13 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "awa-macros",
  "blake3",
  "chrono",
+ "chrono-tz",
+ "croner",
  "serde",
  "serde_json",
  "sqlx",
@@ -174,7 +176,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -188,12 +190,14 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.1.5"
+version = "0.1.6"
 dependencies = [
  "async-trait",
  "awa-macros",
  "awa-model",
  "chrono",
+ "chrono-tz",
+ "croner",
  "opentelemetry",
  "serde",
  "serde_json",
@@ -298,6 +302,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "chrono-tz"
+version = "0.10.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a6139a8597ed92cf816dfb33f5dd6cf0bb93a6adc938f11039f371bc5bcd26c3"
+dependencies = [
+ "chrono",
+ "phf",
+]
+
+[[package]]
 name = "clap"
 version = "4.5.60"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -393,6 +407,15 @@ name = "crc-catalog"
 version = "2.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19d374276b40fb8bbdee95aef7c7fa6b5316ec764510eb64b8dd0e2ed0d7e7f5"
+
+[[package]]
+name = "croner"
+version = "2.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c344b0690c1ad1c7176fe18eb173e0c927008fdaaa256e40dfd43ddd149c0843"
+dependencies = [
+ "chrono",
+]
 
 [[package]]
 name = "crossbeam-queue"
@@ -1130,6 +1153,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "phf"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "913273894cec178f401a31ec4b656318d95473527be05c0752cc41cdc32be8b7"
+dependencies = [
+ "phf_shared",
+]
+
+[[package]]
+name = "phf_shared"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "06005508882fb681fd97892ecff4b7fd0fee13ef1aa569f8695dae7ab9099981"
+dependencies = [
+ "siphasher",
+]
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1507,6 +1548,12 @@ dependencies = [
  "digest",
  "rand_core 0.6.4",
 ]
+
+[[package]]
+name = "siphasher"
+version = "1.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2aa850e253778c88a04c3d7323b043aeda9d3e30d5971937c1855769763678e"
 
 [[package]]
 name = "slab"

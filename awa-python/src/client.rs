@@ -1,10 +1,10 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
-use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error};
+use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error, validation_error};
 use crate::job::{py_to_json, PyJob};
 use crate::transaction::{insert_raw_job, parse_run_at, PyTransaction};
 use crate::worker::PythonWorker;
 use awa_model::admin::ListJobsFilter;
-use awa_model::{InsertOpts, JobState};
+use awa_model::{InsertOpts, JobState, PeriodicJob};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sqlx::postgres::PgPoolOptions;
@@ -128,6 +128,7 @@ impl Clone for WorkerEntry {
 pub struct PyClient {
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
+    periodic_jobs: Arc<Mutex<Vec<PeriodicJob>>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
 }
 
@@ -148,6 +149,7 @@ impl PyClient {
         Ok(Self {
             pool,
             workers: Arc::new(RwLock::new(HashMap::new())),
+            periodic_jobs: Arc::new(Mutex::new(Vec::new())),
             runtime: Arc::new(Mutex::new(None)),
         })
     }
@@ -282,6 +284,56 @@ impl PyClient {
         )?;
 
         Ok(decorator.into_any().unbind())
+    }
+
+    /// Register a periodic (cron) job schedule.
+    ///
+    /// The schedule is synced to the database by the leader and evaluated
+    /// every second to enqueue jobs when they're due.
+    #[pyo3(signature = (name, cron_expr, args_type, args, *, timezone="UTC".to_string(), queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn periodic(
+        &self,
+        py: Python<'_>,
+        name: String,
+        cron_expr: String,
+        args_type: Py<PyAny>,
+        args: Py<PyAny>,
+        timezone: String,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        let args_bound = args.bind(py);
+        let kind = {
+            let class_name = get_type_class_name(args_type.bind(py).as_any())?;
+            derive_kind(&class_name)
+        };
+        let args_json = serialize_args(py, args_bound)?;
+        let metadata_json = metadata
+            .as_ref()
+            .map(|value| py_to_json(py, value.bind(py)))
+            .transpose()?
+            .unwrap_or(serde_json::json!({}));
+
+        let periodic_job = PeriodicJob::builder(&name, &cron_expr)
+            .timezone(&timezone)
+            .queue(&queue)
+            .priority(priority)
+            .max_attempts(max_attempts)
+            .tags(tags)
+            .metadata(metadata_json)
+            .build_raw(kind, args_json)
+            .map_err(map_awa_error)?;
+
+        self.periodic_jobs
+            .lock()
+            .expect("periodic_jobs mutex poisoned")
+            .push(periodic_job);
+
+        Ok(())
     }
 
     fn retry<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
@@ -502,6 +554,16 @@ impl PyClient {
         }
         for entry in &entries {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
+        }
+
+        // Register periodic jobs
+        let periodic_jobs = self
+            .periodic_jobs
+            .lock()
+            .expect("periodic_jobs mutex poisoned")
+            .clone();
+        for job in periodic_jobs {
+            builder = builder.periodic(job);
         }
 
         let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);

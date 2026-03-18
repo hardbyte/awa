@@ -35,6 +35,7 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
         awa_model::AwaError::UnknownJobKind { kind } => {
             UnknownJobKind::new_err(format!("unknown job kind: {kind}"))
         }
+        awa_model::AwaError::Validation(msg) => ValidationError::new_err(msg),
         awa_model::AwaError::Serialization(err) => SerializationError::new_err(err.to_string()),
         awa_model::AwaError::Database(err) => map_sqlx_error(err),
     }

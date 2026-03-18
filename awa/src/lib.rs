@@ -12,5 +12,5 @@ pub use awa_model::{
 // Re-export worker runtime
 pub use awa_worker::{
     self as worker, BuildError, Client, ClientBuilder, HealthCheck, JobContext, JobError,
-    JobResult, QueueConfig, QueueHealth, Worker,
+    JobResult, PeriodicJob, PeriodicJobBuilder, QueueConfig, QueueHealth, Worker,
 };

@@ -7,6 +7,7 @@ pub mod maintenance;
 pub mod metrics;
 
 // Re-exports
+pub use awa_model::{PeriodicJob, PeriodicJobBuilder};
 pub use client::{BuildError, Client, ClientBuilder, HealthCheck, QueueHealth};
 pub use context::JobContext;
 pub use dispatcher::QueueConfig;

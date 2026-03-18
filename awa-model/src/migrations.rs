@@ -3,7 +3,13 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 2;
+
+/// All migrations in order.
+const MIGRATIONS: &[(i32, &str, &str)] = &[
+    (1, "Initial schema", V1_UP),
+    (2, "Periodic/cron jobs", V2_UP),
+];
 
 /// The initial migration SQL.
 const V1_UP: &str = r#"
@@ -127,6 +133,30 @@ CREATE INDEX idx_awa_jobs_kind_state
 INSERT INTO awa.schema_version (version, description) VALUES (1, 'Initial schema');
 "#;
 
+/// V2 migration: Periodic/cron jobs table.
+const V2_UP: &str = r#"
+-- Awa schema v2: Periodic/cron jobs
+
+CREATE TABLE awa.cron_jobs (
+    name            TEXT PRIMARY KEY,
+    cron_expr       TEXT        NOT NULL,
+    timezone        TEXT        NOT NULL DEFAULT 'UTC',
+    kind            TEXT        NOT NULL,
+    queue           TEXT        NOT NULL DEFAULT 'default',
+    args            JSONB       NOT NULL DEFAULT '{}',
+    priority        SMALLINT    NOT NULL DEFAULT 2,
+    max_attempts    SMALLINT    NOT NULL DEFAULT 25,
+    tags            TEXT[]      NOT NULL DEFAULT '{}',
+    metadata        JSONB       NOT NULL DEFAULT '{}',
+    last_enqueued_at TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (2, 'Periodic/cron jobs');
+"#;
+
 /// Run all pending migrations against the database.
 ///
 /// Uses an advisory lock to prevent concurrent migration attempts.
@@ -156,9 +186,12 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
             .await?;
 
     if !has_schema {
-        info!("Running initial migration (v1)");
-        sqlx::raw_sql(V1_UP).execute(pool).await?;
-        info!("Migration v1 applied successfully");
+        // Fresh database — apply all migrations in order
+        for &(version, description, sql) in MIGRATIONS {
+            info!(version, description, "Applying migration");
+            sqlx::raw_sql(sql).execute(pool).await?;
+            info!(version, "Migration applied");
+        }
         return Ok(());
     }
 
@@ -170,9 +203,12 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
     .await?;
 
     if !has_version_table {
-        info!("Running initial migration (v1)");
-        sqlx::raw_sql(V1_UP).execute(pool).await?;
-        info!("Migration v1 applied successfully");
+        // Schema exists but no version table — apply all from v1
+        for &(version, description, sql) in MIGRATIONS {
+            info!(version, description, "Applying migration");
+            sqlx::raw_sql(sql).execute(pool).await?;
+            info!(version, "Migration applied");
+        }
         return Ok(());
     }
 
@@ -187,10 +223,13 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
         return Ok(());
     }
 
-    if current_version == 0 {
-        info!("Running initial migration (v1)");
-        sqlx::raw_sql(V1_UP).execute(pool).await?;
-        info!("Migration v1 applied successfully");
+    // Walk pending migrations
+    for &(version, description, sql) in MIGRATIONS {
+        if version > current_version {
+            info!(version, description, "Applying migration");
+            sqlx::raw_sql(sql).execute(pool).await?;
+            info!(version, "Migration applied");
+        }
     }
 
     Ok(())
@@ -226,5 +265,5 @@ pub async fn current_version(pool: &PgPool) -> Result<i32, AwaError> {
 
 /// Get the raw SQL for all migrations (for extraction / external tooling).
 pub fn migration_sql() -> Vec<(i32, &'static str, &'static str)> {
-    vec![(1, "Initial schema", V1_UP)]
+    MIGRATIONS.iter().map(|&(v, d, s)| (v, d, s)).collect()
 }

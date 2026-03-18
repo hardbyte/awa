@@ -1,6 +1,6 @@
 # AWA — Validation Test Plan
 
-Run after Phase 2 (Rust core + Python client complete). Pass all = ship v0.1.
+Run after Phase 2 (Rust core + Python client complete). Pass all = ship.
 
 Tests run against real Postgres 15+ (not managed services). Dedicated test database.
 All tests are automated and run in CI.
@@ -34,6 +34,19 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T31 | Throughput >= 3,000 jobs/sec (Rust workers, debug build) | Benchmark | Implemented |
 | T32 | Pickup latency p50 < 50ms (LISTEN/NOTIFY) | Benchmark | Implemented |
 | T33 | Insert throughput >= 10,000 inserts/sec | Benchmark | Implemented |
+| T34 | V2 migration creates `awa.cron_jobs` table | Migration | Implemented |
+| T35 | UPSERT sync: inserts new, updates changed, does NOT delete others | Cron | Implemented |
+| T36 | Atomic CTE: mark + insert succeeds, returns job row | Cron | Implemented |
+| T37 | Atomic CTE: second call returns 0 rows (dedup) | Cron | Implemented |
+| T38 | Multi-deployment: disjoint schedules coexist (no orphan deletion) | Cron | Implemented |
+| T39 | No backfill: only latest missed fire enqueued | Cron | Implemented |
+| T40 | End-to-end: register periodic + start → job appears with cron metadata | Cron | Implemented |
+| T41 | Tags and metadata propagate from schedule to enqueued job | Cron | Implemented |
+| T42 | Cron expression validation at build time | Cron (unit) | Implemented |
+| T43 | Timezone validation at build time | Cron (unit) | Implemented |
+| T44 | DST spring-forward: at most one fire | Cron (unit) | Implemented |
+| T45 | DST fall-back: exactly one fire | Cron (unit) | Implemented |
+| T46 | First registration (NULL last_enqueued_at): enqueues most recent past fire | Cron (unit) | Implemented |
 
 ## Running Tests
 

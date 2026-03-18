@@ -16,6 +16,8 @@ tokio.workspace = true
 thiserror.workspace = true
 blake3.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
+croner.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]

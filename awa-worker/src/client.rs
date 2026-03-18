@@ -2,7 +2,7 @@ use crate::dispatcher::{Dispatcher, QueueConfig};
 use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::MaintenanceService;
-use awa_model::{JobArgs, JobRow};
+use awa_model::{JobArgs, JobRow, PeriodicJob};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
@@ -48,6 +48,7 @@ pub struct ClientBuilder {
     workers: HashMap<String, BoxedWorker>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
+    periodic_jobs: Vec<PeriodicJob>,
 }
 
 impl ClientBuilder {
@@ -58,6 +59,7 @@ impl ClientBuilder {
             workers: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
+            periodic_jobs: Vec::new(),
         }
     }
 
@@ -106,6 +108,15 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a periodic (cron) job schedule.
+    ///
+    /// The schedule is synced to the database by the leader and evaluated
+    /// every second. When a fire is due, a job is atomically enqueued.
+    pub fn periodic(mut self, job: PeriodicJob) -> Self {
+        self.periodic_jobs.push(job);
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
@@ -132,6 +143,7 @@ impl ClientBuilder {
             workers: Arc::new(self.workers),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
+            periodic_jobs: Arc::new(self.periodic_jobs),
             cancel: CancellationToken::new(),
             handles: RwLock::new(Vec::new()),
             in_flight: Arc::new(RwLock::new(HashMap::new())),
@@ -187,6 +199,7 @@ pub struct Client {
     workers: Arc<HashMap<String, BoxedWorker>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
+    periodic_jobs: Arc<Vec<PeriodicJob>>,
     cancel: CancellationToken,
     handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
     in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
@@ -236,8 +249,12 @@ impl Client {
         }));
 
         // Start maintenance service
-        let maintenance =
-            MaintenanceService::new(self.pool.clone(), self.leader.clone(), self.cancel.clone());
+        let maintenance = MaintenanceService::new(
+            self.pool.clone(),
+            self.leader.clone(),
+            self.cancel.clone(),
+            self.periodic_jobs.clone(),
+        );
         handles.push(tokio::spawn(async move {
             maintenance.run().await;
         }));

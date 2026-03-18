@@ -14,6 +14,9 @@ pub enum AwaError {
     #[error("unknown job kind: {kind}")]
     UnknownJobKind { kind: String },
 
+    #[error("validation error: {0}")]
+    Validation(String),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),
 

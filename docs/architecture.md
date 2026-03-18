@@ -11,15 +11,15 @@ The Rust runtime owns all queue machinery -- polling, heartbeating, crash recove
 ```
 awa (workspace)
 ├── awa-macros        proc-macro crate: #[derive(JobArgs)] and CamelCase→snake_case
-├── awa-model         Core types, SQL, migrations, insert/admin APIs
-│   └── depends on: awa-macros, sqlx, blake3, serde, chrono
+├── awa-model         Core types, SQL, migrations, insert/admin/cron APIs
+│   └── depends on: awa-macros, sqlx, blake3, serde, chrono, chrono-tz, croner
 ├── awa-worker        Runtime: Client, Dispatcher, Executor, Heartbeat, Maintenance, Metrics
-│   └── depends on: awa-model, sqlx, tokio, opentelemetry
+│   └── depends on: awa-model, sqlx, tokio, opentelemetry, croner, chrono-tz
 ├── awa               Facade crate re-exporting awa-model + awa-worker
 │   └── depends on: awa-model, awa-macros, awa-worker
 ├── awa-testing       Test utilities (TestClient, WorkResult)
 │   └── depends on: awa-model, awa-worker
-├── awa-cli           CLI binary: migrations, job/queue admin
+├── awa-cli           CLI binary: migrations, job/queue/cron admin
 │   └── depends on: awa-model, clap
 └── awa-python        PyO3 cdylib: Python bindings (separate Cargo workspace)
     └── depends on: awa-model, awa-worker, pyo3, pyo3-async-runtimes
@@ -169,6 +169,61 @@ UPDATE awa.jobs SET state = 'available'
 WHERE state = 'retryable' AND run_at <= now()
 ```
 
+## Periodic/Cron Jobs
+
+Awa supports periodic job scheduling via the `PeriodicJob` API. Schedules are defined in application code, synced to an `awa.cron_jobs` table, and evaluated by the maintenance leader. See ADR-007 for design rationale.
+
+### Registration
+
+```rust
+let client = Client::builder(pool)
+    .queue("default", QueueConfig::default())
+    .register::<DailyReport, _, _>(handle_daily_report)
+    .periodic(
+        PeriodicJob::builder("daily_report", "0 9 * * *")
+            .timezone("Pacific/Auckland")
+            .build(&DailyReport { format: "pdf".into() })?
+    )
+    .build()?;
+```
+
+```python
+client.periodic(
+    name="daily_report",
+    cron_expr="0 9 * * *",
+    args_type=DailyReport,
+    args=DailyReport(format="pdf"),
+    timezone="Pacific/Auckland",
+)
+```
+
+Cron expressions and timezones are validated eagerly at registration time via the `croner` crate and `chrono-tz`.
+
+### Scheduler Flow (Leader-Only)
+
+```
+MaintenanceService (leader)
+    │
+    ├── Every 60s: sync_periodic_jobs_to_db()
+    │   └── UPSERT all registered schedules (additive, no deletes)
+    │
+    ├── Every 1s: evaluate_cron_schedules()
+    │   ├── SELECT * FROM awa.cron_jobs
+    │   ├── For each: compute latest fire time ≤ now, after last_enqueued_at
+    │   └── If due: atomic CTE (mark last_enqueued_at + INSERT INTO awa.jobs)
+    │
+    └── Every 30s: leader liveness check
+        └── SELECT 1 on leader connection (break to re-election if dead)
+```
+
+### Crash Safety
+
+The atomic enqueue CTE combines the schedule update and job insertion into a single statement. If the process crashes mid-transaction, Postgres rolls back both. The `IS NOT DISTINCT FROM` clause on `last_enqueued_at` acts as a compare-and-swap, preventing double-fires across leader failovers.
+
+### Multi-Deployment Safety
+
+Sync is additive (UPSERT only). Multiple deployments sharing the same database will not delete each other's schedules. Stale schedules can be removed via `awa cron remove <name>`.
+
 ## Crash Recovery Model
 
 Awa uses a hybrid approach with two independent crash recovery mechanisms, each catching a different failure mode (see ADR-003 for rationale).
@@ -188,7 +243,7 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 
 ### Leader Election
 
-Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds.
+Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup, cron evaluation) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds. The leader verifies its connection is still alive every 30 seconds; if the ping fails, it re-enters the election loop.
 
 ## Python Integration via PyO3
 
@@ -205,6 +260,12 @@ await client.health_check()     ───►   awa_worker::Client::health_check(
 @client.worker(SendEmail, queue="email")
 async def handle(job):                  handler + task locals registered
     ...
+
+client.periodic(                 ───►   PeriodicJob registered
+    name="report", cron_expr="0 9 * * *",
+    args_type=Report, args=Report(...),
+    timezone="Pacific/Auckland",
+)
 
 client.start([("email", 10)])    ───►   awa_worker::Client::start()
                                          ├── Dispatcher (`SKIP LOCKED` + LISTEN/NOTIFY)
@@ -242,6 +303,8 @@ All components emit structured tracing spans via the `tracing` crate with `#[ins
 | `maintenance.rescue_deadline` | maintenance.rs | — |
 | `maintenance.promote` | maintenance.rs | — |
 | `maintenance.cleanup` | maintenance.rs | — |
+| `maintenance.cron_sync` | maintenance.rs | — |
+| `maintenance.cron_eval` | maintenance.rs | — |
 
 The `job.execute` span records `otel.status_code = "OK"` on success or `"ERROR"` on terminal failure, compatible with OpenTelemetry trace semantics.
 

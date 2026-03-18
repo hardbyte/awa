@@ -30,6 +30,11 @@ enum Commands {
         #[command(subcommand)]
         command: QueueCommands,
     },
+    /// Cron/periodic job management
+    Cron {
+        #[command(subcommand)]
+        command: CronCommands,
+    },
 }
 
 #[derive(Subcommand)]
@@ -61,6 +66,14 @@ enum JobCommands {
         #[arg(long, default_value = "20")]
         limit: i64,
     },
+}
+
+#[derive(Subcommand)]
+enum CronCommands {
+    /// List all registered cron job schedules
+    List,
+    /// Remove a cron job schedule by name
+    Remove { name: String },
 }
 
 #[derive(Subcommand)]
@@ -179,6 +192,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     println!("\n{} jobs listed.", jobs.len());
+                }
+            }
+        },
+
+        Commands::Cron { command } => match command {
+            CronCommands::List => {
+                let schedules = awa_model::cron::list_cron_jobs(&pool).await?;
+                if schedules.is_empty() {
+                    println!("No cron job schedules found.");
+                } else {
+                    println!(
+                        "{:<25} {:<20} {:<12} {:<25} {:<10}",
+                        "NAME", "CRON", "TIMEZONE", "KIND", "QUEUE"
+                    );
+                    for s in &schedules {
+                        println!(
+                            "{:<25} {:<20} {:<12} {:<25} {:<10}",
+                            s.name, s.cron_expr, s.timezone, s.kind, s.queue,
+                        );
+                    }
+                    println!("\n{} schedules listed.", schedules.len());
+                }
+            }
+            CronCommands::Remove { name } => {
+                let deleted = awa_model::cron::delete_cron_job(&pool, &name).await?;
+                if deleted {
+                    println!("Removed cron schedule '{name}'");
+                } else {
+                    println!("No cron schedule found with name '{name}'");
                 }
             }
         },

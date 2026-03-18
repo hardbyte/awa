@@ -168,6 +168,20 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     async def health_check(self) -> HealthCheck: ...
+    def periodic(
+        self,
+        name: str,
+        cron_expr: str,
+        args_type: type[T],
+        args: T,
+        *,
+        timezone: str = "UTC",
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None: ...
     def start(
         self,
         queues: list[tuple[str, int]] | None = None,
