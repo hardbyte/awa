@@ -3,7 +3,10 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{admin, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
-use awa::{AwaError, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
+use awa::{
+    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobRow, JobState,
+    Worker,
+};
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -15,7 +18,7 @@ fn database_url() -> String {
 
 async fn setup() -> TestClient {
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(2)
         .connect(&database_url())
         .await
         .expect("Failed to connect to database");
@@ -659,4 +662,13 @@ async fn test_job_state_lifecycle() {
     assert_eq!(final_job.state, JobState::Completed);
     assert_eq!(final_job.attempt, 1);
     assert!(final_job.finalized_at.is_some());
+}
+
+#[tokio::test]
+async fn test_builder_requires_at_least_one_queue() {
+    let client = setup().await;
+
+    let result = Client::builder(client.pool().clone()).build();
+
+    assert!(matches!(result, Err(BuildError::NoQueuesConfigured)));
 }

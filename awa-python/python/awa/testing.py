@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
-from typing import Any, Callable, Awaitable
+from datetime import datetime
+from typing import Any, Awaitable, Callable, Generic, TypeVar
 
 import pytest_asyncio
 
@@ -80,6 +81,26 @@ class _NoJob:
 NoJob = _NoJob()
 """Singleton sentinel used as WorkResult.job when no job was found."""
 
+T = TypeVar("T")
+
+
+@dataclass
+class HandlerJob(Generic[T]):
+    """Python-side stand-in for the runtime job wrapper used by workers."""
+
+    args: T
+    id: int
+    attempt: int
+    max_attempts: int
+    queue: str
+    priority: int
+    deadline: datetime | None
+    metadata: dict[str, Any]
+    tags: list[str]
+
+    def is_cancelled(self) -> bool:
+        return False
+
 
 @dataclass
 class WorkResult:
@@ -136,14 +157,14 @@ class AwaTestClient:
     async def clean(self) -> None:
         """Delete all jobs and queue metadata (for test isolation)."""
         tx = await self._client.transaction()
-        await tx.execute("DELETE FROM awa.jobs", [])
-        await tx.execute("DELETE FROM awa.queue_meta", [])
+        await tx.execute("DELETE FROM awa.jobs")
+        await tx.execute("DELETE FROM awa.queue_meta")
         await tx.commit()
 
     async def work_one(
         self,
         args_type: type,
-        handler: Callable[[Any], Awaitable[Any]],
+        handler: Callable[[HandlerJob[Any]], Awaitable[Any]],
         *,
         kind: str | None = None,
         queue: str = "default",
@@ -185,9 +206,11 @@ class AwaTestClient:
                 -- without explicit registration, so we cast to text.
                 RETURNING awa.jobs.id, awa.jobs.kind, awa.jobs.queue,
                           awa.jobs.args, awa.jobs.attempt, awa.jobs.max_attempts,
-                          awa.jobs.priority, awa.jobs.tags, awa.jobs.state::text AS state
+                          awa.jobs.priority, awa.jobs.tags, awa.jobs.metadata,
+                          awa.jobs.deadline_at AS deadline, awa.jobs.state::text AS state
                 """,
-                [kind_str, queue],
+                kind_str,
+                queue,
             )
         except Exception:
             # No matching job available — fetch_one raises when 0 rows
@@ -200,26 +223,52 @@ class AwaTestClient:
         claimed_job = JobRow.from_row(row)
         job_id = claimed_job.id
 
-        # Deserialize args
-        args_data = row["args"]
-        if hasattr(args_type, "model_validate"):
-            # Pydantic
-            args_instance = args_type.model_validate(args_data)
-        elif hasattr(args_type, "__dataclass_fields__"):
-            # Dataclass
-            args_instance = args_type(**args_data)
-        else:
-            args_instance = args_data
+        # Deserialize args and mirror the runtime job wrapper shape.
+        try:
+            args_data = row["args"]
+            if hasattr(args_type, "model_validate"):
+                args_instance = args_type.model_validate(args_data)
+            elif hasattr(args_type, "__dataclass_fields__"):
+                args_instance = args_type(**args_data)
+            else:
+                args_instance = args_data
+        except Exception as e:
+            tx3 = await self._client.transaction()
+            await tx3.execute(
+                "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+                job_id,
+            )
+            await tx3.commit()
+            job = await _get_job(self._client, job_id)
+            return WorkResult(job=job, outcome="failed", error=str(e))
+
+        deadline_raw = row.get("deadline")
+        deadline = (
+            datetime.fromisoformat(deadline_raw)
+            if isinstance(deadline_raw, str)
+            else deadline_raw
+        )
+        handler_job = HandlerJob(
+            args=args_instance,
+            id=job_id,
+            attempt=row["attempt"],
+            max_attempts=row["max_attempts"],
+            queue=row["queue"],
+            priority=row["priority"],
+            deadline=deadline,
+            metadata=row.get("metadata") or {},
+            tags=row.get("tags") or [],
+        )
 
         # Execute handler
         try:
-            result = await handler(args_instance)
+            result = await handler(handler_job)
         except awa.TerminalError as e:
             # Terminal error -> failed
             tx3 = await self._client.transaction()
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
-                [job_id],
+                job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
@@ -229,7 +278,7 @@ class AwaTestClient:
             tx3 = await self._client.transaction()
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'retryable', finalized_at = now() WHERE id = $1",
-                [job_id],
+                job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
@@ -241,7 +290,7 @@ class AwaTestClient:
             # Completed
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1",
-                [job_id],
+                job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
@@ -249,7 +298,7 @@ class AwaTestClient:
         elif isinstance(result, awa.RetryAfter):
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'retryable', finalized_at = now() WHERE id = $1",
-                [job_id],
+                job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
@@ -257,7 +306,7 @@ class AwaTestClient:
         elif isinstance(result, awa.Snooze):
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'available', attempt = attempt - 1 WHERE id = $1",
-                [job_id],
+                job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
@@ -265,7 +314,7 @@ class AwaTestClient:
         elif isinstance(result, awa.Cancel):
             await tx3.execute(
                 "UPDATE awa.jobs SET state = 'cancelled', finalized_at = now() WHERE id = $1",
-                [job_id],
+                job_id,
             )
             await tx3.commit()
             job = await _get_job(self._client, job_id)
@@ -284,7 +333,7 @@ async def _get_job(client: awa.Client, job_id: int) -> JobRow:
                priority, tags, state::text AS state
         FROM awa.jobs WHERE id = $1
         """,
-        [job_id],
+        job_id,
     )
     await tx.commit()
     return JobRow.from_row(row)

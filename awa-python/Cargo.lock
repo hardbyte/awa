@@ -83,6 +83,7 @@ dependencies = [
 name = "awa-python"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "awa-model",
  "awa-worker",
  "chrono",
@@ -92,6 +93,7 @@ dependencies = [
  "serde_json",
  "sqlx",
  "tokio",
+ "tokio-util",
  "tracing",
 ]
 

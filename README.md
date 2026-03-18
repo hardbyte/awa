@@ -2,7 +2,7 @@
 
 **Postgres-native background job queue for Rust and Python.**
 
-Awa (Māori: river) provides durable, transactional job enqueueing with typed handlers in both Rust and Python. The Rust runtime handles all queue machinery — polling, heartbeating, crash recovery, dispatch — while Python workers run as callbacks via PyO3, getting Rust-grade queue reliability with Python-native ergonomics.
+Awa (Māori: river) provides durable, transactional job enqueueing with typed handlers in both Rust and Python. The Rust runtime handles all queue machinery — polling, LISTEN/NOTIFY wakeups, heartbeating, crash recovery, dispatch — while Python workers run as callbacks via PyO3 on that same runtime, getting Rust-grade queue reliability with Python-native ergonomics.
 
 ## Features
 
@@ -56,7 +56,7 @@ tx.commit().await?;
 let client = Client::builder(pool)
     .queue("default", QueueConfig::default())
     .register_worker(SendEmail { to: String::new(), subject: String::new() })
-    .build();
+    .build()?;
 client.start().await?;
 ```
 
@@ -64,6 +64,7 @@ client.start().await?;
 
 ```python
 import awa
+import asyncio
 from dataclasses import dataclass
 
 @dataclass
@@ -78,7 +79,7 @@ await client.insert(SendEmail(to="alice@example.com", subject="Welcome"))
 
 # Transactional insert — atomic with your business logic
 async with await client.transaction() as tx:
-    await tx.execute("INSERT INTO orders (id, total) VALUES ($1, $2)", [order_id, total])
+    await tx.execute("INSERT INTO orders (id, total) VALUES ($1, $2)", order_id, total)
     await tx.insert(SendEmail(to="alice@example.com", subject="Order confirmed"))
     # Commits on success, rolls back on exception
 
@@ -86,6 +87,13 @@ async with await client.transaction() as tx:
 @client.worker(SendEmail, queue="email")
 async def handle(job):
     await send_email(job.args.to, job.args.subject)
+
+client.start([("email", 10)])
+health = await client.health_check()
+assert health.heartbeat_alive
+
+await asyncio.sleep(10)
+await client.shutdown()
 ```
 
 > **Note:** `async with await client.transaction()` uses a double-await because
@@ -129,25 +137,28 @@ awa --database-url $DATABASE_URL job list --state failed
 ## Architecture
 
 ```
-┌──────────────┐  ┌──────────────┐  ┌──────────────┐
-│ Rust Service  │  │ Python Svc   │  │ Any Language  │
-│ (awa-model)   │  │ (pip awa)    │  │ (raw INSERT)  │
-└──────┬───────┘  └──────┬───────┘  └──────┬───────┘
-       │                 │                  │
-       ▼                 ▼                  ▼
- ┌────────────────────────────────────────────────┐
- │              PostgreSQL — awa.jobs              │
- └───────────────────────┬────────────────────────┘
+┌────────────────────┐      ┌────────────────────┐
+│ Rust producers     │      │ Python producers   │
+│ `awa-model` / `awa`│      │ `pip install awa`  │
+└─────────┬──────────┘      └─────────┬──────────┘
+          │                           │
+          └──────────────┬────────────┘
+                         ▼
+              ┌──────────────────────┐
+              │ PostgreSQL `awa.jobs`│
+              └──────────┬───────────┘
                          │
-          ┌──────────────┼──────────────┐
-          │              │              │
-    ┌─────▼─────┐  ┌────▼────┐  ┌─────▼─────┐
-    │Rust Worker │  │Py Worker│  │Py Worker  │
-    │(awa-worker)│  │(pip awa)│  │(pip awa)  │
-    └───────────┘  └─────────┘  └───────────┘
+        ┌────────────────┼────────────────┐
+        │                │                │
+        ▼                ▼                ▼
+┌───────────────┐ ┌───────────────┐ ┌───────────────┐
+│ Rust runtime  │ │ Rust runtime  │ │ Rust runtime  │
+│ + Rust worker │ │ + Python cb   │ │ + Python cb   │
+│ `awa-worker`  │ │ via PyO3      │ │ via PyO3      │
+└───────────────┘ └───────────────┘ └───────────────┘
 ```
 
-All coordination happens through Postgres. Workers are stateless. Deploy as many as you need. Mixed Rust and Python workers coexist on the same queues — jobs inserted from any language are workable by any language.
+All coordination happens through Postgres, and the Rust runtime owns polling, heartbeats, shutdown, and crash recovery for both Rust and Python handlers. Mixed Rust and Python workers coexist on the same queues — jobs inserted from any language are workable by any language.
 
 ## Workspace
 

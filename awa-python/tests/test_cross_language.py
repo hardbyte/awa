@@ -23,8 +23,8 @@ async def client():
     c = awa.Client(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs", [])
-    await tx.execute("DELETE FROM awa.queue_meta", [])
+    await tx.execute("DELETE FROM awa.jobs")
+    await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
     return c
 
@@ -184,7 +184,7 @@ async def test_retry_transitions_to_available(client):
     tx = await client.transaction()
     await tx.execute(
         "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
-        [job.id],
+        job.id,
     )
     await tx.commit()
 
@@ -206,7 +206,7 @@ async def test_transactional_enqueue_atomic(client):
     # Job should exist
     tx2 = await client.transaction()
     row = await tx2.fetch_one(
-        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job.id]
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job.id
     )
     await tx2.commit()
     assert row["cnt"] == 1
@@ -219,7 +219,7 @@ async def test_transactional_enqueue_atomic(client):
 
     tx4 = await client.transaction()
     row2 = await tx4.fetch_one(
-        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", [job2_id]
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job2_id
     )
     await tx4.commit()
     assert row2["cnt"] == 0
@@ -236,7 +236,7 @@ async def test_pause_resume_affects_queue_meta(client):
     tx = await client.transaction()
     row = await tx.fetch_one(
         "SELECT paused, paused_by FROM awa.queue_meta WHERE queue = $1",
-        ["cross_lang_q"],
+        "cross_lang_q",
     )
     await tx.commit()
     assert row["paused"] is True
@@ -246,7 +246,7 @@ async def test_pause_resume_affects_queue_meta(client):
 
     tx2 = await client.transaction()
     row2 = await tx2.fetch_one(
-        "SELECT paused FROM awa.queue_meta WHERE queue = $1", ["cross_lang_q"]
+        "SELECT paused FROM awa.queue_meta WHERE queue = $1", "cross_lang_q"
     )
     await tx2.commit()
     assert row2["paused"] is False
@@ -268,7 +268,6 @@ async def test_drain_cancels_pending_jobs(client):
     tx = await client.transaction()
     row = await tx.fetch_one(
         "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE queue = 'drain_cross' AND state = 'available'",
-        [],
     )
     await tx.commit()
     assert row["cnt"] == 0

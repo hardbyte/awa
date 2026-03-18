@@ -13,6 +13,7 @@ where
 }
 
 /// Insert a job with custom options.
+#[tracing::instrument(skip(executor, args), fields(job.kind = args.kind_str(), job.queue = %opts.queue))]
 pub async fn insert_with<'e, E>(
     executor: E,
     args: &impl JobArgs,
@@ -75,11 +76,16 @@ where
     .fetch_one(executor)
     .await
     .map_err(|err| {
-        // Check for unique constraint violation
         if let sqlx::Error::Database(ref db_err) = err {
             if db_err.code().as_deref() == Some("23505") {
-                // Try to extract the existing ID from the error
-                return AwaError::UniqueConflict { existing_id: 0 };
+                // Unique constraint violation. The conflicting row ID isn't
+                // available from the PG error message directly — callers can
+                // query by unique_key if they need it.
+                return AwaError::UniqueConflict {
+                    existing_id: db_err
+                        .constraint()
+                        .map(|c| c.to_string()),
+                };
             }
         }
         AwaError::Database(err)
@@ -92,6 +98,7 @@ where
 ///
 /// Supports uniqueness constraints — jobs with `unique` opts will have their
 /// `unique_key` and `unique_states` computed and included.
+#[tracing::instrument(skip(executor, jobs), fields(job.count = jobs.len()))]
 pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError>
 where
     E: PgExecutor<'e>,

@@ -12,6 +12,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | # | Test | Category | Status |
 |---|---|---|---|
 | T1 | No duplicate processing (100k jobs) | Correctness | Implemented |
+| T4 | `kill -9` crash recovery | Crash recovery | Implemented |
 | T5 | Deadline rescue (hung job) | Crash recovery | Implemented |
 | T6 | Transactional atomicity (Rust) | Correctness | Implemented |
 | T7 | Transactional atomicity (Python) | Correctness | Implemented |
@@ -27,6 +28,12 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T22 | Pool exhaustion resilience | Resilience | Implemented |
 | T26 | Migration idempotency | Migration | Implemented |
 | T27 | Admin ops under load | Admin | Implemented |
+| T28 | Tracing spans emitted on job execution | Observability | Implemented |
+| T29 | OTel metrics emitted (completed, duration, in_flight) | Observability | Implemented |
+| T30 | OTel failure metrics emitted | Observability | Implemented |
+| T31 | Throughput >= 3,000 jobs/sec (Rust workers, debug build) | Benchmark | Implemented |
+| T32 | Pickup latency p50 < 50ms (LISTEN/NOTIFY) | Benchmark | Implemented |
+| T33 | Insert throughput >= 10,000 inserts/sec | Benchmark | Implemented |
 
 ## Running Tests
 
@@ -39,6 +46,12 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --work
 
 # Python tests
 cd awa-python && .venv/bin/pytest tests/ -v
+
+# Chaos recovery only (same test CI runs as a dedicated step)
+cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
+
+# Benchmark tests (throughput + latency, requires Postgres)
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test benchmark_test -- --ignored --nocapture
 
 # Repeat 20 times to detect flakes
 for i in $(seq 1 20); do echo "=== Run $i ===" && cargo test --workspace 2>&1 | tail -1; done

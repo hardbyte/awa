@@ -1,6 +1,8 @@
 use awa_model::{JobRow, JobState};
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Python representation of a job state.
 #[pyclass(frozen, eq, eq_int, name = "JobState", skip_from_py_object)]
@@ -31,7 +33,7 @@ impl From<JobState> for PyJobState {
 
 /// Python representation of a job row.
 #[pyclass(frozen, name = "Job", skip_from_py_object)]
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PyJob {
     #[pyo3(get)]
     pub id: i64,
@@ -53,17 +55,46 @@ pub struct PyJob {
     pub args_json: serde_json::Value,
     /// Metadata as a Python dict
     pub metadata_json: serde_json::Value,
+    args_override: Option<Py<PyAny>>,
+    cancelled: Option<Arc<AtomicBool>>,
     pub run_at: DateTime<Utc>,
     pub deadline_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub finalized_at: Option<DateTime<Utc>>,
 }
 
+impl Clone for PyJob {
+    fn clone(&self) -> Self {
+        Python::attach(|py| Self {
+            id: self.id,
+            kind: self.kind.clone(),
+            queue: self.queue.clone(),
+            state: self.state,
+            priority: self.priority,
+            attempt: self.attempt,
+            max_attempts: self.max_attempts,
+            tags: self.tags.clone(),
+            args_json: self.args_json.clone(),
+            metadata_json: self.metadata_json.clone(),
+            args_override: self.args_override.as_ref().map(|value| value.clone_ref(py)),
+            cancelled: self.cancelled.clone(),
+            run_at: self.run_at,
+            deadline_at: self.deadline_at,
+            created_at: self.created_at,
+            finalized_at: self.finalized_at,
+        })
+    }
+}
+
 #[pymethods]
 impl PyJob {
     #[getter]
     fn args(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        json_to_py(py, &self.args_json)
+        if let Some(args) = &self.args_override {
+            Ok(args.clone_ref(py))
+        } else {
+            json_to_py(py, &self.args_json)
+        }
     }
 
     #[getter]
@@ -91,6 +122,13 @@ impl PyJob {
         self.finalized_at.map(|d| d.to_rfc3339())
     }
 
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+            .as_ref()
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Job(id={}, kind='{}', queue='{}', state={:?}, attempt={})",
@@ -112,11 +150,22 @@ impl From<JobRow> for PyJob {
             tags: row.tags,
             args_json: row.args,
             metadata_json: row.metadata,
+            args_override: None,
+            cancelled: None,
             run_at: row.run_at,
             deadline_at: row.deadline_at,
             created_at: row.created_at,
             finalized_at: row.finalized_at,
         }
+    }
+}
+
+impl PyJob {
+    pub fn for_dispatch(row: JobRow, args_override: Py<PyAny>, cancelled: Arc<AtomicBool>) -> Self {
+        let mut job = Self::from(row);
+        job.args_override = Some(args_override);
+        job.cancelled = Some(cancelled);
+        job
     }
 }
 

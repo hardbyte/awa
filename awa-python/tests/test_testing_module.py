@@ -39,8 +39,9 @@ async def test_work_one_completed(tc):
     """work_one returns completed when handler returns None."""
     await tc.insert(SendEmail(to="work@test.com", subject="Work"))
 
-    async def handler(args: SendEmail):
-        assert args.to == "work@test.com"
+    async def handler(job):
+        assert job.args.to == "work@test.com"
+        assert job.queue == "default"
         return None  # Completed
 
     result = await tc.work_one(SendEmail, handler=handler)
@@ -58,7 +59,7 @@ async def test_work_one_retryable_error(tc):
     """work_one returns retryable when handler raises Exception."""
     await tc.insert(SendEmail(to="retry@test.com", subject="Retry"))
 
-    async def handler(args: SendEmail):
+    async def handler(job):
         raise ValueError("temporary failure")
 
     result = await tc.work_one(SendEmail, handler=handler)
@@ -71,7 +72,7 @@ async def test_work_one_cancel(tc):
     """work_one returns cancelled when handler returns Cancel."""
     await tc.insert(SendEmail(to="cancel@test.com", subject="Cancel"))
 
-    async def handler(args: SendEmail):
+    async def handler(job):
         return awa.Cancel(reason="not needed")
 
     result = await tc.work_one(SendEmail, handler=handler)
@@ -84,7 +85,7 @@ async def test_work_one_retry_after(tc):
     """work_one returns retryable when handler returns RetryAfter."""
     await tc.insert(SendEmail(to="later@test.com", subject="Later"))
 
-    async def handler(args: SendEmail):
+    async def handler(job):
         return awa.RetryAfter(seconds=60)
 
     result = await tc.work_one(SendEmail, handler=handler)
@@ -96,7 +97,7 @@ async def test_work_one_snooze(tc):
     """work_one returns snoozed when handler returns Snooze."""
     await tc.insert(SendEmail(to="snooze@test.com", subject="Snooze"))
 
-    async def handler(args: SendEmail):
+    async def handler(job):
         return awa.Snooze(seconds=300)
 
     result = await tc.work_one(SendEmail, handler=handler)
@@ -107,7 +108,7 @@ async def test_work_one_snooze(tc):
 async def test_work_one_no_job(tc):
     """work_one returns no_job result when no matching job exists."""
     # Don't insert anything — the queue is empty after clean()
-    async def handler(args: SendEmail):
+    async def handler(job):
         return None
 
     result = await tc.work_one(SendEmail, handler=handler)
@@ -123,7 +124,7 @@ async def test_work_one_filters_by_queue(tc):
     # Insert a job into a non-default queue
     await tc.insert(SendEmail(to="other@test.com", subject="Other"), queue="emails")
 
-    async def handler(args: SendEmail):
+    async def handler(job):
         return None
 
     # Trying to work from the default queue should find nothing
@@ -145,8 +146,6 @@ async def test_test_client_clean_isolates(tc):
 
     # Should have no jobs
     tx = await tc.client.transaction()
-    row = await tx.fetch_one(
-        "SELECT count(*)::bigint as cnt FROM awa.jobs", []
-    )
+    row = await tx.fetch_one("SELECT count(*)::bigint as cnt FROM awa.jobs")
     await tx.commit()
     assert row["cnt"] == 0

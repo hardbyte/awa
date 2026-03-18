@@ -1,6 +1,8 @@
 use awa_model::JobRow;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -11,6 +13,7 @@ use tracing::{debug, error, info, warn};
 pub struct MaintenanceService {
     pool: PgPool,
     cancel: CancellationToken,
+    leader: Arc<AtomicBool>,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     promote_interval: Duration,
@@ -21,10 +24,11 @@ pub struct MaintenanceService {
 }
 
 impl MaintenanceService {
-    pub fn new(pool: PgPool, cancel: CancellationToken) -> Self {
+    pub fn new(pool: PgPool, leader: Arc<AtomicBool>, cancel: CancellationToken) -> Self {
         Self {
             pool,
             cancel,
+            leader,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_secs(5),
@@ -38,6 +42,7 @@ impl MaintenanceService {
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
+        self.leader.store(false, Ordering::SeqCst);
 
         loop {
             // Try to acquire advisory lock for leader election.
@@ -49,6 +54,7 @@ impl MaintenanceService {
                     tokio::select! {
                         _ = self.cancel.cancelled() => {
                             debug!("Maintenance service shutting down (not leader)");
+                            self.leader.store(false, Ordering::SeqCst);
                             return;
                         }
                         _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
@@ -59,6 +65,7 @@ impl MaintenanceService {
                     tokio::select! {
                         _ = self.cancel.cancelled() => {
                             debug!("Maintenance service shutting down (leader check failed)");
+                            self.leader.store(false, Ordering::SeqCst);
                             return;
                         }
                         _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
@@ -67,6 +74,7 @@ impl MaintenanceService {
             };
 
             debug!("Elected as maintenance leader");
+            self.leader.store(true, Ordering::SeqCst);
 
             // Run maintenance tasks as leader
             let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
@@ -84,6 +92,7 @@ impl MaintenanceService {
                 tokio::select! {
                     _ = self.cancel.cancelled() => {
                         debug!("Maintenance service shutting down");
+                        self.leader.store(false, Ordering::SeqCst);
                         // Release leader lock on the same connection that acquired it.
                         // If this fails, dropping the connection will release the lock anyway.
                         let _ = Self::release_leader(&mut leader_conn).await;
@@ -140,6 +149,7 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs with stale heartbeats (crash detection).
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
         let staleness_str = format!("{} seconds", self.heartbeat_staleness.as_secs());
         match sqlx::query_as::<_, JobRow>(
@@ -179,6 +189,7 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs that exceeded their hard deadline.
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
     async fn rescue_expired_deadlines(&self) {
         match sqlx::query_as::<_, JobRow>(
             r#"
@@ -217,6 +228,7 @@ impl MaintenanceService {
     }
 
     /// Promote scheduled jobs that are now due.
+    #[tracing::instrument(skip(self), name = "maintenance.promote")]
     async fn promote_scheduled(&self) {
         match sqlx::query(
             "UPDATE awa.jobs SET state = 'available' WHERE state = 'scheduled' AND run_at <= now()",
@@ -254,6 +266,7 @@ impl MaintenanceService {
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup")]
     async fn cleanup_completed(&self) {
         let completed_retention = format!("{} seconds", self.completed_retention.as_secs());
         let failed_retention = format!("{} seconds", self.failed_retention.as_secs());
