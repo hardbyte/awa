@@ -149,6 +149,7 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs with stale heartbeats (crash detection).
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
         let staleness_str = format!("{} seconds", self.heartbeat_staleness.as_secs());
         match sqlx::query_as::<_, JobRow>(
@@ -188,6 +189,7 @@ impl MaintenanceService {
     }
 
     /// Rescue jobs that exceeded their hard deadline.
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
     async fn rescue_expired_deadlines(&self) {
         match sqlx::query_as::<_, JobRow>(
             r#"
@@ -226,6 +228,7 @@ impl MaintenanceService {
     }
 
     /// Promote scheduled jobs that are now due.
+    #[tracing::instrument(skip(self), name = "maintenance.promote")]
     async fn promote_scheduled(&self) {
         match sqlx::query(
             "UPDATE awa.jobs SET state = 'available' WHERE state = 'scheduled' AND run_at <= now()",
@@ -263,6 +266,7 @@ impl MaintenanceService {
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup")]
     async fn cleanup_completed(&self) {
         let completed_retention = format!("{} seconds", self.completed_retention.as_secs());
         let failed_retention = format!("{} seconds", self.failed_retention.as_secs());

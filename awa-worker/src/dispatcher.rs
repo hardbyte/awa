@@ -65,6 +65,7 @@ impl Dispatcher {
     }
 
     /// Run the poll loop. Returns when cancelled.
+    #[tracing::instrument(skip(self), fields(queue = %self.queue, max_workers = self.config.max_workers))]
     pub async fn run(&self) {
         self.alive.store(true, Ordering::SeqCst);
         info!(
@@ -140,6 +141,7 @@ impl Dispatcher {
     }
 
     /// Single poll iteration: claim available jobs up to the semaphore limit.
+    #[tracing::instrument(skip(self), fields(queue = %self.queue))]
     async fn poll_once(&self) {
         // How many workers are available?
         let available = self.semaphore.available_permits();

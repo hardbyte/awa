@@ -225,9 +225,25 @@ Key design decisions:
 
 ## Observability
 
-### Structured Logging
+### Tracing Spans
 
-All components emit structured tracing spans via the `tracing` crate. Key span fields: `job_id`, `kind`, `queue`, `attempt`, `error`.
+All components emit structured tracing spans via the `tracing` crate with `#[instrument]` and manual `info_span!`:
+
+| Span | Location | Key Fields |
+|---|---|---|
+| `job.execute` | executor.rs | `job.id`, `job.kind`, `job.queue`, `job.attempt`, `otel.status_code` |
+| `insert_with` | insert.rs | `job.kind`, `job.queue` |
+| `insert_many` | insert.rs | `job.count` |
+| `run` (dispatcher) | dispatcher.rs | `queue`, `max_workers` |
+| `poll_once` | dispatcher.rs | `queue` |
+| `run` (heartbeat) | heartbeat.rs | `interval_ms` |
+| `heartbeat_once` | heartbeat.rs | — |
+| `maintenance.rescue_stale` | maintenance.rs | — |
+| `maintenance.rescue_deadline` | maintenance.rs | — |
+| `maintenance.promote` | maintenance.rs | — |
+| `maintenance.cleanup` | maintenance.rs | — |
+
+The `job.execute` span records `otel.status_code = "OK"` on success or `"ERROR"` on terminal failure, compatible with OpenTelemetry trace semantics.
 
 ### OpenTelemetry Metrics
 

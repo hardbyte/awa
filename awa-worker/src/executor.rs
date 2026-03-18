@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use tracing::{error, info, warn};
+use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
 #[derive(Debug)]
@@ -97,74 +97,87 @@ impl JobExecutor {
         let job_kind = job.kind.clone();
         let job_queue = job.queue.clone();
 
-        tokio::spawn(async move {
-            // Register as in-flight
-            {
-                let mut guard = in_flight.write().await;
-                guard.insert(job_id, cancel.clone());
-            }
-            if let Some(counter) = queue_in_flight.get(&job_queue) {
-                counter.fetch_add(1, Ordering::SeqCst);
-            }
-            metrics.record_in_flight_change(&job_queue, 1);
+        let span = info_span!(
+            "job.execute",
+            job.id = job_id,
+            job.kind = %job_kind,
+            job.queue = %job_queue,
+            job.attempt = job.attempt,
+            otel.name = %format!("job.execute {}", job_kind),
+            otel.status_code = tracing::field::Empty,
+        );
 
-            let start = std::time::Instant::now();
-            let ctx = JobContext::new(job.clone(), cancel, state);
+        tokio::spawn(
+            async move {
+                // Register as in-flight
+                {
+                    let mut guard = in_flight.write().await;
+                    guard.insert(job_id, cancel.clone());
+                }
+                if let Some(counter) = queue_in_flight.get(&job_queue) {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+                metrics.record_in_flight_change(&job_queue, 1);
 
-            let result = match workers.get(&job.kind) {
-                Some(worker) => worker.perform(&job, &ctx).await,
-                None => {
-                    error!(kind = %job.kind, job_id, "No worker registered for job kind");
-                    Err(JobError::Terminal(format!(
-                        "unknown job kind: {}",
-                        job.kind
-                    )))
-                }
-            };
+                let start = std::time::Instant::now();
+                let ctx = JobContext::new(job.clone(), cancel, state);
 
-            let duration = start.elapsed();
+                let result = match workers.get(&job.kind) {
+                    Some(worker) => worker.perform(&job, &ctx).await,
+                    None => {
+                        error!(kind = %job.kind, job_id, "No worker registered for job kind");
+                        Err(JobError::Terminal(format!(
+                            "unknown job kind: {}",
+                            job.kind
+                        )))
+                    }
+                };
 
-            // Record metrics based on outcome
-            match &result {
-                Ok(JobResult::Completed) => {
-                    metrics.record_job_completed(&job_kind, &job_queue, duration);
+                let duration = start.elapsed();
+
+                // Record metrics based on outcome
+                match &result {
+                    Ok(JobResult::Completed) => {
+                        metrics.record_job_completed(&job_kind, &job_queue, duration);
+                    }
+                    Ok(JobResult::RetryAfter(_)) => {
+                        metrics.record_job_retried(&job_kind, &job_queue);
+                    }
+                    Ok(JobResult::Cancel(_)) => {
+                        metrics.jobs_cancelled.add(
+                            1,
+                            &[
+                                opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
+                                opentelemetry::KeyValue::new("awa.job.queue", job_queue.clone()),
+                            ],
+                        );
+                    }
+                    Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
+                    Err(JobError::Terminal(_)) => {
+                        metrics.record_job_failed(&job_kind, &job_queue, true);
+                    }
+                    Err(JobError::Retryable(_)) => {
+                        metrics.record_job_retried(&job_kind, &job_queue);
+                    }
                 }
-                Ok(JobResult::RetryAfter(_)) => {
-                    metrics.record_job_retried(&job_kind, &job_queue);
+
+                // Complete the job based on the result
+                if let Err(err) = complete_job(&pool, &job, result).await {
+                    error!(job_id, error = %err, "Failed to complete job");
                 }
-                Ok(JobResult::Cancel(_)) => {
-                    metrics.jobs_cancelled.add(
-                        1,
-                        &[
-                            opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
-                            opentelemetry::KeyValue::new("awa.job.queue", job_queue.clone()),
-                        ],
-                    );
+
+                // Remove from in-flight
+                {
+                    let mut guard = in_flight.write().await;
+                    guard.remove(&job_id);
                 }
-                Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
-                Err(JobError::Terminal(_)) => {
-                    metrics.record_job_failed(&job_kind, &job_queue, true);
+                if let Some(counter) = queue_in_flight.get(&job_queue) {
+                    counter.fetch_sub(1, Ordering::SeqCst);
                 }
-                Err(JobError::Retryable(_)) => {
-                    metrics.record_job_retried(&job_kind, &job_queue);
-                }
+                metrics.record_in_flight_change(&job_queue, -1);
             }
-
-            // Complete the job based on the result
-            if let Err(err) = complete_job(&pool, &job, result).await {
-                error!(job_id, error = %err, "Failed to complete job");
-            }
-
-            // Remove from in-flight
-            {
-                let mut guard = in_flight.write().await;
-                guard.remove(&job_id);
-            }
-            if let Some(counter) = queue_in_flight.get(&job_queue) {
-                counter.fetch_sub(1, Ordering::SeqCst);
-            }
-            metrics.record_in_flight_change(&job_queue, -1);
-        })
+            .instrument(span),
+        )
     }
 }
 
@@ -176,6 +189,7 @@ async fn complete_job(
 ) -> Result<(), AwaError> {
     match result {
         Ok(JobResult::Completed) => {
+            tracing::Span::current().record("otel.status_code", "OK");
             info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
             sqlx::query(
                 "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1",
@@ -262,6 +276,7 @@ async fn complete_job(
         }
 
         Err(JobError::Terminal(msg)) => {
+            tracing::Span::current().record("otel.status_code", "ERROR");
             error!(
                 job_id = job.id,
                 kind = %job.kind,
@@ -291,6 +306,7 @@ async fn complete_job(
         Err(JobError::Retryable(err)) => {
             let error_msg = err.to_string();
             if job.attempt >= job.max_attempts {
+                tracing::Span::current().record("otel.status_code", "ERROR");
                 error!(
                     job_id = job.id,
                     kind = %job.kind,

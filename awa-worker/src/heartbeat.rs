@@ -36,6 +36,7 @@ impl HeartbeatService {
     }
 
     /// Run the heartbeat loop. Returns when cancelled.
+    #[tracing::instrument(skip(self), fields(interval_ms = self.interval.as_millis() as u64))]
     pub async fn run(&self) {
         self.alive.store(true, Ordering::SeqCst);
         debug!(
@@ -60,6 +61,7 @@ impl HeartbeatService {
         self.alive.store(false, Ordering::SeqCst);
     }
 
+    #[tracing::instrument(skip(self))]
     async fn heartbeat_once(&self) {
         let job_ids: Vec<i64> = {
             let guard = self.in_flight.read().await;

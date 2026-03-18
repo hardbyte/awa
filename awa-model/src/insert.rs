@@ -13,6 +13,7 @@ where
 }
 
 /// Insert a job with custom options.
+#[tracing::instrument(skip(executor, args), fields(job.kind = args.kind_str(), job.queue = %opts.queue))]
 pub async fn insert_with<'e, E>(
     executor: E,
     args: &impl JobArgs,
@@ -97,6 +98,7 @@ where
 ///
 /// Supports uniqueness constraints — jobs with `unique` opts will have their
 /// `unique_key` and `unique_states` computed and included.
+#[tracing::instrument(skip(executor, jobs), fields(job.count = jobs.len()))]
 pub async fn insert_many<'e, E>(executor: E, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError>
 where
     E: PgExecutor<'e>,
