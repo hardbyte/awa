@@ -410,6 +410,280 @@ pub fn bind_json_arg<'q>(
     }
 }
 
+/// Synchronous transaction wrapper for Django/Flask web handlers.
+///
+/// Provides the same operations as `Transaction` but uses `block_on()`
+/// instead of async, and supports `__enter__`/`__exit__` (not async with).
+#[pyclass(name = "SyncTransaction")]
+pub struct PySyncTransaction {
+    tx: Arc<Mutex<Option<Transaction<'static, Postgres>>>>,
+}
+
+impl PySyncTransaction {
+    pub fn new(tx: Transaction<'static, Postgres>) -> Self {
+        Self {
+            tx: Arc::new(Mutex::new(Some(tx))),
+        }
+    }
+}
+
+fn sync_tx_ref<'a>(
+    guard: &'a mut Option<Transaction<'static, Postgres>>,
+) -> PyResult<&'a mut Transaction<'static, Postgres>> {
+    guard
+        .as_mut()
+        .ok_or_else(|| state_error("Transaction already committed or rolled back"))
+}
+
+#[pymethods]
+impl PySyncTransaction {
+    #[pyo3(signature = (query, *args))]
+    fn execute(&self, py: Python<'_>, query: String, args: &Bound<'_, PyTuple>) -> PyResult<i64> {
+        let json_args = to_json_args(py, args)?;
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx_ref = sync_tx_ref(&mut guard)?;
+                let result = bind_json_args(sqlx::query(&query), &json_args)
+                    .execute(&mut **tx_ref)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                Ok(result.rows_affected() as i64)
+            })
+        })
+    }
+
+    #[pyo3(signature = (query, *args))]
+    fn fetch_one(
+        &self,
+        py: Python<'_>,
+        query: String,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<Py<PyAny>> {
+        let json_args = to_json_args(py, args)?;
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx_ref = sync_tx_ref(&mut guard)?;
+                let row = bind_json_args(sqlx::query(&query), &json_args)
+                    .fetch_one(&mut **tx_ref)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                row_to_py_dict(&row)
+            })
+        })
+    }
+
+    #[pyo3(signature = (query, *args))]
+    fn fetch_optional(
+        &self,
+        py: Python<'_>,
+        query: String,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<Py<PyAny>> {
+        let json_args = to_json_args(py, args)?;
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx_ref = sync_tx_ref(&mut guard)?;
+                let row = bind_json_args(sqlx::query(&query), &json_args)
+                    .fetch_optional(&mut **tx_ref)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                match row {
+                    Some(row) => row_to_py_dict(&row),
+                    None => Ok(Python::attach(|py| py.None())),
+                }
+            })
+        })
+    }
+
+    #[pyo3(signature = (query, *args))]
+    fn fetch_all(
+        &self,
+        py: Python<'_>,
+        query: String,
+        args: &Bound<'_, PyTuple>,
+    ) -> PyResult<Py<PyAny>> {
+        let json_args = to_json_args(py, args)?;
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx_ref = sync_tx_ref(&mut guard)?;
+                let rows = bind_json_args(sqlx::query(&query), &json_args)
+                    .fetch_all(&mut **tx_ref)
+                    .await
+                    .map_err(map_sqlx_error)?;
+                Python::attach(|py| {
+                    let list = pyo3::types::PyList::empty(py);
+                    for row in &rows {
+                        list.append(row_to_py_dict(row)?)?;
+                    }
+                    Ok(list.into_any().unbind())
+                })
+            })
+        })
+    }
+
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert(
+        &self,
+        py: Python<'_>,
+        args: Py<PyAny>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+    ) -> PyResult<PyJob> {
+        let prepared = prepare_insert(py, args.bind(py), kind, metadata.as_ref(), run_at.as_ref())?;
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx_ref = sync_tx_ref(&mut guard)?;
+                let row = insert_raw_job(
+                    &mut **tx_ref,
+                    &prepared.kind,
+                    &prepared.args_json,
+                    InsertOpts {
+                        queue,
+                        priority,
+                        max_attempts,
+                        run_at: prepared.run_at,
+                        metadata: prepared.metadata_json,
+                        tags,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
+        })
+    }
+
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn insert_many(
+        &self,
+        py: Python<'_>,
+        jobs: Vec<Py<PyAny>>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+    ) -> PyResult<Vec<PyJob>> {
+        let prepared_jobs = jobs
+            .iter()
+            .map(|job| {
+                prepare_insert(
+                    py,
+                    job.bind(py),
+                    kind.clone(),
+                    metadata.as_ref(),
+                    run_at.as_ref(),
+                )
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx_ref = sync_tx_ref(&mut guard)?;
+                let mut inserted = Vec::with_capacity(prepared_jobs.len());
+                for prepared in prepared_jobs {
+                    let row = insert_raw_job(
+                        &mut **tx_ref,
+                        &prepared.kind,
+                        &prepared.args_json,
+                        InsertOpts {
+                            queue: queue.clone(),
+                            priority,
+                            max_attempts,
+                            run_at: prepared.run_at,
+                            metadata: prepared.metadata_json,
+                            tags: tags.clone(),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .map_err(map_awa_error)?;
+                    inserted.push(PyJob::from(row));
+                }
+                Ok(inserted)
+            })
+        })
+    }
+
+    fn commit(&self, py: Python<'_>) -> PyResult<()> {
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx = guard
+                    .take()
+                    .ok_or_else(|| state_error("Transaction already committed or rolled back"))?;
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(())
+            })
+        })
+    }
+
+    fn rollback(&self, py: Python<'_>) -> PyResult<()> {
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                let tx = guard
+                    .take()
+                    .ok_or_else(|| state_error("Transaction already committed or rolled back"))?;
+                tx.rollback().await.map_err(map_sqlx_error)?;
+                Ok(())
+            })
+        })
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    #[pyo3(signature = (exc_type, _exc_val, _exc_tb))]
+    fn __exit__(
+        &self,
+        py: Python<'_>,
+        exc_type: Option<Py<PyAny>>,
+        _exc_val: Option<Py<PyAny>>,
+        _exc_tb: Option<Py<PyAny>>,
+    ) -> PyResult<bool> {
+        let has_exception = exc_type.is_some();
+        let tx = self.tx.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let mut guard = tx.lock().await;
+                if let Some(tx) = guard.take() {
+                    if has_exception {
+                        let _ = tx.rollback().await;
+                    } else {
+                        tx.commit().await.map_err(map_sqlx_error)?;
+                    }
+                }
+                Ok(false)
+            })
+        })
+    }
+}
+
 pub fn row_to_py_dict(row: &sqlx::postgres::PgRow) -> PyResult<Py<PyAny>> {
     use sqlx::TypeInfo;
 

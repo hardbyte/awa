@@ -7,7 +7,7 @@
 //!   - >5,000 jobs/sec sustained (Rust workers, single queue, no uniqueness)
 //!   - <50ms median pickup latency (LISTEN/NOTIFY enabled)
 
-use awa::model::{insert_many, migrations};
+use awa::model::{insert_many, insert_many_copy_from_pool, migrations};
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker,
 };
@@ -358,6 +358,86 @@ async fn test_throughput_insert_only() {
     assert!(
         insert_rate >= 10_000.0,
         "Insert rate {:.0} jobs/sec is below minimum threshold of 10,000 jobs/sec",
+        insert_rate
+    );
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 4: COPY insert throughput vs chunked INSERT
+// ═══════════════════════════════════════════════════════════════════════
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_throughput_copy_insert() {
+    let pool = setup(20).await;
+    let total_jobs: i64 = 10_000;
+    let batch_size: i64 = 1_000;
+
+    // ── Chunked INSERT baseline ──
+    let queue_insert = "bench_copy_insert";
+    clean_queue(&pool, queue_insert).await;
+
+    let insert_start = Instant::now();
+    for batch_start in (0..total_jobs).step_by(batch_size as usize) {
+        let batch_end = (batch_start + batch_size).min(total_jobs);
+        let params: Vec<_> = (batch_start..batch_end)
+            .map(|i| {
+                awa::model::insert::params_with(
+                    &BenchJob { seq: i },
+                    InsertOpts {
+                        queue: queue_insert.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        insert_many(&pool, &params).await.unwrap();
+    }
+    let insert_elapsed = insert_start.elapsed();
+    let insert_rate = total_jobs as f64 / insert_elapsed.as_secs_f64();
+
+    // ── COPY ──
+    let queue_copy = "bench_copy_copy";
+    clean_queue(&pool, queue_copy).await;
+
+    let copy_start = Instant::now();
+    let params: Vec<_> = (0..total_jobs)
+        .map(|i| {
+            awa::model::insert::params_with(
+                &BenchJob { seq: i },
+                InsertOpts {
+                    queue: queue_copy.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap()
+        })
+        .collect();
+    insert_many_copy_from_pool(&pool, &params).await.unwrap();
+    let copy_elapsed = copy_start.elapsed();
+    let copy_rate = total_jobs as f64 / copy_elapsed.as_secs_f64();
+
+    println!(
+        "[bench] Chunked INSERT: {} jobs in {:.2}s ({:.0} inserts/sec)",
+        total_jobs,
+        insert_elapsed.as_secs_f64(),
+        insert_rate
+    );
+    println!(
+        "[bench] COPY:           {} jobs in {:.2}s ({:.0} inserts/sec)",
+        total_jobs,
+        copy_elapsed.as_secs_f64(),
+        copy_rate
+    );
+    println!("[bench] COPY speedup:   {:.1}x", copy_rate / insert_rate);
+
+    // COPY should be at least as fast as chunked INSERT
+    // (In practice it's significantly faster, but we use a generous threshold)
+    assert!(
+        copy_rate >= insert_rate * 0.8,
+        "COPY rate {:.0}/s should be at least 80% of INSERT rate {:.0}/s",
+        copy_rate,
         insert_rate
     );
 }

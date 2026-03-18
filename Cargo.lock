@@ -166,6 +166,7 @@ dependencies = [
  "chrono",
  "chrono-tz",
  "croner",
+ "hex",
  "serde",
  "serde_json",
  "sqlx",

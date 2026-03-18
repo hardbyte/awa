@@ -57,6 +57,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<job::PyJob>()?;
     m.add_class::<job::PyJobState>()?;
     m.add_class::<transaction::PyTransaction>()?;
+    m.add_class::<transaction::PySyncTransaction>()?;
     m.add_class::<client::PyRetryAfter>()?;
     m.add_class::<client::PySnooze>()?;
     m.add_class::<client::PyCancel>()?;

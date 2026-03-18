@@ -19,6 +19,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 croner.workspace = true
 tracing.workspace = true
+hex = "0.4"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

@@ -1,0 +1,240 @@
+"""Synchronous API tests for the awa Python client.
+
+These tests use NO async — they verify the _sync methods work from
+plain synchronous Python code (Django/Flask web handlers).
+
+Requires Postgres running at localhost:15432.
+"""
+
+import os
+from dataclasses import dataclass
+
+import pytest
+
+import awa
+
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
+)
+
+
+@dataclass
+class SyncEmail:
+    to: str
+    subject: str
+
+
+@dataclass
+class SyncPayment:
+    order_id: int
+    amount: int
+
+
+@pytest.fixture
+def client():
+    """Create a client and run migrations synchronously."""
+    c = awa.Client(DATABASE_URL)
+    c.migrate_sync()
+    # Clean up jobs from previous tests
+    tx = c.transaction_sync()
+    tx.execute("DELETE FROM awa.jobs")
+    tx.execute("DELETE FROM awa.queue_meta")
+    tx.commit()
+    return c
+
+
+# -- Test 12: insert_sync returns Job directly --
+
+
+def test_insert_sync(client):
+    job = client.insert_sync(SyncEmail(to="sync@example.com", subject="Hello"))
+    assert job.kind == "sync_email"
+    assert job.queue == "default"
+    assert job.state == awa.JobState.Available
+    assert job.args["to"] == "sync@example.com"
+
+
+# -- Test 13: migrate_sync is idempotent --
+
+
+def test_migrate_sync_idempotent(client):
+    # Should not raise on repeated calls
+    client.migrate_sync()
+    client.migrate_sync()
+
+
+# -- Test 14: cancel_sync / retry_sync --
+
+
+def test_cancel_and_retry_sync(client):
+    job = client.insert_sync(SyncEmail(to="cancel@example.com", subject="Cancel"))
+    result = client.cancel_sync(job.id)
+    assert result is not None
+    assert result.state == awa.JobState.Cancelled
+
+    # Manually set to failed for retry
+    tx = client.transaction_sync()
+    tx.execute(
+        "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+        job.id,
+    )
+    tx.commit()
+
+    retried = client.retry_sync(job.id)
+    assert retried is not None
+    assert retried.state == awa.JobState.Available
+
+
+# -- Test 15: retry_failed_sync --
+
+
+def test_retry_failed_sync(client):
+    job = client.insert_sync(
+        SyncEmail(to="fail@example.com", subject="Fail"), queue="sync_retry"
+    )
+    tx = client.transaction_sync()
+    tx.execute(
+        "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+        job.id,
+    )
+    tx.commit()
+
+    retried = client.retry_failed_sync(queue="sync_retry")
+    assert len(retried) >= 1
+
+
+# -- Test 16: discard_failed_sync --
+
+
+def test_discard_failed_sync(client):
+    job = client.insert_sync(
+        SyncEmail(to="discard@example.com", subject="Discard"), queue="sync_discard"
+    )
+    tx = client.transaction_sync()
+    tx.execute(
+        "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+        job.id,
+    )
+    tx.commit()
+
+    count = client.discard_failed_sync("sync_email")
+    assert count >= 1
+
+
+# -- Test 17: pause_queue_sync / resume_queue_sync / drain_queue_sync --
+
+
+def test_queue_management_sync(client):
+    for i in range(3):
+        client.insert_sync(
+            SyncEmail(to=f"drain{i}@example.com", subject="Drain"),
+            queue="sync_drain",
+        )
+
+    client.pause_queue_sync("sync_drain")
+    client.resume_queue_sync("sync_drain")
+    count = client.drain_queue_sync("sync_drain")
+    assert count == 3
+
+
+# -- Test 18: list_jobs_sync with filters --
+
+
+def test_list_jobs_sync(client):
+    client.insert_sync(
+        SyncEmail(to="list@example.com", subject="List"), queue="sync_list"
+    )
+    jobs = client.list_jobs_sync(queue="sync_list", state="available")
+    assert len(jobs) == 1
+    assert jobs[0].queue == "sync_list"
+
+
+# -- Test 19: queue_stats_sync --
+
+
+def test_queue_stats_sync(client):
+    client.insert_sync(
+        SyncEmail(to="stats@example.com", subject="Stats"), queue="sync_stats"
+    )
+    stats = client.queue_stats_sync()
+    assert isinstance(stats, list)
+    stat = next((s for s in stats if s["queue"] == "sync_stats"), None)
+    assert stat is not None
+    assert stat["available"] == 1
+
+
+# -- Test 20: health_check_sync --
+
+
+def test_health_check_sync(client):
+    health = client.health_check_sync()
+    assert health.postgres_connected is True
+    assert health.poll_loop_alive is False
+
+
+# -- Test 21: transaction_sync with context manager: commit on clean exit --
+
+
+def test_transaction_sync_context_manager_commit(client):
+    with client.transaction_sync() as tx:
+        job = tx.insert(SyncEmail(to="ctx@example.com", subject="Context"))
+
+    # Job should be committed
+    tx2 = client.transaction_sync()
+    row = tx2.fetch_one(
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job.id
+    )
+    tx2.commit()
+    assert row["cnt"] == 1
+
+
+# -- Test 22: transaction_sync with context manager: rollback on exception --
+
+
+def test_transaction_sync_context_manager_rollback(client):
+    job_id = None
+    try:
+        with client.transaction_sync() as tx:
+            job = tx.insert(SyncEmail(to="err@example.com", subject="Error"))
+            job_id = job.id
+            raise ValueError("simulated error")
+    except ValueError:
+        pass
+
+    # Job should NOT exist
+    tx2 = client.transaction_sync()
+    row = tx2.fetch_one(
+        "SELECT count(*)::bigint as cnt FROM awa.jobs WHERE id = $1", job_id
+    )
+    tx2.commit()
+    assert row["cnt"] == 0
+
+
+# -- Test 23: Sync methods work from non-async context (no event loop) --
+# (All tests in this file are already non-async, proving this by their existence)
+
+
+def test_no_event_loop_required(client):
+    """Verify we're NOT in an async context."""
+    import asyncio
+
+    # Should raise RuntimeError since there's no running event loop
+    with pytest.raises(RuntimeError):
+        asyncio.get_running_loop()
+
+    # But sync methods still work
+    job = client.insert_sync(SyncEmail(to="no-loop@example.com", subject="NoLoop"))
+    assert job.id > 0
+
+
+# -- Test 24: insert_many_copy_sync --
+
+
+def test_insert_many_copy_sync(client):
+    jobs_data = [SyncEmail(to=f"copy{i}@example.com", subject=f"Copy {i}") for i in range(10)]
+    results = client.insert_many_copy_sync(jobs_data, queue="sync_copy")
+    assert len(results) == 10
+    for i, job in enumerate(results):
+        assert job.kind == "sync_email"
+        assert job.queue == "sync_copy"
+        assert job.args["to"] == f"copy{i}@example.com"
