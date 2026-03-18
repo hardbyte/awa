@@ -204,6 +204,7 @@ jobs:
   python-wheels:
     name: Python wheels — ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.emulated || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -214,6 +215,7 @@ jobs:
           - os: ubuntu-latest
             target: aarch64
             manylinux: auto
+            emulated: true
           - os: macos-latest
             target: x86_64
           - os: macos-latest
