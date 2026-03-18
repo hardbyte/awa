@@ -457,12 +457,12 @@ fn compute_fire_time(
         }
     };
 
-    let now_tz = now.with_timezone(&tz);
-
     let search_start = match row.last_enqueued_at {
         Some(last) => last.with_timezone(&tz),
-        // First registration: search from 24h ago
-        None => now_tz - chrono::Duration::hours(24),
+        // First registration: search from cron_jobs.created_at so that
+        // low-frequency schedules (weekly, monthly) still find their most
+        // recent past fire. Previously capped at 24h which missed them.
+        None => row.created_at.with_timezone(&tz),
     };
 
     let mut latest_fire: Option<chrono::DateTime<Utc>> = None;

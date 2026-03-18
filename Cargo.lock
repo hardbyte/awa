@@ -116,7 +116,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "awa"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -136,7 +136,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "awa-model",
  "chrono",
@@ -150,7 +150,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -159,7 +159,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -177,7 +177,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.1.6"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "awa-macros",

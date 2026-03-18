@@ -102,7 +102,7 @@ class Transaction:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> Job[dict[str, Any]]: ...
@@ -114,7 +114,7 @@ class Transaction:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
@@ -141,7 +141,7 @@ class SyncTransaction:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> Job[dict[str, Any]]: ...
@@ -153,7 +153,7 @@ class SyncTransaction:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
@@ -180,7 +180,7 @@ class Client:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> Job[dict[str, Any]]: ...
@@ -222,7 +222,7 @@ class Client:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
@@ -237,7 +237,7 @@ class Client:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
     ) -> None: ...
     def start(
@@ -257,7 +257,7 @@ class Client:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> Job[dict[str, Any]]: ...
@@ -292,7 +292,7 @@ class Client:
         queue: str = "default",
         priority: int = 2,
         max_attempts: int = 25,
-        tags: list[str] | None = None,
+        tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
