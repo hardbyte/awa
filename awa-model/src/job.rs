@@ -15,6 +15,7 @@ pub enum JobState {
     Retryable,
     Failed,
     Cancelled,
+    WaitingExternal,
 }
 
 impl fmt::Display for JobState {
@@ -27,6 +28,7 @@ impl fmt::Display for JobState {
             JobState::Retryable => write!(f, "retryable"),
             JobState::Failed => write!(f, "failed"),
             JobState::Cancelled => write!(f, "cancelled"),
+            JobState::WaitingExternal => write!(f, "waiting_external"),
         }
     }
 }
@@ -42,6 +44,7 @@ impl JobState {
             JobState::Retryable => 4,
             JobState::Failed => 5,
             JobState::Cancelled => 6,
+            JobState::WaitingExternal => 7,
         }
     }
 
@@ -79,6 +82,10 @@ pub struct JobRow {
     /// Skipped in FromRow since it's only used by the DB-side unique index.
     #[sqlx(skip)]
     pub unique_states: Option<u8>,
+    /// Callback ID for external webhook completion.
+    pub callback_id: Option<uuid::Uuid>,
+    /// Deadline for callback timeout.
+    pub callback_timeout_at: Option<DateTime<Utc>>,
 }
 
 /// Options for inserting a job.

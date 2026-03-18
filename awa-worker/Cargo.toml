@@ -21,6 +21,7 @@ chrono.workspace = true
 chrono-tz.workspace = true
 croner.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 opentelemetry.workspace = true
 
 [dev-dependencies]

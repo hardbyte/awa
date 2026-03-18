@@ -1,4 +1,4 @@
-use crate::client::{PyCancel, PyRetryAfter, PySnooze, WorkerEntry};
+use crate::client::{PyCancel, PyRetryAfter, PySnooze, PyWaitForCallback, WorkerEntry};
 use crate::job::{json_to_py, PyJob};
 use awa_model::JobRow;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
@@ -84,7 +84,12 @@ fn build_dispatch_job(
         args_json
     };
 
-    let job = PyJob::for_dispatch(job_row, args_instance, ctx.cancellation_flag());
+    let job = PyJob::for_dispatch(
+        job_row,
+        args_instance,
+        ctx.cancellation_flag(),
+        ctx.pool().clone(),
+    );
     Ok(Py::new(py, job)?.into_bound(py).into_any().unbind())
 }
 
@@ -106,6 +111,8 @@ fn classify_handler_result(value: Py<PyAny>) -> PyResult<JobResult> {
         } else if result.is_instance_of::<PyCancel>() {
             let reason: String = result.getattr("reason")?.extract()?;
             Ok(JobResult::Cancel(reason))
+        } else if result.is_instance_of::<PyWaitForCallback>() {
+            Ok(JobResult::WaitForCallback)
         } else {
             Ok(JobResult::Completed)
         }

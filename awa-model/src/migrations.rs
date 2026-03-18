@@ -3,12 +3,20 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 2;
+pub const CURRENT_VERSION: i32 = 3;
 
 /// All migrations in order.
-const MIGRATIONS: &[(i32, &str, &str)] = &[
-    (1, "Initial schema", V1_UP),
-    (2, "Periodic/cron jobs", V2_UP),
+///
+/// Note: some versions have multiple steps (e.g., V3 has two steps because
+/// ALTER TYPE ADD VALUE must be committed before the new value can be used).
+const MIGRATIONS: &[(i32, &str, &[&str])] = &[
+    (1, "Initial schema", &[V1_UP]),
+    (2, "Periodic/cron jobs", &[V2_UP]),
+    (
+        3,
+        "Webhook completion (waiting_external)",
+        &[V3_UP_ENUM, V3_UP_DDL],
+    ),
 ];
 
 /// The initial migration SQL.
@@ -157,6 +165,54 @@ INSERT INTO awa.schema_version (version, description)
 VALUES (2, 'Periodic/cron jobs');
 "#;
 
+/// V3 migration step 1: Add the waiting_external enum value.
+///
+/// ALTER TYPE ADD VALUE auto-commits and cannot be rolled back. It must be
+/// committed in its own statement/transaction before the new value can be
+/// referenced in DDL (indexes, functions, etc.). This is why V3 is split
+/// into two steps.
+const V3_UP_ENUM: &str = r#"
+-- Awa schema v3 step 1: Add waiting_external enum value
+ALTER TYPE awa.job_state ADD VALUE IF NOT EXISTS 'waiting_external' AFTER 'cancelled';
+"#;
+
+/// V3 migration step 2: DDL that references the new enum value.
+const V3_UP_DDL: &str = r#"
+-- Awa schema v3 step 2: Webhook completion DDL
+
+-- Callback columns
+ALTER TABLE awa.jobs ADD COLUMN IF NOT EXISTS callback_id UUID;
+ALTER TABLE awa.jobs ADD COLUMN IF NOT EXISTS callback_timeout_at TIMESTAMPTZ;
+
+-- Unique index on callback_id for fast lookup
+CREATE UNIQUE INDEX IF NOT EXISTS idx_awa_jobs_callback_id
+    ON awa.jobs (callback_id) WHERE callback_id IS NOT NULL;
+
+-- Timeout sweep index
+CREATE INDEX IF NOT EXISTS idx_awa_jobs_callback_timeout
+    ON awa.jobs (callback_timeout_at)
+    WHERE state = 'waiting_external' AND callback_timeout_at IS NOT NULL;
+
+-- Replace the bitmask function to include waiting_external (bit 7)
+CREATE OR REPLACE FUNCTION awa.job_state_in_bitmask(bitmask BIT(8), state awa.job_state)
+RETURNS BOOLEAN AS $$
+    SELECT CASE state
+        WHEN 'scheduled'         THEN get_bit(bitmask, 0) = 1
+        WHEN 'available'         THEN get_bit(bitmask, 1) = 1
+        WHEN 'running'           THEN get_bit(bitmask, 2) = 1
+        WHEN 'completed'         THEN get_bit(bitmask, 3) = 1
+        WHEN 'retryable'         THEN get_bit(bitmask, 4) = 1
+        WHEN 'failed'            THEN get_bit(bitmask, 5) = 1
+        WHEN 'cancelled'         THEN get_bit(bitmask, 6) = 1
+        WHEN 'waiting_external'  THEN get_bit(bitmask, 7) = 1
+        ELSE FALSE
+    END;
+$$ LANGUAGE sql IMMUTABLE;
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (3, 'Webhook completion (waiting_external)');
+"#;
+
 /// Run all pending migrations against the database.
 ///
 /// Uses an advisory lock to prevent concurrent migration attempts.
@@ -187,9 +243,11 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
 
     if !has_schema {
         // Fresh database — apply all migrations in order
-        for &(version, description, sql) in MIGRATIONS {
+        for &(version, description, steps) in MIGRATIONS {
             info!(version, description, "Applying migration");
-            sqlx::raw_sql(sql).execute(pool).await?;
+            for step in steps {
+                sqlx::raw_sql(step).execute(pool).await?;
+            }
             info!(version, "Migration applied");
         }
         return Ok(());
@@ -204,9 +262,11 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
 
     if !has_version_table {
         // Schema exists but no version table — apply all from v1
-        for &(version, description, sql) in MIGRATIONS {
+        for &(version, description, steps) in MIGRATIONS {
             info!(version, description, "Applying migration");
-            sqlx::raw_sql(sql).execute(pool).await?;
+            for step in steps {
+                sqlx::raw_sql(step).execute(pool).await?;
+            }
             info!(version, "Migration applied");
         }
         return Ok(());
@@ -224,10 +284,12 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
     }
 
     // Walk pending migrations
-    for &(version, description, sql) in MIGRATIONS {
+    for &(version, description, steps) in MIGRATIONS {
         if version > current_version {
             info!(version, description, "Applying migration");
-            sqlx::raw_sql(sql).execute(pool).await?;
+            for step in steps {
+                sqlx::raw_sql(step).execute(pool).await?;
+            }
             info!(version, "Migration applied");
         }
     }
@@ -264,6 +326,11 @@ pub async fn current_version(pool: &PgPool) -> Result<i32, AwaError> {
 }
 
 /// Get the raw SQL for all migrations (for extraction / external tooling).
-pub fn migration_sql() -> Vec<(i32, &'static str, &'static str)> {
-    MIGRATIONS.iter().map(|&(v, d, s)| (v, d, s)).collect()
+///
+/// Returns concatenated SQL per version (multi-step migrations are joined).
+pub fn migration_sql() -> Vec<(i32, &'static str, String)> {
+    MIGRATIONS
+        .iter()
+        .map(|&(v, d, steps)| (v, d, steps.join("\n")))
+        .collect()
 }

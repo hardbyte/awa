@@ -1,8 +1,9 @@
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
 use sqlx::PgExecutor;
+use uuid::Uuid;
 
-/// Retry a single failed or cancelled job.
+/// Retry a single failed, cancelled, or waiting_external job.
 pub async fn retry<'e, E>(executor: E, job_id: i64) -> Result<Option<JobRow>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -11,8 +12,9 @@ where
         r#"
         UPDATE awa.jobs
         SET state = 'available', attempt = 0, run_at = now(),
-            finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL
-        WHERE id = $1 AND state IN ('failed', 'cancelled')
+            finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
+            callback_id = NULL, callback_timeout_at = NULL
+        WHERE id = $1 AND state IN ('failed', 'cancelled', 'waiting_external')
         RETURNING *
         "#,
     )
@@ -31,7 +33,8 @@ where
     sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
-        SET state = 'cancelled', finalized_at = now()
+        SET state = 'cancelled', finalized_at = now(),
+            callback_id = NULL, callback_timeout_at = NULL
         WHERE id = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
         RETURNING *
         "#,
@@ -142,8 +145,10 @@ where
 {
     let result = sqlx::query(
         r#"
-        UPDATE awa.jobs SET state = 'cancelled', finalized_at = now()
-        WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable')
+        UPDATE awa.jobs
+        SET state = 'cancelled', finalized_at = now(),
+            callback_id = NULL, callback_timeout_at = NULL
+        WHERE queue = $1 AND state IN ('available', 'scheduled', 'retryable', 'waiting_external')
         "#,
     )
     .bind(queue)
@@ -160,6 +165,7 @@ pub struct QueueStats {
     pub available: i64,
     pub running: i64,
     pub failed: i64,
+    pub waiting_external: i64,
     pub completed_last_hour: i64,
     pub lag_seconds: Option<f64>,
 }
@@ -169,13 +175,14 @@ pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, Option<f64>)>(
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, Option<f64>)>(
         r#"
         SELECT
             queue,
             count(*) FILTER (WHERE state = 'available') AS available,
             count(*) FILTER (WHERE state = 'running') AS running,
             count(*) FILTER (WHERE state = 'failed') AS failed,
+            count(*) FILTER (WHERE state = 'waiting_external') AS waiting_external,
             count(*) FILTER (WHERE state = 'completed'
                 AND finalized_at > now() - interval '1 hour') AS completed_last_hour,
             EXTRACT(EPOCH FROM (now() - min(run_at) FILTER (WHERE state = 'available')))::float8 AS lag_seconds
@@ -189,11 +196,20 @@ where
     Ok(rows
         .into_iter()
         .map(
-            |(queue, available, running, failed, completed_last_hour, lag_seconds)| QueueStats {
+            |(
                 queue,
                 available,
                 running,
                 failed,
+                waiting_external,
+                completed_last_hour,
+                lag_seconds,
+            )| QueueStats {
+                queue,
+                available,
+                running,
+                failed,
+                waiting_external,
                 completed_last_hour,
                 lag_seconds,
             },
@@ -248,4 +264,147 @@ where
         .await?;
 
     row.ok_or(AwaError::JobNotFound { id: job_id })
+}
+
+/// Register a callback for a running job, writing the callback_id and timeout
+/// to the database immediately.
+///
+/// Call this BEFORE sending the callback_id to the external system to avoid
+/// the race condition where the external system fires before the DB knows
+/// about the callback.
+///
+/// Returns the generated callback UUID on success.
+pub async fn register_callback<'e, E>(
+    executor: E,
+    job_id: i64,
+    timeout: std::time::Duration,
+) -> Result<Uuid, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let callback_id = Uuid::new_v4();
+    let timeout_secs = timeout.as_secs_f64();
+    let result = sqlx::query(
+        "UPDATE awa.jobs SET callback_id = $2, callback_timeout_at = now() + make_interval(secs => $3)
+         WHERE id = $1 AND state = 'running'",
+    )
+    .bind(job_id)
+    .bind(callback_id)
+    .bind(timeout_secs)
+    .execute(executor)
+    .await?;
+    if result.rows_affected() == 0 {
+        return Err(AwaError::Validation("job is not in running state".into()));
+    }
+    Ok(callback_id)
+}
+
+/// Complete a waiting job via external callback.
+///
+/// Accepts jobs in `waiting_external` or `running` state (race handling: the
+/// external system may fire before the executor transitions to `waiting_external`).
+///
+/// The `payload` parameter is accepted but not stored on the job — it exists
+/// for callers who want to pass callback data through and will be used by the
+/// planned CEL expression filtering/transforms feature. Callers can process
+/// the payload immediately or enqueue a follow-up job with it.
+pub async fn complete_external<'e, E>(
+    executor: E,
+    callback_id: Uuid,
+    _payload: Option<serde_json::Value>,
+) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'completed',
+            finalized_at = now(),
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            heartbeat_at = NULL,
+            deadline_at = NULL
+        WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
+        RETURNING *
+        "#,
+    )
+    .bind(callback_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.ok_or(AwaError::CallbackNotFound {
+        callback_id: callback_id.to_string(),
+    })
+}
+
+/// Fail a waiting job via external callback.
+///
+/// Records the error and transitions to `failed`.
+pub async fn fail_external<'e, E>(
+    executor: E,
+    callback_id: Uuid,
+    error: &str,
+) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'failed',
+            finalized_at = now(),
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            errors = errors || jsonb_build_object(
+                'error', $2::text,
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
+        RETURNING *
+        "#,
+    )
+    .bind(callback_id)
+    .bind(error)
+    .fetch_optional(executor)
+    .await?;
+
+    row.ok_or(AwaError::CallbackNotFound {
+        callback_id: callback_id.to_string(),
+    })
+}
+
+/// Retry a waiting job via external callback.
+///
+/// Resets to `available` with attempt = 0. The handler must be idempotent
+/// with respect to the external call — a retry re-executes from scratch.
+pub async fn retry_external<'e, E>(executor: E, callback_id: Uuid) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'available',
+            attempt = 0,
+            run_at = now(),
+            finalized_at = NULL,
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            heartbeat_at = NULL,
+            deadline_at = NULL
+        WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
+        RETURNING *
+        "#,
+    )
+    .bind(callback_id)
+    .fetch_optional(executor)
+    .await?;
+
+    row.ok_or(AwaError::CallbackNotFound {
+        callback_id: callback_id.to_string(),
+    })
 }

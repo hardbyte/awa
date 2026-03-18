@@ -27,7 +27,10 @@ awa-macros = { path = "awa-macros", version = "0.2.1" }
 awa-worker = { path = "awa-worker", version = "0.2.1" }
 
 # Database
-sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate", "uuid"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

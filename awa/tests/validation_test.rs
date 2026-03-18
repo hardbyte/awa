@@ -1005,7 +1005,7 @@ async fn t26_migration_idempotency() {
     migrations::run(&pool).await.unwrap();
 
     let version = migrations::current_version(&pool).await.unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, migrations::CURRENT_VERSION);
 
     // Verify schema is intact
     let has_jobs: bool = sqlx::query_scalar(

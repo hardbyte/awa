@@ -5,6 +5,9 @@ pub enum AwaError {
     #[error("job not found: {id}")]
     JobNotFound { id: i64 },
 
+    #[error("callback not found: {callback_id}")]
+    CallbackNotFound { callback_id: String },
+
     #[error("unique conflict")]
     UniqueConflict { constraint: Option<String> },
 
