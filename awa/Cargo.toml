@@ -12,7 +12,7 @@ awa-macros.workspace = true
 awa-worker.workspace = true
 
 [dev-dependencies]
-awa-testing = { path = "../awa-testing" }
+awa-testing = { path = "../awa-testing", version = "0.1.1" }
 sqlx.workspace = true
 serde.workspace = true
 serde_json.workspace = true
