@@ -120,18 +120,19 @@ Some new queries are needed:
 
 ### 3.1 Shell
 
-```
-+-------+--------------------------------------------------+
-|       | [AWA]  Dashboard  Jobs  Queues  Cron    [theme] |
-|       +--------------------------------------------------+
-|       |                                                  |
-|       |  (page content)                                  |
-|       |                                                  |
-+-------+--------------------------------------------------+
-```
-
 **Top navigation bar** (horizontal tabs, like Sidekiq). Simpler than a sidebar for a
 tool with 4-5 pages. Responsive: on mobile, tabs collapse into a hamburger menu.
+
+```mermaid
+block-beta
+  columns 6
+  logo["AWA"]:1
+  dashboard["Dashboard"]:1
+  jobs["Jobs"]:1
+  queues["Queues"]:1
+  cron["Cron"]:1
+  theme["Theme Toggle"]:1
+```
 
 - **Logo/title:** "AWA" (small, left-aligned). Links to dashboard.
 - **Tabs:** Dashboard, Jobs, Queues, Cron
@@ -148,6 +149,17 @@ tool with 4-5 pages. Responsive: on mobile, tabs collapse into a hamburger menu.
 | Queue Detail | `/queues/:name` | Filtered job list for one queue |
 | Cron | `/cron` | Periodic job schedules |
 
+```mermaid
+graph LR
+  D[Dashboard] --> J[Jobs]
+  D --> Q[Queues]
+  D --> C[Cron]
+  J -->|click row| JD[Job Detail]
+  Q -->|click row| QD[Queue Detail]
+  QD -->|click job| JD
+  JD -->|back| J
+```
+
 ---
 
 ## 4. Page Designs
@@ -156,31 +168,32 @@ tool with 4-5 pages. Responsive: on mobile, tabs collapse into a hamburger menu.
 
 The landing page answers: "Is my system healthy right now?"
 
-```
-+------------------------------------------------------------------+
-|  DASHBOARD                                                        |
-|                                                                   |
-|  +----------+  +----------+  +----------+  +----------+          |
-|  | Available|  | Running  |  | Failed   |  | Completed|          |
-|  |   142    |  |    23    |  |     3    |  |  12,847  |          |
-|  +----------+  +----------+  +----------+  +----------+          |
-|                                                                   |
-|  Queues                                                           |
-|  +--------------------------------------------------------------+|
-|  | Queue     | Available | Running | Failed | Lag    | Status   ||
-|  |-----------|-----------|---------|--------|--------|----------||
-|  | default   | 89        | 15      | 2      | 1.2s   | Active   ||
-|  | email     | 42        | 8       | 1      | 0.3s   | Active   ||
-|  | billing   | 11        | 0       | 0      | 45.1s  | Paused   ||
-|  +--------------------------------------------------------------+|
-|                                                                   |
-|  Recent failures                                                  |
-|  +--------------------------------------------------------------+|
-|  | #4821  send_email     email    3/25  "SMTP timeout"   2m ago ||
-|  | #4819  process_order  default  25/25 "DB deadlock"    5m ago ||
-|  | #4812  send_email     email    5/25  "Rate limited"   8m ago ||
-|  +--------------------------------------------------------------+|
-+------------------------------------------------------------------+
+```mermaid
+block-beta
+  columns 4
+  block:counters:4
+    columns 4
+    available["Available\n142"]
+    running["Running\n23"]
+    failed["Failed\n3"]
+    completed["Completed/hr\n12,847"]
+  end
+  block:qtable["Queue Summary Table"]:4
+    columns 1
+    q1["default | 89 avail | 15 running | 2 failed | lag 1.2s | Active"]
+    q2["email   | 42 avail |  8 running | 1 failed | lag 0.3s | Active"]
+    q3["billing | 11 avail |  0 running | 0 failed | lag 45s  | Paused"]
+  end
+  block:failures["Recent Failures"]:4
+    columns 1
+    f1["#4821 send_email — email — 3/25 — SMTP timeout — 2m ago"]
+    f2["#4819 process_order — default — 25/25 — DB deadlock — 5m ago"]
+    f3["#4812 send_email — email — 5/25 — Rate limited — 8m ago"]
+  end
+
+  style failed fill:#fee2e2,color:#991b1b
+  style running fill:#dcfce7,color:#166534
+  style available fill:#dbeafe,color:#1e40af
 ```
 
 **Components:**
@@ -201,26 +214,23 @@ the browser tab is backgrounded (pattern from Oban Web).
 
 The core page. Shows a filterable, paginated list of jobs.
 
-```
-+------------------------------------------------------------------+
-|  JOBS                                                             |
-|                                                                   |
-|  [State filter tabs]                                              |
-|  All(12,847)  Available(142)  Running(23)  Scheduled(7)          |
-|  Retryable(4)  Failed(3)  Completed(12,668)  Cancelled(0)       |
-|                                                                   |
-|  [Search: kind, queue, tags...]           [Refresh: 2s ⏸]       |
-|                                                                   |
-|  [ ] | State | Kind            | Queue   | Attempt | Time       |
-|  ----|-------|-----------------|---------|---------|------------|
-|  [ ] | 🟢   | send_email      | email   | 1/25    | 2s ago     |
-|  [ ] | 🟢   | process_order   | default | 1/5     | 5s ago     |
-|  [ ] | 🔴   | send_email      | email   | 25/25   | 1m ago     |
-|  [ ] | 🟡   | generate_report | default | 3/10    | 30s ago    |
-|                                                                   |
-|  Selected: 2  [Retry] [Cancel]           < 1 2 3 ... 42 >       |
-+------------------------------------------------------------------+
-```
+**Layout (top to bottom):**
+
+1. **State filter tabs** — horizontal pills with counts:
+   `All(12,847)` | `Available(142)` | `Running(23)` | `Scheduled(7)` | `Retryable(4)` | `Failed(3)` | `Completed(12,668)` | `Cancelled(0)`
+
+2. **Toolbar row** — search input (left), refresh indicator (right)
+
+3. **Job table:**
+
+   | | State | Kind | Queue | Attempt | Time |
+   |---|---|---|---|---|---|
+   | ☐ | `running` | send_email | email | 1/25 | 2s ago |
+   | ☐ | `running` | process_order | default | 1/5 | 5s ago |
+   | ☐ | `failed` | send_email | email | 25/25 | 1m ago |
+   | ☐ | `retryable` | generate_report | default | 3/10 | 30s ago |
+
+4. **Footer** — bulk action toolbar (when selected) + cursor pagination
 
 **State filter tabs:** Horizontal pill-style tabs showing each state with a count badge.
 Clicking a tab sets `?state=<state>` in the URL. "All" shows everything.
@@ -255,54 +265,59 @@ Forward/back buttons. Shows "Showing 1-20 of ~142" with approximate count.
 
 Full inspection of a single job.
 
+**Header:** `< Back to Jobs` | Job #4821 — `send_email` | `[Retry]` `[Cancel]`
+
+**Two-column layout** (stacks on mobile):
+
+**Left column — Properties:**
+
+| Property | Value |
+|----------|-------|
+| State | `failed` (red badge) |
+| Queue | `email` |
+| Priority | 2 |
+| Attempt | 3/25 |
+| Created | 14:32:01 |
+| Tags | `urgent` (blue chip) |
+
+**Right column — Timeline:**
+
+```mermaid
+graph TD
+  A["● Created — 2m ago"] --> B["● Available — 2m ago"]
+  B --> C["● Running — 2m ago"]
+  C --> D["● Retryable — 1m ago\n<i>SMTP timeout</i>"]
+  D --> E["● Running — 45s ago"]
+  E --> F["● Retryable — 30s ago\n<i>SMTP timeout</i>"]
+  F --> G["● Running — 15s ago"]
+  G --> H["● Failed — 5s ago\n<i>SMTP timeout</i>"]
+
+  style A fill:#dbeafe,color:#1e40af
+  style B fill:#dbeafe,color:#1e40af
+  style C fill:#dcfce7,color:#166534
+  style D fill:#fef3c7,color:#92400e
+  style E fill:#dcfce7,color:#166534
+  style F fill:#fef3c7,color:#92400e
+  style G fill:#dcfce7,color:#166534
+  style H fill:#fee2e2,color:#991b1b
 ```
-+------------------------------------------------------------------+
-|  < Back to Jobs                                                   |
-|                                                                   |
-|  Job #4821                          [Retry] [Cancel]             |
-|  send_email                                                       |
-|                                                                   |
-|  +--Properties-----------+  +--Timeline-------------------+      |
-|  | State:    Failed      |  |  ● Created     2m ago       |      |
-|  | Queue:    email       |  |  ● Available   2m ago       |      |
-|  | Priority: 2           |  |  ● Running     2m ago       |      |
-|  | Attempt:  3/25        |  |  ● Retryable   1m ago       |      |
-|  | Created:  14:32:01    |  |     "SMTP timeout"          |      |
-|  | Tags:     [urgent]    |  |  ● Running     45s ago      |      |
-|  +-----------------------+  |  ● Retryable   30s ago      |      |
-|                              |     "SMTP timeout"          |      |
-|                              |  ● Running     15s ago      |      |
-|                              |  ● Failed      5s ago       |      |
-|                              |     "SMTP timeout"          |      |
-|                              +-----------------------------+      |
-|                                                                   |
-|  Arguments                                                        |
-|  +--------------------------------------------------------------+|
-|  | {                                                             ||
-|  |   "to": "user@example.com",                                  ||
-|  |   "subject": "Order confirmation #1234",                     ||
-|  |   "template": "order_confirm"                                ||
-|  | }                                                             ||
-|  +--------------------------------------------------------------+|
-|                                                                   |
-|  Metadata                                                         |
-|  +--------------------------------------------------------------+|
-|  | { "trace_id": "abc123", "source": "api" }                    ||
-|  +--------------------------------------------------------------+|
-|                                                                   |
-|  Errors (3 attempts)                                              |
-|  +--------------------------------------------------------------+|
-|  | Attempt 3 — 5s ago                                            ||
-|  | SMTP timeout connecting to mx.example.com:587                 ||
-|  |                                                               ||
-|  | Attempt 2 — 30s ago                                           ||
-|  | SMTP timeout connecting to mx.example.com:587                 ||
-|  |                                                               ||
-|  | Attempt 1 — 1m ago                                            ||
-|  | SMTP timeout connecting to mx.example.com:587                 ||
-|  +--------------------------------------------------------------+|
-+------------------------------------------------------------------+
-```
+
+**Full-width sections below:**
+
+- **Arguments** — collapsible JSON viewer with syntax highlighting:
+  ```json
+  {
+    "to": "user@example.com",
+    "subject": "Order confirmation #1234",
+    "template": "order_confirm"
+  }
+  ```
+- **Metadata** — same JSON viewer (collapsed by default if `{}`):
+  ```json
+  { "trace_id": "abc123", "source": "api" }
+  ```
+- **Errors** — reverse-chronological list from `errors[]` array. Each entry shows
+  attempt number, relative time, and error message. Expandable for full stack traces.
 
 **Layout:** Two-column at desktop (properties + timeline side by side), stacking to
 single column on mobile.
@@ -323,19 +338,11 @@ single column on mobile.
 
 ### 4.4 Queues (`/queues`)
 
-```
-+------------------------------------------------------------------+
-|  QUEUES                                                           |
-|                                                                   |
-|  +--------------------------------------------------------------+|
-|  | Queue     | Available | Running | Failed | Lag    | Actions  ||
-|  |-----------|-----------|---------|--------|--------|----------||
-|  | default   | 89        | 15      | 2      | 1.2s   | [⏸ Pause]||
-|  | email     | 42        | 8       | 1      | 0.3s   | [⏸ Pause]||
-|  | billing   | 0         | 0       | 0      | —      | [▶ Resume]|
-|  +--------------------------------------------------------------+|
-+------------------------------------------------------------------+
-```
+| Queue | Available | Running | Failed | Lag | Actions |
+|-------|-----------|---------|--------|-----|---------|
+| **default** | 89 | 15 | 2 | 1.2s | `Pause` |
+| **email** | 42 | 8 | 1 | 0.3s | `Pause` |
+| **billing** | 0 | 0 | 0 | — | `Resume` `Drain` |
 
 **Columns:** Queue name (linked to detail view), available count, running count, failed
 count, lag (humanized), status/actions.
@@ -362,19 +369,11 @@ Reuses the Jobs list component with:
 
 ### 4.6 Cron (`/cron`)
 
-```
-+------------------------------------------------------------------+
-|  CRON SCHEDULES                                                   |
-|                                                                   |
-|  +--------------------------------------------------------------+|
-|  | Name            | Schedule    | Kind          | Queue  | Last ||
-|  |-----------------|-------------|---------------|--------|------||
-|  | daily_report    | 0 9 * * *   | gen_report    | default| 3h  ||
-|  | hourly_cleanup  | 0 * * * *   | cleanup       | maint  | 12m ||
-|  | weekly_digest   | 0 8 * * MON | send_digest   | email  | 4d  ||
-|  +--------------------------------------------------------------+|
-+------------------------------------------------------------------+
-```
+| Name | Schedule | Kind | Queue | Last Enqueued |
+|------|----------|------|-------|---------------|
+| daily_report | `0 9 * * *` | gen_report | default | 3h ago |
+| hourly_cleanup | `0 * * * *` | cleanup | maint | 12m ago |
+| weekly_digest | `0 8 * * MON` | send_digest | email | 4d ago |
 
 **Columns:** Name, cron expression (with human-readable tooltip e.g., "Every day at
 9:00 AM"), timezone, kind, queue, priority, last enqueued (relative time), next fire
