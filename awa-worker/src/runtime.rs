@@ -23,13 +23,13 @@ pub(crate) struct InFlightState {
 #[derive(Debug)]
 pub struct ProgressState {
     /// Latest assembled progress value visible to handler code.
-    pub latest: Option<serde_json::Value>,
+    pub(crate) latest: Option<serde_json::Value>,
     /// Generation counter — bumped on each handler-side mutation.
-    pub generation: u64,
+    pub(crate) generation: u64,
     /// Highest generation durably acknowledged by Postgres.
-    pub acked_generation: u64,
+    pub(crate) acked_generation: u64,
     /// Snapshot currently being flushed by heartbeat, if any.
-    pub in_flight: Option<(u64, serde_json::Value)>,
+    pub(crate) in_flight: Option<(u64, serde_json::Value)>,
 }
 
 impl ProgressState {
@@ -45,6 +45,74 @@ impl ProgressState {
     /// Whether there is a pending update that has not been acked.
     pub fn has_pending(&self) -> bool {
         self.generation > self.acked_generation
+    }
+
+    /// Get a reference to the latest progress value.
+    pub fn latest(&self) -> Option<&serde_json::Value> {
+        self.latest.as_ref()
+    }
+
+    /// Clone the latest progress value.
+    pub fn clone_latest(&self) -> Option<serde_json::Value> {
+        self.latest.clone()
+    }
+
+    /// Set progress: percent (clamped 0-100), optional message.
+    /// Preserves existing metadata sub-object.
+    pub fn set_progress(&mut self, percent: u8, message: Option<&str>) {
+        let percent = percent.min(100);
+        let existing_metadata = self
+            .latest
+            .as_ref()
+            .and_then(|v| v.get("metadata"))
+            .cloned();
+
+        let mut value = serde_json::json!({ "percent": percent });
+        if let Some(msg) = message {
+            value["message"] = serde_json::Value::String(msg.to_string());
+        }
+        if let Some(meta) = existing_metadata {
+            value["metadata"] = meta;
+        }
+        self.latest = Some(value);
+        self.generation += 1;
+    }
+
+    /// Shallow-merge keys into the `metadata` sub-object.
+    /// Returns false if the existing metadata sub-object is a non-object type (no-op).
+    pub fn merge_metadata(&mut self, updates: &serde_json::Map<String, serde_json::Value>) -> bool {
+        let progress = self.latest.get_or_insert_with(|| serde_json::json!({}));
+        let metadata = progress
+            .as_object_mut()
+            .expect("progress is always an object")
+            .entry("metadata")
+            .or_insert_with(|| serde_json::json!({}));
+
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            for (k, v) in updates {
+                meta_obj.insert(k.clone(), v.clone());
+            }
+            self.generation += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Snapshot for flush: returns (value, generation) if there is a pending update.
+    pub fn pending_snapshot(&self) -> Option<(serde_json::Value, u64)> {
+        if self.acked_generation >= self.generation {
+            return None;
+        }
+        self.latest.as_ref().map(|v| (v.clone(), self.generation))
+    }
+
+    /// Advance acked_generation after a successful flush.
+    /// Only advances if `generation` is newer than current acked.
+    pub fn ack(&mut self, generation: u64) {
+        if generation > self.acked_generation {
+            self.acked_generation = generation;
+        }
     }
 }
 
@@ -87,15 +155,6 @@ impl InFlightRegistry {
             .read()
             .expect("in_flight shard poisoned");
         guard.get(&key).map(|s| s.cancel.clone())
-    }
-
-    #[allow(dead_code)]
-    pub fn get_progress(&self, key: InFlightKey) -> Option<Arc<std::sync::Mutex<ProgressState>>> {
-        let guard = self
-            .shard_for(&key)
-            .read()
-            .expect("in_flight shard poisoned");
-        guard.get(&key).map(|s| s.progress.clone())
     }
 
     pub fn keys(&self) -> Vec<InFlightKey> {

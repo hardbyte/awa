@@ -122,25 +122,8 @@ impl JobContext {
     ///
     /// `percent` is clamped to 0-100.
     pub fn set_progress(&self, percent: u8, message: Option<&str>) {
-        let percent = percent.min(100);
         let mut guard = self.progress.lock().expect("progress lock poisoned");
-        let existing_metadata = guard
-            .latest
-            .as_ref()
-            .and_then(|v| v.get("metadata"))
-            .cloned();
-
-        let mut value = serde_json::json!({
-            "percent": percent,
-        });
-        if let Some(msg) = message {
-            value["message"] = serde_json::Value::String(msg.to_string());
-        }
-        if let Some(meta) = existing_metadata {
-            value["metadata"] = meta;
-        }
-        guard.latest = Some(value);
-        guard.generation += 1;
+        guard.set_progress(percent, message);
     }
 
     /// Shallow-merge keys into progress.metadata for checkpointing. Sync.
@@ -153,21 +136,11 @@ impl JobContext {
             .ok_or_else(|| AwaError::Validation("update_metadata requires a JSON object".into()))?;
 
         let mut guard = self.progress.lock().expect("progress lock poisoned");
-        let progress = guard.latest.get_or_insert_with(|| serde_json::json!({}));
-
-        let metadata = progress
-            .as_object_mut()
-            .expect("progress is always an object")
-            .entry("metadata")
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(meta_obj) = metadata.as_object_mut() {
-            for (k, v) in obj {
-                meta_obj.insert(k.clone(), v.clone());
-            }
+        if !guard.merge_metadata(obj) {
+            return Err(AwaError::Validation(
+                "progress.metadata is not a JSON object; cannot merge".into(),
+            ));
         }
-
-        guard.generation += 1;
         Ok(())
     }
 
@@ -178,12 +151,8 @@ impl JobContext {
     pub async fn flush_progress(&self) -> Result<(), AwaError> {
         let (snapshot, target_generation) = {
             let guard = self.progress.lock().expect("progress lock poisoned");
-            if guard.acked_generation >= guard.generation {
-                // Already flushed
-                return Ok(());
-            }
-            match &guard.latest {
-                Some(value) => (value.clone(), guard.generation),
+            match guard.pending_snapshot() {
+                Some(pair) => pair,
                 None => return Ok(()),
             }
         };
@@ -207,9 +176,7 @@ impl JobContext {
         }
 
         let mut guard = self.progress.lock().expect("progress lock poisoned");
-        if target_generation > guard.acked_generation {
-            guard.acked_generation = target_generation;
-        }
+        guard.ack(target_generation);
 
         Ok(())
     }

@@ -165,7 +165,7 @@ impl PyJob {
         // During dispatch, read from the live buffer
         if let Some(ref buffer) = self.progress_buffer {
             let guard = buffer.lock().expect("progress lock poisoned");
-            match &guard.latest {
+            match guard.latest() {
                 Some(value) => return json_to_py(py, value),
                 None => return Ok(py.None()),
             }
@@ -186,25 +186,8 @@ impl PyJob {
             )
         })?;
 
-        let percent = percent.min(100);
         let mut guard = buffer.lock().expect("progress lock poisoned");
-        let existing_metadata = guard
-            .latest
-            .as_ref()
-            .and_then(|v| v.get("metadata"))
-            .cloned();
-
-        let mut value = serde_json::json!({
-            "percent": percent,
-        });
-        if let Some(msg) = message {
-            value["message"] = serde_json::Value::String(msg);
-        }
-        if let Some(meta) = existing_metadata {
-            value["metadata"] = meta;
-        }
-        guard.latest = Some(value);
-        guard.generation += 1;
+        guard.set_progress(percent, message.as_deref());
         Ok(())
     }
 
@@ -222,20 +205,11 @@ impl PyJob {
         })?;
 
         let mut guard = buffer.lock().expect("progress lock poisoned");
-        let progress = guard.latest.get_or_insert_with(|| serde_json::json!({}));
-        let metadata = progress
-            .as_object_mut()
-            .expect("progress is always an object")
-            .entry("metadata")
-            .or_insert_with(|| serde_json::json!({}));
-
-        if let Some(meta_obj) = metadata.as_object_mut() {
-            for (k, v) in obj {
-                meta_obj.insert(k.clone(), v.clone());
-            }
+        if !guard.merge_metadata(obj) {
+            return Err(pyo3::exceptions::PyRuntimeError::new_err(
+                "progress.metadata is not a JSON object; cannot merge",
+            ));
         }
-
-        guard.generation += 1;
         Ok(())
     }
 
@@ -258,16 +232,13 @@ impl PyJob {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (snapshot, target_generation) = {
                 let guard = buffer.lock().expect("progress lock poisoned");
-                if guard.acked_generation >= guard.generation {
-                    return Ok(());
-                }
-                match &guard.latest {
-                    Some(value) => (value.clone(), guard.generation),
+                match guard.pending_snapshot() {
+                    Some(pair) => pair,
                     None => return Ok(()),
                 }
             };
 
-            sqlx::query(
+            let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs_hot
                 SET progress = $2
@@ -281,15 +252,13 @@ impl PyJob {
             .await
             .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
 
+            if result.rows_affected() == 0 {
+                // Job was rescued/cancelled — not an error for the caller
+                return Ok(());
+            }
+
             let mut guard = buffer.lock().expect("progress lock poisoned");
-            if target_generation > guard.acked_generation {
-                guard.acked_generation = target_generation;
-            }
-            if let Some((gen, _)) = &guard.in_flight {
-                if *gen <= target_generation {
-                    guard.in_flight = None;
-                }
-            }
+            guard.ack(target_generation);
 
             Ok(())
         })
@@ -340,11 +309,7 @@ impl PyJob {
                     transform,
                 };
                 awa_model::admin::register_callback_with_config(
-                    &pool,
-                    job_id,
-                    run_lease,
-                    timeout,
-                    &config,
+                    &pool, job_id, run_lease, timeout, &config,
                 )
                 .await
                 .map_err(map_awa_error)?

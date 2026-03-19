@@ -205,7 +205,7 @@ impl Worker for NoProgressWorker {
     }
 }
 
-/// Worker that sets progress > 100.
+/// Worker that sets progress > 100 and verifies it is clamped to 100.
 struct ClampProgressWorker;
 
 #[async_trait::async_trait]
@@ -217,6 +217,13 @@ impl Worker for ClampProgressWorker {
     async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
         ctx.set_progress(101, Some("over the top"));
         ctx.flush_progress().await.map_err(JobError::retryable)?;
+        // Verify clamped value was written to DB
+        let row = admin::get_job(ctx.pool(), ctx.job.id)
+            .await
+            .map_err(|e| JobError::terminal(format!("failed to get job: {e}")))?;
+        let progress = row.progress.expect("progress should be set after flush");
+        let percent = progress.get("percent").and_then(|v| v.as_u64()).unwrap();
+        assert_eq!(percent, 100, "percent should be clamped to 100");
         Ok(JobResult::Completed)
     }
 }
@@ -266,12 +273,13 @@ async fn test_set_progress_and_flush() {
         .unwrap();
     assert!(result.is_completed());
 
-    // After completion, progress should be NULL (completed jobs clear progress)
+    // Completed jobs have progress cleared to NULL
     let completed = admin::get_job(tc.pool(), job.id).await.unwrap();
     assert_eq!(completed.state, JobState::Completed);
-    // Progress was flushed during execution, then cleared on completion by the test harness
-    // The test harness doesn't clear progress, so we check the flush worked during execution
-    // by the assertion inside FlushProgressWorker. For SetProgressWorker, we verified it wrote.
+    assert!(
+        completed.progress.is_none(),
+        "completed jobs should have NULL progress"
+    );
 }
 
 /// P2: update_metadata({"key": "val"}) + flush → progress.metadata.key == "val"
@@ -636,8 +644,12 @@ async fn test_terminal_failure_preserves_progress() {
 
     let failed = admin::get_job(tc.pool(), job.id).await.unwrap();
     assert_eq!(failed.state, JobState::Failed);
-    // The test harness doesn't use complete_job from executor, so progress isn't
-    // automatically set. Let's verify by using the full executor path via a real client.
+    assert!(
+        failed.progress.is_some(),
+        "progress should be preserved on terminal failure"
+    );
+    let progress = failed.progress.unwrap();
+    assert_eq!(progress.get("percent").and_then(|v| v.as_u64()), Some(10));
 }
 
 /// P15: Cancelled preserves progress
@@ -647,7 +659,7 @@ async fn test_cancel_preserves_progress() {
     let queue = "progress_p15";
     clean_queue(tc.pool(), queue).await;
 
-    let _job = awa::insert_with(
+    let job = awa::insert_with(
         tc.pool(),
         &ProgressJob { data: "p15".into() },
         awa::InsertOpts {
@@ -663,6 +675,15 @@ async fn test_cancel_preserves_progress() {
         .await
         .unwrap();
     assert!(matches!(result, awa_testing::WorkResult::Cancelled(_, _)));
+
+    let cancelled = admin::get_job(tc.pool(), job.id).await.unwrap();
+    assert_eq!(cancelled.state, JobState::Cancelled);
+    assert!(
+        cancelled.progress.is_some(),
+        "progress should be preserved on cancel"
+    );
+    let progress = cancelled.progress.unwrap();
+    assert_eq!(progress.get("percent").and_then(|v| v.as_u64()), Some(75));
 }
 
 /// P5: Progress survives rescue: set progress → simulate stale heartbeat → rescued job has progress
