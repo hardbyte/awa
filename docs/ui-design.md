@@ -102,7 +102,7 @@ POST /api/queues/:name/resume            # Resume queue
 POST /api/queues/:name/drain             # Drain queue
 
 GET  /api/cron                           # Cron job schedules
-DELETE /api/cron/:name                   # Remove a cron schedule
+POST /api/cron/:name/trigger             # Trigger a scheduled job immediately
 
 GET  /api/kinds                          # Distinct job kinds (for autocomplete)
 ```
@@ -336,9 +336,13 @@ Reuses the Jobs list component with:
 9:00 AM"), timezone, kind, queue, priority, last enqueued (relative time), next fire
 (computed from cron expression).
 
-**Read-only in v1.** Cron schedules are defined in application code and synced by the
-leader. The UI shows what's registered but doesn't allow editing (schedules should be
-managed as code). Future: "Run now" button to manually trigger a cron job.
+**Read-only, with one exception.** Cron schedules are defined in application code and
+synced by the leader. The UI shows what's registered but doesn't allow editing
+(schedules should be managed as code). The one write action is a **"Trigger now"**
+button per schedule — this calls `POST /api/cron/:name/trigger`, which inserts a job
+using the schedule's kind, args, queue, and priority without affecting `last_enqueued_at`
+(so the next scheduled fire still happens on time). Useful for debugging or re-running
+a missed fire.
 
 ---
 
@@ -470,9 +474,9 @@ Features explicitly not in v1, but worth noting for future:
 
 | Feature | Rationale for deferring |
 |---------|------------------------|
-| **Time-series charts** | Dashboard sparklines would be nice but require a timeseries query and charting library. Grafana covers this today. Add in v2 if operators want it without Grafana. |
-| **Job search by args** | Oban Web's `args.address.city:Edinburgh` is powerful but requires JSONB path queries. Expensive without a GIN index. Defer until demand is clear. |
-| **Cron editing** | Schedules should be managed as code. A "Run now" button is the only write action that makes sense. |
+| **Time-series charts** | Dashboard sparklines would be nice but require a charting library. Grafana covers this today. The BRIN index and `state_timeseries()` query are ready (section 8) — this is a frontend-only addition in v2. |
+| **Job search by args** | Oban Web's `args.address.city:Edinburgh` is powerful but requires JSONB path queries. Expensive without a GIN index on `args`. Defer until demand is clear. |
+| **Cron editing** | Schedules are managed as code. "Trigger now" is included in v1 (section 4.6). No other write actions planned. |
 | **Worker/process list** | Flower-style worker management. AWA workers are stateless Kubernetes pods — `kubectl` is the right tool. Revisit if health_check data is enriched with worker metadata. |
 | **Authentication** | Start unauthenticated (assume network isolation or reverse proxy auth). Add optional basic auth or JWT middleware as a configuration option. |
 | **Webhook jobs** | The `waiting_external` state (webhook completion, same v0.4 milestone) will need UI representation — an additional state color and filter tab. Design when the state is implemented. |
@@ -484,38 +488,85 @@ Features explicitly not in v1, but worth noting for future:
 
 ## 8. API Additions Required in `awa-model`
 
-The existing `admin.rs` covers most operations. New queries needed:
+### 8.1 Migration (V3)
+
+Two new indexes to support UI queries:
+
+```sql
+-- BRIN index for time-range queries (state_timeseries, recent failures).
+-- BRIN is ideal because created_at is monotonically increasing (insert-ordered).
+-- ~1000x smaller than an equivalent B-tree on large tables.
+CREATE INDEX idx_awa_jobs_created_at
+    ON awa.jobs USING BRIN (created_at)
+    WITH (pages_per_range = 32);
+
+-- GIN index for tag filtering in the jobs list.
+-- Tags are TEXT[] arrays; GIN supports @> (contains) and && (overlaps) operators.
+CREATE INDEX idx_awa_jobs_tags
+    ON awa.jobs USING GIN (tags)
+    WHERE tags IS NOT NULL AND tags != '{}';
+```
+
+**Why BRIN for `created_at`:** The `awa.jobs` table is insert-ordered (rows arrive in
+`created_at` order and are never updated to change `created_at`). BRIN stores min/max
+per block range rather than per row, making it orders of magnitude smaller than B-tree
+while still efficiently pruning blocks for range scans like
+`WHERE created_at > now() - interval '60 minutes'`. The `pages_per_range = 32` setting
+balances granularity vs index size — 32 pages (~256KB of table data) per summary entry.
+
+**Why GIN for `tags`:** The `tags` column is a `TEXT[]` array. Without an index,
+`$1 = ANY(tags)` requires a sequential scan. GIN supports efficient array containment
+queries. The partial index (`WHERE tags IS NOT NULL AND tags != '{}'`) keeps the index
+small since many jobs have no tags.
+
+### 8.2 New queries
 
 ```rust
 // New in admin.rs or a new stats.rs module:
 
 /// Aggregate counts by state (for dashboard counters and state filter badges).
+/// Uses sequential scan with GROUP BY — acceptable at 5s poll for <10M rows.
+/// The existing idx_awa_jobs_kind_state index can be used for index-only scan.
 pub async fn state_counts(executor) -> Result<HashMap<JobState, i64>, AwaError>
 
-/// Job counts bucketed by minute and state (for dashboard sparklines, v2).
+/// Job counts bucketed by minute and state (for dashboard sparklines).
+/// Uses the BRIN index on created_at for efficient range scan.
 pub async fn state_timeseries(executor, minutes: i32)
     -> Result<Vec<(DateTime<Utc>, JobState, i64)>, AwaError>
 
 /// Distinct job kinds (for search autocomplete).
+/// Efficient: uses idx_awa_jobs_kind_state for index-backed distinct.
 pub async fn distinct_kinds(executor) -> Result<Vec<String>, AwaError>
 
 /// Distinct queues (for search autocomplete — supplements queue_stats).
+/// Efficient: uses leading column of idx_awa_jobs_dequeue.
 pub async fn distinct_queues(executor) -> Result<Vec<String>, AwaError>
 
-// Modify existing:
+/// Trigger a cron schedule immediately. Reads the schedule's config from
+/// awa.cron_jobs and inserts a job with those parameters. Does NOT update
+/// last_enqueued_at, so the next scheduled fire still happens on time.
+pub async fn trigger_cron_job(executor, name: &str) -> Result<JobRow, AwaError>
+
+/// Bulk retry by ID list. Uses id = ANY($1) on primary key.
+pub async fn bulk_retry(executor, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
+
+/// Bulk cancel by ID list. Uses id = ANY($1) on primary key.
+pub async fn bulk_cancel(executor, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
+```
+
+### 8.3 Modifications to existing queries
+
+```rust
 /// list_jobs needs cursor-based pagination (before_id) and tag filtering.
+/// Cursor uses primary key (excellent performance). Tag filter uses GIN index.
 pub struct ListJobsFilter {
     pub state: Option<JobState>,
     pub kind: Option<String>,
     pub queue: Option<String>,
-    pub tag: Option<String>,       // NEW
-    pub before_id: Option<i64>,    // NEW: cursor pagination
+    pub tag: Option<String>,       // NEW: uses GIN index
+    pub before_id: Option<i64>,    // NEW: cursor pagination on PK
     pub limit: Option<i64>,
 }
-
-/// Bulk retry/cancel by ID list.
-pub async fn bulk_retry(executor, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
-pub async fn bulk_cancel(executor, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
 ```
 
 ---
