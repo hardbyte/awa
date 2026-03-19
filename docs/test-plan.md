@@ -97,6 +97,27 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | P14 | Python: Backward compat tuple form | Python config | Implemented |
 | P15 | Python: tuple + global_max_workers raises | Python config | Implemented |
 | P16 | Python: both max_workers and min_workers raises | Python config | Implemented |
+| PR1 | set_progress + flush → percent persisted | Progress | Implemented |
+| PR2 | update_metadata shallow-merge | Progress | Implemented |
+| PR3 | Multiple set_progress → only last value | Progress | Implemented |
+| PR4 | flush_progress immediate DB write (verified inside handler) | Progress | Implemented |
+| PR5 | Progress survives rescue (stale heartbeat) | Progress | Implemented |
+| PR6 | Completed job → progress = NULL | Progress | Implemented |
+| PR7 | RetryAfter → next attempt sees previous progress | Progress | Implemented |
+| PR8 | No progress set → no overhead | Progress | Implemented |
+| PR9 | set_progress(101) → clamped to 100 (verified via DB) | Progress | Implemented |
+| PR10 | WaitForCallback preserves progress | Progress | Implemented |
+| PR11 | complete_external clears progress | Progress | Implemented |
+| PR12 | fail_external preserves progress | Progress | Implemented |
+| PR13 | Callback timeout rescue preserves progress | Progress | Implemented |
+| PR14 | Terminal failure preserves progress | Progress | Implemented |
+| PR15 | Cancel preserves progress | Progress | Implemented |
+| PR16 | Full lifecycle (real Client): complete clears, retry preserves checkpoint | Progress | Implemented |
+| PP1 | Python: set_progress from handler persists after flush | Progress (Py) | Implemented |
+| PP2 | Python: update_metadata shallow-merges into progress.metadata | Progress (Py) | Implemented |
+| PP3 | Python: flush_progress immediate DB write | Progress (Py) | Implemented |
+| PP4 | Python: job.progress property returns dict during execution | Progress (Py) | Implemented |
+| PP5 | Python: progress persists across retry (checkpoint) | Progress (Py) | Implemented |
 
 ## Running Tests
 
@@ -139,6 +160,12 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 
 # Python start() config validation tests
 cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_start_config.py -v
+
+# Progress tests (Rust)
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test progress_test -- --test-threads=1 --nocapture
+
+# Progress tests (Python)
+cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_progress.py -v
 
 # Repeat 20 times to detect flakes
 for i in $(seq 1 20); do echo "=== Run $i ===" && cargo test --workspace 2>&1 | tail -1; done
