@@ -292,8 +292,14 @@ where
     let callback_id = Uuid::new_v4();
     let timeout_secs = timeout.as_secs_f64();
     let result = sqlx::query(
-        "UPDATE awa.jobs SET callback_id = $2, callback_timeout_at = now() + make_interval(secs => $3)
-         WHERE id = $1 AND state = 'running'",
+        r#"UPDATE awa.jobs
+           SET callback_id = $2,
+               callback_timeout_at = now() + make_interval(secs => $3),
+               callback_filter = NULL,
+               callback_on_complete = NULL,
+               callback_on_fail = NULL,
+               callback_transform = NULL
+           WHERE id = $1 AND state = 'running'"#,
     )
     .bind(job_id)
     .bind(callback_id)
@@ -514,7 +520,7 @@ pub async fn register_callback_with_config<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    // Validate CEL expressions at registration time
+    // Validate CEL expressions at registration time: compile + check references
     #[cfg(feature = "cel")]
     {
         for (name, expr) in [
@@ -524,9 +530,26 @@ where
             ("transform", &config.transform),
         ] {
             if let Some(src) = expr {
-                cel::Program::compile(src).map_err(|e| {
+                let program = cel::Program::compile(src).map_err(|e| {
                     AwaError::Validation(format!("invalid CEL expression for {name}: {e}"))
                 })?;
+
+                // Reject undeclared variables — CEL only reports these at execution
+                // time, so an expression like `missing == 1` would parse fine but
+                // silently fall into the fail-open path at resolve time.
+                let refs = program.references();
+                let bad_vars: Vec<&str> = refs
+                    .variables()
+                    .into_iter()
+                    .filter(|v| *v != "payload")
+                    .collect();
+                if !bad_vars.is_empty() {
+                    return Err(AwaError::Validation(format!(
+                        "CEL expression for {name} references undeclared variable(s): {}; \
+                         only 'payload' is available",
+                        bad_vars.join(", ")
+                    )));
+                }
             }
         }
     }
@@ -594,7 +617,7 @@ pub async fn resolve_callback(
 
     let job = sqlx::query_as::<_, JobRow>(
         "SELECT * FROM awa.jobs WHERE callback_id = $1
-         AND state IN ('waiting_external', 'running')
+         AND state = 'waiting_external'
          FOR UPDATE",
     )
     .bind(callback_id)

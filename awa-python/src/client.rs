@@ -86,6 +86,9 @@ pub struct PyResolveResult {
     pub job: Option<PyJob>,
     /// Transformed payload (only for completed).
     pub payload_json: Option<serde_json::Value>,
+    /// Why the callback was ignored (only for ignored).
+    #[pyo3(get)]
+    pub reason: Option<String>,
 }
 
 #[pymethods]
@@ -1469,16 +1472,19 @@ fn resolve_outcome_to_py(outcome: awa_model::admin::ResolveOutcome) -> PyResolve
             outcome: "completed".to_string(),
             job: Some(PyJob::from(job)),
             payload_json: payload,
+            reason: None,
         },
         awa_model::admin::ResolveOutcome::Failed { job } => PyResolveResult {
             outcome: "failed".to_string(),
             job: Some(PyJob::from(job)),
             payload_json: None,
+            reason: None,
         },
-        awa_model::admin::ResolveOutcome::Ignored { reason: _ } => PyResolveResult {
+        awa_model::admin::ResolveOutcome::Ignored { reason } => PyResolveResult {
             outcome: "ignored".to_string(),
             job: None,
             payload_json: None,
+            reason: Some(reason),
         },
     }
 }

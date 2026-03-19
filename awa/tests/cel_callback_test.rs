@@ -673,12 +673,15 @@ async fn test_c15_missing_field_fail_open() {
     assert_eq!(job.state, JobState::WaitingExternal);
 }
 
-// ── C16: resolve_callback during running state ──
+// ── C16: resolve_callback rejects running state (only waiting_external) ──
+// Unlike complete_external/fail_external which accept running for race handling,
+// resolve_callback only accepts waiting_external to prevent cross-attempt
+// state corruption.
 
 #[tokio::test]
-async fn test_c16_resolve_during_running() {
+async fn test_c16_resolve_rejects_running() {
     let client = setup().await;
-    let queue = "test_c16_running_race";
+    let queue = "test_c16_running_rejected";
     clean_queue(client.pool(), queue).await;
 
     let job = awa::insert_with(
@@ -706,12 +709,15 @@ async fn test_c16_resolve_during_running() {
     .await
     .unwrap();
 
-    // resolve_callback should work on running state too
-    let result = admin::resolve_callback(client.pool(), callback_id, None, DefaultAction::Complete)
+    // resolve_callback should NOT find it (only waiting_external)
+    let err = admin::resolve_callback(client.pool(), callback_id, None, DefaultAction::Complete)
         .await
-        .unwrap();
+        .unwrap_err();
 
-    assert!(result.is_completed());
+    match err {
+        AwaError::CallbackNotFound { .. } => {}
+        other => panic!("Expected CallbackNotFound, got: {other:?}"),
+    }
 }
 
 // ── C17: Concurrent resolve_callback (FOR UPDATE prevents race) ──
