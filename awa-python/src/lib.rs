@@ -7,10 +7,6 @@ mod worker;
 
 use pyo3::prelude::*;
 
-async fn run_migrations(pool: sqlx::PgPool) -> Result<(), awa_model::AwaError> {
-    awa_model::migrations::run(&pool).await
-}
-
 // Python exception types for Awa errors.
 pyo3::create_exception!(_awa, AwaError, pyo3::exceptions::PyException);
 pyo3::create_exception!(_awa, UniqueConflict, AwaError);
@@ -31,17 +27,22 @@ fn derive_kind(name: &str) -> String {
 /// Run migrations against the given database URL.
 #[pyfunction]
 fn migrate<'py>(py: Python<'py>, database_url: String) -> PyResult<Bound<'py, PyAny>> {
-    pyo3_async_runtimes::tokio::local_future_into_py(py, async move {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .map_err(errors::map_connect_error)?;
+    let result = pyo3_async_runtimes::tokio::get_runtime()
+        .block_on(async {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .map_err(errors::map_connect_error)?;
 
-        run_migrations(pool)
-            .await
-            .map_err(errors::map_awa_error)?;
+            awa_model::migrations::run(&pool)
+                .await
+                .map_err(errors::map_awa_error)?;
 
+            Ok::<(), PyErr>(())
+        });
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        result?;
         Ok(())
     })
 }

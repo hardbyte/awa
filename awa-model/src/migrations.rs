@@ -405,6 +405,9 @@ VALUES (1, 'Canonical schema');
 /// Because Awa does not have external users yet, any pre-canonical `awa`
 /// schema is replaced with the canonical schema rather than upgraded through a
 /// historical chain.
+///
+/// Takes `&PgPool` for ergonomic use from Rust. For a `Send`-safe variant
+/// that takes the pool by value, see [`run_owned`].
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
     let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
     let mut conn = pool.acquire().await?;
