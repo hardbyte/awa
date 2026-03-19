@@ -15,6 +15,9 @@ jobs:
     name: Rust nightly benchmarks
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
     services:
       postgres:
         image: postgres:17-alpine
@@ -40,11 +43,13 @@ jobs:
         run: mkdir -p artifacts/nightly
       - name: Run sustained hot-path benchmark
         run: |
+          set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
             test_runtime_sustained_hot_path -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-hot.txt
       - name: Run sustained deferred benchmark
         run: |
+          set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
             test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-scheduled-2m-4k.txt
@@ -74,6 +79,7 @@ jobs:
           --health-retries 5
     defaults:
       run:
+        shell: bash
         working-directory: awa-python
     steps:
       - uses: actions/checkout@v4
@@ -98,10 +104,12 @@ jobs:
         run: mkdir -p artifacts/nightly
       - name: Run Python chaos recovery test
         run: |
+          set -o pipefail
           .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos \
             | tee artifacts/nightly/python-chaos.txt
       - name: Run Python runtime benchmarks
         run: |
+          set -o pipefail
           .venv/bin/python scripts/benchmark_runtime.py --scenario all \
             | tee artifacts/nightly/python-benchmarks.txt
       - name: Upload Python nightly artifacts
