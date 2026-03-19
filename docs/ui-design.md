@@ -123,20 +123,11 @@ Some new queries are needed:
 **Top navigation bar** (horizontal tabs, like Sidekiq). Simpler than a sidebar for a
 tool with 4-5 pages. Responsive: on mobile, tabs collapse into a hamburger menu.
 
-```mermaid
-block-beta
-  columns 6
-  logo["AWA"]:1
-  dashboard["Dashboard"]:1
-  jobs["Jobs"]:1
-  queues["Queues"]:1
-  cron["Cron"]:1
-  theme["Theme Toggle"]:1
-```
-
 - **Logo/title:** "AWA" (small, left-aligned). Links to dashboard.
 - **Tabs:** Dashboard, Jobs, Queues, Cron
 - **Right side:** Theme toggle (light/dark/system), auto-refresh indicator
+
+> `[AWA]  Dashboard  Jobs  Queues  Cron  ·····················  [☀/☾]  [⟳ 2s]`
 
 ### 3.2 Pages
 
@@ -168,44 +159,37 @@ graph LR
 
 The landing page answers: "Is my system healthy right now?"
 
-```mermaid
-block-beta
-  columns 4
-  block:counters:4
-    columns 4
-    available["Available\n142"]
-    running["Running\n23"]
-    failed["Failed\n3"]
-    completed["Completed/hr\n12,847"]
-  end
-  block:qtable["Queue Summary Table"]:4
-    columns 1
-    q1["default | 89 avail | 15 running | 2 failed | lag 1.2s | Active"]
-    q2["email   | 42 avail |  8 running | 1 failed | lag 0.3s | Active"]
-    q3["billing | 11 avail |  0 running | 0 failed | lag 45s  | Paused"]
-  end
-  block:failures["Recent Failures"]:4
-    columns 1
-    f1["#4821 send_email — email — 3/25 — SMTP timeout — 2m ago"]
-    f2["#4819 process_order — default — 25/25 — DB deadlock — 5m ago"]
-    f3["#4812 send_email — email — 5/25 — Rate limited — 8m ago"]
-  end
+Three sections, stacked vertically:
 
-  style failed fill:#fee2e2,color:#991b1b
-  style running fill:#dcfce7,color:#166534
-  style available fill:#dbeafe,color:#1e40af
-```
+**Section 1 — State counter cards** (4-across row):
 
-**Components:**
-1. **State counters** — four cards showing current counts for active states. Each card
-   is clickable, linking to `/jobs?state=<state>`. The "Failed" card uses red/warning
-   styling when count > 0. "Completed" shows last-hour count rather than total
-   (since completed jobs are cleaned up).
-2. **Queue summary table** — from `queue_stats()`. Columns: name, available, running,
-   failed, lag (humanized), status (Active/Paused). Clicking a row goes to
-   `/queues/:name`. Lag > 30s gets amber warning color; lag > 5m gets red.
-3. **Recent failures** — last 5-10 failed jobs. Shows ID, kind, queue, attempt/max,
-   first line of latest error, relative time. Clicking goes to `/jobs/:id`.
+| Available | Running | Failed | Completed/hr |
+|:---------:|:-------:|:------:|:------------:|
+| **142** | **23** | **3** | **12,847** |
+
+Each card is clickable (links to `/jobs?state=<state>`). Failed card uses red styling
+when count > 0. Completed shows last-hour count since completed jobs are cleaned up.
+
+**Section 2 — Queue summary table:**
+
+| Queue | Available | Running | Failed | Lag | Status |
+|-------|-----------|---------|--------|-----|--------|
+| default | 89 | 15 | 2 | 1.2s | Active |
+| email | 42 | 8 | 1 | 0.3s | Active |
+| billing | 11 | 0 | 0 | 45.1s | **Paused** |
+
+Clicking a row navigates to `/queues/:name`. Lag color-coded: green < 10s, amber 10–60s,
+red > 60s.
+
+**Section 3 — Recent failures** (last 5-10 failed jobs):
+
+| ID | Kind | Queue | Attempt | Error | When |
+|----|------|-------|---------|-------|------|
+| #4821 | send_email | email | 3/25 | SMTP timeout | 2m ago |
+| #4819 | process_order | default | 25/25 | DB deadlock | 5m ago |
+| #4812 | send_email | email | 5/25 | Rate limited | 8m ago |
+
+Clicking a row navigates to `/jobs/:id`.
 
 **Auto-refresh:** Every 5 seconds via TanStack Query `refetchInterval`. Pauses when
 the browser tab is backgrounded (pattern from Oban Web).
@@ -267,74 +251,47 @@ Full inspection of a single job.
 
 **Header:** `< Back to Jobs` | Job #4821 — `send_email` | `[Retry]` `[Cancel]`
 
-**Two-column layout** (stacks on mobile):
+**Two-column layout** at desktop (stacks on mobile):
 
-**Left column — Properties:**
+**Left — Properties panel:**
 
 | Property | Value |
 |----------|-------|
 | State | `failed` (red badge) |
-| Queue | `email` |
+| Queue | email |
 | Priority | 2 |
 | Attempt | 3/25 |
 | Created | 14:32:01 |
-| Tags | `urgent` (blue chip) |
+| Tags | `urgent` (chip) |
 
-**Right column — Timeline:**
+**Right — Timeline** (vertical, inspired by RiverUI's `JobTimeline`). Color-coded dots
+connected by a vertical line. Errors shown inline after retryable/failed transitions:
 
-```mermaid
-graph TD
-  A["● Created — 2m ago"] --> B["● Available — 2m ago"]
-  B --> C["● Running — 2m ago"]
-  C --> D["● Retryable — 1m ago\n<i>SMTP timeout</i>"]
-  D --> E["● Running — 45s ago"]
-  E --> F["● Retryable — 30s ago\n<i>SMTP timeout</i>"]
-  F --> G["● Running — 15s ago"]
-  G --> H["● Failed — 5s ago\n<i>SMTP timeout</i>"]
+> - Created — 2m ago
+> - Available — 2m ago
+> - Running — 2m ago
+> - Retryable — 1m ago — *SMTP timeout*
+> - Running — 45s ago
+> - Retryable — 30s ago — *SMTP timeout*
+> - Running — 15s ago
+> - Failed — 5s ago — *SMTP timeout*
 
-  style A fill:#dbeafe,color:#1e40af
-  style B fill:#dbeafe,color:#1e40af
-  style C fill:#dcfce7,color:#166534
-  style D fill:#fef3c7,color:#92400e
-  style E fill:#dcfce7,color:#166534
-  style F fill:#fef3c7,color:#92400e
-  style G fill:#dcfce7,color:#166534
-  style H fill:#fee2e2,color:#991b1b
-```
+**Full-width sections below the two columns:**
 
-**Full-width sections below:**
-
-- **Arguments** — collapsible JSON viewer with syntax highlighting:
-  ```json
-  {
-    "to": "user@example.com",
-    "subject": "Order confirmation #1234",
-    "template": "order_confirm"
-  }
-  ```
-- **Metadata** — same JSON viewer (collapsed by default if `{}`):
-  ```json
-  { "trace_id": "abc123", "source": "api" }
-  ```
-- **Errors** — reverse-chronological list from `errors[]` array. Each entry shows
-  attempt number, relative time, and error message. Expandable for full stack traces.
-
-**Layout:** Two-column at desktop (properties + timeline side by side), stacking to
-single column on mobile.
-
-**Sections:**
-1. **Header** — Job ID, kind, action buttons (Retry/Cancel based on state)
-2. **Properties panel** — Key-value pairs: state (with colored badge), queue, priority,
-   attempt count, created_at, attempted_at, finalized_at, tags (as badge chips)
-3. **Timeline** — Visual state progression (inspired by RiverUI's `JobTimeline`).
-   Vertical line with colored dots for each state transition. Errors shown inline
-   after retryable/failed states. Color-coded: green for forward progress, red for
-   errors, amber for retries.
-4. **Arguments** — Collapsible JSON viewer with syntax highlighting. Pretty-printed.
-5. **Metadata** — Same JSON viewer. Collapsed by default if empty `{}`.
-6. **Errors** — Reverse-chronological list of attempt errors from the `errors[]` array.
-   Each shows attempt number, relative time, and error message. Expandable for full
-   stack traces if present.
+1. **Arguments** — collapsible JSON viewer with syntax highlighting:
+   ```json
+   {
+     "to": "user@example.com",
+     "subject": "Order confirmation #1234",
+     "template": "order_confirm"
+   }
+   ```
+2. **Metadata** — same JSON viewer, collapsed by default if `{}`:
+   ```json
+   { "trace_id": "abc123", "source": "api" }
+   ```
+3. **Errors** — reverse-chronological list from `errors[]` array. Each entry shows
+   attempt number, relative time, and error message. Expandable for full stack traces.
 
 ### 4.4 Queues (`/queues`)
 
