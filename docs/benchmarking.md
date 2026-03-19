@@ -73,6 +73,62 @@ This is good enough to show that the hot/deferred split plus indexed promotion
 can handle a very large deferred frontier locally, but the release pattern is
 still burstier than ideal.
 
+### Moderate Deferred Frontier — Higher Due Rate
+
+Measured with `test_scheduled_steady_2m_due_4k_per_sec`:
+
+- total deferred backlog: `2,000,000` rows
+- due rate target: `4,000` jobs/s
+- measurement window: 10s
+
+Result:
+
+- all `40,000` due jobs picked and completed within the window
+- pickup lateness:
+  - `p50`: `0 ms`
+  - `p95`: about `304 ms`
+  - `p99`: about `374 ms`
+- promotion batches averaged `191` jobs at `96 ms` per batch
+- claim latency: `12 ms` mean
+
+This validates the architecture at a realistic production scale: 2M deferred
+rows with 4k/s throughput and sub-400ms p99 latency.
+
+### Scaling Limit: 10M Deferred at 6k/s
+
+Measured with `test_scheduled_steady_10m_due_6k_per_sec`:
+
+- total deferred backlog: `10,000,000` rows
+- due rate target: `6,000` jobs/s
+- measurement window: 10s
+
+Result:
+
+- only `~20k–57k` of the `60,000` target jobs promoted in the window
+- promotion batches: `10–21` batches at `1.7–3.6s` mean (`5–8s` max)
+- pickup lateness: `p50 ~12s`, `p99 ~15–21s`
+- claim and completion latency remained healthy (`11–20 ms` mean)
+
+The bottleneck is promotion, not dispatch or completion. The promotion query
+(`DELETE FROM scheduled_jobs` + `INSERT INTO jobs_hot` in a single CTE) runs in
+`~50 ms` in isolation but degrades to multi-second latency under concurrent load.
+
+Investigation showed this is caused by WAL/IO pressure from operating on the
+2.5 GB `scheduled_jobs` table (heap + 566 MB partial index) under concurrent
+dispatch and completion activity. Increasing `shared_buffers` from `128 MB` to
+`2 GB` did not help — the bottleneck is write-path contention, not cache misses.
+
+**Key tuning parameters for promotion throughput:**
+
+- `PROMOTE_BATCH_SIZE` (default `4,096`): rows per promotion batch
+- `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
+- `promote_interval` (default `250 ms`): how often promotion runs
+- `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
+
+The current architecture handles 2M deferred / 4k/s comfortably. For 10M+ at
+higher due rates, promotion would need to be parallelized (e.g., by queue or
+ID range) or the deferred table partitioned.
+
 ## Interpreting The Results
 
 Some practical guidelines:
@@ -97,7 +153,11 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
 
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   cargo test --package awa --test scheduling_benchmark_test \
-  test_scheduled_steady_10m_due_1k_per_sec -- --exact --ignored --nocapture
+  test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture
+
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  cargo test --package awa --test scheduling_benchmark_test \
+  test_scheduled_steady_10m_due_6k_per_sec -- --exact --ignored --nocapture
 ```
 
 ## Caveats

@@ -812,6 +812,18 @@ async fn test_scheduled_steady_10m_due_1k_per_sec_rt16() {
     run_scheduled_steady_benchmark("bench_steady_10m_rt16", 10_000_000, 1_000, 10).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn test_scheduled_steady_2m_due_4k_per_sec() {
+    run_scheduled_steady_benchmark("bench_steady_2m_4k", 2_000_000, 4_000, 10).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn test_scheduled_steady_10m_due_6k_per_sec() {
+    run_scheduled_steady_benchmark("bench_steady_10m_6k", 10_000_000, 6_000, 10).await;
+}
+
 async fn run_scheduled_frontier_benchmark(queue: &str, total_jobs: i64, due_now: i64) {
     let pool = setup(20).await;
     clean_queue(&pool, queue).await;

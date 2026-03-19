@@ -77,6 +77,7 @@ impl TestClient {
             UPDATE awa.jobs
             SET state = 'running',
                 attempt = attempt + 1,
+                run_lease = run_lease + 1,
                 attempted_at = now(),
                 heartbeat_at = now(),
                 deadline_at = now() + interval '5 minutes'
