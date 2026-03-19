@@ -66,6 +66,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyQueueHealth>()?;
     m.add_class::<client::PyHealthCheck>()?;
     m.add_class::<job::PyCallbackToken>()?;
+    m.add_class::<client::PyResolveResult>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;

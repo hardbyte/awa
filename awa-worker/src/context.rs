@@ -1,4 +1,4 @@
-use awa_model::{AwaError, JobRow};
+use awa_model::{AwaError, CallbackConfig, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -86,6 +86,24 @@ impl JobContext {
     pub async fn register_callback(&self, timeout: Duration) -> Result<CallbackToken, AwaError> {
         let callback_id =
             awa_model::admin::register_callback(&self.pool, self.job.id, timeout).await?;
+        Ok(CallbackToken { id: callback_id })
+    }
+
+    /// Register a callback with CEL expressions for automatic resolution.
+    ///
+    /// See [`CallbackConfig`] for expression semantics.
+    pub async fn register_callback_with_config(
+        &self,
+        timeout: Duration,
+        config: &CallbackConfig,
+    ) -> Result<CallbackToken, AwaError> {
+        let callback_id = awa_model::admin::register_callback_with_config(
+            &self.pool,
+            self.job.id,
+            timeout,
+            config,
+        )
+        .await?;
         Ok(CallbackToken { id: callback_id })
     }
 }

@@ -7,6 +7,9 @@ description.workspace = true
 repository.workspace = true
 readme.workspace = true
 
+[features]
+cel = ["awa-model/cel"]
+
 [dependencies]
 awa-model.workspace = true
 awa-macros.workspace = true

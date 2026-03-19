@@ -7,6 +7,10 @@ edition = "2021"
 name = "_awa"
 crate-type = ["cdylib"]
 
+[features]
+default = ["cel"]
+cel = ["awa-model/cel"]
+
 [dependencies]
 awa-model = { path = "../awa-model", version = "0.2.1" }
 awa-worker = { path = "../awa-worker", version = "0.2.1" }

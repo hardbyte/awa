@@ -7,6 +7,9 @@ description = "Core types, queries, and migrations for the Awa job queue"
 repository.workspace = true
 readme.workspace = true
 
+[features]
+cel = ["dep:cel"]
+
 [dependencies]
 awa-macros.workspace = true
 sqlx.workspace = true
@@ -21,6 +24,7 @@ croner.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 hex = "0.4"
+cel = { workspace = true, optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

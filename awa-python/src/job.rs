@@ -152,11 +152,22 @@ impl PyJob {
 
     /// Register a callback for this job, writing the callback_id to the database
     /// immediately. Call this BEFORE sending the callback_id to the external system.
-    #[pyo3(signature = (timeout_seconds=3600.0))]
+    ///
+    /// Optional CEL expression kwargs enable automatic resolution via
+    /// `resolve_callback`:
+    /// - `filter`: gate expression (bool) — should this payload be processed?
+    /// - `on_complete`: success condition (bool)
+    /// - `on_fail`: failure condition (bool, evaluated before on_complete)
+    /// - `transform`: reshape payload expression (any value)
+    #[pyo3(signature = (timeout_seconds=3600.0, filter=None, on_complete=None, on_fail=None, transform=None))]
     fn register_callback<'py>(
         &self,
         py: Python<'py>,
         timeout_seconds: f64,
+        filter: Option<String>,
+        on_complete: Option<String>,
+        on_fail: Option<String>,
+        transform: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         use crate::errors::map_awa_error;
         let pool = self.pool.clone().ok_or_else(|| {
@@ -170,11 +181,26 @@ impl PyJob {
             ));
         }
         let job_id = self.id;
+        let has_expressions =
+            filter.is_some() || on_complete.is_some() || on_fail.is_some() || transform.is_some();
+
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
-            let callback_id = awa_model::admin::register_callback(&pool, job_id, timeout)
-                .await
-                .map_err(map_awa_error)?;
+            let callback_id = if has_expressions {
+                let config = awa_model::admin::CallbackConfig {
+                    filter,
+                    on_complete,
+                    on_fail,
+                    transform,
+                };
+                awa_model::admin::register_callback_with_config(&pool, job_id, timeout, &config)
+                    .await
+                    .map_err(map_awa_error)?
+            } else {
+                awa_model::admin::register_callback(&pool, job_id, timeout)
+                    .await
+                    .map_err(map_awa_error)?
+            };
             Ok(PyCallbackToken {
                 id: callback_id.to_string(),
             })

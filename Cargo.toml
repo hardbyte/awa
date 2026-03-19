@@ -60,6 +60,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 opentelemetry = { version = "0.29", features = ["metrics"] }
 opentelemetry_sdk = { version = "0.29", features = ["metrics", "rt-tokio"] }
 
+# CEL expressions (optional)
+cel = { version = "0.13", features = ["json"] }
+
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
 

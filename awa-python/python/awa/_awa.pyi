@@ -52,8 +52,24 @@ class Job(Generic[T]):
     def finalized_at(self) -> str | None: ...
     def is_cancelled(self) -> bool: ...
     async def register_callback(
-        self, timeout_seconds: float = 3600
+        self,
+        timeout_seconds: float = 3600,
+        filter: str | None = None,
+        on_complete: str | None = None,
+        on_fail: str | None = None,
+        transform: str | None = None,
     ) -> CallbackToken: ...
+
+class ResolveResult:
+    @property
+    def outcome(self) -> str: ...
+    @property
+    def job(self) -> Job[dict[str, Any]] | None: ...
+    @property
+    def payload(self) -> Any: ...
+    def is_completed(self) -> bool: ...
+    def is_failed(self) -> bool: ...
+    def is_ignored(self) -> bool: ...
 
 class QueueHealth:
     @property
@@ -271,6 +287,12 @@ class Client:
     async def retry_external(
         self, callback_id: str
     ) -> Job[dict[str, Any]]: ...
+    async def resolve_callback(
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        default_action: str = "ignore",
+    ) -> ResolveResult: ...
     # Sync methods
     def insert_sync(
         self,
@@ -331,6 +353,12 @@ class Client:
     def retry_external_sync(
         self, callback_id: str
     ) -> Job[dict[str, Any]]: ...
+    def resolve_callback_sync(
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        default_action: str = "ignore",
+    ) -> ResolveResult: ...
 
 # Functions
 def derive_kind(name: str) -> str: ...
