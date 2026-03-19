@@ -14,6 +14,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+async fn run_migrations(pool: PgPool) -> Result<(), awa_model::AwaError> {
+    awa_model::migrations::run(&pool).await
+}
+
 /// Python result types for worker handlers.
 #[pyclass(frozen, name = "RetryAfter", skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -292,10 +296,8 @@ impl PyClient {
 
     fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            awa_model::migrations::run(&pool)
-                .await
-                .map_err(map_awa_error)?;
+        pyo3_async_runtimes::tokio::local_future_into_py(py, async move {
+            run_migrations(pool).await.map_err(map_awa_error)?;
             Ok(())
         })
     }

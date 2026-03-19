@@ -594,7 +594,8 @@ async fn test_e12_crash_clears_stale_callback() {
             )::jsonb
         WHERE id IN (
             SELECT id FROM awa.jobs
-            WHERE state = 'running'
+            WHERE id = $1
+              AND state = 'running'
               AND heartbeat_at < now() - interval '90 seconds'
             LIMIT 500
             FOR UPDATE SKIP LOCKED
@@ -602,6 +603,7 @@ async fn test_e12_crash_clears_stale_callback() {
         RETURNING *
         "#,
     )
+    .bind(job.id)
     .fetch_all(client.pool())
     .await
     .unwrap();

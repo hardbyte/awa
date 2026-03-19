@@ -153,15 +153,15 @@ async fn t01_no_duplicate_processing() {
                 let jobs: Vec<JobRow> = sqlx::query_as(
                     r#"
                     WITH claimed AS (
-                        SELECT id FROM awa.jobs
+                        SELECT id FROM awa.jobs_hot
                         WHERE state = 'available' AND queue = $1
                         LIMIT 20
                         FOR UPDATE SKIP LOCKED
                     )
-                    UPDATE awa.jobs SET state = 'running', attempt = attempt + 1,
+                    UPDATE awa.jobs_hot SET state = 'running', attempt = attempt + 1,
                         attempted_at = now(), heartbeat_at = now()
-                    FROM claimed WHERE awa.jobs.id = claimed.id
-                    RETURNING awa.jobs.*
+                    FROM claimed WHERE awa.jobs_hot.id = claimed.id
+                    RETURNING awa.jobs_hot.*
                     "#,
                 )
                 .bind(&q)
@@ -171,7 +171,7 @@ async fn t01_no_duplicate_processing() {
 
                 if jobs.is_empty() {
                     let remaining: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'available'"
+                        "SELECT count(*) FROM awa.jobs_hot WHERE queue = $1 AND state = 'available'"
                     ).bind(&q).fetch_one(&pool).await.unwrap();
                     if remaining == 0 { break; }
                     tokio::time::sleep(Duration::from_millis(5)).await;
@@ -182,7 +182,7 @@ async fn t01_no_duplicate_processing() {
                     // Increment counter atomically
                     sqlx::query("UPDATE t01_counters SET value = value + 1 WHERE id = 1")
                         .execute(&pool).await.unwrap();
-                    sqlx::query("UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1")
+                    sqlx::query("UPDATE awa.jobs_hot SET state = 'completed', finalized_at = now() WHERE id = $1")
                         .bind(job.id).execute(&pool).await.unwrap();
                     count.fetch_add(1, Ordering::SeqCst);
                 }
@@ -200,14 +200,14 @@ async fn t01_no_duplicate_processing() {
         .await
         .unwrap();
     let completed_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'completed'",
+        "SELECT count(*) FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
     )
     .bind(queue)
     .fetch_one(&pool)
     .await
     .unwrap();
     let non_completed: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state != 'completed'",
+        "SELECT count(*) FROM awa.jobs_hot WHERE queue = $1 AND state != 'completed'",
     )
     .bind(queue)
     .fetch_one(&pool)
@@ -943,12 +943,12 @@ async fn t22_pool_exhaustion_resilience() {
                 let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
                     r#"
                     WITH claimed AS (
-                        SELECT id FROM awa.jobs WHERE state = 'available' AND queue = $1
+                        SELECT id FROM awa.jobs_hot WHERE state = 'available' AND queue = $1
                         LIMIT 5 FOR UPDATE SKIP LOCKED
                     )
-                    UPDATE awa.jobs SET state = 'completed', finalized_at = now()
-                    FROM claimed WHERE awa.jobs.id = claimed.id
-                    RETURNING awa.jobs.*
+                    UPDATE awa.jobs_hot SET state = 'completed', finalized_at = now()
+                    FROM claimed WHERE awa.jobs_hot.id = claimed.id
+                    RETURNING awa.jobs_hot.*
                     "#,
                 )
                 .bind(&q)
@@ -964,7 +964,7 @@ async fn t22_pool_exhaustion_resilience() {
 
                 if jobs.is_empty() {
                     let remaining: i64 = sqlx::query_scalar(
-                        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'available'",
+                        "SELECT count(*) FROM awa.jobs_hot WHERE queue = $1 AND state = 'available'",
                     )
                     .bind(&q)
                     .fetch_one(&pool)

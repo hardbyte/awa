@@ -1,4 +1,5 @@
 use crate::error::AwaError;
+use sqlx::postgres::PgConnection;
 use sqlx::PgPool;
 use tracing::info;
 
@@ -406,29 +407,30 @@ VALUES (1, 'Canonical schema');
 /// historical chain.
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
     let lock_key: i64 = 0x4157_415f_4d49_4752; // "AWA_MIGR"
+    let mut conn = pool.acquire().await?;
     sqlx::query("SELECT pg_advisory_lock($1)")
         .bind(lock_key)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
-    let result = run_inner(pool).await;
+    let result = run_inner(&mut conn).await;
 
     let _ = sqlx::query("SELECT pg_advisory_unlock($1)")
         .bind(lock_key)
-        .execute(pool)
+        .execute(&mut *conn)
         .await;
 
     result
 }
 
-async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
+async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
     let has_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     let current = if has_schema {
-        current_version(pool).await?
+        current_version_conn(conn).await?
     } else {
         0
     };
@@ -444,14 +446,14 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
             "Replacing existing awa schema with canonical schema"
         );
         sqlx::raw_sql("DROP SCHEMA awa CASCADE")
-            .execute(pool)
+            .execute(&mut *conn)
             .await?;
     }
 
     for &(version, description, steps) in MIGRATIONS {
         info!(version, description, "Applying migration");
         for step in steps {
-            sqlx::raw_sql(step).execute(pool).await?;
+            sqlx::raw_sql(step).execute(&mut *conn).await?;
         }
         info!(version, "Migration applied");
     }
@@ -461,9 +463,14 @@ async fn run_inner(pool: &PgPool) -> Result<(), AwaError> {
 
 /// Get the current schema version.
 pub async fn current_version(pool: &PgPool) -> Result<i32, AwaError> {
+    let mut conn = pool.acquire().await?;
+    current_version_conn(&mut conn).await
+}
+
+async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> {
     let has_schema: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_namespace WHERE nspname = 'awa')")
-            .fetch_one(pool)
+            .fetch_one(&mut *conn)
             .await?;
 
     if !has_schema {
@@ -473,7 +480,7 @@ pub async fn current_version(pool: &PgPool) -> Result<i32, AwaError> {
     let has_table: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'schema_version')",
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *conn)
     .await?;
 
     if !has_table {
@@ -481,7 +488,7 @@ pub async fn current_version(pool: &PgPool) -> Result<i32, AwaError> {
     }
 
     let version: Option<i32> = sqlx::query_scalar("SELECT MAX(version) FROM awa.schema_version")
-        .fetch_one(pool)
+        .fetch_one(&mut *conn)
         .await?;
 
     Ok(version.unwrap_or(0))

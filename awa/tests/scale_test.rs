@@ -128,19 +128,19 @@ async fn test_concurrent_claim_no_double_dispatch() {
             let jobs: Vec<JobRow> = sqlx::query_as(
                 r#"
                 WITH claimed AS (
-                    SELECT id FROM awa.jobs
+                    SELECT id FROM awa.jobs_hot
                     WHERE state = 'available' AND queue = $1
                     ORDER BY run_at ASC, id ASC
                     LIMIT 20
                     FOR UPDATE SKIP LOCKED
                 )
-                UPDATE awa.jobs
+                UPDATE awa.jobs_hot
                 SET state = 'running', attempt = attempt + 1,
                     attempted_at = now(), heartbeat_at = now(),
                     deadline_at = now() + interval '5 minutes'
                 FROM claimed
-                WHERE awa.jobs.id = claimed.id
-                RETURNING awa.jobs.*
+                WHERE awa.jobs_hot.id = claimed.id
+                RETURNING awa.jobs_hot.*
                 "#,
             )
             .bind(&q)
@@ -186,7 +186,7 @@ async fn test_priority_aging_reorders_jobs() {
     let old_time = chrono::Utc::now() - chrono::Duration::seconds(300);
     sqlx::query(
         r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, run_at)
+        INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, run_at)
         VALUES ('scale_job', $1, '{"index": 1}', 'available', 4, $2)
         "#,
     )
@@ -199,7 +199,7 @@ async fn test_priority_aging_reorders_jobs() {
     // Insert a high-priority job with recent run_at
     sqlx::query(
         r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, run_at)
+        INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, run_at)
         VALUES ('scale_job', $1, '{"index": 2}', 'available', 1, now())
         "#,
     )
@@ -215,7 +215,7 @@ async fn test_priority_aging_reorders_jobs() {
     let jobs: Vec<JobRow> = sqlx::query_as(
         r#"
         WITH claimed AS (
-            SELECT id FROM awa.jobs
+            SELECT id FROM awa.jobs_hot
             WHERE state = 'available' AND queue = $1
             ORDER BY
               GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / 60)::int) ASC,
@@ -223,11 +223,11 @@ async fn test_priority_aging_reorders_jobs() {
             LIMIT 1
             FOR UPDATE SKIP LOCKED
         )
-        UPDATE awa.jobs
+        UPDATE awa.jobs_hot
         SET state = 'running', attempt = attempt + 1
         FROM claimed
-        WHERE awa.jobs.id = claimed.id
-        RETURNING awa.jobs.*
+        WHERE awa.jobs_hot.id = claimed.id
+        RETURNING awa.jobs_hot.*
         "#,
     )
     .bind(queue)
@@ -388,15 +388,15 @@ async fn test_queue_isolation_under_load() {
     let queue_a_jobs: Vec<JobRow> = sqlx::query_as(
         r#"
         WITH claimed AS (
-            SELECT id FROM awa.jobs
+            SELECT id FROM awa.jobs_hot
             WHERE state = 'available' AND queue = 'scale_iso_a'
             ORDER BY run_at ASC, id ASC
             LIMIT 100
             FOR UPDATE SKIP LOCKED
         )
-        UPDATE awa.jobs SET state = 'running', attempt = 1
-        FROM claimed WHERE awa.jobs.id = claimed.id
-        RETURNING awa.jobs.*
+        UPDATE awa.jobs_hot SET state = 'running', attempt = 1
+        FROM claimed WHERE awa.jobs_hot.id = claimed.id
+        RETURNING awa.jobs_hot.*
         "#,
     )
     .fetch_all(&pool)
@@ -408,7 +408,7 @@ async fn test_queue_isolation_under_load() {
 
     // queue_b should still have 50 available
     let queue_b_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM awa.jobs WHERE queue = 'scale_iso_b' AND state = 'available'",
+        "SELECT count(*) FROM awa.jobs_hot WHERE queue = 'scale_iso_b' AND state = 'available'",
     )
     .fetch_one(&pool)
     .await
@@ -497,14 +497,14 @@ async fn test_concurrent_insert_and_claim() {
                 let jobs: Vec<JobRow> = sqlx::query_as(
                     r#"
                     WITH claimed AS (
-                        SELECT id FROM awa.jobs
+                        SELECT id FROM awa.jobs_hot
                         WHERE state = 'available' AND queue = $1
                         LIMIT 10
                         FOR UPDATE SKIP LOCKED
                     )
-                    UPDATE awa.jobs SET state = 'completed', finalized_at = now()
-                    FROM claimed WHERE awa.jobs.id = claimed.id
-                    RETURNING awa.jobs.*
+                    UPDATE awa.jobs_hot SET state = 'completed', finalized_at = now()
+                    FROM claimed WHERE awa.jobs_hot.id = claimed.id
+                    RETURNING awa.jobs_hot.*
                     "#,
                 )
                 .bind(&q)
@@ -517,7 +517,7 @@ async fn test_concurrent_insert_and_claim() {
                     if inserted_count.load(Ordering::SeqCst) >= 500 {
                         tokio::time::sleep(Duration::from_millis(10)).await;
                         let remaining: i64 = sqlx::query_scalar(
-                            "SELECT count(*) FROM awa.jobs WHERE state = 'available' AND queue = $1",
+                            "SELECT count(*) FROM awa.jobs_hot WHERE state = 'available' AND queue = $1",
                         )
                         .bind(&q)
                         .fetch_one(&pool)

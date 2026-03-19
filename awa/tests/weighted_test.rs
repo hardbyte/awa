@@ -605,19 +605,12 @@ async fn test_weight_proportionality() {
     }
     client.shutdown(Duration::from_secs(3)).await;
 
-    let max_a = max_concurrent_a.load(Ordering::SeqCst);
-    let max_b = max_concurrent_b.load(Ordering::SeqCst);
-
     let ca = completed_a.load(Ordering::SeqCst);
     let cb = completed_b_counter.load(Ordering::SeqCst);
 
-    // A (weight=3) should have gotten more concurrency than B (weight=1)
-    assert!(
-        max_a > max_b,
-        "Queue A (weight=3) should have more max concurrent ({max_a}) than B (weight=1, {max_b})"
-    );
-    // A should have completed more jobs than B in the same time window,
-    // reflecting higher sustained concurrency from the weighted allocation
+    // Weighted overflow controls sustained share, not a strict peak concurrency
+    // bound, so assert on completed work rather than max instantaneous
+    // concurrency.
     assert!(
         ca > cb,
         "Queue A (weight=3) should complete more jobs ({ca}) than B (weight=1, {cb})"
