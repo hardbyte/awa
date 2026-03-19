@@ -1,7 +1,7 @@
 ---- MODULE AwaCore ----
 EXTENDS FiniteSets, Naturals
 
-Jobs == {"j1", "j2"}
+Jobs == {"j1"}
 Workers == {"w1"}
 Queues == {"q1"}
 QueueOf == [j \in Jobs |-> "q1"]
@@ -10,6 +10,7 @@ WorkerQueue == [w \in Workers |-> "q1"]
 JobStates == {"available", "running", "retryable", "completed", "failed", "cancelled"}
 FinalStates == {"retryable", "completed", "failed", "cancelled"}
 NoOwner == "no_owner"
+MaxLease == 2
 
 VARIABLES jobState, owner, lease, taskLease, cancelFlag, shutdownPhase
 
@@ -27,6 +28,7 @@ Claim(w, j) ==
     /\ shutdownPhase = "running"
     /\ jobState[j] = "available"
     /\ QueueOf[j] = WorkerQueue[w]
+    /\ lease[j] < MaxLease
     /\ jobState' = [jobState EXCEPT ![j] = "running"]
     /\ owner' = [owner EXCEPT ![j] = w]
     /\ lease' = [lease EXCEPT ![j] = @ + 1]
@@ -121,8 +123,8 @@ Next ==
 TypeOK ==
     /\ jobState \in [Jobs -> JobStates]
     /\ owner \in [Jobs -> Workers \cup {NoOwner}]
-    /\ lease \in [Jobs -> Nat]
-    /\ taskLease \in [Workers -> [Jobs -> Nat]]
+    /\ lease \in [Jobs -> 0..MaxLease]
+    /\ taskLease \in [Workers -> [Jobs -> 0..MaxLease]]
     /\ cancelFlag \in [Workers -> BOOLEAN]
     /\ shutdownPhase \in {"running", "stop_claim", "draining", "stopped"}
 

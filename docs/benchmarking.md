@@ -72,17 +72,17 @@ runtime metrics path is exercised while measuring.
 Measured with `awa-python/scripts/benchmark_runtime.py` on the same local
 database:
 
-- `insert_many_copy`: about `11.0k jobs/s` (`50,000` jobs in `4.53s`)
+- `insert_many_copy`: about `15.6k jobs/s` (`50,000` jobs in `3.20s`)
 - sustained hot path:
-  - handler returns: about `4.7k jobs/s`
-  - DB `completed` transitions: about `4.7k jobs/s`
+  - handler returns: about `4.9k jobs/s`
+  - DB `completed` transitions: about `4.8k jobs/s`
 - sustained deferred frontier, `2,000,000` deferred rows with `4,000/s` due:
   - all `40,000` due jobs were eventually picked and completed
-  - about `29.0k` completed within the 10-second measurement window
+  - about `36.6k` completed within the 10-second measurement window
   - pickup lateness:
-    - `p50`: about `1.48s`
-    - `p95`: about `3.53s`
-    - `p99`: about `4.18s`
+    - `p50`: about `243 ms`
+    - `p95`: about `700 ms`
+    - `p99`: about `794 ms`
 
 These runs isolate the Python worker path. Seed data is inserted with SQL so
 the runtime number is not dominated by Python-side enqueue serialization.
@@ -118,13 +118,13 @@ Measured with `test_scheduled_steady_2m_due_4k_per_sec`:
 Result:
 
 - all `40,000` due jobs were picked
-- `38,737` completed within the 10-second window
+- `37,696` completed within the 10-second window
 - pickup lateness:
-  - `p50`: `0 ms`
-  - `p95`: about `282 ms`
-  - `p99`: about `557 ms`
-- promotion batches averaged `186` jobs at `116 ms` per batch
-- claim latency: `14 ms` mean
+  - `p50`: about `204 ms`
+  - `p95`: about `501 ms`
+  - `p99`: about `589 ms`
+- promotion batches averaged `196` jobs at `54 ms` per batch
+- claim latency: `4.8 ms` mean
 
 This validates the architecture at a realistic production scale: 2M deferred
 rows with 4k/s throughput and sub-second tail pickup latency.

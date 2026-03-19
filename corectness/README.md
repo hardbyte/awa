@@ -82,6 +82,9 @@ finalization protocol:
 That maps much more closely to the Rust `run_lease` guard than the older
 owner-only core model.
 
+Like the extended model, the core model bounds lease growth (`MaxLease == 2`)
+so TLC explores a finite reclaim/finalize surface instead of an unbounded loop.
+
 `AwaExtended` adds:
 
 - `Instances = {"i1", "i2"}` with per-instance `inFlight`, `taskLease`,
