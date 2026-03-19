@@ -387,15 +387,59 @@ managed as code). Future: "Run now" button to manually trigger a cron job.
 
 ## 5. Interaction Patterns
 
-### 5.1 Auto-refresh
+### 5.1 Data freshness: polling now, SSE-invalidation later
 
-- TanStack Query `refetchInterval` on all list views
-- Default: 2s for jobs (matches RiverUI), 5s for dashboard/queues
+**v1: Polling via TanStack Query `refetchInterval`.**
+
+- Default intervals: 2s for jobs list/detail, 5s for dashboard/queues/cron
 - **Pause on selection:** When any checkbox is selected, refetching pauses. A small
   amber badge "Updates paused" appears. Clears when selection is emptied.
 - **Pause on background:** Stop refetching when `document.hidden === true`. Resume on
   focus. (Oban Web pattern — saves server load.)
 - **Manual refresh button** in the nav bar
+
+**Why not SSE or WebSocket for v1?**
+
+WebSocket is overkill — the UI is read-mostly, and the few writes (retry, cancel, pause)
+are fine as POST requests. Bidirectional communication buys nothing here, and it adds
+upgrade handshakes, ping/pong keepalive, manual reconnection, and stateful connections
+that complicate load balancing.
+
+SSE (server-sent events) is the more interesting option. AWA already has the building
+block: **LISTEN/NOTIFY** fires `pg_notify('awa:<queue>', job_id)` on every job insert.
+A UI server could subscribe and push changes to the browser. But several factors make
+this a poor fit for v1:
+
+1. **LISTEN needs a dedicated connection.** `sqlx::PgPool` multiplexes queries across
+   pooled connections, but LISTEN must hold a single connection open permanently. The UI
+   server would need a separate non-pooled connection with its own reconnection logic,
+   fanning out notifications to all SSE clients. Real complexity.
+2. **NOTIFY says *something changed*, not *what changed*.** The payload is just a job ID.
+   To update dashboard counters or a job list, you still need a SQL query after receiving
+   the notification. SSE doesn't eliminate queries — it makes them event-triggered rather
+   than time-triggered.
+3. **Aggregate views don't benefit much.** The dashboard shows `COUNT(*) GROUP BY state`
+   and `queue_stats()`. Even with SSE, you'd debounce notifications and run the same
+   aggregate query. Polling every 2s gives a nearly identical result with far less code.
+4. **2s polling is perceptually real-time.** Human reaction time to a dashboard change is
+   ~1s. A 2s poll means worst-case 2s latency, average 1s — indistinguishable from
+   instant for an operational tool.
+
+**v2 upgrade path: SSE for cache invalidation.**
+
+If push updates are needed later, the right pattern is SSE for *invalidation* with
+queries for *data*:
+
+- Dedicated LISTEN connection in the UI server, subscribing to `awa:*` channels
+- SSE endpoint at `GET /api/events` streaming lightweight change notifications
+- Client uses `EventSource` and calls `queryClient.invalidateQueries()` on events,
+  triggering a TanStack Query refetch — rather than maintaining client-side state from
+  individual events
+- This avoids the consistency problems of pure event-driven state (out-of-order events,
+  missed events, partial updates) while giving near-instant responsiveness
+
+This hybrid is elegant because TanStack Query already supports programmatic
+invalidation. The SSE stream just becomes a smarter refetch trigger instead of a timer.
 
 ### 5.2 URL-driven state
 
@@ -537,6 +581,5 @@ pub async fn bulk_cancel(executor, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
    case: view jobs, retry/cancel, pause/resume queues, view cron. The CLI remains the
    power-user tool for batch operations, migrations, and scripting.
 
-5. **Real-time updates via WebSocket or polling?** Polling via TanStack Query is simpler,
-   proven (RiverUI uses it), and sufficient for a 2-second refresh interval. WebSocket
-   would reduce server load at scale but adds complexity. Start with polling.
+5. **Real-time updates?** Decided: polling for v1, SSE-invalidation hybrid for v2.
+   See section 5.1 for full rationale.
