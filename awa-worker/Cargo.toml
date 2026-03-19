@@ -7,6 +7,9 @@ description = "Worker runtime for the Awa job queue"
 repository.workspace = true
 readme.workspace = true
 
+[features]
+cel = ["awa-model/cel"]
+
 [dependencies]
 awa-model.workspace = true
 awa-macros.workspace = true

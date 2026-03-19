@@ -289,6 +289,10 @@ impl MaintenanceService {
                 deadline_at = NULL,
                 callback_id = NULL,
                 callback_timeout_at = NULL,
+                callback_filter = NULL,
+                callback_on_complete = NULL,
+                callback_on_fail = NULL,
+                callback_transform = NULL,
                 errors = errors || jsonb_build_object(
                     'error', 'heartbeat stale: worker presumed dead',
                     'attempt', attempt,
@@ -332,6 +336,10 @@ impl MaintenanceService {
                 deadline_at = NULL,
                 callback_id = NULL,
                 callback_timeout_at = NULL,
+                callback_filter = NULL,
+                callback_on_complete = NULL,
+                callback_on_fail = NULL,
+                callback_transform = NULL,
                 errors = errors || jsonb_build_object(
                     'error', 'hard deadline exceeded',
                     'attempt', attempt,
@@ -373,6 +381,10 @@ impl MaintenanceService {
                 finalized_at = now(),
                 callback_id = NULL,
                 callback_timeout_at = NULL,
+                callback_filter = NULL,
+                callback_on_complete = NULL,
+                callback_on_fail = NULL,
+                callback_transform = NULL,
                 run_at = CASE WHEN attempt >= max_attempts THEN run_at
                          ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
                 errors = errors || jsonb_build_object(

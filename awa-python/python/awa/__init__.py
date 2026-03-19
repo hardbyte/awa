@@ -11,6 +11,7 @@ from awa._awa import (
     # Callback
     CallbackToken,
     WaitForCallback,
+    ResolveResult,
     # Transaction
     Transaction,
     SyncTransaction,
@@ -42,6 +43,7 @@ __all__ = [
     "QueueHealth",
     "CallbackToken",
     "WaitForCallback",
+    "ResolveResult",
     "Transaction",
     "SyncTransaction",
     "RetryAfter",

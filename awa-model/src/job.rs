@@ -86,6 +86,14 @@ pub struct JobRow {
     pub callback_id: Option<uuid::Uuid>,
     /// Deadline for callback timeout.
     pub callback_timeout_at: Option<DateTime<Utc>>,
+    /// CEL filter expression for callback resolution.
+    pub callback_filter: Option<String>,
+    /// CEL expression: does the payload indicate completion?
+    pub callback_on_complete: Option<String>,
+    /// CEL expression: does the payload indicate failure?
+    pub callback_on_fail: Option<String>,
+    /// CEL expression to transform the payload before returning.
+    pub callback_transform: Option<String>,
 }
 
 /// Options for inserting a job.

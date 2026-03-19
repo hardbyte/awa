@@ -3,7 +3,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 3;
+pub const CURRENT_VERSION: i32 = 4;
 
 /// All migrations in order.
 ///
@@ -17,6 +17,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Webhook completion (waiting_external)",
         &[V3_UP_ENUM, V3_UP_DDL],
     ),
+    (4, "CEL callback expressions", &[V4_UP]),
 ];
 
 /// The initial migration SQL.
@@ -211,6 +212,19 @@ $$ LANGUAGE sql IMMUTABLE;
 
 INSERT INTO awa.schema_version (version, description)
 VALUES (3, 'Webhook completion (waiting_external)');
+"#;
+
+/// V4 migration: CEL callback expression columns.
+const V4_UP: &str = r#"
+-- Awa schema v4: CEL callback expressions
+
+ALTER TABLE awa.jobs ADD COLUMN IF NOT EXISTS callback_filter TEXT;
+ALTER TABLE awa.jobs ADD COLUMN IF NOT EXISTS callback_on_complete TEXT;
+ALTER TABLE awa.jobs ADD COLUMN IF NOT EXISTS callback_on_fail TEXT;
+ALTER TABLE awa.jobs ADD COLUMN IF NOT EXISTS callback_transform TEXT;
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (4, 'CEL callback expressions');
 "#;
 
 /// Run all pending migrations against the database.

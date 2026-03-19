@@ -75,6 +75,54 @@ impl PyWaitForCallback {
     }
 }
 
+/// Result of `resolve_callback`.
+#[pyclass(frozen, name = "ResolveResult", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyResolveResult {
+    /// One of "completed", "failed", "ignored".
+    #[pyo3(get)]
+    pub outcome: String,
+    /// The job row (None when ignored).
+    pub job: Option<PyJob>,
+    /// Transformed payload (only for completed).
+    pub payload_json: Option<serde_json::Value>,
+    /// Why the callback was ignored (only for ignored).
+    #[pyo3(get)]
+    pub reason: Option<String>,
+}
+
+#[pymethods]
+impl PyResolveResult {
+    #[getter]
+    fn job(&self, _py: Python<'_>) -> PyResult<Option<PyJob>> {
+        Ok(self.job.clone())
+    }
+
+    #[getter]
+    fn payload(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.payload_json {
+            Some(v) => crate::job::json_to_py(py, v),
+            None => Ok(py.None()),
+        }
+    }
+
+    fn is_completed(&self) -> bool {
+        self.outcome == "completed"
+    }
+
+    fn is_failed(&self) -> bool {
+        self.outcome == "failed"
+    }
+
+    fn is_ignored(&self) -> bool {
+        self.outcome == "ignored"
+    }
+
+    fn __repr__(&self) -> String {
+        format!("ResolveResult(outcome='{}')", self.outcome)
+    }
+}
+
 #[pyclass(frozen, name = "QueueHealth", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQueueHealth {
@@ -733,6 +781,59 @@ impl PyClient {
         })
     }
 
+    // ── Resolve callback (async + sync) ─────────────────────────────
+
+    #[pyo3(signature = (callback_id, payload=None, default_action="ignore"))]
+    fn resolve_callback<'py>(
+        &self,
+        py: Python<'py>,
+        callback_id: String,
+        payload: Option<Py<PyAny>>,
+        default_action: &str,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let payload_json = payload
+            .as_ref()
+            .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
+            .transpose()?;
+        let action = parse_default_action(default_action)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&callback_id)
+                .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+            let outcome = awa_model::admin::resolve_callback(&pool, uuid, payload_json, action)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(resolve_outcome_to_py(outcome))
+        })
+    }
+
+    #[pyo3(signature = (callback_id, payload=None, default_action="ignore"))]
+    fn resolve_callback_sync(
+        &self,
+        py: Python<'_>,
+        callback_id: String,
+        payload: Option<Py<PyAny>>,
+        default_action: &str,
+    ) -> PyResult<PyResolveResult> {
+        let pool = self.pool.clone();
+        let payload_json = payload
+            .as_ref()
+            .map(|value| py_to_json(py, value.bind(py)))
+            .transpose()?;
+        let action = parse_default_action(default_action)?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let uuid = uuid::Uuid::parse_str(&callback_id)
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+                let outcome =
+                    awa_model::admin::resolve_callback(&pool, uuid, payload_json, action)
+                        .await
+                        .map_err(map_awa_error)?;
+                Ok(resolve_outcome_to_py(outcome))
+            })
+        })
+    }
+
     // ── COPY batch insert (async + sync) ────────────────────────────
 
     #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
@@ -1351,5 +1452,39 @@ fn parse_job_state(value: &str) -> PyResult<JobState> {
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown job state: {other}"
         ))),
+    }
+}
+
+fn parse_default_action(value: &str) -> PyResult<awa_model::admin::DefaultAction> {
+    match value {
+        "complete" => Ok(awa_model::admin::DefaultAction::Complete),
+        "fail" => Ok(awa_model::admin::DefaultAction::Fail),
+        "ignore" => Ok(awa_model::admin::DefaultAction::Ignore),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "unknown default_action: {other} (expected 'complete', 'fail', or 'ignore')"
+        ))),
+    }
+}
+
+fn resolve_outcome_to_py(outcome: awa_model::admin::ResolveOutcome) -> PyResolveResult {
+    match outcome {
+        awa_model::admin::ResolveOutcome::Completed { payload, job } => PyResolveResult {
+            outcome: "completed".to_string(),
+            job: Some(PyJob::from(job)),
+            payload_json: payload,
+            reason: None,
+        },
+        awa_model::admin::ResolveOutcome::Failed { job } => PyResolveResult {
+            outcome: "failed".to_string(),
+            job: Some(PyJob::from(job)),
+            payload_json: None,
+            reason: None,
+        },
+        awa_model::admin::ResolveOutcome::Ignored { reason } => PyResolveResult {
+            outcome: "ignored".to_string(),
+            job: None,
+            payload_json: None,
+            reason: Some(reason),
+        },
     }
 }
