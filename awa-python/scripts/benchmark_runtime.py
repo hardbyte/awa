@@ -1,0 +1,381 @@
+from __future__ import annotations
+
+import argparse
+import asyncio
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from statistics import quantiles
+from typing import Any
+
+import awa
+
+
+DEFAULT_DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
+)
+
+
+@dataclass
+class TimingJob:
+    seq: int
+
+
+async def scalar(client: awa.Client, query: str, *args: Any) -> int:
+    tx = await client.transaction()
+    try:
+        row = await tx.fetch_one(query, *args)
+    finally:
+        await tx.rollback()
+    return int(row["cnt"])
+
+
+async def execute(client: awa.Client, query: str, *args: Any) -> int:
+    tx = await client.transaction()
+    try:
+        affected = await tx.execute(query, *args)
+        await tx.commit()
+    except Exception:
+        await tx.rollback()
+        raise
+    return affected
+
+
+async def reset_runtime_state(client: awa.Client) -> None:
+    await execute(
+        client,
+        """
+        TRUNCATE awa.jobs_hot, awa.scheduled_jobs, awa.queue_meta, awa.job_unique_claims
+        RESTART IDENTITY CASCADE
+        """,
+    )
+
+
+def pctl_ms(samples: list[float], pct: int) -> float:
+    if not samples:
+        return 0.0
+    if len(samples) == 1:
+        return samples[0]
+    cuts = quantiles(samples, n=100, method="inclusive")
+    return cuts[pct - 1]
+
+
+async def run_copy_benchmark(
+    client: awa.Client,
+    total_jobs: int,
+    chunk_size: int,
+) -> None:
+    queue = "py_bench_copy"
+    await reset_runtime_state(client)
+
+    started = asyncio.get_running_loop().time()
+    inserted = 0
+    for chunk_start in range(0, total_jobs, chunk_size):
+        chunk_end = min(chunk_start + chunk_size, total_jobs)
+        jobs = [TimingJob(seq=i) for i in range(chunk_start, chunk_end)]
+        rows = await client.insert_many_copy(jobs, queue=queue)
+        inserted += len(rows)
+    elapsed = asyncio.get_running_loop().time() - started
+
+    print(
+        f"[py-copy] total_jobs={inserted} chunk_size={chunk_size} "
+        f"elapsed={elapsed:.3f}s throughput={inserted / elapsed:.0f}/s"
+    )
+
+
+async def run_hot_benchmark(
+    client: awa.Client,
+    total_jobs: int,
+    warmup_secs: int,
+    window_secs: int,
+    max_workers: int,
+    poll_interval_ms: int,
+) -> None:
+    queue = "py_bench_hot"
+    await reset_runtime_state(client)
+
+    await execute(
+        client,
+        """
+        INSERT INTO awa.jobs_hot
+            (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+        SELECT
+            'timing_job',
+            $1,
+            jsonb_build_object('seq', g),
+            'available'::awa.job_state,
+            2,
+            25,
+            now(),
+            '{}'::jsonb,
+            '{}'::text[]
+        FROM generate_series(1, $2) AS g
+        """,
+        queue,
+        total_jobs,
+    )
+
+    handler_returned = 0
+
+    @client.worker(TimingJob, queue=queue)
+    async def handle(job: awa.Job) -> None:
+        nonlocal handler_returned
+        handler_returned += 1
+        return None
+
+    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+    await asyncio.sleep(warmup_secs)
+
+    handler_before = handler_returned
+    completed_before = await scalar(
+        client,
+        """
+        SELECT count(*)::bigint AS cnt
+        FROM awa.jobs_hot
+        WHERE queue = $1 AND state = 'completed'
+        """,
+        queue,
+    )
+
+    await asyncio.sleep(window_secs)
+
+    completed_after = await scalar(
+        client,
+        """
+        SELECT count(*)::bigint AS cnt
+        FROM awa.jobs_hot
+        WHERE queue = $1 AND state = 'completed'
+        """,
+        queue,
+    )
+    remaining_hot = await scalar(
+        client,
+        """
+        SELECT count(*)::bigint AS cnt
+        FROM awa.jobs_hot
+        WHERE queue = $1 AND state IN ('available', 'running')
+        """,
+        queue,
+    )
+
+    await client.shutdown(timeout_ms=5000)
+
+    handler_delta = handler_returned - handler_before
+    completed_delta = completed_after - completed_before
+    print(
+        f"[py-steady-hot] warmup={warmup_secs}s window={window_secs}s "
+        f"handler_returned={handler_delta} ({handler_delta / window_secs:.0f}/s) "
+        f"db_completed_delta={completed_delta} ({completed_delta / window_secs:.0f}/s) "
+        f"remaining_hot={remaining_hot}"
+    )
+
+
+async def run_scheduled_benchmark(
+    client: awa.Client,
+    total_jobs: int,
+    due_rate: int,
+    window_secs: int,
+    max_workers: int,
+    poll_interval_ms: int,
+) -> None:
+    queue = "py_bench_scheduled"
+    await reset_runtime_state(client)
+
+    await execute(
+        client,
+        """
+        INSERT INTO awa.scheduled_jobs
+            (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+        SELECT
+            'timing_job',
+            $1,
+            jsonb_build_object('seq', g),
+            'scheduled'::awa.job_state,
+            2,
+            25,
+            now() + interval '365 days' + make_interval(secs => g),
+            '{}'::jsonb,
+            '{}'::text[]
+        FROM generate_series(1, $2) AS g
+        """,
+        queue,
+        total_jobs,
+    )
+
+    due_rows = due_rate * window_secs
+    handler_returned = 0
+    pickup_lateness_ms: list[float] = []
+    schedule_started_at: datetime | None = None
+
+    @client.worker(TimingJob, queue=queue)
+    async def handle(job: awa.Job) -> None:
+        nonlocal handler_returned
+        handler_returned += 1
+
+        slot = job.metadata.get("steady_slot")
+        if slot is not None and schedule_started_at is not None:
+            scheduled_for = schedule_started_at + timedelta(seconds=int(slot))
+            lateness_ms = max(
+                0.0,
+                (datetime.now(timezone.utc) - scheduled_for).total_seconds() * 1000.0,
+            )
+            pickup_lateness_ms.append(lateness_ms)
+        return None
+
+    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+    await asyncio.sleep(1)
+
+    await execute(
+        client,
+        """
+        WITH target AS (
+            SELECT id, row_number() OVER (ORDER BY id) AS rn
+            FROM (
+                SELECT id
+                FROM awa.scheduled_jobs
+                WHERE queue = $1
+                  AND state = 'scheduled'
+                ORDER BY id ASC
+                LIMIT $2
+            ) picked
+        )
+        UPDATE awa.scheduled_jobs AS jobs
+        SET run_at = now() + make_interval(secs => (((target.rn - 1) / $3) + 1)),
+            metadata = jsonb_set(
+                COALESCE(jobs.metadata, '{}'::jsonb),
+                '{steady_slot}',
+                to_jsonb((((target.rn - 1) / $3) + 1)),
+                true
+            )
+        FROM target
+        WHERE jobs.id = target.id
+        """,
+        queue,
+        due_rows,
+        due_rate,
+    )
+
+    schedule_started_at = datetime.now(timezone.utc)
+    completed_prev = 0
+    completed_by_second: list[tuple[int, int]] = []
+
+    for second in range(1, window_secs + 1):
+        await asyncio.sleep(1)
+        completed = await scalar(
+            client,
+            """
+            SELECT count(*)::bigint AS cnt
+            FROM awa.jobs_hot
+            WHERE queue = $1 AND state = 'completed'
+            """,
+            queue,
+        )
+        completed_by_second.append((second, completed - completed_prev))
+        completed_prev = completed
+
+    deadline = asyncio.get_running_loop().time() + window_secs + 10
+    while handler_returned < due_rows and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.2)
+
+    completed_total = await scalar(
+        client,
+        """
+        SELECT count(*)::bigint AS cnt
+        FROM awa.jobs_hot
+        WHERE queue = $1 AND state = 'completed'
+        """,
+        queue,
+    )
+    scheduled_remaining = await scalar(
+        client,
+        """
+        SELECT count(*)::bigint AS cnt
+        FROM awa.scheduled_jobs
+        WHERE queue = $1 AND state = 'scheduled'
+        """,
+        queue,
+    )
+
+    await client.shutdown(timeout_ms=5000)
+
+    print(
+        f"[py-steady-scheduled] seeded={total_jobs} due_rate={due_rate}/s "
+        f"window={window_secs}s picked_total={handler_returned} "
+        f"completed_total={completed_total} scheduled_remaining={scheduled_remaining}"
+    )
+    print(
+        "[py-steady-scheduled] per-second completions="
+        + ", ".join(f"{second}:{count}" for second, count in completed_by_second)
+    )
+    if pickup_lateness_ms:
+        print(
+            "[py-steady-scheduled] pickup_lateness_ms "
+            f"p50={pctl_ms(pickup_lateness_ms, 50):.0f} "
+            f"p95={pctl_ms(pickup_lateness_ms, 95):.0f} "
+            f"p99={pctl_ms(pickup_lateness_ms, 99):.0f}"
+        )
+
+
+async def make_client(args: argparse.Namespace) -> awa.Client:
+    client = awa.Client(args.database_url, max_connections=args.max_connections)
+    await client.migrate()
+    return client
+
+
+async def async_main(args: argparse.Namespace) -> None:
+    if args.scenario in {"copy", "all"}:
+        client = await make_client(args)
+        await run_copy_benchmark(client, args.copy_total_jobs, args.copy_chunk_size)
+    if args.scenario in {"hot", "all"}:
+        client = await make_client(args)
+        await run_hot_benchmark(
+            client,
+            total_jobs=args.hot_total_jobs,
+            warmup_secs=args.warmup_secs,
+            window_secs=args.window_secs,
+            max_workers=args.max_workers,
+            poll_interval_ms=args.poll_interval_ms,
+        )
+    if args.scenario in {"scheduled", "all"}:
+        client = await make_client(args)
+        await run_scheduled_benchmark(
+            client,
+            total_jobs=args.scheduled_total_jobs,
+            due_rate=args.due_rate,
+            window_secs=args.window_secs,
+            max_workers=args.max_workers,
+            poll_interval_ms=args.poll_interval_ms,
+        )
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Local Python worker benchmarks for Awa")
+    parser.add_argument(
+        "--database-url",
+        default=DEFAULT_DATABASE_URL,
+        help="PostgreSQL connection URL",
+    )
+    parser.add_argument(
+        "--scenario",
+        choices=["copy", "hot", "scheduled", "all"],
+        default="all",
+    )
+    parser.add_argument("--max-connections", type=int, default=50)
+    parser.add_argument("--max-workers", type=int, default=256)
+    parser.add_argument("--poll-interval-ms", type=int, default=50)
+    parser.add_argument("--warmup-secs", type=int, default=2)
+    parser.add_argument("--window-secs", type=int, default=10)
+    parser.add_argument("--copy-total-jobs", type=int, default=50_000)
+    parser.add_argument("--copy-chunk-size", type=int, default=10_000)
+    parser.add_argument("--hot-total-jobs", type=int, default=200_000)
+    parser.add_argument("--scheduled-total-jobs", type=int, default=2_000_000)
+    parser.add_argument("--due-rate", type=int, default=4_000)
+    return parser.parse_args()
+
+
+def main() -> None:
+    asyncio.run(async_main(parse_args()))
+
+
+if __name__ == "__main__":
+    main()

@@ -12,6 +12,8 @@ results from local runs.
 - Benchmarks live in:
   `awa/tests/benchmark_test.rs`
   `awa/tests/scheduling_benchmark_test.rs`
+- Python worker benchmarks live in:
+  `awa-python/scripts/benchmark_runtime.py`
 
 These are local engineering benchmarks, not published vendor-style numbers. The
 main goal is to compare shapes, validate architecture changes, and catch
@@ -35,6 +37,18 @@ Two benchmark shapes are used:
 
 Steady numbers are the better indicator of sustained runtime behavior.
 
+## Python Runtime Benchmarks
+
+The Python benchmark script exercises the real `awa-python` worker path while
+reusing the same database-facing benchmark shapes as the Rust runtime:
+
+- `copy`: Python client `insert_many_copy` throughput
+- `hot`: sustained worker throughput over pre-seeded `awa.jobs_hot`
+- `scheduled`: sustained deferred promotion over pre-seeded `awa.scheduled_jobs`
+
+The worker-focused scenarios seed with SQL directly so the reported number is
+about Python handler dispatch and runtime behavior, not enqueue serialization.
+
 ## Current Headline Results
 
 ### Sustained Hot Path
@@ -52,6 +66,26 @@ Latest observed result:
 
 This benchmark always enables the in-memory OpenTelemetry exporter so the
 runtime metrics path is exercised while measuring.
+
+### Python Runtime Baseline
+
+Measured with `awa-python/scripts/benchmark_runtime.py` on the same local
+database:
+
+- `insert_many_copy`: about `11.0k jobs/s` (`50,000` jobs in `4.53s`)
+- sustained hot path:
+  - handler returns: about `4.7k jobs/s`
+  - DB `completed` transitions: about `4.7k jobs/s`
+- sustained deferred frontier, `2,000,000` deferred rows with `4,000/s` due:
+  - all `40,000` due jobs were eventually picked and completed
+  - about `29.0k` completed within the 10-second measurement window
+  - pickup lateness:
+    - `p50`: about `1.48s`
+    - `p95`: about `3.53s`
+    - `p99`: about `4.18s`
+
+These runs isolate the Python worker path. Seed data is inserted with SQL so
+the runtime number is not dominated by Python-side enqueue serialization.
 
 ### Large Deferred Frontier
 
@@ -83,16 +117,17 @@ Measured with `test_scheduled_steady_2m_due_4k_per_sec`:
 
 Result:
 
-- all `40,000` due jobs picked and completed within the window
+- all `40,000` due jobs were picked
+- `38,737` completed within the 10-second window
 - pickup lateness:
   - `p50`: `0 ms`
-  - `p95`: about `304 ms`
-  - `p99`: about `374 ms`
-- promotion batches averaged `191` jobs at `96 ms` per batch
-- claim latency: `12 ms` mean
+  - `p95`: about `282 ms`
+  - `p99`: about `557 ms`
+- promotion batches averaged `186` jobs at `116 ms` per batch
+- claim latency: `14 ms` mean
 
 This validates the architecture at a realistic production scale: 2M deferred
-rows with 4k/s throughput and sub-400ms p99 latency.
+rows with 4k/s throughput and sub-second tail pickup latency.
 
 ### Scaling Limit: 10M Deferred at 6k/s
 
@@ -158,6 +193,11 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   cargo test --package awa --test scheduling_benchmark_test \
   test_scheduled_steady_10m_due_6k_per_sec -- --exact --ignored --nocapture
+
+cd awa-python
+uv run maturin develop
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  uv run python scripts/benchmark_runtime.py --scenario all
 ```
 
 ## Caveats
