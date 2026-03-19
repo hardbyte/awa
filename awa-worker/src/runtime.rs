@@ -155,7 +155,7 @@ impl InFlightRegistry {
                     .as_ref()
                     .is_some_and(|(gen, _)| *gen == generation)
                 {
-                    progress.acked_generation = generation;
+                    progress.acked_generation = progress.acked_generation.max(generation);
                     progress.in_flight = None;
                 }
             }
@@ -188,5 +188,36 @@ impl InFlightRegistry {
         key.hash(&mut hasher);
         let idx = (hasher.finish() as usize) % self.shards.len();
         &self.shards[idx]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ack_progress_does_not_roll_back_newer_explicit_flush() {
+        let registry = InFlightRegistry::default();
+        let key = (42, 7);
+        let progress = Arc::new(std::sync::Mutex::new(ProgressState {
+            latest: Some(serde_json::json!({"percent": 90})),
+            generation: 2,
+            acked_generation: 2,
+            in_flight: Some((1, serde_json::json!({"percent": 50}))),
+        }));
+
+        registry.insert(
+            key,
+            InFlightState {
+                cancel: Arc::new(AtomicBool::new(false)),
+                progress: progress.clone(),
+            },
+        );
+
+        registry.ack_progress(&[(key.0, key.1, 1)]);
+
+        let state = progress.lock().expect("progress lock poisoned");
+        assert_eq!(state.acked_generation, 2);
+        assert!(state.in_flight.is_none());
     }
 }

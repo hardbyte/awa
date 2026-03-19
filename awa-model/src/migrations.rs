@@ -4,14 +4,14 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 1;
+pub const CURRENT_VERSION: i32 = 2;
 
 /// All migrations in order.
-const MIGRATIONS: &[(i32, &str, &[&str])] = &[(1, "Canonical schema", &[V1_UP])];
+const MIGRATIONS: &[(i32, &str, &[&str])] = &[(2, "Canonical schema", &[V2_UP])];
 
 /// The canonical schema.
-const V1_UP: &str = r#"
--- Awa schema v1: Canonical hot/deferred schema
+const V2_UP: &str = r#"
+-- Awa schema v2: Canonical hot/deferred schema with structured progress
 
 CREATE SCHEMA IF NOT EXISTS awa;
 
@@ -399,7 +399,7 @@ CREATE UNIQUE INDEX idx_awa_jobs_unique
     ON awa.job_unique_claims (unique_key);
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (1, 'Canonical schema');
+VALUES (2, 'Canonical schema');
 "#;
 
 /// Run all pending migrations against the database.

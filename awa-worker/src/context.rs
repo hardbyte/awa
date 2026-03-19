@@ -201,20 +201,14 @@ impl JobContext {
         .execute(&self.pool)
         .await?;
 
-        let mut guard = self.progress.lock().expect("progress lock poisoned");
-        if target_generation > guard.acked_generation {
-            guard.acked_generation = target_generation;
-        }
-        // Clear any in-flight heartbeat snapshot that is now stale
-        if let Some((gen, _)) = &guard.in_flight {
-            if *gen <= target_generation {
-                guard.in_flight = None;
-            }
-        }
-
         if result.rows_affected() == 0 {
             // Job was rescued/cancelled — not an error for the caller
             return Ok(());
+        }
+
+        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        if target_generation > guard.acked_generation {
+            guard.acked_generation = target_generation;
         }
 
         Ok(())
