@@ -381,6 +381,11 @@ where
 ///
 /// Resets to `available` with attempt = 0. The handler must be idempotent
 /// with respect to the external call — a retry re-executes from scratch.
+///
+/// Only accepts `waiting_external` state — unlike complete/fail which are
+/// terminal transitions, retry puts the job back to `available`. Allowing
+/// retry from `running` would risk concurrent dispatch if the original
+/// handler hasn't finished yet.
 pub async fn retry_external<'e, E>(executor: E, callback_id: Uuid) -> Result<JobRow, AwaError>
 where
     E: PgExecutor<'e>,
@@ -396,7 +401,7 @@ where
             callback_timeout_at = NULL,
             heartbeat_at = NULL,
             deadline_at = NULL
-        WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
+        WHERE callback_id = $1 AND state = 'waiting_external'
         RETURNING *
         "#,
     )

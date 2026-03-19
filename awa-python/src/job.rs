@@ -164,6 +164,11 @@ impl PyJob {
                 "register_callback is only available during job execution",
             )
         })?;
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "timeout_seconds must be a finite non-negative number",
+            ));
+        }
         let job_id = self.id;
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
