@@ -8,6 +8,9 @@ from awa._awa import (
     JobState,
     HealthCheck,
     QueueHealth,
+    # Callback
+    CallbackToken,
+    WaitForCallback,
     # Transaction
     Transaction,
     SyncTransaction,
@@ -28,6 +31,7 @@ from awa._awa import (
     ValidationError,
     TerminalError,
     DatabaseError,
+    CallbackNotFound,
 )
 
 __all__ = [
@@ -36,6 +40,8 @@ __all__ = [
     "JobState",
     "HealthCheck",
     "QueueHealth",
+    "CallbackToken",
+    "WaitForCallback",
     "Transaction",
     "SyncTransaction",
     "RetryAfter",
@@ -52,4 +58,5 @@ __all__ = [
     "ValidationError",
     "TerminalError",
     "DatabaseError",
+    "CallbackNotFound",
 ]

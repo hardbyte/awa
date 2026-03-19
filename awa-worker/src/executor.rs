@@ -19,6 +19,9 @@ pub enum JobResult {
     Snooze(std::time::Duration),
     /// Job should be cancelled.
     Cancel(String),
+    /// Job is waiting for an external callback (webhook completion).
+    /// The handler must have called `ctx.register_callback()` before returning this.
+    WaitForCallback,
 }
 
 /// Error type for job handlers — any error is retryable unless it's terminal.
@@ -120,7 +123,7 @@ impl JobExecutor {
                 metrics.record_in_flight_change(&job_queue, 1);
 
                 let start = std::time::Instant::now();
-                let ctx = JobContext::new(job.clone(), cancel, state);
+                let ctx = JobContext::new(job.clone(), cancel, state, pool.clone());
 
                 let result = match workers.get(&job.kind) {
                     Some(worker) => worker.perform(&job, &ctx).await,
@@ -163,6 +166,21 @@ impl JobExecutor {
                                 );
                             }
                             Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
+                            Ok(JobResult::WaitForCallback) => {
+                                metrics.jobs_waiting_external.add(
+                                    1,
+                                    &[
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.kind",
+                                            job_kind.clone(),
+                                        ),
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.queue",
+                                            job_queue.clone(),
+                                        ),
+                                    ],
+                                );
+                            }
                             Err(JobError::Terminal(_)) => {
                                 metrics.record_job_failed(&job_kind, &job_queue, true);
                             }
@@ -316,6 +334,81 @@ async fn complete_job(
                     "Job already rescued/cancelled, cancel ignored"
                 );
                 return Ok(false);
+            }
+        }
+
+        Ok(JobResult::WaitForCallback) => {
+            info!(
+                job_id = job.id,
+                kind = %job.kind,
+                "Job waiting for external callback"
+            );
+            // Transition to waiting_external. Requires callback_id to be set
+            // (handler must have called register_callback).
+            let result = sqlx::query(
+                r#"
+                UPDATE awa.jobs
+                SET state = 'waiting_external',
+                    heartbeat_at = NULL,
+                    deadline_at = NULL
+                WHERE id = $1 AND state = 'running' AND callback_id IS NOT NULL
+                "#,
+            )
+            .bind(job.id)
+            .execute(pool)
+            .await?;
+            if result.rows_affected() == 0 {
+                // Check if a racing callback already completed/failed the job,
+                // or if the handler forgot to call register_callback.
+                let current: Option<(awa_model::JobState, Option<uuid::Uuid>)> =
+                    sqlx::query_as("SELECT state, callback_id FROM awa.jobs WHERE id = $1")
+                        .bind(job.id)
+                        .fetch_optional(pool)
+                        .await?;
+                match current {
+                    Some((state, _)) if state.is_terminal() => {
+                        // Racing callback already completed the job — all good
+                        info!(
+                            job_id = job.id,
+                            state = %state,
+                            "Job already completed by racing callback"
+                        );
+                        return Ok(true);
+                    }
+                    Some((_, None)) => {
+                        // Still running but no callback_id — programming error
+                        error!(
+                            job_id = job.id,
+                            "WaitForCallback returned without calling register_callback"
+                        );
+                        sqlx::query(
+                            r#"
+                            UPDATE awa.jobs
+                            SET state = 'failed',
+                                finalized_at = now(),
+                                errors = errors || $2::jsonb
+                            WHERE id = $1 AND state = 'running'
+                            "#,
+                        )
+                        .bind(job.id)
+                        .bind(serde_json::json!({
+                            "error": "WaitForCallback returned without calling register_callback",
+                            "attempt": job.attempt,
+                            "at": chrono::Utc::now().to_rfc3339(),
+                            "terminal": true
+                        }))
+                        .execute(pool)
+                        .await?;
+                        return Ok(true);
+                    }
+                    _ => {
+                        warn!(
+                            job_id = job.id,
+                            "Job already rescued/cancelled, wait-for-callback ignored"
+                        );
+                        return Ok(false);
+                    }
+                }
             }
         }
 

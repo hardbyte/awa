@@ -16,6 +16,7 @@ pyo3::create_exception!(_awa, SerializationError, AwaError);
 pyo3::create_exception!(_awa, ValidationError, AwaError);
 pyo3::create_exception!(_awa, TerminalError, AwaError);
 pyo3::create_exception!(_awa, DatabaseError, AwaError);
+pyo3::create_exception!(_awa, CallbackNotFound, AwaError);
 
 /// Derive a kind string from a CamelCase class name.
 #[pyfunction]
@@ -46,7 +47,7 @@ fn migrate<'py>(py: Python<'py>, database_url: String) -> PyResult<Bound<'py, Py
 fn migrations() -> Vec<(i32, String, String)> {
     awa_model::migrations::migration_sql()
         .into_iter()
-        .map(|(v, d, s)| (v, d.to_string(), s.to_string()))
+        .map(|(v, d, s)| (v, d.to_string(), s))
         .collect()
 }
 
@@ -61,8 +62,10 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyRetryAfter>()?;
     m.add_class::<client::PySnooze>()?;
     m.add_class::<client::PyCancel>()?;
+    m.add_class::<client::PyWaitForCallback>()?;
     m.add_class::<client::PyQueueHealth>()?;
     m.add_class::<client::PyHealthCheck>()?;
+    m.add_class::<job::PyCallbackToken>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;
@@ -81,6 +84,10 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
     m.add("TerminalError", m.py().get_type::<TerminalError>())?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
+    m.add(
+        "CallbackNotFound",
+        m.py().get_type::<CallbackNotFound>(),
+    )?;
 
     Ok(())
 }

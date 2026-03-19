@@ -98,7 +98,7 @@ impl TestClient {
         let cancel = Arc::new(AtomicBool::new(false));
         let state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>> =
             Arc::new(HashMap::new());
-        let ctx = JobContext::new(job.clone(), cancel, state);
+        let ctx = JobContext::new(job.clone(), cancel, state, self.pool.clone());
 
         let result = worker.perform(&job, &ctx).await;
 
@@ -140,6 +140,39 @@ impl TestClient {
                 .await?;
                 Ok(WorkResult::Snoozed(job))
             }
+            Ok(JobResult::WaitForCallback) => {
+                // Check if callback_id was registered
+                let has_callback: Option<(Option<uuid::Uuid>,)> =
+                    sqlx::query_as("SELECT callback_id FROM awa.jobs WHERE id = $1")
+                        .bind(job.id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                match has_callback {
+                    Some((Some(_),)) => {
+                        sqlx::query(
+                            "UPDATE awa.jobs SET state = 'waiting_external', heartbeat_at = NULL, deadline_at = NULL WHERE id = $1",
+                        )
+                        .bind(job.id)
+                        .execute(&self.pool)
+                        .await?;
+                        let updated = self.get_job(job.id).await?;
+                        Ok(WorkResult::WaitingExternal(updated))
+                    }
+                    _ => {
+                        sqlx::query(
+                            "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+                        )
+                        .bind(job.id)
+                        .execute(&self.pool)
+                        .await?;
+                        Ok(WorkResult::Failed(
+                            job,
+                            "WaitForCallback returned without calling register_callback"
+                                .to_string(),
+                        ))
+                    }
+                }
+            }
             Err(JobError::Terminal(msg)) => {
                 sqlx::query(
                     "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
@@ -173,6 +206,8 @@ pub enum WorkResult {
     Cancelled(JobRow, String),
     /// Job failed terminally.
     Failed(JobRow, String),
+    /// Job is waiting for an external callback.
+    WaitingExternal(JobRow),
 }
 
 impl WorkResult {
@@ -186,5 +221,9 @@ impl WorkResult {
 
     pub fn is_no_job(&self) -> bool {
         matches!(self, WorkResult::NoJob)
+    }
+
+    pub fn is_waiting_external(&self) -> bool {
+        matches!(self, WorkResult::WaitingExternal(_))
     }
 }

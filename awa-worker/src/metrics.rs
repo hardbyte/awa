@@ -32,6 +32,8 @@ pub struct AwaMetrics {
     pub heartbeat_batches: Counter<u64>,
     /// Total maintenance rescue operations.
     pub maintenance_rescues: Counter<u64>,
+    /// Total jobs parked for external callback.
+    pub jobs_waiting_external: Counter<u64>,
 }
 
 impl AwaMetrics {
@@ -78,6 +80,10 @@ impl AwaMetrics {
             maintenance_rescues: meter
                 .u64_counter("awa.maintenance.rescues")
                 .with_description("Total jobs rescued by maintenance (stale heartbeat + deadline)")
+                .build(),
+            jobs_waiting_external: meter
+                .u64_counter("awa.jobs.waiting_external")
+                .with_description("Total jobs parked for external callback")
                 .build(),
         }
     }

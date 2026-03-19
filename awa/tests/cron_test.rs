@@ -19,7 +19,7 @@ fn database_url() -> String {
 
 async fn pool() -> PgPool {
     PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(10)
         .connect(&database_url())
         .await
         .expect("Failed to connect to database")
@@ -65,7 +65,7 @@ struct DailyReport {
 async fn test_v2_migration_creates_cron_jobs_table() {
     let pool = setup().await;
     let version = migrations::current_version(&pool).await.unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, migrations::CURRENT_VERSION);
 
     // Verify cron_jobs table exists
     let has_cron_table: bool = sqlx::query_scalar(
@@ -89,7 +89,7 @@ async fn test_migration_idempotent() {
     migrations::run(&pool).await.unwrap();
 
     let version = migrations::current_version(&pool).await.unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
 #[tokio::test]
@@ -357,7 +357,10 @@ async fn test_end_to_end_periodic_job_enqueued() {
     // If another test binary's maintenance service holds the advisory lock,
     // leader election retries every 10s, so we need a generous timeout.
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(30);
+    // The cron fires "* * * * *" (every minute). If we start late in a minute,
+    // we may need to wait almost a full minute for the next fire plus leader
+    // election time (up to 10s). Use 90s to avoid flaky failures.
+    let timeout = std::time::Duration::from_secs(90);
     let jobs = loop {
         let found: Vec<awa::JobRow> =
             sqlx::query_as("SELECT * FROM awa.jobs WHERE queue = $1 AND kind = 'daily_report'")

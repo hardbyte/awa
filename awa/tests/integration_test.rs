@@ -104,7 +104,7 @@ impl Worker for FailingWorker {
 async fn test_migrations() {
     let client = setup().await;
     let version = migrations::current_version(client.pool()).await.unwrap();
-    assert_eq!(version, 2);
+    assert_eq!(version, migrations::CURRENT_VERSION);
 }
 
 #[tokio::test]

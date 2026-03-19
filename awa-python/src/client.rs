@@ -61,6 +61,20 @@ impl PyCancel {
     }
 }
 
+/// Signal that the job should be parked to wait for an external callback.
+/// The handler must have called `job.register_callback()` before returning this.
+#[pyclass(frozen, name = "WaitForCallback", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyWaitForCallback;
+
+#[pymethods]
+impl PyWaitForCallback {
+    #[new]
+    fn new() -> Self {
+        Self
+    }
+}
+
 #[pyclass(frozen, name = "QueueHealth", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyQueueHealth {
@@ -460,6 +474,7 @@ impl PyClient {
                     dict.set_item("available", stat.available)?;
                     dict.set_item("running", stat.running)?;
                     dict.set_item("failed", stat.failed)?;
+                    dict.set_item("waiting_external", stat.waiting_external)?;
                     dict.set_item("completed_last_hour", stat.completed_last_hour)?;
                     dict.set_item("lag_seconds", stat.lag_seconds)?;
                     list.append(dict)?;
@@ -601,6 +616,120 @@ impl PyClient {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
             Ok(())
+        })
+    }
+
+    // ── External callback completion (async + sync) ─────────────────
+
+    #[pyo3(signature = (callback_id, payload=None))]
+    fn complete_external<'py>(
+        &self,
+        py: Python<'py>,
+        callback_id: String,
+        payload: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let payload_json = payload
+            .as_ref()
+            .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
+            .transpose()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&callback_id)
+                .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+            let row = awa_model::admin::complete_external(&pool, uuid, payload_json)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyJob::from(row))
+        })
+    }
+
+    fn fail_external<'py>(
+        &self,
+        py: Python<'py>,
+        callback_id: String,
+        error: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&callback_id)
+                .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+            let row = awa_model::admin::fail_external(&pool, uuid, &error)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyJob::from(row))
+        })
+    }
+
+    fn retry_external<'py>(
+        &self,
+        py: Python<'py>,
+        callback_id: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&callback_id)
+                .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+            let row = awa_model::admin::retry_external(&pool, uuid)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyJob::from(row))
+        })
+    }
+
+    #[pyo3(signature = (callback_id, payload=None))]
+    fn complete_external_sync(
+        &self,
+        py: Python<'_>,
+        callback_id: String,
+        payload: Option<Py<PyAny>>,
+    ) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        let payload_json = payload
+            .as_ref()
+            .map(|value| py_to_json(py, value.bind(py)))
+            .transpose()?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let uuid = uuid::Uuid::parse_str(&callback_id)
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+                let row = awa_model::admin::complete_external(&pool, uuid, payload_json)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
+        })
+    }
+
+    fn fail_external_sync(
+        &self,
+        py: Python<'_>,
+        callback_id: String,
+        error: String,
+    ) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let uuid = uuid::Uuid::parse_str(&callback_id)
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+                let row = awa_model::admin::fail_external(&pool, uuid, &error)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
+        })
+    }
+
+    fn retry_external_sync(&self, py: Python<'_>, callback_id: String) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let uuid = uuid::Uuid::parse_str(&callback_id)
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+                let row = awa_model::admin::retry_external(&pool, uuid)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
         })
     }
 
@@ -891,6 +1020,7 @@ impl PyClient {
                         dict.set_item("available", stat.available)?;
                         dict.set_item("running", stat.running)?;
                         dict.set_item("failed", stat.failed)?;
+                        dict.set_item("waiting_external", stat.waiting_external)?;
                         dict.set_item("completed_last_hour", stat.completed_last_hour)?;
                         dict.set_item("lag_seconds", stat.lag_seconds)?;
                         list.append(dict)?;
@@ -1217,6 +1347,7 @@ fn parse_job_state(value: &str) -> PyResult<JobState> {
         "retryable" => Ok(JobState::Retryable),
         "failed" => Ok(JobState::Failed),
         "cancelled" => Ok(JobState::Cancelled),
+        "waiting_external" => Ok(JobState::WaitingExternal),
         other => Err(pyo3::exceptions::PyValueError::new_err(format!(
             "unknown job state: {other}"
         ))),

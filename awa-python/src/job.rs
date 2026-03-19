@@ -1,8 +1,24 @@
 use awa_model::{JobRow, JobState};
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
+use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+
+/// Python representation of a callback token.
+#[pyclass(frozen, name = "CallbackToken", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyCallbackToken {
+    #[pyo3(get)]
+    pub id: String,
+}
+
+#[pymethods]
+impl PyCallbackToken {
+    fn __repr__(&self) -> String {
+        format!("CallbackToken(id='{}')", self.id)
+    }
+}
 
 /// Python representation of a job state.
 #[pyclass(frozen, eq, eq_int, name = "JobState", skip_from_py_object)]
@@ -15,6 +31,7 @@ pub enum PyJobState {
     Retryable,
     Failed,
     Cancelled,
+    WaitingExternal,
 }
 
 impl From<JobState> for PyJobState {
@@ -27,6 +44,7 @@ impl From<JobState> for PyJobState {
             JobState::Retryable => PyJobState::Retryable,
             JobState::Failed => PyJobState::Failed,
             JobState::Cancelled => PyJobState::Cancelled,
+            JobState::WaitingExternal => PyJobState::WaitingExternal,
         }
     }
 }
@@ -57,6 +75,8 @@ pub struct PyJob {
     pub metadata_json: serde_json::Value,
     args_override: Option<Py<PyAny>>,
     cancelled: Option<Arc<AtomicBool>>,
+    /// Database pool for callback registration (only set during dispatch).
+    pool: Option<PgPool>,
     pub run_at: DateTime<Utc>,
     pub deadline_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -78,6 +98,7 @@ impl Clone for PyJob {
             metadata_json: self.metadata_json.clone(),
             args_override: self.args_override.as_ref().map(|value| value.clone_ref(py)),
             cancelled: self.cancelled.clone(),
+            pool: self.pool.clone(),
             run_at: self.run_at,
             deadline_at: self.deadline_at,
             created_at: self.created_at,
@@ -129,6 +150,37 @@ impl PyJob {
             .unwrap_or(false)
     }
 
+    /// Register a callback for this job, writing the callback_id to the database
+    /// immediately. Call this BEFORE sending the callback_id to the external system.
+    #[pyo3(signature = (timeout_seconds=3600.0))]
+    fn register_callback<'py>(
+        &self,
+        py: Python<'py>,
+        timeout_seconds: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use crate::errors::map_awa_error;
+        let pool = self.pool.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "register_callback is only available during job execution",
+            )
+        })?;
+        if !timeout_seconds.is_finite() || timeout_seconds < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "timeout_seconds must be a finite non-negative number",
+            ));
+        }
+        let job_id = self.id;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let timeout = std::time::Duration::from_secs_f64(timeout_seconds);
+            let callback_id = awa_model::admin::register_callback(&pool, job_id, timeout)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyCallbackToken {
+                id: callback_id.to_string(),
+            })
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Job(id={}, kind='{}', queue='{}', state={:?}, attempt={})",
@@ -152,6 +204,7 @@ impl From<JobRow> for PyJob {
             metadata_json: row.metadata,
             args_override: None,
             cancelled: None,
+            pool: None,
             run_at: row.run_at,
             deadline_at: row.deadline_at,
             created_at: row.created_at,
@@ -161,10 +214,16 @@ impl From<JobRow> for PyJob {
 }
 
 impl PyJob {
-    pub fn for_dispatch(row: JobRow, args_override: Py<PyAny>, cancelled: Arc<AtomicBool>) -> Self {
+    pub fn for_dispatch(
+        row: JobRow,
+        args_override: Py<PyAny>,
+        cancelled: Arc<AtomicBool>,
+        pool: PgPool,
+    ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
         job.cancelled = Some(cancelled);
+        job.pool = Some(pool);
         job
     }
 }

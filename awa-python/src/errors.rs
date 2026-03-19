@@ -1,6 +1,6 @@
 use crate::{
-    AwaError as PyAwaError, DatabaseError, SchemaNotMigrated, SerializationError, UniqueConflict,
-    UnknownJobKind, ValidationError,
+    AwaError as PyAwaError, CallbackNotFound, DatabaseError, SchemaNotMigrated,
+    SerializationError, UniqueConflict, UnknownJobKind, ValidationError,
 };
 use pyo3::PyErr;
 
@@ -22,6 +22,9 @@ pub fn map_awa_error(err: awa_model::AwaError) -> PyErr {
     match err {
         awa_model::AwaError::JobNotFound { id } => {
             PyAwaError::new_err(format!("job not found: {id}"))
+        }
+        awa_model::AwaError::CallbackNotFound { callback_id } => {
+            CallbackNotFound::new_err(format!("callback not found: {callback_id}"))
         }
         awa_model::AwaError::UniqueConflict { constraint } => {
             let detail = constraint

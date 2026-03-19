@@ -26,6 +26,7 @@ pub struct MaintenanceService {
     in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
+    callback_rescue_interval: Duration,
     promote_interval: Duration,
     cleanup_interval: Duration,
     cron_sync_interval: Duration,
@@ -52,6 +53,7 @@ impl MaintenanceService {
             in_flight,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
+            callback_rescue_interval: Duration::from_secs(30),
             promote_interval: Duration::from_secs(5),
             cleanup_interval: Duration::from_secs(60),
             cron_sync_interval: Duration::from_secs(60),
@@ -103,6 +105,7 @@ impl MaintenanceService {
             // Run maintenance tasks as leader
             let mut heartbeat_rescue_timer = tokio::time::interval(self.heartbeat_rescue_interval);
             let mut deadline_rescue_timer = tokio::time::interval(self.deadline_rescue_interval);
+            let mut callback_rescue_timer = tokio::time::interval(self.callback_rescue_interval);
             let mut promote_timer = tokio::time::interval(self.promote_interval);
             let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
             let mut cron_sync_timer = tokio::time::interval(self.cron_sync_interval);
@@ -112,6 +115,7 @@ impl MaintenanceService {
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
             deadline_rescue_timer.tick().await;
+            callback_rescue_timer.tick().await;
             promote_timer.tick().await;
             cleanup_timer.tick().await;
             cron_sync_timer.tick().await;
@@ -136,6 +140,9 @@ impl MaintenanceService {
                     }
                     _ = deadline_rescue_timer.tick() => {
                         self.rescue_expired_deadlines().await;
+                    }
+                    _ = callback_rescue_timer.tick() => {
+                        self.rescue_expired_callbacks().await;
                     }
                     _ = promote_timer.tick() => {
                         self.promote_scheduled().await;
@@ -280,6 +287,8 @@ impl MaintenanceService {
                 finalized_at = now(),
                 heartbeat_at = NULL,
                 deadline_at = NULL,
+                callback_id = NULL,
+                callback_timeout_at = NULL,
                 errors = errors || jsonb_build_object(
                     'error', 'heartbeat stale: worker presumed dead',
                     'attempt', attempt,
@@ -321,6 +330,8 @@ impl MaintenanceService {
                 finalized_at = now(),
                 heartbeat_at = NULL,
                 deadline_at = NULL,
+                callback_id = NULL,
+                callback_timeout_at = NULL,
                 errors = errors || jsonb_build_object(
                     'error', 'hard deadline exceeded',
                     'attempt', attempt,
@@ -347,6 +358,47 @@ impl MaintenanceService {
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
+            }
+            _ => {}
+        }
+    }
+
+    /// Rescue jobs whose callback timeout has expired.
+    #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
+    async fn rescue_expired_callbacks(&self) {
+        match sqlx::query_as::<_, JobRow>(
+            r#"
+            UPDATE awa.jobs
+            SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
+                finalized_at = now(),
+                callback_id = NULL,
+                callback_timeout_at = NULL,
+                run_at = CASE WHEN attempt >= max_attempts THEN run_at
+                         ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
+                errors = errors || jsonb_build_object(
+                    'error', 'callback timed out',
+                    'attempt', attempt,
+                    'at', now()
+                )::jsonb
+            WHERE id IN (
+                SELECT id FROM awa.jobs
+                WHERE state = 'waiting_external'
+                  AND callback_timeout_at IS NOT NULL
+                  AND callback_timeout_at < now()
+                LIMIT 500
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rescued) if !rescued.is_empty() => {
+                warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rescue callback-timed-out jobs");
             }
             _ => {}
         }
