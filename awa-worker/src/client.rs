@@ -71,6 +71,7 @@ pub struct ClientBuilder {
     heartbeat_interval: Duration,
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
+    leader_election_interval: Option<Duration>,
 }
 
 impl ClientBuilder {
@@ -83,6 +84,7 @@ impl ClientBuilder {
             heartbeat_interval: Duration::from_secs(30),
             periodic_jobs: Vec::new(),
             global_max_workers: None,
+            leader_election_interval: None,
         }
     }
 
@@ -128,6 +130,15 @@ impl ClientBuilder {
     /// Set the heartbeat interval (default: 30s).
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Set the leader election retry interval (default: 10s).
+    ///
+    /// Controls how often a non-leader instance retries acquiring the maintenance
+    /// advisory lock. Lower values are useful in tests.
+    pub fn leader_election_interval(mut self, interval: Duration) -> Self {
+        self.leader_election_interval = Some(interval);
         self
     }
 
@@ -220,6 +231,7 @@ impl ClientBuilder {
             leader: Arc::new(AtomicBool::new(false)),
             overflow_pool,
             metrics,
+            leader_election_interval: self.leader_election_interval,
         })
     }
 }
@@ -286,6 +298,7 @@ pub struct Client {
     /// Shared overflow pool for weighted mode (None in hard-reserved mode).
     overflow_pool: Option<Arc<OverflowPool>>,
     metrics: crate::metrics::AwaMetrics,
+    leader_election_interval: Option<Duration>,
 }
 
 impl Client {
@@ -327,13 +340,16 @@ impl Client {
         }));
 
         // Start maintenance service (uses service_cancel — stays alive during drain)
-        let maintenance = MaintenanceService::new(
+        let mut maintenance = MaintenanceService::new(
             self.pool.clone(),
             self.leader.clone(),
             self.service_cancel.clone(),
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
         );
+        if let Some(interval) = self.leader_election_interval {
+            maintenance = maintenance.leader_election_interval(interval);
+        }
         service_handles.push(tokio::spawn(async move {
             maintenance.run().await;
         }));
