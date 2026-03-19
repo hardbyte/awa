@@ -55,13 +55,13 @@ This is the key architectural insight that makes PyO3 viable for job processing:
 │  HeartbeatService runs on tokio, not on GIL.     │
 │  Even if Python blocks the GIL, heartbeats       │
 │  continue because they only do:                  │
-│    UPDATE awa.jobs SET heartbeat_at = now()       │
-│    WHERE id = ANY($1)                            │
+│    UPDATE awa.jobs ...                           │
+│    WHERE (id, run_lease) matches in-flight       │
 │  ...which is pure Rust + sqlx, no GIL needed.    │
 └─────────────────────────────────────────────────┘
 ```
 
-The `HeartbeatService` reads the in-flight job ID set (a Rust `HashSet<i64>` behind `RwLock`) and writes to Postgres via `sqlx`. Neither operation requires the GIL. Even if a Python handler does CPU-bound work that holds the GIL for seconds, heartbeats are unaffected.
+The `HeartbeatService` reads the in-flight attempt registry (a sharded Rust map keyed by `(job_id, run_lease)`) and writes to Postgres via `sqlx`. Neither operation requires the GIL. Even if a Python handler does CPU-bound work that holds the GIL for seconds, heartbeats are unaffected.
 
 The one scenario where heartbeats would fail is if the entire tokio runtime is blocked (e.g., a Rust-side bug that blocks the executor). The deadline recovery mechanism (ADR-003) covers this case.
 

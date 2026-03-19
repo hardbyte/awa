@@ -67,6 +67,7 @@ pub struct JobRow {
     pub state: JobState,
     pub priority: i16,
     pub attempt: i16,
+    pub run_lease: i64,
     pub max_attempts: i16,
     pub run_at: DateTime<Utc>,
     pub heartbeat_at: Option<DateTime<Utc>>,

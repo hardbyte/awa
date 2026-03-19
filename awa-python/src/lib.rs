@@ -27,17 +27,22 @@ fn derive_kind(name: &str) -> String {
 /// Run migrations against the given database URL.
 #[pyfunction]
 fn migrate<'py>(py: Python<'py>, database_url: String) -> PyResult<Bound<'py, PyAny>> {
+    let result = pyo3_async_runtimes::tokio::get_runtime()
+        .block_on(async {
+            let pool = sqlx::postgres::PgPoolOptions::new()
+                .max_connections(2)
+                .connect(&database_url)
+                .await
+                .map_err(errors::map_connect_error)?;
+
+            awa_model::migrations::run(&pool)
+                .await
+                .map_err(errors::map_awa_error)?;
+
+            Ok::<(), PyErr>(())
+        });
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let pool = sqlx::postgres::PgPoolOptions::new()
-            .max_connections(2)
-            .connect(&database_url)
-            .await
-            .map_err(errors::map_connect_error)?;
-
-        awa_model::migrations::run(&pool)
-            .await
-            .map_err(errors::map_awa_error)?;
-
+        result?;
         Ok(())
     })
 }

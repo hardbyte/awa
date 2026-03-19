@@ -50,20 +50,22 @@ Migration serialization also uses advisory locks (`pg_advisory_lock`) to prevent
 
 ### LISTEN/NOTIFY (PRD section 6.2)
 
-Dispatchers subscribe to `awa:<queue>` channels via `PgListener`. An `AFTER INSERT` trigger fires `pg_notify` for immediately-available jobs, reducing poll latency from the poll interval (200ms) to near-instant wakeup.
+Dispatchers subscribe to `awa:<queue>` channels via `PgListener`. An `AFTER INSERT` trigger on `awa.jobs_hot` fires `pg_notify` for immediately-available jobs, reducing poll latency from the poll interval (200ms) to near-instant wakeup. `awa.jobs` remains a compatibility view, but dispatch and promotion operate on the physical hot/deferred tables directly. Notifications use an empty payload so PostgreSQL can coalesce wakeups within a transaction.
 
 ### Partial Indexes
 
 The schema uses partial indexes extensively to keep the hot path fast:
 
-- `idx_awa_jobs_dequeue`: only `state = 'available'` rows
-- `idx_awa_jobs_heartbeat`: only `state = 'running'` rows
-- `idx_awa_jobs_deadline`: only `state = 'running' AND deadline_at IS NOT NULL`
-- `idx_awa_jobs_unique`: conditional unique index using `awa.job_state_in_bitmask()`
+- `idx_awa_jobs_hot_dequeue`: only hot `state = 'available'` rows
+- `idx_awa_scheduled_jobs_run_at_scheduled`: only deferred `state = 'scheduled'` rows
+- `idx_awa_scheduled_jobs_run_at_retryable`: only deferred `state = 'retryable'` rows
+- `idx_awa_jobs_hot_heartbeat`: only hot `state = 'running'` rows
+- `idx_awa_jobs_hot_deadline`: only hot `state = 'running' AND deadline_at IS NOT NULL`
+- `idx_awa_jobs_unique`: unique claims on `awa.job_unique_claims`
 
 ### Database-Side Functions
 
-Backoff calculation (`awa.backoff_duration`) and uniqueness bitmask checks (`awa.job_state_in_bitmask`) run as PL/pgSQL and SQL functions, keeping logic close to the data and enabling the partial unique index.
+Backoff calculation (`awa.backoff_duration`) and uniqueness bitmask checks (`awa.job_state_in_bitmask`) run as database functions, keeping logic close to the data. Cross-table uniqueness is maintained by trigger-managed claims in `awa.job_unique_claims`, which lets `awa.jobs_hot` and `awa.scheduled_jobs` share one uniqueness boundary without one giant jobs heap.
 
 ## Consequences
 

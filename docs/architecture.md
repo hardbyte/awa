@@ -92,10 +92,15 @@ awa_model::insert() / insert_with() / insert_many()
     ▼
 INSERT INTO awa.jobs (...) VALUES (...)
     │
-    ├── state = 'available' (if run_at is now or omitted)
-    ├── state = 'scheduled' (if run_at is in the future)
+    ├── `awa.jobs` is a compatibility view
+    ├── available/immediate rows route to `awa.jobs_hot`
+    ├── future `scheduled` / `retryable` rows route to `awa.scheduled_jobs`
     ├── unique_key computed via BLAKE3 (if UniqueOpts provided)
-    └── TRIGGER: pg_notify('awa:<queue>', job_id) fires on available+immediate jobs
+    └── TRIGGER: pg_notify('awa:<queue>', '') fires on hot available jobs
+
+`awa.jobs` preserves raw SQL compatibility for tests, admin queries, and
+non-Rust producers, but dispatch and promotion use the physical tables directly
+so the planner only touches the hot runnable set on the execution path.
 ```
 
 Insert accepts a `PgExecutor`, so it works inside an existing transaction -- the job becomes visible only when the outer transaction commits. This is the "transactional enqueue" pattern (PRD section 1).
@@ -109,8 +114,9 @@ insert_many_copy(conn, jobs)
     │
     ├── CREATE TEMP TABLE awa_copy_staging (...) ON COMMIT DROP
     ├── COPY awa_copy_staging FROM STDIN (CSV)       ◄── no triggers, no constraints
-    ├── INSERT INTO awa.jobs SELECT ... FROM staging  ◄── ON CONFLICT DO NOTHING for unique
-    └── RETURNING *
+    ├── INSERT INTO awa.jobs SELECT ... FROM staging
+    └── unique rows use per-row savepoints to skip duplicates without aborting the batch
+        RETURNING *
 ```
 
 Accepts `&mut PgConnection`, so it works within caller-managed transactions. `insert_many_copy_from_pool` is a convenience wrapper that manages its own transaction.
@@ -133,14 +139,22 @@ Dispatcher::run()
             │
             ▼
             CTE claim query:
-              WITH claimed AS (
-                SELECT id FROM awa.jobs
-                WHERE state='available' AND queue=$1 AND run_at<=now()
-                ORDER BY GREATEST(1, priority - FLOOR(...)) ASC, run_at, id
+              WITH candidates AS (
+                (SELECT id, priority, run_at FROM awa.jobs_hot
+                 WHERE state='available' AND queue=$1 AND priority=1 AND run_at<=now()
+                 ORDER BY run_at, id LIMIT ... )
+                UNION ALL ...
+              ),
+              claimed AS (
+                SELECT jobs.id
+                FROM awa.jobs_hot AS jobs
+                JOIN candidates ON candidates.id = jobs.id
+                ORDER BY GREATEST(1, candidates.priority - FLOOR(...)) ASC,
+                         candidates.run_at, candidates.id
                 LIMIT $2
-                FOR UPDATE SKIP LOCKED       ◄── concurrent-safe dispatch
+                FOR UPDATE OF jobs SKIP LOCKED   ◄── concurrent-safe dispatch
               )
-              UPDATE awa.jobs SET state='running', attempt=attempt+1, ...
+              UPDATE awa.jobs_hot SET state='running', attempt=attempt+1, run_lease=run_lease+1, ...
             │
             ├── Release excess permits (if DB returned fewer jobs)
             ├── Consume rate limit tokens
@@ -150,6 +164,11 @@ Dispatcher::run()
 
 Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job (PRD section 6.2).
 
+The dispatcher intentionally applies priority aging only over a bounded
+candidate window rather than over the full available backlog. That keeps the
+claim query planner-friendly under large hot backlogs while preserving the
+fairness effect of aging.
+
 ### Execute (Executor)
 
 ```
@@ -157,13 +176,13 @@ JobExecutor::execute(job)
     │
     ▼
 tokio::spawn(async {
-    in_flight.insert(job_id)           ◄── register for heartbeat
+    in_flight.insert((job_id, run_lease))  ◄── register exact attempt for heartbeat/cancel
     │
     ▼
     worker.perform(&job, &ctx)         ◄── dispatch to registered handler
     │
     ▼
-    complete_job(pool, job, &result)    ◄── UPDATE state + 'AND state = running' guard
+    complete_job(pool, job, &result)    ◄── lease-guarded finalize, batched for Completed
     │
     ├── Ok(true):  state transitioned → record metrics
     ├── Ok(false): already rescued/cancelled → skip metrics
@@ -185,16 +204,41 @@ Backoff uses a database-side function `awa.backoff_duration(attempt, max_attempt
 
 ### State Guard on Completion
 
-All `UPDATE` statements in `complete_job()` include `AND state = 'running'` to prevent late completions from overwriting rescued/cancelled state. If `rows_affected() == 0`, the job was already rescued by maintenance or cancelled by an admin — the handler's result is silently discarded. Metrics are only recorded when the state transition succeeds.
+Every running attempt carries a durable `run_lease` token that is incremented at claim time. Heartbeats, callback registration, and finalization all match on `id`, `state = 'running'`, and `run_lease`, so a stale worker cannot mutate a newer running attempt of the same job ID. If `rows_affected() == 0`, the job was already rescued, reclaimed, or cancelled — the stale result is silently discarded. Metrics are only recorded when the guarded transition succeeds.
+
+Successful `Completed` outcomes are flushed through a small batched finalizer. The worker does not release local in-flight tracking or capacity until the batch flush acknowledges success or stale rejection, so shutdown drain and heartbeat semantics still match the correctness model. Locally, in-flight attempts are tracked in a sharded registry keyed by `(job_id, run_lease)` rather than a single global lock, which preserves the lease model while reducing executor/heartbeat contention.
 
 ### Complete and Retry
 
-When a retryable job's backoff elapses, the maintenance service promotes it back to `available`:
+When a retryable or scheduled job becomes due, the maintenance service moves it
+from the cold deferred table back into the hot runnable table. This uses
+partial due-time indexes on `awa.scheduled_jobs` and promotes small ordered
+batches (`run_at ASC, id ASC`) so large scheduled frontiers do not require
+scanning the execution table:
 
 ```
-UPDATE awa.jobs SET state = 'available'
-WHERE state = 'retryable' AND run_at <= now()
+WITH due AS (
+    DELETE FROM awa.scheduled_jobs
+    WHERE id IN (
+        SELECT id
+        FROM awa.scheduled_jobs
+        WHERE state = 'retryable' AND run_at <= now()
+        ORDER BY run_at ASC, id ASC
+        LIMIT ...
+        FOR UPDATE SKIP LOCKED
+    )
+    RETURNING *
+)
+INSERT INTO awa.jobs_hot (...)
+SELECT ..., 'available', ...
+FROM due
 ```
+
+Uniqueness now uses a tiny claims table (`awa.job_unique_claims`) rather than a
+partial unique index on the full jobs storage. Rows only reserve a claim when
+their current state is inside their `unique_states` bitmask, so the hot and
+deferred tables can share one uniqueness boundary without keeping all jobs in a
+single heap.
 
 ## Queue Concurrency Modes
 
@@ -288,7 +332,7 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 ### 1. Heartbeat Staleness (Crash Detection)
 
 - The `HeartbeatService` runs on every worker instance (not leader-elected).
-- Every 30 seconds (configurable), it batch-updates `heartbeat_at = now()` for all in-flight job IDs on this worker.
+- Every 30 seconds (configurable), it batch-updates `heartbeat_at = now()` for all in-flight `(job_id, run_lease)` pairs on this worker.
 - The maintenance leader (leader-elected via `pg_try_advisory_lock`) periodically scans for running jobs where `heartbeat_at < now() - 90s` and transitions them to `retryable`.
 - After rescue, the maintenance service signals cancellation (`ctx.is_cancelled() == true`) for any rescued jobs still running on this worker instance.
 - **Catches:** Worker process crash, OOM kill, network partition, pod eviction.
@@ -303,6 +347,10 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 ### Leader Election
 
 Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup, cron evaluation) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds. The leader verifies its connection is still alive every 30 seconds; if the ping fails, it re-enters the election loop.
+
+Scheduled and retryable promotion runs every 250ms by default, in bounded
+batches, and emits queue notifications after promotion. Cron evaluation remains
+on a 1-second tick.
 
 ## Python Integration via PyO3
 

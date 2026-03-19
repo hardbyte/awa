@@ -25,12 +25,15 @@ Awa uses both heartbeat and deadline crash recovery, running as independent main
 ### Heartbeat Recovery
 
 - The `HeartbeatService` runs on every worker instance (not leader-elected).
-- Every 30 seconds (configurable via `ClientBuilder::heartbeat_interval`), it batch-updates `heartbeat_at = now()` for all in-flight job IDs:
+- Every 30 seconds (configurable via `ClientBuilder::heartbeat_interval`), it batch-updates `heartbeat_at = now()` for all in-flight `(job_id, run_lease)` pairs:
   ```sql
-  UPDATE awa.jobs SET heartbeat_at = now()
-  WHERE id = ANY($1) AND state = 'running'
+  UPDATE awa.jobs_hot AS jobs SET heartbeat_at = now()
+  FROM unnest($1::bigint[], $2::bigint[]) AS inflight(id, run_lease)
+  WHERE jobs.id = inflight.id
+    AND jobs.run_lease = inflight.run_lease
+    AND jobs.state = 'running'
   ```
-- Batches are chunked at 500 IDs to avoid oversized queries.
+- Batches are chunked at 500 in-flight attempts to avoid oversized queries.
 - The maintenance leader scans every 30 seconds for running jobs with `heartbeat_at < now() - 90s` and transitions them to `retryable`.
 - **Catches:** Process crash, OOM kill, network partition, pod eviction -- any failure where the worker process stops entirely.
 

@@ -284,6 +284,7 @@ where
 pub async fn register_callback<'e, E>(
     executor: E,
     job_id: i64,
+    run_lease: i64,
     timeout: std::time::Duration,
 ) -> Result<Uuid, AwaError>
 where
@@ -299,11 +300,12 @@ where
                callback_on_complete = NULL,
                callback_on_fail = NULL,
                callback_transform = NULL
-           WHERE id = $1 AND state = 'running'"#,
+           WHERE id = $1 AND state = 'running' AND run_lease = $4"#,
     )
     .bind(job_id)
     .bind(callback_id)
     .bind(timeout_secs)
+    .bind(run_lease)
     .execute(executor)
     .await?;
     if result.rows_affected() == 0 {
@@ -514,6 +516,7 @@ impl ResolveOutcome {
 pub async fn register_callback_with_config<'e, E>(
     executor: E,
     job_id: i64,
+    run_lease: i64,
     timeout: std::time::Duration,
     config: &CallbackConfig,
 ) -> Result<Uuid, AwaError>
@@ -574,7 +577,7 @@ where
                callback_on_complete = $5,
                callback_on_fail = $6,
                callback_transform = $7
-           WHERE id = $1 AND state = 'running'"#,
+           WHERE id = $1 AND state = 'running' AND run_lease = $8"#,
     )
     .bind(job_id)
     .bind(callback_id)
@@ -583,6 +586,7 @@ where
     .bind(&config.on_complete)
     .bind(&config.on_fail)
     .bind(&config.transform)
+    .bind(run_lease)
     .execute(executor)
     .await?;
 

@@ -2,7 +2,7 @@
 //! deadline cancellation signal (Fix 3), UniqueConflict field (Fix 4).
 
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig};
-use awa_model::{insert_with, migrations, InsertOpts};
+use awa_model::{admin, insert_with, migrations, InsertOpts};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -106,6 +106,107 @@ async fn test_late_completion_after_rescue_is_noop() {
     assert_eq!(state, "retryable");
 }
 
+/// B1b: Late completion cannot finalize a newer running attempt of the same job.
+#[tokio::test]
+async fn test_late_completion_cannot_finalize_reclaimed_running_attempt() {
+    let pool = setup().await;
+    let queue = "guard_reclaimed_running";
+    clean_queue(&pool, queue).await;
+
+    let job = insert_with(
+        &pool,
+        &GuardJob {
+            value: "test".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE awa.jobs
+         SET state = 'running',
+             attempt = 1,
+             run_lease = 1,
+             heartbeat_at = now(),
+             deadline_at = now() + interval '5 minutes'
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE awa.jobs
+         SET state = 'retryable',
+             finalized_at = now(),
+             heartbeat_at = NULL,
+             deadline_at = NULL
+         WHERE id = $1 AND run_lease = 1",
+    )
+    .bind(job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE awa.jobs
+         SET state = 'available',
+             finalized_at = NULL,
+             run_at = now()
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE awa.jobs
+         SET state = 'running',
+             attempt = 2,
+             run_lease = 2,
+             heartbeat_at = now(),
+             deadline_at = now() + interval '5 minutes'
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let result = sqlx::query(
+        "UPDATE awa.jobs
+         SET state = 'completed', finalized_at = now()
+         WHERE id = $1 AND state = 'running' AND run_lease = $2",
+    )
+    .bind(job.id)
+    .bind(1_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        result.rows_affected(),
+        0,
+        "Late completion from the old lease must not finalize the new running attempt"
+    );
+
+    let row: (String, i16, i64) =
+        sqlx::query_as("SELECT state::text, attempt, run_lease FROM awa.jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(row.0, "running");
+    assert_eq!(row.1, 2);
+    assert_eq!(row.2, 2);
+}
+
 /// B2: Late completion after admin cancel — DB state stays `cancelled`.
 #[tokio::test]
 async fn test_late_completion_after_cancel_is_noop() {
@@ -159,6 +260,56 @@ async fn test_late_completion_after_cancel_is_noop() {
         .await
         .unwrap();
     assert_eq!(state, "cancelled");
+}
+
+/// B2b: Callback registration is rejected for stale running attempts.
+#[tokio::test]
+async fn test_register_callback_rejects_stale_lease() {
+    let pool = setup().await;
+    let queue = "guard_callback_lease";
+    clean_queue(&pool, queue).await;
+
+    let job = insert_with(
+        &pool,
+        &GuardJob {
+            value: "test".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE awa.jobs
+         SET state = 'running',
+             attempt = 2,
+             run_lease = 2,
+             heartbeat_at = now(),
+             deadline_at = now() + interval '5 minutes'
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = admin::register_callback(&pool, job.id, 1, Duration::from_secs(3600))
+        .await
+        .unwrap_err();
+    match err {
+        awa_model::AwaError::Validation(msg) => {
+            assert!(msg.contains("job is not in running state"));
+        }
+        other => panic!("Expected Validation error, got: {other:?}"),
+    }
+
+    let callback_id = admin::register_callback(&pool, job.id, 2, Duration::from_secs(3600))
+        .await
+        .unwrap();
+    assert_ne!(callback_id, uuid::Uuid::nil());
 }
 
 /// B3: Shutdown waits for in-flight jobs — shutdown does not return until

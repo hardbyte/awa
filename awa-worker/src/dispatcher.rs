@@ -1,14 +1,18 @@
 use crate::executor::JobExecutor;
+use crate::runtime::InFlightMap;
 use awa_model::JobRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+const CLAIM_BATCH_LIMIT: usize = 128;
+const CLAIM_CANDIDATES_PER_PRIORITY_MULTIPLIER: usize = 4;
 
 /// Rate limit configuration for a queue.
 #[derive(Debug, Clone)]
@@ -221,7 +225,8 @@ pub struct Dispatcher {
     config: QueueConfig,
     pool: PgPool,
     executor: Arc<JobExecutor>,
-    _in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    metrics: crate::metrics::AwaMetrics,
+    _in_flight: InFlightMap,
     concurrency: ConcurrencyMode,
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
@@ -231,12 +236,13 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(
+    pub(crate) fn new(
         queue: String,
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
-        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        metrics: crate::metrics::AwaMetrics,
+        in_flight: InFlightMap,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
@@ -250,6 +256,7 @@ impl Dispatcher {
             config,
             pool,
             executor,
+            metrics,
             _in_flight: in_flight,
             concurrency,
             alive,
@@ -266,7 +273,8 @@ impl Dispatcher {
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
-        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        metrics: crate::metrics::AwaMetrics,
+        in_flight: InFlightMap,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
@@ -278,6 +286,7 @@ impl Dispatcher {
             config,
             pool,
             executor,
+            metrics,
             _in_flight: in_flight,
             concurrency,
             alive,
@@ -330,7 +339,7 @@ impl Dispatcher {
                     match notification {
                         Ok(_) => {
                             debug!(queue = %self.queue, "Woken by NOTIFY");
-                            self.poll_once().await;
+                            self.drain_ready().await;
                         }
                         Err(err) => {
                             warn!(error = %err, "PG listener error, will retry");
@@ -339,7 +348,7 @@ impl Dispatcher {
                     }
                 }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.poll_once().await;
+                    self.drain_ready().await;
                 }
             }
         }
@@ -356,7 +365,7 @@ impl Dispatcher {
                     break;
                 }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.poll_once().await;
+                    self.drain_ready().await;
                 }
             }
         }
@@ -367,7 +376,7 @@ impl Dispatcher {
         let mut permits = Vec::new();
         match &self.concurrency {
             ConcurrencyMode::HardReserved { semaphore } => {
-                for _ in 0..10 {
+                for _ in 0..CLAIM_BATCH_LIMIT {
                     match semaphore.clone().try_acquire_owned() {
                         Ok(p) => permits.push(DispatchPermit::Hard(p)),
                         Err(_) => break,
@@ -380,14 +389,14 @@ impl Dispatcher {
                 queue_name,
             } => {
                 // First: local (guaranteed) permits
-                for _ in 0..10 {
+                for _ in 0..CLAIM_BATCH_LIMIT {
                     match local_semaphore.clone().try_acquire_owned() {
                         Ok(p) => permits.push(DispatchPermit::Local(p)),
                         Err(_) => break,
                     }
                 }
-                // Then: overflow permits (up to 10 total)
-                let overflow_wanted = (10usize.saturating_sub(permits.len())) as u32;
+                // Then: overflow permits up to the claim batch limit.
+                let overflow_wanted = (CLAIM_BATCH_LIMIT.saturating_sub(permits.len())) as u32;
                 let granted = overflow_pool.try_acquire(queue_name, overflow_wanted);
                 for _ in 0..granted {
                     permits.push(DispatchPermit::Overflow {
@@ -400,13 +409,23 @@ impl Dispatcher {
         permits
     }
 
+    /// Drain immediately available work after a wake-up until the queue is empty,
+    /// capacity is exhausted, rate limiting stops us, or shutdown is requested.
+    async fn drain_ready(&mut self) {
+        while !self.cancel.is_cancelled() {
+            if !self.poll_once().await {
+                break;
+            }
+        }
+    }
+
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
     #[tracing::instrument(skip(self), fields(queue = %self.queue))]
-    async fn poll_once(&mut self) {
+    async fn poll_once(&mut self) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
-            return;
+            return false;
         }
 
         // Phase 2: Apply rate limit
@@ -415,10 +434,12 @@ impl Dispatcher {
             .as_mut()
             .map(|rl| rl.available() as usize)
             .unwrap_or(usize::MAX);
-        let batch_size = permits.len().min(rate_available).min(10);
+        let batch_size = permits.len().min(rate_available).min(CLAIM_BATCH_LIMIT);
+        let candidate_limit_per_priority =
+            (batch_size * CLAIM_CANDIDATES_PER_PRIORITY_MULTIPLIER).max(batch_size);
         if batch_size == 0 {
             // Drop all permits — rate limited
-            return;
+            return false;
         }
         // Release excess permits beyond what rate limit allows
         while permits.len() > batch_size {
@@ -428,50 +449,120 @@ impl Dispatcher {
         // Phase 3: Claim from DB
         let deadline_secs = self.config.deadline_duration.as_secs_f64();
         let aging_secs = self.config.priority_aging_interval.as_secs_f64();
+        let claim_start = Instant::now();
 
         let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
             r#"
-            WITH claimed AS (
-                SELECT id
-                FROM awa.jobs
-                WHERE state = 'available'
-                  AND queue = $1
-                  AND run_at <= now()
-                  AND NOT EXISTS (
-                      SELECT 1 FROM awa.queue_meta
-                      WHERE queue = $1 AND paused = TRUE
-                  )
+            WITH candidates AS (
+                (
+                    SELECT id, priority, run_at
+                    FROM awa.jobs_hot
+                    WHERE state = 'available'
+                      AND queue = $1
+                      AND priority = 1
+                      AND run_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM awa.queue_meta
+                          WHERE queue = $1 AND paused = TRUE
+                      )
+                    ORDER BY run_at ASC, id ASC
+                    LIMIT $5
+                )
+
+                UNION ALL
+
+                (
+                    SELECT id, priority, run_at
+                    FROM awa.jobs_hot
+                    WHERE state = 'available'
+                      AND queue = $1
+                      AND priority = 2
+                      AND run_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM awa.queue_meta
+                          WHERE queue = $1 AND paused = TRUE
+                      )
+                    ORDER BY run_at ASC, id ASC
+                    LIMIT $5
+                )
+
+                UNION ALL
+
+                (
+                    SELECT id, priority, run_at
+                    FROM awa.jobs_hot
+                    WHERE state = 'available'
+                      AND queue = $1
+                      AND priority = 3
+                      AND run_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM awa.queue_meta
+                          WHERE queue = $1 AND paused = TRUE
+                      )
+                    ORDER BY run_at ASC, id ASC
+                    LIMIT $5
+                )
+
+                UNION ALL
+
+                (
+                    SELECT id, priority, run_at
+                    FROM awa.jobs_hot
+                    WHERE state = 'available'
+                      AND queue = $1
+                      AND priority = 4
+                      AND run_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM awa.queue_meta
+                          WHERE queue = $1 AND paused = TRUE
+                      )
+                    ORDER BY run_at ASC, id ASC
+                    LIMIT $5
+                )
+            ),
+            claimed AS (
+                SELECT jobs.id
+                FROM awa.jobs_hot AS jobs
+                JOIN candidates ON candidates.id = jobs.id
                 ORDER BY
-                  GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $4)::int) ASC,
-                  run_at ASC,
-                  id ASC
+                  GREATEST(1, candidates.priority - FLOOR(EXTRACT(EPOCH FROM (now() - candidates.run_at)) / $4)::int) ASC,
+                  candidates.run_at ASC,
+                  candidates.id ASC
                 LIMIT $2
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF jobs SKIP LOCKED
             )
-            UPDATE awa.jobs
+            UPDATE awa.jobs_hot
             SET state = 'running',
                 attempt = attempt + 1,
+                run_lease = run_lease + 1,
                 attempted_at = now(),
                 heartbeat_at = now(),
                 deadline_at = now() + make_interval(secs => $3)
             FROM claimed
-            WHERE awa.jobs.id = claimed.id
-            RETURNING awa.jobs.*
+            WHERE awa.jobs_hot.id = claimed.id
+            RETURNING awa.jobs_hot.*
             "#,
         )
         .bind(&self.queue)
         .bind(batch_size as i32)
         .bind(deadline_secs)
         .bind(aging_secs)
+        .bind(candidate_limit_per_priority as i32)
         .fetch_all(&self.pool)
         .await
         {
             Ok(jobs) => jobs,
             Err(err) => {
                 warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
-                return;
+                return false;
             }
         };
+        self.metrics
+            .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
+        if !jobs.is_empty() {
+            self.metrics
+                .record_job_claimed(&self.queue, jobs.len() as u64);
+        }
 
         // Phase 4: Release excess permits if DB had fewer jobs
         while permits.len() > jobs.len() {
@@ -488,7 +579,7 @@ impl Dispatcher {
             {
                 overflow_pool.try_acquire(queue_name, 0);
             }
-            return;
+            return false;
         }
 
         debug!(queue = %self.queue, count = jobs.len(), "Claimed jobs");
@@ -499,17 +590,16 @@ impl Dispatcher {
         }
 
         // Phase 7: Dispatch (each job takes one pre-acquired permit)
+        let mut set = self.job_set.lock().await;
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
-            let handle = self.executor.execute(job, cancel_flag);
-
-            // Spawn into JoinSet so shutdown can drain in-flight jobs
-            let job_set = self.job_set.clone();
-            let mut set = job_set.lock().await;
+            let task = self.executor.execute_task(job, cancel_flag);
             set.spawn(async move {
-                let _ = handle.await;
+                task.await;
                 drop(permit);
             });
         }
+
+        true
     }
 }

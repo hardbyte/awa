@@ -1,8 +1,7 @@
+use crate::runtime::{InFlightMap, RunLease};
 use sqlx::PgPool;
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -10,7 +9,7 @@ use tracing::{debug, warn};
 /// for all in-flight jobs.
 pub struct HeartbeatService {
     pool: PgPool,
-    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    in_flight: InFlightMap,
     interval: std::time::Duration,
     batch_size: usize,
     alive: Arc<AtomicBool>,
@@ -18,9 +17,9 @@ pub struct HeartbeatService {
 }
 
 impl HeartbeatService {
-    pub fn new(
+    pub(crate) fn new(
         pool: PgPool,
-        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        in_flight: InFlightMap,
         interval: std::time::Duration,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
@@ -63,28 +62,34 @@ impl HeartbeatService {
 
     #[tracing::instrument(skip(self))]
     async fn heartbeat_once(&self) {
-        let job_ids: Vec<i64> = {
-            let guard = self.in_flight.read().await;
-            guard.keys().copied().collect()
-        };
+        let jobs: Vec<(i64, RunLease)> = self.in_flight.keys();
 
-        if job_ids.is_empty() {
+        if jobs.is_empty() {
             return;
         }
 
         // Batch heartbeats in chunks of batch_size
-        for chunk in job_ids.chunks(self.batch_size) {
-            let chunk_vec: Vec<i64> = chunk.to_vec();
+        for chunk in jobs.chunks(self.batch_size) {
+            let job_ids: Vec<i64> = chunk.iter().map(|(job_id, _)| *job_id).collect();
+            let run_leases: Vec<i64> = chunk.iter().map(|(_, run_lease)| *run_lease).collect();
             match sqlx::query(
-                "UPDATE awa.jobs SET heartbeat_at = now() WHERE id = ANY($1) AND state = 'running'",
+                r#"
+                UPDATE awa.jobs_hot AS jobs
+                SET heartbeat_at = now()
+                FROM unnest($1::bigint[], $2::bigint[]) AS inflight(id, run_lease)
+                WHERE jobs.id = inflight.id
+                  AND jobs.run_lease = inflight.run_lease
+                  AND jobs.state = 'running'
+                "#,
             )
-            .bind(&chunk_vec)
+            .bind(&job_ids)
+            .bind(&run_leases)
             .execute(&self.pool)
             .await
             {
                 Ok(result) => {
                     debug!(
-                        count = chunk_vec.len(),
+                        count = job_ids.len(),
                         updated = result.rows_affected(),
                         "Heartbeat batch sent"
                     );

@@ -292,10 +292,15 @@ impl PyClient {
 
     fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
+        // Run synchronously via block_on then return an already-resolved future
+        // for backward compatibility with `await client.migrate()`.
+        // migrations::run is not Send-safe (holds PoolConnection across awaits),
+        // so we cannot use future_into_py.
+        let result = pyo3_async_runtimes::tokio::get_runtime()
+            .block_on(async { awa_model::migrations::run(&pool).await })
+            .map_err(map_awa_error);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            awa_model::migrations::run(&pool)
-                .await
-                .map_err(map_awa_error)?;
+            result?;
             Ok(())
         })
     }

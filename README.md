@@ -14,6 +14,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Priority aging** — low-priority jobs won't starve.
 - **LISTEN/NOTIFY wakeup** — sub-10ms pickup latency.
 - **OpenTelemetry metrics** — built-in counters, histograms, and gauges.
+- **Hot/cold job storage** — runnable work stays in a hot table while deferred work stays in a cold deferred table.
 
 ## Quick Start (Rust)
 
@@ -146,7 +147,9 @@ awa --database-url $DATABASE_URL job list --state failed
                          ▼
               ┌─────────────────────┐
               │  PostgreSQL         │
-              │  awa.jobs           │
+              │  awa.jobs_hot       │
+              │  awa.scheduled_jobs │
+              │  awa.jobs (view)    │
               └──────────┬──────────┘
                          │
         ┌────────────────┼────────────────┐
@@ -160,6 +163,11 @@ awa --database-url $DATABASE_URL job list --state failed
 ```
 
 All coordination happens through Postgres, and the Rust runtime owns polling, heartbeats, shutdown, and crash recovery for both Rust and Python handlers. Mixed Rust and Python workers coexist on the same queues — jobs inserted from any language are workable by any language.
+
+Physically, Awa keeps runnable and actively-executing rows in `awa.jobs_hot`
+and future-dated deferred rows in `awa.scheduled_jobs`. `awa.jobs` remains as a
+compatibility view for SQL consumers, while dispatch and promotion operate on
+the physical tables directly.
 
 ## Workspace
 
@@ -187,6 +195,9 @@ All coordination happens through Postgres, and the Rust runtime owns polling, he
 - [ADR-009: Python sync support](docs/adr/009-python-sync-support.md)
 - [ADR-010: Per-queue rate limiting](docs/adr/010-rate-limiting.md)
 - [ADR-011: Weighted concurrency](docs/adr/011-weighted-concurrency.md)
+- [ADR-012: Split hot and deferred job storage](docs/adr/012-hot-deferred-job-storage.md)
+- [ADR-013: Durable run leases and guarded finalization](docs/adr/013-run-lease-and-guarded-finalization.md)
+- [Benchmarking notes](docs/benchmarking.md)
 - [Validation test plan](docs/test-plan.md)
 - [TLA+ correctness models](corectness/README.md)
 

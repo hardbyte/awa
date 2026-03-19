@@ -1,7 +1,9 @@
+use crate::completion::CompletionBatcher;
 use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
 use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::MaintenanceService;
+use crate::runtime::{InFlightMap, InFlightRegistry};
 use awa_model::{JobArgs, JobRow, PeriodicJob};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -69,6 +71,7 @@ pub struct ClientBuilder {
     workers: HashMap<String, BoxedWorker>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
+    promote_interval: Duration,
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
@@ -82,6 +85,7 @@ impl ClientBuilder {
             workers: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
+            promote_interval: Duration::from_millis(250),
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
@@ -130,6 +134,12 @@ impl ClientBuilder {
     /// Set the heartbeat interval (default: 30s).
     pub fn heartbeat_interval(mut self, interval: Duration) -> Self {
         self.heartbeat_interval = interval;
+        self
+    }
+
+    /// Set the scheduled/retryable promotion interval (default: 250ms).
+    pub fn promote_interval(mut self, interval: Duration) -> Self {
+        self.promote_interval = interval;
         self
     }
 
@@ -218,13 +228,14 @@ impl ClientBuilder {
             workers: Arc::new(self.workers),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
+            promote_interval: self.promote_interval,
             periodic_jobs: Arc::new(self.periodic_jobs),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
             dispatcher_handles: RwLock::new(Vec::new()),
             service_handles: RwLock::new(Vec::new()),
             job_set: Arc::new(Mutex::new(JoinSet::new())),
-            in_flight: Arc::new(RwLock::new(HashMap::new())),
+            in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
             dispatcher_alive,
             heartbeat_alive: Arc::new(AtomicBool::new(false)),
@@ -279,6 +290,7 @@ pub struct Client {
     workers: Arc<HashMap<String, BoxedWorker>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
+    promote_interval: Duration,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
@@ -290,7 +302,7 @@ pub struct Client {
     service_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
     /// JoinSet tracking in-flight job tasks for graceful drain.
     job_set: Arc<Mutex<JoinSet<()>>>,
-    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
@@ -315,6 +327,14 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
+        // Completion batcher stays alive during drain so tasks can release
+        // only after their completion has been acknowledged.
+        let (completion_batcher, completion_handle) = CompletionBatcher::new(
+            self.pool.clone(),
+            self.service_cancel.clone(),
+            self.metrics.clone(),
+        );
+
         // Create executor with metrics
         let executor = Arc::new(JobExecutor::new(
             self.pool.clone(),
@@ -323,9 +343,12 @@ impl Client {
             self.queue_in_flight.clone(),
             self.state.clone(),
             self.metrics.clone(),
+            completion_handle,
         ));
 
         let mut service_handles = self.service_handles.write().await;
+
+        service_handles.extend(completion_batcher.spawn());
 
         // Start heartbeat service (uses service_cancel — stays alive during drain)
         let heartbeat = HeartbeatService::new(
@@ -342,11 +365,13 @@ impl Client {
         // Start maintenance service (uses service_cancel — stays alive during drain)
         let mut maintenance = MaintenanceService::new(
             self.pool.clone(),
+            self.metrics.clone(),
             self.leader.clone(),
             self.service_cancel.clone(),
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
-        );
+        )
+        .promote_interval(self.promote_interval);
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
         }
@@ -377,6 +402,7 @@ impl Client {
                     config.clone(),
                     self.pool.clone(),
                     executor.clone(),
+                    self.metrics.clone(),
                     self.in_flight.clone(),
                     alive,
                     self.dispatch_cancel.clone(),
@@ -390,6 +416,7 @@ impl Client {
                     config.clone(),
                     self.pool.clone(),
                     executor.clone(),
+                    self.metrics.clone(),
                     self.in_flight.clone(),
                     alive,
                     self.dispatch_cancel.clone(),
@@ -420,11 +447,8 @@ impl Client {
         self.dispatch_cancel.cancel();
 
         // Phase 2: Signal in-flight cancellation flags
-        {
-            let guard = self.in_flight.read().await;
-            for flag in guard.values() {
-                flag.store(true, Ordering::SeqCst);
-            }
+        for flag in self.in_flight.flags() {
+            flag.store(true, Ordering::SeqCst);
         }
 
         // Phase 3: Wait for dispatchers to exit their poll loops
@@ -479,7 +503,7 @@ impl Client {
         let available_rows = sqlx::query_as::<_, (String, i64)>(
             r#"
             SELECT queue, count(*)::bigint AS available
-            FROM awa.jobs
+            FROM awa.jobs_hot
             WHERE state = 'available'
             GROUP BY queue
             "#,

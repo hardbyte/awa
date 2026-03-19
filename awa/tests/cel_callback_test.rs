@@ -539,6 +539,7 @@ async fn test_c11_invalid_cel_at_registration() {
     let err = admin::register_callback_with_config(
         client.pool(),
         job.id,
+        0,
         Duration::from_secs(3600),
         &config,
     )
@@ -793,6 +794,7 @@ async fn test_c18_cel_disabled_register_error() {
     let err = admin::register_callback_with_config(
         client.pool(),
         job.id,
+        0,
         Duration::from_secs(3600),
         &config,
     )

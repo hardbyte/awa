@@ -65,6 +65,7 @@ pub struct PyJob {
     pub priority: i16,
     #[pyo3(get)]
     pub attempt: i16,
+    pub run_lease: i64,
     #[pyo3(get)]
     pub max_attempts: i16,
     #[pyo3(get)]
@@ -92,6 +93,7 @@ impl Clone for PyJob {
             state: self.state,
             priority: self.priority,
             attempt: self.attempt,
+            run_lease: self.run_lease,
             max_attempts: self.max_attempts,
             tags: self.tags.clone(),
             args_json: self.args_json.clone(),
@@ -181,6 +183,7 @@ impl PyJob {
             ));
         }
         let job_id = self.id;
+        let run_lease = self.run_lease;
         let has_expressions =
             filter.is_some() || on_complete.is_some() || on_fail.is_some() || transform.is_some();
 
@@ -193,11 +196,17 @@ impl PyJob {
                     on_fail,
                     transform,
                 };
-                awa_model::admin::register_callback_with_config(&pool, job_id, timeout, &config)
-                    .await
-                    .map_err(map_awa_error)?
+                awa_model::admin::register_callback_with_config(
+                    &pool,
+                    job_id,
+                    run_lease,
+                    timeout,
+                    &config,
+                )
+                .await
+                .map_err(map_awa_error)?
             } else {
-                awa_model::admin::register_callback(&pool, job_id, timeout)
+                awa_model::admin::register_callback(&pool, job_id, run_lease, timeout)
                     .await
                     .map_err(map_awa_error)?
             };
@@ -224,6 +233,7 @@ impl From<JobRow> for PyJob {
             state: row.state.into(),
             priority: row.priority,
             attempt: row.attempt,
+            run_lease: row.run_lease,
             max_attempts: row.max_attempts,
             tags: row.tags,
             args_json: row.args,

@@ -24,8 +24,26 @@ pub struct AwaMetrics {
     pub jobs_cancelled: Counter<u64>,
     /// Total jobs claimed (dequeued) for execution.
     pub jobs_claimed: Counter<u64>,
+    /// Number of dispatcher claim queries executed.
+    pub claim_batches: Counter<u64>,
+    /// Claim batch size in jobs.
+    pub claim_batch_size: Histogram<u64>,
+    /// Claim query latency in seconds.
+    pub claim_duration_seconds: Histogram<f64>,
     /// Job execution duration in seconds.
     pub job_duration_seconds: Histogram<f64>,
+    /// Number of completion batch flushes executed.
+    pub completion_flushes: Counter<u64>,
+    /// Completion flush batch size in jobs.
+    pub completion_flush_batch_size: Histogram<u64>,
+    /// Completion flush latency in seconds.
+    pub completion_flush_duration_seconds: Histogram<f64>,
+    /// Number of scheduled/retryable promotion batches executed.
+    pub promotion_batches: Counter<u64>,
+    /// Promotion batch size in jobs.
+    pub promotion_batch_size: Histogram<u64>,
+    /// Promotion query latency in seconds.
+    pub promotion_duration_seconds: Histogram<f64>,
     /// Current in-flight jobs (gauge — can go up and down).
     pub jobs_in_flight: UpDownCounter<i64>,
     /// Total heartbeat batches sent.
@@ -64,9 +82,48 @@ impl AwaMetrics {
                 .u64_counter("awa.jobs.claimed")
                 .with_description("Total jobs claimed for execution")
                 .build(),
+            claim_batches: meter
+                .u64_counter("awa.dispatch.claim_batches")
+                .with_description("Total dispatcher claim queries executed")
+                .build(),
+            claim_batch_size: meter
+                .u64_histogram("awa.dispatch.claim_batch_size")
+                .with_description("Dispatcher claim batch size in jobs")
+                .build(),
+            claim_duration_seconds: meter
+                .f64_histogram("awa.dispatch.claim_duration")
+                .with_description("Dispatcher claim query duration in seconds")
+                .with_unit("s")
+                .build(),
             job_duration_seconds: meter
                 .f64_histogram("awa.jobs.duration")
                 .with_description("Job execution duration in seconds")
+                .with_unit("s")
+                .build(),
+            completion_flushes: meter
+                .u64_counter("awa.completion.flushes")
+                .with_description("Total completion batch flushes")
+                .build(),
+            completion_flush_batch_size: meter
+                .u64_histogram("awa.completion.flush_batch_size")
+                .with_description("Completion batch flush size in jobs")
+                .build(),
+            completion_flush_duration_seconds: meter
+                .f64_histogram("awa.completion.flush_duration")
+                .with_description("Completion batch flush duration in seconds")
+                .with_unit("s")
+                .build(),
+            promotion_batches: meter
+                .u64_counter("awa.maintenance.promote_batches")
+                .with_description("Total scheduled/retryable promotion batches")
+                .build(),
+            promotion_batch_size: meter
+                .u64_histogram("awa.maintenance.promote_batch_size")
+                .with_description("Promotion batch size in jobs")
+                .build(),
+            promotion_duration_seconds: meter
+                .f64_histogram("awa.maintenance.promote_duration")
+                .with_description("Promotion batch duration in seconds")
                 .with_unit("s")
                 .build(),
             jobs_in_flight: meter
@@ -131,6 +188,42 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.jobs_claimed.add(batch_size, &attrs);
+    }
+
+    /// Record a dispatcher claim query batch and its latency.
+    pub fn record_claim_batch(&self, queue: &str, batch_size: u64, duration: Duration) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.claim_batches.add(1, &attrs);
+        self.claim_batch_size.record(batch_size, &attrs);
+        self.claim_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record a completion batch flush.
+    pub fn record_completion_flush(&self, shard: usize, batch_size: u64, duration: Duration) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.completion.shard",
+            shard as i64,
+        )];
+        self.completion_flushes.add(1, &attrs);
+        self.completion_flush_batch_size.record(batch_size, &attrs);
+        self.completion_flush_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record a scheduled/retryable promotion batch.
+    pub fn record_promotion_batch(&self, state: &str, batch_size: u64, duration: Duration) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.state",
+            state.to_string(),
+        )];
+        self.promotion_batches.add(1, &attrs);
+        self.promotion_batch_size.record(batch_size, &attrs);
+        self.promotion_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
     }
 
     /// Record in-flight change.

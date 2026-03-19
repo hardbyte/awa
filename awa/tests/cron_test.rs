@@ -62,7 +62,7 @@ struct DailyReport {
 // -- Tests --
 
 #[tokio::test]
-async fn test_v2_migration_creates_cron_jobs_table() {
+async fn test_canonical_schema_creates_cron_jobs_table() {
     let pool = setup().await;
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
@@ -76,7 +76,7 @@ async fn test_v2_migration_creates_cron_jobs_table() {
     .unwrap();
     assert!(
         has_cron_table,
-        "awa.cron_jobs table must exist after v2 migration"
+        "awa.cron_jobs table must exist after canonical schema setup"
     );
 }
 

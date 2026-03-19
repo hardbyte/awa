@@ -282,51 +282,138 @@ pub async fn insert_many_copy(
     // 3. INSERT...SELECT from staging into real table
     let has_unique = rows.iter().any(|r| r.unique_key.is_some());
 
-    let insert_sql = if has_unique {
-        r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
-        SELECT
-            s.kind,
-            s.queue,
-            s.args,
-            s.state::awa.job_state,
-            s.priority,
-            s.max_attempts,
-            CASE WHEN s.run_at = '\N' OR s.run_at IS NULL THEN now() ELSE s.run_at::timestamptz END,
-            s.metadata,
-            s.tags::text[],
-            CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
-            CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
-        FROM awa_copy_staging s
-        ON CONFLICT (unique_key) WHERE unique_key IS NOT NULL
-            AND unique_states IS NOT NULL
-            AND awa.job_state_in_bitmask(unique_states, state)
-        DO NOTHING
-        RETURNING *
-        "#
-    } else {
-        r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
-        SELECT
-            s.kind,
-            s.queue,
-            s.args,
-            s.state::awa.job_state,
-            s.priority,
-            s.max_attempts,
-            CASE WHEN s.run_at = '\N' OR s.run_at IS NULL THEN now() ELSE s.run_at::timestamptz END,
-            s.metadata,
-            s.tags::text[],
-            CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
-            CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
-        FROM awa_copy_staging s
-        RETURNING *
-        "#
-    };
-
-    let results = sqlx::query_as::<_, JobRow>(insert_sql)
+    let results = if has_unique {
+        // The compatibility `awa.jobs` surface is now a view backed by hot and
+        // deferred tables, so the old `ON CONFLICT` path is no longer available
+        // here. Keep COPY for staging/parsing, then insert unique rows one at a
+        // time and skip duplicates explicitly.
+        let staged_rows = sqlx::query_as::<
+            _,
+            (
+                String,
+                String,
+                serde_json::Value,
+                String,
+                i16,
+                i16,
+                Option<chrono::DateTime<chrono::Utc>>,
+                serde_json::Value,
+                Vec<String>,
+                Option<Vec<u8>>,
+                Option<String>,
+            ),
+        >(
+            r#"
+            SELECT
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                max_attempts,
+                CASE WHEN run_at = '\N' OR run_at IS NULL THEN NULL ELSE run_at::timestamptz END,
+                metadata,
+                tags::text[],
+                CASE WHEN unique_key = '\N' OR unique_key IS NULL THEN NULL ELSE decode(unique_key, 'hex') END,
+                unique_states
+            FROM awa_copy_staging
+            "#,
+        )
         .fetch_all(&mut *conn)
         .await?;
+
+        let mut inserted = Vec::with_capacity(staged_rows.len());
+        for (
+            kind,
+            queue,
+            args,
+            state,
+            priority,
+            max_attempts,
+            run_at,
+            metadata,
+            tags,
+            unique_key,
+            unique_states,
+        ) in staged_rows
+        {
+            sqlx::query("SAVEPOINT awa_copy_unique_row")
+                .execute(&mut *conn)
+                .await?;
+
+            let result = sqlx::query_as::<_, JobRow>(
+                r#"
+                INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
+                VALUES ($1, $2, $3, $4::awa.job_state, $5, $6, COALESCE($7, now()), $8, $9, $10, $11::bit(8))
+                RETURNING *
+                "#,
+            )
+            .bind(&kind)
+            .bind(&queue)
+            .bind(&args)
+            .bind(&state)
+            .bind(priority)
+            .bind(max_attempts)
+            .bind(run_at)
+            .bind(&metadata)
+            .bind(&tags)
+            .bind(&unique_key)
+            .bind(&unique_states)
+            .fetch_one(&mut *conn)
+            .await;
+
+            match result {
+                Ok(row) => {
+                    inserted.push(row);
+                    sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
+                        .execute(&mut *conn)
+                        .await?;
+                }
+                Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("23505") => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT awa_copy_unique_row")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
+                        .execute(&mut *conn)
+                        .await?;
+                    continue;
+                }
+                Err(err) => {
+                    sqlx::query("ROLLBACK TO SAVEPOINT awa_copy_unique_row")
+                        .execute(&mut *conn)
+                        .await?;
+                    sqlx::query("RELEASE SAVEPOINT awa_copy_unique_row")
+                        .execute(&mut *conn)
+                        .await?;
+                    return Err(AwaError::Database(err));
+                }
+            }
+        }
+
+        inserted
+    } else {
+        let insert_sql = r#"
+            INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
+            SELECT
+                s.kind,
+                s.queue,
+                s.args,
+                s.state::awa.job_state,
+                s.priority,
+                s.max_attempts,
+                CASE WHEN s.run_at = '\N' OR s.run_at IS NULL THEN now() ELSE s.run_at::timestamptz END,
+                s.metadata,
+                s.tags::text[],
+                CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
+                CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
+            FROM awa_copy_staging s
+            RETURNING *
+        "#;
+
+        sqlx::query_as::<_, JobRow>(insert_sql)
+            .fetch_all(&mut *conn)
+            .await?
+    };
 
     Ok(results)
 }
