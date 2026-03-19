@@ -32,6 +32,7 @@ pub struct MaintenanceService {
     cron_sync_interval: Duration,
     cron_eval_interval: Duration,
     leader_check_interval: Duration,
+    leader_election_interval: Duration,
     heartbeat_staleness: Duration,
     completed_retention: Duration,
     failed_retention: Duration,
@@ -59,10 +60,20 @@ impl MaintenanceService {
             cron_sync_interval: Duration::from_secs(60),
             cron_eval_interval: Duration::from_secs(1),
             leader_check_interval: Duration::from_secs(30),
+            leader_election_interval: Duration::from_secs(10),
             heartbeat_staleness: Duration::from_secs(90),
             completed_retention: Duration::from_secs(86400), // 24h
             failed_retention: Duration::from_secs(259200),   // 72h
         }
+    }
+
+    /// Set the leader election retry interval (default: 10s).
+    ///
+    /// Controls how often a non-leader instance retries acquiring the
+    /// advisory lock. Lower values speed up leader election in tests.
+    pub fn leader_election_interval(mut self, interval: Duration) -> Self {
+        self.leader_election_interval = interval;
+        self
     }
 
     /// Run the maintenance loop. Attempts leader election first.
@@ -83,7 +94,7 @@ impl MaintenanceService {
                             self.leader.store(false, Ordering::SeqCst);
                             return;
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                        _ = tokio::time::sleep(self.leader_election_interval) => continue,
                     }
                 }
                 Err(err) => {
@@ -94,7 +105,7 @@ impl MaintenanceService {
                             self.leader.store(false, Ordering::SeqCst);
                             return;
                         }
-                        _ = tokio::time::sleep(Duration::from_secs(10)) => continue,
+                        _ = tokio::time::sleep(self.leader_election_interval) => continue,
                     }
                 }
             };

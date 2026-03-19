@@ -333,9 +333,12 @@ async fn test_end_to_end_periodic_job_enqueued() {
     let queue = "cron_e2e";
     clean_queue(&pool, queue).await;
 
-    // Build a client with a periodic job that fires every minute
+    // Build a client with a periodic job that fires every minute.
+    // Use a 1s leader election interval so the test doesn't wait 10s per
+    // retry when another test binary holds the advisory lock.
     let client = Client::builder(pool.clone())
         .queue(queue, QueueConfig::default())
+        .leader_election_interval(std::time::Duration::from_secs(1))
         .register::<DailyReport, _, _>(|_args: DailyReport, _ctx: &JobContext| async move {
             Ok(JobResult::Completed)
         })
@@ -353,13 +356,9 @@ async fn test_end_to_end_periodic_job_enqueued() {
     client.start().await.unwrap();
 
     // Poll until the cron evaluator fires, or timeout.
-    // The maintenance service needs to: win leader election, sync schedules, then evaluate.
-    // If another test binary's maintenance service holds the advisory lock,
-    // leader election retries every 10s, so we need a generous timeout.
+    // Timing budget: leader election (1s retries) + cron eval (1s tick) +
+    // wait for next minute boundary (up to ~60s) = ~62s worst case.
     let start = std::time::Instant::now();
-    // The cron fires "* * * * *" (every minute). If we start late in a minute,
-    // we may need to wait almost a full minute for the next fire plus leader
-    // election time (up to 10s). Use 90s to avoid flaky failures.
     let timeout = std::time::Duration::from_secs(90);
     let jobs = loop {
         let found: Vec<awa::JobRow> =
