@@ -18,6 +18,8 @@ FinalStates == {"retryable", "completed"}
 PermitKinds == {"none", "local", "overflow"}
 ShutdownPhases == {"running", "stop_claim", "draining", "stopped"}
 NoInstance == "no_instance"
+DeferredStates == {"retryable"}
+HotStates == JobStates \ DeferredStates
 
 VARIABLES
     jobState,
@@ -556,6 +558,13 @@ TaskLeaseBounded ==
 TerminalReleasesPermit ==
     \A j \in Jobs :
         jobState[j] \in FinalStates =>
+            /\ dbOwner[j] = NoInstance
+            /\ permitHolder[j] = NoInstance
+            /\ permitKind[j] = "none"
+
+DeferredRowsIdle ==
+    \A j \in Jobs :
+        jobState[j] \in DeferredStates =>
             /\ dbOwner[j] = NoInstance
             /\ permitHolder[j] = NoInstance
             /\ permitKind[j] = "none"

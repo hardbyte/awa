@@ -1,3 +1,4 @@
+pub use crate::runtime::ProgressState;
 use awa_model::{AwaError, CallbackConfig, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
@@ -17,7 +18,7 @@ pub struct CallbackToken {
 /// Context passed to worker handlers during job execution.
 ///
 /// Provides access to the job metadata, shared state (e.g., service dependencies),
-/// and callback registration for external webhook completion.
+/// callback registration, and structured progress reporting.
 pub struct JobContext {
     /// The raw job row from the database.
     pub job: JobRow,
@@ -25,8 +26,10 @@ pub struct JobContext {
     cancelled: Arc<AtomicBool>,
     /// Shared state map for dependency injection.
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
-    /// Database pool for callback registration.
+    /// Database pool for callback registration and progress flush.
     pool: PgPool,
+    /// Shared progress buffer — written by handler, read by heartbeat service.
+    progress: Arc<std::sync::Mutex<ProgressState>>,
 }
 
 impl JobContext {
@@ -35,12 +38,14 @@ impl JobContext {
         cancelled: Arc<AtomicBool>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         pool: PgPool,
+        progress: Arc<std::sync::Mutex<ProgressState>>,
     ) -> Self {
         Self {
             job,
             cancelled,
             state,
             pool,
+            progress,
         }
     }
 
@@ -111,5 +116,112 @@ impl JobContext {
         )
         .await?;
         Ok(CallbackToken { id: callback_id })
+    }
+
+    /// Set structured progress (0-100, optional message). Sync — writes to in-memory buffer.
+    ///
+    /// `percent` is clamped to 0-100.
+    pub fn set_progress(&self, percent: u8, message: Option<&str>) {
+        let percent = percent.min(100);
+        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let existing_metadata = guard
+            .latest
+            .as_ref()
+            .and_then(|v| v.get("metadata"))
+            .cloned();
+
+        let mut value = serde_json::json!({
+            "percent": percent,
+        });
+        if let Some(msg) = message {
+            value["message"] = serde_json::Value::String(msg.to_string());
+        }
+        if let Some(meta) = existing_metadata {
+            value["metadata"] = meta;
+        }
+        guard.latest = Some(value);
+        guard.generation += 1;
+    }
+
+    /// Shallow-merge keys into progress.metadata for checkpointing. Sync.
+    ///
+    /// `updates` must be a JSON object. Top-level keys overwrite; nested objects
+    /// are replaced, not deep-merged.
+    pub fn update_metadata(&self, updates: serde_json::Value) -> Result<(), AwaError> {
+        let obj = updates
+            .as_object()
+            .ok_or_else(|| AwaError::Validation("update_metadata requires a JSON object".into()))?;
+
+        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        let progress = guard.latest.get_or_insert_with(|| serde_json::json!({}));
+
+        let metadata = progress
+            .as_object_mut()
+            .expect("progress is always an object")
+            .entry("metadata")
+            .or_insert_with(|| serde_json::json!({}));
+
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            for (k, v) in obj {
+                meta_obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        guard.generation += 1;
+        Ok(())
+    }
+
+    /// Force immediate flush of pending progress to DB. For critical checkpoints.
+    ///
+    /// Does not return success until the progress has been durably written
+    /// or the job is no longer in running state (rescued/cancelled).
+    pub async fn flush_progress(&self) -> Result<(), AwaError> {
+        let (snapshot, target_generation) = {
+            let guard = self.progress.lock().expect("progress lock poisoned");
+            if guard.acked_generation >= guard.generation {
+                // Already flushed
+                return Ok(());
+            }
+            match &guard.latest {
+                Some(value) => (value.clone(), guard.generation),
+                None => return Ok(()),
+            }
+        };
+
+        let result = sqlx::query(
+            r#"
+            UPDATE awa.jobs_hot
+            SET progress = $2
+            WHERE id = $1 AND state = 'running' AND run_lease = $3
+            "#,
+        )
+        .bind(self.job.id)
+        .bind(&snapshot)
+        .bind(self.job.run_lease)
+        .execute(&self.pool)
+        .await?;
+
+        let mut guard = self.progress.lock().expect("progress lock poisoned");
+        if target_generation > guard.acked_generation {
+            guard.acked_generation = target_generation;
+        }
+        // Clear any in-flight heartbeat snapshot that is now stale
+        if let Some((gen, _)) = &guard.in_flight {
+            if *gen <= target_generation {
+                guard.in_flight = None;
+            }
+        }
+
+        if result.rows_affected() == 0 {
+            // Job was rescued/cancelled — not an error for the caller
+            return Ok(());
+        }
+
+        Ok(())
+    }
+
+    /// Get a clone of the shared progress state Arc (for Python bridge).
+    pub fn progress_buffer(&self) -> Arc<std::sync::Mutex<ProgressState>> {
+        self.progress.clone()
     }
 }

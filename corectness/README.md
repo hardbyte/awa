@@ -70,10 +70,20 @@ docker run --rm -v "$PWD/corectness:/work" awa-tlaplus \
 
 ## Model Notes
 
-`AwaCore` is the smallest useful model. It encodes the ownership rule that
-fixes the v0.1 stale-completion bug: only the current owner of a `running` job
-may finalize it. Rescue and admin cancel clear ownership, so any late worker
-completion becomes impossible in the model.
+`AwaCore` is the smallest useful model. It now encodes a minimal lease-guarded
+finalization protocol:
+
+- `Claim` increments a durable `lease`
+- `StartTask` snapshots that lease into `taskLease`
+- `FinalizeAccepted` requires `taskLease = lease`
+- `FinalizeRejected` models the late-completion cleanup path after rescue,
+  cancel, or reclaim
+
+That maps much more closely to the Rust `run_lease` guard than the older
+owner-only core model.
+
+Like the extended model, the core model bounds lease growth (`MaxLease == 2`)
+so TLC explores a finite reclaim/finalize surface instead of an unbounded loop.
 
 `AwaExtended` adds:
 
@@ -89,6 +99,8 @@ completion becomes impossible in the model.
 - weighted overflow via `Weight`, `GlobalOverflow`, and derived queue contention
 - `BatchMax` and per-instance `rateBudget[i][q]` as bounded abstractions of
   dispatcher batching and queue-level rate limiting
+- `DeferredRowsIdle`, which captures the hot/deferred storage split by requiring
+  `retryable` jobs to have no live owner, permit, or in-flight task
 - `DrainTimeout(i)`, `Abandoned(j)`, and `RecoverableAbandoned(j)` so one
   instance can abandon a running or claimed attempt and another still-running
   instance must rescue it
@@ -105,6 +117,7 @@ protocol rather than re-exploring the full cancel surface.
 - `TypeOK`
 - `RunningOwned`
 - `NonRunningUnowned`
+- `TaskLeaseBounded`
 
 `AwaExtended.cfg` checks:
 
@@ -114,6 +127,7 @@ protocol rather than re-exploring the full cancel surface.
 - `CurrentOwnerConsistent`
 - `TaskLeaseBounded`
 - `TerminalReleasesPermit`
+- `DeferredRowsIdle`
 - `LocalCapacitySafe`
 - `OverflowCapacitySafe`
 - `BatchBounded`
@@ -142,6 +156,9 @@ needs an extra environment assumption such as "some instance remains running".
 - `inFlight[i][j]` and `taskLease[i][j]` approximate each instance's local
   executor registry keyed by `(job_id, run_lease)`; the Rust runtime currently
   implements this as a sharded local registry rather than a single global lock
+- `jobState[j] = "retryable"` corresponds to the row living in
+  `awa.scheduled_jobs`; the hot table only holds runnable / running / terminal
+  rows
 - `permitHolder[j]` is the reserved capacity backing the current claim or
   execution attempt for that job row
 - `cancelRequested[i][j]` approximates the per-instance in-flight cancellation

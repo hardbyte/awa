@@ -113,6 +113,9 @@ cd awa-python && .venv/bin/pytest tests/ -v
 # Chaos recovery only (same test CI runs as a dedicated step)
 cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
 
+# Nightly chaos + benchmark lane
+# GitHub Actions: .github/workflows/nightly-chaos.yml
+
 # COPY integration tests
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test copy_test -- --nocapture
 

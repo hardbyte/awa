@@ -49,6 +49,7 @@ CREATE TABLE awa.jobs_hot (
     callback_on_fail    TEXT,
     callback_transform  TEXT,
     run_lease           BIGINT      NOT NULL DEFAULT 0,
+    progress            JSONB,
 
     CONSTRAINT jobs_hot_state_check CHECK (state NOT IN ('scheduled', 'retryable')),
     CONSTRAINT jobs_hot_priority_in_range CHECK (priority BETWEEN 1 AND 4),
@@ -85,6 +86,7 @@ CREATE TABLE awa.scheduled_jobs (
     callback_on_fail    TEXT,
     callback_transform  TEXT,
     run_lease           BIGINT      NOT NULL DEFAULT 0,
+    progress            JSONB,
 
     CONSTRAINT scheduled_jobs_state_check CHECK (state IN ('scheduled', 'retryable')),
     CONSTRAINT scheduled_jobs_priority_in_range CHECK (priority BETWEEN 1 AND 4),
@@ -274,13 +276,13 @@ BEGIN
             run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
             created_at, errors, metadata, tags, unique_key, unique_states,
             callback_id, callback_timeout_at, callback_filter, callback_on_complete,
-            callback_on_fail, callback_transform, run_lease
+            callback_on_fail, callback_transform, run_lease, progress
         ) VALUES (
             $1, $2, $3, $4, $5, $6, $7, $8,
             $9, $10, $11, $12, $13,
             $14, $15, $16, $17, $18, $19,
             $20, $21, $22, $23,
-            $24, $25, $26
+            $24, $25, $26, $27
         )',
         target_table
     )
@@ -290,7 +292,7 @@ BEGIN
         NEW.finalized_at, NEW.created_at, NEW.errors, NEW.metadata, NEW.tags,
         NEW.unique_key, NEW.unique_states, NEW.callback_id, NEW.callback_timeout_at,
         NEW.callback_filter, NEW.callback_on_complete, NEW.callback_on_fail,
-        NEW.callback_transform, NEW.run_lease;
+        NEW.callback_transform, NEW.run_lease, NEW.progress;
 
     RETURN NEW;
 END;

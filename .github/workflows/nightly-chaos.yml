@@ -1,0 +1,112 @@
+name: Nightly Chaos And Benchmarks
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
+jobs:
+  rust-nightly:
+    name: Rust nightly benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Create artifact directory
+        run: mkdir -p artifacts/nightly
+      - name: Run sustained hot-path benchmark
+        run: |
+          cargo test --package awa --test scheduling_benchmark_test \
+            test_runtime_sustained_hot_path -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-hot.txt
+      - name: Run sustained deferred benchmark
+        run: |
+          cargo test --package awa --test scheduling_benchmark_test \
+            test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-scheduled-2m-4k.txt
+      - name: Upload Rust nightly artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-rust
+          path: artifacts/nightly/
+
+  python-nightly:
+    name: Python nightly chaos and benchmarks
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    defaults:
+      run:
+        working-directory: awa-python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: "awa-python -> awa-python/target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Create venv and install deps
+        run: |
+          uv venv .venv
+          uv pip install maturin pytest pytest-asyncio
+      - name: Build extension (maturin develop)
+        run: .venv/bin/maturin develop
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Create artifact directory
+        run: mkdir -p artifacts/nightly
+      - name: Run Python chaos recovery test
+        run: |
+          .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos \
+            | tee artifacts/nightly/python-chaos.txt
+      - name: Run Python runtime benchmarks
+        run: |
+          .venv/bin/python scripts/benchmark_runtime.py --scenario all \
+            | tee artifacts/nightly/python-benchmarks.txt
+      - name: Upload Python nightly artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-python
+          path: awa-python/artifacts/nightly/

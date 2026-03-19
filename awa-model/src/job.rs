@@ -95,6 +95,8 @@ pub struct JobRow {
     pub callback_on_fail: Option<String>,
     /// CEL expression to transform the payload before returning.
     pub callback_transform: Option<String>,
+    /// Structured progress reported by the handler during execution.
+    pub progress: Option<serde_json::Value>,
 }
 
 /// Options for inserting a job.

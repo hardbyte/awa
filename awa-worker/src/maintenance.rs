@@ -442,7 +442,7 @@ impl MaintenanceService {
     /// Signal cancellation to any rescued jobs that are still running on this instance.
     async fn signal_cancellation(&self, rescued_jobs: &[JobRow]) {
         for job in rescued_jobs {
-            if let Some(flag) = self.in_flight.get((job.id, job.run_lease)) {
+            if let Some(flag) = self.in_flight.get_cancel((job.id, job.run_lease)) {
                 flag.store(true, Ordering::SeqCst);
                 debug!(job_id = job.id, "Signalled cancellation for rescued job");
             }
@@ -528,7 +528,7 @@ impl MaintenanceService {
                     run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
                     created_at, errors, metadata, tags, unique_key, unique_states,
                     callback_id, callback_timeout_at, callback_filter, callback_on_complete,
-                    callback_on_fail, callback_transform, run_lease
+                    callback_on_fail, callback_transform, run_lease, progress
                 )
                 SELECT
                     id,
@@ -556,7 +556,8 @@ impl MaintenanceService {
                     NULL,
                     NULL,
                     NULL,
-                    run_lease
+                    run_lease,
+                    progress
                 FROM due
                 RETURNING queue
             )
