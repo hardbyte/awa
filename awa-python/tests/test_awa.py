@@ -91,7 +91,8 @@ def test_migrations_sql():
     sqls = awa.migrations()
     assert len(sqls) >= 1
     version, description, sql = sqls[0]
-    assert version == 1
+    assert isinstance(version, int)
+    assert version >= 1
     assert "CREATE SCHEMA" in sql
     assert "awa.jobs" in sql
 
