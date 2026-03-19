@@ -1,11 +1,12 @@
+use crate::completion::CompletionBatcherHandle;
 use crate::context::JobContext;
+use crate::runtime::InFlightMap;
 use awa_model::{AwaError, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
-use tokio::sync::RwLock;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
@@ -63,20 +64,22 @@ pub(crate) type BoxedWorker = Box<dyn Worker>;
 pub struct JobExecutor {
     pool: PgPool,
     workers: Arc<HashMap<String, BoxedWorker>>,
-    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
     metrics: crate::metrics::AwaMetrics,
+    completion_batcher: CompletionBatcherHandle,
 }
 
 impl JobExecutor {
-    pub fn new(
+    pub(crate) fn new(
         pool: PgPool,
         workers: Arc<HashMap<String, BoxedWorker>>,
-        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        in_flight: InFlightMap,
         queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         metrics: crate::metrics::AwaMetrics,
+        completion_batcher: CompletionBatcherHandle,
     ) -> Self {
         Self {
             pool,
@@ -85,18 +88,27 @@ impl JobExecutor {
             queue_in_flight,
             state,
             metrics,
+            completion_batcher,
         }
     }
 
-    /// Execute a claimed job. Returns a JoinHandle for the spawned task.
-    pub fn execute(&self, job: JobRow, cancel: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    /// Build the future that executes a claimed job.
+    ///
+    /// The caller is responsible for spawning it onto the runtime.
+    pub fn execute_task(
+        &self,
+        job: JobRow,
+        cancel: Arc<AtomicBool>,
+    ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let in_flight = self.in_flight.clone();
         let queue_in_flight = self.queue_in_flight.clone();
         let state = self.state.clone();
         let metrics = self.metrics.clone();
+        let completion_batcher = self.completion_batcher.clone();
         let job_id = job.id;
+        let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
         let job_queue = job.queue.clone();
 
@@ -110,105 +122,91 @@ impl JobExecutor {
             otel.status_code = tracing::field::Empty,
         );
 
-        tokio::spawn(
-            async move {
-                // Register as in-flight
-                {
-                    let mut guard = in_flight.write().await;
-                    guard.insert(job_id, cancel.clone());
+        async move {
+            // Register as in-flight
+            in_flight.insert((job_id, job_run_lease), cancel.clone());
+            if let Some(counter) = queue_in_flight.get(&job_queue) {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            metrics.record_in_flight_change(&job_queue, 1);
+
+            let start = std::time::Instant::now();
+            let ctx = JobContext::new(job.clone(), cancel, state, pool.clone());
+
+            let result = match workers.get(&job.kind) {
+                Some(worker) => worker.perform(&job, &ctx).await,
+                None => {
+                    error!(kind = %job.kind, job_id, "No worker registered for job kind");
+                    Err(JobError::Terminal(format!(
+                        "unknown job kind: {}",
+                        job.kind
+                    )))
                 }
-                if let Some(counter) = queue_in_flight.get(&job_queue) {
-                    counter.fetch_add(1, Ordering::SeqCst);
-                }
-                metrics.record_in_flight_change(&job_queue, 1);
+            };
 
-                let start = std::time::Instant::now();
-                let ctx = JobContext::new(job.clone(), cancel, state, pool.clone());
+            let duration = start.elapsed();
 
-                let result = match workers.get(&job.kind) {
-                    Some(worker) => worker.perform(&job, &ctx).await,
-                    None => {
-                        error!(kind = %job.kind, job_id, "No worker registered for job kind");
-                        Err(JobError::Terminal(format!(
-                            "unknown job kind: {}",
-                            job.kind
-                        )))
-                    }
-                };
-
-                let duration = start.elapsed();
-
-                // Complete the job based on the result, then record metrics
-                // only if the state transition actually happened (not stale).
-                match complete_job(&pool, &job, &result).await {
-                    Ok(true) => {
-                        // State transition succeeded — record metrics
-                        match &result {
-                            Ok(JobResult::Completed) => {
-                                metrics.record_job_completed(&job_kind, &job_queue, duration);
-                            }
-                            Ok(JobResult::RetryAfter(_)) => {
-                                metrics.record_job_retried(&job_kind, &job_queue);
-                            }
-                            Ok(JobResult::Cancel(_)) => {
-                                metrics.jobs_cancelled.add(
-                                    1,
-                                    &[
-                                        opentelemetry::KeyValue::new(
-                                            "awa.job.kind",
-                                            job_kind.clone(),
-                                        ),
-                                        opentelemetry::KeyValue::new(
-                                            "awa.job.queue",
-                                            job_queue.clone(),
-                                        ),
-                                    ],
-                                );
-                            }
-                            Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
-                            Ok(JobResult::WaitForCallback) => {
-                                metrics.jobs_waiting_external.add(
-                                    1,
-                                    &[
-                                        opentelemetry::KeyValue::new(
-                                            "awa.job.kind",
-                                            job_kind.clone(),
-                                        ),
-                                        opentelemetry::KeyValue::new(
-                                            "awa.job.queue",
-                                            job_queue.clone(),
-                                        ),
-                                    ],
-                                );
-                            }
-                            Err(JobError::Terminal(_)) => {
-                                metrics.record_job_failed(&job_kind, &job_queue, true);
-                            }
-                            Err(JobError::Retryable(_)) => {
-                                metrics.record_job_retried(&job_kind, &job_queue);
-                            }
+            // Complete the job based on the result, then record metrics
+            // only if the state transition actually happened (not stale).
+            match complete_job(&pool, &job, &result, &completion_batcher).await {
+                Ok(true) => {
+                    // State transition succeeded — record metrics
+                    match &result {
+                        Ok(JobResult::Completed) => {
+                            metrics.record_job_completed(&job_kind, &job_queue, duration);
+                        }
+                        Ok(JobResult::RetryAfter(_)) => {
+                            metrics.record_job_retried(&job_kind, &job_queue);
+                        }
+                        Ok(JobResult::Cancel(_)) => {
+                            metrics.jobs_cancelled.add(
+                                1,
+                                &[
+                                    opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
+                                    opentelemetry::KeyValue::new(
+                                        "awa.job.queue",
+                                        job_queue.clone(),
+                                    ),
+                                ],
+                            );
+                        }
+                        Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
+                        Ok(JobResult::WaitForCallback) => {
+                            metrics.jobs_waiting_external.add(
+                                1,
+                                &[
+                                    opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
+                                    opentelemetry::KeyValue::new(
+                                        "awa.job.queue",
+                                        job_queue.clone(),
+                                    ),
+                                ],
+                            );
+                        }
+                        Err(JobError::Terminal(_)) => {
+                            metrics.record_job_failed(&job_kind, &job_queue, true);
+                        }
+                        Err(JobError::Retryable(_)) => {
+                            metrics.record_job_retried(&job_kind, &job_queue);
                         }
                     }
-                    Ok(false) => {
-                        // Job was already rescued/cancelled — no metrics
-                    }
-                    Err(err) => {
-                        error!(job_id, error = %err, "Failed to complete job");
-                    }
                 }
-
-                // Remove from in-flight
-                {
-                    let mut guard = in_flight.write().await;
-                    guard.remove(&job_id);
+                Ok(false) => {
+                    // Job was already rescued/cancelled — no metrics
                 }
-                if let Some(counter) = queue_in_flight.get(&job_queue) {
-                    counter.fetch_sub(1, Ordering::SeqCst);
+                Err(err) => {
+                    error!(job_id, error = %err, "Failed to complete job");
                 }
-                metrics.record_in_flight_change(&job_queue, -1);
             }
-            .instrument(span),
-        )
+
+            // Remove from in-flight
+            in_flight.remove((job_id, job_run_lease));
+            if let Some(counter) = queue_in_flight.get(&job_queue) {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+            metrics.record_in_flight_change(&job_queue, -1);
+        }
+        .instrument(span)
     }
 }
 
@@ -220,18 +218,24 @@ async fn complete_job(
     pool: &PgPool,
     job: &JobRow,
     result: &Result<JobResult, JobError>,
+    completion_batcher: &CompletionBatcherHandle,
 ) -> Result<bool, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");
             info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
-            let result = sqlx::query(
-                "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1 AND state = 'running'",
-            )
-            .bind(job.id)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() == 0 {
+            let result = match completion_batcher.complete(job.id, job.run_lease).await {
+                Ok(updated) => updated,
+                Err(err) => {
+                    warn!(
+                        job_id = job.id,
+                        error = %err,
+                        "Completion batch flush failed, falling back to direct finalize"
+                    );
+                    direct_complete_job(pool, job).await?
+                }
+            };
+            if !result {
                 warn!(
                     job_id = job.id,
                     "Job already rescued/cancelled, completion ignored"
@@ -254,11 +258,12 @@ async fn complete_job(
                 SET state = 'retryable',
                     run_at = now() + make_interval(secs => $2),
                     finalized_at = now()
-                WHERE id = $1 AND state = 'running'
+                WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
             .bind(job.id)
             .bind(seconds)
+            .bind(job.run_lease)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -288,11 +293,12 @@ async fn complete_job(
                     attempt = attempt - 1,
                     heartbeat_at = NULL,
                     deadline_at = NULL
-                WHERE id = $1 AND state = 'running'
+                WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
             .bind(job.id)
             .bind(seconds)
+            .bind(job.run_lease)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -317,7 +323,7 @@ async fn complete_job(
                 SET state = 'cancelled',
                     finalized_at = now(),
                     errors = errors || $2::jsonb
-                WHERE id = $1 AND state = 'running'
+                WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
             .bind(job.id)
@@ -326,6 +332,7 @@ async fn complete_job(
                 "attempt": job.attempt,
                 "at": chrono::Utc::now().to_rfc3339()
             }))
+            .bind(job.run_lease)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -351,10 +358,11 @@ async fn complete_job(
                 SET state = 'waiting_external',
                     heartbeat_at = NULL,
                     deadline_at = NULL
-                WHERE id = $1 AND state = 'running' AND callback_id IS NOT NULL
+                WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id IS NOT NULL
                 "#,
             )
             .bind(job.id)
+            .bind(job.run_lease)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -387,7 +395,7 @@ async fn complete_job(
                             SET state = 'failed',
                                 finalized_at = now(),
                                 errors = errors || $2::jsonb
-                            WHERE id = $1 AND state = 'running'
+                            WHERE id = $1 AND state = 'running' AND run_lease = $3
                             "#,
                         )
                         .bind(job.id)
@@ -397,6 +405,7 @@ async fn complete_job(
                             "at": chrono::Utc::now().to_rfc3339(),
                             "terminal": true
                         }))
+                        .bind(job.run_lease)
                         .execute(pool)
                         .await?;
                         return Ok(true);
@@ -426,7 +435,7 @@ async fn complete_job(
                 SET state = 'failed',
                     finalized_at = now(),
                     errors = errors || $2::jsonb
-                WHERE id = $1 AND state = 'running'
+                WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
             .bind(job.id)
@@ -436,6 +445,7 @@ async fn complete_job(
                 "at": chrono::Utc::now().to_rfc3339(),
                 "terminal": true
             }))
+            .bind(job.run_lease)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -465,7 +475,7 @@ async fn complete_job(
                     SET state = 'failed',
                         finalized_at = now(),
                         errors = errors || $2::jsonb
-                    WHERE id = $1 AND state = 'running'
+                    WHERE id = $1 AND state = 'running' AND run_lease = $3
                     "#,
                 )
                 .bind(job.id)
@@ -474,6 +484,7 @@ async fn complete_job(
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
                 }))
+                .bind(job.run_lease)
                 .execute(pool)
                 .await?;
                 if result.rows_affected() == 0 {
@@ -501,7 +512,7 @@ async fn complete_job(
                         heartbeat_at = NULL,
                         deadline_at = NULL,
                         errors = errors || $4::jsonb
-                    WHERE id = $1 AND state = 'running'
+                    WHERE id = $1 AND state = 'running' AND run_lease = $5
                     "#,
                 )
                 .bind(job.id)
@@ -512,6 +523,7 @@ async fn complete_job(
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
                 }))
+                .bind(job.run_lease)
                 .execute(pool)
                 .await?;
                 if result.rows_affected() == 0 {
@@ -526,4 +538,21 @@ async fn complete_job(
     }
 
     Ok(true)
+}
+
+async fn direct_complete_job(pool: &PgPool, job: &JobRow) -> Result<bool, AwaError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'completed',
+            finalized_at = now()
+        WHERE id = $1 AND state = 'running' AND run_lease = $2
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.run_lease)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }

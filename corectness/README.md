@@ -138,9 +138,10 @@ needs an extra environment assumption such as "some instance remains running".
 ## Mapping Back To The Rust Runtime
 
 - `dbOwner[j]` corresponds to the worker attempt that can still satisfy the SQL
-  `WHERE state = 'running'` guard
+  `WHERE state = 'running' AND run_lease = ...` guard
 - `inFlight[i][j]` and `taskLease[i][j]` approximate each instance's local
-  executor registry
+  executor registry keyed by `(job_id, run_lease)`; the Rust runtime currently
+  implements this as a sharded local registry rather than a single global lock
 - `permitHolder[j]` is the reserved capacity backing the current claim or
   execution attempt for that job row
 - `cancelRequested[i][j]` approximates the per-instance in-flight cancellation

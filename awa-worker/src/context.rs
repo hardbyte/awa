@@ -84,8 +84,13 @@ impl JobContext {
     /// Returns a `CallbackToken` whose `id` should be included in the URL or
     /// payload sent to the external system.
     pub async fn register_callback(&self, timeout: Duration) -> Result<CallbackToken, AwaError> {
-        let callback_id =
-            awa_model::admin::register_callback(&self.pool, self.job.id, timeout).await?;
+        let callback_id = awa_model::admin::register_callback(
+            &self.pool,
+            self.job.id,
+            self.job.run_lease,
+            timeout,
+        )
+        .await?;
         Ok(CallbackToken { id: callback_id })
     }
 
@@ -100,6 +105,7 @@ impl JobContext {
         let callback_id = awa_model::admin::register_callback_with_config(
             &self.pool,
             self.job.id,
+            self.job.run_lease,
             timeout,
             config,
         )

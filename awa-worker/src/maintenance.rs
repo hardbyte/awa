@@ -1,14 +1,14 @@
+use crate::runtime::InFlightMap;
 use awa_model::cron::{atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow};
 use awa_model::{JobRow, PeriodicJob};
 use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -18,12 +18,13 @@ use tracing::{debug, error, info, warn};
 /// periodic job sync and evaluation.
 pub struct MaintenanceService {
     pool: PgPool,
+    metrics: crate::metrics::AwaMetrics,
     cancel: CancellationToken,
     leader: Arc<AtomicBool>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
-    in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+    in_flight: InFlightMap,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
@@ -38,16 +39,21 @@ pub struct MaintenanceService {
     failed_retention: Duration,
 }
 
+const PROMOTE_BATCH_SIZE: i64 = 4_096;
+const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
+
 impl MaintenanceService {
-    pub fn new(
+    pub(crate) fn new(
         pool: PgPool,
+        metrics: crate::metrics::AwaMetrics,
         leader: Arc<AtomicBool>,
         cancel: CancellationToken,
         periodic_jobs: Arc<Vec<PeriodicJob>>,
-        in_flight: Arc<RwLock<HashMap<i64, Arc<AtomicBool>>>>,
+        in_flight: InFlightMap,
     ) -> Self {
         Self {
             pool,
+            metrics,
             cancel,
             leader,
             periodic_jobs,
@@ -55,7 +61,7 @@ impl MaintenanceService {
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             callback_rescue_interval: Duration::from_secs(30),
-            promote_interval: Duration::from_secs(5),
+            promote_interval: Duration::from_millis(250),
             cleanup_interval: Duration::from_secs(60),
             cron_sync_interval: Duration::from_secs(60),
             cron_eval_interval: Duration::from_secs(1),
@@ -73,6 +79,12 @@ impl MaintenanceService {
     /// advisory lock. Lower values speed up leader election in tests.
     pub fn leader_election_interval(mut self, interval: Duration) -> Self {
         self.leader_election_interval = interval;
+        self
+    }
+
+    /// Set the promotion interval for scheduled/retryable jobs.
+    pub fn promote_interval(mut self, interval: Duration) -> Self {
+        self.promote_interval = interval;
         self
     }
 
@@ -429,9 +441,8 @@ impl MaintenanceService {
 
     /// Signal cancellation to any rescued jobs that are still running on this instance.
     async fn signal_cancellation(&self, rescued_jobs: &[JobRow]) {
-        let guard = self.in_flight.read().await;
         for job in rescued_jobs {
-            if let Some(flag) = guard.get(&job.id) {
+            if let Some(flag) = self.in_flight.get((job.id, job.run_lease)) {
                 flag.store(true, Ordering::SeqCst);
                 debug!(job_id = job.id, "Signalled cancellation for rescued job");
             }
@@ -441,39 +452,134 @@ impl MaintenanceService {
     /// Promote scheduled jobs that are now due.
     #[tracing::instrument(skip(self), name = "maintenance.promote")]
     async fn promote_scheduled(&self) {
-        match sqlx::query(
-            "UPDATE awa.jobs SET state = 'available' WHERE state = 'scheduled' AND run_at <= now()",
-        )
-        .execute(&self.pool)
-        .await
+        if let Err(err) = self.promote_due_state("scheduled", "scheduled jobs").await {
+            error!(error = %err, "Failed to promote scheduled jobs");
+        }
+        if let Err(err) = self
+            .promote_due_state("retryable", "retryable jobs (backoff elapsed)")
+            .await
         {
-            Ok(result) if result.rows_affected() > 0 => {
-                debug!(count = result.rows_affected(), "Promoted scheduled jobs");
+            error!(error = %err, "Failed to promote retryable jobs");
+        }
+    }
+
+    async fn promote_due_state(
+        &self,
+        state: &'static str,
+        label: &'static str,
+    ) -> Result<(), sqlx::Error> {
+        let mut promoted_total = 0usize;
+        let mut notified_queues = HashSet::new();
+
+        for _ in 0..PROMOTE_MAX_BATCHES_PER_TICK {
+            if self.cancel.is_cancelled() {
+                break;
             }
-            Err(err) => {
-                error!(error = %err, "Failed to promote scheduled jobs");
+
+            let (promoted, queues) = self.promote_due_batch(state).await?;
+            if promoted == 0 {
+                break;
             }
-            _ => {}
+
+            promoted_total += promoted;
+            notified_queues.extend(queues);
+
+            if promoted < PROMOTE_BATCH_SIZE as usize {
+                break;
+            }
         }
 
-        // Also promote retryable jobs whose backoff has elapsed
-        match sqlx::query(
-            "UPDATE awa.jobs SET state = 'available' WHERE state = 'retryable' AND run_at <= now()",
-        )
-        .execute(&self.pool)
-        .await
-        {
-            Ok(result) if result.rows_affected() > 0 => {
-                debug!(
-                    count = result.rows_affected(),
-                    "Promoted retryable jobs (backoff elapsed)"
-                );
-            }
-            Err(err) => {
-                error!(error = %err, "Failed to promote retryable jobs");
-            }
-            _ => {}
+        if promoted_total > 0 {
+            debug!(
+                count = promoted_total,
+                queues = notified_queues.len(),
+                state,
+                "Promoted {label}"
+            );
         }
+
+        Ok(())
+    }
+
+    async fn promote_due_batch(
+        &self,
+        state: &'static str,
+    ) -> Result<(usize, HashSet<String>), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let promote_start = std::time::Instant::now();
+        let promoted_rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            WITH due AS (
+                DELETE FROM awa.scheduled_jobs
+                WHERE id IN (
+                    SELECT id
+                    FROM awa.scheduled_jobs
+                    WHERE state = $1::awa.job_state
+                      AND run_at <= now()
+                    ORDER BY run_at ASC, id ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
+            ),
+            promoted AS (
+                INSERT INTO awa.jobs_hot (
+                    id, kind, queue, args, state, priority, attempt, max_attempts,
+                    run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                    created_at, errors, metadata, tags, unique_key, unique_states,
+                    callback_id, callback_timeout_at, callback_filter, callback_on_complete,
+                    callback_on_fail, callback_transform, run_lease
+                )
+                SELECT
+                    id,
+                    kind,
+                    queue,
+                    args,
+                    'available'::awa.job_state,
+                    priority,
+                    attempt,
+                    max_attempts,
+                    now(),
+                    NULL,
+                    NULL,
+                    attempted_at,
+                    finalized_at,
+                    created_at,
+                    errors,
+                    metadata,
+                    tags,
+                    unique_key,
+                    unique_states,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    run_lease
+                FROM due
+                RETURNING queue
+            )
+            SELECT queue FROM promoted
+            "#,
+        )
+        .bind(state)
+        .bind(PROMOTE_BATCH_SIZE)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let promoted = promoted_rows.len();
+        self.metrics
+            .record_promotion_batch(state, promoted as u64, promote_start.elapsed());
+        if promoted == 0 {
+            tx.commit().await?;
+            return Ok((0, HashSet::new()));
+        }
+
+        let queues: HashSet<String> = promoted_rows.into_iter().map(|(queue,)| queue).collect();
+
+        tx.commit().await?;
+        Ok((promoted, queues))
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.

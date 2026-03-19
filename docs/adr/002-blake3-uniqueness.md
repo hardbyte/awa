@@ -6,7 +6,7 @@ Accepted
 
 ## Context
 
-Awa supports job deduplication via a uniqueness constraint (PRD section 6.6). When a job is inserted with `UniqueOpts`, a `unique_key` is computed from a combination of: kind, optional queue, optional args (canonical JSON), and optional time-period bucket. This key is stored as `BYTEA` and enforced via a conditional unique index in Postgres.
+Awa supports job deduplication via a uniqueness constraint (PRD section 6.6). When a job is inserted with `UniqueOpts`, a `unique_key` is computed from a combination of: kind, optional queue, optional args (canonical JSON), and optional time-period bucket. This key is stored as `BYTEA` and enforced by a trigger-managed uniqueness claims table in Postgres.
 
 The hash function must satisfy:
 
@@ -65,7 +65,7 @@ Domain separator bytes (`\x00`) between fields prevent ambiguous concatenation (
 
 ### Positive
 
-- **16 bytes per row** is compact enough for excellent index performance. The `idx_awa_jobs_unique` partial index stays small.
+- **16 bytes per row** is compact enough for excellent index performance. The `idx_awa_jobs_unique` claims index stays small.
 - **BLAKE3 is fast:** ~3-6x faster than SHA-256, with SIMD acceleration on modern CPUs. Key computation adds negligible latency to inserts.
 - **Birthday bound is astronomical:** 128 bits provides a collision probability that is effectively zero for any realistic workload.
 - **Cross-language consistency:** Both Rust and Python use BLAKE3 with the same canonical serialization, verified by golden tests.

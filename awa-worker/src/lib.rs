@@ -1,10 +1,12 @@
 pub mod client;
+mod completion;
 pub mod context;
 pub mod dispatcher;
 pub mod executor;
 pub mod heartbeat;
 pub mod maintenance;
 pub mod metrics;
+mod runtime;
 
 // Re-exports
 pub use awa_model::{CallbackConfig, PeriodicJob, PeriodicJobBuilder};
