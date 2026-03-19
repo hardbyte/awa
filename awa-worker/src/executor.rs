@@ -1,6 +1,6 @@
 use crate::completion::CompletionBatcherHandle;
 use crate::context::JobContext;
-use crate::runtime::InFlightMap;
+use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use awa_model::{AwaError, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
@@ -123,15 +123,30 @@ impl JobExecutor {
         );
 
         async move {
-            // Register as in-flight
-            in_flight.insert((job_id, job_run_lease), cancel.clone());
+            // Seed progress from the persisted checkpoint (for retries/snoozes)
+            let progress_state = Arc::new(std::sync::Mutex::new(ProgressState::new(
+                job.progress.clone(),
+            )));
+
+            // Register as in-flight with cancel + progress
+            let in_flight_state = InFlightState {
+                cancel: cancel.clone(),
+                progress: progress_state.clone(),
+            };
+            in_flight.insert((job_id, job_run_lease), in_flight_state);
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, 1);
 
             let start = std::time::Instant::now();
-            let ctx = JobContext::new(job.clone(), cancel, state, pool.clone());
+            let ctx = JobContext::new(
+                job.clone(),
+                cancel,
+                state,
+                pool.clone(),
+                progress_state.clone(),
+            );
 
             let result = match workers.get(&job.kind) {
                 Some(worker) => worker.perform(&job, &ctx).await,
@@ -146,9 +161,15 @@ impl JobExecutor {
 
             let duration = start.elapsed();
 
+            // Snapshot progress for state transition
+            let progress_snapshot = {
+                let guard = progress_state.lock().expect("progress lock poisoned");
+                guard.latest.clone()
+            };
+
             // Complete the job based on the result, then record metrics
             // only if the state transition actually happened (not stale).
-            match complete_job(&pool, &job, &result, &completion_batcher).await {
+            match complete_job(&pool, &job, &result, &completion_batcher, progress_snapshot).await {
                 Ok(true) => {
                     // State transition succeeded — record metrics
                     match &result {
@@ -219,6 +240,7 @@ async fn complete_job(
     job: &JobRow,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
+    progress_snapshot: Option<serde_json::Value>,
 ) -> Result<bool, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
@@ -257,13 +279,15 @@ async fn complete_job(
                 UPDATE awa.jobs
                 SET state = 'retryable',
                     run_at = now() + make_interval(secs => $2),
-                    finalized_at = now()
+                    finalized_at = now(),
+                    progress = $4
                 WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
             .bind(job.id)
             .bind(seconds)
             .bind(job.run_lease)
+            .bind(&progress_snapshot)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -292,13 +316,15 @@ async fn complete_job(
                     run_at = now() + make_interval(secs => $2),
                     attempt = attempt - 1,
                     heartbeat_at = NULL,
-                    deadline_at = NULL
+                    deadline_at = NULL,
+                    progress = $4
                 WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
             .bind(job.id)
             .bind(seconds)
             .bind(job.run_lease)
+            .bind(&progress_snapshot)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -322,7 +348,8 @@ async fn complete_job(
                 UPDATE awa.jobs
                 SET state = 'cancelled',
                     finalized_at = now(),
-                    errors = errors || $2::jsonb
+                    errors = errors || $2::jsonb,
+                    progress = $4
                 WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
@@ -333,6 +360,7 @@ async fn complete_job(
                 "at": chrono::Utc::now().to_rfc3339()
             }))
             .bind(job.run_lease)
+            .bind(&progress_snapshot)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -357,12 +385,14 @@ async fn complete_job(
                 UPDATE awa.jobs
                 SET state = 'waiting_external',
                     heartbeat_at = NULL,
-                    deadline_at = NULL
+                    deadline_at = NULL,
+                    progress = $3
                 WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id IS NOT NULL
                 "#,
             )
             .bind(job.id)
             .bind(job.run_lease)
+            .bind(&progress_snapshot)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -434,7 +464,8 @@ async fn complete_job(
                 UPDATE awa.jobs
                 SET state = 'failed',
                     finalized_at = now(),
-                    errors = errors || $2::jsonb
+                    errors = errors || $2::jsonb,
+                    progress = $4
                 WHERE id = $1 AND state = 'running' AND run_lease = $3
                 "#,
             )
@@ -446,6 +477,7 @@ async fn complete_job(
                 "terminal": true
             }))
             .bind(job.run_lease)
+            .bind(&progress_snapshot)
             .execute(pool)
             .await?;
             if result.rows_affected() == 0 {
@@ -474,7 +506,8 @@ async fn complete_job(
                     UPDATE awa.jobs
                     SET state = 'failed',
                         finalized_at = now(),
-                        errors = errors || $2::jsonb
+                        errors = errors || $2::jsonb,
+                        progress = $4
                     WHERE id = $1 AND state = 'running' AND run_lease = $3
                     "#,
                 )
@@ -485,6 +518,7 @@ async fn complete_job(
                     "at": chrono::Utc::now().to_rfc3339()
                 }))
                 .bind(job.run_lease)
+                .bind(&progress_snapshot)
                 .execute(pool)
                 .await?;
                 if result.rows_affected() == 0 {
@@ -511,7 +545,8 @@ async fn complete_job(
                         finalized_at = now(),
                         heartbeat_at = NULL,
                         deadline_at = NULL,
-                        errors = errors || $4::jsonb
+                        errors = errors || $4::jsonb,
+                        progress = $6
                     WHERE id = $1 AND state = 'running' AND run_lease = $5
                     "#,
                 )
@@ -524,6 +559,7 @@ async fn complete_job(
                     "at": chrono::Utc::now().to_rfc3339()
                 }))
                 .bind(job.run_lease)
+                .bind(&progress_snapshot)
                 .execute(pool)
                 .await?;
                 if result.rows_affected() == 0 {
@@ -545,7 +581,8 @@ async fn direct_complete_job(pool: &PgPool, job: &JobRow) -> Result<bool, AwaErr
         r#"
         UPDATE awa.jobs_hot
         SET state = 'completed',
-            finalized_at = now()
+            finalized_at = now(),
+            progress = NULL
         WHERE id = $1 AND state = 'running' AND run_lease = $2
         "#,
     )

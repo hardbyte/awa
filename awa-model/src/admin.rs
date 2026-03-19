@@ -343,7 +343,8 @@ where
             callback_on_fail = NULL,
             callback_transform = NULL,
             heartbeat_at = NULL,
-            deadline_at = NULL
+            deadline_at = NULL,
+            progress = NULL
         WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
         RETURNING *
         "#,
@@ -647,7 +648,8 @@ pub async fn resolve_callback(
                     callback_on_fail = NULL,
                     callback_transform = NULL,
                     heartbeat_at = NULL,
-                    deadline_at = NULL
+                    deadline_at = NULL,
+                    progress = NULL
                 WHERE id = $1
                 RETURNING *
                 "#,

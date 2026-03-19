@@ -154,7 +154,8 @@ impl CompletionWorker {
             )
             UPDATE awa.jobs_hot AS jobs
             SET state = 'completed',
-                finalized_at = now()
+                finalized_at = now(),
+                progress = NULL
             FROM completed
             WHERE jobs.id = completed.id
               AND jobs.run_lease = completed.run_lease

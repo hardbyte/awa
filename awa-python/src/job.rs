@@ -1,4 +1,5 @@
 use awa_model::{JobRow, JobState};
+use awa_worker::context::ProgressState;
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use sqlx::PgPool;
@@ -78,6 +79,10 @@ pub struct PyJob {
     cancelled: Option<Arc<AtomicBool>>,
     /// Database pool for callback registration (only set during dispatch).
     pool: Option<PgPool>,
+    /// Shared progress buffer for in-flight reporting (only set during dispatch).
+    progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
+    /// Progress JSON from the job row (for queried jobs).
+    progress_json: Option<serde_json::Value>,
     pub run_at: DateTime<Utc>,
     pub deadline_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -101,6 +106,8 @@ impl Clone for PyJob {
             args_override: self.args_override.as_ref().map(|value| value.clone_ref(py)),
             cancelled: self.cancelled.clone(),
             pool: self.pool.clone(),
+            progress_buffer: self.progress_buffer.clone(),
+            progress_json: self.progress_json.clone(),
             run_at: self.run_at,
             deadline_at: self.deadline_at,
             created_at: self.created_at,
@@ -150,6 +157,142 @@ impl PyJob {
             .as_ref()
             .map(|flag| flag.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    /// Get progress as a Python dict, or None if no progress has been set.
+    #[getter]
+    fn progress(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        // During dispatch, read from the live buffer
+        if let Some(ref buffer) = self.progress_buffer {
+            let guard = buffer.lock().expect("progress lock poisoned");
+            match &guard.latest {
+                Some(value) => return json_to_py(py, value),
+                None => return Ok(py.None()),
+            }
+        }
+        // For queried jobs, use the row data
+        match &self.progress_json {
+            Some(value) => json_to_py(py, value),
+            None => Ok(py.None()),
+        }
+    }
+
+    /// Set structured progress (0-100, optional message). Sync — writes to in-memory buffer.
+    #[pyo3(signature = (percent, message=None))]
+    fn set_progress(&self, percent: u8, message: Option<String>) -> PyResult<()> {
+        let buffer = self.progress_buffer.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "set_progress is only available during job execution",
+            )
+        })?;
+
+        let percent = percent.min(100);
+        let mut guard = buffer.lock().expect("progress lock poisoned");
+        let existing_metadata = guard
+            .latest
+            .as_ref()
+            .and_then(|v| v.get("metadata"))
+            .cloned();
+
+        let mut value = serde_json::json!({
+            "percent": percent,
+        });
+        if let Some(msg) = message {
+            value["message"] = serde_json::Value::String(msg);
+        }
+        if let Some(meta) = existing_metadata {
+            value["metadata"] = meta;
+        }
+        guard.latest = Some(value);
+        guard.generation += 1;
+        Ok(())
+    }
+
+    /// Shallow-merge keys into progress.metadata for checkpointing. Sync.
+    fn update_metadata(&self, py: Python<'_>, updates: Py<PyAny>) -> PyResult<()> {
+        let buffer = self.progress_buffer.as_ref().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "update_metadata is only available during job execution",
+            )
+        })?;
+
+        let updates_json = py_to_json(py, updates.bind(py))?;
+        let obj = updates_json.as_object().ok_or_else(|| {
+            pyo3::exceptions::PyValueError::new_err("update_metadata requires a dict")
+        })?;
+
+        let mut guard = buffer.lock().expect("progress lock poisoned");
+        let progress = guard.latest.get_or_insert_with(|| serde_json::json!({}));
+        let metadata = progress
+            .as_object_mut()
+            .expect("progress is always an object")
+            .entry("metadata")
+            .or_insert_with(|| serde_json::json!({}));
+
+        if let Some(meta_obj) = metadata.as_object_mut() {
+            for (k, v) in obj {
+                meta_obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        guard.generation += 1;
+        Ok(())
+    }
+
+    /// Force immediate flush of pending progress to DB.
+    fn flush_progress<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        use crate::errors::map_awa_error;
+        let pool = self.pool.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "flush_progress is only available during job execution",
+            )
+        })?;
+        let buffer = self.progress_buffer.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "flush_progress is only available during job execution",
+            )
+        })?;
+        let job_id = self.id;
+        let run_lease = self.run_lease;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let (snapshot, target_generation) = {
+                let guard = buffer.lock().expect("progress lock poisoned");
+                if guard.acked_generation >= guard.generation {
+                    return Ok(());
+                }
+                match &guard.latest {
+                    Some(value) => (value.clone(), guard.generation),
+                    None => return Ok(()),
+                }
+            };
+
+            sqlx::query(
+                r#"
+                UPDATE awa.jobs_hot
+                SET progress = $2
+                WHERE id = $1 AND state = 'running' AND run_lease = $3
+                "#,
+            )
+            .bind(job_id)
+            .bind(&snapshot)
+            .bind(run_lease)
+            .execute(&pool)
+            .await
+            .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+
+            let mut guard = buffer.lock().expect("progress lock poisoned");
+            if target_generation > guard.acked_generation {
+                guard.acked_generation = target_generation;
+            }
+            if let Some((gen, _)) = &guard.in_flight {
+                if *gen <= target_generation {
+                    guard.in_flight = None;
+                }
+            }
+
+            Ok(())
+        })
     }
 
     /// Register a callback for this job, writing the callback_id to the database
@@ -226,6 +369,7 @@ impl PyJob {
 
 impl From<JobRow> for PyJob {
     fn from(row: JobRow) -> Self {
+        let progress_json = row.progress.clone();
         PyJob {
             id: row.id,
             kind: row.kind,
@@ -241,6 +385,8 @@ impl From<JobRow> for PyJob {
             args_override: None,
             cancelled: None,
             pool: None,
+            progress_buffer: None,
+            progress_json,
             run_at: row.run_at,
             deadline_at: row.deadline_at,
             created_at: row.created_at,
@@ -255,11 +401,13 @@ impl PyJob {
         args_override: Py<PyAny>,
         cancelled: Arc<AtomicBool>,
         pool: PgPool,
+        progress_buffer: Arc<std::sync::Mutex<ProgressState>>,
     ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
         job.cancelled = Some(cancelled);
         job.pool = Some(pool);
+        job.progress_buffer = Some(progress_buffer);
         job
     }
 }

@@ -3,6 +3,7 @@
 //! Provides `TestClient` for integration testing of job handlers.
 
 use awa_model::{AwaError, JobArgs, JobRow};
+use awa_worker::context::ProgressState;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
 use sqlx::PgPool;
 use std::any::Any;
@@ -99,15 +100,30 @@ impl TestClient {
         let cancel = Arc::new(AtomicBool::new(false));
         let state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>> =
             Arc::new(HashMap::new());
-        let ctx = JobContext::new(job.clone(), cancel, state, self.pool.clone());
+        let progress = Arc::new(std::sync::Mutex::new(ProgressState::new(
+            job.progress.clone(),
+        )));
+        let ctx = JobContext::new(
+            job.clone(),
+            cancel,
+            state,
+            self.pool.clone(),
+            progress.clone(),
+        );
 
         let result = worker.perform(&job, &ctx).await;
+
+        // Snapshot progress from the buffer after handler execution
+        let progress_snapshot: Option<serde_json::Value> = {
+            let guard = progress.lock().expect("progress lock poisoned");
+            guard.latest.clone()
+        };
 
         // Update job state based on result
         match &result {
             Ok(JobResult::Completed) => {
                 sqlx::query(
-                    "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1",
+                    "UPDATE awa.jobs SET state = 'completed', finalized_at = now(), progress = NULL WHERE id = $1",
                 )
                 .bind(job.id)
                 .execute(&self.pool)
@@ -116,27 +132,30 @@ impl TestClient {
             }
             Ok(JobResult::Cancel(reason)) => {
                 sqlx::query(
-                    "UPDATE awa.jobs SET state = 'cancelled', finalized_at = now() WHERE id = $1",
+                    "UPDATE awa.jobs SET state = 'cancelled', finalized_at = now(), progress = $2 WHERE id = $1",
                 )
                 .bind(job.id)
+                .bind(&progress_snapshot)
                 .execute(&self.pool)
                 .await?;
                 Ok(WorkResult::Cancelled(job, reason.clone()))
             }
             Ok(JobResult::RetryAfter(_)) | Err(JobError::Retryable(_)) => {
                 sqlx::query(
-                    "UPDATE awa.jobs SET state = 'retryable', finalized_at = now() WHERE id = $1",
+                    "UPDATE awa.jobs SET state = 'retryable', finalized_at = now(), progress = $2 WHERE id = $1",
                 )
                 .bind(job.id)
+                .bind(&progress_snapshot)
                 .execute(&self.pool)
                 .await?;
                 Ok(WorkResult::Retryable(job))
             }
             Ok(JobResult::Snooze(_)) => {
                 sqlx::query(
-                    "UPDATE awa.jobs SET state = 'available', attempt = attempt - 1 WHERE id = $1",
+                    "UPDATE awa.jobs SET state = 'available', attempt = attempt - 1, progress = $2 WHERE id = $1",
                 )
                 .bind(job.id)
+                .bind(&progress_snapshot)
                 .execute(&self.pool)
                 .await?;
                 Ok(WorkResult::Snoozed(job))
@@ -151,9 +170,10 @@ impl TestClient {
                 match has_callback {
                     Some((Some(_),)) => {
                         sqlx::query(
-                            "UPDATE awa.jobs SET state = 'waiting_external', heartbeat_at = NULL, deadline_at = NULL WHERE id = $1",
+                            "UPDATE awa.jobs SET state = 'waiting_external', heartbeat_at = NULL, deadline_at = NULL, progress = $2 WHERE id = $1",
                         )
                         .bind(job.id)
+                        .bind(&progress_snapshot)
                         .execute(&self.pool)
                         .await?;
                         let updated = self.get_job(job.id).await?;
@@ -176,9 +196,10 @@ impl TestClient {
             }
             Err(JobError::Terminal(msg)) => {
                 sqlx::query(
-                    "UPDATE awa.jobs SET state = 'failed', finalized_at = now() WHERE id = $1",
+                    "UPDATE awa.jobs SET state = 'failed', finalized_at = now(), progress = $2 WHERE id = $1",
                 )
                 .bind(job.id)
+                .bind(&progress_snapshot)
                 .execute(&self.pool)
                 .await?;
                 Ok(WorkResult::Failed(job, msg.clone()))
