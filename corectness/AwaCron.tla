@@ -161,10 +161,12 @@ TypeOK ==
 NoDuplicateFire ==
     \A f \in FireTimes : jobCount[f] <= 1
 
-\* last_enqueued_at is monotonically non-decreasing.
-LastEnqueuedMonotonic ==
+\* A cached snapshot is never ahead of the current DB value.
+\* Holds because: snapshots are read from lastEnqueued, and lastEnqueued
+\* only increases (AtomicEnqueue: fire > snapshot[i] = lastEnqueued).
+SnapshotNeverAheadOfDB ==
     \A i \in Instances :
-        hasSnapshot[i] => snapshot[i] <= lastEnqueued \/ lastEnqueued >= snapshot[i]
+        hasSnapshot[i] => snapshot[i] <= lastEnqueued
 
 \* Only alive instances with snapshots attempt CAS.
 SnapshotRequiresAlive ==
