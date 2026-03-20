@@ -39,6 +39,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   const [localValue, setLocalValue] = useState(value);
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
+  const [selectedIdx, setSelectedIdx] = useState(-1);
   const containerRef = useRef<HTMLDivElement>(null);
 
   const kindsQuery = useQuery<string[]>({
@@ -55,6 +56,24 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   useEffect(() => {
     setLocalValue(value);
   }, [value]);
+
+  // Global "/" shortcut to focus search
+  useEffect(() => {
+    function handleGlobalKeyDown(e: KeyboardEvent) {
+      if (
+        e.key === "/" &&
+        !e.ctrlKey &&
+        !e.metaKey &&
+        document.activeElement?.tagName !== "INPUT" &&
+        document.activeElement?.tagName !== "TEXTAREA"
+      ) {
+        e.preventDefault();
+        containerRef.current?.querySelector("input")?.focus();
+      }
+    }
+    document.addEventListener("keydown", handleGlobalKeyDown);
+    return () => document.removeEventListener("keydown", handleGlobalKeyDown);
+  }, []);
 
   const computeSuggestions = useCallback(
     (text: string) => {
@@ -80,7 +99,6 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
           }
         }
       } else if (!lastPart.startsWith("tag:") && lastPart.length === 0) {
-        // Show prefix hints when empty or just starting
         results.push(
           { label: "kind:<name>", value: "kind:" },
           { label: "queue:<name>", value: "queue:" },
@@ -99,6 +117,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
       const suggs = computeSuggestions(newValue);
       setSuggestions(suggs);
       setShowSuggestions(suggs.length > 0);
+      setSelectedIdx(-1);
     },
     [computeSuggestions]
   );
@@ -108,11 +127,12 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
       const finalValue = submitValue ?? localValue;
       onChange(finalValue);
       setShowSuggestions(false);
+      setSelectedIdx(-1);
     },
     [localValue, onChange]
   );
 
-  const handleSuggestionClick = useCallback(
+  const applySuggestion = useCallback(
     (suggestion: Suggestion) => {
       const parts = localValue.trim().split(/\s+/);
       parts.pop();
@@ -120,12 +140,53 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
       const newValue = parts.join(" ");
       setLocalValue(newValue);
       setShowSuggestions(false);
-      // If the suggestion is a complete value (not just a prefix), submit
+      setSelectedIdx(-1);
       if (!suggestion.value.endsWith(":")) {
         onChange(newValue);
       }
     },
     [localValue, onChange]
+  );
+
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (!showSuggestions || suggestions.length === 0) {
+        if (e.key === "Enter") {
+          handleSubmit();
+        }
+        return;
+      }
+
+      switch (e.key) {
+        case "ArrowDown":
+          e.preventDefault();
+          setSelectedIdx((prev) =>
+            prev < suggestions.length - 1 ? prev + 1 : 0
+          );
+          break;
+        case "ArrowUp":
+          e.preventDefault();
+          setSelectedIdx((prev) =>
+            prev > 0 ? prev - 1 : suggestions.length - 1
+          );
+          break;
+        case "Enter": {
+          e.preventDefault();
+          if (selectedIdx >= 0 && selectedIdx < suggestions.length) {
+            const s = suggestions[selectedIdx];
+            if (s) applySuggestion(s);
+          } else {
+            handleSubmit();
+          }
+          break;
+        }
+        case "Escape":
+          setShowSuggestions(false);
+          setSelectedIdx(-1);
+          break;
+      }
+    },
+    [showSuggestions, suggestions, selectedIdx, applySuggestion, handleSubmit]
   );
 
   // Close dropdown on click outside
@@ -136,6 +197,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         !containerRef.current.contains(event.target as Node)
       ) {
         setShowSuggestions(false);
+        setSelectedIdx(-1);
       }
     }
     document.addEventListener("mousedown", handleClickOutside);
@@ -161,26 +223,31 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         aria-label="Search jobs"
       >
         <SearchInput
-          placeholder="Search by kind:, queue:, tag: ..."
-          onKeyDown={(e) => {
-            if (e.key === "Enter") {
-              handleSubmit();
-            }
-          }}
+          placeholder="Search by kind:, queue:, tag: ...  (press / to focus)"
+          onKeyDown={handleKeyDown}
         />
       </SearchField>
 
       {showSuggestions && suggestions.length > 0 && (
-        <ul className="absolute z-20 mt-1 w-full rounded-lg border border-border bg-overlay p-1 shadow-lg">
+        <ul
+          className="absolute z-20 mt-1 w-full rounded-lg border border-border bg-overlay p-1 shadow-lg"
+          role="listbox"
+        >
           {suggestions.map((suggestion, index) => (
-            <li key={index}>
+            <li key={index} role="option" aria-selected={index === selectedIdx}>
               <button
                 type="button"
-                className="w-full cursor-pointer rounded-md px-3 py-1.5 text-left text-sm text-fg hover:bg-secondary"
+                className={[
+                  "w-full cursor-pointer rounded-md px-3 py-1.5 text-left text-sm",
+                  index === selectedIdx
+                    ? "bg-primary text-primary-fg"
+                    : "text-fg hover:bg-secondary",
+                ].join(" ")}
                 onMouseDown={(e) => {
                   e.preventDefault();
-                  handleSuggestionClick(suggestion);
+                  applySuggestion(suggestion);
                 }}
+                onMouseEnter={() => setSelectedIdx(index)}
               >
                 {suggestion.label}
               </button>
