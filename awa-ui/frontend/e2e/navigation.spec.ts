@@ -69,3 +69,79 @@ test.describe("Shell navigation", () => {
     await expect(queuesLink).toHaveAttribute("aria-current", "page");
   });
 });
+
+test.describe("Theme toggle", () => {
+  test("cycles through system, light, dark themes", async ({ page }) => {
+    await page.goto("/");
+
+    // The theme toggle button should be visible with initial "system" label
+    const themeBtn = page.getByRole("button", { name: /Theme:/ }).first();
+    await expect(themeBtn).toBeVisible();
+
+    // Initial state should be "system" (default)
+    await expect(themeBtn).toHaveAttribute("aria-label", "Theme: system");
+
+    // Click to cycle to "light"
+    await themeBtn.click();
+    await expect(themeBtn).toHaveAttribute("aria-label", "Theme: light");
+
+    // Click to cycle to "dark"
+    await themeBtn.click();
+    await expect(themeBtn).toHaveAttribute("aria-label", "Theme: dark");
+
+    // Verify dark class is applied to the document
+    const isDark = await page.evaluate(() =>
+      document.documentElement.classList.contains("dark")
+    );
+    expect(isDark).toBeTruthy();
+
+    // Click to cycle back to "system"
+    await themeBtn.click();
+    await expect(themeBtn).toHaveAttribute("aria-label", "Theme: system");
+  });
+
+  test("theme persists across page reloads", async ({ page }) => {
+    await page.goto("/");
+
+    const themeBtn = page.getByRole("button", { name: /Theme:/ }).first();
+
+    // Set to light
+    await themeBtn.click();
+    await expect(themeBtn).toHaveAttribute("aria-label", "Theme: light");
+
+    // Verify localStorage was set
+    const storedTheme = await page.evaluate(() =>
+      localStorage.getItem("theme")
+    );
+    expect(storedTheme).toBe("light");
+
+    // Reload and verify persistence
+    await page.reload();
+    const themeBtnAfterReload = page.getByRole("button", { name: /Theme:/ }).first();
+    await expect(themeBtnAfterReload).toHaveAttribute("aria-label", "Theme: light");
+
+    // Clean up - reset to system
+    await themeBtnAfterReload.click(); // light -> dark
+    await themeBtnAfterReload.click(); // dark -> system
+  });
+});
+
+test.describe("Refresh button", () => {
+  test("clicking refresh button triggers data refetch", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/stats") && r.ok()),
+      page.goto("/"),
+    ]);
+
+    const refreshBtn = page.getByRole("button", { name: "Refresh data" }).first();
+    await expect(refreshBtn).toBeVisible();
+
+    // Click refresh and verify that API calls are made
+    const [statsRefetch] = await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/stats") && r.ok()),
+      refreshBtn.click(),
+    ]);
+
+    expect(statsRefetch.ok()).toBeTruthy();
+  });
+});

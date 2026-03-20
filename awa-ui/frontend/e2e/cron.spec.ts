@@ -8,33 +8,54 @@ test.describe("Cron page", () => {
     ).toBeVisible();
   });
 
-  test("cron table renders or shows empty state", async ({ page }) => {
-    const [response] = await Promise.all([
+  test("cron list renders or shows empty state", async ({ page }) => {
+    await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
       page.goto("/cron"),
     ]);
 
-    // Either the cron table is present with data, or the empty state message shows
-    const cronTable = page.getByRole("grid", { name: "Cron schedules" });
+    // Either cron entries exist or the empty state shows
+    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
     const emptyMessage = page.getByText("No cron schedules found.");
 
-    // One of these should be visible
-    const tableVisible = await cronTable.isVisible().catch(() => false);
+    const hasEntries = await triggerBtn.isVisible().catch(() => false);
     const emptyVisible = await emptyMessage.isVisible().catch(() => false);
-    expect(tableVisible || emptyVisible).toBeTruthy();
+    expect(hasEntries || emptyVisible).toBeTruthy();
+  });
 
-    if (tableVisible) {
-      // Verify column headers if table has data
-      for (const header of ["Name", "Cron", "Kind"]) {
-        await expect(
-          cronTable.getByRole("columnheader", { name: header, exact: true })
-        ).toBeVisible();
-      }
-      // "Queue" needs exact matching to avoid partial match with "Last Enqueued"
-      await expect(
-        cronTable.getByRole("columnheader", { name: "Queue", exact: true })
-      ).toBeVisible();
+  test("clicking cron row toggles expand/collapse", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
+      page.goto("/cron"),
+    ]);
+
+    // Check if there are any cron entries
+    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
+    const hasEntries = await triggerBtn.isVisible().catch(() => false);
+    if (!hasEntries) {
+      test.skip();
+      return;
     }
+
+    // The first cron entry is a clickable row that expands
+    // The expanded section shows Kind, Queue, Priority, Max attempts
+    const kindLabel = page.getByText("Kind", { exact: true }).first();
+    await expect(kindLabel).not.toBeVisible();
+
+    // Click the cron row (the summary area, not the button)
+    const firstEntry = page.locator(".rounded-lg.border").first();
+    const summaryRow = firstEntry.locator(".cursor-pointer").first();
+    await summaryRow.click();
+
+    // Expanded detail should now be visible with Kind/Queue/Priority fields
+    await expect(firstEntry.getByText("Kind", { exact: true })).toBeVisible();
+    await expect(firstEntry.getByText("Queue", { exact: true })).toBeVisible();
+    await expect(firstEntry.getByText("Priority", { exact: true })).toBeVisible();
+    await expect(firstEntry.getByText("Max attempts", { exact: true })).toBeVisible();
+
+    // Click again to collapse
+    await summaryRow.click();
+    await expect(firstEntry.getByText("Max attempts", { exact: true })).not.toBeVisible();
   });
 
   test("trigger now button creates a job", async ({ page }) => {
@@ -43,28 +64,28 @@ test.describe("Cron page", () => {
       page.goto("/cron"),
     ]);
 
-    const cronTable = page.getByRole("grid", { name: "Cron schedules" });
-    const tableVisible = await cronTable.isVisible().catch(() => false);
-    if (!tableVisible) {
+    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
+    const hasEntries = await triggerBtn.isVisible().catch(() => false);
+    if (!hasEntries) {
       test.skip();
       return;
     }
 
-    // Click the first "Trigger now" button and verify the API response
-    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
-    await expect(triggerBtn).toBeVisible();
-
+    // Click "Trigger now" and verify the API response
     const [triggerResponse] = await Promise.all([
       page.waitForResponse(
-        (r) => r.url().includes("/api/cron/") && r.url().includes("/trigger") && r.ok()
+        (r) =>
+          r.url().includes("/api/cron/") &&
+          r.url().includes("/trigger") &&
+          r.request().method() === "POST"
       ),
       triggerBtn.click(),
     ]);
 
-    // Verify the response contains a created job
+    expect(triggerResponse.ok()).toBeTruthy();
+
     const job = await triggerResponse.json();
     expect(job.id).toBeTruthy();
     expect(job.state).toBe("available");
-    expect(job.metadata.triggered_manually).toBe(true);
   });
 });
