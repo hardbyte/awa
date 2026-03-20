@@ -1,0 +1,196 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e6]:
+      - link "AWA" [ref=e8] [cursor=pointer]:
+        - /url: /
+        - img [ref=e9]
+        - generic [ref=e16]: AWA
+      - generic [ref=e17]:
+        - link "Dashboard" [ref=e18] [cursor=pointer]:
+          - /url: /
+          - generic [ref=e19]: Dashboard
+        - link "Jobs" [ref=e20] [cursor=pointer]:
+          - /url: /jobs
+          - generic [ref=e21]: Jobs
+        - link "Queues" [ref=e23] [cursor=pointer]:
+          - /url: /queues
+          - generic [ref=e24]: Queues
+        - link "Cron" [ref=e25] [cursor=pointer]:
+          - /url: /cron
+          - generic [ref=e26]: Cron
+      - generic [ref=e27]:
+        - button "Refresh data" [ref=e28]:
+          - img [ref=e29]
+        - 'button "Theme: system" [ref=e31]':
+          - img [ref=e32]
+    - main [ref=e34]:
+      - generic [ref=e35]:
+        - 'heading "Queue: sync_copy" [level=2] [ref=e37]'
+        - generic [ref=e38]:
+          - generic [ref=e39]: Active
+          - generic [ref=e40]:
+            - text: 10 available · 0 running ·
+            - generic [ref=e41]: 0 failed
+            - text: · 0/hr
+          - generic [ref=e42]:
+            - button "Pause" [ref=e43]
+            - button "Drain" [ref=e44]
+        - generic [ref=e45]:
+          - button "all 22" [ref=e46]:
+            - text: all
+            - generic [ref=e47]: "22"
+          - button "available 17" [ref=e48]:
+            - text: available
+            - generic [ref=e49]: "17"
+          - button "running" [ref=e50]
+          - button "scheduled" [ref=e51]
+          - button "retryable" [ref=e52]
+          - button "failed 2" [ref=e53]:
+            - text: failed
+            - generic [ref=e54]: "2"
+          - button "completed 2" [ref=e55]:
+            - text: completed
+            - generic [ref=e56]: "2"
+          - button "cancelled 1" [ref=e57]:
+            - text: cancelled
+            - generic [ref=e58]: "1"
+          - button "waiting" [ref=e59]
+        - group [ref=e62]:
+          - img
+          - searchbox "Search jobs" [ref=e64]: queue:sync_copy
+          - button "Clear search" [ref=e65]:
+            - img [ref=e66]
+        - generic [ref=e68]:
+          - generic [ref=e69]: "Filters:"
+          - generic [ref=e70]: queue:sync_copy
+          - button "Clear" [ref=e71]
+        - grid "Jobs" [ref=e75]:
+          - rowgroup [ref=e76]:
+            - row "Select All Kind State Queue Attempt Tags Created" [ref=e77]:
+              - columnheader "Select All" [ref=e78]:
+                - checkbox "Select All" [ref=e81]
+              - columnheader "Kind" [ref=e84]:
+                - generic [ref=e85]: Kind
+              - columnheader "State" [ref=e86]:
+                - generic [ref=e87]: State
+              - columnheader "Queue" [ref=e88]:
+                - generic [ref=e89]: Queue
+              - columnheader "Attempt" [ref=e90]:
+                - generic [ref=e91]: Attempt
+              - columnheader "Tags" [ref=e92]:
+                - generic [ref=e93]: Tags
+              - columnheader "Created" [ref=e94]:
+                - generic [ref=e95]: Created
+          - rowgroup [ref=e96]:
+            - row "sync_email" [ref=e97] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e98]:
+                - checkbox "Select sync_email" [ref=e101]
+              - rowheader "sync_email" [ref=e104]
+              - gridcell "available" [ref=e105]:
+                - generic [ref=e106]: available
+              - gridcell "sync_copy" [ref=e107]
+              - gridcell "0/25" [ref=e108]
+              - gridcell "-" [ref=e109]
+              - gridcell "2h ago" [ref=e110]
+            - row "sync_email" [ref=e111] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e112]:
+                - checkbox "Select sync_email" [ref=e115]
+              - rowheader "sync_email" [ref=e118]
+              - gridcell "available" [ref=e119]:
+                - generic [ref=e120]: available
+              - gridcell "sync_copy" [ref=e121]
+              - gridcell "0/25" [ref=e122]
+              - gridcell "-" [ref=e123]
+              - gridcell "2h ago" [ref=e124]
+            - row "sync_email" [ref=e125] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e126]:
+                - checkbox "Select sync_email" [ref=e129]
+              - rowheader "sync_email" [ref=e132]
+              - gridcell "available" [ref=e133]:
+                - generic [ref=e134]: available
+              - gridcell "sync_copy" [ref=e135]
+              - gridcell "0/25" [ref=e136]
+              - gridcell "-" [ref=e137]
+              - gridcell "2h ago" [ref=e138]
+            - row "sync_email" [ref=e139] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e140]:
+                - checkbox "Select sync_email" [ref=e143]
+              - rowheader "sync_email" [ref=e146]
+              - gridcell "available" [ref=e147]:
+                - generic [ref=e148]: available
+              - gridcell "sync_copy" [ref=e149]
+              - gridcell "0/25" [ref=e150]
+              - gridcell "-" [ref=e151]
+              - gridcell "2h ago" [ref=e152]
+            - row "sync_email" [ref=e153] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e154]:
+                - checkbox "Select sync_email" [ref=e157]
+              - rowheader "sync_email" [ref=e160]
+              - gridcell "available" [ref=e161]:
+                - generic [ref=e162]: available
+              - gridcell "sync_copy" [ref=e163]
+              - gridcell "0/25" [ref=e164]
+              - gridcell "-" [ref=e165]
+              - gridcell "2h ago" [ref=e166]
+            - row "sync_email" [ref=e167] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e168]:
+                - checkbox "Select sync_email" [ref=e171]
+              - rowheader "sync_email" [ref=e174]
+              - gridcell "available" [ref=e175]:
+                - generic [ref=e176]: available
+              - gridcell "sync_copy" [ref=e177]
+              - gridcell "0/25" [ref=e178]
+              - gridcell "-" [ref=e179]
+              - gridcell "2h ago" [ref=e180]
+            - row "sync_email" [ref=e181] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e182]:
+                - checkbox "Select sync_email" [ref=e185]
+              - rowheader "sync_email" [ref=e188]
+              - gridcell "available" [ref=e189]:
+                - generic [ref=e190]: available
+              - gridcell "sync_copy" [ref=e191]
+              - gridcell "0/25" [ref=e192]
+              - gridcell "-" [ref=e193]
+              - gridcell "2h ago" [ref=e194]
+            - row "sync_email" [ref=e195] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e196]:
+                - checkbox "Select sync_email" [ref=e199]
+              - rowheader "sync_email" [ref=e202]
+              - gridcell "available" [ref=e203]:
+                - generic [ref=e204]: available
+              - gridcell "sync_copy" [ref=e205]
+              - gridcell "0/25" [ref=e206]
+              - gridcell "-" [ref=e207]
+              - gridcell "2h ago" [ref=e208]
+            - row "sync_email" [ref=e209] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e210]:
+                - checkbox "Select sync_email" [ref=e213]
+              - rowheader "sync_email" [ref=e216]
+              - gridcell "available" [ref=e217]:
+                - generic [ref=e218]: available
+              - gridcell "sync_copy" [ref=e219]
+              - gridcell "0/25" [ref=e220]
+              - gridcell "-" [ref=e221]
+              - gridcell "2h ago" [ref=e222]
+            - row "sync_email" [ref=e223] [cursor=pointer]:
+              - gridcell "Select sync_email" [ref=e224]:
+                - checkbox "Select sync_email" [ref=e227]
+              - rowheader "sync_email" [ref=e230]
+              - gridcell "available" [ref=e231]:
+                - generic [ref=e232]: available
+              - gridcell "sync_copy" [ref=e233]
+              - gridcell "0/25" [ref=e234]
+              - gridcell "-" [ref=e235]
+              - gridcell "2h ago" [ref=e236]
+        - generic [ref=e237]:
+          - generic [ref=e239]: Showing 10 jobs of ~22
+          - generic [ref=e240]:
+            - generic [ref=e241]: "Per page:"
+            - button "20" [ref=e242]
+            - button "50" [ref=e243]
+            - button "100" [ref=e244]
+  - region "Notifications alt+T"
+```
