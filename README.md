@@ -16,6 +16,9 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Structured progress tracking** — handlers report percent, message, and checkpoint metadata; persisted across retries; flushed on every heartbeat.
 - **OpenTelemetry metrics** — built-in counters, histograms, and gauges.
 - **Hot/cold job storage** — runnable work stays in a hot table while deferred work stays in a cold deferred table.
+- **Web UI** — built-in dashboard, job inspector, queue management, and cron controls.
+
+![AWA Web UI — Dashboard (dark mode)](docs/images/awa-ui-dark.png)
 
 ## Quick Start (Rust)
 
@@ -144,6 +147,10 @@ cargo install awa-cli
 awa --database-url $DATABASE_URL migrate
 awa --database-url $DATABASE_URL queue stats
 awa --database-url $DATABASE_URL job list --state failed
+
+# Start the web UI
+awa --database-url $DATABASE_URL serve
+# Open http://127.0.0.1:3000
 ```
 
 ## Architecture
@@ -191,6 +198,7 @@ the physical tables directly.
 | `awa-python` | PyO3 extension module |
 | `awa-testing` | Test helpers (`TestClient`) |
 | `awa-cli` | CLI binary |
+| `awa-ui` | Web UI (axum API + React/IntentUI frontend) |
 
 ## Documentation
 
@@ -209,6 +217,7 @@ the physical tables directly.
 - [ADR-012: Split hot and deferred job storage](docs/adr/012-hot-deferred-job-storage.md)
 - [ADR-013: Durable run leases and guarded finalization](docs/adr/013-run-lease-and-guarded-finalization.md)
 - [ADR-014: Structured progress and metadata](docs/adr/014-structured-progress.md)
+- [Web UI design](docs/ui-design.md)
 - [Benchmarking notes](docs/benchmarking.md)
 - [Validation test plan](docs/test-plan.md)
 - [TLA+ correctness models](corectness/README.md)
