@@ -590,13 +590,17 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None))]
+    #[allow(clippy::too_many_arguments)]
     fn start(
         &self,
         py: Python<'_>,
         queues: Option<Py<PyAny>>,
         poll_interval_ms: u64,
         global_max_workers: Option<u32>,
+        completed_retention_hours: Option<f64>,
+        failed_retention_hours: Option<f64>,
+        cleanup_batch_size: Option<i64>,
     ) -> PyResult<()> {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
@@ -639,6 +643,37 @@ impl PyClient {
         if let Some(global_max) = global_max_workers {
             builder = builder.global_max_workers(global_max);
         }
+        if let Some(hours) = completed_retention_hours {
+            if !hours.is_finite() || hours < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "completed_retention_hours must be a non-negative finite number",
+                ));
+            }
+            builder = builder.completed_retention(Duration::from_secs_f64(hours * 3600.0));
+        }
+        if let Some(hours) = failed_retention_hours {
+            if !hours.is_finite() || hours < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "failed_retention_hours must be a non-negative finite number",
+                ));
+            }
+            builder = builder.failed_retention(Duration::from_secs_f64(hours * 3600.0));
+        }
+        if let Some(batch_size) = cleanup_batch_size {
+            if batch_size <= 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "cleanup_batch_size must be > 0",
+                ));
+            }
+            builder = builder.cleanup_batch_size(batch_size);
+        }
+
+        // Apply per-queue retention overrides collected from queue config dicts
+        let queue_overrides = parse_queue_retention_overrides(py, queues.as_ref())?;
+        for (queue_name, policy) in queue_overrides {
+            builder = builder.queue_retention(queue_name, policy);
+        }
+
         for entry in &entries {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
         }
@@ -1492,4 +1527,86 @@ fn resolve_outcome_to_py(outcome: awa_model::admin::ResolveOutcome) -> PyResolve
             reason: Some(reason),
         },
     }
+}
+
+/// Parse per-queue retention overrides from the queue config dicts.
+///
+/// Looks for an optional `"retention"` key in each dict, expecting:
+/// `{"completed_hours": float, "failed_hours": float}`
+fn parse_queue_retention_overrides(
+    py: Python<'_>,
+    queues: Option<&Py<PyAny>>,
+) -> PyResult<Vec<(String, awa_worker::RetentionPolicy)>> {
+    let queues = match queues {
+        Some(q) => q,
+        None => return Ok(Vec::new()),
+    };
+
+    let bound = queues.bind(py);
+    let list: Vec<Bound<'_, PyAny>> = match bound.extract() {
+        Ok(l) => l,
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let mut overrides = Vec::new();
+
+    for item in &list {
+        // Only dict-form configs can have retention
+        let dict: &Bound<'_, PyDict> = match item.cast() {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        let retention_val = match dict.get_item("retention")? {
+            Some(v) if !v.is_none() => v,
+            _ => continue,
+        };
+
+        let retention_dict: &Bound<'_, PyDict> = retention_val.cast().map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err(
+                "retention must be a dict with 'completed_hours' and/or 'failed_hours' keys",
+            )
+        })?;
+
+        let name: String = dict
+            .get_item("name")?
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "queue config dict with retention must have 'name' key",
+                )
+            })?
+            .extract()?;
+
+        let default_policy = awa_worker::RetentionPolicy::default();
+        let completed_hours: f64 = retention_dict
+            .get_item("completed_hours")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(default_policy.completed.as_secs_f64() / 3600.0);
+        if !completed_hours.is_finite() || completed_hours < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "retention completed_hours must be a non-negative finite number",
+            ));
+        }
+        let failed_hours: f64 = retention_dict
+            .get_item("failed_hours")?
+            .map(|v| v.extract())
+            .transpose()?
+            .unwrap_or(default_policy.failed.as_secs_f64() / 3600.0);
+        if !failed_hours.is_finite() || failed_hours < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "retention failed_hours must be a non-negative finite number",
+            ));
+        }
+
+        overrides.push((
+            name,
+            awa_worker::RetentionPolicy {
+                completed: Duration::from_secs_f64(completed_hours * 3600.0),
+                failed: Duration::from_secs_f64(failed_hours * 3600.0),
+            },
+        ));
+    }
+
+    Ok(overrides)
 }

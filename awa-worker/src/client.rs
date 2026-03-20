@@ -2,7 +2,7 @@ use crate::completion::CompletionBatcher;
 use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
 use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
-use crate::maintenance::MaintenanceService;
+use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
 use awa_model::{JobArgs, JobRow, PeriodicJob};
 use serde::de::DeserializeOwned;
@@ -28,6 +28,8 @@ pub enum BuildError {
     InvalidRateLimit,
     #[error("queue weight must be > 0")]
     InvalidWeight,
+    #[error("cleanup_batch_size must be > 0")]
+    InvalidBatchSize,
 }
 
 /// Health check result.
@@ -75,6 +77,11 @@ pub struct ClientBuilder {
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
+    completed_retention: Option<Duration>,
+    failed_retention: Option<Duration>,
+    cleanup_batch_size: Option<i64>,
+    cleanup_interval: Option<Duration>,
+    queue_retention_overrides: HashMap<String, RetentionPolicy>,
 }
 
 impl ClientBuilder {
@@ -89,6 +96,11 @@ impl ClientBuilder {
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
+            completed_retention: None,
+            failed_retention: None,
+            cleanup_batch_size: None,
+            cleanup_interval: None,
+            queue_retention_overrides: HashMap::new(),
         }
     }
 
@@ -161,6 +173,36 @@ impl ClientBuilder {
         self
     }
 
+    /// Set retention for completed jobs (default: 24h).
+    pub fn completed_retention(mut self, retention: Duration) -> Self {
+        self.completed_retention = Some(retention);
+        self
+    }
+
+    /// Set retention for failed/cancelled jobs (default: 72h).
+    pub fn failed_retention(mut self, retention: Duration) -> Self {
+        self.failed_retention = Some(retention);
+        self
+    }
+
+    /// Set the maximum number of jobs to delete per cleanup pass (default: 1000).
+    pub fn cleanup_batch_size(mut self, batch_size: i64) -> Self {
+        self.cleanup_batch_size = Some(batch_size);
+        self
+    }
+
+    /// Set the cleanup interval (default: 60s).
+    pub fn cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = Some(interval);
+        self
+    }
+
+    /// Set a per-queue retention override.
+    pub fn queue_retention(mut self, queue: impl Into<String>, policy: RetentionPolicy) -> Self {
+        self.queue_retention_overrides.insert(queue.into(), policy);
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -185,6 +227,13 @@ impl ClientBuilder {
             }
             if config.weight == 0 {
                 return Err(BuildError::InvalidWeight);
+            }
+        }
+
+        // Validate batch size
+        if let Some(bs) = self.cleanup_batch_size {
+            if bs <= 0 {
+                return Err(BuildError::InvalidBatchSize);
             }
         }
 
@@ -243,6 +292,11 @@ impl ClientBuilder {
             overflow_pool,
             metrics,
             leader_election_interval: self.leader_election_interval,
+            completed_retention: self.completed_retention,
+            failed_retention: self.failed_retention,
+            cleanup_batch_size: self.cleanup_batch_size,
+            cleanup_interval: self.cleanup_interval,
+            queue_retention_overrides: self.queue_retention_overrides,
         })
     }
 }
@@ -311,6 +365,11 @@ pub struct Client {
     overflow_pool: Option<Arc<OverflowPool>>,
     metrics: crate::metrics::AwaMetrics,
     leader_election_interval: Option<Duration>,
+    completed_retention: Option<Duration>,
+    failed_retention: Option<Duration>,
+    cleanup_batch_size: Option<i64>,
+    cleanup_interval: Option<Duration>,
+    queue_retention_overrides: HashMap<String, RetentionPolicy>,
 }
 
 impl Client {
@@ -374,6 +433,22 @@ impl Client {
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
+        }
+        if let Some(retention) = self.completed_retention {
+            maintenance = maintenance.completed_retention(retention);
+        }
+        if let Some(retention) = self.failed_retention {
+            maintenance = maintenance.failed_retention(retention);
+        }
+        if let Some(batch_size) = self.cleanup_batch_size {
+            maintenance = maintenance.cleanup_batch_size(batch_size);
+        }
+        if let Some(interval) = self.cleanup_interval {
+            maintenance = maintenance.cleanup_interval(interval);
+        }
+        if !self.queue_retention_overrides.is_empty() {
+            maintenance =
+                maintenance.queue_retention_overrides(self.queue_retention_overrides.clone());
         }
         service_handles.push(tokio::spawn(async move {
             maintenance.run().await;

@@ -182,3 +182,45 @@ async def test_rate_limit_wrong_type_raises(client):
         client.start(
             [{"name": queue, "max_workers": 10, "rate_limit": "fast"}]
         )
+
+
+# -- Retention kwargs --
+
+
+@pytest.mark.asyncio
+async def test_retention_kwargs_accepted(client):
+    """start() with retention kwargs starts successfully."""
+    queue = "cfg_retention"
+
+    @client.worker(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    client.start(
+        [(queue, 10)],
+        completed_retention_hours=1.0,
+        failed_retention_hours=168.0,
+        cleanup_batch_size=500,
+    )
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_per_queue_retention_in_dict_config(client):
+    """Dict form with per-queue retention config starts successfully."""
+    queue = "cfg_per_queue_retention"
+
+    @client.worker(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    client.start(
+        [
+            {
+                "name": queue,
+                "max_workers": 5,
+                "retention": {"completed_hours": 1, "failed_hours": 168},
+            }
+        ]
+    )
+    await client.shutdown()

@@ -14,5 +14,5 @@ pub use awa_model::{
 pub use awa_worker::{
     self as worker, context::ProgressState, BuildError, CallbackToken, Client, ClientBuilder,
     HealthCheck, JobContext, JobError, JobResult, PeriodicJob, PeriodicJobBuilder, QueueCapacity,
-    QueueConfig, QueueHealth, RateLimit, Worker,
+    QueueConfig, QueueHealth, RateLimit, RetentionPolicy, Worker,
 };
