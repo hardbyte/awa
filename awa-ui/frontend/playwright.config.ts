@@ -1,4 +1,10 @@
 import { defineConfig } from "@playwright/test";
+import path from "node:path";
+
+const awaBinary = path.resolve(__dirname, "../../target/debug/awa");
+const databaseUrl =
+  process.env.DATABASE_URL ??
+  "postgres://postgres:test@localhost:15432/awa_test";
 
 export default defineConfig({
   testDir: "./e2e",
@@ -18,8 +24,7 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command:
-      "/Users/brian/dev/awa/.claude/worktrees/spicy-swinging-corbato/target/debug/awa --database-url postgres://postgres:test@localhost:15432/awa_test serve",
+    command: `${awaBinary} --database-url ${databaseUrl} serve`,
     url: "http://127.0.0.1:3000",
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

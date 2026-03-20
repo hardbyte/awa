@@ -5,6 +5,10 @@ import { resolve } from "path";
 
 export default defineConfig({
   plugins: [react(), tailwindcss()],
+  test: {
+    include: ["src/**/*.test.{ts,tsx}"],
+    exclude: ["e2e/**"],
+  },
   resolve: {
     alias: {
       "@": resolve(__dirname, "./src"),

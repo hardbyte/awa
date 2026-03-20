@@ -1,11 +1,12 @@
 import { QueryClient } from "@tanstack/react-query";
+import { POLL } from "@/lib/constants";
 
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      refetchInterval: 5000,
+      refetchInterval: POLL.DEFAULT,
       refetchIntervalInBackground: false, // Pause polling when tab is hidden
-      staleTime: 1000,
+      staleTime: POLL.DEFAULT / 2,
       refetchOnWindowFocus: true,
     },
   },

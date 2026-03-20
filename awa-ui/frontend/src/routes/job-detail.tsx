@@ -22,6 +22,7 @@ import { ProgressDisplay } from "@/components/ProgressDisplay";
 import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
+import { POLL } from "@/lib/constants";
 
 function hasMetadata(job: JobRow): boolean {
   return (
@@ -40,7 +41,7 @@ export function JobDetailPage() {
     queryKey: ["job", jobId],
     queryFn: () => fetchJob(jobId),
     enabled: !isNaN(jobId),
-    refetchInterval: 2000,
+    refetchInterval: POLL.FAST,
   });
 
   const retryMutation = useMutation({
