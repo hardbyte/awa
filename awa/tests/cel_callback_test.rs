@@ -722,10 +722,10 @@ async fn test_c16_resolve_rejects_running() {
 }
 
 // ── C17: Concurrent resolve_callback (FOR UPDATE prevents race) ──
-// This is hard to test deterministically. We verify that the second
-// call gets CallbackNotFound (the lock ensures serialization).
+// Use multi_thread + tokio::spawn to ensure both futures truly run
+// in parallel on separate tasks, exercising the FOR UPDATE lock.
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_c17_concurrent_resolve() {
     let client = setup().await;
     let queue = "test_c17_concurrent";
@@ -736,12 +736,18 @@ async fn test_c17_concurrent_resolve() {
     let pool1 = client.pool().clone();
     let pool2 = client.pool().clone();
 
-    let (r1, r2) = tokio::join!(
-        admin::resolve_callback(&pool1, callback_id, None, DefaultAction::Complete),
-        admin::resolve_callback(&pool2, callback_id, None, DefaultAction::Complete),
-    );
+    // Spawn on separate tasks to guarantee true parallel execution
+    let h1 = tokio::spawn(async move {
+        admin::resolve_callback(&pool1, callback_id, None, DefaultAction::Complete).await
+    });
+    let h2 = tokio::spawn(async move {
+        admin::resolve_callback(&pool2, callback_id, None, DefaultAction::Complete).await
+    });
 
-    // One should succeed, the other should fail
+    let r1 = h1.await.expect("task 1 panicked");
+    let r2 = h2.await.expect("task 2 panicked");
+
+    // One should succeed, the other should fail with CallbackNotFound
     let successes = [&r1, &r2].iter().filter(|r| r.is_ok()).count();
     let failures = [&r1, &r2]
         .iter()

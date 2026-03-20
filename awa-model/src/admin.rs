@@ -620,8 +620,12 @@ pub async fn resolve_callback(
 ) -> Result<ResolveOutcome, AwaError> {
     let mut tx = pool.begin().await?;
 
+    // Query jobs_hot directly (not the awa.jobs UNION ALL view) because
+    // FOR UPDATE is not reliably supported on UNION views. Waiting_external
+    // jobs are always in jobs_hot (the check constraint on scheduled_jobs
+    // only allows scheduled/retryable).
     let job = sqlx::query_as::<_, JobRow>(
-        "SELECT * FROM awa.jobs WHERE callback_id = $1
+        "SELECT * FROM awa.jobs_hot WHERE callback_id = $1
          AND state = 'waiting_external'
          FOR UPDATE",
     )
