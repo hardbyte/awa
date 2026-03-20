@@ -1,7 +1,9 @@
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
+use serde::Serialize;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
+use std::collections::HashMap;
 use uuid::Uuid;
 
 /// Retry a single failed, cancelled, or waiting_external job.
@@ -166,7 +168,7 @@ where
 }
 
 /// Queue statistics.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueueStats {
     pub queue: String,
     pub available: i64,
@@ -175,6 +177,7 @@ pub struct QueueStats {
     pub waiting_external: i64,
     pub completed_last_hour: i64,
     pub lag_seconds: Option<f64>,
+    pub paused: bool,
 }
 
 /// Get statistics for all queues.
@@ -182,19 +185,21 @@ pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, Option<f64>)>(
+    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, Option<f64>, bool)>(
         r#"
         SELECT
-            queue,
-            count(*) FILTER (WHERE state = 'available') AS available,
-            count(*) FILTER (WHERE state = 'running') AS running,
-            count(*) FILTER (WHERE state = 'failed') AS failed,
-            count(*) FILTER (WHERE state = 'waiting_external') AS waiting_external,
-            count(*) FILTER (WHERE state = 'completed'
-                AND finalized_at > now() - interval '1 hour') AS completed_last_hour,
-            EXTRACT(EPOCH FROM (now() - min(run_at) FILTER (WHERE state = 'available')))::float8 AS lag_seconds
-        FROM awa.jobs
-        GROUP BY queue
+            j.queue,
+            count(*) FILTER (WHERE j.state = 'available') AS available,
+            count(*) FILTER (WHERE j.state = 'running') AS running,
+            count(*) FILTER (WHERE j.state = 'failed') AS failed,
+            count(*) FILTER (WHERE j.state = 'waiting_external') AS waiting_external,
+            count(*) FILTER (WHERE j.state = 'completed'
+                AND j.finalized_at > now() - interval '1 hour') AS completed_last_hour,
+            EXTRACT(EPOCH FROM (now() - min(j.run_at) FILTER (WHERE j.state = 'available')))::float8 AS lag_seconds,
+            COALESCE(qm.paused, FALSE) AS paused
+        FROM awa.jobs j
+        LEFT JOIN awa.queue_meta qm ON qm.queue = j.queue
+        GROUP BY j.queue, qm.paused
         "#,
     )
     .fetch_all(executor)
@@ -211,6 +216,7 @@ where
                 waiting_external,
                 completed_last_hour,
                 lag_seconds,
+                paused,
             )| QueueStats {
                 queue,
                 available,
@@ -219,17 +225,20 @@ where
                 waiting_external,
                 completed_last_hour,
                 lag_seconds,
+                paused,
             },
         )
         .collect())
 }
 
 /// List jobs with optional filters.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct ListJobsFilter {
     pub state: Option<JobState>,
     pub kind: Option<String>,
     pub queue: Option<String>,
+    pub tag: Option<String>,
+    pub before_id: Option<i64>,
     pub limit: Option<i64>,
 }
 
@@ -246,13 +255,17 @@ where
         WHERE ($1::awa.job_state IS NULL OR state = $1)
           AND ($2::text IS NULL OR kind = $2)
           AND ($3::text IS NULL OR queue = $3)
+          AND ($4::text IS NULL OR tags @> ARRAY[$4]::text[])
+          AND ($5::bigint IS NULL OR id < $5)
         ORDER BY id DESC
-        LIMIT $4
+        LIMIT $6
         "#,
     )
     .bind(filter.state)
     .bind(&filter.kind)
     .bind(&filter.queue)
+    .bind(&filter.tag)
+    .bind(filter.before_id)
     .bind(limit)
     .fetch_all(executor)
     .await?;
@@ -271,6 +284,133 @@ where
         .await?;
 
     row.ok_or(AwaError::JobNotFound { id: job_id })
+}
+
+/// Count jobs grouped by state.
+pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows =
+        sqlx::query_as::<_, (JobState, i64)>("SELECT state, count(*) FROM awa.jobs GROUP BY state")
+            .fetch_all(executor)
+            .await?;
+
+    Ok(rows.into_iter().collect())
+}
+
+/// Return all distinct job kinds.
+pub async fn distinct_kinds<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = sqlx::query_scalar::<_, String>("SELECT DISTINCT kind FROM awa.jobs ORDER BY kind")
+        .fetch_all(executor)
+        .await?;
+
+    Ok(rows)
+}
+
+/// Return all distinct queue names.
+pub async fn distinct_queues<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows =
+        sqlx::query_scalar::<_, String>("SELECT DISTINCT queue FROM awa.jobs ORDER BY queue")
+            .fetch_all(executor)
+            .await?;
+
+    Ok(rows)
+}
+
+/// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.
+pub async fn bulk_retry<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'available', attempt = 0, run_at = now(),
+            finalized_at = NULL, heartbeat_at = NULL, deadline_at = NULL,
+            callback_id = NULL, callback_timeout_at = NULL,
+            callback_filter = NULL, callback_on_complete = NULL,
+            callback_on_fail = NULL, callback_transform = NULL
+        WHERE id = ANY($1) AND state IN ('failed', 'cancelled', 'waiting_external')
+        RETURNING *
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Cancel multiple jobs by ID. Only cancels non-terminal jobs.
+pub async fn bulk_cancel<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'cancelled', finalized_at = now(),
+            callback_id = NULL, callback_timeout_at = NULL,
+            callback_filter = NULL, callback_on_complete = NULL,
+            callback_on_fail = NULL, callback_transform = NULL
+        WHERE id = ANY($1) AND state NOT IN ('completed', 'failed', 'cancelled')
+        RETURNING *
+        "#,
+    )
+    .bind(ids)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows)
+}
+
+/// A bucketed count of jobs by state over time.
+#[derive(Debug, Clone, Serialize)]
+pub struct StateTimeseriesBucket {
+    pub bucket: chrono::DateTime<chrono::Utc>,
+    pub state: JobState,
+    pub count: i64,
+}
+
+/// Return time-bucketed state counts over the last N minutes.
+pub async fn state_timeseries<'e, E>(
+    executor: E,
+    minutes: i32,
+) -> Result<Vec<StateTimeseriesBucket>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(
+        r#"
+        SELECT
+            date_trunc('minute', created_at) AS bucket,
+            state,
+            count(*) AS count
+        FROM awa.jobs
+        WHERE created_at >= now() - make_interval(mins => $1)
+        GROUP BY bucket, state
+        ORDER BY bucket
+        "#,
+    )
+    .bind(minutes)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(bucket, state, count)| StateTimeseriesBucket {
+            bucket,
+            state,
+            count,
+        })
+        .collect())
 }
 
 /// Register a callback for a running job, writing the callback_id and timeout

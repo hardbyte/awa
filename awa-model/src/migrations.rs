@@ -4,13 +4,13 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 2;
+pub const CURRENT_VERSION: i32 = 3;
 
 /// All migrations in order.
-const MIGRATIONS: &[(i32, &str, &[&str])] = &[(2, "Canonical schema", &[V2_UP])];
+const MIGRATIONS: &[(i32, &str, &[&str])] = &[(3, "Canonical schema with UI indexes", &[V3_UP])];
 
-/// The canonical schema.
-const V2_UP: &str = r#"
+/// The canonical schema (V3: V2 + BRIN on created_at + GIN on tags).
+const V3_UP: &str = r#"
 -- Awa schema v2: Canonical hot/deferred schema with structured progress
 
 CREATE SCHEMA IF NOT EXISTS awa;
@@ -398,8 +398,20 @@ CREATE INDEX idx_awa_scheduled_jobs_kind_state
 CREATE UNIQUE INDEX idx_awa_jobs_unique
     ON awa.job_unique_claims (unique_key);
 
+-- BRIN indexes on created_at for time-range queries (UI dashboard, timeseries)
+CREATE INDEX idx_awa_jobs_hot_created_at
+    ON awa.jobs_hot USING BRIN (created_at) WITH (pages_per_range = 32);
+CREATE INDEX idx_awa_scheduled_jobs_created_at
+    ON awa.scheduled_jobs USING BRIN (created_at) WITH (pages_per_range = 32);
+
+-- GIN indexes on tags for array containment queries (tag filtering)
+CREATE INDEX idx_awa_jobs_hot_tags
+    ON awa.jobs_hot USING GIN (tags) WHERE tags IS NOT NULL AND tags != '{}';
+CREATE INDEX idx_awa_scheduled_jobs_tags
+    ON awa.scheduled_jobs USING GIN (tags) WHERE tags IS NOT NULL AND tags != '{}';
+
 INSERT INTO awa.schema_version (version, description)
-VALUES (2, 'Canonical schema');
+VALUES (3, 'Canonical schema with UI indexes');
 "#;
 
 /// Run all pending migrations against the database.

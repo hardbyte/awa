@@ -117,6 +117,25 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
+  # ─── Frontend ──────────────────────────────────────────
+  frontend-lint:
+    name: Frontend lint + typecheck
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: awa-ui/frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npx tsc --noEmit
+      - name: Build
+        run: npm run build
+
   # ─── Phase 0 spike ──────────────────────────────────────
   pyo3-spike:
     name: Phase 0 PyO3 spike
@@ -197,3 +216,10 @@ jobs:
         run: ./target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test job list
       - name: Queue stats (empty)
         run: ./target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test queue stats
+      - name: Serve smoke test
+        run: |
+          ./target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test serve &
+          SERVER_PID=$!
+          sleep 2
+          curl -sf http://127.0.0.1:3000/api/stats
+          kill $SERVER_PID

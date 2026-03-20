@@ -7,6 +7,7 @@ use crate::error::AwaError;
 use crate::job::JobRow;
 use chrono::{DateTime, Utc};
 use croner::Cron;
+use serde::Serialize;
 use sqlx::PgExecutor;
 
 /// A periodic job schedule definition.
@@ -211,7 +212,7 @@ impl PeriodicJobBuilder {
 }
 
 /// A row from the `awa.cron_jobs` table.
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct CronJobRow {
     pub name: String,
     pub cron_expr: String,
@@ -332,6 +333,36 @@ where
     .await?;
 
     Ok(row)
+}
+
+/// Trigger an immediate run of a cron job without updating last_enqueued_at.
+///
+/// Reads the cron job config from `awa.cron_jobs` and inserts a new job
+/// directly. Does NOT update `last_enqueued_at` so the normal schedule
+/// is unaffected.
+pub async fn trigger_cron_job<'e, E>(executor: E, name: &str) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        WITH cron AS (
+            SELECT name, kind, queue, args, priority, max_attempts, tags, metadata
+            FROM awa.cron_jobs
+            WHERE name = $1
+        )
+        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, tags, metadata)
+        SELECT kind, queue, args, 'available', priority, max_attempts, tags,
+               metadata || jsonb_build_object('cron_name', name, 'triggered_manually', true)
+        FROM cron
+        RETURNING *
+        "#,
+    )
+    .bind(name)
+    .fetch_optional(executor)
+    .await?;
+
+    row.ok_or_else(|| AwaError::Validation(format!("cron job not found: {name}")))
 }
 
 #[cfg(test)]

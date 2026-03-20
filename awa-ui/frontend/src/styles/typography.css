@@ -1,0 +1,48 @@
+/* Inter */
+@font-face {
+  font-family: "Inter";
+  src: url("fonts/InterVariable.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Inter";
+  src: url("fonts/InterVariable-Italic.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* Geist */
+@font-face {
+  font-family: "Geist Mono";
+  src: url("fonts/geist-mono.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "Geist Mono";
+  src: url("fonts/geist-mono-italic.woff2") format("woff2-variations");
+  font-weight: 100 900;
+  font-style: italic;
+  font-display: swap;
+}
+
+/* Instrument serif */
+@font-face {
+  font-family: 'Instrument Serif Regular';
+  font-style: normal;
+  font-weight: normal;
+  src: local('Instrument Serif Regular'), url('fonts/instrumentserif-regular.woff') format('woff');
+}
+
+@font-face {
+  font-family: 'Instrument Serif Italic';
+  font-style: normal;
+  font-weight: normal;
+  src: local('Instrument Serif Italic'), url('fonts/instrumentserif-italic.woff') format('woff');
+}

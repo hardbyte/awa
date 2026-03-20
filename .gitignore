@@ -11,3 +11,8 @@
 *.dll
 .env
 awa-python/python/awa/lib_awa.dylib.dSYM/
+
+# Frontend
+/awa-ui/frontend/node_modules
+/awa-ui/static/assets
+/awa-ui/static/index.html

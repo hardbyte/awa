@@ -1,0 +1,25 @@
+[package]
+name = "awa-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Web UI and JSON API for the Awa job queue"
+repository.workspace = true
+readme.workspace = true
+
+[dependencies]
+awa-model.workspace = true
+axum.workspace = true
+tower-http.workspace = true
+rust-embed.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+mime_guess = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }

@@ -35,6 +35,15 @@ enum Commands {
         #[command(subcommand)]
         command: CronCommands,
     },
+    /// Start the web UI server
+    Serve {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on
+        #[arg(long, default_value = "3000")]
+        port: u16,
+    },
 }
 
 #[derive(Subcommand)]
@@ -175,6 +184,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     kind,
                     queue,
                     limit: Some(limit),
+                    ..Default::default()
                 };
 
                 let jobs = awa_model::admin::list_jobs(&pool, &filter).await?;
@@ -225,6 +235,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         },
 
+        Commands::Serve { host, port } => {
+            let app = awa_ui::router(pool);
+            let addr = format!("{host}:{port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!("AWA UI listening on http://{addr}");
+            axum::serve(listener, app).await?;
+        }
+
         Commands::Queue { command } => match command {
             QueueCommands::Pause { queue } => {
                 awa_model::admin::pause_queue(&pool, &queue, Some("cli")).await?;
@@ -244,12 +262,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("No queues found.");
                 } else {
                     println!(
-                        "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10}",
-                        "QUEUE", "AVAIL", "RUNNING", "FAILED", "COMPLETED/1H", "LAG(s)"
+                        "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
+                        "QUEUE", "AVAIL", "RUNNING", "FAILED", "COMPLETED/1H", "LAG(s)", "PAUSED"
                     );
                     for stat in &stats {
                         println!(
-                            "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10}",
+                            "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
                             stat.queue,
                             stat.available,
                             stat.running,
@@ -258,6 +276,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             stat.lag_seconds
                                 .map(|s| format!("{:.1}", s))
                                 .unwrap_or_else(|| "-".to_string()),
+                            if stat.paused { "yes" } else { "no" },
                         );
                     }
                 }

@@ -13,6 +13,8 @@ path = "src/main.rs"
 
 [dependencies]
 awa-model.workspace = true
+awa-ui = { path = "../awa-ui" }
+axum.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 clap.workspace = true
