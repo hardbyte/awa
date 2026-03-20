@@ -13,7 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 awa-model.workspace = true
-awa-ui = { path = "../awa-ui", version = "0.3.0-alpha.3" }
+awa-ui = { path = "../awa-ui", version = "0.3.0" }
 axum.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
