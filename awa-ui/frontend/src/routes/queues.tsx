@@ -76,8 +76,57 @@ export function QueuesPage() {
     <div className="space-y-4">
       <Heading level={2}>Queues</Heading>
 
+      {/* Mobile card layout */}
+      {queues.length > 0 && (
+        <div className="space-y-3 sm:hidden">
+          {queues.map((q) => (
+            <div key={q.queue} className="rounded-lg border p-4">
+              <div className="flex items-center justify-between">
+                <Link
+                  to="/queues/$name"
+                  params={{ name: q.queue }}
+                  className="font-medium text-primary no-underline hover:underline"
+                >
+                  {q.queue}
+                </Link>
+                {q.paused ? (
+                  <Badge intent="warning">Paused</Badge>
+                ) : (
+                  <Badge intent="success">Active</Badge>
+                )}
+              </div>
+              <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                <span className="text-muted-fg">Available</span>
+                <span>{q.available}</span>
+                <span className="text-muted-fg">Running</span>
+                <span>{q.running}</span>
+                <span className="text-muted-fg">Failed</span>
+                <span className={q.failed > 0 ? "text-danger" : ""}>{q.failed}</span>
+                <span className="text-muted-fg">Lag</span>
+                <span><LagValue seconds={q.lag_seconds} /></span>
+              </div>
+              <div className="mt-3 flex gap-2">
+                {q.paused ? (
+                  <Button intent="outline" size="xs" onPress={() => resumeMutation.mutate(q.queue)}>
+                    Resume
+                  </Button>
+                ) : (
+                  <Button intent="outline" size="xs" onPress={() => pauseMutation.mutate(q.queue)}>
+                    Pause
+                  </Button>
+                )}
+                <Button intent="outline" size="xs" className="text-danger" onPress={() => setDrainTarget(q.queue)}>
+                  Drain
+                </Button>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Desktop table layout */}
       {queues.length > 0 ? (
-        <Table aria-label="Queues">
+        <Table aria-label="Queues" className="hidden sm:table">
           <TableHeader>
             <TableColumn isRowHeader>Queue</TableColumn>
             <TableColumn>Available</TableColumn>

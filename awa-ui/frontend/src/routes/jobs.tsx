@@ -115,7 +115,7 @@ export function JobsPage() {
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
-    refetchInterval: hasSel ? false : undefined, // undefined = use global default (2s)
+    refetchInterval: hasSel ? false : 2000,
   });
 
   const statsQuery = useQuery<StateCounts>({

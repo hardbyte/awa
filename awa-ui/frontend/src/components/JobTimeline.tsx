@@ -1,6 +1,10 @@
 /**
- * Vertical timeline showing a job's lifecycle progression.
- * Reconstructs history from timestamps and the errors array.
+ * Vertical timeline showing a job's lifecycle.
+ *
+ * Important: this reconstructs history from available timestamps and the
+ * errors[] array. AWA does not store a full state-transition log, so the
+ * timeline shows what we *know* (timestamps that exist) rather than
+ * guessing intermediate states.
  */
 
 import type { JobRow } from "@/lib/api";
@@ -17,14 +21,13 @@ interface TimelineEvent {
 function buildTimeline(job: JobRow): TimelineEvent[] {
   const events: TimelineEvent[] = [];
 
-  // Created
+  // Created — this is always known
   events.push({
     timestamp: job.created_at,
     label: "Created",
-    state: job.run_at !== job.created_at ? "scheduled" : "available",
   });
 
-  // Errors (each attempt that failed)
+  // Error history — each entry in errors[] has a timestamp and attempt number
   if (job.errors && job.errors.length > 0) {
     for (const err of job.errors) {
       if (err && typeof err === "object" && err !== null) {
@@ -35,8 +38,8 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
         if (at) {
           events.push({
             timestamp: at,
-            label: `Attempt ${attempt ?? "?"}`,
-            state: "retryable",
+            label: attempt != null ? `Attempt ${attempt} failed` : "Error",
+            state: "failed",
             detail: error,
             isError: true,
           });
@@ -45,41 +48,35 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
     }
   }
 
-  // Last attempt (if running or completed without errors)
-  if (job.attempted_at && job.state === "running") {
+  // Current attempt started — only shown if we have attempted_at
+  if (job.attempted_at && !["completed", "failed", "cancelled"].includes(job.state)) {
     events.push({
       timestamp: job.attempted_at,
-      label: `Running (attempt ${job.attempt})`,
-      state: "running",
-    });
-  }
-
-  // Waiting external
-  if (job.state === "waiting_external" && job.attempted_at) {
-    events.push({
-      timestamp: job.attempted_at,
-      label: "Waiting for callback",
-      state: "waiting_external",
-    });
-  }
-
-  // Finalized
-  if (job.finalized_at) {
-    events.push({
-      timestamp: job.finalized_at,
-      label:
-        job.state === "completed"
-          ? "Completed"
-          : job.state === "failed"
-            ? "Failed (exhausted attempts)"
-            : job.state === "cancelled"
-              ? "Cancelled"
-              : "Finalized",
+      label: job.state === "waiting_external"
+        ? `Attempt ${job.attempt} — waiting for callback`
+        : `Attempt ${job.attempt} started`,
       state: job.state,
     });
   }
 
-  // Sort by timestamp
+  // Finalized — only shown if we have finalized_at
+  if (job.finalized_at) {
+    const label =
+      job.state === "completed"
+        ? `Completed (attempt ${job.attempt})`
+        : job.state === "failed"
+          ? `Failed after ${job.attempt} attempt${job.attempt !== 1 ? "s" : ""}`
+          : job.state === "cancelled"
+            ? "Cancelled"
+            : "Finalized";
+    events.push({
+      timestamp: job.finalized_at,
+      label,
+      state: job.state,
+    });
+  }
+
+  // Sort chronologically
   events.sort(
     (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime()
   );
@@ -104,7 +101,7 @@ export function JobTimeline({ job }: { job: JobRow }) {
   if (events.length === 0) return null;
 
   return (
-    <div className="relative space-y-0">
+    <div className="space-y-0">
       {events.map((event, i) => {
         const isLast = i === events.length - 1;
         const dotColor = event.state
@@ -129,10 +126,10 @@ export function JobTimeline({ job }: { job: JobRow }) {
 
             {/* Content */}
             <div className="min-w-0 flex-1">
-              <div className="flex items-baseline gap-2">
+              <div className="flex flex-wrap items-baseline gap-2">
                 <span className="text-sm font-medium">{event.label}</span>
                 {event.state && <StateBadge state={event.state} />}
-                <time className="ml-auto text-xs text-muted-fg tabular-nums">
+                <time className="ml-auto text-xs tabular-nums text-muted-fg">
                   {new Date(event.timestamp).toLocaleString()}
                 </time>
               </div>
@@ -143,6 +140,11 @@ export function JobTimeline({ job }: { job: JobRow }) {
           </div>
         );
       })}
+
+      {/* Transparency note */}
+      <p className="pt-2 text-xs text-muted-fg/60">
+        Timeline reconstructed from job timestamps and error history.
+      </p>
     </div>
   );
 }
