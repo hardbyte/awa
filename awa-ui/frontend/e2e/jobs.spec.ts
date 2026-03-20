@@ -61,7 +61,7 @@ test.describe("Jobs page", () => {
   test("search bar is present and interactive", async ({ page }) => {
     await page.goto("/jobs");
 
-    const searchInput = page.getByPlaceholder("Search by kind:");
+    const searchInput = page.getByPlaceholder(/Filter by kind/);
     await expect(searchInput).toBeVisible();
 
     await searchInput.fill("kind:test");
