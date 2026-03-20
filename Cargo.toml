@@ -7,6 +7,7 @@ members = [
     "awa",
     "awa-testing",
     "awa-cli",
+    "awa-ui",
 ]
 exclude = ["awa-python", "spike"]
 
@@ -65,6 +66,11 @@ cel = { version = "0.13", features = ["json"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+
+# Web
+axum = "0.8"
+tower-http = { version = "0.6", features = ["cors"] }
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
 
 # Proc macro
 syn = { version = "2", features = ["full"] }

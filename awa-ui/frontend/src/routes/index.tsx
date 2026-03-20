@@ -1,0 +1,281 @@
+import { useQuery } from "@tanstack/react-query";
+import { Link } from "@tanstack/react-router";
+import { fetchStats, fetchQueues, fetchJobs } from "@/lib/api";
+import type { StateCounts, QueueStats, JobRow } from "@/lib/api";
+import { StateBadge } from "@/components/StateBadge";
+import { Heading } from "@/components/ui/heading";
+import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import {
+  Table,
+  TableHeader,
+  TableBody,
+  TableRow,
+  TableCell,
+  TableColumn,
+} from "@/components/ui/table";
+import { Badge } from "@/components/ui/badge";
+
+function timeAgo(dateStr: string): string {
+  const seconds = Math.floor(
+    (Date.now() - new Date(dateStr).getTime()) / 1000
+  );
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+/** Background tint per state for counter cards */
+const STATE_CARD_BG: Record<string, string> = {
+  available: "bg-info-subtle",
+  running: "bg-success-subtle",
+  failed: "bg-danger-subtle",
+  completed: "bg-success-subtle/50",
+};
+
+const COUNTER_KEYS = ["available", "running", "failed", "completed"] as const;
+
+/** Show top N queues sorted by activity, with a "View all" link. */
+const DASHBOARD_QUEUE_LIMIT = 10;
+
+export function DashboardPage() {
+  const statsQuery = useQuery<StateCounts>({
+    queryKey: ["stats"],
+    queryFn: fetchStats,
+  });
+
+  const queuesQuery = useQuery<QueueStats[]>({
+    queryKey: ["queues"],
+    queryFn: fetchQueues,
+  });
+
+  const failedQuery = useQuery<JobRow[]>({
+    queryKey: ["jobs", { state: "failed", limit: 10 }],
+    queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
+  });
+
+  const completedPerHour = queuesQuery.data
+    ? queuesQuery.data.reduce((sum, q) => sum + q.completed_last_hour, 0)
+    : null;
+
+  const totalJobs = statsQuery.data
+    ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
+    : null;
+
+  // Sort queues by activity (available + running + failed desc), take top N
+  const topQueues = queuesQuery.data
+    ? [...queuesQuery.data]
+        .sort(
+          (a, b) =>
+            b.available +
+            b.running +
+            b.failed -
+            (a.available + a.running + a.failed)
+        )
+        .slice(0, DASHBOARD_QUEUE_LIMIT)
+    : [];
+
+  const hasMoreQueues =
+    queuesQuery.data && queuesQuery.data.length > DASHBOARD_QUEUE_LIMIT;
+
+  return (
+    <div className="space-y-6">
+      <Heading level={2}>Dashboard</Heading>
+
+      {/* Headline counter cards */}
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+        {COUNTER_KEYS.map((key) => {
+          const count = statsQuery.data?.[key] ?? 0;
+          const bg = STATE_CARD_BG[key] ?? "";
+          return (
+            <Link
+              key={key}
+              to="/jobs"
+              search={{ state: key === "completed" ? undefined : key }}
+              className="no-underline"
+            >
+              <Card
+                className={`text-center transition-colors hover:opacity-80 ${bg}`}
+              >
+                <CardContent className="py-4">
+                  <div className="text-3xl font-bold tabular-nums">
+                    {count.toLocaleString()}
+                  </div>
+                  <div className="mt-1.5">
+                    <StateBadge state={key} />
+                  </div>
+                </CardContent>
+              </Card>
+            </Link>
+          );
+        })}
+        {completedPerHour != null && (
+          <Card className="text-center">
+            <CardContent className="py-4">
+              <div className="text-3xl font-bold tabular-nums">
+                {completedPerHour.toLocaleString()}
+              </div>
+              <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
+            </CardContent>
+          </Card>
+        )}
+      </div>
+
+      {/* Total jobs count */}
+      {totalJobs != null && (
+        <p className="text-sm text-muted-fg">
+          {totalJobs.toLocaleString()} total jobs across{" "}
+          {queuesQuery.data?.length ?? 0} queues
+        </p>
+      )}
+
+      {/* Queue summary — top N by activity */}
+      <Card>
+        <CardHeader
+          title="Queues"
+          description={
+            hasMoreQueues
+              ? `Showing top ${DASHBOARD_QUEUE_LIMIT} by activity`
+              : undefined
+          }
+        />
+        <CardContent>
+          {topQueues.length > 0 ? (
+            <>
+              <Table aria-label="Queue summary">
+                <TableHeader>
+                  <TableColumn isRowHeader>Queue</TableColumn>
+                  <TableColumn>Available</TableColumn>
+                  <TableColumn>Running</TableColumn>
+                  <TableColumn>Failed</TableColumn>
+                  <TableColumn>Completed/hr</TableColumn>
+                  <TableColumn>Lag (s)</TableColumn>
+                  <TableColumn>Status</TableColumn>
+                </TableHeader>
+                <TableBody>
+                  {topQueues.map((q) => (
+                    <TableRow key={q.queue} id={q.queue}>
+                      <TableCell className="font-medium">
+                        <Link
+                          to="/queues/$name"
+                          params={{ name: q.queue }}
+                          className="text-primary no-underline hover:underline"
+                        >
+                          {q.queue}
+                        </Link>
+                      </TableCell>
+                      <TableCell>{q.available.toLocaleString()}</TableCell>
+                      <TableCell>{q.running}</TableCell>
+                      <TableCell>
+                        <span className={q.failed > 0 ? "text-danger" : ""}>
+                          {q.failed}
+                        </span>
+                      </TableCell>
+                      <TableCell>{q.completed_last_hour}</TableCell>
+                      <TableCell>
+                        {q.lag_seconds != null
+                          ? q.lag_seconds.toFixed(1)
+                          : "-"}
+                      </TableCell>
+                      <TableCell>
+                        {q.paused ? (
+                          <Badge intent="warning">Paused</Badge>
+                        ) : (
+                          <Badge intent="success">Active</Badge>
+                        )}
+                      </TableCell>
+                    </TableRow>
+                  ))}
+                </TableBody>
+              </Table>
+              {hasMoreQueues && (
+                <div className="px-4 py-3">
+                  <Link
+                    to="/queues"
+                    className="text-sm text-primary no-underline hover:underline"
+                  >
+                    View all {queuesQuery.data?.length} queues &rarr;
+                  </Link>
+                </div>
+              )}
+            </>
+          ) : queuesQuery.isLoading ? (
+            <p className="py-4 text-sm text-muted-fg">Loading queues...</p>
+          ) : (
+            <p className="py-4 text-sm text-muted-fg">No queues found.</p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* Recent failures */}
+      <Card>
+        <CardHeader title="Recent Failures" />
+        <CardContent>
+          {failedQuery.data && failedQuery.data.length > 0 ? (
+            <Table aria-label="Recent failures">
+              <TableHeader>
+                <TableColumn isRowHeader>ID</TableColumn>
+                <TableColumn>Kind</TableColumn>
+                <TableColumn>Queue</TableColumn>
+                <TableColumn>Attempt</TableColumn>
+                <TableColumn>Failed</TableColumn>
+                <TableColumn>Error</TableColumn>
+              </TableHeader>
+              <TableBody>
+                {failedQuery.data.map((job) => {
+                  const lastErr =
+                    job.errors && job.errors.length > 0
+                      ? job.errors[job.errors.length - 1]
+                      : null;
+                  const errMsg =
+                    lastErr &&
+                    typeof lastErr === "object" &&
+                    lastErr !== null
+                      ? String(
+                          (lastErr as Record<string, unknown>)["error"] ?? ""
+                        )
+                      : "";
+                  return (
+                    <TableRow key={job.id} id={job.id}>
+                      <TableCell className="font-mono">
+                        <Link
+                          to="/jobs/$id"
+                          params={{ id: String(job.id) }}
+                          className="text-primary no-underline hover:underline"
+                        >
+                          {job.id}
+                        </Link>
+                      </TableCell>
+                      <TableCell>{job.kind}</TableCell>
+                      <TableCell>{job.queue}</TableCell>
+                      <TableCell>
+                        {job.attempt}/{job.max_attempts}
+                      </TableCell>
+                      <TableCell>
+                        {job.finalized_at
+                          ? timeAgo(job.finalized_at)
+                          : "-"}
+                      </TableCell>
+                      <TableCell className="max-w-[300px] truncate text-danger">
+                        {errMsg || "-"}
+                      </TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          ) : failedQuery.isLoading ? (
+            <p className="py-4 text-sm text-muted-fg">Loading...</p>
+          ) : (
+            <p className="py-4 text-sm text-muted-fg">
+              No recent failures.
+            </p>
+          )}
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
