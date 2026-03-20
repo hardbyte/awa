@@ -644,12 +644,27 @@ impl PyClient {
             builder = builder.global_max_workers(global_max);
         }
         if let Some(hours) = completed_retention_hours {
+            if !hours.is_finite() || hours < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "completed_retention_hours must be a non-negative finite number",
+                ));
+            }
             builder = builder.completed_retention(Duration::from_secs_f64(hours * 3600.0));
         }
         if let Some(hours) = failed_retention_hours {
+            if !hours.is_finite() || hours < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "failed_retention_hours must be a non-negative finite number",
+                ));
+            }
             builder = builder.failed_retention(Duration::from_secs_f64(hours * 3600.0));
         }
         if let Some(batch_size) = cleanup_batch_size {
+            if batch_size <= 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "cleanup_batch_size must be > 0",
+                ));
+            }
             builder = builder.cleanup_batch_size(batch_size);
         }
 
@@ -1568,11 +1583,21 @@ fn parse_queue_retention_overrides(
             .map(|v| v.extract())
             .transpose()?
             .unwrap_or(default_policy.completed.as_secs_f64() / 3600.0);
+        if !completed_hours.is_finite() || completed_hours < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "retention completed_hours must be a non-negative finite number",
+            ));
+        }
         let failed_hours: f64 = retention_dict
             .get_item("failed_hours")?
             .map(|v| v.extract())
             .transpose()?
             .unwrap_or(default_policy.failed.as_secs_f64() / 3600.0);
+        if !failed_hours.is_finite() || failed_hours < 0.0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "retention failed_hours must be a non-negative finite number",
+            ));
+        }
 
         overrides.push((
             name,

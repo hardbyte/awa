@@ -28,6 +28,8 @@ pub enum BuildError {
     InvalidRateLimit,
     #[error("queue weight must be > 0")]
     InvalidWeight,
+    #[error("cleanup_batch_size must be > 0")]
+    InvalidBatchSize,
 }
 
 /// Health check result.
@@ -225,6 +227,13 @@ impl ClientBuilder {
             }
             if config.weight == 0 {
                 return Err(BuildError::InvalidWeight);
+            }
+        }
+
+        // Validate batch size
+        if let Some(bs) = self.cleanup_batch_size {
+            if bs <= 0 {
+                return Err(BuildError::InvalidBatchSize);
             }
         }
 
