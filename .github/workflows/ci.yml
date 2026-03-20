@@ -166,7 +166,11 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-      - name: Build CLI
+      - name: Install frontend dependencies
+        run: npm ci
+      - name: Build frontend
+        run: npm run build
+      - name: Build CLI (with embedded frontend)
         run: cargo build -p awa-cli
         working-directory: .
       - name: Wait for Postgres
@@ -174,8 +178,6 @@ jobs:
         working-directory: .
       - name: Run migrations
         run: ../../target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test migrate
-      - name: Install frontend dependencies
-        run: npm ci
       - name: Install Playwright browsers
         run: npx playwright install chromium
       - name: Run E2E tests
