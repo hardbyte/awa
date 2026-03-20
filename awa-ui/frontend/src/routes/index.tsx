@@ -15,19 +15,8 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
-
-function timeAgo(dateStr: string): string {
-  const seconds = Math.floor(
-    (Date.now() - new Date(dateStr).getTime()) / 1000
-  );
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
+import { timeAgo } from "@/lib/time";
+import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
 
 /** Background tint per state for counter cards */
 const STATE_CARD_BG: Record<string, string> = {
@@ -38,9 +27,6 @@ const STATE_CARD_BG: Record<string, string> = {
 };
 
 const COUNTER_KEYS = ["available", "running", "failed"] as const;
-
-/** Show top N queues sorted by activity, with a "View all" link. */
-const DASHBOARD_QUEUE_LIMIT = 10;
 
 export function DashboardPage() {
   const navigate = useNavigate();

@@ -1,6 +1,7 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { fetchDistinctKinds, fetchDistinctQueues } from "@/lib/api";
+import { POLL, MAX_SUGGESTIONS } from "@/lib/constants";
 
 interface SearchFilters {
   kind?: string;
@@ -61,14 +62,14 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
   const kindsQuery = useQuery<string[]>({
     queryKey: ["distinct-kinds"],
     queryFn: fetchDistinctKinds,
-    staleTime: 60_000,
+    staleTime: POLL.SLOW,
     refetchInterval: false,
   });
 
   const queuesQuery = useQuery<string[]>({
     queryKey: ["distinct-queues"],
     queryFn: fetchDistinctQueues,
-    staleTime: 60_000,
+    staleTime: POLL.SLOW,
     refetchInterval: false,
   });
 
@@ -124,7 +125,7 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
         }
       }
 
-      return results.slice(0, 8);
+      return results.slice(0, MAX_SUGGESTIONS);
     },
     [kindsQuery.data, queuesQuery.data, activeFilters]
   );

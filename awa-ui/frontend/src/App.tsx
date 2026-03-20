@@ -64,12 +64,15 @@ const routeTree = rootRoute.addChildren([
 const router = createRouter({ routeTree });
 
 import { Toaster } from "@/components/ui/toast";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 export function App() {
   return (
+    <ErrorBoundary>
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
       <Toaster position="bottom-right" />
     </QueryClientProvider>
+    </ErrorBoundary>
   );
 }

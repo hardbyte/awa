@@ -31,6 +31,14 @@ import {
   TableCell,
   TableColumn,
 } from "@/components/ui/table";
+import { timeAgo } from "@/lib/time";
+import {
+  DEFAULT_PAGE_SIZE,
+  PAGE_SIZES,
+  RETRYABLE_STATES,
+  TERMINAL_STATES,
+  POLL,
+} from "@/lib/constants";
 
 const STATES = [
   "all",
@@ -43,22 +51,6 @@ const STATES = [
   "cancelled",
   "waiting_external",
 ] as const;
-
-const DEFAULT_PAGE_SIZE = 50;
-const PAGE_SIZES = [20, 50, 100] as const;
-
-function timeAgo(dateStr: string): string {
-  const seconds = Math.floor(
-    (Date.now() - new Date(dateStr).getTime()) / 1000
-  );
-  if (seconds < 60) return `${seconds}s ago`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m ago`;
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.floor(hours / 24);
-  return `${days}d ago`;
-}
 
 /** Show the most relevant timestamp based on job state */
 function contextualTime(job: { state: string; created_at: string; attempted_at: string | null; finalized_at: string | null }): string {
@@ -115,7 +107,7 @@ export function JobsPage() {
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
-    refetchInterval: hasSel ? false : 2000,
+    refetchInterval: hasSel ? false : POLL.FAST,
   });
 
   const statsQuery = useQuery<StateCounts>({
@@ -191,8 +183,6 @@ export function JobsPage() {
   });
 
   // Compute which selected jobs are retryable vs cancellable
-  const RETRYABLE_STATES = new Set(["failed", "cancelled", "waiting_external"]);
-  const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
   const { retryableIds, cancellableIds } = useMemo(() => {
     const selectedJobs = jobs.filter((j) => selected.has(j.id));
     return {
