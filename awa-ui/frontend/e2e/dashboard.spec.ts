@@ -8,31 +8,33 @@ test.describe("Dashboard page", () => {
     ).toBeVisible();
   });
 
-  test("state counter cards are visible", async ({ page }) => {
+  test("state counter cards are visible with counts", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/stats") && r.ok()),
       page.goto("/"),
     ]);
 
-    // Counter cards link to /jobs — should always render even with 0 counts
+    // Counter cards should show numeric values (seeded data exists)
     const counterCards = page.locator('a[href*="/jobs"]');
     const count = await counterCards.count();
-    expect(count).toBeGreaterThanOrEqual(3); // available, running, failed + completed/hr
+    expect(count).toBeGreaterThanOrEqual(3);
   });
 
-  test("queues section present", async ({ page }) => {
+  test("queues card renders", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
       page.goto("/"),
     ]);
 
-    // The Queues card header should always render
     await expect(
       page.locator('[data-slot="card-header"]', { hasText: "Queues" })
     ).toBeVisible();
+
+    // Seeded e2e_test queue should appear
+    await expect(page.getByText("e2e_test")).toBeVisible();
   });
 
-  test("recent failures section present", async ({ page }) => {
+  test("recent failures section shows seeded failed job", async ({ page }) => {
     await Promise.all([
       page.waitForResponse(
         (r) =>
@@ -43,11 +45,13 @@ test.describe("Dashboard page", () => {
       page.goto("/"),
     ]);
 
-    // The Recent Failures card header should always render
     await expect(
       page.locator('[data-slot="card-header"]', {
         hasText: "Recent Failures",
       })
     ).toBeVisible();
+
+    // Seeded failed e2e_job should appear
+    await expect(page.getByText("e2e_job").first()).toBeVisible();
   });
 });

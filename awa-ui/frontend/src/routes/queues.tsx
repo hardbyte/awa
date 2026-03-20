@@ -102,6 +102,12 @@ export function QueuesPage() {
                 <span>{q.running}</span>
                 <span className="text-muted-fg">Failed</span>
                 <span className={q.failed > 0 ? "text-danger" : ""}>{q.failed}</span>
+                {q.waiting_external > 0 && (
+                  <>
+                    <span className="text-muted-fg">Waiting</span>
+                    <span>{q.waiting_external}</span>
+                  </>
+                )}
                 <span className="text-muted-fg">Lag</span>
                 <span><LagValue seconds={q.lag_seconds} /></span>
               </div>
@@ -132,6 +138,7 @@ export function QueuesPage() {
             <TableColumn>Available</TableColumn>
             <TableColumn>Running</TableColumn>
             <TableColumn>Failed</TableColumn>
+            <TableColumn>Waiting</TableColumn>
             <TableColumn>Completed/hr</TableColumn>
             <TableColumn>Lag (s)</TableColumn>
             <TableColumn>Status</TableColumn>
@@ -155,6 +162,9 @@ export function QueuesPage() {
                   <span className={q.failed > 0 ? "text-danger" : ""}>
                     {q.failed}
                   </span>
+                </TableCell>
+                <TableCell>
+                  {q.waiting_external > 0 ? q.waiting_external : "-"}
                 </TableCell>
                 <TableCell>{q.completed_last_hour}</TableCell>
                 <TableCell>
