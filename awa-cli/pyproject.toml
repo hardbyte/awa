@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "awa-cli"
 version = "0.2.1"
 description = "CLI for the Awa Postgres-native job queue (migrations, admin, serve)"
-readme = "../README.md"
+readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT OR Apache-2.0" }
 authors = [{ name = "Brian Thorne" }]
@@ -25,7 +25,8 @@ classifiers = [
 [project.urls]
 Homepage = "https://github.com/hardbyte/awa"
 Repository = "https://github.com/hardbyte/awa"
-Documentation = "https://github.com/hardbyte/awa"
+Documentation = "https://github.com/hardbyte/awa#cli"
+Changelog = "https://github.com/hardbyte/awa/releases"
 
 [tool.maturin]
 # Package the Rust binary directly (no Python extension module).
