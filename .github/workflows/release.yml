@@ -196,6 +196,8 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
+          fail_on_unmatched_files: false
           files: |
             *.tar.gz
             *.whl
@@ -341,6 +343,14 @@ jobs:
 
       - name: Publish awa-testing
         run: cargo publish --package awa-testing --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index
+        run: sleep 30
+
+      - name: Publish awa-ui
+        run: cargo publish --package awa-ui --no-verify
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
