@@ -265,7 +265,7 @@ impl Worker for TimingWorker {
             .args
             .get("seq")
             .and_then(|v| v.as_i64())
-            .expect("timing job missing seq");
+            .unwrap_or(0);
         let steady_slot = job.metadata.get("steady_slot").and_then(|v| v.as_i64());
         let cron_name = job
             .metadata
