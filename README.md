@@ -23,7 +23,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 
 Local benchmarks show ~8k jobs/sec sustained throughput (Rust workers), ~5k jobs/sec (Python workers), and sub-10ms p50 pickup latency. See [benchmarking notes](docs/benchmarking.md) for methodology and caveats.
 
-Core concurrency invariants (no duplicate processing after rescue, stale completions rejected, shutdown drain ordering) are checked with [TLA+ models](corectness/README.md) covering single and multi-instance deployments.
+Core concurrency invariants (no duplicate processing after rescue, stale completions rejected, shutdown drain ordering) are checked with [TLA+ models](correctness/README.md) covering single and multi-instance deployments.
 
 ## Getting Started
 
@@ -216,7 +216,7 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 | [Web UI design](docs/ui-design.md) | API endpoints, pages, component library |
 | [Benchmarking notes](docs/benchmarking.md) | Methodology, headline numbers, how to run |
 | [Validation test plan](docs/test-plan.md) | Full test matrix with 100+ test cases |
-| [TLA+ correctness models](corectness/README.md) | Formal verification of core invariants |
+| [TLA+ correctness models](correctness/README.md) | Formal verification of core invariants |
 
 <details>
 <summary>Architecture Decision Records (ADRs)</summary>
