@@ -1,5 +1,5 @@
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { fetchStats, fetchQueues, fetchJobs } from "@/lib/api";
 import type { StateCounts, QueueStats, JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -43,6 +43,8 @@ const COUNTER_KEYS = ["available", "running", "failed", "completed"] as const;
 const DASHBOARD_QUEUE_LIMIT = 10;
 
 export function DashboardPage() {
+  const navigate = useNavigate();
+
   const statsQuery = useQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
@@ -95,7 +97,7 @@ export function DashboardPage() {
             <Link
               key={key}
               to="/jobs"
-              search={{ state: key === "completed" ? undefined : key }}
+              search={{ state: key }}
               className="no-underline"
             >
               <Card
@@ -158,7 +160,17 @@ export function DashboardPage() {
                 </TableHeader>
                 <TableBody>
                   {topQueues.map((q) => (
-                    <TableRow key={q.queue} id={q.queue}>
+                    <TableRow
+                      key={q.queue}
+                      id={q.queue}
+                      className="cursor-pointer"
+                      onAction={() =>
+                        void navigate({
+                          to: "/jobs",
+                          search: { q: `queue:${q.queue}` },
+                        })
+                      }
+                    >
                       <TableCell className="font-medium">
                         <Link
                           to="/queues/$name"
@@ -238,15 +250,19 @@ export function DashboardPage() {
                         )
                       : "";
                   return (
-                    <TableRow key={job.id} id={job.id}>
-                      <TableCell className="font-mono">
-                        <Link
-                          to="/jobs/$id"
-                          params={{ id: String(job.id) }}
-                          className="text-primary no-underline hover:underline"
-                        >
-                          {job.id}
-                        </Link>
+                    <TableRow
+                      key={job.id}
+                      id={job.id}
+                      className="cursor-pointer"
+                      onAction={() =>
+                        void navigate({
+                          to: "/jobs/$id",
+                          params: { id: String(job.id) },
+                        })
+                      }
+                    >
+                      <TableCell className="font-mono text-primary">
+                        {job.id}
                       </TableCell>
                       <TableCell>{job.kind}</TableCell>
                       <TableCell>{job.queue}</TableCell>

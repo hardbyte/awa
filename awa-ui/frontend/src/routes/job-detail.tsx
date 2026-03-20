@@ -40,6 +40,7 @@ export function JobDetailPage() {
     queryKey: ["job", jobId],
     queryFn: () => fetchJob(jobId),
     enabled: !isNaN(jobId),
+    refetchInterval: 2000,
   });
 
   const retryMutation = useMutation({
