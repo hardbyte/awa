@@ -9,6 +9,7 @@ const databaseUrl =
   "postgres://postgres:test@localhost:15432/awa_test";
 
 export default defineConfig({
+  globalSetup: "./e2e/seed.ts",
   testDir: "./e2e",
   fullyParallel: true,
   forbidOnly: !!process.env.CI,

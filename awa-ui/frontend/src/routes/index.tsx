@@ -23,10 +23,12 @@ const STATE_CARD_BG: Record<string, string> = {
   available: "bg-info-subtle",
   running: "bg-success-subtle",
   failed: "bg-danger-subtle",
-  completed: "bg-success-subtle/50",
+  scheduled: "bg-secondary/50",
+  waiting_external: "bg-[oklch(0.87_0.07_280)]/30",
 };
 
-const COUNTER_KEYS = ["available", "running", "failed"] as const;
+/** Headline metrics — includes deferred and callback-blocked work */
+const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_external"] as const;
 
 export function DashboardPage() {
   const navigate = useNavigate();
@@ -75,7 +77,7 @@ export function DashboardPage() {
       <Heading level={2}>Dashboard</Heading>
 
       {/* Headline counter cards */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {COUNTER_KEYS.map((key) => {
           const count = statsQuery.data?.[key] ?? 0;
           const bg = STATE_CARD_BG[key] ?? "";
@@ -140,6 +142,7 @@ export function DashboardPage() {
                   <TableColumn>Available</TableColumn>
                   <TableColumn>Running</TableColumn>
                   <TableColumn>Failed</TableColumn>
+                  <TableColumn>Waiting</TableColumn>
                   <TableColumn>Completed/hr</TableColumn>
                   <TableColumn>Lag (s)</TableColumn>
                   <TableColumn>Status</TableColumn>
@@ -172,6 +175,9 @@ export function DashboardPage() {
                         <span className={q.failed > 0 ? "text-danger" : ""}>
                           {q.failed}
                         </span>
+                      </TableCell>
+                      <TableCell>
+                        {q.waiting_external > 0 ? q.waiting_external : "-"}
                       </TableCell>
                       <TableCell>{q.completed_last_hour}</TableCell>
                       <TableCell>
