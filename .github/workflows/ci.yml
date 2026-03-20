@@ -141,6 +141,8 @@ jobs:
   frontend-e2e:
     name: Frontend E2E tests
     runs-on: ubuntu-latest
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
     services:
       postgres:
         image: postgres:17-alpine
@@ -177,13 +179,11 @@ jobs:
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
         working-directory: .
       - name: Run migrations
-        run: ../../target/debug/awa --database-url postgres://postgres:postgres@localhost:5432/awa_test migrate
+        run: ../../target/debug/awa --database-url $DATABASE_URL migrate
       - name: Install Playwright browsers
         run: npx playwright install chromium
       - name: Run E2E tests
         run: npx playwright test
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
   # ─── Phase 0 spike ──────────────────────────────────────
   pyo3-spike:
