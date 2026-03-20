@@ -164,6 +164,21 @@ The current architecture handles 2M deferred / 4k/s comfortably. For 10M+ at
 higher due rates, promotion would need to be parallelized (e.g., by queue or
 ID range) or the deferred table partitioned.
 
+### Progress Feature Overhead
+
+The structured progress feature (ADR-014) adds a `progress JSONB` column
+and a two-tier heartbeat flush. Performance impact was validated:
+
+- **Zero overhead when no progress is set.** The heartbeat service
+  partitions jobs by pending progress — jobs without mutations use the
+  original heartbeat-only query. `snapshot_pending_progress` returns empty
+  when no generation has been bumped.
+- **Completion batcher** adds `progress = NULL` to the batch UPDATE. This
+  is a constant-time write to a nullable column with no measurable impact
+  (batcher throughput remains ~78k/s in unit benchmarks).
+- **Sustained hot-path throughput** unchanged at ~8.1k/s after the feature
+  was added.
+
 ## Interpreting The Results
 
 Some practical guidelines:

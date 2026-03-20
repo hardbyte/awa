@@ -79,6 +79,8 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 
 Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled).
 
+Jobs carry an optional `progress` JSONB column that handlers can write during execution. Progress is cleared to NULL on completion but preserved across all other transitions (retry, snooze, cancel, fail, rescue), enabling checkpoint-based resumption on retry.
+
 ## Data Flow
 
 ### Insert (Producer)
@@ -201,6 +203,48 @@ tokio::spawn(async {
 ```
 
 Backoff uses a database-side function `awa.backoff_duration(attempt, max_attempts)` implementing exponential backoff with jitter, capped at 24 hours (PRD section 6.3).
+
+### Progress Tracking
+
+Handlers can report structured progress during execution via an in-memory buffer that is flushed to Postgres on each heartbeat cycle and atomically with state transitions.
+
+```
+Handler code (sync)                    Heartbeat service (async, periodic)
+─────────────────                      ────────────────────────────────────
+ctx.set_progress(50, "halfway")  ──►   ProgressState { latest, generation }
+ctx.update_metadata({"cursor":N}) ──►  (generation bumped on each mutation)
+                                            │
+                                            ▼
+                                       heartbeat_once():
+                                         ├── Tier 1: jobs without pending progress
+                                         │   UPDATE jobs_hot SET heartbeat_at = now() ...
+                                         └── Tier 2: jobs with pending progress
+                                             UPDATE jobs_hot SET heartbeat_at = now(),
+                                                                 progress = v.progress ...
+                                             (ack generation on success)
+
+ctx.flush_progress()             ──►   Direct UPDATE jobs_hot SET progress = $2
+                                       WHERE id = $1 AND run_lease = $3
+                                       (immediate, stronger than heartbeat)
+```
+
+**Storage:** The `progress` column is a nullable JSONB on both `jobs_hot` and `scheduled_jobs`, structured as `{"percent": 0-100, "message": "...", "metadata": {...}}`. The `metadata` sub-object is shallow-merged on each `update_metadata` call — top-level keys overwrite, nested objects are replaced.
+
+**Buffer design:** Each in-flight job has an `Arc<Mutex<ProgressState>>` shared between the handler and the heartbeat service. The buffer tracks a `generation` counter (bumped on mutation) and an `acked_generation` (advanced when Postgres confirms the write). The heartbeat service snapshots pending progress into an `in_flight` field before flushing, preventing double-snapshots and enabling retry on failure without data loss. `std::sync::Mutex` is used (not tokio) because the critical section is pure in-memory JSON assembly with no async work.
+
+**Lifecycle semantics:**
+
+| Transition | Progress value |
+|---|---|
+| Completed | `NULL` (ephemeral — job succeeded) |
+| RetryAfter / Retryable error | Preserved (checkpoint for next attempt) |
+| Snooze | Preserved |
+| Cancel | Preserved (operator inspection) |
+| WaitForCallback | Preserved |
+| Failed (terminal or exhausted) | Preserved (operator inspection) |
+| Rescue (stale heartbeat / deadline / callback timeout) | Preserved (implicit via view trigger) |
+
+On retry, the handler can read the previous attempt's checkpoint from `ctx.job.progress` and resume work from where it left off.
 
 ### State Guard on Completion
 

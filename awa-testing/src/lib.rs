@@ -116,7 +116,7 @@ impl TestClient {
         // Snapshot progress from the buffer after handler execution
         let progress_snapshot: Option<serde_json::Value> = {
             let guard = progress.lock().expect("progress lock poisoned");
-            guard.latest.clone()
+            guard.clone_latest()
         };
 
         // Update job state based on result

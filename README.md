@@ -13,6 +13,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Heartbeat + deadline crash recovery** — stale jobs rescued automatically.
 - **Priority aging** — low-priority jobs won't starve.
 - **LISTEN/NOTIFY wakeup** — sub-10ms pickup latency.
+- **Structured progress tracking** — handlers report percent, message, and checkpoint metadata; persisted across retries; flushed on every heartbeat.
 - **OpenTelemetry metrics** — built-in counters, histograms, and gauges.
 - **Hot/cold job storage** — runnable work stays in a hot table while deferred work stays in a cold deferred table.
 
@@ -88,6 +89,16 @@ async with await client.transaction() as tx:
 @client.worker(SendEmail, queue="email")
 async def handle(job):
     await send_email(job.args.to, job.args.subject)
+
+# Workers can report progress and checkpoint metadata
+@client.worker(BatchProcess, queue="etl")
+async def handle_batch(job):
+    last_id = (job.progress or {}).get("metadata", {}).get("last_id", 0)
+    for i, item in enumerate(fetch_items(after=last_id)):
+        process(item)
+        job.set_progress(int(100 * i / total), f"Processing item {i}")
+        job.update_metadata({"last_id": item.id})
+    await job.flush_progress()  # critical checkpoint
 
 client.start([("email", 10)])
 health = await client.health_check()
@@ -197,6 +208,7 @@ the physical tables directly.
 - [ADR-011: Weighted concurrency](docs/adr/011-weighted-concurrency.md)
 - [ADR-012: Split hot and deferred job storage](docs/adr/012-hot-deferred-job-storage.md)
 - [ADR-013: Durable run leases and guarded finalization](docs/adr/013-run-lease-and-guarded-finalization.md)
+- [ADR-014: Structured progress and metadata](docs/adr/014-structured-progress.md)
 - [Benchmarking notes](docs/benchmarking.md)
 - [Validation test plan](docs/test-plan.md)
 - [TLA+ correctness models](corectness/README.md)

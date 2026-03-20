@@ -164,7 +164,7 @@ impl JobExecutor {
             // Snapshot progress for state transition
             let progress_snapshot = {
                 let guard = progress_state.lock().expect("progress lock poisoned");
-                guard.latest.clone()
+                guard.clone_latest()
             };
 
             // Complete the job based on the result, then record metrics

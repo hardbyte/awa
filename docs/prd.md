@@ -72,6 +72,7 @@ The common limitations of pure-Python Postgres queues:
 - Rate limiting per queue
 - Experimental ORM/driver transaction bridging (psycopg3, asyncpg)
 - Weighted/opportunistic queue concurrency mode
+- Structured progress tracking (percent + message + checkpoint metadata, persisted across retries)
 
 ### 3.3 Tertiary (v0.4+)
 
