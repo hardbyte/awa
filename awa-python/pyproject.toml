@@ -34,4 +34,5 @@ module-name = "awa._awa"
 asyncio_mode = "auto"
 markers = [
     "chaos: exercises kill -9 recovery with real worker subprocesses",
+    "slow: tests that require leader election (up to 30s)",
 ]

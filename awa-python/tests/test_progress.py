@@ -176,3 +176,79 @@ async def test_progress_persists_across_retry(client):
     p = attempt_data[0]
     assert p["percent"] == 50
     assert p["metadata"]["last_id"] == 999
+
+
+# PP6: get_job returns progress on a retrying job (external read)
+@pytest.mark.asyncio
+async def test_get_job_returns_progress(client):
+    """Progress is readable via get_job() from outside the handler."""
+    queue = "progress_pp6"
+    retried = []
+
+    @client.worker(ProgressArgs, queue=queue)
+    async def handle(job):
+        if job.attempt == 1:
+            job.set_progress(70, "external read test")
+            job.update_metadata({"cursor": "xyz"})
+            return awa.RetryAfter(60)  # long retry so we can read it
+        return None
+
+    inserted = await client.insert(ProgressArgs(data="pp6"), queue=queue)
+
+    client.start([(queue, 1)])
+    await asyncio.sleep(1.0)
+    await client.shutdown()
+
+    # Job should be retryable with progress preserved
+    job = await client.get_job(inserted.id)
+    assert job.progress is not None, "retrying job should have progress"
+    assert job.progress["percent"] == 70
+    assert job.progress["message"] == "external read test"
+    assert job.progress["metadata"]["cursor"] == "xyz"
+
+
+# PP7: flush_progress_sync works from a sync-style handler
+@pytest.mark.asyncio
+async def test_flush_progress_sync(client):
+    """flush_progress_sync() flushes to DB without await."""
+    queue = "progress_pp7"
+    flushed = []
+
+    @client.worker(ProgressArgs, queue=queue)
+    async def handle(job):
+        job.set_progress(33, "sync flush")
+        job.flush_progress_sync()
+        flushed.append(True)
+        return None
+
+    await client.insert(ProgressArgs(data="pp7"), queue=queue)
+
+    client.start([(queue, 1)])
+    await asyncio.sleep(1.0)
+    await client.shutdown()
+
+    assert len(flushed) == 1, "handler should have run"
+
+
+# PP8: get_job_sync returns progress
+@pytest.mark.asyncio
+async def test_get_job_sync_returns_progress(client):
+    """get_job_sync() returns a Job with progress."""
+    queue = "progress_pp8"
+
+    @client.worker(ProgressArgs, queue=queue)
+    async def handle(job):
+        if job.attempt == 1:
+            job.set_progress(80, "sync read")
+            return awa.RetryAfter(60)
+        return None
+
+    inserted = await client.insert(ProgressArgs(data="pp8"), queue=queue)
+
+    client.start([(queue, 1)])
+    await asyncio.sleep(1.0)
+    await client.shutdown()
+
+    job = client.get_job_sync(inserted.id)
+    assert job.progress is not None
+    assert job.progress["percent"] == 80

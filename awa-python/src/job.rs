@@ -264,6 +264,58 @@ impl PyJob {
         })
     }
 
+    /// Synchronous variant of flush_progress for sync handlers (Django/Flask).
+    fn flush_progress_sync(&self, py: Python<'_>) -> PyResult<()> {
+        use crate::errors::map_awa_error;
+        let pool = self.pool.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "flush_progress_sync is only available during job execution",
+            )
+        })?;
+        let buffer = self.progress_buffer.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "flush_progress_sync is only available during job execution",
+            )
+        })?;
+        let job_id = self.id;
+        let run_lease = self.run_lease;
+
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let (snapshot, target_generation) = {
+                    let guard = buffer.lock().expect("progress lock poisoned");
+                    match guard.pending_snapshot() {
+                        Some(pair) => pair,
+                        None => return Ok(()),
+                    }
+                };
+
+                let result = sqlx::query(
+                    r#"
+                    UPDATE awa.jobs_hot
+                    SET progress = $2
+                    WHERE id = $1 AND state = 'running' AND run_lease = $3
+                    "#,
+                )
+                .bind(job_id)
+                .bind(&snapshot)
+                .bind(run_lease)
+                .execute(&pool)
+                .await
+                .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+
+                if result.rows_affected() == 0 {
+                    return Ok(());
+                }
+
+                let mut guard = buffer.lock().expect("progress lock poisoned");
+                guard.ack(target_generation);
+
+                Ok(())
+            })
+        })
+    }
+
     /// Register a callback for this job, writing the callback_id to the database
     /// immediately. Call this BEFORE sending the callback_id to the external system.
     ///
