@@ -568,6 +568,17 @@ impl PyClient {
         })
     }
 
+    /// Get a single job by ID.
+    fn get_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let job = awa_model::admin::get_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyJob::from(job))
+        })
+    }
+
     fn health_check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
@@ -1195,6 +1206,19 @@ impl PyClient {
                     .await
                     .map_err(map_awa_error)?;
                 Ok(jobs.into_iter().map(PyJob::from).collect())
+            })
+        })
+    }
+
+    /// Get a single job by ID (sync).
+    fn get_job_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let job = awa_model::admin::get_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyJob::from(job))
             })
         })
     }
