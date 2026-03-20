@@ -554,6 +554,7 @@ impl PyClient {
                 kind,
                 queue,
                 limit: Some(limit),
+                ..Default::default()
             };
             let jobs = awa_model::admin::list_jobs(&pool, &filter)
                 .await
@@ -1155,6 +1156,7 @@ impl PyClient {
                     kind,
                     queue,
                     limit: Some(limit),
+                    ..Default::default()
                 };
                 let jobs = awa_model::admin::list_jobs(&pool, &filter)
                     .await
