@@ -63,10 +63,13 @@ const routeTree = rootRoute.addChildren([
 
 const router = createRouter({ routeTree });
 
+import { Toaster } from "@/components/ui/toast";
+
 export function App() {
   return (
     <QueryClientProvider client={queryClient}>
       <RouterProvider router={router} />
+      <Toaster position="bottom-right" />
     </QueryClientProvider>
   );
 }

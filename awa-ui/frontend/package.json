@@ -17,6 +17,7 @@
     "react": "^19",
     "react-aria-components": "^1",
     "react-dom": "^19",
+    "sonner": "^2.0.7",
     "tailwind-merge": "^3",
     "tailwind-variants": "^1"
   },

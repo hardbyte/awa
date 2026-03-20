@@ -11,6 +11,7 @@ import {
   resumeQueue,
   drainQueue,
 } from "@/lib/api";
+import { toast } from "@/components/ui/toast";
 import type { QueueStats } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
@@ -24,6 +25,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { LagValue } from "@/components/LagValue";
 
 export function QueuesPage() {
   const queryClient = useQueryClient();
@@ -36,14 +38,24 @@ export function QueuesPage() {
 
   const pauseMutation = useMutation({
     mutationFn: (queue: string) => pauseQueue(queue, "ui"),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ["queues"] }),
+    onSuccess: (_data, queue) => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      toast.success(`Queue "${queue}" paused`);
+    },
+    onError: () => {
+      toast.error("Failed to pause queue");
+    },
   });
 
   const resumeMutation = useMutation({
     mutationFn: (queue: string) => resumeQueue(queue),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ["queues"] }),
+    onSuccess: (_data, queue) => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      toast.success(`Queue "${queue}" resumed`);
+    },
+    onError: () => {
+      toast.error("Failed to resume queue");
+    },
   });
 
   const drainMutation = useMutation({
@@ -51,6 +63,10 @@ export function QueuesPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success(`Queue drained`);
+    },
+    onError: () => {
+      toast.error("Failed to drain queue");
     },
   });
 
@@ -93,9 +109,7 @@ export function QueuesPage() {
                 </TableCell>
                 <TableCell>{q.completed_last_hour}</TableCell>
                 <TableCell>
-                  {q.lag_seconds != null
-                    ? q.lag_seconds.toFixed(1)
-                    : "-"}
+                  <LagValue seconds={q.lag_seconds} />
                 </TableCell>
                 <TableCell>
                   {q.paused ? (

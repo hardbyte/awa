@@ -6,6 +6,7 @@ import {
 import { useState, useCallback } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
 import { fetchJobs, fetchStats, bulkRetry, bulkCancel } from "@/lib/api";
+import { toast } from "@/components/ui/toast";
 import type { JobRow, ListJobsParams, StateCounts } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { SearchBar, parseSearch } from "@/components/SearchBar";
@@ -95,19 +96,27 @@ export function JobsPage() {
 
   const retryMutation = useMutation({
     mutationFn: (ids: number[]) => bulkRetry(ids),
-    onSuccess: () => {
+    onSuccess: (_data, ids) => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       void queryClient.invalidateQueries({ queryKey: ["stats"] });
+      toast.success(`Retried ${ids.length} job(s)`);
+    },
+    onError: () => {
+      toast.error("Failed to retry jobs");
     },
   });
 
   const cancelMutation = useMutation({
     mutationFn: (ids: number[]) => bulkCancel(ids),
-    onSuccess: () => {
+    onSuccess: (_data, ids) => {
       setSelected(new Set());
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
       void queryClient.invalidateQueries({ queryKey: ["stats"] });
+      toast.success(`Cancelled ${ids.length} job(s)`);
+    },
+    onError: () => {
+      toast.error("Failed to cancel jobs");
     },
   });
 

@@ -1,0 +1,74 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e3]:
+  - generic [ref=e6]:
+    - link "AWA" [ref=e8] [cursor=pointer]:
+      - /url: /
+      - img [ref=e9]
+      - generic [ref=e16]: AWA
+    - generic [ref=e17]:
+      - link "Dashboard" [ref=e18] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e19]: Dashboard
+      - link "Jobs" [ref=e20] [cursor=pointer]:
+        - /url: /jobs
+        - generic [ref=e21]: Jobs
+      - link "Queues" [ref=e23] [cursor=pointer]:
+        - /url: /queues
+        - generic [ref=e24]: Queues
+      - link "Cron" [ref=e25] [cursor=pointer]:
+        - /url: /cron
+        - generic [ref=e26]: Cron
+    - 'button "Theme: system" [ref=e28]':
+      - img [ref=e29]
+  - main [ref=e31]:
+    - generic [ref=e32]:
+      - generic [ref=e33]:
+        - heading "Jobs" [level=2] [ref=e34]
+        - generic [ref=e35]: 2 total
+      - generic [ref=e36]:
+        - button "all 2" [ref=e37]:
+          - text: all
+          - generic [ref=e38]: "2"
+        - button "available" [ref=e39]
+        - button "running" [ref=e40]
+        - button "scheduled" [ref=e41]
+        - button "retryable" [ref=e42]
+        - button "failed" [ref=e43]
+        - button "completed 2" [ref=e44]:
+          - text: completed
+          - generic [ref=e45]: "2"
+        - button "cancelled" [ref=e46]
+        - button "waiting" [ref=e47]
+      - group [ref=e50]:
+        - img
+        - searchbox "Search jobs" [ref=e52]: queue:ui_demo
+        - button "Clear search" [ref=e53]:
+          - img [ref=e54]
+      - generic [ref=e56]:
+        - generic [ref=e57]: "Filters:"
+        - generic [ref=e58]: queue:ui_demo
+        - button "Clear" [ref=e59]
+      - grid "Jobs" [active] [ref=e63]:
+        - rowgroup [ref=e64]:
+          - row "Select All Kind State Queue Attempt Tags Created" [ref=e65]:
+            - columnheader "Select All" [ref=e66]:
+              - checkbox "Select All" [disabled] [ref=e69]
+            - columnheader "Kind" [ref=e72]:
+              - generic [ref=e73]: Kind
+            - columnheader "State" [ref=e74]:
+              - generic [ref=e75]: State
+            - columnheader "Queue" [ref=e76]:
+              - generic [ref=e77]: Queue
+            - columnheader "Attempt" [ref=e78]:
+              - generic [ref=e79]: Attempt
+            - columnheader "Tags" [ref=e80]:
+              - generic [ref=e81]: Tags
+            - columnheader "Created" [ref=e82]:
+              - generic [ref=e83]: Created
+        - rowgroup [ref=e84]:
+          - row "No jobs found." [ref=e85]:
+            - rowheader "No jobs found." [ref=e86]:
+              - generic [ref=e87]: No jobs found.
+```

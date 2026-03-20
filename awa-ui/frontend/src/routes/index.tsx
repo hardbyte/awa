@@ -14,6 +14,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { LagValue } from "@/components/LagValue";
 
 function timeAgo(dateStr: string): string {
   const seconds = Math.floor(
@@ -176,9 +177,7 @@ export function DashboardPage() {
                       </TableCell>
                       <TableCell>{q.completed_last_hour}</TableCell>
                       <TableCell>
-                        {q.lag_seconds != null
-                          ? q.lag_seconds.toFixed(1)
-                          : "-"}
+                        <LagValue seconds={q.lag_seconds} />
                       </TableCell>
                       <TableCell>
                         {q.paused ? (

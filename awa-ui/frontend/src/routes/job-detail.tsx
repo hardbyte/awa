@@ -5,6 +5,7 @@ import {
 } from "@tanstack/react-query";
 import { useParams, Link } from "@tanstack/react-router";
 import { fetchJob, retryJob, cancelJob } from "@/lib/api";
+import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Heading } from "@/components/ui/heading";
@@ -45,6 +46,10 @@ export function JobDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success("Job retried");
+    },
+    onError: () => {
+      toast.error("Failed to retry job");
     },
   });
 
@@ -53,6 +58,10 @@ export function JobDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["job", jobId] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success("Job cancelled");
+    },
+    onError: () => {
+      toast.error("Failed to cancel job");
     },
   });
 

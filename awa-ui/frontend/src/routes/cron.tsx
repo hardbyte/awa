@@ -4,6 +4,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { fetchCronJobs, triggerCronJob } from "@/lib/api";
+import { toast } from "@/components/ui/toast";
 import type { CronJobRow } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Button } from "@/components/ui/button";
@@ -15,6 +16,7 @@ import {
   TableCell,
   TableColumn,
 } from "@/components/ui/table";
+import { CronExpr } from "@/components/CronExpr";
 
 export function CronPage() {
   const queryClient = useQueryClient();
@@ -26,8 +28,12 @@ export function CronPage() {
 
   const triggerMutation = useMutation({
     mutationFn: (name: string) => triggerCronJob(name),
-    onSuccess: () => {
+    onSuccess: (_data, name) => {
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success(`Cron job "${name}" triggered`);
+    },
+    onError: () => {
+      toast.error("Failed to trigger cron job");
     },
   });
 
@@ -52,7 +58,9 @@ export function CronPage() {
             {cronJobs.map((cj) => (
               <TableRow key={cj.name} id={cj.name}>
                 <TableCell className="font-medium">{cj.name}</TableCell>
-                <TableCell className="font-mono">{cj.cron_expr}</TableCell>
+                <TableCell>
+                  <CronExpr expr={cj.cron_expr} />
+                </TableCell>
                 <TableCell>{cj.timezone}</TableCell>
                 <TableCell>{cj.kind}</TableCell>
                 <TableCell>{cj.queue}</TableCell>
