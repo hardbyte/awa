@@ -1,6 +1,8 @@
 import { defineConfig } from "@playwright/test";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const awaBinary = path.resolve(__dirname, "../../target/debug/awa");
 const databaseUrl =
   process.env.DATABASE_URL ??
