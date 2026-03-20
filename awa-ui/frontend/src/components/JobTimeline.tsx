@@ -48,14 +48,17 @@ function buildTimeline(job: JobRow): TimelineEvent[] {
     }
   }
 
-  // Current attempt started — only shown if we have attempted_at
-  if (job.attempted_at && !["completed", "failed", "cancelled"].includes(job.state)) {
+  // Attempt started — shown whenever attempted_at exists
+  if (job.attempted_at) {
+    const isTerminal = ["completed", "failed", "cancelled"].includes(job.state);
     events.push({
       timestamp: job.attempted_at,
       label: job.state === "waiting_external"
         ? `Attempt ${job.attempt} — waiting for callback`
-        : `Attempt ${job.attempt} started`,
-      state: job.state,
+        : isTerminal
+          ? `Attempt ${job.attempt} started`
+          : `Attempt ${job.attempt} running`,
+      state: isTerminal ? "running" : job.state,
     });
   }
 

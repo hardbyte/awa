@@ -37,7 +37,7 @@ const STATE_CARD_BG: Record<string, string> = {
   completed: "bg-success-subtle/50",
 };
 
-const COUNTER_KEYS = ["available", "running", "failed", "completed"] as const;
+const COUNTER_KEYS = ["available", "running", "failed"] as const;
 
 /** Show top N queues sorted by activity, with a "View all" link. */
 const DASHBOARD_QUEUE_LIMIT = 10;
@@ -89,7 +89,7 @@ export function DashboardPage() {
       <Heading level={2}>Dashboard</Heading>
 
       {/* Headline counter cards */}
-      <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+      <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
         {COUNTER_KEYS.map((key) => {
           const count = statsQuery.data?.[key] ?? 0;
           const bg = STATE_CARD_BG[key] ?? "";
@@ -115,16 +115,16 @@ export function DashboardPage() {
             </Link>
           );
         })}
-        {completedPerHour != null && (
-          <Card className="text-center">
+        <Link to="/jobs" search={{ state: "completed" }} className="no-underline">
+          <Card className="bg-success-subtle/50 text-center transition-colors hover:opacity-80">
             <CardContent className="py-4">
               <div className="text-3xl font-bold tabular-nums">
-                {completedPerHour.toLocaleString()}
+                {completedPerHour != null ? completedPerHour.toLocaleString() : "—"}
               </div>
               <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
             </CardContent>
           </Card>
-        )}
+        </Link>
       </div>
 
       {/* Total jobs count */}

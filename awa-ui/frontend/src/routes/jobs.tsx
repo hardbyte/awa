@@ -404,6 +404,7 @@ export function JobsPage() {
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn>State</TableColumn>
           <TableColumn>Queue</TableColumn>
+          <TableColumn>Pri</TableColumn>
           <TableColumn>Attempt</TableColumn>
           <TableColumn>Tags</TableColumn>
           <TableColumn>{timeColumnLabel(filters.state)}</TableColumn>
@@ -438,6 +439,15 @@ export function JobsPage() {
                 <StateBadge state={job.state} />
               </TableCell>
               <TableCell className="text-muted-fg">{job.queue}</TableCell>
+              <TableCell>
+                {job.priority !== 2 ? (
+                  <Badge intent={job.priority === 1 ? "danger" : "secondary"} className="text-[10px]">
+                    {job.priority}
+                  </Badge>
+                ) : (
+                  <span className="text-muted-fg/40">2</span>
+                )}
+              </TableCell>
               <TableCell>
                 {job.attempt}/{job.max_attempts}
               </TableCell>

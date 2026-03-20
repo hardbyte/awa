@@ -7,6 +7,7 @@ import { fetchCronJobs, triggerCronJob } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
 import type { CronJobRow } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
+import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
   Table,
@@ -17,6 +18,20 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { CronExpr } from "@/components/CronExpr";
+
+function timeAgo(dateStr: string): string {
+  const seconds = Math.floor(
+    (Date.now() - new Date(dateStr).getTime()) / 1000
+  );
+  if (seconds < 0) return "just now";
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
 
 export function CronPage() {
   const queryClient = useQueryClient();
@@ -47,10 +62,10 @@ export function CronPage() {
         <Table aria-label="Cron schedules">
           <TableHeader>
             <TableColumn isRowHeader>Name</TableColumn>
-            <TableColumn>Cron</TableColumn>
-            <TableColumn>Timezone</TableColumn>
+            <TableColumn>Schedule</TableColumn>
             <TableColumn>Kind</TableColumn>
             <TableColumn>Queue</TableColumn>
+            <TableColumn>Pri</TableColumn>
             <TableColumn>Last Enqueued</TableColumn>
             <TableColumn>Actions</TableColumn>
           </TableHeader>
@@ -59,15 +74,35 @@ export function CronPage() {
               <TableRow key={cj.name} id={cj.name}>
                 <TableCell className="font-medium">{cj.name}</TableCell>
                 <TableCell>
-                  <CronExpr expr={cj.cron_expr} />
+                  <div className="space-y-0.5">
+                    <CronExpr expr={cj.cron_expr} />
+                    {cj.timezone !== "UTC" && (
+                      <div className="text-xs text-muted-fg">{cj.timezone}</div>
+                    )}
+                  </div>
                 </TableCell>
-                <TableCell>{cj.timezone}</TableCell>
                 <TableCell>{cj.kind}</TableCell>
-                <TableCell>{cj.queue}</TableCell>
+                <TableCell className="text-muted-fg">{cj.queue}</TableCell>
                 <TableCell>
-                  {cj.last_enqueued_at
-                    ? new Date(cj.last_enqueued_at).toLocaleString()
-                    : "Never"}
+                  {cj.priority !== 2 ? (
+                    <Badge
+                      intent={cj.priority === 1 ? "danger" : "secondary"}
+                      className="text-[10px]"
+                    >
+                      {cj.priority}
+                    </Badge>
+                  ) : (
+                    <span className="text-muted-fg/40">2</span>
+                  )}
+                </TableCell>
+                <TableCell>
+                  {cj.last_enqueued_at ? (
+                    <span title={new Date(cj.last_enqueued_at).toLocaleString()}>
+                      {timeAgo(cj.last_enqueued_at)}
+                    </span>
+                  ) : (
+                    <span className="text-muted-fg">Never</span>
+                  )}
                 </TableCell>
                 <TableCell>
                   <Button
