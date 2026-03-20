@@ -192,9 +192,10 @@ jobs:
           pattern: "{binary-*,wheels-*,cli-wheels-*}"
           merge-multiple: true
 
-      - name: Create release
+      - name: Create draft release with assets
         uses: softprops/action-gh-release@v2
         with:
+          draft: true
           generate_release_notes: true
           prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
           fail_on_unmatched_files: false
@@ -283,10 +284,10 @@ jobs:
           name: cli-wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
 
-  # ─── Publish Python packages to PyPI ─────────────────────────────────
-  publish-pypi:
-    name: Publish to PyPI
-    needs: [python-wheels, cli-wheels]
+  # ─── Publish Python SDK to PyPI ──────────────────────────────────────
+  publish-pypi-sdk:
+    name: Publish SDK to PyPI
+    needs: [python-wheels]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -299,6 +300,18 @@ jobs:
           merge-multiple: true
           path: dist/
 
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # ─── Publish CLI to PyPI ────────────────────────────────────────────
+  publish-pypi-cli:
+    name: Publish CLI to PyPI
+    needs: [cli-wheels]
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      id-token: write
+    steps:
       - name: Download CLI wheels
         uses: actions/download-artifact@v4
         with:
