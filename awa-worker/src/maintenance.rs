@@ -5,12 +5,30 @@ use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
 use sqlx::{PgPool, Postgres};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+
+/// Per-queue or global retention policy for completed and failed/cancelled jobs.
+#[derive(Debug, Clone)]
+pub struct RetentionPolicy {
+    /// How long to keep completed jobs before cleanup.
+    pub completed: Duration,
+    /// How long to keep failed/cancelled jobs before cleanup.
+    pub failed: Duration,
+}
+
+impl Default for RetentionPolicy {
+    fn default() -> Self {
+        Self {
+            completed: Duration::from_secs(86400), // 24h
+            failed: Duration::from_secs(259200),   // 72h
+        }
+    }
+}
 
 /// Maintenance service: runs leader-elected background tasks.
 ///
@@ -37,6 +55,8 @@ pub struct MaintenanceService {
     heartbeat_staleness: Duration,
     completed_retention: Duration,
     failed_retention: Duration,
+    cleanup_batch_size: i64,
+    queue_retention_overrides: HashMap<String, RetentionPolicy>,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -70,6 +90,8 @@ impl MaintenanceService {
             heartbeat_staleness: Duration::from_secs(90),
             completed_retention: Duration::from_secs(86400), // 24h
             failed_retention: Duration::from_secs(259200),   // 72h
+            cleanup_batch_size: 1000,
+            queue_retention_overrides: HashMap::new(),
         }
     }
 
@@ -85,6 +107,39 @@ impl MaintenanceService {
     /// Set the promotion interval for scheduled/retryable jobs.
     pub fn promote_interval(mut self, interval: Duration) -> Self {
         self.promote_interval = interval;
+        self
+    }
+
+    /// Set the cleanup interval (default: 60s).
+    pub fn cleanup_interval(mut self, interval: Duration) -> Self {
+        self.cleanup_interval = interval;
+        self
+    }
+
+    /// Set retention for completed jobs (default: 24h).
+    pub fn completed_retention(mut self, retention: Duration) -> Self {
+        self.completed_retention = retention;
+        self
+    }
+
+    /// Set retention for failed/cancelled jobs (default: 72h).
+    pub fn failed_retention(mut self, retention: Duration) -> Self {
+        self.failed_retention = retention;
+        self
+    }
+
+    /// Set the maximum number of jobs to delete per cleanup pass (default: 1000).
+    pub fn cleanup_batch_size(mut self, batch_size: i64) -> Self {
+        self.cleanup_batch_size = batch_size;
+        self
+    }
+
+    /// Set per-queue retention overrides.
+    pub fn queue_retention_overrides(
+        mut self,
+        overrides: HashMap<String, RetentionPolicy>,
+    ) -> Self {
+        self.queue_retention_overrides = overrides;
         self
     }
 
@@ -584,34 +639,115 @@ impl MaintenanceService {
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.
+    ///
+    /// Targets `jobs_hot` directly (bypassing the `awa.jobs` INSTEAD OF trigger)
+    /// since terminal-state jobs always reside in `jobs_hot`.
+    /// Runs a global pass for queues without overrides, then per-queue passes
+    /// for queues with custom retention.
     #[tracing::instrument(skip(self), name = "maintenance.cleanup")]
     async fn cleanup_completed(&self) {
+        let mut total_deleted: u64 = 0;
+
+        // Collect override queue names for the exclusion clause
+        let override_queues: Vec<String> = self.queue_retention_overrides.keys().cloned().collect();
+
+        // Global pass: delete jobs in queues that do NOT have overrides
         let completed_retention = format!("{} seconds", self.completed_retention.as_secs());
         let failed_retention = format!("{} seconds", self.failed_retention.as_secs());
 
-        match sqlx::query(
-            r#"
-            DELETE FROM awa.jobs
-            WHERE id IN (
-                SELECT id FROM awa.jobs
-                WHERE (state = 'completed' AND finalized_at < now() - $1::interval)
-                   OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval)
-                LIMIT 1000
+        let global_result = if override_queues.is_empty() {
+            sqlx::query(
+                r#"
+                DELETE FROM awa.jobs_hot
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_hot
+                    WHERE (state = 'completed' AND finalized_at < now() - $1::interval)
+                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval)
+                    LIMIT $3
+                )
+                "#,
             )
-            "#,
-        )
-        .bind(&completed_retention)
-        .bind(&failed_retention)
-        .execute(&self.pool)
-        .await
-        {
+            .bind(&completed_retention)
+            .bind(&failed_retention)
+            .bind(self.cleanup_batch_size)
+            .execute(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                DELETE FROM awa.jobs_hot
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_hot
+                    WHERE ((state = 'completed' AND finalized_at < now() - $1::interval)
+                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval))
+                      AND queue != ALL($4::text[])
+                    LIMIT $3
+                )
+                "#,
+            )
+            .bind(&completed_retention)
+            .bind(&failed_retention)
+            .bind(self.cleanup_batch_size)
+            .bind(&override_queues)
+            .execute(&self.pool)
+            .await
+        };
+
+        match global_result {
             Ok(result) if result.rows_affected() > 0 => {
-                info!(count = result.rows_affected(), "Cleaned up old jobs");
+                total_deleted += result.rows_affected();
             }
             Err(err) => {
-                error!(error = %err, "Failed to clean up old jobs");
+                error!(error = %err, "Failed to clean up old jobs (global pass)");
             }
             _ => {}
+        }
+
+        // Per-queue override passes
+        for (queue_name, policy) in &self.queue_retention_overrides {
+            let queue_completed = format!("{} seconds", policy.completed.as_secs());
+            let queue_failed = format!("{} seconds", policy.failed.as_secs());
+
+            match sqlx::query(
+                r#"
+                DELETE FROM awa.jobs_hot
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_hot
+                    WHERE queue = $4
+                      AND ((state = 'completed' AND finalized_at < now() - $1::interval)
+                        OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval))
+                    LIMIT $3
+                )
+                "#,
+            )
+            .bind(&queue_completed)
+            .bind(&queue_failed)
+            .bind(self.cleanup_batch_size)
+            .bind(queue_name)
+            .execute(&self.pool)
+            .await
+            {
+                Ok(result) if result.rows_affected() > 0 => {
+                    total_deleted += result.rows_affected();
+                    debug!(
+                        queue = %queue_name,
+                        count = result.rows_affected(),
+                        "Cleaned up old jobs (queue override)"
+                    );
+                }
+                Err(err) => {
+                    error!(
+                        queue = %queue_name,
+                        error = %err,
+                        "Failed to clean up old jobs (queue override)"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if total_deleted > 0 {
+            info!(count = total_deleted, "Cleaned up old jobs");
         }
     }
 }

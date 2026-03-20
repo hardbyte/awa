@@ -14,4 +14,5 @@ pub use client::{BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, 
 pub use context::{CallbackToken, JobContext};
 pub use dispatcher::{QueueConfig, RateLimit};
 pub use executor::{JobError, JobResult, Worker};
+pub use maintenance::RetentionPolicy;
 pub use metrics::AwaMetrics;
