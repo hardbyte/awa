@@ -261,11 +261,7 @@ impl Worker for TimingWorker {
     }
 
     async fn perform(&self, job: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
-        let seq = job
-            .args
-            .get("seq")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let seq = job.args.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
         let steady_slot = job.metadata.get("steady_slot").and_then(|v| v.as_i64());
         let cron_name = job
             .metadata
