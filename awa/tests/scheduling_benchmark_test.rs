@@ -835,7 +835,7 @@ async fn run_scheduled_frontier_benchmark(queue: &str, total_jobs: i64, due_now:
         SELECT
             'timing_job',
             $1,
-            '{}'::jsonb,
+            jsonb_build_object('seq', g),
             'scheduled'::awa.job_state,
             2,
             25,

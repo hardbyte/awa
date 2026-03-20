@@ -98,12 +98,20 @@ export function SearchBar({ value, onChange }: SearchBarProps) {
             });
           }
         }
-      } else if (!lastPart.startsWith("tag:") && lastPart.length === 0) {
-        results.push(
-          { label: "kind:<name>", value: "kind:" },
-          { label: "queue:<name>", value: "queue:" },
-          { label: "tag:<name>", value: "tag:" }
-        );
+      } else if (lastPart.startsWith("tag:")) {
+        // No autocomplete source for tags — just let user type
+      } else {
+        // Show available prefix hints for filters not yet used
+        const existing = trimmed.toLowerCase();
+        if (!existing.includes("kind:")) {
+          results.push({ label: "kind:<name>", value: "kind:" });
+        }
+        if (!existing.includes("queue:")) {
+          results.push({ label: "queue:<name>", value: "queue:" });
+        }
+        if (!existing.includes("tag:")) {
+          results.push({ label: "tag:<name>", value: "tag:" });
+        }
       }
 
       return results.slice(0, 8);

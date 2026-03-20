@@ -236,6 +236,13 @@ export function JobsPage() {
     setUrlParams({ q: q || undefined, before_id: undefined });
   };
 
+  /** Remove a single filter prefix from the search string */
+  const removeFilter = (prefix: "kind" | "queue" | "tag") => {
+    const tokens = filters.search.trim().split(/\s+/);
+    const remaining = tokens.filter((t) => !t.startsWith(`${prefix}:`));
+    setSearch(remaining.join(" "));
+  };
+
   const setBeforeId = (id: number | undefined) => {
     setUrlParams({
       before_id: id !== undefined ? String(id) : undefined,
@@ -343,22 +350,42 @@ export function JobsPage() {
       {/* Search bar */}
       <SearchBar value={filters.search} onChange={setSearch} />
 
-      {/* Active filters display */}
+      {/* Active filters — individually removable */}
       {(searchFilters.kind || searchFilters.queue || searchFilters.tag) && (
-        <div className="flex items-center gap-2 text-sm">
+        <div className="flex flex-wrap items-center gap-2 text-sm">
           <span className="text-muted-fg">Filters:</span>
           {searchFilters.kind && (
-            <Badge intent="primary">kind:{searchFilters.kind}</Badge>
+            <button
+              className="inline-flex items-center gap-1 rounded-full bg-primary-subtle px-2.5 py-0.5 text-xs font-medium text-primary-subtle-fg transition-colors hover:bg-primary-subtle/80"
+              onClick={() => removeFilter("kind")}
+            >
+              kind:{searchFilters.kind}
+              <span aria-hidden>&times;</span>
+            </button>
           )}
           {searchFilters.queue && (
-            <Badge intent="primary">queue:{searchFilters.queue}</Badge>
+            <button
+              className="inline-flex items-center gap-1 rounded-full bg-primary-subtle px-2.5 py-0.5 text-xs font-medium text-primary-subtle-fg transition-colors hover:bg-primary-subtle/80"
+              onClick={() => removeFilter("queue")}
+            >
+              queue:{searchFilters.queue}
+              <span aria-hidden>&times;</span>
+            </button>
           )}
           {searchFilters.tag && (
-            <Badge intent="primary">tag:{searchFilters.tag}</Badge>
+            <button
+              className="inline-flex items-center gap-1 rounded-full bg-primary-subtle px-2.5 py-0.5 text-xs font-medium text-primary-subtle-fg transition-colors hover:bg-primary-subtle/80"
+              onClick={() => removeFilter("tag")}
+            >
+              tag:{searchFilters.tag}
+              <span aria-hidden>&times;</span>
+            </button>
           )}
-          <Button intent="outline" size="xs" onPress={() => setSearch("")}>
-            Clear
-          </Button>
+          {Object.keys(searchFilters).filter((k) => searchFilters[k as keyof typeof searchFilters]).length > 1 && (
+            <Button intent="outline" size="xs" onPress={() => setSearch("")}>
+              Clear all
+            </Button>
+          )}
         </div>
       )}
 
