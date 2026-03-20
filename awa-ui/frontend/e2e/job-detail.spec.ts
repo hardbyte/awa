@@ -85,7 +85,9 @@ test.describe("Job detail page", () => {
     await jobTable.getByRole("row").nth(1).click();
     await page.waitForURL(/\/jobs\/\d+/);
 
-    await expect(page.getByText("Timeline")).toBeVisible({ timeout: 10000 });
-    await expect(page.getByText("Created")).toBeVisible();
+    await expect(
+      page.locator('[data-slot="card-header"]', { hasText: "Timeline" })
+    ).toBeVisible({ timeout: 10000 });
+    await expect(page.getByText("Created").first()).toBeVisible();
   });
 });

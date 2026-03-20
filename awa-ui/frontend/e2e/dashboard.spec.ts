@@ -30,8 +30,8 @@ test.describe("Dashboard page", () => {
       page.locator('[data-slot="card-header"]', { hasText: "Queues" })
     ).toBeVisible();
 
-    // Seeded e2e_test queue should appear
-    await expect(page.getByText("e2e_test")).toBeVisible();
+    // Seeded e2e_test queue should appear in the queue table
+    await expect(page.getByText("e2e_test").first()).toBeVisible();
   });
 
   test("recent failures section shows seeded failed job", async ({ page }) => {
