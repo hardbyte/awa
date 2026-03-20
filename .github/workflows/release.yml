@@ -181,7 +181,7 @@ jobs:
   # ─── GitHub Release ──────────────────────────────────────────────────
   github-release:
     name: GitHub Release
-    needs: [build-binaries, python-wheels]
+    needs: [build-binaries, python-wheels, cli-wheels]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -189,7 +189,7 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: "{binary-*,wheels}"
+          pattern: "{binary-*,wheels-*,cli-wheels-*}"
           merge-multiple: true
 
       - name: Create release
@@ -241,19 +241,66 @@ jobs:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
 
-  # ─── Publish Python package to PyPI ──────────────────────────────────
+  # ─── CLI wheels (maturin, bindings=bin) ──────────────────────────────
+  cli-wheels:
+    name: CLI wheels — ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64
+            manylinux: auto
+          - os: ubuntu-24.04-arm
+            target: aarch64
+            manylinux: auto
+          - os: macos-latest
+            target: x86_64
+          - os: macos-latest
+            target: aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Build CLI wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: --release --out dist --manifest-path awa-cli/Cargo.toml
+          before-script-linux: |
+            apt-get update && apt-get install -y libpq-dev || true
+
+      - name: Upload CLI wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-wheels-${{ matrix.os }}-${{ matrix.target }}
+          path: dist/*.whl
+
+  # ─── Publish Python packages to PyPI ─────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
-    needs: [python-wheels]
+    needs: [python-wheels, cli-wheels]
     runs-on: ubuntu-latest
     environment: release
     permissions:
       id-token: write
     steps:
-      - name: Download wheels
+      - name: Download SDK wheels
         uses: actions/download-artifact@v4
         with:
           pattern: wheels-*
+          merge-multiple: true
+          path: dist/
+
+      - name: Download CLI wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-wheels-*
           merge-multiple: true
           path: dist/
 

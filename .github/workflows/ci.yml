@@ -144,6 +144,26 @@ jobs:
       - name: Run spike tests
         run: .venv/bin/pytest test_spike.py -v
 
+  # ─── CLI wheel build test ───────────────────────────────
+  cli-wheel-build:
+    name: CLI wheel build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build CLI wheel (maturin)
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist --manifest-path awa-cli/Cargo.toml
+          before-script-linux: |
+            apt-get update && apt-get install -y libpq-dev || true
+      - name: Verify wheel contents
+        run: |
+          pip install dist/*.whl
+          awa --help
+
   # ─── CLI smoke test ─────────────────────────────────────
   cli-smoke:
     name: CLI smoke test

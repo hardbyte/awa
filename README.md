@@ -133,14 +133,23 @@ awa = "0.2"
 ### Python
 
 ```bash
-pip install awa-pg
+pip install awa-pg       # Python SDK (insert, worker, admin)
+pip install awa-cli      # CLI binary (migrations, admin, serve)
 ```
 
 ### CLI
 
-```bash
-cargo install awa-cli
+The `awa` CLI is available via pip (no Rust toolchain needed) or cargo:
 
+```bash
+# Via pip (recommended for Python users)
+pip install awa-cli
+
+# Via cargo (Rust users)
+cargo install awa-cli
+```
+
+```bash
 awa --database-url $DATABASE_URL migrate
 awa --database-url $DATABASE_URL queue stats
 awa --database-url $DATABASE_URL job list --state failed
