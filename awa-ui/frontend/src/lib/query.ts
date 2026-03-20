@@ -3,9 +3,9 @@ import { QueryClient } from "@tanstack/react-query";
 export const queryClient = new QueryClient({
   defaultOptions: {
     queries: {
-      refetchInterval: 5000,
+      refetchInterval: 2000,
       refetchIntervalInBackground: false, // Pause polling when tab is hidden
-      staleTime: 2000,
+      staleTime: 1000,
       refetchOnWindowFocus: true,
     },
   },

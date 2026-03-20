@@ -1,5 +1,5 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { useIsFetching } from "@tanstack/react-query";
+import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { Button } from "@/components/ui/button";
 import {
@@ -126,20 +126,40 @@ function ThemeToggle() {
   );
 }
 
-/** Subtle animated dot when background fetches are happening */
-function RefreshIndicator() {
+/** Refresh button with live indicator — click to force refresh all queries */
+function RefreshControl() {
   const isFetching = useIsFetching();
-
-  if (isFetching === 0) return null;
+  const queryClient = useQueryClient();
+  const fetching = isFetching > 0;
 
   return (
-    <span
-      className="relative flex size-2"
-      title="Refreshing data..."
+    <Button
+      intent="plain"
+      size="sq-sm"
+      aria-label="Refresh data"
+      onPress={() => void queryClient.invalidateQueries()}
+      className="relative"
     >
-      <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-50" />
-      <span className="relative inline-flex size-2 rounded-full bg-primary" />
-    </span>
+      <svg
+        data-slot="icon"
+        viewBox="0 0 20 20"
+        fill="currentColor"
+        className={fetching ? "animate-spin" : ""}
+      >
+        <path
+          fillRule="evenodd"
+          d="M15.312 11.424a5.5 5.5 0 0 1-9.201 2.466l-.312-.311h2.433a.75.75 0 0 0 0-1.5H4.598a.75.75 0 0 0-.75.75v3.634a.75.75 0 0 0 1.5 0v-2.033l.312.311a7 7 0 0 0 11.712-3.138.75.75 0 0 0-1.449-.39Zm-10.624-2.85a5.5 5.5 0 0 1 9.201-2.465l.312.31H11.768a.75.75 0 0 0 0 1.5h3.634a.75.75 0 0 0 .75-.75V3.535a.75.75 0 0 0-1.5 0v2.033l-.312-.31A7 7 0 0 0 2.628 8.395a.75.75 0 0 0 1.449.39l.611.789Z"
+          clipRule="evenodd"
+        />
+      </svg>
+      {/* Live indicator dot */}
+      {fetching && (
+        <span className="absolute -right-0.5 -top-0.5 flex size-2">
+          <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-50" />
+          <span className="relative inline-flex size-2 rounded-full bg-primary" />
+        </span>
+      )}
+    </Button>
   );
 }
 
@@ -186,7 +206,7 @@ export function Shell() {
         <NavbarSpacer />
 
         <div className="flex items-center gap-2">
-          <RefreshIndicator />
+          <RefreshControl />
           <ThemeToggle />
         </div>
       </Navbar>
@@ -198,7 +218,7 @@ export function Shell() {
           <span className="text-base font-semibold text-fg">AWA</span>
         </a>
         <div className="ml-auto flex items-center gap-2">
-          <RefreshIndicator />
+          <RefreshControl />
           <ThemeToggle />
         </div>
       </NavbarMobile>

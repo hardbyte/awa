@@ -3,16 +3,26 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
 import { useNavigate, useSearch } from "@tanstack/react-router";
-import { fetchJobs, fetchStats, bulkRetry, bulkCancel } from "@/lib/api";
+import {
+  fetchJobs,
+  fetchStats,
+  fetchQueues,
+  bulkRetry,
+  bulkCancel,
+  pauseQueue,
+  resumeQueue,
+  drainQueue,
+} from "@/lib/api";
 import { toast } from "@/components/ui/toast";
-import type { JobRow, ListJobsParams, StateCounts } from "@/lib/api";
+import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { SearchBar, parseSearch } from "@/components/SearchBar";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 import {
   Table,
   TableHeader,
@@ -34,7 +44,8 @@ const STATES = [
   "waiting_external",
 ] as const;
 
-const PAGE_SIZE = 50;
+const DEFAULT_PAGE_SIZE = 50;
+const PAGE_SIZES = [20, 50, 100] as const;
 
 function timeAgo(dateStr: string): string {
   const seconds = Math.floor(
@@ -49,6 +60,24 @@ function timeAgo(dateStr: string): string {
   return `${days}d ago`;
 }
 
+/** Show the most relevant timestamp based on job state */
+function contextualTime(job: { state: string; created_at: string; attempted_at: string | null; finalized_at: string | null }): string {
+  if (job.finalized_at && ["completed", "failed", "cancelled"].includes(job.state)) {
+    return timeAgo(job.finalized_at);
+  }
+  if (job.attempted_at && ["running", "waiting_external"].includes(job.state)) {
+    return timeAgo(job.attempted_at);
+  }
+  return timeAgo(job.created_at);
+}
+
+/** Label for contextual time column header */
+function timeColumnLabel(state: string): string {
+  if (["completed", "failed", "cancelled"].includes(state)) return "Finalized";
+  if (["running", "waiting_external"].includes(state)) return "Started";
+  return "Created";
+}
+
 function useJobFilters() {
   const searchParams = useSearch({ strict: false }) as Record<
     string,
@@ -60,7 +89,7 @@ function useJobFilters() {
     beforeId: searchParams.before_id
       ? Number(searchParams.before_id)
       : undefined,
-    limit: searchParams.limit ? Number(searchParams.limit) : PAGE_SIZE,
+    limit: searchParams.limit ? Number(searchParams.limit) : DEFAULT_PAGE_SIZE,
   };
 }
 
@@ -86,7 +115,7 @@ export function JobsPage() {
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
-    refetchInterval: hasSel ? false : 5000,
+    refetchInterval: hasSel ? false : undefined, // undefined = use global default (2s)
   });
 
   const statsQuery = useQuery<StateCounts>({
@@ -121,6 +150,60 @@ export function JobsPage() {
   });
 
   const jobs = jobsQuery.data ?? [];
+  const [showCancelConfirm, setShowCancelConfirm] = useState(false);
+  const [showDrainConfirm, setShowDrainConfirm] = useState(false);
+
+  // Queue context: when filtering by a single queue, show queue actions
+  const activeQueue = searchFilters.queue;
+  const queuesQuery = useQuery<QueueStats[]>({
+    queryKey: ["queues"],
+    queryFn: fetchQueues,
+    enabled: !!activeQueue,
+  });
+  const queueStats = activeQueue
+    ? queuesQuery.data?.find((q) => q.queue === activeQueue)
+    : undefined;
+
+  const pauseQueueMutation = useMutation({
+    mutationFn: () => pauseQueue(activeQueue!, "ui"),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      toast.success(`Queue "${activeQueue}" paused`);
+    },
+    onError: () => toast.error("Failed to pause queue"),
+  });
+  const resumeQueueMutation = useMutation({
+    mutationFn: () => resumeQueue(activeQueue!),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      toast.success(`Queue "${activeQueue}" resumed`);
+    },
+    onError: () => toast.error("Failed to resume queue"),
+  });
+  const drainQueueMutation = useMutation({
+    mutationFn: () => drainQueue(activeQueue!),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success(`Queue "${activeQueue}" drained`);
+    },
+    onError: () => toast.error("Failed to drain queue"),
+  });
+
+  // Compute which selected jobs are retryable vs cancellable
+  const RETRYABLE_STATES = new Set(["failed", "cancelled", "waiting_external"]);
+  const TERMINAL_STATES = new Set(["completed", "failed", "cancelled"]);
+  const { retryableIds, cancellableIds } = useMemo(() => {
+    const selectedJobs = jobs.filter((j) => selected.has(j.id));
+    return {
+      retryableIds: selectedJobs
+        .filter((j) => RETRYABLE_STATES.has(j.state))
+        .map((j) => j.id),
+      cancellableIds: selectedJobs
+        .filter((j) => !TERMINAL_STATES.has(j.state))
+        .map((j) => j.id),
+    };
+  }, [jobs, selected]);
 
   const setUrlParams = useCallback(
     (updates: Record<string, string | undefined>) => {
@@ -168,13 +251,61 @@ export function JobsPage() {
   return (
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-4">
-        <Heading level={2}>Jobs</Heading>
-        {total !== undefined && (
+        <Heading level={2}>
+          {activeQueue ? `Queue: ${activeQueue}` : "Jobs"}
+        </Heading>
+        {total !== undefined && !activeQueue && (
           <span className="text-sm text-muted-fg">
             {total.toLocaleString()} total
           </span>
         )}
       </div>
+
+      {/* Queue context banner — shown when filtering by a single queue */}
+      {activeQueue && queueStats && (
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/30 p-3">
+          {queueStats.paused ? (
+            <Badge intent="warning">Paused</Badge>
+          ) : (
+            <Badge intent="success">Active</Badge>
+          )}
+          <span className="text-sm text-muted-fg">
+            {queueStats.available} available &middot;{" "}
+            {queueStats.running} running &middot;{" "}
+            <span className={queueStats.failed > 0 ? "text-danger" : ""}>
+              {queueStats.failed} failed
+            </span>{" "}
+            &middot; {queueStats.completed_last_hour}/hr
+          </span>
+          <div className="flex gap-1">
+            {queueStats.paused ? (
+              <Button
+                intent="outline"
+                size="xs"
+                onPress={() => resumeQueueMutation.mutate()}
+              >
+                Resume
+              </Button>
+            ) : (
+              <Button
+                intent="outline"
+                size="xs"
+                onPress={() => pauseQueueMutation.mutate()}
+              >
+                Pause
+              </Button>
+            )}
+            <Button
+              intent="outline"
+              size="xs"
+              className="text-danger"
+              onPress={() => setShowDrainConfirm(true)}
+            >
+              Drain
+            </Button>
+          </div>
+        </div>
+      )}
 
       {/* Compact state filter pills + search on same row */}
       <div className="flex flex-wrap items-center gap-2">
@@ -234,23 +365,24 @@ export function JobsPage() {
       {/* Bulk action toolbar */}
       {selected.size > 0 && (
         <div className="flex items-center gap-3 rounded-lg bg-muted p-3">
-          <span className="text-sm">{selected.size} selected</span>
+          <span className="text-sm font-medium">{selected.size} selected</span>
           <Badge intent="warning">Updates paused</Badge>
           <Button
             intent="primary"
             size="sm"
-            onPress={() => retryMutation.mutate([...selected])}
-            isDisabled={retryMutation.isPending}
+            onPress={() => retryMutation.mutate(retryableIds)}
+            isDisabled={retryMutation.isPending || retryableIds.length === 0}
           >
-            Retry
+            Retry{retryableIds.length > 0 ? ` (${retryableIds.length})` : ""}
           </Button>
           <Button
-            intent="danger"
+            intent="outline"
             size="sm"
-            onPress={() => cancelMutation.mutate([...selected])}
-            isDisabled={cancelMutation.isPending}
+            className="text-danger"
+            onPress={() => setShowCancelConfirm(true)}
+            isDisabled={cancelMutation.isPending || cancellableIds.length === 0}
           >
-            Cancel
+            Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})` : ""}
           </Button>
         </div>
       )}
@@ -274,7 +406,7 @@ export function JobsPage() {
           <TableColumn>Queue</TableColumn>
           <TableColumn>Attempt</TableColumn>
           <TableColumn>Tags</TableColumn>
-          <TableColumn>Created</TableColumn>
+          <TableColumn>{timeColumnLabel(filters.state)}</TableColumn>
         </TableHeader>
         <TableBody
           renderEmptyState={() =>
@@ -328,23 +460,25 @@ export function JobsPage() {
                 )}
               </TableCell>
               <TableCell className="text-muted-fg">
-                {timeAgo(job.created_at)}
+                {contextualTime(job)}
               </TableCell>
             </TableRow>
           ))}
         </TableBody>
       </Table>
 
-      {/* Pagination */}
-      {jobs.length === filters.limit && lastJob && (
-        <div className="flex gap-2 pt-2">
-          <Button
-            intent="outline"
-            size="sm"
-            onPress={() => setBeforeId(lastJob.id)}
-          >
-            Next page
-          </Button>
+      {/* Pagination + page size */}
+      <div className="flex flex-wrap items-center justify-between gap-3 pt-2">
+        <div className="flex items-center gap-2">
+          {jobs.length === filters.limit && lastJob && (
+            <Button
+              intent="outline"
+              size="sm"
+              onPress={() => setBeforeId(lastJob.id)}
+            >
+              Next page
+            </Button>
+          )}
           {filters.beforeId !== undefined && (
             <Button
               intent="outline"
@@ -354,7 +488,59 @@ export function JobsPage() {
               Back to first
             </Button>
           )}
+          {jobs.length > 0 && (
+            <span className="text-sm text-muted-fg">
+              Showing {jobs.length} job{jobs.length !== 1 ? "s" : ""}
+              {total !== undefined && ` of ~${total.toLocaleString()}`}
+            </span>
+          )}
         </div>
+        <div className="flex items-center gap-1.5 text-sm text-muted-fg">
+          <span>Per page:</span>
+          {PAGE_SIZES.map((size) => (
+            <button
+              key={size}
+              onClick={() =>
+                setUrlParams({
+                  limit: size === DEFAULT_PAGE_SIZE ? undefined : String(size),
+                  before_id: undefined,
+                })
+              }
+              className={[
+                "rounded px-2 py-0.5 text-sm transition-colors",
+                filters.limit === size
+                  ? "bg-primary text-primary-fg"
+                  : "hover:bg-secondary",
+              ].join(" ")}
+            >
+              {size}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <ConfirmDialog
+        isOpen={showCancelConfirm}
+        onOpenChange={setShowCancelConfirm}
+        title={`Cancel ${cancellableIds.length} job(s)`}
+        description={`This will cancel ${cancellableIds.length} non-terminal job(s). Running jobs will be marked as cancelled. This action cannot be undone.`}
+        confirmLabel="Cancel jobs"
+        confirmIntent="danger"
+        onConfirm={() => cancelMutation.mutate(cancellableIds)}
+        isPending={cancelMutation.isPending}
+      />
+
+      {activeQueue && (
+        <ConfirmDialog
+          isOpen={showDrainConfirm}
+          onOpenChange={setShowDrainConfirm}
+          title={`Drain queue "${activeQueue}"`}
+          description="This will cancel all available, scheduled, retryable, and waiting_external jobs in this queue. Running jobs will not be affected."
+          confirmLabel="Drain queue"
+          confirmIntent="danger"
+          onConfirm={() => drainQueueMutation.mutate()}
+          isPending={drainQueueMutation.isPending}
+        />
       )}
     </div>
   );

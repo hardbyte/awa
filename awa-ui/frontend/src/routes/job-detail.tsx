@@ -21,6 +21,7 @@ import { JsonView } from "@/components/JsonView";
 import { ProgressDisplay } from "@/components/ProgressDisplay";
 import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
+import { JobTimeline } from "@/components/JobTimeline";
 
 function hasMetadata(job: JobRow): boolean {
   return (
@@ -184,6 +185,14 @@ export function JobDetailPage() {
           </>
         )}
       </DescriptionList>
+
+      {/* Timeline */}
+      <Card>
+        <CardHeader title="Timeline" />
+        <CardContent>
+          <JobTimeline job={job} />
+        </CardContent>
+      </Card>
 
       {/* Progress */}
       {job.progress != null && (
