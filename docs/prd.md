@@ -76,11 +76,14 @@ The common limitations of pure-Python Postgres queues:
 
 ### 3.3 Tertiary (v0.4+)
 
-- Web UI
-- Webhook completion for external systems (`waiting_external` state)
 - Insert-only thin clients for TypeScript/Ruby
 
-### 3.4 Non-Goals
+### 3.4 Delivered ahead of schedule
+
+- Web UI (dashboard, job inspector, queue management, cron controls) — delivered v0.3
+- Webhook completion for external systems (`waiting_external` state) — delivered v0.2
+
+### 3.5 Non-Goals
 
 - **Exactly-once semantics.** At-least-once with idempotent handlers.
 - **Multi-backend support.** No SQLite, no MySQL, no Redis. Postgres-only.

@@ -777,10 +777,11 @@ fn compute_fire_time(
 
     let search_start = match row.last_enqueued_at {
         Some(last) => last.with_timezone(&tz),
-        // First registration: search from cron_jobs.created_at so that
-        // low-frequency schedules (weekly, monthly) still find their most
-        // recent past fire. Previously capped at 24h which missed them.
-        None => row.created_at.with_timezone(&tz),
+        // First registration: search from one interval before created_at
+        // so that the current minute's fire is found. Without this,
+        // a schedule created at HH:MM:30 won't find the HH:MM:00 fire
+        // because created_at > fire_time, causing up to 60s delay.
+        None => (row.created_at - chrono::Duration::minutes(1)).with_timezone(&tz),
     };
 
     let mut latest_fire: Option<chrono::DateTime<Utc>> = None;

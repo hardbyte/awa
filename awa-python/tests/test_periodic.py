@@ -181,10 +181,11 @@ async def test_periodic_fires_and_executes(client):
         queue=queue,
     )
 
-    client.start([(queue, 1)])
+    # Use fast leader election so the cron job fires promptly.
+    # Default 10s election interval makes this test timing-dependent.
+    client.start([(queue, 1)], leader_election_interval_ms=100, heartbeat_interval_ms=100)
 
-    # Poll until the job fires or timeout. Leader election can take up to 10s
-    # plus cron sync + eval cycles.
+    # Poll until the job fires or timeout.
     for _ in range(60):
         await asyncio.sleep(0.5)
         if len(executed) >= 1:

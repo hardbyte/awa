@@ -19,8 +19,10 @@ awa (workspace)
 │   └── depends on: awa-model, awa-macros, awa-worker
 ├── awa-testing       Test utilities (TestClient, WorkResult)
 │   └── depends on: awa-model, awa-worker
-├── awa-cli           CLI binary: migrations, job/queue/cron admin
-│   └── depends on: awa-model, clap
+├── awa-ui            Web UI: axum REST API + embedded React/IntentUI frontend
+│   └── depends on: awa-model, axum, rust-embed, tokio, serde
+├── awa-cli           CLI binary: migrations, job/queue/cron admin, web UI server
+│   └── depends on: awa-model, awa-ui, axum, clap
 └── awa-python        PyO3 cdylib: Python bindings (separate Cargo workspace)
     └── depends on: awa-model, awa-worker, pyo3, pyo3-async-runtimes
 ```
@@ -56,6 +58,9 @@ INSERT ──► scheduled ──► available ──► running ──► compl
                │              ▲           │
                │              │           ├──► retryable ──► available (via promotion)
                │              │           │
+               │              │           ├──► waiting_external ──► completed/failed
+               │              │           │         (webhook callback)
+               │              │           │
                │              │           ├──► failed (max attempts exhausted or terminal error)
                │              │           │
                │              │           └──► cancelled (by handler or admin)
@@ -76,6 +81,7 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 | `retryable` | Failed but eligible for retry after backoff |
 | `failed` | Exhausted max attempts or terminal error (terminal) |
 | `cancelled` | Cancelled by handler or admin (terminal) |
+| `waiting_external` | Parked for webhook callback completion |
 
 Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled).
 
@@ -457,6 +463,7 @@ All components emit structured tracing spans via the `tracing` crate with `#[ins
 | `maintenance.rescue_deadline` | maintenance.rs | — |
 | `maintenance.promote` | maintenance.rs | — |
 | `maintenance.cleanup` | maintenance.rs | — |
+| `maintenance.rescue_callback_timeout` | maintenance.rs | — |
 | `maintenance.cron_sync` | maintenance.rs | — |
 | `maintenance.cron_eval` | maintenance.rs | — |
 
@@ -474,16 +481,60 @@ The `AwaMetrics` struct (in `awa-worker/src/metrics.rs`) publishes OTel metrics 
 | `awa.jobs.retried` | Counter | Total jobs marked retryable |
 | `awa.jobs.cancelled` | Counter | Total jobs cancelled |
 | `awa.jobs.claimed` | Counter | Total jobs claimed for execution |
+| `awa.jobs.waiting_external` | Counter | Total jobs parked for external callback |
 | `awa.jobs.duration` | Histogram | Job execution duration in seconds |
 | `awa.jobs.in_flight` | UpDownCounter | Current in-flight jobs |
+| `awa.dispatch.claim_batches` | Counter | Total dispatcher claim queries |
+| `awa.dispatch.claim_batch_size` | Histogram | Dispatcher claim batch size in jobs |
+| `awa.dispatch.claim_duration` | Histogram | Dispatcher claim query duration (seconds) |
+| `awa.completion.flushes` | Counter | Total completion batch flushes |
+| `awa.completion.flush_batch_size` | Histogram | Completion flush batch size in jobs |
+| `awa.completion.flush_duration` | Histogram | Completion flush duration (seconds) |
+| `awa.maintenance.promote_batches` | Counter | Total promotion batches |
+| `awa.maintenance.promote_batch_size` | Histogram | Promotion batch size in jobs |
+| `awa.maintenance.promote_duration` | Histogram | Promotion batch duration (seconds) |
 | `awa.heartbeat.batches` | Counter | Total heartbeat batch updates |
 | `awa.maintenance.rescues` | Counter | Total jobs rescued by maintenance |
 
-All metrics carry `awa.job.kind` and `awa.job.queue` attributes for per-job-type and per-queue dashboards.
+Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch metrics carry `awa.job.queue`. Completion metrics carry `awa.completion.shard`. Promotion metrics carry `awa.job.state`.
 
 ### Queue Statistics (SQL)
 
 The `stats.sql` query and `admin::queue_stats()` function provide per-queue depth, lag, and throughput metrics directly from Postgres, suitable for Grafana dashboards or CLI monitoring (`awa queue stats`).
+
+## Web UI
+
+The `awa-ui` crate provides a built-in web dashboard via `awa serve`:
+
+```
+awa --database-url $DATABASE_URL serve
+# Open http://127.0.0.1:3000
+```
+
+The UI is a React/TypeScript frontend built with IntentUI components, compiled to static assets and embedded into the Rust binary via `rust-embed`. The backend is an axum REST API that queries `awa-model` admin functions directly.
+
+**Pages:** Dashboard (state counts, throughput chart), Job Inspector (search, filter, bulk actions, detail view), Queue Management (stats, pause/resume, drain), Cron Schedules (list, trigger, details).
+
+**API endpoints** (all under `/api`):
+
+| Endpoint | Method | Description |
+|---|---|---|
+| `/api/jobs` | GET | List/search jobs with filters |
+| `/api/jobs/:id` | GET | Single job detail |
+| `/api/jobs/retry` | POST | Bulk retry by IDs |
+| `/api/jobs/cancel` | POST | Bulk cancel by IDs |
+| `/api/queues` | GET | Queue stats with pause status |
+| `/api/queues/:name/pause` | POST | Pause a queue |
+| `/api/queues/:name/resume` | POST | Resume a queue |
+| `/api/queues/:name/drain` | POST | Drain a queue |
+| `/api/cron` | GET | List cron schedules |
+| `/api/cron/:name/trigger` | POST | Trigger a cron job immediately |
+| `/api/stats/counts` | GET | Job state counts |
+| `/api/stats/timeseries` | GET | Throughput timeseries |
+| `/api/stats/kinds` | GET | Distinct job kinds |
+| `/api/stats/queues` | GET | Distinct queue names |
+
+The UI is distributed via `pip install awa-cli` (platform wheel containing the native binary with embedded assets) or `cargo install awa-cli`.
 
 ## Deployment Model
 
