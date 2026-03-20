@@ -281,7 +281,7 @@ jobs:
           name: cli-wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
 
-  # ─── Publish Python package to PyPI ──────────────────────────────────
+  # ─── Publish Python packages to PyPI ─────────────────────────────────
   publish-pypi:
     name: Publish to PyPI
     needs: [python-wheels, cli-wheels]
