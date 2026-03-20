@@ -66,16 +66,45 @@ The frontend SPA is compiled with Vite, then embedded into the Rust binary via
 | Choice | Rationale |
 |--------|-----------|
 | **React 19 + TypeScript** | Industry standard. Same stack as RiverUI. Brian knows React. |
+| **IntentUI** (commercial license) | 116-component kit built on React Aria Components + Tailwind v4. Provides production-grade Table, Badge, Tabs, Navbar, Pagination, Dialog, Toast, ComboBox, CodeBlock, Charts, and more. CSS-variable theme system with dark mode. See section 2.2.1. |
 | **TanStack Router** | File-based routing with type-safe params. URL-driven state. |
 | **TanStack Query** | Server state with auto-refetch, stale-while-revalidate, mutations. |
-| **Tailwind CSS v4** | Utility-first. Dark mode via `dark:` prefix. Small bundle. |
-| **Headless UI** | Accessible dropdowns, dialogs, transitions without style opinions. |
-| **Heroicons** | Clean icon set. Same as RiverUI. |
+| **Tailwind CSS v4** | Required by IntentUI. Utility-first, dark mode via class strategy. |
+| **React Aria Components** | Adobe's accessibility primitives — IntentUI's foundation. Replaces Headless UI with better keyboard nav, ARIA, and focus management. |
+| **Heroicons** | Icon set used by IntentUI. |
 | **date-fns** | Lightweight date formatting. |
 | **Vite** | Fast builds, HMR for development. |
 
-No heavy charting library initially. Use CSS-based sparklines or a lightweight library
-(e.g., `uplot`) if charts are needed for the dashboard.
+Additional dependencies via IntentUI: `tailwind-variants`, `tailwind-merge`, `sonner`
+(toasts), `motion/react` (animations), `shiki` (syntax highlighting for JSON viewer).
+
+#### 2.2.1 IntentUI component mapping
+
+IntentUI provides pre-built components for nearly every UI element in the design:
+
+| AWA UI need | IntentUI component | Notes |
+|---|---|---|
+| Job table with checkbox selection | `Table` | Sorting, resizable columns, empty states, striped mode |
+| State badges (running, failed, etc.) | `Badge` | `intent` prop maps to job states (see section 6) |
+| Job detail properties panel | `DescriptionList` | Key-value layout with responsive grid |
+| State filter tabs | `Tabs` | Animated selection indicator |
+| Top navigation bar | `Navbar` | Responsive, mobile drawer, current-page indicator |
+| Search/filter autocomplete | `ComboBox` | Built-in autocomplete with keyboard support |
+| Confirmation dialogs | `Dialog` + `Modal` | Accessible, composable header/body/footer |
+| Pagination | `Pagination` | First/prev/next/last with gap indicators |
+| JSON args/metadata viewer | `CodeBlock` | Shiki syntax highlighting for JSON |
+| Toast notifications | `Toast` | Sonner-based with success/error/warning variants |
+| Dashboard stat cards | `Card` | Header/content/footer composition |
+| Job tags display | `TagGroup` | Styled tag chips |
+| Compact state history | `Tracker` | Color-coded block visualization (bonus) |
+| Dashboard charts | `BarChart`, `LineChart` | Charts are included — no longer deferred |
+| Loading states | `Skeleton` | Placeholder shimmer |
+
+**What we still build ourselves:**
+- Job timeline component (vertical state progression — compose from IntentUI primitives)
+- TanStack Router/Query integration layer
+- Auto-refresh with pause-on-select/pause-on-background logic
+- AWA-specific theme (custom CSS variables extending IntentUI's system)
 
 ### 2.3 API layer
 
@@ -455,16 +484,20 @@ Consistent color mapping across all views:
 | Failed | Red | 🔴 | Error — needs attention |
 | Cancelled | Gray | ⚫ | Inactive — intentional stop |
 
-Tailwind classes:
-```
-available:  bg-blue-100 text-blue-800   dark:bg-blue-900 dark:text-blue-200
-scheduled:  bg-slate-100 text-slate-600 dark:bg-slate-800 dark:text-slate-300
-running:    bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200
-completed:  bg-green-50 text-green-600  dark:bg-green-950 dark:text-green-300
-retryable:  bg-amber-100 text-amber-800 dark:bg-amber-900 dark:text-amber-200
-failed:     bg-red-100 text-red-800     dark:bg-red-900 dark:text-red-200
-cancelled:  bg-gray-100 text-gray-600   dark:bg-gray-800 dark:text-gray-300
-```
+**IntentUI Badge mapping:**
+
+| State | Badge `intent` | CSS variables used |
+|-------|---------------|-------------------|
+| Available | `info` | `--info-subtle`, `--info-subtle-fg` |
+| Scheduled | `secondary` | `--secondary`, `--secondary-fg` |
+| Running | `success` | `--success-subtle`, `--success-subtle-fg` |
+| Completed | `success` | Same as running (muted via opacity or variant) |
+| Retryable | `warning` | `--warning-subtle`, `--warning-subtle-fg` |
+| Failed | `danger` | `--danger-subtle`, `--danger-subtle-fg` |
+| Cancelled | `secondary` | `--secondary`, `--secondary-fg` |
+
+Usage: `<Badge intent="danger">Failed</Badge>`. Dark mode handled automatically
+by IntentUI's CSS variable system — no manual `dark:` classes needed.
 
 ---
 
@@ -474,7 +507,7 @@ Features explicitly not in v1, but worth noting for future:
 
 | Feature | Rationale for deferring |
 |---------|------------------------|
-| **Time-series charts** | Dashboard sparklines would be nice but require a charting library. Grafana covers this today. The BRIN index and `state_timeseries()` query are ready (section 8) — this is a frontend-only addition in v2. |
+| **Time-series charts** | IntentUI includes `LineChart`/`BarChart` so the frontend cost is low. The BRIN index and `state_timeseries()` query are ready (section 8). Include in v1 if time permits, otherwise easy v2 addition. |
 | **Job search by args** | Oban Web's `args.address.city:Edinburgh` is powerful but requires JSONB path queries. Expensive without a GIN index on `args`. Defer until demand is clear. |
 | **Cron editing** | Schedules are managed as code. "Trigger now" is included in v1 (section 4.6). No other write actions planned. |
 | **Worker/process list** | Flower-style worker management. AWA workers are stateless Kubernetes pods — `kubectl` is the right tool. Revisit if health_check data is enriched with worker metadata. |
