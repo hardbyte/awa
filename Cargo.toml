@@ -15,11 +15,11 @@ exclude = ["awa-python", "spike"]
 version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
-description = "Postgres-native background job queue for Rust and Python"
+description = "Postgres-native background job queue — transactional enqueue, heartbeat crash recovery, SKIP LOCKED dispatch"
 repository = "https://github.com/hardbyte/awa"
 readme = "README.md"
 keywords = ["postgres", "job-queue", "background-jobs", "async"]
-categories = ["database", "asynchronous"]
+categories = ["database", "asynchronous", "web-programming"]
 
 [workspace.dependencies]
 # Internal crates

@@ -116,6 +116,12 @@ jobs:
         run: .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+      - name: Run Python examples (README drift detection)
+        run: |
+          .venv/bin/python examples/quickstart.py
+          .venv/bin/python examples/sync_api.py
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
   # ─── Frontend ──────────────────────────────────────────
   frontend-lint:

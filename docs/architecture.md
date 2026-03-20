@@ -35,10 +35,11 @@ awa-macros  (proc-macro, no runtime deps)
     ▼
 awa-model   (core types + SQL, re-exports awa-macros::JobArgs)
     │
-    ├──────────────┐
-    ▼              ▼
-awa-worker     awa-cli
-    │
+    ├──────────────┬──────────────┐
+    ▼              ▼              ▼
+awa-worker     awa-ui          awa-cli
+    │          (axum API +       (depends on awa-ui)
+    │           embedded UI)
     ├──────────────┐
     ▼              ▼
 awa (facade)   awa-testing
@@ -51,7 +52,7 @@ awa (facade)   awa-testing
 
 ## Job Lifecycle State Machine
 
-As defined in PRD section 6.1, jobs follow this state machine:
+Jobs follow this state machine:
 
 ```
 INSERT ──► scheduled ──► available ──► running ──► completed
@@ -105,13 +106,11 @@ INSERT INTO awa.jobs (...) VALUES (...)
     ├── future `scheduled` / `retryable` rows route to `awa.scheduled_jobs`
     ├── unique_key computed via BLAKE3 (if UniqueOpts provided)
     └── TRIGGER: pg_notify('awa:<queue>', '') fires on hot available jobs
-
-`awa.jobs` preserves raw SQL compatibility for tests, admin queries, and
-non-Rust producers, but dispatch and promotion use the physical tables directly
-so the planner only touches the hot runnable set on the execution path.
 ```
 
-Insert accepts a `PgExecutor`, so it works inside an existing transaction -- the job becomes visible only when the outer transaction commits. This is the "transactional enqueue" pattern (PRD section 1).
+`awa.jobs` preserves raw SQL compatibility for tests, admin queries, and non-Rust producers, but dispatch and promotion use the physical tables directly so the planner only touches the hot runnable set on the execution path.
+
+Insert accepts a `PgExecutor`, so it works inside an existing transaction — the job becomes visible only when the outer transaction commits. This is the transactional enqueue pattern.
 
 ### Batch Insert via COPY
 
@@ -170,7 +169,7 @@ Dispatcher::run()
             For each claimed job + permit → executor.execute(job)
 ```
 
-Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job (PRD section 6.2).
+Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job.
 
 The dispatcher intentionally applies priority aging only over a bounded
 candidate window rather than over the full available backlog. That keeps the
@@ -208,30 +207,31 @@ tokio::spawn(async {
 })
 ```
 
-Backoff uses a database-side function `awa.backoff_duration(attempt, max_attempts)` implementing exponential backoff with jitter, capped at 24 hours (PRD section 6.3).
+Backoff uses a database-side function `awa.backoff_duration(attempt, max_attempts)` implementing exponential backoff with jitter, capped at 24 hours. See [ADR-003](adr/003-heartbeat-deadline-hybrid.md) for the crash recovery design that drives retry timing.
 
 ### Progress Tracking
 
 Handlers can report structured progress during execution via an in-memory buffer that is flushed to Postgres on each heartbeat cycle and atomically with state transitions.
 
-```
-Handler code (sync)                    Heartbeat service (async, periodic)
-─────────────────                      ────────────────────────────────────
-ctx.set_progress(50, "halfway")  ──►   ProgressState { latest, generation }
-ctx.update_metadata({"cursor":N}) ──►  (generation bumped on each mutation)
-                                            │
-                                            ▼
-                                       heartbeat_once():
-                                         ├── Tier 1: jobs without pending progress
-                                         │   UPDATE jobs_hot SET heartbeat_at = now() ...
-                                         └── Tier 2: jobs with pending progress
-                                             UPDATE jobs_hot SET heartbeat_at = now(),
-                                                                 progress = v.progress ...
-                                             (ack generation on success)
+Three flush paths:
 
-ctx.flush_progress()             ──►   Direct UPDATE jobs_hot SET progress = $2
-                                       WHERE id = $1 AND run_lease = $3
-                                       (immediate, stronger than heartbeat)
+1. **Heartbeat piggyback** — on every heartbeat cycle, jobs with pending progress updates get a combined `SET heartbeat_at = now(), progress = v.progress` query. Jobs without changes get the original heartbeat-only query. At most two queries per cycle regardless of job count.
+
+2. **State-transition atomic** — when `complete_job()` runs, the latest progress snapshot is included in the same UPDATE that transitions state.
+
+3. **Explicit flush** — `ctx.flush_progress()` performs a direct `UPDATE jobs_hot SET progress = $2 WHERE id = $1 AND run_lease = $3`. This is the reliable path for critical checkpoints.
+
+```
+ctx.set_progress(50, "halfway")       ──► ProgressState.latest updated, generation bumped
+ctx.update_metadata({"cursor": N})    ──► metadata shallow-merged, generation bumped
+
+heartbeat_once()                      ──► if generation > acked_generation:
+                                            flush progress with heartbeat (batched)
+                                            ack generation on success
+
+ctx.flush_progress()                  ──► direct UPDATE, ack generation on success
+
+complete_job(result, progress_snapshot) ──► progress included in state transition UPDATE
 ```
 
 **Storage:** The `progress` column is a nullable JSONB on both `jobs_hot` and `scheduled_jobs`, structured as `{"percent": 0-100, "message": "...", "metadata": {...}}`. The `metadata` sub-object is shallow-merged on each `update_metadata` call — top-level keys overwrite, nested objects are replaced.
@@ -258,13 +258,9 @@ Every running attempt carries a durable `run_lease` token that is incremented at
 
 Successful `Completed` outcomes are flushed through a small batched finalizer. The worker does not release local in-flight tracking or capacity until the batch flush acknowledges success or stale rejection, so shutdown drain and heartbeat semantics still match the correctness model. Locally, in-flight attempts are tracked in a sharded registry keyed by `(job_id, run_lease)` rather than a single global lock, which preserves the lease model while reducing executor/heartbeat contention.
 
-### Complete and Retry
+### Promotion (Scheduled → Available)
 
-When a retryable or scheduled job becomes due, the maintenance service moves it
-from the cold deferred table back into the hot runnable table. This uses
-partial due-time indexes on `awa.scheduled_jobs` and promotes small ordered
-batches (`run_at ASC, id ASC`) so large scheduled frontiers do not require
-scanning the execution table:
+Future-dated and retryable jobs live in `awa.scheduled_jobs` until their `run_at` time arrives. The maintenance leader promotes due jobs into the hot table in bounded batches, using partial due-time indexes so large deferred frontiers do not require scanning the execution table:
 
 ```
 WITH due AS (
@@ -284,15 +280,15 @@ SELECT ..., 'available', ...
 FROM due
 ```
 
-Uniqueness now uses a tiny claims table (`awa.job_unique_claims`) rather than a
-partial unique index on the full jobs storage. Rows only reserve a claim when
-their current state is inside their `unique_states` bitmask, so the hot and
-deferred tables can share one uniqueness boundary without keeping all jobs in a
-single heap.
+### Uniqueness
+
+Jobs can declare uniqueness constraints via `UniqueOpts`. The unique key is a BLAKE3 hash of the job kind plus optional queue, args, and time-period components. A separate `awa.job_unique_claims` table holds one row per active claim, enforced by a unique index. Triggers on both `jobs_hot` and `scheduled_jobs` insert/remove claims as jobs transition between states.
+
+Each job carries a `unique_states` bitmask (BIT(8)) specifying which states count as "active" for uniqueness purposes (default: scheduled, available, running, completed, retryable). A job only holds a uniqueness claim while its current state is set in its bitmask. This allows the hot and deferred tables to share one uniqueness boundary without keeping all jobs in a single heap.
 
 ## Queue Concurrency Modes
 
-Awa supports two concurrency modes, selected at build time (see ADR-011):
+Awa supports two concurrency modes, selected at build time. See [ADR-011](adr/011-weighted-concurrency.md) for design rationale.
 
 ### Hard-Reserved (Default)
 
@@ -306,7 +302,7 @@ The dispatcher uses a **permit-before-claim** flow: permits are pre-acquired (no
 
 ### Per-Queue Rate Limiting
 
-An optional token bucket rate limiter can be configured per queue (see ADR-010). When set, the dispatcher gates the batch size by available tokens, preventing downstream systems from being overwhelmed. Rate limiting composes with both concurrency modes.
+An optional token bucket rate limiter can be configured per queue. See [ADR-010](adr/010-rate-limiting.md). When set, the dispatcher gates the batch size by available tokens, preventing downstream systems from being overwhelmed. Rate limiting composes with both concurrency modes.
 
 ## Graceful Shutdown
 
@@ -322,7 +318,7 @@ This ensures in-flight jobs complete (or timeout) with heartbeats still running,
 
 ## Periodic/Cron Jobs
 
-Awa supports periodic job scheduling via the `PeriodicJob` API. Schedules are defined in application code, synced to an `awa.cron_jobs` table, and evaluated by the maintenance leader. See ADR-007 for design rationale.
+Awa supports periodic job scheduling via the `PeriodicJob` API. Schedules are defined in application code, synced to an `awa.cron_jobs` table, and evaluated by the maintenance leader. See [ADR-007](adr/007-periodic-cron-jobs.md) for design rationale.
 
 ### Registration
 
@@ -377,7 +373,7 @@ Sync is additive (UPSERT only). Multiple deployments sharing the same database w
 
 ## Crash Recovery Model
 
-Awa uses a hybrid approach with two independent crash recovery mechanisms, each catching a different failure mode (see ADR-003 for rationale).
+Awa uses a hybrid approach with two independent crash recovery mechanisms, each catching a different failure mode. See [ADR-003](adr/003-heartbeat-deadline-hybrid.md) for rationale.
 
 ### 1. Heartbeat Staleness (Crash Detection)
 
@@ -402,47 +398,18 @@ Scheduled and retryable promotion runs every 250ms by default, in bounded
 batches, and emits queue notifications after promotion. Cron evaluation remains
 on a 1-second tick.
 
-## Python Integration via PyO3
+## Python Integration
 
-The `awa-python` crate provides a native Python module (`_awa`) built with PyO3 and maturin:
+The `awa-python` crate provides a native Python module built with PyO3 and maturin. Python workers are callbacks invoked by the Rust runtime — they don't run a separate poller, heartbeat, or maintenance service. All queue machinery is delegated to `awa-worker`.
 
-```
-Python process                         Rust runtime inside `awa-python`
-──────────────────────────────────     ─────────────────────────────────────
+Key properties:
 
-client = awa.Client(url)        ───►   PgPool::connect()
-await client.insert(...)        ───►   raw INSERT / migration helpers
-await client.health_check()     ───►   awa_worker::Client::health_check()
+- **Async + sync** — every async method has a `_sync` counterpart for Django/Flask (see [ADR-009](adr/009-python-sync-support.md))
+- **Heartbeats survive GIL blocks** — heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL
+- **Type bridging** — Python dataclasses and pydantic BaseModels round-trip through `serde_json::Value`
+- **Full feature parity** — progress tracking, callbacks, cron, weighted concurrency, rate limiting all available from Python
 
-@client.worker(SendEmail, queue="email")
-async def handle(job):                  handler + task locals registered
-    ...
-
-client.periodic(                 ───►   PeriodicJob registered
-    name="report", cron_expr="0 9 * * *",
-    args_type=Report, args=Report(...),
-    timezone="Pacific/Auckland",
-)
-
-client.start([("email", 10)])    ───►   awa_worker::Client::start()
-# or dict form:                          ├── Dispatcher (`SKIP LOCKED` + LISTEN/NOTIFY)
-# client.start(                          ├── HeartbeatService
-#   [{"name":"email",                    ├── MaintenanceService
-#     "min_workers":5,                   └── PythonWorker bridge
-#     "weight":2,                            └── into_future_with_locals(...)
-#     "rate_limit":(10.0, 20)}],
-#   global_max_workers=30)
-
-await client.shutdown()          ───►   phased drain + cancellation
-```
-
-Key design decisions:
-
-- **Single runtime:** Python workers do not run a separate poller. They register callbacks, then delegate polling, heartbeats, maintenance, and shutdown to `awa-worker`.
-- **Async bridge:** `pyo3_async_runtimes::tokio::future_into_py` converts Rust futures to Python awaitables. Registered Python handlers are driven from Rust via `into_future_with_locals`, using task-local event loop state captured when the handler is registered.
-- **Sync support:** Every async database method has a `_sync` counterpart using `py.detach(|| block_on(...))` for Django/Flask handlers (see ADR-009). `SyncTransaction` provides `__enter__`/`__exit__` context manager support.
-- **Heartbeats survive GIL blocks:** Heartbeat writes run on a dedicated Rust tokio task that never acquires the GIL. Even if a Python handler blocks the GIL (e.g., CPU-bound work in a sync call), heartbeats continue uninterrupted.
-- **Type bridging:** Python dataclasses and pydantic BaseModels are serialized to `serde_json::Value` via `model_dump(mode="json")` or `dataclasses.asdict()`. On dispatch, the bridge reconstructs the typed args object before invoking the handler and exposes `job.is_cancelled()` from the shared Rust cancellation flag.
+See [ADR-004](adr/004-pyo3-async-bridge.md) for the async bridge design.
 
 ## Observability
 
@@ -504,66 +471,20 @@ The `stats.sql` query and `admin::queue_stats()` function provide per-queue dept
 
 ## Web UI
 
-The `awa-ui` crate provides a built-in web dashboard via `awa serve`:
+The `awa-ui` crate provides a built-in dashboard, job inspector, queue management, and cron controls via `awa serve`. The frontend is React/TypeScript with IntentUI components, embedded into the binary via `rust-embed`. The backend is an axum REST API backed by `awa-model` admin functions.
 
 ```
 awa --database-url $DATABASE_URL serve
-# Open http://127.0.0.1:3000
+# → http://127.0.0.1:3000
 ```
 
-The UI is a React/TypeScript frontend built with IntentUI components, compiled to static assets and embedded into the Rust binary via `rust-embed`. The backend is an axum REST API that queries `awa-model` admin functions directly.
-
-**Pages:** Dashboard (state counts, throughput chart), Job Inspector (search, filter, bulk actions, detail view), Queue Management (stats, pause/resume, drain), Cron Schedules (list, trigger, details).
-
-**API endpoints** (all under `/api`):
-
-| Endpoint | Method | Description |
-|---|---|---|
-| `/api/jobs` | GET | List/search jobs with filters |
-| `/api/jobs/:id` | GET | Single job detail |
-| `/api/jobs/retry` | POST | Bulk retry by IDs |
-| `/api/jobs/cancel` | POST | Bulk cancel by IDs |
-| `/api/queues` | GET | Queue stats with pause status |
-| `/api/queues/:name/pause` | POST | Pause a queue |
-| `/api/queues/:name/resume` | POST | Resume a queue |
-| `/api/queues/:name/drain` | POST | Drain a queue |
-| `/api/cron` | GET | List cron schedules |
-| `/api/cron/:name/trigger` | POST | Trigger a cron job immediately |
-| `/api/stats/counts` | GET | Job state counts |
-| `/api/stats/timeseries` | GET | Throughput timeseries |
-| `/api/stats/kinds` | GET | Distinct job kinds |
-| `/api/stats/queues` | GET | Distinct queue names |
-
-The UI is distributed via `pip install awa-cli` (platform wheel containing the native binary with embedded assets) or `cargo install awa-cli`.
+Distributed via `pip install awa-cli` (no Rust toolchain needed) or `cargo install awa-cli`. See [Web UI design](ui-design.md) for API endpoints, page layouts, and component details.
 
 ## Deployment Model
 
-Awa workers are stateless processes. All state lives in Postgres.
+Awa workers are stateless processes. All state lives in Postgres. The only external dependency is a Postgres connection.
 
-### Kubernetes
-
-```
-┌──────────────────────────────────────────────┐
-│ Kubernetes Cluster                           │
-│                                              │
-│  ┌─────────────┐  ┌─────────────┐           │
-│  │ Worker Pod 1 │  │ Worker Pod 2 │  ...     │
-│  │  Dispatcher  │  │  Dispatcher  │          │
-│  │  Heartbeat   │  │  Heartbeat   │          │
-│  │  Maintenance │  │  Maintenance │          │
-│  └──────┬───────┘  └──────┬───────┘          │
-│         │                  │                  │
-│         └────────┬─────────┘                  │
-│                  ▼                            │
-│         ┌────────────────┐                    │
-│         │   PostgreSQL   │                    │
-│         │  (awa schema)  │                    │
-│         └────────────────┘                    │
-└──────────────────────────────────────────────┘
-```
-
-- **Horizontal scaling:** Add more worker pods. `SKIP LOCKED` ensures no double dispatch.
-- **Leader election:** Only one pod runs maintenance tasks at a time via `pg_try_advisory_lock`. If the leader dies, another pod acquires the lock within 10 seconds.
-- **Graceful shutdown:** `Client::shutdown(timeout)` uses a phased approach: stops dispatchers first (no new claims), then drains in-flight jobs while heartbeat and maintenance remain alive to prevent false rescue, then shuts down background services. In Kubernetes, set `terminationGracePeriodSeconds` to match the drain timeout.
-- **No sticky state:** Workers can be rescheduled to any node. The Postgres connection pool is the only external dependency.
-- **Queue assignment:** Different deployments can handle different queues by configuring `ClientBuilder::queue()`, enabling workload isolation (e.g., CPU-heavy jobs on dedicated node pools).
+- **Horizontal scaling:** Add more worker processes. `SKIP LOCKED` ensures no double dispatch.
+- **Leader election:** Only one instance runs maintenance tasks at a time via `pg_try_advisory_lock`. If the leader dies, another instance acquires the lock within 10 seconds.
+- **No sticky state:** Workers can be restarted or moved freely. There is no local disk state.
+- **Queue assignment:** Different deployments can handle different queues by configuring `ClientBuilder::queue()`, enabling workload isolation.
