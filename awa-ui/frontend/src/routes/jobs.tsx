@@ -369,7 +369,83 @@ export function JobsPage() {
         </div>
       )}
 
-      {/* Job table — kind is the primary column, no ID */}
+      {/* Mobile card layout */}
+      <div className="space-y-2 sm:hidden">
+        {jobsQuery.isLoading && (
+          <p className="py-8 text-center text-sm text-muted-fg">Loading...</p>
+        )}
+        {!jobsQuery.isLoading && jobs.length === 0 && (
+          <p className="py-8 text-center text-sm text-muted-fg">No jobs found.</p>
+        )}
+        {jobs.map((job) => (
+          <div
+            key={job.id}
+            className={[
+              "rounded-lg border p-3 transition-colors",
+              selected.has(job.id) ? "border-primary bg-primary-subtle/30" : "",
+            ].join(" ")}
+          >
+            <div className="flex items-start gap-3">
+              <input
+                type="checkbox"
+                checked={selected.has(job.id)}
+                onChange={() => {
+                  setSelected((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(job.id)) next.delete(job.id);
+                    else next.add(job.id);
+                    return next;
+                  });
+                }}
+                className="mt-1 shrink-0"
+              />
+              <div
+                className="min-w-0 flex-1 cursor-pointer"
+                onClick={() =>
+                  void navigate({
+                    to: "/jobs/$id",
+                    params: { id: String(job.id) },
+                  })
+                }
+              >
+                <div className="flex items-center gap-2">
+                  <span className="font-medium">{job.kind}</span>
+                  <StateBadge state={job.state} />
+                  {job.priority !== 2 && (
+                    <Badge
+                      intent={job.priority === 1 ? "danger" : "secondary"}
+                      className="text-[10px]"
+                    >
+                      P{job.priority}
+                    </Badge>
+                  )}
+                </div>
+                <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-fg">
+                  <span>{job.queue}</span>
+                  <span>{job.attempt}/{job.max_attempts}</span>
+                  <span>{contextualTime(job)}</span>
+                </div>
+                {job.tags.length > 0 && (
+                  <div className="mt-1.5 flex flex-wrap gap-1">
+                    {job.tags.slice(0, 3).map((t) => (
+                      <Badge key={t} intent="secondary" className="text-[10px]">
+                        {t}
+                      </Badge>
+                    ))}
+                    {job.tags.length > 3 && (
+                      <span className="text-[10px] text-muted-fg">
+                        +{job.tags.length - 3}
+                      </span>
+                    )}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+
+      {/* Desktop table */}
       <Table
         aria-label="Jobs"
         selectionMode="multiple"
@@ -381,6 +457,7 @@ export function JobsPage() {
             setSelected(new Set(keys as Set<number>));
           }
         }}
+        className="hidden sm:table"
       >
         <TableHeader>
           <TableColumn isRowHeader>Kind</TableColumn>
