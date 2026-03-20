@@ -1,5 +1,9 @@
 //! Integration tests for configurable retention policies and cleanup.
 //!
+//! These tests must run sequentially because each starts a Client that
+//! becomes leader and runs global cleanup — concurrent leaders with
+//! different retention policies would interfere with each other's test data.
+//!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{insert_with, InsertOpts};
@@ -7,7 +11,13 @@ use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Retenti
 use awa_testing::TestClient;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::LazyLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+/// Serialize retention tests — each starts a Client that becomes leader and
+/// runs global cleanup, so concurrent tests interfere with each other.
+static RETENTION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -96,6 +106,7 @@ async fn job_exists(pool: &sqlx::PgPool, job_id: i64) -> bool {
 
 #[tokio::test]
 async fn test_cleanup_respects_completed_retention() {
+    let _guard = RETENTION_LOCK.lock().await;
     let test_client = setup().await;
     let pool = test_client.pool();
     let queue = "retention_completed";
@@ -126,6 +137,7 @@ async fn test_cleanup_respects_completed_retention() {
 
 #[tokio::test]
 async fn test_cleanup_preserves_recent_jobs() {
+    let _guard = RETENTION_LOCK.lock().await;
     let test_client = setup().await;
     let pool = test_client.pool();
     let queue = "retention_recent";
@@ -154,6 +166,7 @@ async fn test_cleanup_preserves_recent_jobs() {
 
 #[tokio::test]
 async fn test_cleanup_batch_size_accepted() {
+    let _guard = RETENTION_LOCK.lock().await;
     let test_client = setup().await;
     let pool = test_client.pool();
     let queue = "retention_batch";
@@ -187,6 +200,7 @@ async fn test_cleanup_batch_size_accepted() {
 
 #[tokio::test]
 async fn test_per_queue_retention_override() {
+    let _guard = RETENTION_LOCK.lock().await;
     let test_client = setup().await;
     let pool = test_client.pool();
     let fast_queue = "retention_fast";
@@ -232,6 +246,7 @@ async fn test_per_queue_retention_override() {
 
 #[tokio::test]
 async fn test_cleanup_targets_jobs_hot_directly() {
+    let _guard = RETENTION_LOCK.lock().await;
     let test_client = setup().await;
     let pool = test_client.pool();
     let queue = "retention_hot_target";
