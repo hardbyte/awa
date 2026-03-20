@@ -1,0 +1,35 @@
+[build-system]
+requires = ["maturin>=1.7,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "awa-cli"
+version = "0.2.1"
+description = "CLI for the Awa Postgres-native job queue (migrations, admin, serve)"
+readme = "../README.md"
+requires-python = ">=3.10"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "Brian Thorne" }]
+keywords = ["job-queue", "postgres", "background-jobs", "cli"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: System :: Distributed Computing",
+]
+
+[project.urls]
+Homepage = "https://github.com/hardbyte/awa"
+Repository = "https://github.com/hardbyte/awa"
+Documentation = "https://github.com/hardbyte/awa"
+
+[tool.maturin]
+# Package the Rust binary directly (no Python extension module).
+# This is the same pattern used by ruff, uv, and taplo.
+bindings = "bin"
+manifest-path = "Cargo.toml"
+strip = true
