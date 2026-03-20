@@ -12,6 +12,7 @@ import {
   resumeQueue,
   drainQueue,
 } from "@/lib/api";
+import { toast } from "@/components/ui/toast";
 import type { JobRow, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Heading } from "@/components/ui/heading";
@@ -26,6 +27,7 @@ import {
   TableColumn,
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { LagValue } from "@/components/LagValue";
 
 function timeAgo(dateStr: string): string {
   const seconds = Math.floor(
@@ -62,14 +64,24 @@ export function QueueDetailPage() {
 
   const pauseMutation = useMutation({
     mutationFn: () => pauseQueue(queueName, "ui"),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ["queues"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      toast.success("Queue paused");
+    },
+    onError: () => {
+      toast.error("Failed to pause queue");
+    },
   });
 
   const resumeMutation = useMutation({
     mutationFn: () => resumeQueue(queueName),
-    onSuccess: () =>
-      void queryClient.invalidateQueries({ queryKey: ["queues"] }),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: ["queues"] });
+      toast.success("Queue resumed");
+    },
+    onError: () => {
+      toast.error("Failed to resume queue");
+    },
   });
 
   const drainMutation = useMutation({
@@ -77,6 +89,10 @@ export function QueueDetailPage() {
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: ["queues"] });
       void queryClient.invalidateQueries({ queryKey: ["jobs"] });
+      toast.success("Queue drained");
+    },
+    onError: () => {
+      toast.error("Failed to drain queue");
     },
   });
 
@@ -134,11 +150,8 @@ export function QueueDetailPage() {
             Failed: {queueStats.failed}
           </span>
           <span>Completed/hr: {queueStats.completed_last_hour}</span>
-          <span>
-            Lag:{" "}
-            {queueStats.lag_seconds != null
-              ? `${queueStats.lag_seconds.toFixed(1)}s`
-              : "-"}
+          <span className="inline-flex items-center gap-1">
+            Lag: <LagValue seconds={queueStats.lag_seconds} />
           </span>
         </div>
       )}

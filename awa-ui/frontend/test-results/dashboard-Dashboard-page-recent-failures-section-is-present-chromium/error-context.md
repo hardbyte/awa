@@ -1,0 +1,98 @@
+# Page snapshot
+
+```yaml
+- generic [ref=e3]:
+  - generic [ref=e6]:
+    - link "AWA" [ref=e8] [cursor=pointer]:
+      - /url: /
+      - img [ref=e9]
+      - generic [ref=e16]: AWA
+    - generic [ref=e17]:
+      - link "Dashboard" [ref=e18] [cursor=pointer]:
+        - /url: /
+        - generic [ref=e19]: Dashboard
+      - link "Jobs" [ref=e21] [cursor=pointer]:
+        - /url: /jobs
+        - generic [ref=e22]: Jobs
+      - link "Queues" [ref=e23] [cursor=pointer]:
+        - /url: /queues
+        - generic [ref=e24]: Queues
+      - link "Cron" [ref=e25] [cursor=pointer]:
+        - /url: /cron
+        - generic [ref=e26]: Cron
+    - 'button "Theme: system" [ref=e28]':
+      - img [ref=e29]
+  - main [ref=e31]:
+    - generic [ref=e32]:
+      - heading "Dashboard" [level=2] [ref=e33]
+      - generic [ref=e34]:
+        - link "0 available" [ref=e35] [cursor=pointer]:
+          - /url: /jobs?state=available
+          - generic [ref=e37]:
+            - generic [ref=e38]: "0"
+            - generic [ref=e40]: available
+        - link "0 running" [ref=e41] [cursor=pointer]:
+          - /url: /jobs?state=running
+          - generic [ref=e43]:
+            - generic [ref=e44]: "0"
+            - generic [ref=e46]: running
+        - link "0 failed" [ref=e47] [cursor=pointer]:
+          - /url: /jobs?state=failed
+          - generic [ref=e49]:
+            - generic [ref=e50]: "0"
+            - generic [ref=e52]: failed
+        - link "2 completed" [ref=e53] [cursor=pointer]:
+          - /url: /jobs
+          - generic [ref=e55]:
+            - generic [ref=e56]: "2"
+            - generic [ref=e58]: completed
+        - generic [ref=e60]:
+          - generic [ref=e61]: "0"
+          - generic [ref=e62]: completed/hr
+      - paragraph [ref=e63]: 2 total jobs across 2 queues
+      - generic [ref=e64]:
+        - generic [ref=e66]: Queues
+        - grid "Queue summary" [ref=e71]:
+          - rowgroup [ref=e72]:
+            - row "Queue Available Running Failed Completed/hr Lag (s) Status" [ref=e73]:
+              - columnheader "Queue" [ref=e74]:
+                - generic [ref=e75]: Queue
+              - columnheader "Available" [ref=e76]:
+                - generic [ref=e77]: Available
+              - columnheader "Running" [ref=e78]:
+                - generic [ref=e79]: Running
+              - columnheader "Failed" [ref=e80]:
+                - generic [ref=e81]: Failed
+              - columnheader "Completed/hr" [ref=e82]:
+                - generic [ref=e83]: Completed/hr
+              - columnheader "Lag (s)" [ref=e84]:
+                - generic [ref=e85]: Lag (s)
+              - columnheader "Status" [ref=e86]:
+                - generic [ref=e87]: Status
+          - rowgroup [ref=e88]:
+            - row "retention_recent" [ref=e89]:
+              - rowheader "retention_recent" [ref=e90]:
+                - link "retention_recent" [ref=e91] [cursor=pointer]:
+                  - /url: /queues/retention_recent
+              - gridcell "0" [ref=e92]
+              - gridcell "0" [ref=e93]
+              - gridcell "0" [ref=e94]
+              - gridcell "0" [ref=e95]
+              - gridcell "-" [ref=e96]
+              - gridcell "Active" [ref=e97]:
+                - generic [ref=e98]: Active
+            - row "retention_slow" [ref=e99]:
+              - rowheader "retention_slow" [ref=e100]:
+                - link "retention_slow" [ref=e101] [cursor=pointer]:
+                  - /url: /queues/retention_slow
+              - gridcell "0" [ref=e102]
+              - gridcell "0" [ref=e103]
+              - gridcell "0" [ref=e104]
+              - gridcell "0" [ref=e105]
+              - gridcell "-" [ref=e106]
+              - gridcell "Active" [ref=e107]:
+                - generic [ref=e108]: Active
+      - generic [ref=e109]:
+        - generic [ref=e111]: Recent Failures
+        - paragraph [ref=e113]: No recent failures.
+```
