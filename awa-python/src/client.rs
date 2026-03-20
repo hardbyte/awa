@@ -602,7 +602,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn start(
         &self,
@@ -613,6 +613,8 @@ impl PyClient {
         completed_retention_hours: Option<f64>,
         failed_retention_hours: Option<f64>,
         cleanup_batch_size: Option<i64>,
+        leader_election_interval_ms: Option<u64>,
+        heartbeat_interval_ms: Option<u64>,
     ) -> PyResult<()> {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
@@ -684,6 +686,13 @@ impl PyClient {
         let queue_overrides = parse_queue_retention_overrides(py, queues.as_ref())?;
         for (queue_name, policy) in queue_overrides {
             builder = builder.queue_retention(queue_name, policy);
+        }
+
+        if let Some(ms) = leader_election_interval_ms {
+            builder = builder.leader_election_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = heartbeat_interval_ms {
+            builder = builder.heartbeat_interval(Duration::from_millis(ms));
         }
 
         for entry in &entries {
