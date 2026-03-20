@@ -115,14 +115,25 @@ await client.shutdown()
 > `transaction()` is an async method that returns a context manager. This is
 > inherent to the PyO3 async bridge pattern.
 
-## Setup
+## Getting Started
 
 ```bash
-# Run migrations once (not on every app startup)
+# 1. Install
+pip install awa-pg awa-cli
+
+# 2. Run migrations (once per database, not per deploy)
+export DATABASE_URL=postgres://localhost/mydb
 awa --database-url $DATABASE_URL migrate
-# Or from Python:
-# await awa.migrate("postgres://...")
+
+# 3. Write a worker (see Quick Start above)
+
+# 4. Monitor with the web UI
+awa --database-url $DATABASE_URL serve
+# → http://127.0.0.1:3000
 ```
+
+From Rust, use `awa::migrations::run(&pool).await` instead of the CLI.
+From Python, use `await client.migrate()` or `client.migrate_sync()`.
 
 ## Installation
 
