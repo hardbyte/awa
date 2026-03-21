@@ -760,7 +760,10 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_runtime_recovers_after_terminating_postgres_connections() {
-    let app_name = format!("chaos_disconnect_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let app_name = format!(
+        "chaos_disconnect_{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
     let app_pool = pool_with_url(&database_url_with_app_name(&app_name), 20).await;
     migrations::run(&app_pool)
         .await
@@ -848,9 +851,18 @@ async fn test_runtime_recovers_after_terminating_postgres_connections() {
     assert_eq!(state_count(&counts, "completed"), 16);
 
     let health = client.health_check().await;
-    assert!(health.postgres_connected, "client should reconnect to Postgres");
-    assert!(health.poll_loop_alive, "dispatch loop should still be alive");
-    assert!(health.heartbeat_alive, "heartbeat loop should still be alive");
+    assert!(
+        health.postgres_connected,
+        "client should reconnect to Postgres"
+    );
+    assert!(
+        health.poll_loop_alive,
+        "dispatch loop should still be alive"
+    );
+    assert!(
+        health.heartbeat_alive,
+        "heartbeat loop should still be alive"
+    );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
