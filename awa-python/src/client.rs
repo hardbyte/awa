@@ -602,7 +602,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn start(
         &self,
@@ -615,6 +615,10 @@ impl PyClient {
         cleanup_batch_size: Option<i64>,
         leader_election_interval_ms: Option<u64>,
         heartbeat_interval_ms: Option<u64>,
+        promote_interval_ms: Option<u64>,
+        heartbeat_rescue_interval_ms: Option<u64>,
+        deadline_rescue_interval_ms: Option<u64>,
+        callback_rescue_interval_ms: Option<u64>,
     ) -> PyResult<()> {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
@@ -693,6 +697,18 @@ impl PyClient {
         }
         if let Some(ms) = heartbeat_interval_ms {
             builder = builder.heartbeat_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = promote_interval_ms {
+            builder = builder.promote_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = heartbeat_rescue_interval_ms {
+            builder = builder.heartbeat_rescue_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = deadline_rescue_interval_ms {
+            builder = builder.deadline_rescue_interval(Duration::from_millis(ms));
+        }
+        if let Some(ms) = callback_rescue_interval_ms {
+            builder = builder.callback_rescue_interval(Duration::from_millis(ms));
         }
 
         for entry in &entries {

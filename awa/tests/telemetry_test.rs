@@ -10,22 +10,20 @@
 //!
 //! See docs/test-plan.md for local setup instructions.
 
-use awa::model::{insert_with, migrations, InsertOpts};
-use awa::{Client, JobArgs, JobResult, QueueConfig};
+use async_trait::async_trait;
+use awa::model::{insert_with, InsertOpts};
+use awa::{Client, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker};
+use awa_testing::setup::{clean_queue, setup};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
+use tokio::net::{TcpListener, TcpStream};
+use tokio::task::JoinHandle;
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
 
 fn otlp_endpoint() -> String {
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -36,34 +34,123 @@ fn prometheus_url() -> String {
     std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://localhost:9090".to_string())
 }
 
-async fn setup_pool() -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database");
-    migrations::run(&pool).await.expect("Failed to migrate");
-    pool
-}
-
-async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
-}
-
 // ── Job type ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct TelemetryJob {
     pub value: String,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct FailureModeTelemetryJob {
+    mode: String,
+}
+
+struct FailureModeWorker;
+
+#[async_trait]
+impl Worker for FailureModeWorker {
+    fn kind(&self) -> &'static str {
+        "failure_mode_telemetry_job"
+    }
+
+    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: FailureModeTelemetryJob =
+            serde_json::from_value(job_row.args.clone()).map_err(JobError::retryable)?;
+
+        match args.mode.as_str() {
+            "complete" => Ok(JobResult::Completed),
+            "terminal_fail" => Err(JobError::terminal("intentional telemetry test failure")),
+            "retry_once" => {
+                if job_row.attempt == 1 {
+                    Ok(JobResult::RetryAfter(Duration::from_millis(100)))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "callback_timeout" => {
+                if job_row.attempt == 1 {
+                    ctx.register_callback(Duration::from_millis(200))
+                        .await
+                        .map_err(JobError::retryable)?;
+                    Ok(JobResult::WaitForCallback)
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            other => Err(JobError::terminal(format!(
+                "unknown telemetry test mode: {other}"
+            ))),
+        }
+    }
+}
+
+// ── OTLP + Prometheus helpers ───────────────────────────────────────
+
+fn build_otlp_meter_provider(endpoint: &str, service_name: &str) -> SdkMeterProvider {
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .expect("Failed to build OTLP metric exporter");
+
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_secs(1))
+        .build();
+
+    let resource = Resource::builder()
+        .with_service_name(service_name.to_string())
+        .build();
+
+    SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(resource)
+        .build()
+}
+
+async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: i64) {
+    let start = std::time::Instant::now();
+    loop {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM awa.jobs WHERE queue = $1 AND state = $2::awa.job_state",
+        )
+        .bind(queue)
+        .bind(state)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to query job count");
+
+        if count >= min {
+            return;
+        }
+
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!("Timed out waiting for {min} {state} jobs in queue {queue}; only {count} found");
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Start a TCP proxy that forwards traffic to target_addr.
+/// Aborting the returned handle kills the proxy, severing all connections.
+async fn start_tcp_proxy(target_addr: &str) -> (u16, JoinHandle<()>) {
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind TCP proxy listener");
+    let port = listener.local_addr().unwrap().port();
+    let target = target_addr.to_string();
+    let handle = tokio::spawn(async move {
+        while let Ok((mut client_stream, _)) = listener.accept().await {
+            let target = target.clone();
+            tokio::spawn(async move {
+                if let Ok(mut server_stream) = TcpStream::connect(&target).await {
+                    let _ =
+                        tokio::io::copy_bidirectional(&mut client_stream, &mut server_stream).await;
+                }
+            });
+        }
+    });
+    (port, handle)
 }
 
 // ── Prometheus query helpers ─────────────────────────────────────────
@@ -139,7 +226,7 @@ async fn wait_for_metric(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_otlp_metrics_reach_prometheus() {
-    let pool = setup_pool().await;
+    let pool = setup(5).await;
     let queue = "telemetry_otlp_test";
     clean_queue(&pool, queue).await;
 
@@ -278,4 +365,281 @@ async fn test_otlp_metrics_reach_prometheus() {
     // Clean up.
     let _ = meter_provider.shutdown();
     eprintln!("Telemetry OTLP integration test passed!");
+}
+
+/// Validates that failure-path metrics (failed, retried, rescues) reach Prometheus
+/// via the full OTLP gRPC export pipeline.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_failure_path_metrics_reach_prometheus() {
+    let pool = setup(5).await;
+    let queue = "telemetry_failure_path";
+    clean_queue(&pool, queue).await;
+
+    // 1. Configure OTLP exporter and set as global.
+    let meter_provider = build_otlp_meter_provider(&otlp_endpoint(), "awa-failure-path-test");
+    global::set_meter_provider(meter_provider.clone());
+
+    // 2. Build client with fast rescue intervals so callback timeouts trigger quickly.
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .callback_rescue_interval(Duration::from_millis(150))
+        .leader_election_interval(Duration::from_millis(100))
+        .register_worker(FailureModeWorker)
+        .build()
+        .expect("Failed to build failure-path client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start failure-path client");
+
+    // 3. Insert jobs across failure modes.
+    let modes: [(&str, i32, i16); 4] = [
+        ("complete", 3, 3),         // 3 jobs, max_attempts 3
+        ("terminal_fail", 2, 1),    // 2 jobs, max_attempts 1 → immediate terminal
+        ("callback_timeout", 2, 3), // 2 jobs, max_attempts 3 → callback rescue then complete
+        ("retry_once", 2, 3),       // 2 jobs, max_attempts 3 → retry then complete
+    ];
+
+    for (mode, count, max_attempts) in modes {
+        for i in 0..count {
+            insert_with(
+                &pool,
+                &FailureModeTelemetryJob {
+                    mode: mode.to_string(),
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    max_attempts,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|_| panic!("Failed to insert {mode} job {i}"));
+        }
+    }
+
+    // 4. Wait for terminal states: 7 completed (3 + 2 callback + 2 retry) + 2 failed.
+    let expected_completed = 7_i64;
+    let expected_failed = 2_i64;
+
+    wait_for_job_count(&pool, queue, "completed", expected_completed).await;
+    wait_for_job_count(&pool, queue, "failed", expected_failed).await;
+
+    // 5. Shutdown + flush to push metrics to the collector.
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush meter provider");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // 6. Query Prometheus for failure-path metrics.
+    // OTel metric names are translated: dots → underscores, counter → _total,
+    // unit "s" → _seconds. Annotation units like {job} are dropped.
+    let http = reqwest::Client::new();
+    let timeout = Duration::from_secs(60);
+
+    eprintln!("Querying Prometheus for failure-path metrics...");
+
+    // Use PromQL label filters scoped to this test's queue to avoid
+    // cross-contamination from other tests sharing the same Prometheus.
+    let q = queue;
+
+    let completed = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_completed_total{{awa_job_queue="{q}"}})"#),
+        expected_completed as f64,
+        timeout,
+    )
+    .await;
+    eprintln!("  awa_job_completed_total = {completed}");
+
+    let failed = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_failed_total{{awa_job_queue="{q}"}})"#),
+        expected_failed as f64,
+        timeout,
+    )
+    .await;
+    eprintln!("  awa_job_failed_total = {failed}");
+
+    let retried = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_retried_total{{awa_job_queue="{q}"}})"#),
+        2.0,
+        timeout,
+    )
+    .await;
+    eprintln!("  awa_job_retried_total = {retried}");
+
+    // maintenance.rescues has awa_rescue_kind attribute, not awa_job_queue.
+    // Only this test generates rescues, so no filtering needed.
+    let rescues = wait_for_metric(&http, "awa_maintenance_rescues_total", 2.0, timeout).await;
+    eprintln!("  awa_maintenance_rescues_total = {rescues}");
+
+    let claimed = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_claimed_total{{awa_job_queue="{q}"}})"#),
+        9.0,
+        timeout,
+    )
+    .await;
+    eprintln!("  awa_job_claimed_total = {claimed}");
+
+    let duration_count = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_duration_seconds_count{{awa_job_queue="{q}"}})"#),
+        5.0,
+        timeout,
+    )
+    .await;
+    eprintln!("  awa_job_duration_seconds_count = {duration_count}");
+
+    assert!(completed >= expected_completed as f64);
+    assert!(failed >= expected_failed as f64);
+    assert!(retried >= 2.0, "Expected retried >= 2, got {retried}");
+    assert!(rescues >= 2.0, "Expected rescues >= 2, got {rescues}");
+    assert!(claimed >= 9.0, "Expected claimed >= 9, got {claimed}");
+    assert!(
+        duration_count >= 5.0,
+        "Expected duration count >= 5, got {duration_count}"
+    );
+
+    let _ = meter_provider.shutdown();
+    eprintln!("Failure-path OTLP telemetry test passed!");
+}
+
+/// Validates that job processing is unaffected when the OTLP collector dies mid-flight.
+///
+/// Uses an in-process TCP proxy to the real collector. Phase 1 verifies metrics
+/// flow through the proxy. Phase 2 kills the proxy (simulating collector death)
+/// and asserts jobs still complete and health checks pass.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn test_collector_death_does_not_block_job_processing() {
+    let pool = setup(5).await;
+    let queue = "telemetry_collector_death";
+    clean_queue(&pool, queue).await;
+
+    // 1. Start TCP proxy forwarding to the real OTLP collector.
+    let otlp_target = otlp_endpoint()
+        .strip_prefix("http://")
+        .unwrap_or("localhost:4317")
+        .to_string();
+    let (proxy_port, proxy_handle) = start_tcp_proxy(&otlp_target).await;
+    let proxy_endpoint = format!("http://127.0.0.1:{proxy_port}");
+    eprintln!("TCP proxy listening on {proxy_endpoint} → {otlp_target}");
+
+    // 2. Configure OTLP exporter through the proxy.
+    let meter_provider = build_otlp_meter_provider(&proxy_endpoint, "awa-collector-death-test");
+    global::set_meter_provider(meter_provider.clone());
+
+    // 3. Build + start client.
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .register::<TelemetryJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+        .build()
+        .expect("Failed to build collector-death client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start collector-death client");
+
+    // ── Phase 1: collector alive ──
+    let phase1_jobs = 5_i64;
+    for i in 0..phase1_jobs {
+        insert_with(
+            &pool,
+            &TelemetryJob {
+                value: format!("alive-{i}"),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert phase-1 job");
+    }
+
+    wait_for_job_count(&pool, queue, "completed", phase1_jobs).await;
+    eprintln!("Phase 1: {phase1_jobs} jobs completed with live collector");
+
+    // Flush to ensure at least one export went through the proxy.
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush meter provider");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    // Verify the pipeline was live by checking Prometheus (filter by this test's queue).
+    let http = reqwest::Client::new();
+    let completed = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_completed_total{{awa_job_queue="{queue}"}})"#),
+        1.0,
+        Duration::from_secs(30),
+    )
+    .await;
+    eprintln!("Phase 1: Prometheus confirms awa_job_completed_total = {completed}");
+
+    // ── Phase 2: kill the collector proxy ──
+    proxy_handle.abort();
+    eprintln!("Phase 2: TCP proxy killed — OTLP collector is now unreachable");
+
+    // Insert more jobs while the collector is dead.
+    let phase2_jobs = 5_i64;
+    for i in 0..phase2_jobs {
+        insert_with(
+            &pool,
+            &TelemetryJob {
+                value: format!("dead-{i}"),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert phase-2 job");
+    }
+
+    // Jobs must still complete — the dead collector must not block processing.
+    wait_for_job_count(&pool, queue, "completed", phase1_jobs + phase2_jobs).await;
+    eprintln!(
+        "Phase 2: all {} jobs completed with dead collector",
+        phase1_jobs + phase2_jobs
+    );
+
+    // Health check: the runtime loops must still be alive.
+    let health = client.health_check().await;
+    assert!(
+        health.poll_loop_alive,
+        "Dispatch loop should still be alive after collector death"
+    );
+    assert!(
+        health.heartbeat_alive,
+        "Heartbeat loop should still be alive after collector death"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+    let _ = meter_provider.shutdown();
+    eprintln!("Collector-death resilience test passed!");
 }

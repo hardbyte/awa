@@ -38,6 +38,6 @@ module-name = "awa._awa"
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 markers = [
-    "chaos: exercises kill -9 recovery with real worker subprocesses",
+    "chaos: exercises subprocess failure recovery, deadline rescue, and callback timeout rescue",
     "slow: tests that require leader election (up to 30s)",
 ]
