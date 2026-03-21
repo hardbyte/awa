@@ -456,6 +456,7 @@ impl Client {
             self.heartbeat_interval,
             self.heartbeat_alive.clone(),
             self.service_cancel.clone(),
+            self.metrics.clone(),
         );
         service_handles.push(tokio::spawn(async move {
             heartbeat.run().await;

@@ -14,6 +14,7 @@ pub struct HeartbeatService {
     batch_size: usize,
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
+    metrics: crate::metrics::AwaMetrics,
 }
 
 impl HeartbeatService {
@@ -23,6 +24,7 @@ impl HeartbeatService {
         interval: std::time::Duration,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
+        metrics: crate::metrics::AwaMetrics,
     ) -> Self {
         Self {
             pool,
@@ -31,6 +33,7 @@ impl HeartbeatService {
             batch_size: 500,
             alive,
             cancel,
+            metrics,
         }
     }
 
@@ -103,6 +106,7 @@ impl HeartbeatService {
             .await
             {
                 Ok(result) => {
+                    self.metrics.heartbeat_batches.add(1, &[]);
                     debug!(
                         count = job_ids.len(),
                         updated = result.rows_affected(),
@@ -141,6 +145,7 @@ impl HeartbeatService {
                 .await
                 {
                     Ok(result) => {
+                        self.metrics.heartbeat_batches.add(1, &[]);
                         debug!(
                             count = job_ids.len(),
                             updated = result.rows_affected(),
