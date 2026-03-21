@@ -173,8 +173,7 @@ async fn start_tcp_proxy(target_addr: &str) -> (u16, JoinHandle<()>) {
             tokio::spawn(async move {
                 if let Ok(mut server_stream) = TcpStream::connect(&target).await {
                     let _ =
-                        tokio::io::copy_bidirectional(&mut client_stream, &mut server_stream)
-                            .await;
+                        tokio::io::copy_bidirectional(&mut client_stream, &mut server_stream).await;
                 }
             });
         }
