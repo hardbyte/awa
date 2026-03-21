@@ -110,6 +110,24 @@ impl MaintenanceService {
         self
     }
 
+    /// Set the stale-heartbeat rescue interval (default: 30s).
+    pub fn heartbeat_rescue_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_rescue_interval = interval;
+        self
+    }
+
+    /// Set the deadline rescue interval (default: 30s).
+    pub fn deadline_rescue_interval(mut self, interval: Duration) -> Self {
+        self.deadline_rescue_interval = interval;
+        self
+    }
+
+    /// Set the callback-timeout rescue interval (default: 30s).
+    pub fn callback_rescue_interval(mut self, interval: Duration) -> Self {
+        self.callback_rescue_interval = interval;
+        self
+    }
+
     /// Set the cleanup interval (default: 60s).
     pub fn cleanup_interval(mut self, interval: Duration) -> Self {
         self.cleanup_interval = interval;
@@ -391,6 +409,10 @@ impl MaintenanceService {
         .await
         {
             Ok(rescued) if !rescued.is_empty() => {
+                self.metrics.maintenance_rescues.add(
+                    rescued.len() as u64,
+                    &[opentelemetry::KeyValue::new("awa.rescue.kind", "heartbeat")],
+                );
                 warn!(count = rescued.len(), "Rescued stale heartbeat jobs");
                 // Signal cancellation to any rescued jobs still running on this instance
                 self.signal_cancellation(&rescued).await;
@@ -438,6 +460,10 @@ impl MaintenanceService {
         .await
         {
             Ok(rescued) if !rescued.is_empty() => {
+                self.metrics.maintenance_rescues.add(
+                    rescued.len() as u64,
+                    &[opentelemetry::KeyValue::new("awa.rescue.kind", "deadline")],
+                );
                 warn!(count = rescued.len(), "Rescued deadline-expired jobs");
                 // Signal cancellation so handlers see ctx.is_cancelled() == true
                 self.signal_cancellation(&rescued).await;
@@ -485,6 +511,13 @@ impl MaintenanceService {
         .await
         {
             Ok(rescued) if !rescued.is_empty() => {
+                self.metrics.maintenance_rescues.add(
+                    rescued.len() as u64,
+                    &[opentelemetry::KeyValue::new(
+                        "awa.rescue.kind",
+                        "callback_timeout",
+                    )],
+                );
                 warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
             }
             Err(err) => {

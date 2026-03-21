@@ -79,6 +79,94 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
         await _stop_process(worker_b)
 
 
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
+    queue = f"chaos_{uuid.uuid4().hex[:8]}"
+    worker = await _start_worker(queue, "hang_until_cancel")
+
+    try:
+        await _wait_for_line(worker, "READY role=hang_until_cancel", timeout=10)
+
+        job = await client.insert(ChaosProbe(marker="deadline"), queue=queue)
+        await _wait_for_line(
+            worker,
+            f"START role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=1",
+            timeout=10,
+        )
+
+        tx = await client.transaction()
+        await tx.execute(
+            "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
+            job.id,
+        )
+        await tx.commit()
+
+        await _wait_for_line(
+            worker,
+            f"CANCELLED role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=1",
+            timeout=10,
+        )
+        await _wait_for_line(
+            worker,
+            f"START role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=2",
+            timeout=10,
+        )
+        await _wait_for_line(
+            worker,
+            f"COMPLETE role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=2",
+            timeout=5,
+        )
+
+        row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        assert row["attempt"] == 2
+        assert row["finalized_at"] is not None
+    finally:
+        await _stop_process(worker)
+
+
+@pytest.mark.asyncio
+@pytest.mark.chaos
+async def test_callback_timeout_is_rescued_and_retried(client):
+    queue = f"chaos_{uuid.uuid4().hex[:8]}"
+    worker = await _start_worker(queue, "callback_wait")
+
+    try:
+        await _wait_for_line(worker, "READY role=callback_wait", timeout=10)
+
+        job = await client.insert(ChaosProbe(marker="callback"), queue=queue)
+        await _wait_for_line(
+            worker,
+            f"START role=callback_wait pid={worker.pid} job_id={job.id} attempt=1",
+            timeout=10,
+        )
+        await _wait_for_line(
+            worker,
+            f"WAITING role=callback_wait pid={worker.pid} job_id={job.id} attempt=1",
+            timeout=5,
+        )
+
+        row = await _wait_for_job_state(client, job.id, "waiting_external", timeout=5)
+        assert row["attempt"] == 1
+
+        await _wait_for_line(
+            worker,
+            f"START role=callback_wait pid={worker.pid} job_id={job.id} attempt=2",
+            timeout=10,
+        )
+        await _wait_for_line(
+            worker,
+            f"COMPLETE role=callback_wait pid={worker.pid} job_id={job.id} attempt=2",
+            timeout=5,
+        )
+
+        final_row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        assert final_row["attempt"] == 2
+        assert final_row["finalized_at"] is not None
+    finally:
+        await _stop_process(worker)
+
+
 async def _start_worker(
     queue: str, role: str
 ) -> asyncio.subprocess.Process:

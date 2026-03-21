@@ -74,6 +74,9 @@ pub struct ClientBuilder {
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
+    heartbeat_rescue_interval: Option<Duration>,
+    deadline_rescue_interval: Option<Duration>,
+    callback_rescue_interval: Option<Duration>,
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
@@ -93,6 +96,9 @@ impl ClientBuilder {
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
+            heartbeat_rescue_interval: None,
+            deadline_rescue_interval: None,
+            callback_rescue_interval: None,
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
@@ -152,6 +158,24 @@ impl ClientBuilder {
     /// Set the scheduled/retryable promotion interval (default: 250ms).
     pub fn promote_interval(mut self, interval: Duration) -> Self {
         self.promote_interval = interval;
+        self
+    }
+
+    /// Set the stale-heartbeat rescue interval (default: 30s).
+    pub fn heartbeat_rescue_interval(mut self, interval: Duration) -> Self {
+        self.heartbeat_rescue_interval = Some(interval);
+        self
+    }
+
+    /// Set the deadline rescue interval (default: 30s).
+    pub fn deadline_rescue_interval(mut self, interval: Duration) -> Self {
+        self.deadline_rescue_interval = Some(interval);
+        self
+    }
+
+    /// Set the callback-timeout rescue interval (default: 30s).
+    pub fn callback_rescue_interval(mut self, interval: Duration) -> Self {
+        self.callback_rescue_interval = Some(interval);
         self
     }
 
@@ -278,6 +302,9 @@ impl ClientBuilder {
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
             promote_interval: self.promote_interval,
+            heartbeat_rescue_interval: self.heartbeat_rescue_interval,
+            deadline_rescue_interval: self.deadline_rescue_interval,
+            callback_rescue_interval: self.callback_rescue_interval,
             periodic_jobs: Arc::new(self.periodic_jobs),
             dispatch_cancel: CancellationToken::new(),
             service_cancel: CancellationToken::new(),
@@ -345,6 +372,9 @@ pub struct Client {
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
+    heartbeat_rescue_interval: Option<Duration>,
+    deadline_rescue_interval: Option<Duration>,
+    callback_rescue_interval: Option<Duration>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// Cancellation token for dispatchers only — stops claiming new jobs.
     dispatch_cancel: CancellationToken,
@@ -431,6 +461,15 @@ impl Client {
             self.in_flight.clone(),
         )
         .promote_interval(self.promote_interval);
+        if let Some(interval) = self.heartbeat_rescue_interval {
+            maintenance = maintenance.heartbeat_rescue_interval(interval);
+        }
+        if let Some(interval) = self.deadline_rescue_interval {
+            maintenance = maintenance.deadline_rescue_interval(interval);
+        }
+        if let Some(interval) = self.callback_rescue_interval {
+            maintenance = maintenance.callback_rescue_interval(interval);
+        }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
         }

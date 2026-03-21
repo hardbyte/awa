@@ -282,6 +282,15 @@ class Client:
         *,
         poll_interval_ms: int = 200,
         global_max_workers: int | None = None,
+        completed_retention_hours: float | None = None,
+        failed_retention_hours: float | None = None,
+        cleanup_batch_size: int | None = None,
+        leader_election_interval_ms: int | None = None,
+        heartbeat_interval_ms: int | None = None,
+        promote_interval_ms: int | None = None,
+        heartbeat_rescue_interval_ms: int | None = None,
+        deadline_rescue_interval_ms: int | None = None,
+        callback_rescue_interval_ms: int | None = None,
     ) -> None: ...
     async def shutdown(self, timeout_ms: int = 2000) -> None: ...
     # External callback completion (async)
