@@ -72,6 +72,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T69 | Python: sync methods work from non-async context | Sync | Implemented |
 | T70 | Python: insert_many_copy_sync | Sync | Implemented |
 | T71 | Mixed Rust/Python workers share the same queue correctly | Cross-language resilience | Implemented |
+| T72 | Runtime recovers after terminating Postgres worker backends | Resilience | Implemented |
 | B1 | Late completion after rescue is no-op (state guard) | Bug fix | Implemented |
 | B2 | Late completion after cancel is no-op (state guard) | Bug fix | Implemented |
 | B3 | Shutdown waits for in-flight jobs | Bug fix | Implemented |
@@ -142,7 +143,7 @@ cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
 # Nightly chaos + benchmark lane
 # GitHub Actions: .github/workflows/nightly-chaos.yml
 
-# Rust chaos suite (mixed workload soak, leader failover, leader connection loss, mixed Rust/Python fleet)
+# Rust chaos suite (mixed workload soak, leader failover, leader connection loss, mixed Rust/Python fleet, transient DB disconnect recovery)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python" \
   cargo test --package awa --test chaos_suite_test \

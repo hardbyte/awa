@@ -25,10 +25,27 @@ fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
+fn database_url_with_app_name(app_name: &str) -> String {
+    let mut url = database_url();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    url.push(sep);
+    url.push_str("application_name=");
+    url.push_str(app_name);
+    url
+}
+
 async fn pool_with(max_conns: u32) -> sqlx::PgPool {
     PgPoolOptions::new()
         .max_connections(max_conns)
         .connect(&database_url())
+        .await
+        .expect("Failed to connect to database")
+}
+
+async fn pool_with_url(database_url: &str, max_conns: u32) -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_conns)
+        .connect(database_url)
         .await
         .expect("Failed to connect to database")
 }
@@ -314,6 +331,28 @@ async fn terminate_backend(pool: &sqlx::PgPool, pid: i32) {
         terminated.0,
         "Postgres declined to terminate backend pid={pid}"
     );
+}
+
+async fn terminate_application_backends(pool: &sqlx::PgPool, app_name: &str) -> usize {
+    let pids: Vec<(i32,)> = sqlx::query_as(
+        r#"
+        SELECT pid
+        FROM pg_stat_activity
+        WHERE application_name = $1
+          AND pid <> pg_backend_pid()
+          AND backend_type = 'client backend'
+        "#,
+    )
+    .bind(app_name)
+    .fetch_all(pool)
+    .await
+    .expect("Failed to query application backends");
+
+    for (pid,) in &pids {
+        terminate_backend(pool, *pid).await;
+    }
+
+    pids.len()
 }
 
 fn sum_counter_metric(
@@ -716,6 +755,104 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
     client.shutdown(Duration::from_secs(5)).await;
 
     test_result
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_runtime_recovers_after_terminating_postgres_connections() {
+    let app_name = format!("chaos_disconnect_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let app_pool = pool_with_url(&database_url_with_app_name(&app_name), 20).await;
+    migrations::run(&app_pool)
+        .await
+        .expect("Failed to migrate app pool");
+
+    let admin_pool = pool_with(2).await;
+    let queue = chaos_queue("chaos_disconnect");
+    clean_queue(&app_pool, &queue).await;
+
+    let client = Client::builder(app_pool.clone())
+        .queue(
+            &queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
+        .register_worker(CompleteWorker)
+        .build()
+        .expect("Failed to build disconnect-recovery client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start disconnect-recovery client");
+
+    for seq in 0..8_i64 {
+        insert_with(
+            &app_pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert first available wave");
+    }
+
+    wait_for_counts(
+        &app_pool,
+        &queue,
+        |counts| state_count(counts, "completed") >= 4,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    let terminated = terminate_application_backends(&admin_pool, &app_name).await;
+    assert!(
+        terminated > 0,
+        "Expected to terminate at least one backend for app_name={app_name}"
+    );
+
+    for seq in 8..16_i64 {
+        insert_with(
+            &app_pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                run_at: Some(Utc::now() + ChronoDuration::milliseconds(200)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert second scheduled wave");
+    }
+
+    let counts = wait_for_counts(
+        &app_pool,
+        &queue,
+        |counts| {
+            state_count(counts, "completed") == 16
+                && state_count(counts, "scheduled") == 0
+                && state_count(counts, "running") == 0
+                && state_count(counts, "available") == 0
+        },
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(state_count(&counts, "completed"), 16);
+
+    let health = client.health_check().await;
+    assert!(health.postgres_connected, "client should reconnect to Postgres");
+    assert!(health.poll_loop_alive, "dispatch loop should still be alive");
+    assert!(health.heartbeat_alive, "heartbeat loop should still be alive");
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
