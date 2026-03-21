@@ -4,7 +4,7 @@ use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
-use awa_model::{JobArgs, JobRow, PeriodicJob};
+use awa_model::{JobArgs, PeriodicJob};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
@@ -360,13 +360,8 @@ where
         self.kind
     }
 
-    async fn perform(
-        &self,
-        job_row: &JobRow,
-        ctx: &crate::context::JobContext,
-    ) -> Result<JobResult, JobError> {
-        // Deserialize args
-        let args: T = serde_json::from_value(job_row.args.clone())
+    async fn perform(&self, ctx: &crate::context::JobContext) -> Result<JobResult, JobError> {
+        let args: T = serde_json::from_value(ctx.job.args.clone())
             .map_err(|err| JobError::Terminal(format!("failed to deserialize args: {}", err)))?;
 
         (self.handler)(args, ctx).await

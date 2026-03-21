@@ -4,7 +4,7 @@
 
 use awa::model::admin::{self, CallbackConfig, DefaultAction};
 use awa::model::migrations;
-use awa::{AwaError, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
+use awa::{AwaError, JobArgs, JobContext, JobError, JobResult, JobState, Worker};
 use awa_testing::TestClient;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -52,7 +52,7 @@ impl Worker for PlainCallbackWorker {
         "webhook_payment"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let _callback = ctx
             .register_callback(Duration::from_secs(3600))
             .await
@@ -75,7 +75,7 @@ impl Worker for CelCallbackWorker {
         "webhook_payment"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let _callback = ctx
             .register_callback_with_config(Duration::from_secs(3600), &self.config)
             .await

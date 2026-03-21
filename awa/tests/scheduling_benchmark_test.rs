@@ -5,8 +5,7 @@
 
 use awa::model::{insert_many, migrations};
 use awa::{
-    Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, PeriodicJob, QueueConfig,
-    Worker,
+    Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, PeriodicJob, QueueConfig, Worker,
 };
 use chrono::{DateTime, Utc};
 use opentelemetry_sdk::metrics::data::{Histogram, Sum};
@@ -260,22 +259,29 @@ impl Worker for TimingWorker {
         "timing_job"
     }
 
-    async fn perform(&self, job: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
-        let seq = job.args.get("seq").and_then(|v| v.as_i64()).unwrap_or(0);
-        let steady_slot = job.metadata.get("steady_slot").and_then(|v| v.as_i64());
-        let cron_name = job
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let seq = ctx
+            .job
+            .args
+            .get("seq")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let steady_slot = ctx.job.metadata.get("steady_slot").and_then(|v| v.as_i64());
+        let cron_name = ctx
+            .job
             .metadata
             .get("cron_name")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
-        let cron_fire_time = job
+        let cron_fire_time = ctx
+            .job
             .metadata
             .get("cron_fire_time")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned);
 
         let _ = self.tx.send(PickupEvent {
-            id: job.id,
+            id: ctx.job.id,
             picked_at: Utc::now(),
             _seq: seq,
             steady_slot,

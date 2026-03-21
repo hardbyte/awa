@@ -51,7 +51,7 @@ impl Worker for ExternalPaymentWorker {
         "external_payment"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let _callback = ctx
             .register_callback(Duration::from_secs(3600))
             .await
@@ -70,7 +70,7 @@ impl Worker for ForgotCallbackWorker {
         "external_payment"
     }
 
-    async fn perform(&self, _job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         // Oops! Forgot to call register_callback
         Ok(JobResult::WaitForCallback)
     }

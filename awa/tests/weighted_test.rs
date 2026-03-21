@@ -53,11 +53,7 @@ impl awa::Worker for SlowWorker {
     fn kind(&self) -> &'static str {
         "weighted_job"
     }
-    async fn perform(
-        &self,
-        _job: &awa_model::JobRow,
-        _ctx: &JobContext,
-    ) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         tokio::time::sleep(self.delay).await;
         self.completed.fetch_add(1, Ordering::SeqCst);
         Ok(JobResult::Completed)
@@ -168,11 +164,7 @@ async fn test_global_cap_not_exceeded() {
         fn kind(&self) -> &'static str {
             "weighted_job"
         }
-        async fn perform(
-            &self,
-            _job: &awa_model::JobRow,
-            _ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
+        async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
             let current = self.current_concurrent.fetch_add(1, Ordering::SeqCst) + 1;
             // Update max seen concurrent
             self.max_concurrent.fetch_max(current, Ordering::SeqCst);
@@ -396,12 +388,8 @@ async fn test_floor_guarantee_under_load() {
         fn kind(&self) -> &'static str {
             "weighted_job"
         }
-        async fn perform(
-            &self,
-            job: &awa_model::JobRow,
-            _ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
-            if job.queue == "wt_floor_a" {
+        async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+            if ctx.job.queue == "wt_floor_a" {
                 let c = self.current_a.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_concurrent_a.fetch_max(c, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(300)).await;
@@ -533,12 +521,8 @@ async fn test_weight_proportionality() {
         fn kind(&self) -> &'static str {
             "weighted_job"
         }
-        async fn perform(
-            &self,
-            job: &awa_model::JobRow,
-            _ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
-            if job.queue == "wt_prop_a" {
+        async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+            if ctx.job.queue == "wt_prop_a" {
                 let c = self.current_a.fetch_add(1, Ordering::SeqCst) + 1;
                 self.max_concurrent_a.fetch_max(c, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(150)).await;

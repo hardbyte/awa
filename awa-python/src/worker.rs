@@ -42,12 +42,13 @@ impl Worker for PythonWorker {
         self.kind
     }
 
-    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let handler = Python::attach(|py| self.handler.clone_ref(py));
         let args_type = Python::attach(|py| self.args_type.clone_ref(py));
         let task_locals = self.task_locals.clone();
-        let py_job = Python::attach(|py| build_dispatch_job(py, job_row.clone(), &args_type, ctx))
-            .map_err(|err| classify_python_error(err, true))?;
+        let py_job =
+            Python::attach(|py| build_dispatch_job(py, ctx.job.clone(), &args_type, ctx))
+                .map_err(|err| classify_python_error(err, true))?;
 
         let future = Python::attach(|py| {
             let coro = handler.call1(py, (py_job,))?;

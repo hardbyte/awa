@@ -4,8 +4,7 @@
 
 use awa::model::{admin, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
 use awa::{
-    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobRow, JobState,
-    Worker,
+    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobState, Worker,
 };
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
@@ -74,8 +73,8 @@ impl Worker for SendEmailWorker {
         "send_email"
     }
 
-    async fn perform(&self, job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
-        let args: SendEmail = serde_json::from_value(job_row.args.clone())
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: SendEmail = serde_json::from_value(ctx.job.args.clone())
             .map_err(|e| JobError::Terminal(e.to_string()))?;
         assert!(!args.to.is_empty());
         Ok(JobResult::Completed)
@@ -90,7 +89,7 @@ impl Worker for FailingWorker {
         "process_payment"
     }
 
-    async fn perform(&self, _job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Err(JobError::retryable(std::io::Error::new(
             std::io::ErrorKind::ConnectionRefused,
             "payment gateway unavailable",

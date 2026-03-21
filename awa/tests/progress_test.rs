@@ -3,7 +3,7 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{admin, migrations};
-use awa::{JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
+use awa::{JobArgs, JobContext, JobError, JobResult, JobState, Worker};
 use awa_testing::TestClient;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -52,8 +52,8 @@ impl Worker for SetProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(50, Some("half done"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(50, "half done");
         ctx.flush_progress().await.map_err(JobError::retryable)?;
         Ok(JobResult::Completed)
     }
@@ -68,7 +68,7 @@ impl Worker for UpdateMetadataWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         ctx.update_metadata(serde_json::json!({"last_processed_id": 1234}))
             .map_err(|e| JobError::terminal(e.to_string()))?;
         ctx.flush_progress().await.map_err(JobError::retryable)?;
@@ -85,10 +85,10 @@ impl Worker for OverwriteProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(10, Some("starting"));
-        ctx.set_progress(50, Some("middle"));
-        ctx.set_progress(90, Some("almost done"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(10, "starting");
+        ctx.set_progress(50, "middle");
+        ctx.set_progress(90, "almost done");
         ctx.flush_progress().await.map_err(JobError::retryable)?;
         Ok(JobResult::Completed)
     }
@@ -103,8 +103,8 @@ impl Worker for FlushProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(42, Some("flushed"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(42, "flushed");
         ctx.flush_progress().await.map_err(JobError::retryable)?;
         // Verify progress was written to DB
         let row = admin::get_job(ctx.pool(), ctx.job.id)
@@ -126,8 +126,8 @@ impl Worker for RetryWithProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(30, Some("partial work"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(30, "partial work");
         ctx.update_metadata(serde_json::json!({"last_id": 500}))
             .map_err(|e| JobError::terminal(e.to_string()))?;
         Ok(JobResult::RetryAfter(Duration::from_secs(1)))
@@ -143,7 +143,7 @@ impl Worker for ReadCheckpointWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         // Read checkpoint from previous attempt
         let last_id = ctx
             .job
@@ -170,8 +170,8 @@ impl Worker for CancelWithProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(75, Some("cancelling"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(75, "cancelling");
         Ok(JobResult::Cancel("user requested".to_string()))
     }
 }
@@ -185,8 +185,8 @@ impl Worker for FailWithProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(10, Some("about to fail"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(10, "about to fail");
         Err(JobError::terminal("fatal error"))
     }
 }
@@ -200,7 +200,7 @@ impl Worker for NoProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Ok(JobResult::Completed)
     }
 }
@@ -214,8 +214,8 @@ impl Worker for ClampProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(101, Some("over the top"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(101, "over the top");
         ctx.flush_progress().await.map_err(JobError::retryable)?;
         // Verify clamped value was written to DB
         let row = admin::get_job(ctx.pool(), ctx.job.id)
@@ -237,8 +237,8 @@ impl Worker for WaitWithProgressWorker {
         "progress_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        ctx.set_progress(50, Some("waiting for callback"));
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        ctx.set_progress(50, "waiting for callback");
         let _callback = ctx
             .register_callback(Duration::from_secs(3600))
             .await
@@ -888,19 +888,19 @@ async fn test_progress_full_lifecycle() {
             "lifecycle_job"
         }
 
-        async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-            let args: LifecycleJob = serde_json::from_value(job_row.args.clone())
+        async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+            let args: LifecycleJob = serde_json::from_value(ctx.job.args.clone())
                 .map_err(|e| JobError::terminal(e.to_string()))?;
             match args.mode.as_str() {
                 "complete" => {
-                    ctx.set_progress(100, Some("done"));
+                    ctx.set_progress(100, "done");
                     ctx.flush_progress().await.map_err(JobError::retryable)?;
                     // Record what we flushed
                     LAST_FLUSHED_PERCENT.store(100, Ordering::SeqCst);
                     Ok(JobResult::Completed)
                 }
                 "retry" => {
-                    ctx.set_progress(50, Some("halfway"));
+                    ctx.set_progress(50, "halfway");
                     ctx.update_metadata(serde_json::json!({"checkpoint": 42}))
                         .map_err(|e| JobError::terminal(e.to_string()))?;
                     Ok(JobResult::RetryAfter(Duration::from_millis(10)))
