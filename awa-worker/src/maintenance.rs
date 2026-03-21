@@ -104,6 +104,12 @@ impl MaintenanceService {
         self
     }
 
+    /// Set the leader connection health-check interval (default: 30s).
+    pub fn leader_check_interval(mut self, interval: Duration) -> Self {
+        self.leader_check_interval = interval;
+        self
+    }
+
     /// Set the promotion interval for scheduled/retryable jobs.
     pub fn promote_interval(mut self, interval: Duration) -> Self {
         self.promote_interval = interval;

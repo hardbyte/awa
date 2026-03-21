@@ -47,6 +47,12 @@ jobs:
           cargo test --package awa --test scheduling_benchmark_test \
             test_runtime_sustained_hot_path -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-hot.txt
+      - name: Run Rust chaos suite
+        run: |
+          set -o pipefail
+          cargo test --package awa --test chaos_suite_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-chaos.txt
       - name: Run sustained deferred benchmark
         run: |
           set -o pipefail

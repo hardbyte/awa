@@ -80,6 +80,7 @@ pub struct ClientBuilder {
     periodic_jobs: Vec<PeriodicJob>,
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
+    leader_check_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
@@ -102,6 +103,7 @@ impl ClientBuilder {
             periodic_jobs: Vec::new(),
             global_max_workers: None,
             leader_election_interval: None,
+            leader_check_interval: None,
             completed_retention: None,
             failed_retention: None,
             cleanup_batch_size: None,
@@ -185,6 +187,12 @@ impl ClientBuilder {
     /// advisory lock. Lower values are useful in tests.
     pub fn leader_election_interval(mut self, interval: Duration) -> Self {
         self.leader_election_interval = Some(interval);
+        self
+    }
+
+    /// Set the leader connection health-check interval (default: 30s).
+    pub fn leader_check_interval(mut self, interval: Duration) -> Self {
+        self.leader_check_interval = Some(interval);
         self
     }
 
@@ -319,6 +327,7 @@ impl ClientBuilder {
             overflow_pool,
             metrics,
             leader_election_interval: self.leader_election_interval,
+            leader_check_interval: self.leader_check_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
             cleanup_batch_size: self.cleanup_batch_size,
@@ -395,6 +404,7 @@ pub struct Client {
     overflow_pool: Option<Arc<OverflowPool>>,
     metrics: crate::metrics::AwaMetrics,
     leader_election_interval: Option<Duration>,
+    leader_check_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
@@ -472,6 +482,9 @@ impl Client {
         }
         if let Some(interval) = self.leader_election_interval {
             maintenance = maintenance.leader_election_interval(interval);
+        }
+        if let Some(interval) = self.leader_check_interval {
+            maintenance = maintenance.leader_check_interval(interval);
         }
         if let Some(retention) = self.completed_retention {
             maintenance = maintenance.completed_retention(retention);

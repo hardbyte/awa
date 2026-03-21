@@ -141,6 +141,11 @@ cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
 # Nightly chaos + benchmark lane
 # GitHub Actions: .github/workflows/nightly-chaos.yml
 
+# Rust chaos suite (leader failover, callback rescue, mixed workload soak)
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  cargo test --package awa --test chaos_suite_test \
+  -- --ignored --test-threads=1 --nocapture
+
 # COPY integration tests
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test copy_test -- --nocapture
 
