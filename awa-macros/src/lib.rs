@@ -49,6 +49,10 @@ pub fn derive_job_args(input: TokenStream) -> TokenStream {
 
     let kind_str = custom_kind.unwrap_or_else(|| camel_to_snake(&name.to_string()));
 
+    // Resolve the crate providing JobArgs. When users depend on the `awa`
+    // facade crate, it re-exports awa_model as `awa::model`, so both paths
+    // work. We use awa_model directly since it's always available (awa
+    // depends on awa_model, and awa_model depends on awa_macros).
     let expanded = quote! {
         impl awa_model::JobArgs for #name {
             fn kind() -> &'static str {

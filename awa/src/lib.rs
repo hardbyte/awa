@@ -3,6 +3,11 @@
 //! This is the facade crate that re-exports the main types from awa-model,
 //! awa-macros, and awa-worker for ergonomic usage.
 
+// Re-export awa_model so the JobArgs derive macro resolves when users
+// depend only on `awa` (the macro expands to `awa_model::JobArgs`).
+#[doc(hidden)]
+pub use awa_model;
+
 // Re-export core model types (includes JobArgs derive macro via awa-model)
 pub use awa_model::{
     self as model, admin, insert, insert_many, insert_many_copy, insert_many_copy_from_pool,

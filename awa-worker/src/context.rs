@@ -67,6 +67,18 @@ impl JobContext {
     /// Extract a shared state value by type.
     ///
     /// State values are registered via `Client::builder().state(value)`.
+    /// Register the concrete type you want to extract:
+    ///
+    /// ```ignore
+    /// // Register with the type you'll extract:
+    /// let deps = Arc::new(MyDeps::new());
+    /// Client::builder(pool)
+    ///     .state(deps.clone())  // stores Arc<MyDeps>
+    ///     .build()?;
+    ///
+    /// // In handler — extract the same type:
+    /// let deps = ctx.extract::<Arc<MyDeps>>().unwrap();
+    /// ```
     pub fn extract<T: Any + Send + Sync + Clone>(&self) -> Option<T> {
         self.state
             .get(&std::any::TypeId::of::<T>())
@@ -121,9 +133,9 @@ impl JobContext {
     /// Set structured progress (0-100, optional message). Sync — writes to in-memory buffer.
     ///
     /// `percent` is clamped to 0-100.
-    pub fn set_progress(&self, percent: u8, message: Option<&str>) {
+    pub fn set_progress(&self, percent: u8, message: Option<impl Into<String>>) {
         let mut guard = self.progress.lock().expect("progress lock poisoned");
-        guard.set_progress(percent, message);
+        guard.set_progress(percent, message.map(Into::into).as_deref());
     }
 
     /// Shallow-merge keys into progress.metadata for checkpointing. Sync.
