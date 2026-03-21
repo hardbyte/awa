@@ -6,12 +6,19 @@ Demonstrates:
 - Structured progress with percent, message, and metadata
 - Checkpoint/resume: a crashed job resumes from the last processed row
 - Periodic scheduling for daily runs
-- Admin: monitoring queue health
+- Queue stats monitoring
 
-Run:
+In production you'd split this into:
+- A scheduler/API that enqueues ImportTable jobs (the "Enqueue jobs" section)
+- A worker process running `client.start([("etl", 3)])` as a separate
+  deployment (e.g. k8s Deployment with replicas=2)
+- The periodic schedule is registered on the worker and evaluated by
+  whichever instance wins leader election
+- Monitor via the web UI: `awa serve --database-url $DATABASE_URL`
+
+Run (single-process demo):
     cd awa-python
-    DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
-    .venv/bin/python ../examples/python/etl_pipeline.py
+    DATABASE_URL=postgres://... .venv/bin/python ../examples/python/etl_pipeline.py
 """
 
 import asyncio
@@ -65,7 +72,7 @@ async def main():
     await client.migrate()
     print("AWA ETL Pipeline Example\n")
 
-    # ── Register workers ────────────────────────────────────────
+    # ── Worker handlers (WORKER PROCESS in production) ────────────
 
     @client.worker(ImportTable, queue="etl")
     async def handle_import(job):

@@ -8,10 +8,16 @@ Demonstrates:
 - Admin operations: retry_failed, queue_stats
 - Periodic cron schedule
 
-Run:
+In production you'd split this into:
+- A marketing service that bulk-enqueues campaign emails (the insert_many_copy
+  section) — triggered by an admin action or scheduled campaign
+- A worker process: client.start([("email", 10)]) as a separate deployment
+- An admin/ops script or the web UI for retry_failed, queue_stats, drain
+- The periodic schedule runs on the worker (leader evaluates it)
+
+Run (single-process demo):
     cd awa-python
-    DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
-    .venv/bin/python ../examples/python/email_campaign.py
+    DATABASE_URL=postgres://... .venv/bin/python ../examples/python/email_campaign.py
 """
 
 import asyncio

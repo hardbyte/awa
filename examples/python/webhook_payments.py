@@ -8,10 +8,17 @@ Demonstrates:
 - Queue stats and health monitoring
 - Metadata for correlation and audit
 
-Run:
+In production you'd split this into:
+- A checkout API (FastAPI/Django) that calls client.insert(ChargeCustomer(...))
+  when a customer clicks "Pay" — this is the "Enqueue payment jobs" section
+- A worker process: client.start([("payments", 4), ("notifications", 2)])
+  as a separate deployment
+- The charge handler enqueues receipt jobs — picked up by the notifications
+  worker (same or different process on that queue)
+
+Run (single-process demo):
     cd awa-python
-    DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
-    .venv/bin/python ../examples/python/webhook_payments.py
+    DATABASE_URL=postgres://... .venv/bin/python ../examples/python/webhook_payments.py
 """
 
 import asyncio
