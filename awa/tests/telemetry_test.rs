@@ -479,9 +479,13 @@ async fn test_failure_path_metrics_reach_prometheus() {
 
     eprintln!("Querying Prometheus for failure-path metrics...");
 
+    // Use PromQL label filters scoped to this test's queue to avoid
+    // cross-contamination from other tests sharing the same Prometheus.
+    let q = queue;
+
     let completed = wait_for_metric(
         &http,
-        "awa_job_completed_total",
+        &format!(r#"sum(awa_job_completed_total{{awa_job_queue="{q}"}})"#),
         expected_completed as f64,
         timeout,
     )
@@ -490,24 +494,43 @@ async fn test_failure_path_metrics_reach_prometheus() {
 
     let failed = wait_for_metric(
         &http,
-        "awa_job_failed_total",
+        &format!(r#"sum(awa_job_failed_total{{awa_job_queue="{q}"}})"#),
         expected_failed as f64,
         timeout,
     )
     .await;
     eprintln!("  awa_job_failed_total = {failed}");
 
-    let retried = wait_for_metric(&http, "awa_job_retried_total", 2.0, timeout).await;
+    let retried = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_retried_total{{awa_job_queue="{q}"}})"#),
+        2.0,
+        timeout,
+    )
+    .await;
     eprintln!("  awa_job_retried_total = {retried}");
 
+    // maintenance.rescues has awa_rescue_kind attribute, not awa_job_queue.
+    // Only this test generates rescues, so no filtering needed.
     let rescues = wait_for_metric(&http, "awa_maintenance_rescues_total", 2.0, timeout).await;
     eprintln!("  awa_maintenance_rescues_total = {rescues}");
 
-    let claimed = wait_for_metric(&http, "awa_job_claimed_total", 9.0, timeout).await;
+    let claimed = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_claimed_total{{awa_job_queue="{q}"}})"#),
+        9.0,
+        timeout,
+    )
+    .await;
     eprintln!("  awa_job_claimed_total = {claimed}");
 
-    let duration_count =
-        wait_for_metric(&http, "awa_job_duration_seconds_count", 5.0, timeout).await;
+    let duration_count = wait_for_metric(
+        &http,
+        &format!(r#"sum(awa_job_duration_seconds_count{{awa_job_queue="{q}"}})"#),
+        5.0,
+        timeout,
+    )
+    .await;
     eprintln!("  awa_job_duration_seconds_count = {duration_count}");
 
     assert!(completed >= expected_completed as f64);
@@ -594,11 +617,11 @@ async fn test_collector_death_does_not_block_job_processing() {
         .expect("Failed to flush meter provider");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Verify the pipeline was live by checking Prometheus.
+    // Verify the pipeline was live by checking Prometheus (filter by this test's queue).
     let http = reqwest::Client::new();
     let completed = wait_for_metric(
         &http,
-        "awa_job_completed_total",
+        &format!(r#"sum(awa_job_completed_total{{awa_job_queue="{queue}"}})"#),
         1.0,
         Duration::from_secs(30),
     )
