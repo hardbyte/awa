@@ -26,7 +26,7 @@ interfere with hot-path dispatch performance.
 
 Split the physical storage into:
 
-- `awa.jobs_hot`: runnable, running, waiting, and terminal rows
+- `awa.jobs_hot`: available, running, and terminal-state rows
 - `awa.scheduled_jobs`: deferred `scheduled` and `retryable` rows
 - `awa.jobs`: compatibility `UNION ALL` view across both tables
 
