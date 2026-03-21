@@ -37,6 +37,17 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create Python venv for Rust chaos suite
+        run: |
+          python -m venv awa-python/.venv
+          awa-python/.venv/bin/pip install --upgrade pip maturin
+      - name: Build Python extension for mixed-fleet chaos test
+        run: |
+          cd awa-python
+          .venv/bin/maturin develop
       - name: Wait for Postgres
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
       - name: Create artifact directory
@@ -50,6 +61,7 @@ jobs:
       - name: Run Rust chaos suite
         run: |
           set -o pipefail
+          export AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python"
           cargo test --package awa --test chaos_suite_test \
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-chaos.txt

@@ -12,7 +12,12 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::path::PathBuf;
+use std::process::Stdio;
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::process::{Child, ChildStdout, Command};
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 fn database_url() -> String {
@@ -107,6 +112,151 @@ async fn wait_for_single_leader(clients: &[&Client], timeout: Duration) -> usize
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("workspace root")
+        .to_path_buf()
+}
+
+fn python_test_bin() -> PathBuf {
+    std::env::var_os("AWA_PYTHON_BIN")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| workspace_root().join("awa-python/.venv/bin/python"))
+}
+
+fn mixed_fleet_helper_path() -> PathBuf {
+    workspace_root().join("awa-python/tests/mixed_fleet_helper.py")
+}
+
+struct PythonHelperProcess {
+    child: Child,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl PythonHelperProcess {
+    async fn wait_for_line(&mut self, expected: &str, timeout: Duration) -> String {
+        let deadline = tokio::time::Instant::now() + timeout;
+        let mut seen = Vec::new();
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Timed out waiting for python helper output: {expected}\n{}",
+                seen.join("\n")
+            );
+            let mut line = String::new();
+            let read = match tokio::time::timeout(
+                Duration::from_millis(250),
+                self.stdout.read_line(&mut line),
+            )
+            .await
+            {
+                Ok(result) => result.expect("Failed to read python helper stdout"),
+                Err(_) => continue,
+            };
+            if read == 0 {
+                let status = self
+                    .child
+                    .wait()
+                    .await
+                    .expect("Failed to wait for python helper");
+                panic!(
+                    "Python helper exited before emitting expected output: {expected}\nstatus={status}\n{}",
+                    seen.join("\n")
+                );
+            }
+            let text = line.trim().to_string();
+            seen.push(text.clone());
+            if text.contains(expected) {
+                return text;
+            }
+        }
+    }
+
+    async fn stop(mut self) {
+        if self.child.id().is_none() {
+            return;
+        }
+        let _ = self.child.kill().await;
+        let _ = self.child.wait().await;
+    }
+}
+
+async fn start_python_helper(
+    mode: &str,
+    queue: &str,
+    extra_env: &[(&str, String)],
+) -> PythonHelperProcess {
+    let python = python_test_bin();
+    assert!(
+        python.exists(),
+        "Python test interpreter not found at {}. Build the awa-python test venv or set AWA_PYTHON_BIN.",
+        python.display()
+    );
+
+    let script = mixed_fleet_helper_path();
+    assert!(
+        script.exists(),
+        "Mixed-fleet helper script not found at {}",
+        script.display()
+    );
+
+    let mut command = Command::new(python);
+    command
+        .arg(script)
+        .env("DATABASE_URL", database_url())
+        .env("MIXED_QUEUE", queue)
+        .env("MIXED_MODE", mode)
+        .env("PYTHONUNBUFFERED", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let mut child = command.spawn().expect("Failed to spawn python helper");
+    let stdout = child
+        .stdout
+        .take()
+        .expect("Failed to capture python helper stdout");
+
+    PythonHelperProcess {
+        child,
+        stdout: BufReader::new(stdout),
+    }
+}
+
+async fn run_python_helper(mode: &str, queue: &str, extra_env: &[(&str, String)]) -> String {
+    let python = python_test_bin();
+    assert!(
+        python.exists(),
+        "Python test interpreter not found at {}. Build the awa-python test venv or set AWA_PYTHON_BIN.",
+        python.display()
+    );
+
+    let script = mixed_fleet_helper_path();
+    let mut command = Command::new(python);
+    command
+        .arg(script)
+        .env("DATABASE_URL", database_url())
+        .env("MIXED_QUEUE", queue)
+        .env("MIXED_MODE", mode)
+        .stderr(Stdio::inherit());
+
+    for (key, value) in extra_env {
+        command.env(key, value);
+    }
+
+    let output = command.output().await.expect("Failed to run python helper");
+    assert!(
+        output.status.success(),
+        "Python helper failed with status {}",
+        output.status
+    );
+    String::from_utf8(output.stdout).expect("Python helper output was not valid UTF-8")
 }
 
 async fn current_leader_backend_pid(pool: &sqlx::PgPool) -> Option<i32> {
@@ -211,6 +361,11 @@ fn complete_client(pool: sqlx::PgPool, queue: &str) -> Client {
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct SimpleChaosJob {
     seq: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct ChaosProbe {
+    marker: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
@@ -323,6 +478,28 @@ impl Worker for CallbackTimeoutWorker {
     }
 }
 
+struct MixedFleetRustWorker {
+    tx: mpsc::UnboundedSender<String>,
+}
+
+#[async_trait]
+impl Worker for MixedFleetRustWorker {
+    fn kind(&self) -> &'static str {
+        "chaos_probe"
+    }
+
+    async fn perform(&self, job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: ChaosProbe = serde_json::from_value(job_row.args.clone()).map_err(|err| {
+            JobError::terminal(format!("failed to decode mixed fleet args: {err}"))
+        })?;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        self.tx
+            .send(args.marker)
+            .expect("mixed fleet receiver dropped");
+        Ok(JobResult::Completed)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
@@ -432,6 +609,113 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
     );
 
     let _ = meter_provider.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_mixed_rust_and_python_workers_share_same_queue() {
+    let pool = setup(20).await;
+    let queue = chaos_queue("chaos_mixed_lang");
+    clean_queue(&pool, &queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Client::builder(pool.clone())
+        .queue(
+            &queue,
+            QueueConfig {
+                max_workers: 1,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .register_worker(MixedFleetRustWorker { tx })
+        .build()
+        .expect("Failed to build mixed-fleet client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start mixed-fleet Rust client");
+
+    let mut python_worker = start_python_helper("worker_chaos_probe", &queue, &[]).await;
+
+    let batch_size = 12_i64;
+
+    let test_result = async {
+        python_worker
+            .wait_for_line("READY mode=worker_chaos_probe", Duration::from_secs(10))
+            .await;
+
+        let inserted = run_python_helper(
+            "insert_chaos_probe_batch",
+            &queue,
+            &[
+                ("MIXED_PREFIX", "python".to_string()),
+                ("MIXED_COUNT", batch_size.to_string()),
+            ],
+        )
+        .await;
+        assert!(
+            inserted.contains("INSERTED mode=insert_chaos_probe_batch")
+                && inserted.contains(&format!("count={batch_size}")),
+            "Unexpected python inserter output: {inserted}"
+        );
+
+        for idx in 0..batch_size {
+            insert_with(
+                &pool,
+                &ChaosProbe {
+                    marker: format!("rust-{idx}"),
+                },
+                InsertOpts {
+                    queue: queue.clone(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert Rust-enqueued ChaosProbe");
+        }
+
+        let rust_processed_marker = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .expect("Timed out waiting for Rust worker to process a shared-kind job")
+            .expect("Rust mixed-fleet receiver closed unexpectedly");
+        assert!(
+            rust_processed_marker.starts_with("python-")
+                || rust_processed_marker.starts_with("rust-"),
+            "Unexpected marker processed by Rust worker: {rust_processed_marker}"
+        );
+
+        let python_line = python_worker
+            .wait_for_line("COMPLETE mode=worker_chaos_probe", Duration::from_secs(10))
+            .await;
+        assert!(
+            python_line.contains("marker=python-") || python_line.contains("marker=rust-"),
+            "Unexpected python worker completion line: {python_line}"
+        );
+
+        let counts = wait_for_counts(
+            &pool,
+            &queue,
+            |counts| {
+                state_count(counts, "completed") == batch_size * 2
+                    && state_count(counts, "running") == 0
+                    && state_count(counts, "available") == 0
+            },
+            Duration::from_secs(10),
+        )
+        .await;
+        assert_eq!(state_count(&counts, "completed"), batch_size * 2);
+    }
+    .await;
+
+    python_worker.stop().await;
+    client.shutdown(Duration::from_secs(5)).await;
+
+    test_result
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

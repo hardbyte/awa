@@ -71,6 +71,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T68 | Python: transaction_sync context manager rollback on exception | Sync | Implemented |
 | T69 | Python: sync methods work from non-async context | Sync | Implemented |
 | T70 | Python: insert_many_copy_sync | Sync | Implemented |
+| T71 | Mixed Rust/Python workers share the same queue correctly | Cross-language resilience | Implemented |
 | B1 | Late completion after rescue is no-op (state guard) | Bug fix | Implemented |
 | B2 | Late completion after cancel is no-op (state guard) | Bug fix | Implemented |
 | B3 | Shutdown waits for in-flight jobs | Bug fix | Implemented |
@@ -141,8 +142,9 @@ cd awa-python && .venv/bin/pytest tests/test_chaos_recovery.py -v -m chaos
 # Nightly chaos + benchmark lane
 # GitHub Actions: .github/workflows/nightly-chaos.yml
 
-# Rust chaos suite (leader failover, callback rescue, mixed workload soak)
+# Rust chaos suite (mixed workload soak, leader failover, leader connection loss, mixed Rust/Python fleet)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python" \
   cargo test --package awa --test chaos_suite_test \
   -- --ignored --test-threads=1 --nocapture
 
