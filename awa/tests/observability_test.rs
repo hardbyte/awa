@@ -353,11 +353,11 @@ async fn test_job_execution_emits_otel_metrics() {
         }
     }
 
-    // Assert awa.jobs.completed counter >= 1
-    let completed_metrics = metrics_by_name.get("awa.jobs.completed");
+    // Assert awa.job.completed counter >= 1
+    let completed_metrics = metrics_by_name.get("awa.job.completed");
     assert!(
         completed_metrics.is_some(),
-        "Expected 'awa.jobs.completed' metric, found metrics: {:?}",
+        "Expected 'awa.job.completed' metric, found metrics: {:?}",
         metrics_by_name.keys().collect::<Vec<_>>()
     );
     let completed_sum = completed_metrics
@@ -366,7 +366,7 @@ async fn test_job_execution_emits_otel_metrics() {
         .find_map(|m| m.data.as_any().downcast_ref::<Sum<u64>>());
     assert!(
         completed_sum.is_some(),
-        "Expected Sum<u64> aggregation for awa.jobs.completed"
+        "Expected Sum<u64> aggregation for awa.job.completed"
     );
     let total_completed: u64 = completed_sum
         .unwrap()
@@ -376,15 +376,15 @@ async fn test_job_execution_emits_otel_metrics() {
         .sum();
     assert!(
         total_completed >= 1,
-        "Expected awa.jobs.completed >= 1, got {}",
+        "Expected awa.job.completed >= 1, got {}",
         total_completed
     );
 
-    // Assert awa.jobs.duration histogram has data points
-    let duration_metrics = metrics_by_name.get("awa.jobs.duration");
+    // Assert awa.job.duration histogram has data points
+    let duration_metrics = metrics_by_name.get("awa.job.duration");
     assert!(
         duration_metrics.is_some(),
-        "Expected 'awa.jobs.duration' metric"
+        "Expected 'awa.job.duration' metric"
     );
     let duration_histogram = duration_metrics
         .unwrap()
@@ -392,7 +392,7 @@ async fn test_job_execution_emits_otel_metrics() {
         .find_map(|m| m.data.as_any().downcast_ref::<Histogram<f64>>());
     assert!(
         duration_histogram.is_some(),
-        "Expected Histogram<f64> aggregation for awa.jobs.duration"
+        "Expected Histogram<f64> aggregation for awa.job.duration"
     );
     let total_duration_count: u64 = duration_histogram
         .unwrap()
@@ -406,12 +406,12 @@ async fn test_job_execution_emits_otel_metrics() {
         total_duration_count
     );
 
-    // Assert awa.jobs.in_flight gauge returned to 0
+    // Assert awa.job.in_flight gauge returned to 0
     // The UpDownCounter is represented as a non-monotonic Sum. After shutdown
     // and force_flush, the last reported value per attribute set should be 0.
     // We check the last data point rather than summing all points, since
     // intermediate exports may have captured non-zero in-flight counts.
-    if let Some(in_flight_metrics) = metrics_by_name.get("awa.jobs.in_flight") {
+    if let Some(in_flight_metrics) = metrics_by_name.get("awa.job.in_flight") {
         if let Some(in_flight_sum) = in_flight_metrics
             .iter()
             .find_map(|m| m.data.as_any().downcast_ref::<Sum<i64>>())
@@ -424,7 +424,7 @@ async fn test_job_execution_emits_otel_metrics() {
                 .unwrap_or(0);
             assert!(
                 max_in_flight <= 2,
-                "Expected awa.jobs.in_flight to be at most max_workers (2), got {}",
+                "Expected awa.job.in_flight to be at most max_workers (2), got {}",
                 max_in_flight
             );
         }
@@ -510,11 +510,11 @@ async fn test_failed_job_emits_failure_metrics() {
         }
     }
 
-    // Assert awa.jobs.failed counter >= 1
-    let failed_metrics = metrics_by_name.get("awa.jobs.failed");
+    // Assert awa.job.failed counter >= 1
+    let failed_metrics = metrics_by_name.get("awa.job.failed");
     assert!(
         failed_metrics.is_some(),
-        "Expected 'awa.jobs.failed' metric, found metrics: {:?}",
+        "Expected 'awa.job.failed' metric, found metrics: {:?}",
         metrics_by_name.keys().collect::<Vec<_>>()
     );
     let failed_sum = failed_metrics
@@ -523,7 +523,7 @@ async fn test_failed_job_emits_failure_metrics() {
         .find_map(|m| m.data.as_any().downcast_ref::<Sum<u64>>());
     assert!(
         failed_sum.is_some(),
-        "Expected Sum<u64> aggregation for awa.jobs.failed"
+        "Expected Sum<u64> aggregation for awa.job.failed"
     );
     let total_failed: u64 = failed_sum
         .unwrap()
@@ -533,7 +533,7 @@ async fn test_failed_job_emits_failure_metrics() {
         .sum();
     assert!(
         total_failed >= 1,
-        "Expected awa.jobs.failed >= 1, got {}",
+        "Expected awa.job.failed >= 1, got {}",
         total_failed
     );
 

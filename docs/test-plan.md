@@ -118,6 +118,10 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | PP3 | Python: flush_progress immediate DB write | Progress (Py) | Implemented |
 | PP4 | Python: job.progress property returns dict during execution | Progress (Py) | Implemented |
 | PP5 | Python: progress persists across retry (checkpoint) | Progress (Py) | Implemented |
+| OT1 | OTLP export: awa.job.completed reaches collector | Telemetry (E2E) | Implemented |
+| OT2 | OTLP export: awa.job.claimed reaches collector | Telemetry (E2E) | Implemented |
+| OT3 | OTLP export: awa.dispatch.claim_batches reaches collector | Telemetry (E2E) | Implemented |
+| OT4 | OTLP export: awa.job.duration histogram reaches collector | Telemetry (E2E) | Implemented |
 
 ## Running Tests
 
@@ -166,6 +170,18 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 
 # Progress tests (Python)
 cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_progress.py -v
+
+# Telemetry OTLP integration test (requires otel-lgtm + postgres)
+# Start an OTLP collector (receives metrics via gRPC, exposes Prometheus API):
+docker run -d --name otel-lgtm -p 4317:4317 -p 9090:9090 grafana/otel-lgtm:0.22.0
+# Wait for ready:
+until curl -sf http://localhost:9090/api/v1/status/runtimeinfo; do sleep 2; done
+# Run the test:
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+  cargo test -p awa --test telemetry_test -- --ignored --nocapture
+# Cleanup:
+docker rm -f otel-lgtm
 
 # Repeat 20 times to detect flakes
 for i in $(seq 1 20); do echo "=== Run $i ===" && cargo test --workspace 2>&1 | tail -1; done

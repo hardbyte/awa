@@ -194,7 +194,7 @@ fn print_histogram_metric_f64(
 }
 
 fn print_runtime_metrics(resource_metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics]) {
-    print_counter_metric(resource_metrics, "awa.jobs.claimed");
+    print_counter_metric(resource_metrics, "awa.job.claimed");
     print_counter_metric(resource_metrics, "awa.dispatch.claim_batches");
     print_histogram_metric_u64(resource_metrics, "awa.dispatch.claim_batch_size");
     print_histogram_metric_f64(resource_metrics, "awa.dispatch.claim_duration");

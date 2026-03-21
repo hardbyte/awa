@@ -27,4 +27,7 @@ uuid.workspace = true
 tracing-subscriber = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry = { workspace = true, features = ["testing"] }
+opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic"] }
+tracing-opentelemetry = "0.28"
+reqwest = { version = "0.12", features = ["json"] }
 tracing = { workspace = true }
