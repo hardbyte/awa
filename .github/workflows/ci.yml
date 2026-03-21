@@ -122,6 +122,10 @@ jobs:
           .venv/bin/python examples/sync_api.py
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+      - name: Run Python example integration tests
+        run: .venv/bin/pytest ../examples/python/test_examples.py -v
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
   # ─── Frontend ──────────────────────────────────────────
   frontend-lint:
@@ -278,6 +282,10 @@ jobs:
           sleep 2
           curl -sf http://127.0.0.1:3000/api/stats
           kill $SERVER_PID
+      - name: Run Rust ETL example
+        run: cargo run -p awa --example etl_pipeline
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
   # ─── Telemetry validation ─────────────────────────────────────
   telemetry-validation:
