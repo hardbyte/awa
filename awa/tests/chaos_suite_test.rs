@@ -1132,3 +1132,155 @@ async fn test_leader_failover_rescues_callback_timeouts() {
 
     follower.shutdown(Duration::from_secs(5)).await;
 }
+
+/// Full Postgres outage: terminate ALL application backends twice in succession,
+/// then verify the client recovers and processes all jobs with correct metrics.
+///
+/// This is heavier than the targeted disconnect test — it simulates a sustained
+/// Postgres restart by disrupting ALL connections, not just one backend.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_full_postgres_outage_recovers_with_metrics() {
+    let app_name = format!("chaos_outage_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let app_pool = pool_with_url(&database_url_with_app_name(&app_name), 20).await;
+    migrations::run(&app_pool)
+        .await
+        .expect("Failed to migrate app pool");
+
+    let admin_pool = pool_with(2).await;
+    let queue = chaos_queue("chaos_outage");
+    clean_queue(&app_pool, &queue).await;
+
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let client = Client::builder(app_pool.clone())
+        .queue(
+            &queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
+        .register_worker(CompleteWorker)
+        .build()
+        .expect("Failed to build outage-recovery client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start outage-recovery client");
+
+    // Insert first wave and wait for partial completion.
+    for seq in 0..8_i64 {
+        insert_with(
+            &app_pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert first wave job");
+    }
+
+    wait_for_counts(
+        &app_pool,
+        &queue,
+        |counts| state_count(counts, "completed") >= 4,
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // First outage: terminate ALL application backends.
+    let terminated_1 = terminate_application_backends(&admin_pool, &app_name).await;
+    assert!(
+        terminated_1 > 0,
+        "Expected to terminate backends in first outage"
+    );
+    eprintln!("First outage: terminated {terminated_1} backends");
+
+    // Sustained outage: terminate again after a brief pause.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let terminated_2 = terminate_application_backends(&admin_pool, &app_name).await;
+    eprintln!("Second outage: terminated {terminated_2} backends");
+
+    // Insert second wave as scheduled jobs (tests promotion after recovery).
+    for seq in 8..16_i64 {
+        insert_with(
+            &app_pool,
+            &SimpleChaosJob { seq },
+            InsertOpts {
+                queue: queue.clone(),
+                run_at: Some(Utc::now() + ChronoDuration::milliseconds(300)),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert second wave job");
+    }
+
+    // Wait for full recovery: all 16 jobs completed.
+    let counts = wait_for_counts(
+        &app_pool,
+        &queue,
+        |counts| {
+            state_count(counts, "completed") == 16
+                && state_count(counts, "scheduled") == 0
+                && state_count(counts, "running") == 0
+                && state_count(counts, "available") == 0
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(state_count(&counts, "completed"), 16);
+
+    // Health check: the client should have recovered.
+    let health = client.health_check().await;
+    assert!(
+        health.postgres_connected,
+        "Client should reconnect to Postgres after full outage"
+    );
+    assert!(
+        health.poll_loop_alive,
+        "Dispatch loop should survive full outage"
+    );
+    assert!(
+        health.heartbeat_alive,
+        "Heartbeat loop should survive full outage"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+
+    // Flush and assert metrics survived the outage.
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush outage metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to read outage metrics");
+
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.job.completed") >= 16,
+        "completed metric should account for all jobs after outage recovery"
+    );
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.job.claimed") >= 16,
+        "claimed metric should account for all jobs after outage recovery"
+    );
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.dispatch.claim_batches") >= 2,
+        "dispatch should have run claim batches across pre- and post-outage"
+    );
+
+    let _ = meter_provider.shutdown();
+}
