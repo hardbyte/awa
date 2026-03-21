@@ -7,9 +7,8 @@ Accepted
 ## Context
 
 The original schema stored every job lifecycle state in one `awa.jobs` table.
-That worked well for modest queue sizes, but the performance investigations on
-this branch exposed a bad scaling shape once large deferred frontiers were
-introduced.
+That worked well for modest queue sizes, but performance investigations
+exposed a bad scaling shape once large deferred frontiers were introduced.
 
 The critical issue was not just due-row lookup. With millions of future-dated
 rows present, every job still churned through the same heap and indexes:
@@ -18,16 +17,16 @@ rows present, every job still churned through the same heap and indexes:
 - `available -> running`
 - `running -> completed`
 
-Even after adding due-time indexes, that kept cold deferred rows and hot
-execution rows in the same physical structure. It made dispatch plans more
+Even after adding due-time indexes, cold deferred rows and hot execution rows
+shared the same physical structure. This made dispatch query plans more
 fragile, increased write amplification, and let background promotion work
-interfere with hot-path benchmarks and runtime behavior.
+interfere with hot-path dispatch performance.
 
 ## Decision
 
 Split the physical storage into:
 
-- `awa.jobs_hot`: runnable, running, waiting, and terminal rows
+- `awa.jobs_hot`: available, running, and terminal-state rows
 - `awa.scheduled_jobs`: deferred `scheduled` and `retryable` rows
 - `awa.jobs`: compatibility `UNION ALL` view across both tables
 
