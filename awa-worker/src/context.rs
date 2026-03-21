@@ -133,9 +133,9 @@ impl JobContext {
     /// Set structured progress (0-100, optional message). Sync — writes to in-memory buffer.
     ///
     /// `percent` is clamped to 0-100.
-    pub fn set_progress(&self, percent: u8, message: Option<impl Into<String>>) {
+    pub fn set_progress(&self, percent: u8, message: Option<&str>) {
         let mut guard = self.progress.lock().expect("progress lock poisoned");
-        guard.set_progress(percent, message.map(Into::into).as_deref());
+        guard.set_progress(percent, message);
     }
 
     /// Shallow-merge keys into progress.metadata for checkpointing. Sync.
