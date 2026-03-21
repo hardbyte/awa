@@ -47,7 +47,14 @@ The `trg_awa_notify` trigger fires AFTER INSERT on `awa.jobs`. The final `INSERT
 
 ## Consequences
 
-- COPY path bypasses the 65,535 parameter limit entirely
-- Single-statement inserts of 10K+ rows with no chunking needed
-- Shared `RowValues` / `precompute_row_values` between `insert_many` and `insert_many_copy`
-- Python bindings expose `insert_many_copy` / `insert_many_copy_sync`
+### Positive
+
+- **No parameter limit:** COPY path bypasses the 65,535 parameter limit entirely.
+- **No chunking needed:** Single-statement inserts of 10K+ rows without client-side batching.
+- **Shared internals:** `RowValues` / `precompute_row_values` are reused between `insert_many` and `insert_many_copy`.
+- **Python support:** Python bindings expose `insert_many_copy` / `insert_many_copy_sync`.
+
+### Negative
+
+- **CSV serialization complexity:** Custom CSV encoding for JSONB, TEXT[], BYTEA, and TIMESTAMPTZ requires careful escaping and adds a non-trivial code path to maintain.
+- **Temp table per call:** Each invocation creates and drops a temporary staging table, adding per-call overhead that is amortized only for larger batches.

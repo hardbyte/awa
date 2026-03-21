@@ -20,7 +20,7 @@ Job queues with fixed priority ordering (no aging) require operators to manually
 
 Use the formula `GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / aging_interval)::int)` to compute an effective priority at claim time.
 
-This is implemented in the claim CTE (`awa-worker/src/dispatcher.rs` and `awa-model/queries/claim.sql`):
+This is implemented in the claim CTE (`awa-worker/src/dispatcher.rs` and `awa-model/queries/claim.sql`), where `$4` is the aging interval in seconds:
 
 ```sql
 ORDER BY

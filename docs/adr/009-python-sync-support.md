@@ -53,7 +53,14 @@ New `PySyncTransaction` wrapping `Arc<Mutex<Option<Transaction>>>`:
 
 ## Consequences
 
-- Django/Flask handlers can use awa directly without async adapters
-- Full type stubs in `_awa.pyi` for IDE support
-- `SyncTransaction` registered as a separate Python class alongside `Transaction`
-- GIL released during all blocking calls via `py.detach()`
+### Positive
+
+- **Django/Flask support:** Sync handlers can use Awa directly without async adapters.
+- **IDE support:** Full type stubs in `_awa.pyi` for both async and sync methods.
+- **Simple pattern:** `with client.transaction_sync() as tx:` is easier than the async double-await.
+- **GIL safety:** All blocking calls release the GIL via `py.detach()`, preventing deadlocks with other Python threads.
+
+### Negative
+
+- **API surface doubling:** Every async method gets a `_sync` twin, increasing the maintenance and documentation burden.
+- **Two transaction classes:** `Transaction` (async) and `SyncTransaction` (sync) are separate Python types, which may confuse users who switch between sync and async code.
