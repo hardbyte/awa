@@ -11,24 +11,19 @@
 //! See docs/test-plan.md for local setup instructions.
 
 use async_trait::async_trait;
-use awa::model::{insert_with, migrations, InsertOpts};
+use awa::model::{insert_with, InsertOpts};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker};
+use awa_testing::setup::{clean_queue, setup};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 // ── Helpers ──────────────────────────────────────────────────────────
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
 
 fn otlp_endpoint() -> String {
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -37,29 +32,6 @@ fn otlp_endpoint() -> String {
 
 fn prometheus_url() -> String {
     std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://localhost:9090".to_string())
-}
-
-async fn setup_pool() -> sqlx::PgPool {
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database");
-    migrations::run(&pool).await.expect("Failed to migrate");
-    pool
-}
-
-async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
 }
 
 // ── Job type ─────────────────────────────────────────────────────────
@@ -254,7 +226,7 @@ async fn wait_for_metric(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_otlp_metrics_reach_prometheus() {
-    let pool = setup_pool().await;
+    let pool = setup(5).await;
     let queue = "telemetry_otlp_test";
     clean_queue(&pool, queue).await;
 
@@ -400,7 +372,7 @@ async fn test_otlp_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_failure_path_metrics_reach_prometheus() {
-    let pool = setup_pool().await;
+    let pool = setup(5).await;
     let queue = "telemetry_failure_path";
     clean_queue(&pool, queue).await;
 
@@ -555,7 +527,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_collector_death_does_not_block_job_processing() {
-    let pool = setup_pool().await;
+    let pool = setup(5).await;
     let queue = "telemetry_collector_death";
     clean_queue(&pool, queue).await;
 

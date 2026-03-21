@@ -6,12 +6,14 @@
 use async_trait::async_trait;
 use awa::model::{insert_with, migrations, InsertOpts};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker};
+use awa_testing::setup::{
+    clean_queue, database_url, database_url_with_app_name, pool as pool_with, pool_with_url, setup,
+    state_count, wait_for_counts,
+};
 use chrono::{Duration as ChronoDuration, Utc};
 use opentelemetry_sdk::metrics::data::Sum;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -19,96 +21,6 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::mpsc;
 use uuid::Uuid;
-
-fn database_url() -> String {
-    std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
-}
-
-fn database_url_with_app_name(app_name: &str) -> String {
-    let mut url = database_url();
-    let sep = if url.contains('?') { '&' } else { '?' };
-    url.push(sep);
-    url.push_str("application_name=");
-    url.push_str(app_name);
-    url
-}
-
-async fn pool_with(max_conns: u32) -> sqlx::PgPool {
-    PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database")
-}
-
-async fn pool_with_url(database_url: &str, max_conns: u32) -> sqlx::PgPool {
-    PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(database_url)
-        .await
-        .expect("Failed to connect to database")
-}
-
-async fn setup(max_conns: u32) -> sqlx::PgPool {
-    let pool = pool_with(max_conns).await;
-    migrations::run(&pool).await.expect("Failed to migrate");
-    pool
-}
-
-async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
-}
-
-async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        r#"
-        SELECT state::text, count(*)::bigint
-        FROM awa.jobs
-        WHERE queue = $1
-        GROUP BY state
-        "#,
-    )
-    .bind(queue)
-    .fetch_all(pool)
-    .await
-    .expect("Failed to query state counts");
-
-    rows.into_iter().collect()
-}
-
-fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
-    counts.get(state).copied().unwrap_or(0)
-}
-
-async fn wait_for_counts(
-    pool: &sqlx::PgPool,
-    queue: &str,
-    predicate: impl Fn(&HashMap<String, i64>) -> bool,
-    timeout: Duration,
-) -> HashMap<String, i64> {
-    let start = Instant::now();
-    loop {
-        let counts = queue_state_counts(pool, queue).await;
-        if predicate(&counts) {
-            return counts;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "Timed out waiting for queue {queue} counts; last counts: {counts:?}"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-}
 
 async fn wait_for_single_leader(clients: &[&Client], timeout: Duration) -> usize {
     let start = Instant::now();

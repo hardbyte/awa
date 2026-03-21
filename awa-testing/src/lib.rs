@@ -2,6 +2,8 @@
 //!
 //! Provides `TestClient` for integration testing of job handlers.
 
+pub mod setup;
+
 use awa_model::{AwaError, JobArgs, JobRow};
 use awa_worker::context::ProgressState;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
