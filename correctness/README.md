@@ -1,6 +1,6 @@
 # Awa Correctness Models
 
-This directory intentionally uses the requested `corectness/` spelling.
+This directory contains TLA+ correctness models for the Awa worker runtime.
 
 It contains small TLA+ models for the coordination protocol behind the worker
 runtime. The goal is to check the concurrency invariants that are easy to miss
@@ -56,15 +56,15 @@ What is intentionally not modeled:
 From the repository root:
 
 ```bash
-./corectness/run-tlc.sh AwaCore.tla
-./corectness/run-tlc.sh AwaExtended.tla
+./correctness/run-tlc.sh AwaCore.tla
+./correctness/run-tlc.sh AwaExtended.tla
 ```
 
 Or directly:
 
 ```bash
-docker build -t awa-tlaplus -f corectness/Dockerfile corectness
-docker run --rm -v "$PWD/corectness:/work" awa-tlaplus \
+docker build -t awa-tlaplus -f correctness/Dockerfile correctness
+docker run --rm -v "$PWD/correctness:/work" awa-tlaplus \
   -config /work/AwaExtended.cfg /work/AwaExtended.tla
 ```
 
