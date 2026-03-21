@@ -62,7 +62,7 @@ impl Worker for RetentionTestWorker {
         "retention_test_job"
     }
 
-    async fn perform(&self, _job: &awa::JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Ok(JobResult::Completed)
     }
 }
