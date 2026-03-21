@@ -249,6 +249,7 @@ dependencies = [
 name = "awa-worker"
 version = "0.3.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "awa-macros",
  "awa-model",

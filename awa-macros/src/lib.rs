@@ -54,7 +54,7 @@ pub fn derive_job_args(input: TokenStream) -> TokenStream {
     // work. We use awa_model directly since it's always available (awa
     // depends on awa_model, and awa_model depends on awa_macros).
     let expanded = quote! {
-        impl awa_model::JobArgs for #name {
+        impl ::awa_model::JobArgs for #name {
             fn kind() -> &'static str {
                 #kind_str
             }

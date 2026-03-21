@@ -331,11 +331,7 @@ async fn test_shutdown_waits_for_inflight_jobs() {
         fn kind(&self) -> &'static str {
             "guard_job"
         }
-        async fn perform(
-            &self,
-            _job: &awa_model::JobRow,
-            _ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
+        async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
             tokio::time::sleep(Duration::from_millis(500)).await;
             self.completed.fetch_add(1, Ordering::SeqCst);
             Ok(JobResult::Completed)
@@ -412,12 +408,8 @@ async fn test_heartbeat_alive_during_drain() {
         fn kind(&self) -> &'static str {
             "guard_job"
         }
-        async fn perform(
-            &self,
-            job: &awa_model::JobRow,
-            _ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
-            let job_id = job.id;
+        async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+            let job_id = ctx.job.id;
             // Sleep long enough that a heartbeat cycle fires (interval is 30s default,
             // but we just need the job to still be running when shutdown starts).
             // The key check: after we return, verify the job was still `running`
@@ -503,11 +495,7 @@ async fn test_deadline_rescue_signals_cancellation() {
         fn kind(&self) -> &'static str {
             "guard_job"
         }
-        async fn perform(
-            &self,
-            _job: &awa_model::JobRow,
-            ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
+        async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
             // Wait for deadline rescue to fire. Deadline is 1s, but maintenance
             // only checks every 30s and leader election can take up to 10s.
             // We poll for up to 50s to cover worst-case timing.

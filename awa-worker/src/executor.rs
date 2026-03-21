@@ -10,6 +10,10 @@ use std::sync::Arc;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
+///
+/// See also [`JobError`] for the error side — notably [`JobError::Retryable`]
+/// provides error-driven retry with database-computed backoff, while
+/// [`JobResult::RetryAfter`] is an explicit retry with caller-specified delay.
 #[derive(Debug)]
 pub enum JobResult {
     /// Job completed successfully.
@@ -26,6 +30,9 @@ pub enum JobResult {
 }
 
 /// Error type for job handlers — any error is retryable unless it's terminal.
+///
+/// [`JobError::Retryable`] triggers retry with database-computed exponential backoff.
+/// For explicit caller-controlled retry delay, return [`Ok(JobResult::RetryAfter)`] instead.
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     /// Retryable error — will be retried if attempts remain.
@@ -74,25 +81,43 @@ impl std::fmt::Display for DisplayError {
 
 impl std::error::Error for DisplayError {}
 
+/// With the `anyhow` feature, `?` works directly in handlers:
+/// ```ignore
+/// async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+///     let data = fallible_thing().await?; // anyhow::Error → JobError::Retryable
+///     Ok(JobResult::Completed)
+/// }
+/// ```
+#[cfg(feature = "anyhow")]
+impl From<anyhow::Error> for JobError {
+    fn from(err: anyhow::Error) -> Self {
+        JobError::retryable_msg(format!("{err:#}"))
+    }
+}
+
 /// Worker trait — implement this for each job type.
 #[async_trait::async_trait]
 pub trait Worker: Send + Sync + 'static {
     /// The kind string for this worker (must match the job's kind).
     fn kind(&self) -> &'static str;
 
-    /// Execute the job. The raw args JSON and context are provided.
-    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError>;
+    /// Execute the job. Access the job row via `ctx.job`.
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError>;
 
     /// Called when a retryable error exhausts all attempts and the job will be
     /// moved to `failed`. Use this for cleanup: updating external state,
     /// sending notifications, releasing resources.
     ///
     /// The default implementation does nothing. The error string is the
-    /// formatted message from the last `JobError::Retryable`.
+    /// formatted message from the last [`JobError::Retryable`].
+    ///
+    /// **Not called for [`JobError::Terminal`]** — terminal errors indicate the
+    /// handler already knows the failure is permanent, so cleanup should be
+    /// done inline before returning the terminal error.
     ///
     /// This runs *before* the state transition — if it panics, the job
     /// still transitions to failed normally.
-    async fn on_exhausted(&self, _job_row: &JobRow, _ctx: &JobContext, _last_error: &str) {}
+    async fn on_exhausted(&self, _ctx: &JobContext, _last_error: &str) {}
 }
 
 /// Type-erased worker wrapper for the registry.
@@ -187,7 +212,7 @@ impl JobExecutor {
             );
 
             let result = match workers.get(&job.kind) {
-                Some(worker) => worker.perform(&job, &ctx).await,
+                Some(worker) => worker.perform(&ctx).await,
                 None => {
                     error!(kind = %job.kind, job_id, "No worker registered for job kind");
                     Err(JobError::Terminal(format!(
@@ -545,7 +570,7 @@ async fn complete_job(
             if job.attempt >= job.max_attempts {
                 // Call on_exhausted hook before transitioning to failed
                 if let Some(w) = worker {
-                    w.on_exhausted(job, ctx, &error_msg).await;
+                    w.on_exhausted(ctx, &error_msg).await;
                 }
 
                 tracing::Span::current().record("otel.status_code", "ERROR");

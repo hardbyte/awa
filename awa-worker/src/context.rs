@@ -130,12 +130,12 @@ impl JobContext {
         Ok(CallbackToken { id: callback_id })
     }
 
-    /// Set structured progress (0-100, optional message). Sync — writes to in-memory buffer.
+    /// Set structured progress (0-100 with message). Sync — writes to in-memory buffer.
     ///
-    /// `percent` is clamped to 0-100.
-    pub fn set_progress(&self, percent: u8, message: Option<&str>) {
+    /// `percent` is clamped to 0-100. For progress without a message, pass `""`.
+    pub fn set_progress(&self, percent: u8, message: &str) {
         let mut guard = self.progress.lock().expect("progress lock poisoned");
-        guard.set_progress(percent, message);
+        guard.set_progress(percent, Some(message));
     }
 
     /// Shallow-merge keys into progress.metadata for checkpointing. Sync.

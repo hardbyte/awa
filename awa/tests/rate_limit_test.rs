@@ -52,11 +52,7 @@ impl awa::Worker for RateLimitWorker {
     fn kind(&self) -> &'static str {
         "rate_limit_job"
     }
-    async fn perform(
-        &self,
-        _job: &awa_model::JobRow,
-        _ctx: &JobContext,
-    ) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         self.completed_count.fetch_add(1, Ordering::SeqCst);
         Ok(JobResult::Completed)
     }

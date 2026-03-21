@@ -5,15 +5,13 @@
 
 use async_trait::async_trait;
 use awa::model::{insert_with, migrations, InsertOpts};
-use awa::{Client, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker};
-use awa_testing::setup::{
-    clean_queue, database_url, database_url_with_app_name, pool as pool_with, pool_with_url, setup,
-    state_count, wait_for_counts,
-};
+use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use chrono::{Duration as ChronoDuration, Utc};
 use opentelemetry_sdk::metrics::data::Sum;
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -21,6 +19,96 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::mpsc;
 use uuid::Uuid;
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
+
+fn database_url_with_app_name(app_name: &str) -> String {
+    let mut url = database_url();
+    let sep = if url.contains('?') { '&' } else { '?' };
+    url.push(sep);
+    url.push_str("application_name=");
+    url.push_str(app_name);
+    url
+}
+
+async fn pool_with(max_conns: u32) -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_conns)
+        .connect(&database_url())
+        .await
+        .expect("Failed to connect to database")
+}
+
+async fn pool_with_url(database_url: &str, max_conns: u32) -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .max_connections(max_conns)
+        .connect(database_url)
+        .await
+        .expect("Failed to connect to database")
+}
+
+async fn setup(max_conns: u32) -> sqlx::PgPool {
+    let pool = pool_with(max_conns).await;
+    migrations::run(&pool).await.expect("Failed to migrate");
+    pool
+}
+
+async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
+    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue jobs");
+    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue meta");
+}
+
+async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT state::text, count(*)::bigint
+        FROM awa.jobs
+        WHERE queue = $1
+        GROUP BY state
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("Failed to query state counts");
+
+    rows.into_iter().collect()
+}
+
+fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
+    counts.get(state).copied().unwrap_or(0)
+}
+
+async fn wait_for_counts(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    predicate: impl Fn(&HashMap<String, i64>) -> bool,
+    timeout: Duration,
+) -> HashMap<String, i64> {
+    let start = Instant::now();
+    loop {
+        let counts = queue_state_counts(pool, queue).await;
+        if predicate(&counts) {
+            return counts;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "Timed out waiting for queue {queue} counts; last counts: {counts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
 
 async fn wait_for_single_leader(clients: &[&Client], timeout: Duration) -> usize {
     let start = Instant::now();
@@ -333,7 +421,7 @@ impl Worker for CompleteWorker {
         "simple_chaos_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Ok(JobResult::Completed)
     }
 }
@@ -346,14 +434,14 @@ impl Worker for MixedChaosWorker {
         "chaos_job"
     }
 
-    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let args: ChaosJob = serde_json::from_value(job_row.args.clone())
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: ChaosJob = serde_json::from_value(ctx.job.args.clone())
             .map_err(|err| JobError::terminal(format!("failed to decode chaos args: {err}")))?;
 
         match args.mode.as_str() {
             "complete" => Ok(JobResult::Completed),
             "retry_once" => {
-                if job_row.attempt == 1 {
+                if ctx.job.attempt == 1 {
                     Ok(JobResult::RetryAfter(Duration::from_millis(100)))
                 } else {
                     Ok(JobResult::Completed)
@@ -361,7 +449,7 @@ impl Worker for MixedChaosWorker {
             }
             "terminal_fail" => Err(JobError::terminal("intentional chaos failure")),
             "callback_timeout" => {
-                if job_row.attempt == 1 {
+                if ctx.job.attempt == 1 {
                     ctx.register_callback(Duration::from_millis(150))
                         .await
                         .map_err(JobError::retryable)?;
@@ -371,7 +459,7 @@ impl Worker for MixedChaosWorker {
                 }
             }
             "deadline_hang" => {
-                if job_row.attempt == 1 {
+                if ctx.job.attempt == 1 {
                     sqlx::query(
                         r#"
                         UPDATE awa.jobs
@@ -379,9 +467,9 @@ impl Worker for MixedChaosWorker {
                         WHERE id = $1 AND run_lease = $3
                         "#,
                     )
-                    .bind(job_row.id)
+                    .bind(ctx.job.id)
                     .bind(0.15_f64)
-                    .bind(job_row.run_lease)
+                    .bind(ctx.job.run_lease)
                     .execute(ctx.pool())
                     .await
                     .map_err(JobError::retryable)?;
@@ -417,13 +505,14 @@ impl Worker for CallbackTimeoutWorker {
         "simple_chaos_job"
     }
 
-    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        if job_row.attempt == 1 {
-            // Register with a very long timeout so the leader's rescue cycle
-            // can never expire these callbacks naturally. The test manually
-            // backdates callback_timeout_at after killing the leader, making
-            // the scenario fully deterministic (no timing race).
-            ctx.register_callback(Duration::from_secs(3600))
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if ctx.job.attempt == 1 {
+            // Use a long callback timeout (30s) so that callbacks only expire
+            // AFTER the test has killed the leader. A short timeout (e.g. 500ms)
+            // races with the leader's own rescue cycle — the leader can rescue
+            // and re-execute all jobs before the test observes them in
+            // waiting_external, causing a flake.
+            ctx.register_callback(Duration::from_secs(30))
                 .await
                 .map_err(JobError::retryable)?;
             Ok(JobResult::WaitForCallback)
@@ -443,8 +532,8 @@ impl Worker for MixedFleetRustWorker {
         "chaos_probe"
     }
 
-    async fn perform(&self, job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
-        let args: ChaosProbe = serde_json::from_value(job_row.args.clone()).map_err(|err| {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: ChaosProbe = serde_json::from_value(ctx.job.args.clone()).map_err(|err| {
             JobError::terminal(format!("failed to decode mixed fleet args: {err}"))
         })?;
         tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1019,20 +1108,6 @@ async fn test_leader_failover_rescues_callback_timeouts() {
         follower_idx, 0,
         "Follower never became leader after failover"
     );
-
-    // Backdate callback_timeout_at so the follower's rescue cycle picks them up.
-    // The callbacks were registered with a very long timeout (1h) to avoid a
-    // timing race where the original leader rescues them before we kill it.
-    // Now that the leader is dead and the follower has taken over, we expire
-    // the callbacks by moving their timeout into the past.
-    sqlx::query(
-        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
-         WHERE queue = $1 AND state = 'waiting_external'",
-    )
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate callback_timeout_at");
 
     let counts = wait_for_counts(
         &pool,

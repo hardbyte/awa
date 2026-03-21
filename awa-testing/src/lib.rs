@@ -113,7 +113,7 @@ impl TestClient {
             progress.clone(),
         );
 
-        let result = worker.perform(&job, &ctx).await;
+        let result = worker.perform(&ctx).await;
 
         // Snapshot progress from the buffer after handler execution
         let progress_snapshot: Option<serde_json::Value> = {

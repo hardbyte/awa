@@ -9,6 +9,7 @@ readme.workspace = true
 
 [features]
 cel = ["awa-model/cel"]
+anyhow = ["awa-worker/anyhow"]
 
 [dependencies]
 awa-model.workspace = true

@@ -9,6 +9,7 @@ readme = "README.md"
 
 [features]
 cel = ["awa-model/cel"]
+anyhow = ["dep:anyhow"]
 
 [dependencies]
 awa-model.workspace = true
@@ -26,6 +27,7 @@ croner.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 opentelemetry.workspace = true
+anyhow = { version = "1", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

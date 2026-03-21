@@ -11,19 +11,24 @@
 //! See docs/test-plan.md for local setup instructions.
 
 use async_trait::async_trait;
-use awa::model::{insert_with, InsertOpts};
-use awa::{Client, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker};
-use awa_testing::setup::{clean_queue, setup};
+use awa::model::{insert_with, migrations, InsertOpts};
+use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use opentelemetry::global;
 use opentelemetry_otlp::WithExportConfig;
 use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
+use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL")
+        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
 
 fn otlp_endpoint() -> String {
     std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
@@ -32,6 +37,29 @@ fn otlp_endpoint() -> String {
 
 fn prometheus_url() -> String {
     std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://localhost:9090".to_string())
+}
+
+async fn setup_pool() -> sqlx::PgPool {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&database_url())
+        .await
+        .expect("Failed to connect to database");
+    migrations::run(&pool).await.expect("Failed to migrate");
+    pool
+}
+
+async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
+    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue jobs");
+    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue meta");
 }
 
 // ── Job type ─────────────────────────────────────────────────────────
@@ -54,22 +82,22 @@ impl Worker for FailureModeWorker {
         "failure_mode_telemetry_job"
     }
 
-    async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let args: FailureModeTelemetryJob =
-            serde_json::from_value(job_row.args.clone()).map_err(JobError::retryable)?;
+            serde_json::from_value(ctx.job.args.clone()).map_err(JobError::retryable)?;
 
         match args.mode.as_str() {
             "complete" => Ok(JobResult::Completed),
             "terminal_fail" => Err(JobError::terminal("intentional telemetry test failure")),
             "retry_once" => {
-                if job_row.attempt == 1 {
+                if ctx.job.attempt == 1 {
                     Ok(JobResult::RetryAfter(Duration::from_millis(100)))
                 } else {
                     Ok(JobResult::Completed)
                 }
             }
             "callback_timeout" => {
-                if job_row.attempt == 1 {
+                if ctx.job.attempt == 1 {
                     ctx.register_callback(Duration::from_millis(200))
                         .await
                         .map_err(JobError::retryable)?;
@@ -99,7 +127,7 @@ fn build_otlp_meter_provider(endpoint: &str, service_name: &str) -> SdkMeterProv
         .build();
 
     let resource = Resource::builder()
-        .with_service_name(service_name.to_string())
+        .with_service_name(service_name.to_owned())
         .build();
 
     SdkMeterProvider::builder()
@@ -226,7 +254,7 @@ async fn wait_for_metric(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_otlp_metrics_reach_prometheus() {
-    let pool = setup(5).await;
+    let pool = setup_pool().await;
     let queue = "telemetry_otlp_test";
     clean_queue(&pool, queue).await;
 
@@ -372,7 +400,7 @@ async fn test_otlp_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_failure_path_metrics_reach_prometheus() {
-    let pool = setup(5).await;
+    let pool = setup_pool().await;
     let queue = "telemetry_failure_path";
     clean_queue(&pool, queue).await;
 
@@ -404,7 +432,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
         .expect("Failed to start failure-path client");
 
     // 3. Insert jobs across failure modes.
-    let modes: [(&str, i32, i16); 4] = [
+    let modes = [
         ("complete", 3, 3),         // 3 jobs, max_attempts 3
         ("terminal_fail", 2, 1),    // 2 jobs, max_attempts 1 → immediate terminal
         ("callback_timeout", 2, 3), // 2 jobs, max_attempts 3 → callback rescue then complete
@@ -444,20 +472,14 @@ async fn test_failure_path_metrics_reach_prometheus() {
     tokio::time::sleep(Duration::from_secs(3)).await;
 
     // 6. Query Prometheus for failure-path metrics.
-    // OTel metric names are translated: dots → underscores, counter → _total,
-    // unit "s" → _seconds. Annotation units like {job} are dropped.
     let http = reqwest::Client::new();
     let timeout = Duration::from_secs(60);
 
     eprintln!("Querying Prometheus for failure-path metrics...");
 
-    // Use PromQL label filters scoped to this test's queue to avoid
-    // cross-contamination from other tests sharing the same Prometheus.
-    let q = queue;
-
     let completed = wait_for_metric(
         &http,
-        &format!(r#"sum(awa_job_completed_total{{awa_job_queue="{q}"}})"#),
+        "awa_job_completed_total",
         expected_completed as f64,
         timeout,
     )
@@ -466,43 +488,24 @@ async fn test_failure_path_metrics_reach_prometheus() {
 
     let failed = wait_for_metric(
         &http,
-        &format!(r#"sum(awa_job_failed_total{{awa_job_queue="{q}"}})"#),
+        "awa_job_failed_total",
         expected_failed as f64,
         timeout,
     )
     .await;
     eprintln!("  awa_job_failed_total = {failed}");
 
-    let retried = wait_for_metric(
-        &http,
-        &format!(r#"sum(awa_job_retried_total{{awa_job_queue="{q}"}})"#),
-        2.0,
-        timeout,
-    )
-    .await;
+    let retried = wait_for_metric(&http, "awa_job_retried_total", 2.0, timeout).await;
     eprintln!("  awa_job_retried_total = {retried}");
 
-    // maintenance.rescues has awa_rescue_kind attribute, not awa_job_queue.
-    // Only this test generates rescues, so no filtering needed.
     let rescues = wait_for_metric(&http, "awa_maintenance_rescues_total", 2.0, timeout).await;
     eprintln!("  awa_maintenance_rescues_total = {rescues}");
 
-    let claimed = wait_for_metric(
-        &http,
-        &format!(r#"sum(awa_job_claimed_total{{awa_job_queue="{q}"}})"#),
-        9.0,
-        timeout,
-    )
-    .await;
+    let claimed = wait_for_metric(&http, "awa_job_claimed_total", 9.0, timeout).await;
     eprintln!("  awa_job_claimed_total = {claimed}");
 
-    let duration_count = wait_for_metric(
-        &http,
-        &format!(r#"sum(awa_job_duration_seconds_count{{awa_job_queue="{q}"}})"#),
-        5.0,
-        timeout,
-    )
-    .await;
+    let duration_count =
+        wait_for_metric(&http, "awa_job_duration_seconds_count", 5.0, timeout).await;
     eprintln!("  awa_job_duration_seconds_count = {duration_count}");
 
     assert!(completed >= expected_completed as f64);
@@ -527,7 +530,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_collector_death_does_not_block_job_processing() {
-    let pool = setup(5).await;
+    let pool = setup_pool().await;
     let queue = "telemetry_collector_death";
     clean_queue(&pool, queue).await;
 
@@ -589,11 +592,11 @@ async fn test_collector_death_does_not_block_job_processing() {
         .expect("Failed to flush meter provider");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // Verify the pipeline was live by checking Prometheus (filter by this test's queue).
+    // Verify the pipeline was live by checking Prometheus.
     let http = reqwest::Client::new();
     let completed = wait_for_metric(
         &http,
-        &format!(r#"sum(awa_job_completed_total{{awa_job_queue="{queue}"}})"#),
+        "awa_job_completed_total",
         1.0,
         Duration::from_secs(30),
     )

@@ -8,9 +8,7 @@
 //!   - <50ms median pickup latency (LISTEN/NOTIFY enabled)
 
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations};
-use awa::{
-    Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker,
-};
+use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::time::{Duration, Instant};
@@ -64,7 +62,7 @@ impl Worker for BenchWorker {
         "bench_job"
     }
 
-    async fn perform(&self, _job_row: &JobRow, _ctx: &JobContext) -> Result<JobResult, JobError> {
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Ok(JobResult::Completed)
     }
 }
@@ -222,11 +220,7 @@ async fn test_pickup_latency_listen_notify() {
             "bench_job"
         }
 
-        async fn perform(
-            &self,
-            _job_row: &JobRow,
-            _ctx: &JobContext,
-        ) -> Result<JobResult, JobError> {
+        async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
             let _ = self.tx.send(Instant::now());
             Ok(JobResult::Completed)
         }
