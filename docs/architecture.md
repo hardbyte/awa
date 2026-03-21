@@ -440,28 +440,28 @@ The `job.execute` span records `otel.status_code = "OK"` on success or `"ERROR"`
 
 The `AwaMetrics` struct (in `awa-worker/src/metrics.rs`) publishes OTel metrics via the global meter provider. Callers configure their exporter (Prometheus, OTLP, etc.) before starting the client.
 
-| Metric | Type | Description |
-|---|---|---|
-| `awa.jobs.inserted` | Counter | Total jobs inserted |
-| `awa.jobs.completed` | Counter | Total jobs completed successfully |
-| `awa.jobs.failed` | Counter | Total jobs that failed terminally |
-| `awa.jobs.retried` | Counter | Total jobs marked retryable |
-| `awa.jobs.cancelled` | Counter | Total jobs cancelled |
-| `awa.jobs.claimed` | Counter | Total jobs claimed for execution |
-| `awa.jobs.waiting_external` | Counter | Total jobs parked for external callback |
-| `awa.jobs.duration` | Histogram | Job execution duration in seconds |
-| `awa.jobs.in_flight` | UpDownCounter | Current in-flight jobs |
-| `awa.dispatch.claim_batches` | Counter | Total dispatcher claim queries |
-| `awa.dispatch.claim_batch_size` | Histogram | Dispatcher claim batch size in jobs |
-| `awa.dispatch.claim_duration` | Histogram | Dispatcher claim query duration (seconds) |
-| `awa.completion.flushes` | Counter | Total completion batch flushes |
-| `awa.completion.flush_batch_size` | Histogram | Completion flush batch size in jobs |
-| `awa.completion.flush_duration` | Histogram | Completion flush duration (seconds) |
-| `awa.maintenance.promote_batches` | Counter | Total promotion batches |
-| `awa.maintenance.promote_batch_size` | Histogram | Promotion batch size in jobs |
-| `awa.maintenance.promote_duration` | Histogram | Promotion batch duration (seconds) |
-| `awa.heartbeat.batches` | Counter | Total heartbeat batch updates |
-| `awa.maintenance.rescues` | Counter | Total jobs rescued by maintenance |
+| Metric | Type | Unit | Description |
+|---|---|---|---|
+| `awa.job.inserted` | Counter | `{job}` | Number of jobs inserted |
+| `awa.job.completed` | Counter | `{job}` | Number of jobs completed successfully |
+| `awa.job.failed` | Counter | `{job}` | Number of jobs that failed terminally |
+| `awa.job.retried` | Counter | `{job}` | Number of jobs marked retryable |
+| `awa.job.cancelled` | Counter | `{job}` | Number of jobs cancelled |
+| `awa.job.claimed` | Counter | `{job}` | Number of jobs claimed for execution |
+| `awa.job.waiting_external` | Counter | `{job}` | Number of jobs parked for external callback |
+| `awa.job.duration` | Histogram | `s` | Job execution duration |
+| `awa.job.in_flight` | UpDownCounter | `{job}` | Current in-flight jobs |
+| `awa.dispatch.claim_batches` | Counter | `{batch}` | Number of dispatcher claim queries |
+| `awa.dispatch.claim_batch_size` | Histogram | `{job}` | Dispatcher claim batch size |
+| `awa.dispatch.claim_duration` | Histogram | `s` | Dispatcher claim query duration |
+| `awa.completion.flushes` | Counter | `{batch}` | Number of completion batch flushes |
+| `awa.completion.flush_batch_size` | Histogram | `{job}` | Completion flush batch size |
+| `awa.completion.flush_duration` | Histogram | `s` | Completion flush duration |
+| `awa.maintenance.promote_batches` | Counter | `{batch}` | Number of promotion batches |
+| `awa.maintenance.promote_batch_size` | Histogram | `{job}` | Promotion batch size |
+| `awa.maintenance.promote_duration` | Histogram | `s` | Promotion batch duration |
+| `awa.heartbeat.batches` | Counter | `{batch}` | Number of heartbeat batch updates |
+| `awa.maintenance.rescues` | Counter | `{job}` | Number of jobs rescued by maintenance |
 
 Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch metrics carry `awa.job.queue`. Completion metrics carry `awa.completion.shard`. Promotion metrics carry `awa.job.state`.
 

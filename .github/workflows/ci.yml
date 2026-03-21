@@ -278,3 +278,53 @@ jobs:
           sleep 2
           curl -sf http://127.0.0.1:3000/api/stats
           kill $SERVER_PID
+
+  # ─── Telemetry validation ─────────────────────────────────────
+  telemetry-validation:
+    name: Telemetry OTLP validation
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      otel-lgtm:
+        image: grafana/otel-lgtm:0.22.0
+        ports:
+          - 4317:4317
+          - 4318:4318
+          - 9090:9090
+        options: >-
+          --health-cmd "cat /tmp/ready"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 12
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Wait for OTLP collector
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9090/api/v1/status/runtimeinfo && break
+            echo "Waiting for Prometheus... ($i)"
+            sleep 2
+          done
+      - name: Run telemetry integration test
+        run: cargo test -p awa --test telemetry_test -- --ignored --nocapture
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+          OTEL_EXPORTER_OTLP_ENDPOINT: http://localhost:4317
+          PROMETHEUS_URL: http://localhost:9090

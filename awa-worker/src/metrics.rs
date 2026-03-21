@@ -4,7 +4,11 @@
 //! Metrics are published via the global OTel meter provider — callers
 //! configure their exporter (Prometheus, OTLP, etc.) before starting the client.
 //!
-//! All metrics use the `awa` meter name and follow OTel semantic conventions.
+//! All metrics use the `awa` meter name and follow OTel semantic conventions:
+//! - Dot-separated hierarchical namespaces (`awa.job.*`, `awa.dispatch.*`)
+//! - Singular nouns for namespaces (not pluralized)
+//! - Units declared via `.with_unit()` using UCUM notation
+//! - No unit suffix in metric names (exporters append automatically)
 
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
 use std::time::Duration;
@@ -26,25 +30,25 @@ pub struct AwaMetrics {
     pub jobs_claimed: Counter<u64>,
     /// Number of dispatcher claim queries executed.
     pub claim_batches: Counter<u64>,
-    /// Claim batch size in jobs.
+    /// Claim batch size distribution.
     pub claim_batch_size: Histogram<u64>,
-    /// Claim query latency in seconds.
+    /// Claim query duration.
     pub claim_duration_seconds: Histogram<f64>,
-    /// Job execution duration in seconds.
+    /// Job execution duration.
     pub job_duration_seconds: Histogram<f64>,
     /// Number of completion batch flushes executed.
     pub completion_flushes: Counter<u64>,
-    /// Completion flush batch size in jobs.
+    /// Completion flush batch size distribution.
     pub completion_flush_batch_size: Histogram<u64>,
-    /// Completion flush latency in seconds.
+    /// Completion flush duration.
     pub completion_flush_duration_seconds: Histogram<f64>,
     /// Number of scheduled/retryable promotion batches executed.
     pub promotion_batches: Counter<u64>,
-    /// Promotion batch size in jobs.
+    /// Promotion batch size distribution.
     pub promotion_batch_size: Histogram<u64>,
-    /// Promotion query latency in seconds.
+    /// Promotion query duration.
     pub promotion_duration_seconds: Histogram<f64>,
-    /// Current in-flight jobs (gauge — can go up and down).
+    /// Current in-flight jobs (can go up and down).
     pub jobs_in_flight: UpDownCounter<i64>,
     /// Total heartbeat batches sent.
     pub heartbeat_batches: Counter<u64>,
@@ -59,88 +63,104 @@ impl AwaMetrics {
     pub fn new(meter: &Meter) -> Self {
         Self {
             jobs_inserted: meter
-                .u64_counter("awa.jobs.inserted")
-                .with_description("Total jobs inserted")
+                .u64_counter("awa.job.inserted")
+                .with_description("Number of jobs inserted")
+                .with_unit("{job}")
                 .build(),
             jobs_completed: meter
-                .u64_counter("awa.jobs.completed")
-                .with_description("Total jobs completed successfully")
+                .u64_counter("awa.job.completed")
+                .with_description("Number of jobs completed successfully")
+                .with_unit("{job}")
                 .build(),
             jobs_failed: meter
-                .u64_counter("awa.jobs.failed")
-                .with_description("Total jobs that failed terminally")
+                .u64_counter("awa.job.failed")
+                .with_description("Number of jobs that failed terminally")
+                .with_unit("{job}")
                 .build(),
             jobs_retried: meter
-                .u64_counter("awa.jobs.retried")
-                .with_description("Total jobs marked retryable")
+                .u64_counter("awa.job.retried")
+                .with_description("Number of jobs marked retryable")
+                .with_unit("{job}")
                 .build(),
             jobs_cancelled: meter
-                .u64_counter("awa.jobs.cancelled")
-                .with_description("Total jobs cancelled")
+                .u64_counter("awa.job.cancelled")
+                .with_description("Number of jobs cancelled")
+                .with_unit("{job}")
                 .build(),
             jobs_claimed: meter
-                .u64_counter("awa.jobs.claimed")
-                .with_description("Total jobs claimed for execution")
+                .u64_counter("awa.job.claimed")
+                .with_description("Number of jobs claimed for execution")
+                .with_unit("{job}")
                 .build(),
             claim_batches: meter
                 .u64_counter("awa.dispatch.claim_batches")
-                .with_description("Total dispatcher claim queries executed")
+                .with_description("Number of dispatcher claim queries executed")
+                .with_unit("{batch}")
                 .build(),
             claim_batch_size: meter
                 .u64_histogram("awa.dispatch.claim_batch_size")
-                .with_description("Dispatcher claim batch size in jobs")
+                .with_description("Dispatcher claim batch size")
+                .with_unit("{job}")
                 .build(),
             claim_duration_seconds: meter
                 .f64_histogram("awa.dispatch.claim_duration")
-                .with_description("Dispatcher claim query duration in seconds")
+                .with_description("Dispatcher claim query duration")
                 .with_unit("s")
                 .build(),
             job_duration_seconds: meter
-                .f64_histogram("awa.jobs.duration")
-                .with_description("Job execution duration in seconds")
+                .f64_histogram("awa.job.duration")
+                .with_description("Job execution duration")
                 .with_unit("s")
                 .build(),
             completion_flushes: meter
                 .u64_counter("awa.completion.flushes")
-                .with_description("Total completion batch flushes")
+                .with_description("Number of completion batch flushes")
+                .with_unit("{batch}")
                 .build(),
             completion_flush_batch_size: meter
                 .u64_histogram("awa.completion.flush_batch_size")
-                .with_description("Completion batch flush size in jobs")
+                .with_description("Completion batch flush size")
+                .with_unit("{job}")
                 .build(),
             completion_flush_duration_seconds: meter
                 .f64_histogram("awa.completion.flush_duration")
-                .with_description("Completion batch flush duration in seconds")
+                .with_description("Completion batch flush duration")
                 .with_unit("s")
                 .build(),
             promotion_batches: meter
                 .u64_counter("awa.maintenance.promote_batches")
-                .with_description("Total scheduled/retryable promotion batches")
+                .with_description("Number of scheduled/retryable promotion batches")
+                .with_unit("{batch}")
                 .build(),
             promotion_batch_size: meter
                 .u64_histogram("awa.maintenance.promote_batch_size")
-                .with_description("Promotion batch size in jobs")
+                .with_description("Promotion batch size")
+                .with_unit("{job}")
                 .build(),
             promotion_duration_seconds: meter
                 .f64_histogram("awa.maintenance.promote_duration")
-                .with_description("Promotion batch duration in seconds")
+                .with_description("Promotion batch duration")
                 .with_unit("s")
                 .build(),
             jobs_in_flight: meter
-                .i64_up_down_counter("awa.jobs.in_flight")
+                .i64_up_down_counter("awa.job.in_flight")
                 .with_description("Current number of in-flight jobs")
+                .with_unit("{job}")
                 .build(),
             heartbeat_batches: meter
                 .u64_counter("awa.heartbeat.batches")
-                .with_description("Total heartbeat batch updates sent")
+                .with_description("Number of heartbeat batch updates sent")
+                .with_unit("{batch}")
                 .build(),
             maintenance_rescues: meter
                 .u64_counter("awa.maintenance.rescues")
-                .with_description("Total jobs rescued by maintenance (stale heartbeat + deadline)")
+                .with_description("Number of jobs rescued by maintenance")
+                .with_unit("{job}")
                 .build(),
             jobs_waiting_external: meter
-                .u64_counter("awa.jobs.waiting_external")
-                .with_description("Total jobs parked for external callback")
+                .u64_counter("awa.job.waiting_external")
+                .with_description("Number of jobs parked for external callback")
+                .with_unit("{job}")
                 .build(),
         }
     }
