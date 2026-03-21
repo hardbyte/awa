@@ -419,7 +419,11 @@ impl Worker for CallbackTimeoutWorker {
 
     async fn perform(&self, job_row: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
         if job_row.attempt == 1 {
-            ctx.register_callback(Duration::from_millis(500))
+            // Register with a very long timeout so the leader's rescue cycle
+            // can never expire these callbacks naturally. The test manually
+            // backdates callback_timeout_at after killing the leader, making
+            // the scenario fully deterministic (no timing race).
+            ctx.register_callback(Duration::from_secs(3600))
                 .await
                 .map_err(JobError::retryable)?;
             Ok(JobResult::WaitForCallback)
@@ -1015,6 +1019,20 @@ async fn test_leader_failover_rescues_callback_timeouts() {
         follower_idx, 0,
         "Follower never became leader after failover"
     );
+
+    // Backdate callback_timeout_at so the follower's rescue cycle picks them up.
+    // The callbacks were registered with a very long timeout (1h) to avoid a
+    // timing race where the original leader rescues them before we kill it.
+    // Now that the leader is dead and the follower has taken over, we expire
+    // the callbacks by moving their timeout into the past.
+    sqlx::query(
+        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'waiting_external'",
+    )
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate callback_timeout_at");
 
     let counts = wait_for_counts(
         &pool,
