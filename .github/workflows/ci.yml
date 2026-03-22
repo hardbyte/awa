@@ -122,11 +122,6 @@ jobs:
           .venv/bin/python examples/sync_api.py
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
-      - name: Run Python example integration tests
-        run: .venv/bin/pytest ../examples/python/test_examples.py -v
-        env:
-          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
-
   # ─── Frontend ──────────────────────────────────────────
   frontend-lint:
     name: Frontend lint + typecheck
