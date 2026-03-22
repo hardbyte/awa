@@ -224,6 +224,10 @@ export function DashboardPage() {
             </Table>
           ) : runtimeQuery.isLoading ? (
             <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
+          ) : runtimeQuery.isError ? (
+            <p className="py-4 text-sm text-danger">
+              Failed to load runtime data.
+            </p>
           ) : (
             <p className="py-4 text-sm text-muted-fg">
               No runtime snapshots yet. Start a worker to populate this view.

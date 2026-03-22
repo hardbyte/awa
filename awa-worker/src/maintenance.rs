@@ -256,6 +256,7 @@ impl MaintenanceService {
                     }
                     _ = cleanup_timer.tick() => {
                         self.cleanup_completed().await;
+                        self.cleanup_stale_runtime_snapshots().await;
                     }
                     _ = cron_sync_timer.tick() => {
                         self.sync_periodic_jobs_to_db().await;
@@ -855,4 +856,18 @@ fn compute_fire_time(
     }
 
     latest_fire
+}
+
+impl MaintenanceService {
+    /// Clean up runtime snapshots older than 24 hours.
+    /// Runs as part of the leader's cleanup cycle (not on every snapshot publish).
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup_runtime_snapshots")]
+    async fn cleanup_stale_runtime_snapshots(&self) {
+        if let Err(err) =
+            awa_model::admin::cleanup_runtime_snapshots(&self.pool, chrono::Duration::hours(24))
+                .await
+        {
+            tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
+        }
+    }
 }

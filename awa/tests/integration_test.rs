@@ -555,6 +555,12 @@ async fn test_admin_runtime_observability_snapshot() {
     let queue = "integ_runtime_observability";
     clean_queue(client.pool(), queue).await;
 
+    // Clean any stale runtime snapshots from previous test runs
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(client.pool())
+        .await
+        .expect("Failed to clean runtime_instances");
+
     let runtime = Client::builder(client.pool().clone())
         .queue(
             queue,

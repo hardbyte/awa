@@ -864,12 +864,6 @@ impl RuntimeReporterState {
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
-            return;
-        }
-        if let Err(err) =
-            admin::cleanup_runtime_snapshots(&self.pool, chrono::Duration::hours(24)).await
-        {
-            warn!(error = %err, "Failed to clean up stale runtime snapshots");
         }
     }
 
