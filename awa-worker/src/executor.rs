@@ -96,6 +96,26 @@ impl From<anyhow::Error> for JobError {
 }
 
 /// Worker trait — implement this for each job type.
+///
+/// # Handling permanent failure
+///
+/// When all retry attempts are exhausted, awa moves the job to `failed`.
+/// To run cleanup logic (update external state, send notifications), check
+/// the attempt count inside `perform`:
+///
+/// ```ignore
+/// async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+///     match do_work(ctx).await {
+///         Ok(()) => Ok(JobResult::Completed),
+///         Err(err) if ctx.job.attempt >= ctx.job.max_attempts => {
+///             // Last attempt — run cleanup before awa marks as failed
+///             mark_permanently_failed(ctx.job.id).await;
+///             Err(JobError::retryable(err))
+///         }
+///         Err(err) => Err(JobError::retryable(err)),
+///     }
+/// }
+/// ```
 #[async_trait::async_trait]
 pub trait Worker: Send + Sync + 'static {
     /// The kind string for this worker (must match the job's kind).
@@ -103,21 +123,6 @@ pub trait Worker: Send + Sync + 'static {
 
     /// Execute the job. Access the job row via `ctx.job`.
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError>;
-
-    /// Called when a retryable error exhausts all attempts and the job will be
-    /// moved to `failed`. Use this for cleanup: updating external state,
-    /// sending notifications, releasing resources.
-    ///
-    /// The default implementation does nothing. The error string is the
-    /// formatted message from the last [`JobError::Retryable`].
-    ///
-    /// **Not called for [`JobError::Terminal`]** — terminal errors indicate the
-    /// handler already knows the failure is permanent, so cleanup should be
-    /// done inline before returning the terminal error.
-    ///
-    /// This runs *before* the state transition — if it panics, the job
-    /// still transitions to failed normally.
-    async fn on_exhausted(&self, _ctx: &JobContext, _last_error: &str) {}
 }
 
 /// Type-erased worker wrapper for the registry.
@@ -232,18 +237,7 @@ impl JobExecutor {
 
             // Complete the job based on the result, then record metrics
             // only if the state transition actually happened (not stale).
-            let worker_ref = workers.get(&job.kind);
-            match complete_job(
-                &pool,
-                &job,
-                &result,
-                &completion_batcher,
-                progress_snapshot,
-                worker_ref,
-                &ctx,
-            )
-            .await
-            {
+            match complete_job(&pool, &job, &result, &completion_batcher, progress_snapshot).await {
                 Ok(true) => {
                     // State transition succeeded — record metrics
                     match &result {
@@ -315,8 +309,6 @@ async fn complete_job(
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
     progress_snapshot: Option<serde_json::Value>,
-    worker: Option<&BoxedWorker>,
-    ctx: &JobContext,
 ) -> Result<bool, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
@@ -568,11 +560,6 @@ async fn complete_job(
         Err(JobError::Retryable(err)) => {
             let error_msg = err.to_string();
             if job.attempt >= job.max_attempts {
-                // Call on_exhausted hook before transitioning to failed
-                if let Some(w) = worker {
-                    w.on_exhausted(ctx, &error_msg).await;
-                }
-
                 tracing::Span::current().record("otel.status_code", "ERROR");
                 error!(
                     job_id = job.id,
