@@ -17,9 +17,7 @@
 //!   DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
 //!   cargo run -p awa --example etl_pipeline
 
-use awa::{
-    Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, QueueConfig, Worker,
-};
+use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
@@ -48,13 +46,15 @@ impl Worker for ImportWorker {
         "import_table"
     }
 
-    async fn perform(&self, job: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let table: &str = job
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let table: &str = ctx
+            .job
             .args
             .get("source_table")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
-        let batch_size = job
+        let batch_size = ctx
+            .job
             .args
             .get("batch_size")
             .and_then(|v| v.as_u64())
@@ -68,7 +68,8 @@ impl Worker for ImportWorker {
         };
 
         // Resume from checkpoint — progress metadata survives retries
-        let checkpoint = job
+        let checkpoint = ctx
+            .job
             .progress
             .as_ref()
             .and_then(|p| p.get("metadata").cloned());
@@ -93,10 +94,7 @@ impl Worker for ImportWorker {
             offset = batch_end;
 
             let pct = (100 * rows_imported / total).min(100) as u8;
-            ctx.set_progress(
-                pct,
-                Some(&format!("Importing {table}: {rows_imported}/{total}")),
-            );
+            ctx.set_progress(pct, &format!("Importing {table}: {rows_imported}/{total}"));
             ctx.update_metadata(serde_json::json!({
                 "last_offset": offset,
                 "rows_imported": rows_imported,
@@ -105,7 +103,7 @@ impl Worker for ImportWorker {
             .map_err(|e| JobError::terminal(e.to_string()))?;
 
             // Flush periodically so progress is visible in the UI
-            if offset % (batch_size * 5) == 0 {
+            if offset.is_multiple_of(batch_size * 5) {
                 ctx.flush_progress().await.map_err(JobError::retryable)?;
             }
 
@@ -125,8 +123,9 @@ impl Worker for AggregateWorker {
         "aggregate_metrics"
     }
 
-    async fn perform(&self, job: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let tables: Vec<String> = job
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let tables: Vec<String> = ctx
+            .job
             .args
             .get("tables")
             .and_then(|v| serde_json::from_value(v.clone()).ok())
@@ -134,7 +133,7 @@ impl Worker for AggregateWorker {
 
         for (i, table) in tables.iter().enumerate() {
             let pct = (100 * (i + 1) / tables.len()).min(100) as u8;
-            ctx.set_progress(pct, Some(&format!("Aggregating {table}")));
+            ctx.set_progress(pct, &format!("Aggregating {table}"));
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
 
