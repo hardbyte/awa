@@ -600,10 +600,13 @@ async fn test_admin_runtime_observability_snapshot() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    assert_eq!(overview.total_instances, 1);
-    assert_eq!(overview.live_instances, 1);
-
-    let instance = &overview.instances[0];
+    // Find the instance serving our queue (other tests may leave stale snapshots)
+    let instance = overview
+        .instances
+        .iter()
+        .find(|i| i.queues.iter().any(|q| q.queue == queue))
+        .expect("expected an instance serving our queue");
+    assert!(!instance.stale);
     assert!(instance.maintenance_alive);
     let queue_snapshot = instance.queues.iter().find(|q| q.queue == queue).unwrap();
     assert_eq!(
