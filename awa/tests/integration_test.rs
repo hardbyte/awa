@@ -4,8 +4,8 @@
 
 use awa::model::{admin, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
 use awa::{
-    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobState,
-    QueueConfig, RateLimit, Worker,
+    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobState, QueueConfig,
+    RateLimit, Worker,
 };
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
@@ -56,12 +56,12 @@ async fn wait_for_runtime_snapshot(
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
     loop {
         let overview = admin::runtime_overview(pool).await.unwrap();
-        if overview.healthy_instances > 0
-            && overview
-            .instances
-            .iter()
-            .any(|instance| instance.queues.iter().any(|queue| queue.queue == expected_queue))
-        {
+        if overview.instances.iter().any(|instance| {
+            instance
+                .queues
+                .iter()
+                .any(|queue| queue.queue == expected_queue)
+        }) {
             return overview;
         }
         assert!(
@@ -577,13 +577,32 @@ async fn test_admin_runtime_observability_snapshot() {
 
     runtime.start().await.unwrap();
 
-    let overview = wait_for_runtime_snapshot(client.pool(), queue).await;
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    let overview = loop {
+        let overview = wait_for_runtime_snapshot(client.pool(), queue).await;
+        if overview
+            .instances
+            .iter()
+            .any(|instance| instance.maintenance_alive)
+        {
+            break overview;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for maintenance loop to become healthy"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
     assert_eq!(overview.total_instances, 1);
     assert_eq!(overview.live_instances, 1);
 
     let instance = &overview.instances[0];
+    assert!(instance.maintenance_alive);
     let queue_snapshot = instance.queues.iter().find(|q| q.queue == queue).unwrap();
-    assert_eq!(queue_snapshot.config.mode, admin::QueueRuntimeMode::Weighted);
+    assert_eq!(
+        queue_snapshot.config.mode,
+        admin::QueueRuntimeMode::Weighted
+    );
     assert_eq!(queue_snapshot.config.min_workers, Some(2));
     assert_eq!(queue_snapshot.config.weight, Some(3));
     assert_eq!(queue_snapshot.config.global_max_workers, Some(16));

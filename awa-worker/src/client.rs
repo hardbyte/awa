@@ -45,6 +45,7 @@ pub struct HealthCheck {
     pub postgres_connected: bool,
     pub poll_loop_alive: bool,
     pub heartbeat_alive: bool,
+    pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
     pub queues: HashMap<String, QueueHealth>,
@@ -337,6 +338,7 @@ impl ClientBuilder {
             queue_in_flight,
             dispatcher_alive,
             heartbeat_alive: Arc::new(AtomicBool::new(false)),
+            maintenance_alive: Arc::new(AtomicBool::new(false)),
             leader: Arc::new(AtomicBool::new(false)),
             overflow_pool,
             metrics,
@@ -415,6 +417,7 @@ pub struct Client {
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
+    maintenance_alive: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     /// Shared overflow pool for weighted mode (None in hard-reserved mode).
     overflow_pool: Option<Arc<OverflowPool>>,
@@ -442,6 +445,7 @@ struct RuntimeReporterState {
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
+    maintenance_alive: Arc<AtomicBool>,
     leader: Arc<AtomicBool>,
     dispatch_cancel: CancellationToken,
     overflow_pool: Option<Arc<OverflowPool>>,
@@ -467,6 +471,7 @@ impl Client {
             queue_in_flight: self.queue_in_flight.clone(),
             dispatcher_alive: self.dispatcher_alive.clone(),
             heartbeat_alive: self.heartbeat_alive.clone(),
+            maintenance_alive: self.maintenance_alive.clone(),
             leader: self.leader.clone(),
             dispatch_cancel: self.dispatch_cancel.clone(),
             overflow_pool: self.overflow_pool.clone(),
@@ -534,6 +539,7 @@ impl Client {
             self.pool.clone(),
             self.metrics.clone(),
             self.leader.clone(),
+            self.maintenance_alive.clone(),
             self.service_cancel.clone(),
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
@@ -702,6 +708,7 @@ impl Client {
             .values()
             .all(|alive| alive.load(Ordering::SeqCst));
         let heartbeat_alive = self.heartbeat_alive.load(Ordering::SeqCst);
+        let maintenance_alive = self.maintenance_alive.load(Ordering::SeqCst);
         let shutting_down = self.dispatch_cancel.is_cancelled();
         let leader = self.leader.load(Ordering::SeqCst);
         let available_rows = sqlx::query_as::<_, (String, i64)>(
@@ -749,10 +756,15 @@ impl Client {
             .collect();
 
         HealthCheck {
-            healthy: postgres_connected && poll_loop_alive && heartbeat_alive && !shutting_down,
+            healthy: postgres_connected
+                && poll_loop_alive
+                && heartbeat_alive
+                && maintenance_alive
+                && !shutting_down,
             postgres_connected,
             poll_loop_alive,
             heartbeat_alive,
+            maintenance_alive,
             shutting_down,
             leader,
             queues,
@@ -815,9 +827,14 @@ impl RuntimeReporterState {
             .values()
             .all(|alive| alive.load(Ordering::SeqCst));
         let heartbeat_alive = self.heartbeat_alive.load(Ordering::SeqCst);
+        let maintenance_alive = self.maintenance_alive.load(Ordering::SeqCst);
         let shutting_down = self.dispatch_cancel.is_cancelled();
         let leader = self.leader.load(Ordering::SeqCst);
-        let healthy = postgres_connected && poll_loop_alive && heartbeat_alive && !shutting_down;
+        let healthy = postgres_connected
+            && poll_loop_alive
+            && heartbeat_alive
+            && maintenance_alive
+            && !shutting_down;
         let queues = self
             .queues
             .iter()
@@ -835,6 +852,7 @@ impl RuntimeReporterState {
             postgres_connected,
             poll_loop_alive,
             heartbeat_alive,
+            maintenance_alive,
             shutting_down,
             leader,
             global_max_workers: self.global_max_workers,

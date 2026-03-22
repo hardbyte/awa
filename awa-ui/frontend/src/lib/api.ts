@@ -76,6 +76,7 @@ export interface RuntimeInstance {
   postgres_connected: boolean;
   poll_loop_alive: boolean;
   heartbeat_alive: boolean;
+  maintenance_alive: boolean;
   shutting_down: boolean;
   leader: boolean;
   global_max_workers: number | null;

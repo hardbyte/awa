@@ -166,6 +166,7 @@ export function DashboardPage() {
               <TableHeader>
                 <TableColumn isRowHeader>Instance</TableColumn>
                 <TableColumn>Health</TableColumn>
+                <TableColumn>Loops</TableColumn>
                 <TableColumn>Role</TableColumn>
                 <TableColumn>Queues</TableColumn>
                 <TableColumn>Seen</TableColumn>
@@ -193,6 +194,19 @@ export function DashboardPage() {
                       </TableCell>
                       <TableCell>
                         <Badge intent={healthIntent}>{healthLabel}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        <div className="flex flex-wrap gap-1">
+                          <Badge intent={instance.poll_loop_alive ? "success" : "danger"}>
+                            poll
+                          </Badge>
+                          <Badge intent={instance.heartbeat_alive ? "success" : "danger"}>
+                            heartbeat
+                          </Badge>
+                          <Badge intent={instance.maintenance_alive ? "success" : "danger"}>
+                            maintenance
+                          </Badge>
+                        </div>
                       </TableCell>
                       <TableCell>
                         {instance.leader ? (

@@ -4,12 +4,13 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 4;
+pub const CURRENT_VERSION: i32 = 5;
 
 /// All migrations in order.
 const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (3, "Canonical schema with UI indexes", &[V3_UP]),
     (4, "Runtime observability snapshots", &[V4_UP]),
+    (5, "Maintenance loop health in runtime snapshots", &[V5_UP]),
 ];
 
 /// The canonical schema (V3: V2 + BRIN on created_at + GIN on tags).
@@ -441,6 +442,14 @@ CREATE INDEX IF NOT EXISTS idx_awa_runtime_instances_last_seen
 
 INSERT INTO awa.schema_version (version, description)
 VALUES (4, 'Runtime observability snapshots');
+"#;
+
+const V5_UP: &str = r#"
+ALTER TABLE awa.runtime_instances
+    ADD COLUMN IF NOT EXISTS maintenance_alive BOOLEAN NOT NULL DEFAULT FALSE;
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (5, 'Maintenance loop health in runtime snapshots');
 "#;
 
 /// Run all pending migrations against the database.

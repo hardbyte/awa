@@ -234,6 +234,7 @@ pub struct RuntimeSnapshotInput {
     pub postgres_connected: bool,
     pub poll_loop_alive: bool,
     pub heartbeat_alive: bool,
+    pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
     pub global_max_workers: Option<u32>,
@@ -255,6 +256,7 @@ pub struct RuntimeInstance {
     pub postgres_connected: bool,
     pub poll_loop_alive: bool,
     pub heartbeat_alive: bool,
+    pub maintenance_alive: bool,
     pub shutting_down: bool,
     pub leader: bool,
     pub global_max_workers: Option<u32>,
@@ -282,6 +284,7 @@ impl RuntimeInstance {
             postgres_connected: row.postgres_connected,
             poll_loop_alive: row.poll_loop_alive,
             heartbeat_alive: row.heartbeat_alive,
+            maintenance_alive: row.maintenance_alive,
             shutting_down: row.shutting_down,
             leader: row.leader,
             global_max_workers: row.global_max_workers.map(|v| v as u32),
@@ -328,6 +331,7 @@ struct RuntimeInstanceRow {
     postgres_connected: bool,
     poll_loop_alive: bool,
     heartbeat_alive: bool,
+    maintenance_alive: bool,
     shutting_down: bool,
     leader: bool,
     global_max_workers: Option<i32>,
@@ -356,13 +360,14 @@ where
             postgres_connected,
             poll_loop_alive,
             heartbeat_alive,
+            maintenance_alive,
             shutting_down,
             leader,
             global_max_workers,
             queues
         )
         VALUES (
-            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14
+            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
@@ -375,6 +380,7 @@ where
             postgres_connected = EXCLUDED.postgres_connected,
             poll_loop_alive = EXCLUDED.poll_loop_alive,
             heartbeat_alive = EXCLUDED.heartbeat_alive,
+            maintenance_alive = EXCLUDED.maintenance_alive,
             shutting_down = EXCLUDED.shutting_down,
             leader = EXCLUDED.leader,
             global_max_workers = EXCLUDED.global_max_workers,
@@ -391,6 +397,7 @@ where
     .bind(snapshot.postgres_connected)
     .bind(snapshot.poll_loop_alive)
     .bind(snapshot.heartbeat_alive)
+    .bind(snapshot.maintenance_alive)
     .bind(snapshot.shutting_down)
     .bind(snapshot.leader)
     .bind(snapshot.global_max_workers.map(|v| v as i32))
@@ -439,6 +446,7 @@ where
             postgres_connected,
             poll_loop_alive,
             heartbeat_alive,
+            maintenance_alive,
             shutting_down,
             leader,
             global_max_workers,

@@ -39,6 +39,7 @@ pub struct MaintenanceService {
     metrics: crate::metrics::AwaMetrics,
     cancel: CancellationToken,
     leader: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
@@ -67,6 +68,7 @@ impl MaintenanceService {
         pool: PgPool,
         metrics: crate::metrics::AwaMetrics,
         leader: Arc<AtomicBool>,
+        alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         periodic_jobs: Arc<Vec<PeriodicJob>>,
         in_flight: InFlightMap,
@@ -76,6 +78,7 @@ impl MaintenanceService {
             metrics,
             cancel,
             leader,
+            alive,
             periodic_jobs,
             in_flight,
             heartbeat_rescue_interval: Duration::from_secs(30),
@@ -170,6 +173,8 @@ impl MaintenanceService {
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
+        self.alive.store(true, Ordering::SeqCst);
+        let _alive_guard = MaintenanceAliveGuard(self.alive.clone());
         self.leader.store(false, Ordering::SeqCst);
 
         loop {
@@ -788,6 +793,14 @@ impl MaintenanceService {
         if total_deleted > 0 {
             info!(count = total_deleted, "Cleaned up old jobs");
         }
+    }
+}
+
+struct MaintenanceAliveGuard(Arc<AtomicBool>);
+
+impl Drop for MaintenanceAliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
     }
 }
 
