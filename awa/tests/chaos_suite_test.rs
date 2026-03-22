@@ -397,6 +397,29 @@ fn complete_client(pool: sqlx::PgPool, queue: &str) -> Client {
         .expect("Failed to build complete client")
 }
 
+fn mixed_client(pool: sqlx::PgPool, queue: &str) -> Client {
+    Client::builder(pool)
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(100))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
+        .register_worker(CompleteWorker)
+        .register_worker(MixedChaosWorker)
+        .build()
+        .expect("Failed to build mixed chaos client")
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct SimpleChaosJob {
     seq: i64,
@@ -443,6 +466,15 @@ impl Worker for MixedChaosWorker {
             "retry_once" => {
                 if ctx.job.attempt == 1 {
                     Ok(JobResult::RetryAfter(Duration::from_millis(100)))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "retry_once_manual" => {
+                if ctx.job.attempt == 1 {
+                    // The test backdates run_at after all retryable rows are visible,
+                    // which removes timing races from the retry path.
+                    Ok(JobResult::RetryAfter(Duration::from_secs(3600)))
                 } else {
                     Ok(JobResult::Completed)
                 }
@@ -649,6 +681,296 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
     assert!(
         sum_counter_metric(&resource_metrics, "awa.maintenance.rescues") >= (per_mode * 2) as u64,
         "maintenance rescue metric did not record deadline + callback rescues"
+    );
+
+    let _ = meter_provider.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
+    let pool = setup(40).await;
+    let admin_pool = pool_with(4).await;
+    let queue = chaos_queue("chaos_node_fail");
+    clean_queue(&pool, &queue).await;
+
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let node_a_app = format!("chaos_node_a_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let node_b_app = format!("chaos_node_b_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let node_a_pool = pool_with_url(&database_url_with_app_name(&node_a_app), 20).await;
+    let node_b_pool = pool_with_url(&database_url_with_app_name(&node_b_app), 20).await;
+
+    let client_a = mixed_client(node_a_pool.clone(), &queue);
+    let client_b = mixed_client(node_b_pool.clone(), &queue);
+
+    let mut python_worker = start_python_helper(
+        "worker_simple_chaos_job",
+        &queue,
+        &[("MIXED_SIMPLE_SLEEP_MS", "400".to_string())],
+    )
+    .await;
+
+    python_worker
+        .wait_for_line(
+            "READY mode=worker_simple_chaos_job",
+            Duration::from_secs(10),
+        )
+        .await;
+
+    insert_with(
+        &pool,
+        &SimpleChaosJob { seq: 0 },
+        InsertOpts {
+            queue: queue.clone(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to insert sentinel simple chaos job");
+
+    python_worker
+        .wait_for_line(
+            "START mode=worker_simple_chaos_job",
+            Duration::from_secs(10),
+        )
+        .await;
+
+    client_a
+        .start()
+        .await
+        .expect("Failed to start mixed chaos client A");
+    client_b
+        .start()
+        .await
+        .expect("Failed to start mixed chaos client B");
+
+    async fn insert_wave(pool: &sqlx::PgPool, queue: &str, seq: &mut i64) {
+        for _ in 0..2 {
+            insert_with(
+                pool,
+                &SimpleChaosJob { seq: *seq },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    max_attempts: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert sustained simple chaos job");
+            *seq += 1;
+        }
+
+        for mode in ["complete", "complete", "terminal_fail", "retry_once_manual"] {
+            insert_with(
+                pool,
+                &ChaosJob {
+                    seq: *seq,
+                    mode: mode.to_string(),
+                },
+                InsertOpts {
+                    queue: queue.to_string(),
+                    max_attempts: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert sustained chaos job");
+            *seq += 1;
+        }
+    }
+
+    let total_waves = 4_i64;
+    let mut seq = 1_i64;
+
+    insert_wave(&pool, &queue, &mut seq).await;
+    insert_wave(&pool, &queue, &mut seq).await;
+
+    python_worker.stop().await;
+
+    let _ = wait_for_single_leader(&[&client_a, &client_b], Duration::from_secs(5)).await;
+
+    sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET heartbeat_at = now() - interval '10 minutes'
+        WHERE queue = $1
+          AND kind = 'simple_chaos_job'
+          AND state = 'running'
+        "#,
+    )
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate heartbeat_at for Python-owned running jobs");
+
+    wait_for_counts(
+        &pool,
+        &queue,
+        |counts| {
+            state_count(counts, "retryable") >= 2
+                && state_count(counts, "failed") >= 2
+                && state_count(counts, "completed") >= 4
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    let terminated = terminate_application_backends(&admin_pool, &node_a_app).await;
+    assert!(
+        terminated > 0,
+        "Expected to terminate at least one backend for app_name={node_a_app}"
+    );
+
+    let reconnect_start = Instant::now();
+    loop {
+        let health = client_a.health_check().await;
+        if health.postgres_connected {
+            break;
+        }
+        assert!(
+            reconnect_start.elapsed() < Duration::from_secs(10),
+            "Timed out waiting for node A to reconnect after backend termination"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    insert_wave(&pool, &queue, &mut seq).await;
+    insert_wave(&pool, &queue, &mut seq).await;
+
+    wait_for_counts(
+        &pool,
+        &queue,
+        |counts| {
+            state_count(counts, "retryable") == total_waves
+                && state_count(counts, "failed") == total_waves
+        },
+        Duration::from_secs(15),
+    )
+    .await;
+
+    sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET heartbeat_at = now() - interval '10 minutes'
+        WHERE queue = $1
+          AND state = 'running'
+        "#,
+    )
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate heartbeat_at for disconnect-stranded running jobs");
+
+    sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET run_at = now() - interval '1 minute'
+        WHERE queue = $1
+          AND kind = 'chaos_job'
+          AND state = 'retryable'
+        "#,
+    )
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate run_at for retryable chaos jobs");
+
+    let expected_completed = 1 + (total_waves * 5);
+    let expected_failed = total_waves;
+
+    let counts = wait_for_counts(
+        &pool,
+        &queue,
+        |counts| {
+            state_count(counts, "completed") == expected_completed
+                && state_count(counts, "failed") == expected_failed
+                && state_count(counts, "running") == 0
+                && state_count(counts, "available") == 0
+                && state_count(counts, "retryable") == 0
+                && state_count(counts, "scheduled") == 0
+                && state_count(counts, "waiting_external") == 0
+        },
+        Duration::from_secs(25),
+    )
+    .await;
+
+    assert_eq!(state_count(&counts, "completed"), expected_completed);
+    assert_eq!(state_count(&counts, "failed"), expected_failed);
+
+    let max_simple_attempt: Option<i16> = sqlx::query_scalar(
+        r#"
+        SELECT max(attempt)
+        FROM awa.jobs
+        WHERE queue = $1
+          AND kind = 'simple_chaos_job'
+          AND state = 'completed'
+        "#,
+    )
+    .bind(&queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to query completed simple job attempts");
+    assert!(
+        max_simple_attempt.unwrap_or(0) >= 2,
+        "Expected at least one simple job to be rescued after the Python node died"
+    );
+
+    let _ = wait_for_single_leader(&[&client_a, &client_b], Duration::from_secs(5)).await;
+
+    let health_a = client_a.health_check().await;
+    let health_b = client_b.health_check().await;
+    assert!(
+        health_a.postgres_connected,
+        "Node A should reconnect after its backend connections are terminated"
+    );
+    assert!(
+        health_a.poll_loop_alive,
+        "Node A poll loop should stay alive"
+    );
+    assert!(
+        health_a.heartbeat_alive,
+        "Node A heartbeat should stay alive"
+    );
+    assert!(
+        health_b.postgres_connected,
+        "Node B should remain connected"
+    );
+    assert!(
+        health_b.poll_loop_alive,
+        "Node B poll loop should stay alive"
+    );
+    assert!(
+        health_b.heartbeat_alive,
+        "Node B heartbeat should stay alive"
+    );
+
+    client_a.shutdown(Duration::from_secs(5)).await;
+    client_b.shutdown(Duration::from_secs(5)).await;
+
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush node failure chaos metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to read node failure chaos metrics");
+
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.job.completed") >= expected_completed as u64,
+        "completed metric did not reflect sustained node-failure workload"
+    );
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.job.failed") >= expected_failed as u64,
+        "failed metric did not reflect sustained node-failure workload"
+    );
+    assert!(
+        sum_counter_metric(&resource_metrics, "awa.maintenance.rescues") >= 1,
+        "maintenance rescue metric did not record recovery from the dead Python node"
     );
 
     let _ = meter_provider.shutdown();

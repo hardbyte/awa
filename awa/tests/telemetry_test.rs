@@ -91,14 +91,18 @@ impl Worker for FailureModeWorker {
             "terminal_fail" => Err(JobError::terminal("intentional telemetry test failure")),
             "retry_once" => {
                 if ctx.job.attempt == 1 {
-                    Ok(JobResult::RetryAfter(Duration::from_millis(100)))
+                    // The test backdates run_at after the rows enter retryable,
+                    // so retry timing never depends on CI scheduling.
+                    Ok(JobResult::RetryAfter(Duration::from_secs(3600)))
                 } else {
                     Ok(JobResult::Completed)
                 }
             }
             "callback_timeout" => {
                 if ctx.job.attempt == 1 {
-                    ctx.register_callback(Duration::from_millis(200))
+                    // Keep the callback parked until the test backdates
+                    // callback_timeout_at after verifying waiting_external rows.
+                    ctx.register_callback(Duration::from_secs(3600))
                         .await
                         .map_err(JobError::retryable)?;
                     Ok(JobResult::WaitForCallback)
@@ -156,6 +160,19 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
             panic!("Timed out waiting for {min} {state} jobs in queue {queue}; only {count} found");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_leader(client: &Client, timeout: Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        if client.health_check().await.leader {
+            return;
+        }
+        if start.elapsed() > timeout {
+            panic!("Timed out waiting for single telemetry client to become leader");
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -408,7 +425,8 @@ async fn test_failure_path_metrics_reach_prometheus() {
     let meter_provider = build_otlp_meter_provider(&otlp_endpoint(), "awa-failure-path-test");
     global::set_meter_provider(meter_provider.clone());
 
-    // 2. Build client with fast rescue intervals so callback timeouts trigger quickly.
+    // 2. Build client with fast maintenance intervals, but keep retry/callback
+    // transitions under explicit DB control to avoid CI timing flakes (#67).
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -422,6 +440,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
         .promote_interval(Duration::from_millis(50))
         .callback_rescue_interval(Duration::from_millis(150))
         .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
         .register_worker(FailureModeWorker)
         .build()
         .expect("Failed to build failure-path client");
@@ -430,6 +449,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
         .start()
         .await
         .expect("Failed to start failure-path client");
+    wait_for_leader(&client, Duration::from_secs(5)).await;
 
     // 3. Insert jobs across failure modes.
     let modes = [
@@ -457,21 +477,46 @@ async fn test_failure_path_metrics_reach_prometheus() {
         }
     }
 
-    // 4. Wait for terminal states: 7 completed (3 + 2 callback + 2 retry) + 2 failed.
+    // 4. Wait for the stable intermediate states, then force the timed
+    // transitions from the database so the test doesn't rely on wall clock.
+    wait_for_job_count(&pool, queue, "completed", 3).await;
+    wait_for_job_count(&pool, queue, "failed", 2).await;
+    wait_for_job_count(&pool, queue, "waiting_external", 2).await;
+    wait_for_job_count(&pool, queue, "retryable", 2).await;
+
+    sqlx::query(
+        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'waiting_external'",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate callback_timeout_at");
+
+    sqlx::query(
+        "UPDATE awa.jobs SET run_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'retryable'",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate retryable run_at");
+
+    // 5. Wait for terminal states: 7 completed (3 + 2 callback + 2 retry) + 2 failed.
     let expected_completed = 7_i64;
     let expected_failed = 2_i64;
 
     wait_for_job_count(&pool, queue, "completed", expected_completed).await;
     wait_for_job_count(&pool, queue, "failed", expected_failed).await;
 
-    // 5. Shutdown + flush to push metrics to the collector.
+    // 6. Shutdown + flush to push metrics to the collector.
     client.shutdown(Duration::from_secs(5)).await;
     meter_provider
         .force_flush()
         .expect("Failed to flush meter provider");
     tokio::time::sleep(Duration::from_secs(3)).await;
 
-    // 6. Query Prometheus for failure-path metrics.
+    // 7. Query Prometheus for failure-path metrics.
     let http = reqwest::Client::new();
     let timeout = Duration::from_secs(60);
 

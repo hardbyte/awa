@@ -47,6 +47,39 @@ async def main() -> None:
         await asyncio.Event().wait()
         return
 
+    if mode == "worker_simple_chaos_job":
+        sleep_ms = int(os.environ.get("MIXED_SIMPLE_SLEEP_MS", "250"))
+        leader_election_interval_ms = int(
+            os.environ.get("MIXED_LEADER_ELECTION_INTERVAL_MS", "60000")
+        )
+
+        @client.worker(SimpleChaosJob, queue=queue)
+        async def handle(job):
+            print(
+                f"START mode={mode} pid={os.getpid()} job_id={job.id} seq={job.args.seq}",
+                flush=True,
+            )
+            await asyncio.sleep(sleep_ms / 1000)
+            print(
+                f"COMPLETE mode={mode} pid={os.getpid()} job_id={job.id} seq={job.args.seq}",
+                flush=True,
+            )
+            return None
+
+        client.start(
+            [(queue, 1)],
+            leader_election_interval_ms=leader_election_interval_ms,
+            heartbeat_interval_ms=50,
+            promote_interval_ms=50,
+        )
+        print(
+            f"READY mode={mode} pid={os.getpid()} sleep_ms={sleep_ms} "
+            f"leader_election_interval_ms={leader_election_interval_ms}",
+            flush=True,
+        )
+        await asyncio.Event().wait()
+        return
+
     if mode == "insert_chaos_probe_batch":
         prefix = os.environ["MIXED_PREFIX"]
         count = int(os.environ["MIXED_COUNT"])
