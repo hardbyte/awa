@@ -131,7 +131,15 @@ export function DashboardPage() {
       <Card>
         <CardHeader
           title="Runtime"
-          description="Worker instances, leader health, and current runtime topology"
+          description={
+            runtimeQuery.data && runtimeQuery.data.instances.length > 0
+              ? `${runtimeQuery.data.instances.length} instance(s) · snapshots every ${
+                  (runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 10000) >= 1000
+                    ? `${Math.round((runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 10000) / 1000)}s`
+                    : `${runtimeQuery.data.instances[0]?.snapshot_interval_ms ?? 0}ms`
+                }`
+              : "Worker instances, leader health, and current runtime topology"
+          }
         />
         <CardContent>
           <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
@@ -161,8 +169,58 @@ export function DashboardPage() {
             </div>
           </div>
 
+          {/* Mobile runtime cards */}
+          {runtimeQuery.data && runtimeQuery.data.instances.length > 0 && (
+            <div className="space-y-2 sm:hidden">
+              {runtimeQuery.data.instances.map((instance) => {
+                const label = instance.hostname ?? `pid ${instance.pid}`;
+                const healthLabel = instance.stale
+                  ? "Stale"
+                  : instance.healthy
+                    ? "Healthy"
+                    : "Degraded";
+                const healthIntent = instance.stale
+                  ? ("warning" as const)
+                  : instance.healthy
+                    ? ("success" as const)
+                    : ("danger" as const);
+                return (
+                  <div key={instance.instance_id} className="rounded-lg border p-3">
+                    <div className="flex items-center justify-between">
+                      <div>
+                        <span className="font-medium">{label}</span>
+                        <span className="ml-2 text-xs text-muted-fg">
+                          {instance.version}
+                        </span>
+                      </div>
+                      <Badge intent={healthIntent}>{healthLabel}</Badge>
+                    </div>
+                    <div className="mt-2 flex flex-wrap gap-1">
+                      <Badge intent={instance.poll_loop_alive ? "success" : "danger"}>
+                        poll
+                      </Badge>
+                      <Badge intent={instance.heartbeat_alive ? "success" : "danger"}>
+                        hb
+                      </Badge>
+                      <Badge intent={instance.maintenance_alive ? "success" : "danger"}>
+                        maint
+                      </Badge>
+                      {instance.leader && (
+                        <Badge intent="primary">Leader</Badge>
+                      )}
+                    </div>
+                    <div className="mt-1 text-xs text-muted-fg">
+                      {instance.queues.length} queue(s) · seen {timeAgo(instance.last_seen_at)}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* Desktop runtime table */}
           {runtimeQuery.data && runtimeQuery.data.instances.length > 0 ? (
-            <Table aria-label="Runtime instances">
+            <Table aria-label="Runtime instances" className="hidden sm:table">
               <TableHeader>
                 <TableColumn isRowHeader>Instance</TableColumn>
                 <TableColumn>Health</TableColumn>
