@@ -217,7 +217,7 @@ struct PromResult {
     value: (f64, String),
 }
 
-/// Query Prometheus and return the first result's value, or None.
+/// Query Prometheus and return the sum across all returned series, or None.
 async fn prom_query(client: &reqwest::Client, metric: &str) -> Option<f64> {
     let url = format!("{}/api/v1/query", prometheus_url());
     let resp = client
@@ -231,10 +231,15 @@ async fn prom_query(client: &reqwest::Client, metric: &str) -> Option<f64> {
     if body.status != "success" {
         return None;
     }
-    body.data
-        .result
-        .first()
-        .and_then(|r| r.value.1.parse::<f64>().ok())
+    let mut total = 0.0;
+    let mut found = false;
+    for result in body.data.result {
+        if let Ok(value) = result.value.1.parse::<f64>() {
+            total += value;
+            found = true;
+        }
+    }
+    found.then_some(total)
 }
 
 /// Retry a Prometheus query until it returns a value >= threshold or timeout.
