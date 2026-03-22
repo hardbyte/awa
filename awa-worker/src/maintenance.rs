@@ -863,9 +863,11 @@ impl MaintenanceService {
     /// Runs as part of the leader's cleanup cycle (not on every snapshot publish).
     #[tracing::instrument(skip(self), name = "maintenance.cleanup_runtime_snapshots")]
     async fn cleanup_stale_runtime_snapshots(&self) {
-        if let Err(err) =
-            awa_model::admin::cleanup_runtime_snapshots(&self.pool, chrono::Duration::hours(24))
-                .await
+        if let Err(err) = awa_model::admin::cleanup_runtime_snapshots(
+            &self.pool,
+            chrono::TimeDelta::try_hours(24).unwrap(),
+        )
+        .await
         {
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
         }

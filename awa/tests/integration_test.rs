@@ -555,11 +555,12 @@ async fn test_admin_runtime_observability_snapshot() {
     let queue = "integ_runtime_observability";
     clean_queue(client.pool(), queue).await;
 
-    // Clean any stale runtime snapshots from previous test runs
-    sqlx::query("DELETE FROM awa.runtime_instances")
+    // Clean runtime snapshots from previous runs of this test (scoped to our queue)
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE queues @> $1::jsonb")
+        .bind(serde_json::json!([{"queue": queue}]))
         .execute(client.pool())
         .await
-        .expect("Failed to clean runtime_instances");
+        .expect("Failed to clean runtime_instances for test queue");
 
     let runtime = Client::builder(client.pool().clone())
         .queue(
@@ -628,6 +629,115 @@ async fn test_admin_runtime_observability_snapshot() {
     );
 
     runtime.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn test_runtime_overview_empty_state() {
+    let client = setup().await;
+    // Ensure a clean table for this test (scoped: delete only instances with no queues
+    // or with a dummy queue name that won't collide with other tests)
+    let dummy_queue = "integ_empty_state_probe";
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE queues @> $1::jsonb")
+        .bind(serde_json::json!([{ "queue": dummy_queue }]))
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // An overview with no snapshots for any queue should return zeroes
+    // Note: there may be snapshots from other tests, so we check that the API succeeds
+    // and returns valid data structure
+    let overview = admin::runtime_overview(client.pool()).await.unwrap();
+    // Structural assertions
+    assert!(overview.live_instances <= overview.total_instances);
+    assert!(overview.stale_instances <= overview.total_instances);
+
+    // queue_runtime_summary on a queue with no instances should be empty for that queue
+    let summaries = admin::queue_runtime_summary(client.pool()).await.unwrap();
+    let dummy_summary = summaries.iter().find(|s| s.queue == dummy_queue);
+    assert!(
+        dummy_summary.is_none(),
+        "no summary expected for non-existent queue"
+    );
+}
+
+#[tokio::test]
+async fn test_cleanup_runtime_snapshots_preserves_fresh() {
+    use chrono::{TimeDelta, Utc};
+    use uuid::Uuid;
+
+    let client = setup().await;
+
+    let fresh_id = Uuid::new_v4();
+    let stale_id = Uuid::new_v4();
+
+    // Insert a "fresh" snapshot (last_seen_at = now, via the upsert)
+    let fresh_snapshot = admin::RuntimeSnapshotInput {
+        instance_id: fresh_id,
+        hostname: Some("fresh-host".into()),
+        pid: 1,
+        version: "test".into(),
+        started_at: Utc::now(),
+        snapshot_interval_ms: 10_000,
+        healthy: true,
+        postgres_connected: true,
+        poll_loop_alive: true,
+        heartbeat_alive: true,
+        maintenance_alive: true,
+        shutting_down: false,
+        leader: false,
+        global_max_workers: None,
+        queues: vec![],
+    };
+    admin::upsert_runtime_snapshot(client.pool(), &fresh_snapshot)
+        .await
+        .unwrap();
+
+    // Insert a "stale" snapshot by directly inserting with an old last_seen_at
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id, hostname, pid, version, started_at, last_seen_at,
+            snapshot_interval_ms, healthy, postgres_connected, poll_loop_alive,
+            heartbeat_alive, maintenance_alive, shutting_down, leader,
+            global_max_workers, queues
+        ) VALUES (
+            $1, 'stale-host', 2, 'test', now(), now() - interval '48 hours',
+            10000, true, true, true, true, false, false, false, NULL, '[]'::jsonb
+        )
+        "#,
+    )
+    .bind(stale_id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    // Run cleanup with 24h threshold — should delete stale but keep fresh
+    let deleted =
+        admin::cleanup_runtime_snapshots(client.pool(), TimeDelta::try_hours(24).unwrap())
+            .await
+            .unwrap();
+    assert!(
+        deleted >= 1,
+        "expected at least the stale snapshot to be deleted"
+    );
+
+    // Verify fresh snapshot still exists
+    let instances = admin::list_runtime_instances(client.pool()).await.unwrap();
+    assert!(
+        instances.iter().any(|i| i.instance_id == fresh_id),
+        "fresh snapshot should not be deleted"
+    );
+    assert!(
+        !instances.iter().any(|i| i.instance_id == stale_id),
+        "stale snapshot should be deleted"
+    );
+
+    // Cleanup: remove our test data
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id = $1")
+        .bind(fresh_id)
+        .execute(client.pool())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]

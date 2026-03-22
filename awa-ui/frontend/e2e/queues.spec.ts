@@ -26,6 +26,23 @@ test.describe("Queues page", () => {
     await expect(queueTable.getByText("e2e_test")).toBeVisible();
   });
 
+  test("queue table includes runtime columns", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.goto("/queues"),
+    ]);
+
+    const queueTable = page.getByRole("grid", { name: "Queues" });
+    await expect(queueTable).toBeVisible();
+
+    // New runtime columns should be present
+    for (const header of ["Mode", "Capacity", "Rate limit"]) {
+      await expect(
+        queueTable.getByRole("columnheader", { name: header })
+      ).toBeVisible();
+    }
+  });
+
   test("click queue navigates to jobs with queue filter", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),

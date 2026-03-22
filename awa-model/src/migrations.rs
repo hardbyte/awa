@@ -454,9 +454,10 @@ VALUES (5, 'Maintenance loop health in runtime snapshots');
 
 /// Run all pending migrations against the database.
 ///
-/// Because Awa does not have external users yet, any pre-canonical `awa`
-/// schema is replaced with the canonical schema rather than upgraded through a
-/// historical chain.
+/// Applies only migrations newer than the current schema version.
+/// The V3 migration bootstraps the canonical schema from scratch;
+/// V4+ are incremental and use `IF NOT EXISTS` / `IF NOT EXISTS` guards
+/// so they are safe to re-run.
 ///
 /// Takes `&PgPool` for ergonomic use from Rust. For a `Send`-safe variant
 /// that takes the pool by value, see [`run_owned`].
@@ -495,17 +496,12 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         return Ok(());
     }
 
-    if has_schema {
-        info!(
-            existing_version = current,
-            "Replacing existing awa schema with canonical schema"
-        );
-        sqlx::raw_sql("DROP SCHEMA awa CASCADE")
-            .execute(&mut *conn)
-            .await?;
-    }
-
+    // Apply only migrations newer than the current version.
+    // V3 bootstraps the full schema; V4+ are incremental patches.
     for &(version, description, steps) in MIGRATIONS {
+        if version <= current {
+            continue;
+        }
         info!(version, description, "Applying migration");
         for step in steps {
             sqlx::raw_sql(step).execute(&mut *conn).await?;
