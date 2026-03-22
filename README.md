@@ -106,7 +106,7 @@ See [`awa-python/examples/`](awa-python/examples/) for complete runnable scripts
 ## Rust Example
 
 ```rust
-use awa::{Client, QueueConfig, JobArgs, JobResult, JobError, JobContext, JobRow, Worker};
+use awa::{Client, QueueConfig, JobArgs, JobResult, JobError, JobContext, Worker};
 use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
@@ -121,8 +121,8 @@ struct SendEmailWorker;
 impl Worker for SendEmailWorker {
     fn kind(&self) -> &'static str { "send_email" }
 
-    async fn perform(&self, job: &JobRow, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let args: SendEmail = serde_json::from_value(job.args.clone())
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: SendEmail = serde_json::from_value(ctx.job.args.clone())
             .map_err(|e| JobError::terminal(e.to_string()))?;
         send_email(&args.to, &args.subject).await
             .map_err(JobError::retryable)?;
