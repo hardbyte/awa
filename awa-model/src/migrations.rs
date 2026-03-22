@@ -4,10 +4,13 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 3;
+pub const CURRENT_VERSION: i32 = 4;
 
 /// All migrations in order.
-const MIGRATIONS: &[(i32, &str, &[&str])] = &[(3, "Canonical schema with UI indexes", &[V3_UP])];
+const MIGRATIONS: &[(i32, &str, &[&str])] = &[
+    (3, "Canonical schema with UI indexes", &[V3_UP]),
+    (4, "Runtime observability snapshots", &[V4_UP]),
+];
 
 /// The canonical schema (V3: V2 + BRIN on created_at + GIN on tags).
 const V3_UP: &str = r#"
@@ -412,6 +415,32 @@ CREATE INDEX idx_awa_scheduled_jobs_tags
 
 INSERT INTO awa.schema_version (version, description)
 VALUES (3, 'Canonical schema with UI indexes');
+"#;
+
+const V4_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS awa.runtime_instances (
+    instance_id          UUID PRIMARY KEY,
+    hostname             TEXT,
+    pid                  INTEGER     NOT NULL,
+    version              TEXT        NOT NULL,
+    started_at           TIMESTAMPTZ NOT NULL,
+    last_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    snapshot_interval_ms BIGINT      NOT NULL,
+    healthy              BOOLEAN     NOT NULL,
+    postgres_connected   BOOLEAN     NOT NULL,
+    poll_loop_alive      BOOLEAN     NOT NULL,
+    heartbeat_alive      BOOLEAN     NOT NULL,
+    shutting_down        BOOLEAN     NOT NULL,
+    leader               BOOLEAN     NOT NULL,
+    global_max_workers   INTEGER,
+    queues               JSONB       NOT NULL DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_awa_runtime_instances_last_seen
+    ON awa.runtime_instances (last_seen_at DESC);
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (4, 'Runtime observability snapshots');
 "#;
 
 /// Run all pending migrations against the database.

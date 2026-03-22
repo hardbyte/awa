@@ -4,7 +4,12 @@ use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
+use awa_model::admin::{
+    self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
+    RuntimeSnapshotInput,
+};
 use awa_model::{JobArgs, PeriodicJob};
+use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
 use std::any::{Any, TypeId};
@@ -16,6 +21,7 @@ use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
+use uuid::Uuid;
 
 /// Errors returned when building a worker client.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -86,6 +92,7 @@ pub struct ClientBuilder {
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
+    runtime_snapshot_interval: Duration,
 }
 
 impl ClientBuilder {
@@ -109,6 +116,7 @@ impl ClientBuilder {
             cleanup_batch_size: None,
             cleanup_interval: None,
             queue_retention_overrides: HashMap::new(),
+            runtime_snapshot_interval: Duration::from_secs(10),
         }
     }
 
@@ -235,6 +243,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how often runtime observability snapshots are published (default: 10s).
+    pub fn runtime_snapshot_interval(mut self, interval: Duration) -> Self {
+        self.runtime_snapshot_interval = interval;
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -333,6 +347,13 @@ impl ClientBuilder {
             cleanup_batch_size: self.cleanup_batch_size,
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
+            global_max_workers: self.global_max_workers,
+            runtime_snapshot_interval: self.runtime_snapshot_interval,
+            runtime_instance_id: Uuid::new_v4(),
+            runtime_started_at: Utc::now(),
+            runtime_hostname: std::env::var("HOSTNAME").ok(),
+            runtime_pid: std::process::id() as i32,
+            runtime_version: env!("CARGO_PKG_VERSION"),
         })
     }
 }
@@ -405,12 +426,63 @@ pub struct Client {
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
+    global_max_workers: Option<u32>,
+    runtime_snapshot_interval: Duration,
+    runtime_instance_id: Uuid,
+    runtime_started_at: DateTime<Utc>,
+    runtime_hostname: Option<String>,
+    runtime_pid: i32,
+    runtime_version: &'static str,
+}
+
+#[derive(Clone)]
+struct RuntimeReporterState {
+    pool: PgPool,
+    queues: Vec<(String, QueueConfig)>,
+    queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
+    dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
+    heartbeat_alive: Arc<AtomicBool>,
+    leader: Arc<AtomicBool>,
+    dispatch_cancel: CancellationToken,
+    overflow_pool: Option<Arc<OverflowPool>>,
+    global_max_workers: Option<u32>,
+    instance_id: Uuid,
+    started_at: DateTime<Utc>,
+    hostname: Option<String>,
+    pid: i32,
+    version: &'static str,
+    snapshot_interval: Duration,
 }
 
 impl Client {
     /// Create a new builder.
     pub fn builder(pool: PgPool) -> ClientBuilder {
         ClientBuilder::new(pool)
+    }
+
+    fn runtime_reporter_state(&self) -> RuntimeReporterState {
+        RuntimeReporterState {
+            pool: self.pool.clone(),
+            queues: self.queues.clone(),
+            queue_in_flight: self.queue_in_flight.clone(),
+            dispatcher_alive: self.dispatcher_alive.clone(),
+            heartbeat_alive: self.heartbeat_alive.clone(),
+            leader: self.leader.clone(),
+            dispatch_cancel: self.dispatch_cancel.clone(),
+            overflow_pool: self.overflow_pool.clone(),
+            global_max_workers: self.global_max_workers,
+            instance_id: self.runtime_instance_id,
+            started_at: self.runtime_started_at,
+            hostname: self.runtime_hostname.clone(),
+            pid: self.runtime_pid,
+            version: self.runtime_version,
+            snapshot_interval: self.runtime_snapshot_interval,
+        }
+    }
+
+    async fn publish_runtime_snapshot(&self) {
+        let reporter = self.runtime_reporter_state();
+        reporter.publish_snapshot().await;
     }
 
     /// Start the worker runtime. Spawns dispatchers, heartbeat, and maintenance.
@@ -551,6 +623,13 @@ impl Client {
             }));
         }
 
+        self.publish_runtime_snapshot().await;
+
+        let reporter = self.runtime_reporter_state();
+        service_handles.push(tokio::spawn(async move {
+            reporter.run().await;
+        }));
+
         info!("Awa worker runtime started");
         Ok(())
     }
@@ -568,6 +647,8 @@ impl Client {
 
         // Phase 1: Stop claiming new jobs
         self.dispatch_cancel.cancel();
+
+        self.publish_runtime_snapshot().await;
 
         // Phase 2: Signal in-flight cancellation flags
         for flag in self.in_flight.flags() {
@@ -675,6 +756,119 @@ impl Client {
             shutting_down,
             leader,
             queues,
+        }
+    }
+}
+
+impl RuntimeReporterState {
+    fn queue_snapshot(&self, queue: &str, config: &QueueConfig) -> QueueRuntimeSnapshot {
+        let in_flight = self
+            .queue_in_flight
+            .get(queue)
+            .map(|counter| counter.load(Ordering::SeqCst))
+            .unwrap_or(0);
+
+        let (mode, max_workers, min_workers, weight, overflow_held) =
+            if let Some(overflow_pool) = &self.overflow_pool {
+                (
+                    QueueRuntimeMode::Weighted,
+                    None,
+                    Some(config.min_workers),
+                    Some(config.weight),
+                    Some(overflow_pool.held(queue)),
+                )
+            } else {
+                (
+                    QueueRuntimeMode::HardReserved,
+                    Some(config.max_workers),
+                    None,
+                    None,
+                    None,
+                )
+            };
+
+        QueueRuntimeSnapshot {
+            queue: queue.to_string(),
+            in_flight,
+            overflow_held,
+            config: QueueRuntimeConfigSnapshot {
+                mode,
+                max_workers,
+                min_workers,
+                weight,
+                global_max_workers: self.global_max_workers,
+                poll_interval_ms: config.poll_interval.as_millis() as u64,
+                deadline_duration_secs: config.deadline_duration.as_secs(),
+                priority_aging_interval_secs: config.priority_aging_interval.as_secs(),
+                rate_limit: config.rate_limit.as_ref().map(|rl| RateLimitSnapshot {
+                    max_rate: rl.max_rate,
+                    burst: rl.burst,
+                }),
+            },
+        }
+    }
+
+    async fn snapshot_input(&self) -> RuntimeSnapshotInput {
+        let postgres_connected = sqlx::query("SELECT 1").execute(&self.pool).await.is_ok();
+        let poll_loop_alive = self
+            .dispatcher_alive
+            .values()
+            .all(|alive| alive.load(Ordering::SeqCst));
+        let heartbeat_alive = self.heartbeat_alive.load(Ordering::SeqCst);
+        let shutting_down = self.dispatch_cancel.is_cancelled();
+        let leader = self.leader.load(Ordering::SeqCst);
+        let healthy = postgres_connected && poll_loop_alive && heartbeat_alive && !shutting_down;
+        let queues = self
+            .queues
+            .iter()
+            .map(|(queue, config)| self.queue_snapshot(queue, config))
+            .collect();
+
+        RuntimeSnapshotInput {
+            instance_id: self.instance_id,
+            hostname: self.hostname.clone(),
+            pid: self.pid,
+            version: self.version.to_string(),
+            started_at: self.started_at,
+            snapshot_interval_ms: self.snapshot_interval.as_millis() as i64,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            shutting_down,
+            leader,
+            global_max_workers: self.global_max_workers,
+            queues,
+        }
+    }
+
+    async fn publish_snapshot(&self) {
+        let snapshot = self.snapshot_input().await;
+        if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
+            warn!(error = %err, "Failed to publish runtime snapshot");
+            return;
+        }
+        if let Err(err) =
+            admin::cleanup_runtime_snapshots(&self.pool, chrono::Duration::hours(24)).await
+        {
+            warn!(error = %err, "Failed to clean up stale runtime snapshots");
+        }
+    }
+
+    async fn run(self) {
+        let mut interval = tokio::time::interval(self.snapshot_interval);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await;
+        loop {
+            tokio::select! {
+                _ = self.dispatch_cancel.cancelled() => {
+                    self.publish_snapshot().await;
+                    break;
+                }
+                _ = interval.tick() => {
+                    self.publish_snapshot().await;
+                }
+            }
         }
     }
 }

@@ -39,6 +39,70 @@ export interface QueueStats {
   paused: boolean;
 }
 
+export interface RateLimitSnapshot {
+  max_rate: number;
+  burst: number;
+}
+
+export interface QueueRuntimeConfigSnapshot {
+  mode: "hard_reserved" | "weighted";
+  max_workers: number | null;
+  min_workers: number | null;
+  weight: number | null;
+  global_max_workers: number | null;
+  poll_interval_ms: number;
+  deadline_duration_secs: number;
+  priority_aging_interval_secs: number;
+  rate_limit: RateLimitSnapshot | null;
+}
+
+export interface QueueRuntimeSnapshot {
+  queue: string;
+  in_flight: number;
+  overflow_held: number | null;
+  config: QueueRuntimeConfigSnapshot;
+}
+
+export interface RuntimeInstance {
+  instance_id: string;
+  hostname: string | null;
+  pid: number;
+  version: string;
+  started_at: string;
+  last_seen_at: string;
+  snapshot_interval_ms: number;
+  stale: boolean;
+  healthy: boolean;
+  postgres_connected: boolean;
+  poll_loop_alive: boolean;
+  heartbeat_alive: boolean;
+  shutting_down: boolean;
+  leader: boolean;
+  global_max_workers: number | null;
+  queues: QueueRuntimeSnapshot[];
+}
+
+export interface RuntimeOverview {
+  total_instances: number;
+  live_instances: number;
+  stale_instances: number;
+  healthy_instances: number;
+  leader_instances: number;
+  instances: RuntimeInstance[];
+}
+
+export interface QueueRuntimeSummary {
+  queue: string;
+  instance_count: number;
+  live_instances: number;
+  stale_instances: number;
+  healthy_instances: number;
+  total_in_flight: number;
+  overflow_held_total: number | null;
+  config_mismatch: boolean;
+  config: QueueRuntimeConfigSnapshot | null;
+}
+
 export interface CronJobRow {
   name: string;
   cron_expr: string;
@@ -125,6 +189,10 @@ export function fetchQueues(): Promise<QueueStats[]> {
   return apiFetch("/queues");
 }
 
+export function fetchQueueRuntime(): Promise<QueueRuntimeSummary[]> {
+  return apiFetch("/queues/runtime");
+}
+
 export function pauseQueue(
   queue: string,
   pausedBy?: string
@@ -161,6 +229,10 @@ export function triggerCronJob(name: string): Promise<JobRow> {
 // Stats
 export function fetchStats(): Promise<StateCounts> {
   return apiFetch("/stats");
+}
+
+export function fetchRuntime(): Promise<RuntimeOverview> {
+  return apiFetch("/runtime");
 }
 
 export function fetchTimeseries(

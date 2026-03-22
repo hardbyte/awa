@@ -4,20 +4,22 @@
 
 use awa::model::{admin, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
 use awa::{
-    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobState, Worker,
+    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobState,
+    QueueConfig, RateLimit, Worker,
 };
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::time::Duration;
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
-async fn setup() -> TestClient {
+async fn setup_with_connections(max_connections: u32) -> TestClient {
     let pool = PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(max_connections)
         .connect(&database_url())
         .await
         .expect("Failed to connect to database");
@@ -26,6 +28,10 @@ async fn setup() -> TestClient {
     client.migrate().await.expect("Failed to run migrations");
     // No global cleanup — each test uses a unique queue name for isolation.
     client
+}
+
+async fn setup() -> TestClient {
+    setup_with_connections(2).await
 }
 
 /// Clean only jobs and queue_meta for a specific queue.
@@ -41,6 +47,29 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue meta");
+}
+
+async fn wait_for_runtime_snapshot(
+    pool: &sqlx::PgPool,
+    expected_queue: &str,
+) -> admin::RuntimeOverview {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let overview = admin::runtime_overview(pool).await.unwrap();
+        if overview.healthy_instances > 0
+            && overview
+            .instances
+            .iter()
+            .any(|instance| instance.queues.iter().any(|queue| queue.queue == expected_queue))
+        {
+            return overview;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for runtime snapshot for queue {expected_queue}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // -- Job types for testing --
@@ -518,6 +547,62 @@ async fn test_admin_list_jobs() {
     assert!(!jobs.is_empty());
     assert!(jobs.iter().all(|j| j.state == JobState::Available));
     assert!(jobs.iter().all(|j| j.queue == queue));
+}
+
+#[tokio::test]
+async fn test_admin_runtime_observability_snapshot() {
+    let client = setup_with_connections(8).await;
+    let queue = "integ_runtime_observability";
+    clean_queue(client.pool(), queue).await;
+
+    let runtime = Client::builder(client.pool().clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 7,
+                min_workers: 2,
+                weight: 3,
+                rate_limit: Some(RateLimit {
+                    max_rate: 12.5,
+                    burst: 25,
+                }),
+                ..Default::default()
+            },
+        )
+        .register_worker(SendEmailWorker)
+        .global_max_workers(16)
+        .runtime_snapshot_interval(Duration::from_millis(25))
+        .build()
+        .unwrap();
+
+    runtime.start().await.unwrap();
+
+    let overview = wait_for_runtime_snapshot(client.pool(), queue).await;
+    assert_eq!(overview.total_instances, 1);
+    assert_eq!(overview.live_instances, 1);
+
+    let instance = &overview.instances[0];
+    let queue_snapshot = instance.queues.iter().find(|q| q.queue == queue).unwrap();
+    assert_eq!(queue_snapshot.config.mode, admin::QueueRuntimeMode::Weighted);
+    assert_eq!(queue_snapshot.config.min_workers, Some(2));
+    assert_eq!(queue_snapshot.config.weight, Some(3));
+    assert_eq!(queue_snapshot.config.global_max_workers, Some(16));
+    let rate_limit = queue_snapshot.config.rate_limit.as_ref().unwrap();
+    assert_eq!(rate_limit.max_rate, 12.5);
+    assert_eq!(rate_limit.burst, 25);
+
+    let queue_runtime = admin::queue_runtime_summary(client.pool()).await.unwrap();
+    let summary = queue_runtime.iter().find(|q| q.queue == queue).unwrap();
+    assert_eq!(summary.instance_count, 1);
+    assert_eq!(summary.live_instances, 1);
+    assert_eq!(summary.healthy_instances, 1);
+    assert!(!summary.config_mismatch);
+    assert_eq!(
+        summary.config.as_ref().map(|cfg| cfg.mode),
+        Some(admin::QueueRuntimeMode::Weighted)
+    );
+
+    runtime.shutdown(Duration::from_secs(2)).await;
 }
 
 #[tokio::test]

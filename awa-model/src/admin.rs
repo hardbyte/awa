@@ -1,8 +1,11 @@
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
-use serde::Serialize;
+use chrono::{DateTime, Duration, Utc};
+use serde::{Deserialize, Serialize};
+use sqlx::types::Json;
 use sqlx::PgExecutor;
 use sqlx::PgPool;
+use std::cmp::max;
 use std::collections::HashMap;
 use uuid::Uuid;
 
@@ -178,6 +181,380 @@ pub struct QueueStats {
     pub completed_last_hour: i64,
     pub lag_seconds: Option<f64>,
     pub paused: bool,
+}
+
+/// Snapshot of a per-queue rate limit configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RateLimitSnapshot {
+    pub max_rate: f64,
+    pub burst: u32,
+}
+
+/// Runtime concurrency mode for a queue.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueRuntimeMode {
+    HardReserved,
+    Weighted,
+}
+
+/// Per-queue configuration published by a worker runtime instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueRuntimeConfigSnapshot {
+    pub mode: QueueRuntimeMode,
+    pub max_workers: Option<u32>,
+    pub min_workers: Option<u32>,
+    pub weight: Option<u32>,
+    pub global_max_workers: Option<u32>,
+    pub poll_interval_ms: u64,
+    pub deadline_duration_secs: u64,
+    pub priority_aging_interval_secs: u64,
+    pub rate_limit: Option<RateLimitSnapshot>,
+}
+
+/// Runtime state for one queue on one worker instance.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueRuntimeSnapshot {
+    pub queue: String,
+    pub in_flight: u32,
+    pub overflow_held: Option<u32>,
+    pub config: QueueRuntimeConfigSnapshot,
+}
+
+/// Data written by a worker runtime into the observability snapshot table.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeSnapshotInput {
+    pub instance_id: Uuid,
+    pub hostname: Option<String>,
+    pub pid: i32,
+    pub version: String,
+    pub started_at: DateTime<Utc>,
+    pub snapshot_interval_ms: i64,
+    pub healthy: bool,
+    pub postgres_connected: bool,
+    pub poll_loop_alive: bool,
+    pub heartbeat_alive: bool,
+    pub shutting_down: bool,
+    pub leader: bool,
+    pub global_max_workers: Option<u32>,
+    pub queues: Vec<QueueRuntimeSnapshot>,
+}
+
+/// A worker runtime instance as exposed through the admin API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeInstance {
+    pub instance_id: Uuid,
+    pub hostname: Option<String>,
+    pub pid: i32,
+    pub version: String,
+    pub started_at: DateTime<Utc>,
+    pub last_seen_at: DateTime<Utc>,
+    pub snapshot_interval_ms: i64,
+    pub stale: bool,
+    pub healthy: bool,
+    pub postgres_connected: bool,
+    pub poll_loop_alive: bool,
+    pub heartbeat_alive: bool,
+    pub shutting_down: bool,
+    pub leader: bool,
+    pub global_max_workers: Option<u32>,
+    pub queues: Vec<QueueRuntimeSnapshot>,
+}
+
+impl RuntimeInstance {
+    fn stale_cutoff(interval_ms: i64) -> Duration {
+        let interval_ms = max(interval_ms, 1_000);
+        Duration::milliseconds(max(interval_ms.saturating_mul(3), 30_000))
+    }
+
+    fn from_db_row(row: RuntimeInstanceRow, now: DateTime<Utc>) -> Self {
+        let stale = row.last_seen_at + Self::stale_cutoff(row.snapshot_interval_ms) < now;
+        Self {
+            instance_id: row.instance_id,
+            hostname: row.hostname,
+            pid: row.pid,
+            version: row.version,
+            started_at: row.started_at,
+            last_seen_at: row.last_seen_at,
+            snapshot_interval_ms: row.snapshot_interval_ms,
+            stale,
+            healthy: row.healthy,
+            postgres_connected: row.postgres_connected,
+            poll_loop_alive: row.poll_loop_alive,
+            heartbeat_alive: row.heartbeat_alive,
+            shutting_down: row.shutting_down,
+            leader: row.leader,
+            global_max_workers: row.global_max_workers.map(|v| v as u32),
+            queues: row.queues.0,
+        }
+    }
+}
+
+/// Cluster-wide runtime overview.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimeOverview {
+    pub total_instances: usize,
+    pub live_instances: usize,
+    pub stale_instances: usize,
+    pub healthy_instances: usize,
+    pub leader_instances: usize,
+    pub instances: Vec<RuntimeInstance>,
+}
+
+/// Queue-centric runtime/config summary aggregated across worker instances.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueueRuntimeSummary {
+    pub queue: String,
+    pub instance_count: usize,
+    pub live_instances: usize,
+    pub stale_instances: usize,
+    pub healthy_instances: usize,
+    pub total_in_flight: u64,
+    pub overflow_held_total: Option<u64>,
+    pub config_mismatch: bool,
+    pub config: Option<QueueRuntimeConfigSnapshot>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RuntimeInstanceRow {
+    instance_id: Uuid,
+    hostname: Option<String>,
+    pid: i32,
+    version: String,
+    started_at: DateTime<Utc>,
+    last_seen_at: DateTime<Utc>,
+    snapshot_interval_ms: i64,
+    healthy: bool,
+    postgres_connected: bool,
+    poll_loop_alive: bool,
+    heartbeat_alive: bool,
+    shutting_down: bool,
+    leader: bool,
+    global_max_workers: Option<i32>,
+    queues: Json<Vec<QueueRuntimeSnapshot>>,
+}
+
+/// Upsert a runtime observability snapshot for one worker instance.
+pub async fn upsert_runtime_snapshot<'e, E>(
+    executor: E,
+    snapshot: &RuntimeSnapshotInput,
+) -> Result<(), AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id,
+            hostname,
+            pid,
+            version,
+            started_at,
+            last_seen_at,
+            snapshot_interval_ms,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            shutting_down,
+            leader,
+            global_max_workers,
+            queues
+        )
+        VALUES (
+            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14
+        )
+        ON CONFLICT (instance_id) DO UPDATE SET
+            hostname = EXCLUDED.hostname,
+            pid = EXCLUDED.pid,
+            version = EXCLUDED.version,
+            started_at = EXCLUDED.started_at,
+            last_seen_at = now(),
+            snapshot_interval_ms = EXCLUDED.snapshot_interval_ms,
+            healthy = EXCLUDED.healthy,
+            postgres_connected = EXCLUDED.postgres_connected,
+            poll_loop_alive = EXCLUDED.poll_loop_alive,
+            heartbeat_alive = EXCLUDED.heartbeat_alive,
+            shutting_down = EXCLUDED.shutting_down,
+            leader = EXCLUDED.leader,
+            global_max_workers = EXCLUDED.global_max_workers,
+            queues = EXCLUDED.queues
+        "#,
+    )
+    .bind(snapshot.instance_id)
+    .bind(snapshot.hostname.as_deref())
+    .bind(snapshot.pid)
+    .bind(&snapshot.version)
+    .bind(snapshot.started_at)
+    .bind(snapshot.snapshot_interval_ms)
+    .bind(snapshot.healthy)
+    .bind(snapshot.postgres_connected)
+    .bind(snapshot.poll_loop_alive)
+    .bind(snapshot.heartbeat_alive)
+    .bind(snapshot.shutting_down)
+    .bind(snapshot.leader)
+    .bind(snapshot.global_max_workers.map(|v| v as i32))
+    .bind(Json(&snapshot.queues))
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+/// Opportunistically delete long-stale runtime snapshot rows.
+pub async fn cleanup_runtime_snapshots<'e, E>(
+    executor: E,
+    max_age: Duration,
+) -> Result<u64, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let seconds = max(max_age.num_seconds(), 1);
+    let result = sqlx::query(
+        "DELETE FROM awa.runtime_instances WHERE last_seen_at < now() - make_interval(secs => $1)",
+    )
+    .bind(seconds)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected())
+}
+
+/// List all runtime instances ordered with leader/live instances first.
+pub async fn list_runtime_instances<'e, E>(executor: E) -> Result<Vec<RuntimeInstance>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = sqlx::query_as::<_, RuntimeInstanceRow>(
+        r#"
+        SELECT
+            instance_id,
+            hostname,
+            pid,
+            version,
+            started_at,
+            last_seen_at,
+            snapshot_interval_ms,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            shutting_down,
+            leader,
+            global_max_workers,
+            queues
+        FROM awa.runtime_instances
+        ORDER BY leader DESC, last_seen_at DESC, started_at DESC
+        "#,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    let now = Utc::now();
+    Ok(rows
+        .into_iter()
+        .map(|row| RuntimeInstance::from_db_row(row, now))
+        .collect())
+}
+
+/// Cluster runtime overview with instance list.
+pub async fn runtime_overview<'e, E>(executor: E) -> Result<RuntimeOverview, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let instances = list_runtime_instances(executor).await?;
+    let total_instances = instances.len();
+    let stale_instances = instances.iter().filter(|i| i.stale).count();
+    let live_instances = total_instances.saturating_sub(stale_instances);
+    let healthy_instances = instances.iter().filter(|i| !i.stale && i.healthy).count();
+    let leader_instances = instances.iter().filter(|i| !i.stale && i.leader).count();
+
+    Ok(RuntimeOverview {
+        total_instances,
+        live_instances,
+        stale_instances,
+        healthy_instances,
+        leader_instances,
+        instances,
+    })
+}
+
+/// Queue runtime/config summary aggregated across worker snapshots.
+pub async fn queue_runtime_summary<'e, E>(executor: E) -> Result<Vec<QueueRuntimeSummary>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let instances = list_runtime_instances(executor).await?;
+    let mut by_queue: HashMap<String, Vec<(bool, bool, QueueRuntimeSnapshot)>> = HashMap::new();
+
+    for instance in instances {
+        let is_live = !instance.stale;
+        let is_healthy = is_live && instance.healthy;
+        for queue in instance.queues {
+            by_queue
+                .entry(queue.queue.clone())
+                .or_default()
+                .push((is_live, is_healthy, queue));
+        }
+    }
+
+    let mut summaries: Vec<_> = by_queue
+        .into_iter()
+        .map(|(queue, entries)| {
+            let instance_count = entries.len();
+            let live_instances = entries.iter().filter(|(live, _, _)| *live).count();
+            let stale_instances = instance_count.saturating_sub(live_instances);
+            let healthy_instances = entries.iter().filter(|(_, healthy, _)| *healthy).count();
+            let total_in_flight = entries
+                .iter()
+                .filter(|(live, _, _)| *live)
+                .map(|(_, _, queue)| u64::from(queue.in_flight))
+                .sum();
+
+            let overflow_total: u64 = entries
+                .iter()
+                .filter(|(live, _, _)| *live)
+                .filter_map(|(_, _, queue)| queue.overflow_held.map(u64::from))
+                .sum();
+
+            let live_configs: Vec<_> = entries
+                .iter()
+                .filter(|(live, _, _)| *live)
+                .map(|(_, _, queue)| queue.config.clone())
+                .collect();
+            let config_candidates = if live_configs.is_empty() {
+                entries
+                    .iter()
+                    .map(|(_, _, queue)| queue.config.clone())
+                    .collect::<Vec<_>>()
+            } else {
+                live_configs
+            };
+            let config = config_candidates.first().cloned();
+            let config_mismatch = config_candidates
+                .iter()
+                .skip(1)
+                .any(|candidate| Some(candidate) != config.as_ref());
+
+            QueueRuntimeSummary {
+                queue,
+                instance_count,
+                live_instances,
+                stale_instances,
+                healthy_instances,
+                total_in_flight,
+                overflow_held_total: config
+                    .as_ref()
+                    .filter(|cfg| cfg.mode == QueueRuntimeMode::Weighted)
+                    .map(|_| overflow_total),
+                config_mismatch,
+                config,
+            }
+        })
+        .collect();
+
+    summaries.sort_by(|a, b| a.queue.cmp(&b.queue));
+    Ok(summaries)
 }
 
 /// Get statistics for all queues.

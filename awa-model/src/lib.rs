@@ -9,8 +9,9 @@ pub mod unique;
 
 // Re-exports for ergonomics
 pub use admin::{
-    CallbackConfig, DefaultAction, ListJobsFilter, QueueStats, ResolveOutcome,
-    StateTimeseriesBucket,
+    CallbackConfig, DefaultAction, ListJobsFilter, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
+    QueueRuntimeSnapshot, QueueRuntimeSummary, QueueStats, RateLimitSnapshot, ResolveOutcome,
+    RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket,
 };
 pub use cron::{CronJobRow, PeriodicJob, PeriodicJobBuilder};
 pub use error::AwaError;

@@ -7,12 +7,13 @@ import {
 import { Link } from "@tanstack/react-router";
 import {
   fetchQueues,
+  fetchQueueRuntime,
   pauseQueue,
   resumeQueue,
   drainQueue,
 } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
-import type { QueueStats } from "@/lib/api";
+import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -34,6 +35,11 @@ export function QueuesPage() {
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
+  });
+
+  const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
+    queryKey: ["queue-runtime"],
+    queryFn: fetchQueueRuntime,
   });
 
   const pauseMutation = useMutation({
@@ -71,6 +77,29 @@ export function QueuesPage() {
   });
 
   const queues = queuesQuery.data ?? [];
+  const runtimeByQueue = new Map<string, QueueRuntimeSummary>(
+    (runtimeQuery.data ?? []).map(
+      (summary): [string, QueueRuntimeSummary] => [summary.queue, summary],
+    ),
+  );
+
+  function capacityLabel(runtime: QueueRuntimeSummary | undefined): string {
+    if (!runtime?.config) return "—";
+    if (runtime.config.mode === "weighted") {
+      return `min ${runtime.config.min_workers ?? 0} / w ${runtime.config.weight ?? 1}`;
+    }
+    return `max ${runtime.config.max_workers ?? 0}`;
+  }
+
+  function rateLimitLabel(runtime: QueueRuntimeSummary | undefined): string {
+    if (!runtime?.config?.rate_limit) return "—";
+    return `${runtime.config.rate_limit.max_rate}/s (${runtime.config.rate_limit.burst})`;
+  }
+
+  function runtimeHealthLabel(runtime: QueueRuntimeSummary | undefined): string {
+    if (!runtime) return "—";
+    return `${runtime.healthy_instances}/${runtime.live_instances || runtime.instance_count}`;
+  }
 
   return (
     <div className="space-y-4">
@@ -79,8 +108,10 @@ export function QueuesPage() {
       {/* Mobile card layout */}
       {queues.length > 0 && (
         <div className="space-y-3 sm:hidden">
-          {queues.map((q) => (
-            <div key={q.queue} className="rounded-lg border p-4">
+          {queues.map((q) => {
+            const runtime = runtimeByQueue.get(q.queue);
+            return (
+              <div key={q.queue} className="rounded-lg border p-4">
               <div className="flex items-center justify-between">
                 <Link
                   to="/queues/$name"
@@ -110,6 +141,18 @@ export function QueuesPage() {
                 )}
                 <span className="text-muted-fg">Lag</span>
                 <span><LagValue seconds={q.lag_seconds} /></span>
+                <span className="text-muted-fg">Capacity</span>
+                <span>{capacityLabel(runtime)}</span>
+                <span className="text-muted-fg">Rate limit</span>
+                <span>{rateLimitLabel(runtime)}</span>
+                <span className="text-muted-fg">Healthy nodes</span>
+                <span>{runtimeHealthLabel(runtime)}</span>
+                {runtime?.config_mismatch && (
+                  <>
+                    <span className="text-muted-fg">Config</span>
+                    <span className="text-warning-fg">Mismatch</span>
+                  </>
+                )}
               </div>
               <div className="mt-3 flex gap-2">
                 {q.paused ? (
@@ -125,8 +168,9 @@ export function QueuesPage() {
                   Drain
                 </Button>
               </div>
-            </div>
-          ))}
+              </div>
+            );
+          })}
         </div>
       )}
 
@@ -141,73 +185,109 @@ export function QueuesPage() {
             <TableColumn>Waiting</TableColumn>
             <TableColumn>Completed/hr</TableColumn>
             <TableColumn>Lag (s)</TableColumn>
+            <TableColumn>Mode</TableColumn>
+            <TableColumn>Capacity</TableColumn>
+            <TableColumn>Rate limit</TableColumn>
+            <TableColumn>Runtime</TableColumn>
             <TableColumn>Status</TableColumn>
             <TableColumn>Actions</TableColumn>
           </TableHeader>
           <TableBody>
-            {queues.map((q) => (
-              <TableRow key={q.queue} id={q.queue}>
-                <TableCell className="font-medium">
-                  <Link
-                    to="/queues/$name"
-                    params={{ name: q.queue }}
-                    className="text-primary no-underline hover:underline"
-                  >
-                    {q.queue}
-                  </Link>
-                </TableCell>
-                <TableCell>{q.available}</TableCell>
-                <TableCell>{q.running}</TableCell>
-                <TableCell>
-                  <span className={q.failed > 0 ? "text-danger" : ""}>
-                    {q.failed}
-                  </span>
-                </TableCell>
-                <TableCell>
-                  {q.waiting_external > 0 ? q.waiting_external : "-"}
-                </TableCell>
-                <TableCell>{q.completed_last_hour}</TableCell>
-                <TableCell>
-                  <LagValue seconds={q.lag_seconds} />
-                </TableCell>
-                <TableCell>
-                  {q.paused ? (
-                    <Badge intent="warning">Paused</Badge>
-                  ) : (
-                    <Badge intent="success">Active</Badge>
-                  )}
-                </TableCell>
-                <TableCell>
-                  <div className="flex gap-1">
-                    {q.paused ? (
-                      <Button
-                        intent="outline"
-                        size="xs"
-                        onPress={() => resumeMutation.mutate(q.queue)}
-                      >
-                        Resume
-                      </Button>
-                    ) : (
-                      <Button
-                        intent="outline"
-                        size="xs"
-                        onPress={() => pauseMutation.mutate(q.queue)}
-                      >
-                        Pause
-                      </Button>
-                    )}
-                    <Button
-                      intent="outline"
-                      size="xs"
-                      className="text-danger"
-                      onPress={() => setDrainTarget(q.queue)}
+            {queues.map((q) => {
+              const runtime = runtimeByQueue.get(q.queue);
+              return (
+                <TableRow key={q.queue} id={q.queue}>
+                  <TableCell className="font-medium">
+                    <Link
+                      to="/queues/$name"
+                      params={{ name: q.queue }}
+                      className="text-primary no-underline hover:underline"
                     >
-                      Drain
-                    </Button>
-                  </div>
-                </TableCell>
-              </TableRow>
-            ))}
+                      {q.queue}
+                    </Link>
+                  </TableCell>
+                  <TableCell>{q.available}</TableCell>
+                  <TableCell>{q.running}</TableCell>
+                  <TableCell>
+                    <span className={q.failed > 0 ? "text-danger" : ""}>
+                      {q.failed}
+                    </span>
+                  </TableCell>
+                  <TableCell>
+                    {q.waiting_external > 0 ? q.waiting_external : "-"}
+                  </TableCell>
+                  <TableCell>{q.completed_last_hour}</TableCell>
+                  <TableCell>
+                    <LagValue seconds={q.lag_seconds} />
+                  </TableCell>
+                  <TableCell>
+                    {runtime?.config ? (
+                      <Badge
+                        intent={
+                          runtime.config.mode === "weighted" ? "secondary" : "outline"
+                        }
+                      >
+                        {runtime.config.mode === "weighted" ? "Weighted" : "Reserved"}
+                      </Badge>
+                    ) : (
+                      "—"
+                    )}
+                  </TableCell>
+                  <TableCell>{capacityLabel(runtime)}</TableCell>
+                  <TableCell>{rateLimitLabel(runtime)}</TableCell>
+                  <TableCell>
+                    <div className="text-sm">
+                      <div>{runtimeHealthLabel(runtime)} healthy</div>
+                      {runtime?.config_mismatch ? (
+                        <div className="text-warning-fg">Config mismatch</div>
+                      ) : runtime ? (
+                        <div className="text-muted-fg">
+                          {runtime.stale_instances > 0
+                            ? `${runtime.stale_instances} stale`
+                            : `${runtime.instance_count} nodes`}
+                        </div>
+                      ) : null}
+                    </div>
+                  </TableCell>
+                  <TableCell>
+                    {q.paused ? (
+                      <Badge intent="warning">Paused</Badge>
+                    ) : (
+                      <Badge intent="success">Active</Badge>
+                    )}
+                  </TableCell>
+                  <TableCell>
+                    <div className="flex gap-1">
+                      {q.paused ? (
+                        <Button
+                          intent="outline"
+                          size="xs"
+                          onPress={() => resumeMutation.mutate(q.queue)}
+                        >
+                          Resume
+                        </Button>
+                      ) : (
+                        <Button
+                          intent="outline"
+                          size="xs"
+                          onPress={() => pauseMutation.mutate(q.queue)}
+                        >
+                          Pause
+                        </Button>
+                      )}
+                      <Button
+                        intent="outline"
+                        size="xs"
+                        className="text-danger"
+                        onPress={() => setDrainTarget(q.queue)}
+                      >
+                        Drain
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              );
+            })}
           </TableBody>
         </Table>
       ) : queuesQuery.isLoading ? (

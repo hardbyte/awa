@@ -1,7 +1,7 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { fetchStats, fetchQueues, fetchJobs } from "@/lib/api";
-import type { StateCounts, QueueStats, JobRow } from "@/lib/api";
+import { fetchStats, fetchQueues, fetchJobs, fetchRuntime } from "@/lib/api";
+import type { StateCounts, QueueStats, JobRow, RuntimeOverview } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Heading } from "@/components/ui/heading";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
@@ -46,6 +46,11 @@ export function DashboardPage() {
   const failedQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", { state: "failed", limit: 10 }],
     queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
+  });
+
+  const runtimeQuery = useQuery<RuntimeOverview>({
+    queryKey: ["runtime"],
+    queryFn: fetchRuntime,
   });
 
   const completedPerHour = queuesQuery.data
@@ -122,6 +127,96 @@ export function DashboardPage() {
           {queuesQuery.data?.length ?? 0} queues
         </p>
       )}
+
+      <Card>
+        <CardHeader
+          title="Runtime"
+          description="Worker instances, leader health, and current runtime topology"
+        />
+        <CardContent>
+          <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Live</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtimeQuery.data?.live_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Healthy</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtimeQuery.data?.healthy_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Leader</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtimeQuery.data?.leader_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Stale</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtimeQuery.data?.stale_instances ?? "—"}
+              </div>
+            </div>
+          </div>
+
+          {runtimeQuery.data && runtimeQuery.data.instances.length > 0 ? (
+            <Table aria-label="Runtime instances">
+              <TableHeader>
+                <TableColumn isRowHeader>Instance</TableColumn>
+                <TableColumn>Health</TableColumn>
+                <TableColumn>Role</TableColumn>
+                <TableColumn>Queues</TableColumn>
+                <TableColumn>Seen</TableColumn>
+              </TableHeader>
+              <TableBody>
+                {runtimeQuery.data.instances.map((instance) => {
+                  const label = instance.hostname ?? `pid ${instance.pid}`;
+                  const healthLabel = instance.stale
+                    ? "Stale"
+                    : instance.healthy
+                      ? "Healthy"
+                      : "Degraded";
+                  const healthIntent = instance.stale
+                    ? "warning"
+                    : instance.healthy
+                      ? "success"
+                      : "danger";
+                  return (
+                    <TableRow key={instance.instance_id} id={instance.instance_id}>
+                      <TableCell className="font-medium">
+                        <div>{label}</div>
+                        <div className="text-xs text-muted-fg">
+                          {instance.version} · pid {instance.pid}
+                        </div>
+                      </TableCell>
+                      <TableCell>
+                        <Badge intent={healthIntent}>{healthLabel}</Badge>
+                      </TableCell>
+                      <TableCell>
+                        {instance.leader ? (
+                          <Badge intent="primary">Leader</Badge>
+                        ) : (
+                          <span className="text-sm text-muted-fg">Worker</span>
+                        )}
+                      </TableCell>
+                      <TableCell>{instance.queues.length}</TableCell>
+                      <TableCell>{timeAgo(instance.last_seen_at)}</TableCell>
+                    </TableRow>
+                  );
+                })}
+              </TableBody>
+            </Table>
+          ) : runtimeQuery.isLoading ? (
+            <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
+          ) : (
+            <p className="py-4 text-sm text-muted-fg">
+              No runtime snapshots yet. Start a worker to populate this view.
+            </p>
+          )}
+        </CardContent>
+      </Card>
 
       {/* Queue summary — top N by activity */}
       <Card>
