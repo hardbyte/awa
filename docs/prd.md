@@ -505,6 +505,8 @@ Override always available: `#[awa(kind = "custom")]` (Rust), `@client.worker(T, 
 #### Rust
 
 ```rust
+use awa_model::JobArgs;
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 #[awa(kind = "send_confirmation_email")]
 pub struct SendConfirmationEmail {
