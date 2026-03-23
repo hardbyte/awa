@@ -1436,3 +1436,56 @@ async fn test_builder_requires_at_least_one_queue() {
 
     assert!(matches!(result, Err(BuildError::NoQueuesConfigured)));
 }
+
+#[tokio::test]
+async fn test_null_byte_in_args_rejected_with_validation_error() {
+    let client = setup().await;
+    let queue = "integ_null_byte";
+
+    let result = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "test\x00@example.com".into(),
+            subject: "Hello".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(result.is_err(), "Null byte in args should be rejected");
+    let err = result.unwrap_err();
+    assert!(
+        matches!(err, AwaError::Validation(_)),
+        "Expected Validation error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("null bytes"),
+        "Error should mention null bytes, got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_null_byte_in_metadata_rejected() {
+    let client = setup().await;
+    let queue = "integ_null_byte_meta";
+
+    let result = insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "alice@example.com".into(),
+            subject: "Hello".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            metadata: serde_json::json!({"key": "value\x00with_null"}),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    assert!(result.is_err(), "Null byte in metadata should be rejected");
+    assert!(matches!(result.unwrap_err(), AwaError::Validation(_)));
+}

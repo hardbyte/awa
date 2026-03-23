@@ -5,6 +5,35 @@ use crate::JobArgs;
 use sqlx::postgres::PgConnection;
 use sqlx::{PgExecutor, PgPool};
 
+/// Reject JSON values containing null bytes (`\u0000`), which Postgres
+/// JSONB does not support. Produces a clear validation error instead of
+/// an opaque database error.
+fn reject_null_bytes(value: &serde_json::Value) -> Result<(), AwaError> {
+    match value {
+        serde_json::Value::String(s) if s.contains('\0') => Err(AwaError::Validation(
+            "job args/metadata must not contain null bytes (\\u0000): Postgres JSONB does not support them".into(),
+        )),
+        serde_json::Value::Array(arr) => {
+            for v in arr {
+                reject_null_bytes(v)?;
+            }
+            Ok(())
+        }
+        serde_json::Value::Object(map) => {
+            for (k, v) in map {
+                if k.contains('\0') {
+                    return Err(AwaError::Validation(
+                        "job args/metadata keys must not contain null bytes (\\u0000)".into(),
+                    ));
+                }
+                reject_null_bytes(v)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Insert a job with default options.
 pub async fn insert<'e, E>(executor: E, args: &impl JobArgs) -> Result<JobRow, AwaError>
 where
@@ -25,6 +54,8 @@ where
 {
     let kind = args.kind_str();
     let args_json = args.to_args()?;
+    reject_null_bytes(&args_json)?;
+    reject_null_bytes(&opts.metadata)?;
 
     let state = if opts.run_at.is_some() {
         JobState::Scheduled
@@ -173,6 +204,12 @@ where
         return Ok(Vec::new());
     }
 
+    // Validate all args/metadata before touching the DB
+    for job in jobs {
+        reject_null_bytes(&job.args)?;
+        reject_null_bytes(&job.opts.metadata)?;
+    }
+
     let count = jobs.len();
     let rows = precompute_row_values(jobs);
 
@@ -240,6 +277,12 @@ pub async fn insert_many_copy(
 ) -> Result<Vec<JobRow>, AwaError> {
     if jobs.is_empty() {
         return Ok(Vec::new());
+    }
+
+    // Validate all args/metadata before touching the DB
+    for job in jobs {
+        reject_null_bytes(&job.args)?;
+        reject_null_bytes(&job.opts.metadata)?;
     }
 
     let rows = precompute_row_values(jobs);
