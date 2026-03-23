@@ -4,7 +4,7 @@
 
 Awa (Māori: river) provides durable, transactional job enqueueing with typed handlers in both Rust and Python. All queue state lives in Postgres — no Redis, no RabbitMQ. The Rust runtime handles polling, heartbeating, crash recovery, and dispatch. Python workers run on that same runtime via PyO3, getting Rust-grade reliability with Python-native ergonomics.
 
-![AWA Web UI — Dashboard (dark mode)](docs/images/awa-ui-dark.png)
+![AWA Web UI — Dashboard (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
 ## Features
 
