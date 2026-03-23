@@ -11,7 +11,11 @@ Tiny FastAPI example showing how Awa fits into a real application:
 
 ```bash
 cd examples/python-app-demo
-export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+# Point this at a dedicated demo database.
+export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_video_demo
+
+# Build the embedded frontend once per checkout, or whenever UI assets change.
+(cd ../../awa-ui/frontend && npm install && npm run build)
 
 uv sync
 uv run awa --database-url $DATABASE_URL migrate
@@ -27,7 +31,7 @@ Terminal 1:
 
 ```bash
 cd examples/python-app-demo
-export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_video_demo
 uv run python -m demo_app.workers
 ```
 
@@ -35,7 +39,7 @@ Terminal 2:
 
 ```bash
 cd examples/python-app-demo
-export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
+export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_video_demo
 uv run uvicorn demo_app.app:app --reload
 ```
 
@@ -53,3 +57,4 @@ curl -X POST http://127.0.0.1:8000/orders/checkout \
 - If you copy this example into another repo, replace the local sources with published `awa-pg` and `awa-cli` dependencies.
 - Reusing the same `checkout_id` is idempotent and won't enqueue another order-confirmation email.
 - The seed script deliberately adds extra operational scenarios like waiting payment callbacks and failed inventory syncs so the UI has something worth inspecting.
+- If `awa serve` shows "Frontend not built", rebuild `awa-ui/frontend` and then rerun `uv sync` here so `awa-cli` picks up the embedded assets.

@@ -190,7 +190,7 @@ async def main() -> None:
         await job.flush_progress()
         token = await job.register_callback(timeout_seconds=3600)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     client.periodic(
         name="ui_demo_daily_digest",
@@ -330,6 +330,7 @@ async def main() -> None:
     print(f"callback id:          {callback_ids[0] if callback_ids else 'missing'}")
     print("cron job:             ui_demo_daily_digest")
     print("\nSuggested next step:")
+    print("  (cd ../../awa-ui/frontend && npm install && npm run build)  # once per checkout")
     print("  awa --database-url $DATABASE_URL serve")
     print("  open http://127.0.0.1:3000")
 

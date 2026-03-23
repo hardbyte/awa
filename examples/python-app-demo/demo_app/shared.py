@@ -136,7 +136,7 @@ def register_workers(client: awa.Client, callback_ids: list[str] | None = None) 
         token = await job.register_callback(timeout_seconds=3600)
         if callback_ids is not None:
             callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     client.periodic(
         name=CRON_NAME,

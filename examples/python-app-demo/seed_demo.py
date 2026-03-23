@@ -163,6 +163,7 @@ async def main() -> None:
     print(f"callback id:        {callback_ids[0] if callback_ids else 'missing'}")
     print(f"cron job:           {CRON_NAME}")
     print("\nSuggested next steps:")
+    print("  (cd ../../awa-ui/frontend && npm install && npm run build)  # once per checkout")
     print("  uv run awa --database-url $DATABASE_URL serve")
     print("  uv run uvicorn demo_app.app:app --reload")
 
