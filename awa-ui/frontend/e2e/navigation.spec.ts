@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Shell navigation", () => {
-  test("all nav links work: Dashboard, Jobs, Queues, Cron", async ({
+  test("all nav links work: Dashboard, Jobs, Queues, Runtime, Cron", async ({
     page,
   }) => {
     await page.goto("/");
@@ -18,6 +18,11 @@ test.describe("Shell navigation", () => {
     await nav.getByRole("link", { name: "Queues" }).click();
     await expect(page).toHaveURL(/\/queues/);
     await expect(page.getByRole("heading", { name: "Queues" })).toBeVisible();
+
+    // Click Runtime nav link
+    await nav.getByRole("link", { name: "Runtime" }).click();
+    await expect(page).toHaveURL(/\/runtime/);
+    await expect(page.getByRole("heading", { name: "Runtime" })).toBeVisible();
 
     // Click Cron nav link (use exact match to avoid matching queue names like "cron_...")
     await nav.getByRole("link", { name: "Cron", exact: true }).click();
