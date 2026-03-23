@@ -4,7 +4,7 @@ import { fetchStats, fetchQueues, fetchJobs, fetchRuntime } from "@/lib/api";
 import type { StateCounts, QueueStats, JobRow, RuntimeOverview } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
 import { Heading } from "@/components/ui/heading";
-import { Card, CardContent, CardHeader } from "@/components/ui/card";
+import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
   Table,
   TableHeader,
@@ -140,7 +140,13 @@ export function DashboardPage() {
                 }`
               : "Worker instances, leader health, and current runtime topology"
           }
-        />
+        >
+          <CardAction>
+            <Link to="/runtime" className="text-sm text-primary no-underline hover:underline">
+              Open runtime
+            </Link>
+          </CardAction>
+        </CardHeader>
         <CardContent>
           <div className="mb-4 grid grid-cols-2 gap-3 md:grid-cols-4">
             <div className="rounded-lg border p-3">

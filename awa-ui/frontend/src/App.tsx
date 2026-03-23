@@ -13,6 +13,7 @@ import { JobDetailPage } from "./routes/job-detail";
 import { QueuesPage } from "./routes/queues";
 import { QueueDetailPage } from "./routes/queue-detail";
 import { CronPage } from "./routes/cron";
+import { RuntimePage } from "./routes/runtime";
 
 const rootRoute = createRootRoute({ component: Shell });
 
@@ -52,12 +53,19 @@ const cronRoute = createRoute({
   component: CronPage,
 });
 
+const runtimeRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/runtime",
+  component: RuntimePage,
+});
+
 const routeTree = rootRoute.addChildren([
   dashboardRoute,
   jobsRoute,
   jobDetailRoute,
   queuesRoute,
   queueDetailRoute,
+  runtimeRoute,
   cronRoute,
 ]);
 
