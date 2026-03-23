@@ -52,27 +52,11 @@ impl Worker for ExternalPaymentWorker {
     }
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let _callback = ctx
+        let callback = ctx
             .register_callback(Duration::from_secs(3600))
             .await
             .map_err(JobError::retryable)?;
-        Ok(JobResult::WaitForCallback)
-    }
-}
-
-// -- Worker that returns WaitForCallback without calling register_callback --
-
-struct ForgotCallbackWorker;
-
-#[async_trait::async_trait]
-impl Worker for ForgotCallbackWorker {
-    fn kind(&self) -> &'static str {
-        "external_payment"
-    }
-
-    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
-        // Oops! Forgot to call register_callback
-        Ok(JobResult::WaitForCallback)
+        Ok(JobResult::WaitForCallback(callback))
     }
 }
 
@@ -704,33 +688,4 @@ async fn test_e14_migration() {
     migrations::run(&pool).await.unwrap();
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
-}
-
-/// WaitForCallback without register_callback → fails the job with descriptive error
-#[tokio::test]
-async fn test_wait_for_callback_without_register() {
-    let client = setup().await;
-    let queue = "test_wait_no_register";
-    clean_queue(client.pool(), queue).await;
-
-    awa::insert_with(
-        client.pool(),
-        &ExternalPayment { order_id: 99 },
-        awa::InsertOpts {
-            queue: queue.to_string(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    let result = client
-        .work_one_in_queue(&ForgotCallbackWorker, Some(queue))
-        .await
-        .unwrap();
-
-    assert!(
-        result.is_failed(),
-        "Expected failed result when register_callback was not called"
-    );
 }

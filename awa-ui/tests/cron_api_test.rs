@@ -69,13 +69,14 @@ async fn test_cron_api_includes_next_fire_at() {
         "next_fire_at should be a timestamp string, got: {next_fire:?}"
     );
 
-    // Verify it's parseable as a datetime and is in the future
+    // Allow a small boundary slack because next_fire_at is inclusive when the
+    // request lands exactly on a schedule tick.
     let next_fire_str = next_fire.unwrap().as_str().unwrap();
     let next_fire_dt = chrono::DateTime::parse_from_rfc3339(next_fire_str)
         .expect("next_fire_at should be valid RFC3339");
     assert!(
-        next_fire_dt > chrono::Utc::now(),
-        "next_fire_at should be in the future, got {next_fire_dt}"
+        next_fire_dt >= chrono::Utc::now() - chrono::Duration::seconds(1),
+        "next_fire_at should not be stale, got {next_fire_dt}"
     );
 
     // Verify the standard CronJobRow fields are still present (flatten works)

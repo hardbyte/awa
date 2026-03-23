@@ -53,11 +53,11 @@ impl Worker for PlainCallbackWorker {
     }
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let _callback = ctx
+        let callback = ctx
             .register_callback(Duration::from_secs(3600))
             .await
             .map_err(JobError::retryable)?;
-        Ok(JobResult::WaitForCallback)
+        Ok(JobResult::WaitForCallback(callback))
     }
 }
 
@@ -76,11 +76,11 @@ impl Worker for CelCallbackWorker {
     }
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
-        let _callback = ctx
+        let callback = ctx
             .register_callback_with_config(Duration::from_secs(3600), &self.config)
             .await
             .map_err(JobError::retryable)?;
-        Ok(JobResult::WaitForCallback)
+        Ok(JobResult::WaitForCallback(callback))
     }
 }
 

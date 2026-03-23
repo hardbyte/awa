@@ -11,7 +11,7 @@ mod runtime;
 // Re-exports
 pub use awa_model::{CallbackConfig, PeriodicJob, PeriodicJobBuilder};
 pub use client::{BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, QueueHealth};
-pub use context::{CallbackToken, JobContext};
+pub use context::{CallbackGuard, CallbackToken, JobContext};
 pub use dispatcher::{QueueConfig, RateLimit};
 pub use executor::{JobError, JobResult, Worker};
 pub use maintenance::RetentionPolicy;

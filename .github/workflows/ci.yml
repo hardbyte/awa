@@ -190,9 +190,9 @@ jobs:
       - name: Run E2E tests
         run: npx playwright test
 
-  # ─── Phase 0 spike ──────────────────────────────────────
+  # ─── PyO3 Spike ─────────────────────────────────────────
   pyo3-spike:
-    name: Phase 0 PyO3 spike
+    name: PyO3 async bridge spike
     runs-on: ubuntu-latest
     defaults:
       run:
