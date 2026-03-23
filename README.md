@@ -69,7 +69,10 @@ async def main():
     async def handle_email(job):
         print(f"Sending to {job.args.to}: {job.args.subject}")
 
-    await client.insert(SendEmail(to="alice@example.com", subject="Welcome"))
+    await client.insert(
+        SendEmail(to="alice@example.com", subject="Welcome"),
+        queue="email",
+    )
 
     client.start([("email", 2)])
     await asyncio.sleep(1)

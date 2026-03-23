@@ -34,7 +34,10 @@ async def main():
         print(f"Sending email to {job.args.to}: {job.args.subject}")
 
     # Insert a job
-    job = await client.insert(SendEmail(to="alice@example.com", subject="Welcome"))
+    job = await client.insert(
+        SendEmail(to="alice@example.com", subject="Welcome"),
+        queue="email",
+    )
     print(f"Inserted job {job.id} (kind={job.kind}, state={job.state})")
 
     # Start processing
