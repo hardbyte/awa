@@ -66,7 +66,7 @@ async def main() -> None:
     await asyncio.sleep(1)
 
     result = await client.get_job(job.id)
-    print(f"job {result.id} state = {result.state.name}")
+    print(f"job {result.id} state = {result.state}")
 
     await client.shutdown()
 
@@ -84,7 +84,7 @@ Expected output is similar to:
 
 ```text
 sending email to alice@example.com: Welcome
-job 1 state = Completed
+job 1 state = JobState.Completed
 ```
 
 ## 5. Inspect the Queue
