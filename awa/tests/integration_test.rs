@@ -376,6 +376,7 @@ async fn test_work_one_no_job() {
 
 #[tokio::test]
 async fn test_admin_retry() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_retry";
     clean_queue(client.pool(), queue).await;
@@ -412,6 +413,7 @@ async fn test_admin_retry() {
 
 #[tokio::test]
 async fn test_admin_cancel() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_cancel";
     clean_queue(client.pool(), queue).await;
@@ -438,6 +440,7 @@ async fn test_admin_cancel() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_unique_key";
     clean_queue(client.pool(), queue).await;
@@ -483,6 +486,7 @@ async fn test_admin_cancel_by_unique_key() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
 
     let result = admin::cancel_by_unique_key(
@@ -500,6 +504,7 @@ async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_completed";
     clean_queue(client.pool(), queue).await;
@@ -551,6 +556,7 @@ async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_scheduled_job() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_scheduled";
     clean_queue(client.pool(), queue).await;
@@ -602,6 +608,7 @@ async fn test_admin_cancel_by_unique_key_scheduled_job() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_cancels_oldest_when_multiple_exist() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_multi";
     clean_queue(client.pool(), queue).await;
@@ -690,6 +697,7 @@ async fn test_admin_cancel_by_unique_key_cancels_oldest_when_multiple_exist() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_mismatched_queue_returns_none() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_mismatch";
     clean_queue(client.pool(), queue).await;
@@ -734,6 +742,7 @@ async fn test_admin_cancel_by_unique_key_mismatched_queue_returns_none() {
 
 #[tokio::test]
 async fn test_admin_pause_resume_queue() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_pause_resume";
     clean_queue(client.pool(), queue).await;
@@ -761,6 +770,7 @@ async fn test_admin_pause_resume_queue() {
 
 #[tokio::test]
 async fn test_admin_drain_queue() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_drain_queue";
     clean_queue(client.pool(), queue).await;
@@ -796,6 +806,7 @@ async fn test_admin_drain_queue() {
 
 #[tokio::test]
 async fn test_admin_queue_stats() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_queue_stats";
     clean_queue(client.pool(), queue).await;
@@ -1055,6 +1066,7 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
 
 #[tokio::test]
 async fn test_admin_list_jobs() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_list_jobs";
     clean_queue(client.pool(), queue).await;
@@ -1086,6 +1098,7 @@ async fn test_admin_list_jobs() {
 
 #[tokio::test]
 async fn test_admin_runtime_observability_snapshot() {
+    let _guard = test_lock().lock().await;
     let client = setup_with_connections(8).await;
     let queue = "integ_runtime_observability";
     clean_queue(client.pool(), queue).await;
