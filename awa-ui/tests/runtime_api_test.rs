@@ -97,7 +97,10 @@ async fn test_get_runtime_endpoint_returns_runtime_overview() {
     assert_eq!(instance.hostname.as_deref(), Some("runtime-api-worker"));
     assert!(instance.leader);
     assert!(instance.maintenance_alive);
-    assert!(instance.queues.iter().any(|snapshot| snapshot.queue == queue));
+    assert!(instance
+        .queues
+        .iter()
+        .any(|snapshot| snapshot.queue == queue));
 }
 
 #[tokio::test]
@@ -134,9 +137,7 @@ async fn test_get_queue_runtime_endpoint_returns_queue_summary() {
         Some(1)
     );
     assert_eq!(
-        queue_summary
-            .get("total_in_flight")
-            .and_then(Value::as_u64),
+        queue_summary.get("total_in_flight").and_then(Value::as_u64),
         Some(4)
     );
     assert_eq!(
