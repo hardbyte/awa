@@ -130,19 +130,50 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 
     let raw_version = version.unwrap_or(0);
 
-    // Normalize legacy version numbering (V3/V4/V5 → V1/V2/V3)
-    if raw_version > CURRENT_VERSION {
+    // Detect legacy version numbering from pre-0.4 releases (V3/V4/V5).
+    // A legacy DB has rows like 3, 4, 5 in schema_version — any row >= 3
+    // that isn't from the new scheme indicates legacy numbering.
+    let has_legacy: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM awa.schema_version WHERE version IN (4, 5))",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(false);
+
+    // Also detect a single legacy V3 row (0.3.0 with only canonical schema)
+    // by checking if runtime_instances exists — if not, this is legacy V3.
+    let is_legacy_v3_only = raw_version == 3
+        && !has_legacy
+        && {
+            let has_runtime: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(false);
+            !has_runtime
+        };
+
+    if has_legacy || is_legacy_v3_only {
         let normalized = normalize_legacy_version(raw_version);
-        // Insert new version rows so future calls return the new numbering
+        info!(
+            old_version = raw_version,
+            new_version = normalized,
+            "Normalizing legacy version numbering"
+        );
+        // Remove legacy rows and insert canonical ones
+        sqlx::query("DELETE FROM awa.schema_version WHERE version >= 3")
+            .execute(&mut *conn)
+            .await?;
         for &(v, desc, _) in MIGRATIONS {
             if v <= normalized {
-                let _ = sqlx::query(
+                sqlx::query(
                     "INSERT INTO awa.schema_version (version, description) VALUES ($1, $2) ON CONFLICT (version) DO NOTHING",
                 )
                 .bind(v)
                 .bind(desc)
                 .execute(&mut *conn)
-                .await;
+                .await?;
             }
         }
         return Ok(normalized);

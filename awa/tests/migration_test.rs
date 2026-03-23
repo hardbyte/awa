@@ -1,14 +1,23 @@
 //! Migration tests: step-through upgrade, data survival, idempotency,
 //! and migration_sql() consistency.
 //!
-//! These tests use a dedicated test schema to avoid interfering with
-//! other tests that call `migrations::run()` on the shared database.
+//! **Must run with `--test-threads=1`** — these tests drop and recreate
+//! the `awa` schema, which would break concurrent tests.
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::migrations;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
+use std::sync::OnceLock;
+use tokio::sync::Mutex;
+
+/// Serialize all migration tests to prevent parallel schema drops.
+static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+
+fn test_mutex() -> &'static Mutex<()> {
+    TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -36,6 +45,7 @@ async fn reset_schema(pool: &PgPool) {
 
 #[tokio::test]
 async fn test_fresh_install_reaches_current_version() {
+    let _guard = test_mutex().lock().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -48,6 +58,7 @@ async fn test_fresh_install_reaches_current_version() {
 
 #[tokio::test]
 async fn test_migrations_are_idempotent() {
+    let _guard = test_mutex().lock().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -64,6 +75,7 @@ async fn test_migrations_are_idempotent() {
 
 #[tokio::test]
 async fn test_step_through_upgrade_preserves_data() {
+    let _guard = test_mutex().lock().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -146,6 +158,7 @@ async fn test_step_through_upgrade_preserves_data() {
 
 #[tokio::test]
 async fn test_migration_sql_matches_run() {
+    let _guard = test_mutex().lock().await;
     let pool = pool().await;
 
     // Apply via run()
@@ -187,6 +200,7 @@ async fn test_migration_sql_matches_run() {
 
 #[tokio::test]
 async fn test_legacy_version_upgrade() {
+    let _guard = test_mutex().lock().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -232,6 +246,87 @@ async fn test_legacy_version_upgrade() {
         migrations::CURRENT_VERSION,
         "Legacy version should be normalized to current"
     );
+
+    // Verify legacy rows were cleaned up (no 4 or 5 remaining)
+    let max_version: i32 =
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM awa.schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        max_version,
+        migrations::CURRENT_VERSION,
+        "Legacy version rows should be cleaned up, MAX should be {}",
+        migrations::CURRENT_VERSION
+    );
+
+    // Restore
+    migrations::run(&pool).await.unwrap();
+}
+
+// ── Legacy V3-only upgrade (0.3.0 exact, no V4/V5) ──────────────
+
+#[tokio::test]
+async fn test_legacy_v3_only_upgrade() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    // Simulate a 0.3.0 database that only applied the canonical schema (V3)
+    // but never got V4/V5. This is version=3 with no runtime_instances table.
+    let v1_sql = &migrations::migration_sql()[0].2;
+    sqlx::raw_sql(v1_sql).execute(&pool).await.unwrap();
+
+    // Replace version row with legacy numbering (only V3, no V4/V5)
+    sqlx::raw_sql(
+        r#"
+        DELETE FROM awa.schema_version;
+        INSERT INTO awa.schema_version (version, description) VALUES (3, 'Legacy V3 only');
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Verify runtime_instances does NOT exist yet
+    let has_runtime: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !has_runtime,
+        "runtime_instances should not exist in legacy V3"
+    );
+
+    // run() must detect this as legacy and apply V2 + V3
+    migrations::run(&pool).await.unwrap();
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(
+        version,
+        migrations::CURRENT_VERSION,
+        "Legacy V3-only should upgrade to current"
+    );
+
+    // Verify V2 table was created
+    let has_runtime: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_runtime, "runtime_instances should exist after upgrade");
+
+    // Verify V3 column was added
+    let has_col: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'awa' AND table_name = 'runtime_instances' AND column_name = 'maintenance_alive')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_col, "maintenance_alive should exist after upgrade");
 
     // Restore
     migrations::run(&pool).await.unwrap();
