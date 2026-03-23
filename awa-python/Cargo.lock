@@ -126,6 +126,7 @@ dependencies = [
  "chrono",
  "pyo3",
  "pyo3-async-runtimes",
+ "pythonize",
  "serde",
  "serde_json",
  "sqlx",
@@ -1258,6 +1259,16 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "pythonize"
+version = "0.28.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0b79f670c9626c8b651c0581011b57b6ba6970bb69faf01a7c4c0cfc81c43f95"
+dependencies = [
+ "pyo3",
+ "serde",
 ]
 
 [[package]]

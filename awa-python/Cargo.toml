@@ -25,3 +25,4 @@ tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 async-trait = "0.1"
+pythonize = "0.28.0"

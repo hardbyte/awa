@@ -56,6 +56,84 @@ where
     .map(Some)
 }
 
+/// Cancel a job by its unique key components.
+///
+/// Reconstructs the BLAKE3 unique key from the same inputs used at insert time
+/// (kind, optional queue, optional args, optional period bucket), then cancels
+/// the single oldest matching non-terminal job. Returns `None` if no matching
+/// job was found (already completed, already cancelled, or never existed).
+///
+/// The parameters must match what was used at insert time: pass `queue` only if
+/// the original `UniqueOpts` had `by_queue: true`, `args` only if `by_args: true`,
+/// and `period_bucket` only if `by_period` was set. Mismatched components produce
+/// a different hash and the job won't be found.
+///
+/// Only one job is cancelled per call (the oldest by `id`). This is intentional:
+/// unique key enforcement uses a state bitmask, so multiple rows with the same
+/// key can legally coexist (e.g., one `waiting_external` + one `available`).
+/// Cancelling all of them in one shot would be surprising.
+///
+/// This is useful when the caller knows the job kind and args but not the job ID —
+/// e.g., cancelling a scheduled reminder when the triggering condition is resolved.
+///
+/// # Implementation notes
+///
+/// Queries `jobs_hot` and `scheduled_jobs` directly rather than the `awa.jobs`
+/// UNION ALL view, because PostgreSQL does not support `FOR UPDATE` on UNION
+/// views. The CTE selects candidate IDs without row locks; blocking on a
+/// concurrently-locked row (e.g., one being processed by a worker) happens
+/// implicitly during the UPDATE phase via the writable view trigger. If the
+/// worker completes the job before the UPDATE acquires the lock, the state
+/// check (`NOT IN ('completed', 'failed', 'cancelled')`) causes the cancel
+/// to no-op and return `None`.
+///
+/// The lookup scans `unique_key` on both physical tables without a dedicated
+/// index. This is acceptable for low-volume use cases. For high-volume tables,
+/// consider adding a partial index on `unique_key WHERE unique_key IS NOT NULL`
+/// or routing through `job_unique_claims` (which is already indexed).
+pub async fn cancel_by_unique_key<'e, E>(
+    executor: E,
+    kind: &str,
+    queue: Option<&str>,
+    args: Option<&serde_json::Value>,
+    period_bucket: Option<i64>,
+) -> Result<Option<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
+
+    // Find the oldest matching job across both physical tables. CTE selects
+    // candidate IDs without row locks; blocking on concurrently-locked rows
+    // happens implicitly during the UPDATE via the writable view trigger.
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        WITH candidates AS (
+            SELECT id FROM awa.jobs_hot
+            WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+            UNION ALL
+            SELECT id FROM awa.scheduled_jobs
+            WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+            ORDER BY id ASC
+            LIMIT 1
+        )
+        UPDATE awa.jobs
+        SET state = 'cancelled', finalized_at = now(),
+            callback_id = NULL, callback_timeout_at = NULL,
+            callback_filter = NULL, callback_on_complete = NULL,
+            callback_on_fail = NULL, callback_transform = NULL
+        FROM candidates
+        WHERE awa.jobs.id = candidates.id
+        RETURNING awa.jobs.*
+        "#,
+    )
+    .bind(&unique_key)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row)
+}
+
 /// Retry all failed jobs of a given kind.
 pub async fn retry_failed_by_kind<'e, E>(executor: E, kind: &str) -> Result<Vec<JobRow>, AwaError>
 where
