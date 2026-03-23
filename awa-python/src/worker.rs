@@ -113,7 +113,15 @@ fn classify_handler_result(value: Py<PyAny>) -> PyResult<JobResult> {
             let reason: String = result.getattr("reason")?.extract()?;
             Ok(JobResult::Cancel(reason))
         } else if result.is_instance_of::<PyWaitForCallback>() {
-            Ok(JobResult::WaitForCallback)
+            let callback_id: String = result.getattr("callback_id")?.extract()?;
+            let callback_id = uuid::Uuid::parse_str(&callback_id).map_err(|err| {
+                pyo3::exceptions::PyValueError::new_err(format!(
+                    "WaitForCallback received invalid callback_id: {err}"
+                ))
+            })?;
+            Ok(JobResult::WaitForCallback(
+                awa_worker::CallbackGuard::from_bridge_token(callback_id),
+            ))
         } else {
             Ok(JobResult::Completed)
         }

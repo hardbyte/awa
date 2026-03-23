@@ -239,11 +239,11 @@ impl Worker for WaitWithProgressWorker {
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         ctx.set_progress(50, "waiting for callback");
-        let _callback = ctx
+        let callback = ctx
             .register_callback(Duration::from_secs(3600))
             .await
             .map_err(JobError::retryable)?;
-        Ok(JobResult::WaitForCallback)
+        Ok(JobResult::WaitForCallback(callback))
     }
 }
 

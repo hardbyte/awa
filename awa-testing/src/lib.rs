@@ -162,7 +162,7 @@ impl TestClient {
                 .await?;
                 Ok(WorkResult::Snoozed(job))
             }
-            Ok(JobResult::WaitForCallback) => {
+            Ok(JobResult::WaitForCallback(_)) => {
                 // Check if callback_id was registered
                 let has_callback: Option<(Option<uuid::Uuid>,)> =
                     sqlx::query_as("SELECT callback_id FROM awa.jobs WHERE id = $1")

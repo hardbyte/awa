@@ -102,10 +102,11 @@ impl Worker for FailureModeWorker {
                 if ctx.job.attempt == 1 {
                     // Keep the callback parked until the test backdates
                     // callback_timeout_at after verifying waiting_external rows.
-                    ctx.register_callback(Duration::from_secs(3600))
+                    let callback = ctx
+                        .register_callback(Duration::from_secs(3600))
                         .await
                         .map_err(JobError::retryable)?;
-                    Ok(JobResult::WaitForCallback)
+                    Ok(JobResult::WaitForCallback(callback))
                 } else {
                     Ok(JobResult::Completed)
                 }

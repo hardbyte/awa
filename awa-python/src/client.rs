@@ -62,16 +62,23 @@ impl PyCancel {
 }
 
 /// Signal that the job should be parked to wait for an external callback.
-/// The handler must have called `job.register_callback()` before returning this.
+///
+/// Pass the token returned by `job.register_callback()`.
 #[pyclass(frozen, name = "WaitForCallback", skip_from_py_object)]
 #[derive(Debug, Clone)]
-pub struct PyWaitForCallback;
+pub struct PyWaitForCallback {
+    #[pyo3(get)]
+    pub callback_id: String,
+}
 
 #[pymethods]
 impl PyWaitForCallback {
     #[new]
-    fn new() -> Self {
-        Self
+    fn new(py: Python<'_>, token: Py<crate::job::PyCallbackToken>) -> Self {
+        let token = token.bind(py).borrow();
+        Self {
+            callback_id: token.id.clone(),
+        }
     }
 }
 

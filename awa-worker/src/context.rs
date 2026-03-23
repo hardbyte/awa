@@ -7,13 +7,34 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-/// Token representing a registered callback for external webhook completion.
+/// Proof that this job registered an external callback in the database.
 ///
-/// The `id` is a UUID that has been persisted to the database. Pass this ID
-/// to the external system so it can call back to complete/fail/retry the job.
-pub struct CallbackToken {
+/// The public `id` can be sent to the external system. The private field keeps
+/// Rust handlers from constructing this type directly.
+#[derive(Debug, Clone)]
+pub struct CallbackGuard {
     pub id: uuid::Uuid,
+    _private: (),
 }
+
+impl CallbackGuard {
+    fn new(id: uuid::Uuid) -> Self {
+        Self { id, _private: () }
+    }
+
+    /// Return the callback UUID persisted for this job.
+    pub fn id(&self) -> uuid::Uuid {
+        self.id
+    }
+
+    #[doc(hidden)]
+    pub fn from_bridge_token(id: uuid::Uuid) -> Self {
+        Self::new(id)
+    }
+}
+
+#[doc(hidden)]
+pub type CallbackToken = CallbackGuard;
 
 /// Context passed to worker handlers during job execution.
 ///
@@ -98,9 +119,9 @@ impl JobContext {
     /// the race condition where the external system fires before the DB knows
     /// about the callback.
     ///
-    /// Returns a `CallbackToken` whose `id` should be included in the URL or
+    /// Returns a `CallbackGuard` whose `id` should be included in the URL or
     /// payload sent to the external system.
-    pub async fn register_callback(&self, timeout: Duration) -> Result<CallbackToken, AwaError> {
+    pub async fn register_callback(&self, timeout: Duration) -> Result<CallbackGuard, AwaError> {
         let callback_id = awa_model::admin::register_callback(
             &self.pool,
             self.job.id,
@@ -108,7 +129,7 @@ impl JobContext {
             timeout,
         )
         .await?;
-        Ok(CallbackToken { id: callback_id })
+        Ok(CallbackGuard::new(callback_id))
     }
 
     /// Register a callback with CEL expressions for automatic resolution.
@@ -118,7 +139,7 @@ impl JobContext {
         &self,
         timeout: Duration,
         config: &CallbackConfig,
-    ) -> Result<CallbackToken, AwaError> {
+    ) -> Result<CallbackGuard, AwaError> {
         let callback_id = awa_model::admin::register_callback_with_config(
             &self.pool,
             self.job.id,
@@ -127,7 +148,7 @@ impl JobContext {
             config,
         )
         .await?;
-        Ok(CallbackToken { id: callback_id })
+        Ok(CallbackGuard::new(callback_id))
     }
 
     /// Set structured progress (0-100 with message). Sync — writes to in-memory buffer.

@@ -45,7 +45,7 @@ async def test_register_callback_and_wait(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=1), queue=queue)
 
@@ -74,7 +74,7 @@ async def test_complete_external(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=2), queue=queue)
 
@@ -97,7 +97,7 @@ async def test_complete_external_without_payload(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=3), queue=queue)
 
@@ -122,7 +122,7 @@ async def test_fail_external(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=4), queue=queue)
 
@@ -147,7 +147,7 @@ async def test_retry_external(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=5), queue=queue)
 
@@ -172,7 +172,7 @@ async def test_resolve_callback_default_complete(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=6), queue=queue)
 
@@ -198,7 +198,7 @@ async def test_resolve_callback_default_ignore(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     job = await client.insert(ExternalTask(order_id=7), queue=queue)
 
@@ -227,7 +227,7 @@ async def test_resolve_callback_default_fail(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=8), queue=queue)
 
@@ -256,7 +256,7 @@ async def test_complete_external_sync(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=9), queue=queue)
 
@@ -278,7 +278,7 @@ async def test_fail_external_sync(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=10), queue=queue)
 
@@ -300,7 +300,7 @@ async def test_retry_external_sync(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=11), queue=queue)
 
@@ -322,7 +322,7 @@ async def test_resolve_callback_sync(client):
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
-        return awa.WaitForCallback()
+        return awa.WaitForCallback(token)
 
     await client.insert(ExternalTask(order_id=12), queue=queue)
 

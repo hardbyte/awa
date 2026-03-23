@@ -1,5 +1,5 @@
 use crate::completion::CompletionBatcherHandle;
-use crate::context::JobContext;
+use crate::context::{CallbackGuard, JobContext};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use awa_model::{AwaError, JobRow};
 use sqlx::PgPool;
@@ -25,8 +25,10 @@ pub enum JobResult {
     /// Job should be cancelled.
     Cancel(String),
     /// Job is waiting for an external callback (webhook completion).
-    /// The handler must have called `ctx.register_callback()` before returning this.
-    WaitForCallback,
+    ///
+    /// Obtain the required guard from `ctx.register_callback()` or
+    /// `ctx.register_callback_with_config()`.
+    WaitForCallback(CallbackGuard),
 }
 
 /// Error type for job handlers — any error is retryable unless it's terminal.
@@ -260,7 +262,7 @@ impl JobExecutor {
                             );
                         }
                         Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
-                        Ok(JobResult::WaitForCallback) => {
+                        Ok(JobResult::WaitForCallback(_)) => {
                             metrics.jobs_waiting_external.add(
                                 1,
                                 &[
@@ -440,7 +442,7 @@ async fn complete_job(
             }
         }
 
-        Ok(JobResult::WaitForCallback) => {
+        Ok(JobResult::WaitForCallback(_guard)) => {
             info!(
                 job_id = job.id,
                 kind = %job.kind,

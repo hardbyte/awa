@@ -482,10 +482,11 @@ impl Worker for MixedChaosWorker {
             "terminal_fail" => Err(JobError::terminal("intentional chaos failure")),
             "callback_timeout" => {
                 if ctx.job.attempt == 1 {
-                    ctx.register_callback(Duration::from_millis(150))
+                    let callback = ctx
+                        .register_callback(Duration::from_millis(150))
                         .await
                         .map_err(JobError::retryable)?;
-                    Ok(JobResult::WaitForCallback)
+                    Ok(JobResult::WaitForCallback(callback))
                 } else {
                     Ok(JobResult::Completed)
                 }
@@ -543,10 +544,11 @@ impl Worker for CallbackTimeoutWorker {
             // can never expire these callbacks naturally. The test manually
             // backdates callback_timeout_at after killing the leader, making
             // the scenario fully deterministic (no timing race).
-            ctx.register_callback(Duration::from_secs(3600))
+            let callback = ctx
+                .register_callback(Duration::from_secs(3600))
                 .await
                 .map_err(JobError::retryable)?;
-            Ok(JobResult::WaitForCallback)
+            Ok(JobResult::WaitForCallback(callback))
         } else {
             Ok(JobResult::Completed)
         }

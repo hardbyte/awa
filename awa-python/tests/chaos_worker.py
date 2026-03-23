@@ -42,7 +42,7 @@ async def main() -> None:
                     f"WAITING role={role} pid={os.getpid()} job_id={job.id} attempt={job.attempt} callback_id={token.id}",
                     flush=True,
                 )
-                return awa.WaitForCallback()
+                return awa.WaitForCallback(token)
 
         print(
             f"COMPLETE role={role} pid={os.getpid()} job_id={job.id} attempt={job.attempt}",
