@@ -1,8 +1,9 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use tokio::sync::Mutex;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -197,7 +198,7 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
 
 #[tokio::test]
 async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
-    let _guard = test_lock().lock().unwrap();
+    let _guard = test_lock().lock().await;
     let pool = setup_pool().await;
     let suffix = Uuid::new_v4().simple().to_string();
     let queue_a = format!("api_stats_meta_a_{suffix}");
@@ -287,7 +288,7 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
 
 #[tokio::test]
 async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
-    let _guard = test_lock().lock().unwrap();
+    let _guard = test_lock().lock().await;
     let pool = setup_pool().await;
     let queue = "api_queue_stats_rollup";
     clean_jobs(&pool, &[queue], &[]).await;
@@ -367,7 +368,7 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
 #[tokio::test]
 #[ignore = "scale validation"]
 async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
-    let _guard = test_lock().lock().unwrap();
+    let _guard = test_lock().lock().await;
     let pool = setup_pool().await;
     let prefix = "api_scale_";
     seed_scale_fixture(&pool, prefix).await;

@@ -251,10 +251,11 @@ async fn test_legacy_version_upgrade() {
         "Legacy version should be normalized to current"
     );
 
-    let max_version: i32 = sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM awa.schema_version")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let max_version: i32 =
+        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM awa.schema_version")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         max_version,
         migrations::CURRENT_VERSION,
@@ -268,7 +269,10 @@ async fn test_legacy_version_upgrade() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(has_queue_state_counts, "V4 should be applied after normalization");
+    assert!(
+        has_queue_state_counts,
+        "V4 should be applied after normalization"
+    );
 
     migrations::run(&pool).await.unwrap();
 }
@@ -336,7 +340,10 @@ async fn test_legacy_v3_only_upgrade() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(has_queue_state_counts, "queue_state_counts should exist after upgrade");
+    assert!(
+        has_queue_state_counts,
+        "queue_state_counts should exist after upgrade"
+    );
 
     migrations::run(&pool).await.unwrap();
 }

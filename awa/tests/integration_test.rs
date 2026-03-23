@@ -10,8 +10,9 @@ use awa::{
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
 
 fn test_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -848,7 +849,7 @@ async fn test_admin_queue_stats() {
 
 #[tokio::test]
 async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
-    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue_a = "integ_admin_meta_a";
     let queue_b = "integ_admin_meta_b";
@@ -954,7 +955,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
 
 #[tokio::test]
 async fn test_admin_metadata_tracks_scheduled_promotion_path() {
-    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_meta_promote";
     let kind = "integ_admin_meta_promote_kind";
