@@ -81,7 +81,7 @@ async fn get_json(app: &axum::Router, path: &str) -> Value {
     serde_json::from_slice(&body).expect("response should deserialize")
 }
 
-async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
+async fn cleanup_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
     let queue_pattern = format!("{prefix}queue_%");
     let kind_pattern = format!("{prefix}kind_%");
     let mut conn = pool.acquire().await.expect("pool acquire should succeed");
@@ -124,6 +124,20 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
         .execute(&mut *conn)
         .await
         .expect("cleanup job_kind_catalog should succeed");
+}
+
+async fn seed_scale_fixture(
+    pool: &sqlx::PgPool,
+    prefix: &str,
+    scheduled_jobs: i64,
+    available_jobs: i64,
+    completed_jobs: i64,
+    kind_buckets: i64,
+    queue_buckets: i64,
+) {
+    cleanup_scale_fixture(pool, prefix).await;
+
+    let mut conn = pool.acquire().await.expect("pool acquire should succeed");
 
     sqlx::query("SET session_replication_role = replica")
         .execute(&mut *conn)
@@ -134,16 +148,19 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
         r#"
         INSERT INTO awa.scheduled_jobs (kind, queue, args, state, run_at, created_at)
         SELECT
-            format($1 || 'kind_%s', g % 50),
-            format($1 || 'queue_%s', g % 100),
+            format($1 || 'kind_%s', g % $3),
+            format($1 || 'queue_%s', g % $4),
             '{}'::jsonb,
             'scheduled',
             now() + interval '1 day',
             now()
-        FROM generate_series(1, 200000) AS g
+        FROM generate_series(1, $2) AS g
         "#,
     )
     .bind(prefix)
+    .bind(scheduled_jobs)
+    .bind(kind_buckets)
+    .bind(queue_buckets)
     .execute(&mut *conn)
     .await
     .expect("seed scheduled jobs should succeed");
@@ -152,16 +169,19 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
         r#"
         INSERT INTO awa.jobs_hot (kind, queue, args, state, run_at, created_at)
         SELECT
-            format($1 || 'kind_%s', g % 50),
-            format($1 || 'queue_%s', g % 100),
+            format($1 || 'kind_%s', g % $3),
+            format($1 || 'queue_%s', g % $4),
             '{}'::jsonb,
             'available',
             now() - interval '30 seconds',
             now()
-        FROM generate_series(1, 2000) AS g
+        FROM generate_series(1, $2) AS g
         "#,
     )
     .bind(prefix)
+    .bind(available_jobs)
+    .bind(kind_buckets)
+    .bind(queue_buckets)
     .execute(&mut *conn)
     .await
     .expect("seed available jobs should succeed");
@@ -170,17 +190,20 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
         r#"
         INSERT INTO awa.jobs_hot (kind, queue, args, state, run_at, created_at, finalized_at)
         SELECT
-            format($1 || 'kind_%s', g % 50),
-            format($1 || 'queue_%s', g % 100),
+            format($1 || 'kind_%s', g % $3),
+            format($1 || 'queue_%s', g % $4),
             '{}'::jsonb,
             'completed',
             now() - interval '2 hours',
             now() - interval '2 hours',
             now() - interval '5 minutes'
-        FROM generate_series(1, 2000) AS g
+        FROM generate_series(1, $2) AS g
         "#,
     )
     .bind(prefix)
+    .bind(completed_jobs)
+    .bind(kind_buckets)
+    .bind(queue_buckets)
     .execute(&mut *conn)
     .await
     .expect("seed completed jobs should succeed");
@@ -194,6 +217,36 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
         .execute(&mut *conn)
         .await
         .expect("admin metadata rebuild should succeed");
+}
+
+async fn assert_admin_endpoints_within_budget(app: &axum::Router, budget: Duration) {
+    for path in [
+        "/api/stats",
+        "/api/queues",
+        "/api/stats/kinds",
+        "/api/stats/queues",
+    ] {
+        let started = Instant::now();
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(path)
+                    .body(Body::empty())
+                    .expect("request should build"),
+            )
+            .await
+            .expect("request should succeed");
+        let elapsed = started.elapsed();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < budget,
+            "{path} took {:?}, expected under {:?}",
+            elapsed,
+            budget
+        );
+        println!("{path} {:?}", elapsed);
+    }
 }
 
 #[tokio::test]
@@ -366,78 +419,28 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
 }
 
 #[tokio::test]
+async fn test_admin_endpoints_perf_smoke_under_moderate_backlog() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let prefix = "api_perf_smoke_";
+    seed_scale_fixture(&pool, prefix, 20_000, 500, 500, 25, 50).await;
+    let app = awa_ui::router(pool.clone());
+
+    assert_admin_endpoints_within_budget(&app, Duration::from_millis(150)).await;
+
+    cleanup_scale_fixture(&pool, prefix).await;
+}
+
+#[tokio::test]
 #[ignore = "scale validation"]
 async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
     let _guard = test_lock().lock().await;
     let pool = setup_pool().await;
     let prefix = "api_scale_";
-    seed_scale_fixture(&pool, prefix).await;
+    seed_scale_fixture(&pool, prefix, 200_000, 2_000, 2_000, 50, 100).await;
     let app = awa_ui::router(pool.clone());
 
-    for path in [
-        "/api/stats",
-        "/api/queues",
-        "/api/stats/kinds",
-        "/api/stats/queues",
-    ] {
-        let started = Instant::now();
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .uri(path)
-                    .body(Body::empty())
-                    .expect("request should build"),
-            )
-            .await
-            .expect("request should succeed");
-        let elapsed = started.elapsed();
-        assert_eq!(response.status(), StatusCode::OK);
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "{path} took {:?}, expected under 50ms",
-            elapsed
-        );
-        println!("{path} {:?}", elapsed);
-    }
+    assert_admin_endpoints_within_budget(&app, Duration::from_millis(50)).await;
 
-    clean_jobs(&pool, &[], &[]).await;
-    let queue_pattern = format!("{prefix}queue_%");
-    let kind_pattern = format!("{prefix}kind_%");
-    let mut conn = pool.acquire().await.expect("pool acquire should succeed");
-    sqlx::query("SET session_replication_role = replica")
-        .execute(&mut *conn)
-        .await
-        .expect("disable triggers should succeed");
-    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue LIKE $1 OR kind LIKE $2")
-        .bind(&queue_pattern)
-        .bind(&kind_pattern)
-        .execute(&mut *conn)
-        .await
-        .expect("cleanup jobs_hot should succeed");
-    sqlx::query("DELETE FROM awa.scheduled_jobs WHERE queue LIKE $1 OR kind LIKE $2")
-        .bind(&queue_pattern)
-        .bind(&kind_pattern)
-        .execute(&mut *conn)
-        .await
-        .expect("cleanup scheduled_jobs should succeed");
-    sqlx::query("SET session_replication_role = DEFAULT")
-        .execute(&mut *conn)
-        .await
-        .expect("enable triggers should succeed");
-    sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue LIKE $1")
-        .bind(&queue_pattern)
-        .execute(&mut *conn)
-        .await
-        .expect("cleanup queue_state_counts should succeed");
-    sqlx::query("DELETE FROM awa.job_queue_catalog WHERE queue LIKE $1")
-        .bind(&queue_pattern)
-        .execute(&mut *conn)
-        .await
-        .expect("cleanup job_queue_catalog should succeed");
-    sqlx::query("DELETE FROM awa.job_kind_catalog WHERE kind LIKE $1")
-        .bind(&kind_pattern)
-        .execute(&mut *conn)
-        .await
-        .expect("cleanup job_kind_catalog should succeed");
+    cleanup_scale_fixture(&pool, prefix).await;
 }
