@@ -16,55 +16,49 @@
   "panels": [
     {
       "title": "Queue Depth by State",
-      "description": "Current job counts per queue and state",
-      "type": "barchart",
+      "description": "Current job counts per queue, pivoted by state. Sortable — click column headers.",
+      "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "fieldConfig": {
-        "defaults": { "unit": "short" },
+        "defaults": { "unit": "short", "custom": { "align": "right" } },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "available" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "running" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "waiting_external" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "scheduled" }, "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "retryable" }, "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
+          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "available" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "running" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
         ]
       },
-      "options": { "stacking": "normal", "xField": "queue" },
+      "options": { "sortBy": [{ "displayName": "available", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, state::text, count(*)::bigint AS count FROM awa.jobs GROUP BY queue, state ORDER BY queue, state",
+          "rawSql": "SELECT queue, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'running')::bigint AS running, count(*) FILTER (WHERE state = 'completed')::bigint AS completed, count(*) FILTER (WHERE state = 'failed')::bigint AS failed, count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled, count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable, count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_ext, count(*) FILTER (WHERE state = 'cancelled')::bigint AS cancelled FROM awa.jobs GROUP BY queue ORDER BY count(*) FILTER (WHERE state = 'available') DESC",
           "format": "table",
           "refId": "A"
         }
-      ],
-      "transformations": [
-        { "id": "groupingToMatrix", "options": { "columnField": "state", "rowField": "queue", "valueField": "count" } }
       ],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
       "title": "Queue Lag (oldest pending job)",
-      "description": "Age of the oldest available job per queue — high values indicate backlog",
-      "type": "bargauge",
+      "description": "Age of the oldest available job per queue — sorted by lag descending",
+      "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              { "color": "green", "value": null },
-              { "color": "yellow", "value": 60 },
-              { "color": "red", "value": 300 }
-            ]
-          }
-        }
+        "defaults": { "custom": { "align": "right" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 200 }] },
+          { "matcher": { "id": "byName", "options": "lag" }, "properties": [
+            { "id": "unit", "value": "s" },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }] } },
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+          ]},
+          { "matcher": { "id": "byName", "options": "pending" }, "properties": [{ "id": "unit", "value": "short" }] }
+        ]
       },
-      "options": { "orientation": "horizontal", "displayMode": "gradient" },
+      "options": { "sortBy": [{ "displayName": "lag", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, EXTRACT(EPOCH FROM (now() - min(run_at)))::float AS lag_seconds FROM awa.jobs_hot WHERE state = 'available' GROUP BY queue ORDER BY lag_seconds DESC",
+          "rawSql": "SELECT queue, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(run_at)))::float AS lag FROM awa.jobs_hot WHERE state = 'available' GROUP BY queue ORDER BY lag DESC LIMIT 20",
           "format": "table",
           "refId": "A"
         }
