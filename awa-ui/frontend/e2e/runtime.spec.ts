@@ -172,4 +172,104 @@ test.describe("Runtime page", () => {
     await expect(queueGrid.getByText("poll 200ms · deadline 300s · aging 60s")).toBeVisible();
     await expect(queueGrid.getByRole("gridcell", { name: "overflow held 1" })).toBeVisible();
   });
+
+  test("navigates to runtime instance drilldown", async ({ page }) => {
+    await page.route("**/api/runtime", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          total_instances: 1,
+          live_instances: 1,
+          stale_instances: 0,
+          healthy_instances: 1,
+          leader_instances: 1,
+          instances: [
+            {
+              instance_id: "11111111-1111-4111-8111-111111111111",
+              hostname: "worker-a",
+              pid: 101,
+              version: "0.4.0-dev",
+              started_at: "2026-03-23T00:00:00Z",
+              last_seen_at: "2026-03-23T00:00:05Z",
+              snapshot_interval_ms: 10000,
+              stale: false,
+              healthy: true,
+              postgres_connected: true,
+              poll_loop_alive: true,
+              heartbeat_alive: true,
+              maintenance_alive: true,
+              shutting_down: false,
+              leader: true,
+              global_max_workers: 16,
+              queues: [
+                {
+                  queue: "email",
+                  in_flight: 3,
+                  overflow_held: 1,
+                  config: {
+                    mode: "weighted",
+                    max_workers: null,
+                    min_workers: 2,
+                    weight: 3,
+                    global_max_workers: 16,
+                    poll_interval_ms: 200,
+                    deadline_duration_secs: 300,
+                    priority_aging_interval_secs: 60,
+                    rate_limit: { max_rate: 5.5, burst: 10 },
+                  },
+                },
+              ],
+            },
+          ],
+        }),
+      });
+    });
+
+    await page.route("**/api/queues/runtime", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            queue: "email",
+            instance_count: 1,
+            live_instances: 1,
+            stale_instances: 0,
+            healthy_instances: 1,
+            total_in_flight: 3,
+            overflow_held_total: 1,
+            config_mismatch: false,
+            config: {
+              mode: "weighted",
+              max_workers: null,
+              min_workers: 2,
+              weight: 3,
+              global_max_workers: 16,
+              poll_interval_ms: 200,
+              deadline_duration_secs: 300,
+              priority_aging_interval_secs: 60,
+              rate_limit: { max_rate: 5.5, burst: 10 },
+            },
+          },
+        ]),
+      });
+    });
+
+    await page.goto("/runtime");
+    const instancesGrid = page.getByRole("grid", { name: "Runtime instances" });
+    await instancesGrid.getByRole("link", { name: "View details" }).click();
+
+    await expect(page).toHaveURL(/\/runtime\/11111111-1111-4111-8111-111111111111$/);
+    await expect(page.getByRole("heading", { name: "worker-a" })).toBeVisible();
+    await expect(page.getByText("Instance Summary")).toBeVisible();
+    await expect(page.getByText("11111111-1111-4111-8111-111111111111")).toBeVisible();
+    await expect(page.getByText("Loop Health")).toBeVisible();
+    await expect(page.getByText("Queues On This Instance")).toBeVisible();
+    const assignmentsGrid = page.getByRole("grid", {
+      name: "Runtime queue assignments",
+    });
+    await expect(assignmentsGrid).toBeVisible();
+    await expect(
+      assignmentsGrid.getByText("poll 200ms · deadline 300s · aging 60s")
+    ).toBeVisible();
+  });
 });
