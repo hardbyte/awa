@@ -67,6 +67,10 @@ where
 ///
 /// This is useful when the caller knows the job kind and args but not the job ID —
 /// e.g., cancelling a scheduled reminder when the triggering condition is resolved.
+///
+/// Note: queries `jobs_hot` and `scheduled_jobs` directly rather than the
+/// `awa.jobs` UNION ALL view, because `FOR UPDATE` is not supported on UNION
+/// views in PostgreSQL.
 pub async fn cancel_by_unique_key<'e, E>(
     executor: E,
     kind: &str,
@@ -79,22 +83,28 @@ where
 {
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
+    // Find the oldest matching job across both physical tables. We cannot use
+    // FOR UPDATE on the UNION ALL view, and we want to block (not skip) if the
+    // row is locked by a running worker — the cancel should wait for the handler
+    // to finish rather than silently returning None.
     let row = sqlx::query_as::<_, JobRow>(
         r#"
-        WITH target AS (
-            SELECT id FROM awa.jobs
+        WITH candidates AS (
+            SELECT id FROM awa.jobs_hot
+            WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+            UNION ALL
+            SELECT id FROM awa.scheduled_jobs
             WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
             ORDER BY id ASC
             LIMIT 1
-            FOR UPDATE SKIP LOCKED
         )
         UPDATE awa.jobs
         SET state = 'cancelled', finalized_at = now(),
             callback_id = NULL, callback_timeout_at = NULL,
             callback_filter = NULL, callback_on_complete = NULL,
             callback_on_fail = NULL, callback_transform = NULL
-        FROM target
-        WHERE awa.jobs.id = target.id
+        FROM candidates
+        WHERE awa.jobs.id = candidates.id
         RETURNING awa.jobs.*
         "#,
     )
