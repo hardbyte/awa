@@ -68,6 +68,15 @@ export function RuntimePage() {
 
   const runtime = runtimeQuery.data;
   const queues = queueRuntimeQuery.data ?? [];
+  const staleInstances = runtime?.instances.filter((instance) => instance.stale) ?? [];
+  const degradedInstances =
+    runtime?.instances.filter((instance) => !instance.stale && !instance.healthy) ?? [];
+  const mismatchQueues = queues.filter((queue) => queue.config_mismatch);
+  const hasAttention =
+    (runtime?.leader_instances ?? 0) !== 1 ||
+    staleInstances.length > 0 ||
+    degradedInstances.length > 0 ||
+    mismatchQueues.length > 0;
 
   return (
     <div className="space-y-6">
@@ -114,6 +123,68 @@ export function RuntimePage() {
         </CardContent>
       </Card>
 
+      {hasAttention && (
+        <Card>
+          <CardHeader
+            title="Attention Needed"
+            description="These states usually need an operator decision rather than passive observation"
+          />
+          <CardContent className="space-y-3">
+            {(runtime?.leader_instances ?? 0) !== 1 && (
+              <div className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-3 text-sm">
+                <div className="font-medium text-warning-subtle-fg">
+                  Leader status is unexpected
+                </div>
+                <div className="mt-1 text-warning-subtle-fg/80">
+                  Expected exactly one maintenance leader, found {runtime?.leader_instances ?? 0}.
+                </div>
+              </div>
+            )}
+            {degradedInstances.length > 0 && (
+              <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm">
+                <div className="font-medium text-danger-subtle-fg">
+                  {degradedInstances.length} degraded instance{degradedInstances.length === 1 ? "" : "s"}
+                </div>
+                <div className="mt-1 text-danger-subtle-fg/80">
+                  {degradedInstances
+                    .slice(0, 3)
+                    .map((instance) => instanceLabel(instance))
+                    .join(", ")}
+                </div>
+              </div>
+            )}
+            {staleInstances.length > 0 && (
+              <div className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-3 text-sm">
+                <div className="font-medium text-warning-subtle-fg">
+                  {staleInstances.length} stale instance{staleInstances.length === 1 ? "" : "s"}
+                </div>
+                <div className="mt-1 text-warning-subtle-fg/80">
+                  Snapshot age exceeded the stale window. Instance may have crashed or lost database connectivity.
+                </div>
+              </div>
+            )}
+            {mismatchQueues.length > 0 && (
+              <div className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-3 text-sm">
+                <div className="font-medium text-warning-subtle-fg">
+                  Queue config mismatch detected
+                </div>
+                <div className="mt-1 flex flex-wrap gap-2 text-warning-subtle-fg/80">
+                  {mismatchQueues.map((queue) => (
+                    <Link
+                      key={queue.queue}
+                      to="/queues"
+                      className="text-primary no-underline hover:underline"
+                    >
+                      {queue.queue}
+                    </Link>
+                  ))}
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      )}
+
       <Card>
         <CardHeader
           title="Instances"
@@ -121,7 +192,41 @@ export function RuntimePage() {
         />
         <CardContent>
           {runtime && runtime.instances.length > 0 ? (
-            <Table aria-label="Runtime instances">
+            <>
+            <div className="space-y-3 sm:hidden">
+              {runtime.instances.map((instance) => (
+                <div key={instance.instance_id} className="rounded-lg border p-4">
+                  <div className="flex items-start justify-between gap-3">
+                    <div>
+                      <div className="font-medium">{instanceLabel(instance)}</div>
+                      <div className="text-xs text-muted-fg">
+                        {instance.version} · pid {instance.pid}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap gap-1">
+                      {healthBadge(instance)}
+                      {instance.leader && <Badge intent="primary">Leader</Badge>}
+                    </div>
+                  </div>
+                  <div className="mt-3 flex flex-wrap gap-1">
+                    {loopBadge("poll", instance.poll_loop_alive)}
+                    {loopBadge("heartbeat", instance.heartbeat_alive)}
+                    {loopBadge("maintenance", instance.maintenance_alive)}
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                    <span className="text-muted-fg">Snapshot</span>
+                    <span>{timeAgo(instance.last_seen_at)}</span>
+                    <span className="text-muted-fg">Interval</span>
+                    <span>{formatSnapshotInterval(instance.snapshot_interval_ms)}</span>
+                    <span className="text-muted-fg">Started</span>
+                    <span>{timeAgo(instance.started_at)}</span>
+                    <span className="text-muted-fg">Queues</span>
+                    <span>{instance.queues.length}</span>
+                  </div>
+                </div>
+              ))}
+            </div>
+            <Table aria-label="Runtime instances" className="hidden sm:table">
               <TableHeader>
                 <TableColumn isRowHeader>Instance</TableColumn>
                 <TableColumn>Health</TableColumn>
@@ -172,8 +277,11 @@ export function RuntimePage() {
                 ))}
               </TableBody>
             </Table>
+            </>
           ) : runtimeQuery.isLoading ? (
             <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
+          ) : runtimeQuery.isError ? (
+            <p className="py-4 text-sm text-danger">Failed to load runtime snapshots.</p>
           ) : (
             <p className="py-4 text-sm text-muted-fg">
               No runtime snapshots yet. Start a worker to populate this view.
@@ -195,7 +303,55 @@ export function RuntimePage() {
         </CardHeader>
         <CardContent>
           {queues.length > 0 ? (
-            <Table aria-label="Queue runtime summary">
+            <>
+            <div className="space-y-3 sm:hidden">
+              {queues.map((queue) => (
+                <div key={queue.queue} className="rounded-lg border p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <Link
+                      to="/jobs"
+                      search={{ q: `queue:${queue.queue}` }}
+                      className="font-medium text-primary no-underline hover:underline"
+                    >
+                      {queue.queue}
+                    </Link>
+                    {queue.config ? (
+                      <Badge intent={queue.config.mode === "weighted" ? "secondary" : "outline"}>
+                        {queue.config.mode === "weighted" ? "Weighted" : "Reserved"}
+                      </Badge>
+                    ) : (
+                      <Badge intent="outline">Unknown</Badge>
+                    )}
+                  </div>
+                  <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                    <span className="text-muted-fg">Capacity</span>
+                    <span>{queueCapacityLabel(queue)}</span>
+                    <span className="text-muted-fg">Rate limit</span>
+                    <span>{rateLimitLabel(queue)}</span>
+                    <span className="text-muted-fg">In flight</span>
+                    <span>{queue.total_in_flight}</span>
+                    <span className="text-muted-fg">Nodes</span>
+                    <span>{queue.healthy_instances}/{queue.live_instances || queue.instance_count} healthy</span>
+                    <span className="text-muted-fg">Config</span>
+                    <span>
+                      {queue.config_mismatch
+                        ? "Mismatch"
+                        : queue.config
+                          ? "Synced"
+                          : "Unknown"}
+                    </span>
+                  </div>
+                  <div className="mt-3 text-sm text-muted-fg">
+                    {queue.stale_instances > 0
+                      ? `${queue.stale_instances} stale node snapshot(s)`
+                      : queue.overflow_held_total != null
+                        ? `Overflow held ${queue.overflow_held_total}`
+                        : "No additional runtime notes"}
+                  </div>
+                </div>
+              ))}
+            </div>
+            <Table aria-label="Queue runtime summary" className="hidden sm:table">
               <TableHeader>
                 <TableColumn isRowHeader>Queue</TableColumn>
                 <TableColumn>Mode</TableColumn>
@@ -252,8 +408,11 @@ export function RuntimePage() {
                 ))}
               </TableBody>
             </Table>
+            </>
           ) : queueRuntimeQuery.isLoading ? (
             <p className="py-4 text-sm text-muted-fg">Loading queue runtime...</p>
+          ) : queueRuntimeQuery.isError ? (
+            <p className="py-4 text-sm text-danger">Failed to load queue runtime snapshots.</p>
           ) : (
             <p className="py-4 text-sm text-muted-fg">
               No queue runtime snapshots yet.
