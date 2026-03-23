@@ -1,5 +1,6 @@
 use crate::completion::CompletionBatcherHandle;
 use crate::context::{CallbackGuard, JobContext};
+use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use awa_model::{AwaError, JobRow};
 use sqlx::PgPool;
@@ -7,6 +8,7 @@ use std::any::Any;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
@@ -130,10 +132,20 @@ pub trait Worker: Send + Sync + 'static {
 /// Type-erased worker wrapper for the registry.
 pub(crate) type BoxedWorker = Box<dyn Worker>;
 
+/// Result of a state-transition attempt in `complete_job`.
+#[allow(clippy::large_enum_variant)]
+enum CompletionOutcome {
+    /// The DB update was applied; optionally carries a lifecycle event to dispatch.
+    Applied { event: Option<UntypedJobEvent> },
+    /// The job was already rescued/cancelled — stale completion, no event.
+    IgnoredStale,
+}
+
 /// Manages job execution — spawns worker futures and tracks in-flight jobs.
 pub struct JobExecutor {
     pool: PgPool,
     workers: Arc<HashMap<String, BoxedWorker>>,
+    lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
@@ -142,9 +154,11 @@ pub struct JobExecutor {
 }
 
 impl JobExecutor {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pool: PgPool,
         workers: Arc<HashMap<String, BoxedWorker>>,
+        lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
         in_flight: InFlightMap,
         queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
@@ -154,6 +168,7 @@ impl JobExecutor {
         Self {
             pool,
             workers,
+            lifecycle_handlers,
             in_flight,
             queue_in_flight,
             state,
@@ -172,6 +187,7 @@ impl JobExecutor {
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let pool = self.pool.clone();
         let workers = self.workers.clone();
+        let lifecycle_handlers = self.lifecycle_handlers.clone();
         let in_flight = self.in_flight.clone();
         let queue_in_flight = self.queue_in_flight.clone();
         let state = self.state.clone();
@@ -239,8 +255,20 @@ impl JobExecutor {
 
             // Complete the job based on the result, then record metrics
             // only if the state transition actually happened (not stale).
-            match complete_job(&pool, &job, &result, &completion_batcher, progress_snapshot).await {
-                Ok(true) => {
+            let has_lifecycle_handlers = lifecycle_handlers.contains_key(&job_kind);
+            let outcome = complete_job(
+                &pool,
+                &job,
+                &result,
+                &completion_batcher,
+                progress_snapshot,
+                duration,
+                has_lifecycle_handlers,
+            )
+            .await;
+
+            match &outcome {
+                Ok(CompletionOutcome::Applied { .. }) => {
                     // State transition succeeded — record metrics
                     match &result {
                         Ok(JobResult::Completed) => {
@@ -282,7 +310,7 @@ impl JobExecutor {
                         }
                     }
                 }
-                Ok(false) => {
+                Ok(CompletionOutcome::IgnoredStale) => {
                     // Job was already rescued/cancelled — no metrics
                 }
                 Err(err) => {
@@ -290,12 +318,27 @@ impl JobExecutor {
                 }
             }
 
-            // Remove from in-flight
+            // Remove from in-flight BEFORE dispatching lifecycle events.
+            // This ensures a slow/hung handler doesn't hold the permit open,
+            // block queue capacity, or delay graceful shutdown.
             in_flight.remove((job_id, job_run_lease));
             if let Some(counter) = queue_in_flight.get(&job_queue) {
                 counter.fetch_sub(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, -1);
+
+            // Dispatch lifecycle event as a detached task — best effort,
+            // does not block the executor or affect shutdown drain.
+            if let Ok(CompletionOutcome::Applied {
+                event: Some(event), ..
+            }) = outcome
+            {
+                let handlers = lifecycle_handlers.clone();
+                let kind = job_kind.clone();
+                tokio::spawn(async move {
+                    dispatch_lifecycle_event(&handlers, &kind, event).await;
+                });
+            }
         }
         .instrument(span)
     }
@@ -303,15 +346,17 @@ impl JobExecutor {
 
 /// Update job state in the database based on handler result.
 ///
-/// Returns `true` if the state transition happened, `false` if the job was
-/// already rescued/cancelled by maintenance (stale completion).
+/// Returns a `CompletionOutcome` indicating whether the state transition was
+/// applied (with an optional lifecycle event) or ignored as stale.
 async fn complete_job(
     pool: &PgPool,
     job: &JobRow,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
     progress_snapshot: Option<serde_json::Value>,
-) -> Result<bool, AwaError> {
+    duration: Duration,
+    needs_event: bool,
+) -> Result<CompletionOutcome, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");
@@ -332,12 +377,26 @@ async fn complete_job(
                     job_id = job.id,
                     "Job already rescued/cancelled, completion ignored"
                 );
-                return Ok(false);
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
+            if needs_event {
+                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                    .bind(job.id)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(CompletionOutcome::Applied {
+                    event: Some(UntypedJobEvent::Completed {
+                        job: updated_job,
+                        duration,
+                    }),
+                })
+            } else {
+                Ok(CompletionOutcome::Applied { event: None })
             }
         }
 
-        Ok(JobResult::RetryAfter(duration)) => {
-            let seconds = duration.as_secs() as f64;
+        Ok(JobResult::RetryAfter(retry_duration)) => {
+            let seconds = retry_duration.as_secs() as f64;
             info!(
                 job_id = job.id,
                 kind = %job.kind,
@@ -365,12 +424,28 @@ async fn complete_job(
                     job_id = job.id,
                     "Job already rescued/cancelled, retry ignored"
                 );
-                return Ok(false);
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
+            if needs_event {
+                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                    .bind(job.id)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(CompletionOutcome::Applied {
+                    event: Some(UntypedJobEvent::Retried {
+                        job: updated_job.clone(),
+                        error: String::new(),
+                        attempt: updated_job.attempt,
+                        next_run_at: updated_job.run_at,
+                    }),
+                })
+            } else {
+                Ok(CompletionOutcome::Applied { event: None })
             }
         }
 
-        Ok(JobResult::Snooze(duration)) => {
-            let seconds = duration.as_secs() as f64;
+        Ok(JobResult::Snooze(snooze_duration)) => {
+            let seconds = snooze_duration.as_secs() as f64;
             info!(
                 job_id = job.id,
                 kind = %job.kind,
@@ -402,8 +477,10 @@ async fn complete_job(
                     job_id = job.id,
                     "Job already rescued/cancelled, snooze ignored"
                 );
-                return Ok(false);
+                return Ok(CompletionOutcome::IgnoredStale);
             }
+            // Snooze is not a terminal event — no lifecycle event
+            Ok(CompletionOutcome::Applied { event: None })
         }
 
         Ok(JobResult::Cancel(reason)) => {
@@ -438,7 +515,21 @@ async fn complete_job(
                     job_id = job.id,
                     "Job already rescued/cancelled, cancel ignored"
                 );
-                return Ok(false);
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
+            if needs_event {
+                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                    .bind(job.id)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(CompletionOutcome::Applied {
+                    event: Some(UntypedJobEvent::Cancelled {
+                        job: updated_job,
+                        reason: reason.clone(),
+                    }),
+                })
+            } else {
+                Ok(CompletionOutcome::Applied { event: None })
             }
         }
 
@@ -481,7 +572,8 @@ async fn complete_job(
                             state = %state,
                             "Job already completed by racing callback"
                         );
-                        return Ok(true);
+                        // No lifecycle event for wait-for-callback
+                        return Ok(CompletionOutcome::Applied { event: None });
                     }
                     Some((_, None)) => {
                         // Still running but no callback_id — programming error
@@ -508,17 +600,20 @@ async fn complete_job(
                         .bind(job.run_lease)
                         .execute(pool)
                         .await?;
-                        return Ok(true);
+                        // No lifecycle event for wait-for-callback
+                        return Ok(CompletionOutcome::Applied { event: None });
                     }
                     _ => {
                         warn!(
                             job_id = job.id,
                             "Job already rescued/cancelled, wait-for-callback ignored"
                         );
-                        return Ok(false);
+                        return Ok(CompletionOutcome::IgnoredStale);
                     }
                 }
             }
+            // No lifecycle event for wait-for-callback
+            Ok(CompletionOutcome::Applied { event: None })
         }
 
         Err(JobError::Terminal(msg)) => {
@@ -555,7 +650,22 @@ async fn complete_job(
                     job_id = job.id,
                     "Job already rescued/cancelled, terminal failure ignored"
                 );
-                return Ok(false);
+                return Ok(CompletionOutcome::IgnoredStale);
+            }
+            if needs_event {
+                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                    .bind(job.id)
+                    .fetch_one(pool)
+                    .await?;
+                Ok(CompletionOutcome::Applied {
+                    event: Some(UntypedJobEvent::Exhausted {
+                        job: updated_job,
+                        error: msg.clone(),
+                        attempt: job.attempt,
+                    }),
+                })
+            } else {
+                Ok(CompletionOutcome::Applied { event: None })
             }
         }
 
@@ -596,7 +706,23 @@ async fn complete_job(
                         job_id = job.id,
                         "Job already rescued/cancelled, failure ignored"
                     );
-                    return Ok(false);
+                    return Ok(CompletionOutcome::IgnoredStale);
+                }
+                if needs_event {
+                    let updated_job: JobRow =
+                        sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                            .bind(job.id)
+                            .fetch_one(pool)
+                            .await?;
+                    Ok(CompletionOutcome::Applied {
+                        event: Some(UntypedJobEvent::Exhausted {
+                            job: updated_job,
+                            error: error_msg,
+                            attempt: job.attempt,
+                        }),
+                    })
+                } else {
+                    Ok(CompletionOutcome::Applied { event: None })
                 }
             } else {
                 warn!(
@@ -637,13 +763,57 @@ async fn complete_job(
                         job_id = job.id,
                         "Job already rescued/cancelled, retry ignored"
                     );
-                    return Ok(false);
+                    return Ok(CompletionOutcome::IgnoredStale);
+                }
+                if needs_event {
+                    let updated_job: JobRow =
+                        sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                            .bind(job.id)
+                            .fetch_one(pool)
+                            .await?;
+                    Ok(CompletionOutcome::Applied {
+                        event: Some(UntypedJobEvent::Retried {
+                            job: updated_job.clone(),
+                            error: error_msg,
+                            attempt: job.attempt,
+                            next_run_at: updated_job.run_at,
+                        }),
+                    })
+                } else {
+                    Ok(CompletionOutcome::Applied { event: None })
                 }
             }
         }
     }
+}
 
-    Ok(true)
+/// Dispatch a lifecycle event to all registered handlers for a job kind.
+///
+/// Handlers are called sequentially. Panics are caught and logged — a
+/// misbehaving handler cannot crash the dispatch loop or lose events
+/// for subsequent handlers.
+async fn dispatch_lifecycle_event(
+    handlers: &HashMap<String, Vec<BoxedUntypedEventHandler>>,
+    kind: &str,
+    event: UntypedJobEvent,
+) {
+    if let Some(handlers) = handlers.get(kind) {
+        for handler in handlers {
+            let handler = handler.clone();
+            let event = event.clone();
+            let result = tokio::spawn(async move {
+                (handler)(event).await;
+            })
+            .await;
+            if let Err(err) = result {
+                tracing::warn!(
+                    kind,
+                    error = %err,
+                    "Lifecycle event handler panicked"
+                );
+            }
+        }
+    }
 }
 
 async fn direct_complete_job(pool: &PgPool, job: &JobRow) -> Result<bool, AwaError> {
