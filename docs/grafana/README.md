@@ -9,12 +9,13 @@ A pre-built Grafana dashboard for monitoring Awa job queue metrics via Prometheu
 | **Job Throughput** | Time series | Completed, failed, retried, cancelled jobs/sec |
 | **In-Flight Jobs** | Time series | Currently executing jobs by queue (stacked) |
 | **Job Duration (p50/p95/p99)** | Time series | Execution time percentiles by queue |
-| **Throughput by Kind** | Stacked bars | Completed jobs/sec by job kind |
+| **Throughput by Kind (top 10)** | Stacked bars | Completed jobs/sec by job kind (capped at 10) |
 | **Claim Latency** | Time series | Postgres dequeue query time (p50/p95) |
 | **Claim Batch Size** | Time series | Average jobs claimed per poll cycle |
 | **Maintenance Rescues** | Bars | Heartbeat, deadline, callback_timeout rescues |
 | **Completion Flush Performance** | Time series | Batch completion write latency |
-| **Promotion Batches** | Time series | Scheduled/retryable job promotion rate |
+| **Promotion Throughput** | Time series | Scheduled/retryable jobs promoted per second |
+| **Jobs Inserted / Waiting External** | Time series | Insertion rate and callback-parked job rate |
 | **Error Rate** | Stat | Failed / (completed + failed) percentage |
 | **Jobs In Flight** | Stat | Total executing jobs with threshold colours |
 | **Throughput** | Stat | Total completed/sec (5m average) |
@@ -57,9 +58,10 @@ Copy `awa-dashboard.json` to your Grafana provisioning directory:
 
 **Option C: API**
 ```bash
+# The Grafana API requires a wrapper object around the dashboard JSON
 curl -X POST "http://admin:admin@localhost:3000/api/dashboards/db" \
   -H "Content-Type: application/json" \
-  -d @awa-dashboard.json
+  -d "{\"dashboard\": $(cat awa-dashboard.json), \"overwrite\": true}"
 ```
 
 ### 3. Verify metrics are flowing

@@ -33,16 +33,16 @@
         ]
       },
       "targets": [
-        { "expr": "sum(rate(awa_job_completed_total[$__rate_interval]))", "legendFormat": "completed" },
-        { "expr": "sum(rate(awa_job_failed_total[$__rate_interval]))", "legendFormat": "failed" },
-        { "expr": "sum(rate(awa_job_retried_total[$__rate_interval]))", "legendFormat": "retried" },
-        { "expr": "sum(rate(awa_job_cancelled_total[$__rate_interval]))", "legendFormat": "cancelled" }
+        { "expr": "sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "completed" },
+        { "expr": "sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "failed" },
+        { "expr": "sum(rate(awa_job_retried_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "retried" },
+        { "expr": "sum(rate(awa_job_cancelled_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "cancelled" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
     {
       "title": "In-Flight Jobs",
-      "description": "Currently executing jobs by queue",
+      "description": "Currently executing jobs by queue (summed across all worker instances)",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "fieldConfig": {
@@ -52,7 +52,7 @@
         }
       },
       "targets": [
-        { "expr": "awa_job_in_flight", "legendFormat": "{{awa_job_queue}}" }
+        { "expr": "sum by (awa_job_queue) (awa_job_in_flight{awa_job_queue=~\"$queue\"})", "legendFormat": "{{awa_job_queue}}" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -68,14 +68,14 @@
         }
       },
       "targets": [
-        { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
-        { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" },
-        { "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p99 {{awa_job_queue}}" }
+        { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" },
+        { "expr": "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p99 {{awa_job_queue}}" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
     {
-      "title": "Throughput by Kind",
+      "title": "Throughput by Kind (top 10)",
       "description": "Completed jobs per second broken down by job kind",
       "type": "timeseries",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
@@ -86,7 +86,7 @@
         }
       },
       "targets": [
-        { "expr": "sum by (awa_job_kind) (rate(awa_job_completed_total[$__rate_interval]))", "legendFormat": "{{awa_job_kind}}" }
+        { "expr": "topk(10, sum by (awa_job_kind) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "{{awa_job_kind}}" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -102,8 +102,8 @@
         }
       },
       "targets": [
-        { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
-        { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" }
+        { "expr": "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p50 {{awa_job_queue}}" },
+        { "expr": "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{awa_job_queue=~\"$queue\"}[$__rate_interval])))", "legendFormat": "p95 {{awa_job_queue}}" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -119,7 +119,7 @@
         }
       },
       "targets": [
-        { "expr": "sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_sum[$__rate_interval])) / sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_count[$__rate_interval]))", "legendFormat": "avg {{awa_job_queue}}" }
+        { "expr": "sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_sum{awa_job_queue=~\"$queue\"}[$__rate_interval])) / sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_count{awa_job_queue=~\"$queue\"}[$__rate_interval]))", "legendFormat": "avg {{awa_job_queue}}" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -146,9 +146,9 @@
     },
     {
       "title": "Completion Flush Performance",
-      "description": "Batch completion flush duration and size",
+      "description": "Batch completion flush duration (p50/p95)",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 24 },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 24 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",
@@ -162,10 +162,10 @@
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
     {
-      "title": "Promotion Batches",
-      "description": "Scheduled/retryable job promotion throughput",
+      "title": "Promotion Throughput",
+      "description": "Scheduled/retryable jobs promoted per second",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 24 },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 24 },
       "fieldConfig": {
         "defaults": {
           "unit": "ops",
@@ -174,6 +174,27 @@
       },
       "targets": [
         { "expr": "sum by (awa_job_state) (rate(awa_maintenance_promote_batch_size_sum[$__rate_interval]))", "legendFormat": "{{awa_job_state}} promoted/s" }
+      ],
+      "datasource": { "uid": "${DS_PROMETHEUS}" }
+    },
+    {
+      "title": "Jobs Inserted / Waiting External",
+      "description": "Job insertion rate and callback-parked jobs",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "inserted" }, "properties": [{ "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "waiting_external" }, "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+        ]
+      },
+      "targets": [
+        { "expr": "sum(rate(awa_job_inserted_total[$__rate_interval]))", "legendFormat": "inserted" },
+        { "expr": "sum(rate(awa_job_waiting_external_total[$__rate_interval]))", "legendFormat": "waiting_external" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -196,13 +217,13 @@
         }
       },
       "targets": [
-        { "expr": "sum(rate(awa_job_failed_total[5m])) / (sum(rate(awa_job_completed_total[5m])) + sum(rate(awa_job_failed_total[5m])) + 1e-10)", "legendFormat": "error rate" }
+        { "expr": "sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[5m])) / (sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[5m])) + sum(rate(awa_job_failed_total{awa_job_queue=~\"$queue\"}[5m])) + 1e-10)", "legendFormat": "error rate" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
     {
       "title": "Jobs In Flight",
-      "description": "Total jobs currently executing",
+      "description": "Total jobs currently executing across all instances",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 4, "y": 32 },
       "fieldConfig": {
@@ -219,7 +240,7 @@
         }
       },
       "targets": [
-        { "expr": "sum(awa_job_in_flight)", "legendFormat": "in flight" }
+        { "expr": "sum(awa_job_in_flight{awa_job_queue=~\"$queue\"})", "legendFormat": "in flight" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -240,7 +261,7 @@
         }
       },
       "targets": [
-        { "expr": "sum(rate(awa_job_completed_total[5m]))", "legendFormat": "completed/s" }
+        { "expr": "sum(rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[5m]))", "legendFormat": "completed/s" }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
     },
@@ -290,5 +311,5 @@
   "timezone": "",
   "title": "Awa Job Queue",
   "uid": "awa-job-queue",
-  "version": 1
+  "version": 2
 }
