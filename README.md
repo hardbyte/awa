@@ -160,7 +160,7 @@ pip install awa-cli      # CLI: migrations, queue admin, web UI
 
 ```toml
 [dependencies]
-awa = "0.2"
+awa = "0.3"
 ```
 
 ### CLI
