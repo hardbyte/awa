@@ -42,6 +42,11 @@ awa --database-url $DATABASE_URL migrate
 awa --database-url $DATABASE_URL serve   # → http://127.0.0.1:3000
 ```
 
+Language-specific guides:
+
+- [Rust getting started](docs/getting-started-rust.md)
+- [Python getting started](docs/getting-started-python.md)
+
 ## Python Example
 
 <!-- Tested in CI via awa-python/examples/quickstart.py -->
@@ -218,6 +223,12 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 
 | Doc | Description |
 |---|---|
+| [Rust getting started](docs/getting-started-rust.md) | From `cargo add` to a job reaching `completed` |
+| [Python getting started](docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
+| [Deployment guide](docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
+| [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
+| [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
+| [Troubleshooting](docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
 | [Architecture overview](docs/architecture.md) | System design, data flow, state machine, crash recovery |
 | [Web UI design](docs/ui-design.md) | API endpoints, pages, component library |
 | [Benchmarking notes](docs/benchmarking.md) | Methodology, headline numbers, how to run |
