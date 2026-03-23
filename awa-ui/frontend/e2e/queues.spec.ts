@@ -16,9 +16,18 @@ test.describe("Queues page", () => {
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
-    for (const header of ["Queue", "Available", "Running", "Failed", "Status"]) {
+    for (const header of [
+      "Queue",
+      "Total queued",
+      "Scheduled",
+      "Retryable",
+      "Available",
+      "Running",
+      "Failed",
+      "Status",
+    ]) {
       await expect(
-        queueTable.getByRole("columnheader", { name: header })
+        queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();
     }
 
@@ -35,10 +44,10 @@ test.describe("Queues page", () => {
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
-    // New runtime columns should be present
-    for (const header of ["Mode", "Capacity", "Rate limit"]) {
+    // Queue health and runtime columns should be present
+    for (const header of ["Mode", "Capacity", "Rate limit", "Waiting"]) {
       await expect(
-        queueTable.getByRole("columnheader", { name: header })
+        queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();
     }
   });

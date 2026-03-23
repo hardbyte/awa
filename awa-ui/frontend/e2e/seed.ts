@@ -13,6 +13,15 @@ const databaseUrl =
   "postgres://postgres:test@localhost:15432/awa_test";
 
 export default async function globalSetup() {
+  try {
+    execSync(`${awaBinary} --database-url ${databaseUrl} migrate`, {
+      stdio: "pipe",
+      timeout: 30_000,
+    });
+  } catch (e) {
+    console.warn("Could not run migrations before E2E seed");
+  }
+
   // Insert test jobs in various states so E2E tests have data
   // Use psql via the DATABASE_URL since awa CLI doesn't have a raw SQL command
   const pgUrl = new URL(databaseUrl);
@@ -61,8 +70,16 @@ export default async function globalSetup() {
   } catch (e) {
     // If psql isn't available, try docker exec (CI uses service containers)
     try {
+      const containerId = execSync(
+        `docker ps --format '{{.ID}} {{.Ports}}' | awk '$0 ~ /:${port}->5432\\/tcp/ {print $1; exit}'`
+      )
+        .toString()
+        .trim();
+      if (!containerId) {
+        throw new Error(`No postgres container published on host port ${port}`);
+      }
       execSync(
-        `docker exec -i $(docker ps -q --filter ancestor=postgres:17-alpine) psql -U ${user} -d ${db} -c "${sql.replace(/"/g, '\\"')}"`,
+        `docker exec -i ${containerId} psql -U ${user} -d ${db} -c "${sql.replace(/"/g, '\\"')}"`,
         { stdio: "pipe", timeout: 10_000 }
       );
       console.log("E2E seed data inserted (via docker)");

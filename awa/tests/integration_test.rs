@@ -10,7 +10,14 @@ use awa::{
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -369,6 +376,7 @@ async fn test_work_one_no_job() {
 
 #[tokio::test]
 async fn test_admin_retry() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_retry";
     clean_queue(client.pool(), queue).await;
@@ -405,6 +413,7 @@ async fn test_admin_retry() {
 
 #[tokio::test]
 async fn test_admin_cancel() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_admin_cancel";
     clean_queue(client.pool(), queue).await;
@@ -431,6 +440,7 @@ async fn test_admin_cancel() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_unique_key";
     clean_queue(client.pool(), queue).await;
@@ -476,6 +486,7 @@ async fn test_admin_cancel_by_unique_key() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
 
     let result = admin::cancel_by_unique_key(
@@ -493,6 +504,7 @@ async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_completed";
     clean_queue(client.pool(), queue).await;
@@ -544,6 +556,7 @@ async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_scheduled_job() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_scheduled";
     clean_queue(client.pool(), queue).await;
@@ -595,6 +608,7 @@ async fn test_admin_cancel_by_unique_key_scheduled_job() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_cancels_oldest_when_multiple_exist() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_multi";
     clean_queue(client.pool(), queue).await;
@@ -683,6 +697,7 @@ async fn test_admin_cancel_by_unique_key_cancels_oldest_when_multiple_exist() {
 
 #[tokio::test]
 async fn test_admin_cancel_by_unique_key_mismatched_queue_returns_none() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_cancel_by_key_mismatch";
     clean_queue(client.pool(), queue).await;
@@ -727,6 +742,7 @@ async fn test_admin_cancel_by_unique_key_mismatched_queue_returns_none() {
 
 #[tokio::test]
 async fn test_admin_pause_resume_queue() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_pause_resume";
     clean_queue(client.pool(), queue).await;
@@ -754,6 +770,7 @@ async fn test_admin_pause_resume_queue() {
 
 #[tokio::test]
 async fn test_admin_drain_queue() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_drain_queue";
     clean_queue(client.pool(), queue).await;
@@ -789,6 +806,7 @@ async fn test_admin_drain_queue() {
 
 #[tokio::test]
 async fn test_admin_queue_stats() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_queue_stats";
     clean_queue(client.pool(), queue).await;
@@ -809,13 +827,246 @@ async fn test_admin_queue_stats() {
         .unwrap();
     }
 
+    insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "scheduled@example.com".into(),
+            subject: "Scheduled stats test".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs (kind, queue, args, state, run_at) VALUES ('send_email', $1, '{}'::jsonb, 'retryable', now() + interval '10 minutes')",
+    )
+    .bind(queue)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
     let stats = admin::queue_stats(client.pool()).await.unwrap();
     let stat = stats.iter().find(|s| s.queue == queue).unwrap();
     assert_eq!(stat.available, 3);
+    assert_eq!(stat.scheduled, 1);
+    assert_eq!(stat.retryable, 1);
+    assert_eq!(stat.total_queued, 5);
+}
+
+#[tokio::test]
+async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    let queue_a = "integ_admin_meta_a";
+    let queue_b = "integ_admin_meta_b";
+    let kind_a = "integ_admin_meta_available_kind";
+    let kind_b = "integ_admin_meta_scheduled_kind";
+    let kind_c = "integ_admin_meta_waiting_kind";
+
+    clean_queue(client.pool(), queue_a).await;
+    clean_queue(client.pool(), queue_b).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
+        .bind(vec![kind_a, kind_b, kind_c])
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let baseline = admin::state_counts(client.pool()).await.unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES
+            ($1, $2, '{}'::jsonb, 'available', now()),
+            ($3, $2, '{}'::jsonb, 'scheduled', now() + interval '30 minutes'),
+            ($4, $5, '{}'::jsonb, 'waiting_external', now())
+        "#,
+    )
+    .bind(kind_a)
+    .bind(queue_a)
+    .bind(kind_b)
+    .bind(kind_c)
+    .bind(queue_b)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let counts = admin::state_counts(client.pool()).await.unwrap();
+    assert_eq!(
+        counts.get(&JobState::Available).copied().unwrap_or(0),
+        baseline.get(&JobState::Available).copied().unwrap_or(0) + 1
+    );
+    assert_eq!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
+        baseline.get(&JobState::Scheduled).copied().unwrap_or(0) + 1
+    );
+    assert_eq!(
+        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0),
+        baseline
+            .get(&JobState::WaitingExternal)
+            .copied()
+            .unwrap_or(0)
+            + 1
+    );
+
+    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
+    assert_eq!(queue_a_stats.total_queued, 2);
+    assert_eq!(queue_a_stats.available, 1);
+    assert_eq!(queue_a_stats.scheduled, 1);
+    let queue_b_stats = queues.iter().find(|stat| stat.queue == queue_b).unwrap();
+    assert_eq!(queue_b_stats.total_queued, 1);
+    assert_eq!(queue_b_stats.waiting_external, 1);
+
+    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
+    assert!(kinds.contains(&kind_a.to_string()));
+    assert!(kinds.contains(&kind_b.to_string()));
+    assert!(kinds.contains(&kind_c.to_string()));
+
+    let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
+    assert!(distinct_queues.contains(&queue_a.to_string()));
+    assert!(distinct_queues.contains(&queue_b.to_string()));
+
+    sqlx::query("UPDATE awa.jobs SET state = 'available', run_at = now() WHERE kind = $1")
+        .bind(kind_b)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let counts = admin::state_counts(client.pool()).await.unwrap();
+    assert_eq!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
+        baseline.get(&JobState::Scheduled).copied().unwrap_or(0)
+    );
+    assert_eq!(
+        counts.get(&JobState::Available).copied().unwrap_or(0),
+        baseline.get(&JobState::Available).copied().unwrap_or(0) + 2
+    );
+
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
+        .bind(kind_c)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    assert!(!queues.iter().any(|stat| stat.queue == queue_b));
+
+    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
+    assert!(!kinds.contains(&kind_c.to_string()));
+
+    let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
+    assert!(!distinct_queues.contains(&queue_b.to_string()));
+}
+
+#[tokio::test]
+async fn test_admin_metadata_tracks_scheduled_promotion_path() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    let queue = "integ_admin_meta_promote";
+    let kind = "integ_admin_meta_promote_kind";
+
+    clean_queue(client.pool(), queue).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
+        .bind(kind)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs (kind, queue, args, state, run_at) VALUES ($1, $2, '{}'::jsonb, 'scheduled', now() - interval '1 minute')",
+    )
+    .bind(kind)
+    .bind(queue)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let before = admin::queue_stats(client.pool()).await.unwrap();
+    let before = before.iter().find(|stat| stat.queue == queue).unwrap();
+    assert_eq!(before.scheduled, 1);
+    assert_eq!(before.available, 0);
+    assert_eq!(before.total_queued, 1);
+
+    let promoted: i64 = sqlx::query_scalar(
+        r#"
+        WITH due AS (
+            DELETE FROM awa.scheduled_jobs
+            WHERE id IN (
+                SELECT id
+                FROM awa.scheduled_jobs
+                WHERE queue = $1
+                  AND state = 'scheduled'
+                  AND run_at <= now()
+                ORDER BY run_at ASC, id ASC
+                LIMIT 32
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        ),
+        promoted AS (
+            INSERT INTO awa.jobs_hot (
+                id, kind, queue, args, state, priority, attempt, max_attempts,
+                run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                created_at, errors, metadata, tags, unique_key, unique_states,
+                callback_id, callback_timeout_at, callback_filter, callback_on_complete,
+                callback_on_fail, callback_transform, run_lease, progress
+            )
+            SELECT
+                id,
+                kind,
+                queue,
+                args,
+                'available'::awa.job_state,
+                priority,
+                attempt,
+                max_attempts,
+                now(),
+                NULL,
+                NULL,
+                attempted_at,
+                finalized_at,
+                created_at,
+                errors,
+                metadata,
+                tags,
+                unique_key,
+                unique_states,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                run_lease,
+                progress
+            FROM due
+            RETURNING id
+        )
+        SELECT count(*)::bigint FROM promoted
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(promoted, 1);
+
+    let after = admin::queue_stats(client.pool()).await.unwrap();
+    let after = after.iter().find(|stat| stat.queue == queue).unwrap();
+    assert_eq!(after.scheduled, 0);
+    assert_eq!(after.available, 1);
+    assert_eq!(after.total_queued, 1);
 }
 
 #[tokio::test]
 async fn test_admin_list_jobs() {
+    let _guard = test_lock().lock().await;
     let client = setup().await;
     let queue = "integ_list_jobs";
     clean_queue(client.pool(), queue).await;
@@ -847,6 +1098,7 @@ async fn test_admin_list_jobs() {
 
 #[tokio::test]
 async fn test_admin_runtime_observability_snapshot() {
+    let _guard = test_lock().lock().await;
     let client = setup_with_connections(8).await;
     let queue = "integ_runtime_observability";
     clean_queue(client.pool(), queue).await;

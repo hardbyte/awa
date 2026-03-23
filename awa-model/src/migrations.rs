@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 3;
+pub const CURRENT_VERSION: i32 = 4;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -22,17 +22,21 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (1, "Canonical schema with UI indexes", &[V1_UP]),
     (2, "Runtime observability snapshots", &[V2_UP]),
     (3, "Maintenance loop health in runtime snapshots", &[V3_UP]),
+    (4, "Admin metadata cache tables", &[V4_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
 const V2_UP: &str = include_str!("../migrations/v002_runtime_instances.sql");
 const V3_UP: &str = include_str!("../migrations/v003_maintenance_health.sql");
+const V4_UP: &str = include_str!("../migrations/v004_admin_metadata.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
+/// Also tolerates the unreleased inline-V6 branch numbering used during review.
 /// Maps old max version → equivalent new version.
 fn normalize_legacy_version(old_version: i32) -> i32 {
     match old_version {
-        v if v >= 5 => 3, // V5 (0.3.x) = V3 (new)
+        v if v >= 6 => 4, // legacy/unreleased V6 admin metadata = V4 (new)
+        5 => 3,           // V5 (0.3.x) = V3 (new)
         4 => 2,           // V4 = V2 (new)
         3 => 1,           // V3 = V1 (new)
         _ => 0,           // Pre-canonical or fresh
@@ -45,8 +49,7 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 /// V1 bootstraps the canonical schema from scratch; V2+ are incremental
 /// and use `IF NOT EXISTS` guards so they are safe to re-run.
 ///
-/// Handles upgrade from pre-0.4 version numbering (V3/V4/V5 → V1/V2/V3)
-/// by normalizing the legacy version and inserting new version rows.
+/// by replacing the legacy `schema_version` rows with the new numbering.
 ///
 /// Takes `&PgPool` for ergonomic use from Rust.
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
@@ -130,20 +133,29 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 
     let raw_version = version.unwrap_or(0);
 
-    // Detect legacy version numbering from pre-0.4 releases (V3/V4/V5).
-    // A legacy DB has rows like 3, 4, 5 in schema_version — any row >= 3
-    // that isn't from the new scheme indicates legacy numbering.
-    let has_legacy: bool = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM awa.schema_version WHERE version IN (4, 5))",
+    // Detect legacy version numbering from pre-0.4 releases.
+    // Version 5/6 are always legacy. Version 4 is legacy only if the new
+    // admin metadata schema is absent.
+    let has_legacy_high: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM awa.schema_version WHERE version IN (5, 6))",
     )
     .fetch_one(&mut *conn)
     .await
     .unwrap_or(false);
 
+    let has_admin_metadata: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .unwrap_or(false);
+
+    let is_legacy_v4_only = raw_version == 4 && !has_legacy_high && !has_admin_metadata;
+
     // Also detect a single legacy V3 row (0.3.0 with only canonical schema)
     // by checking if runtime_instances exists — if not, this is legacy V3.
     let is_legacy_v3_only = raw_version == 3
-        && !has_legacy
+        && !has_legacy_high
         && {
             let has_runtime: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
@@ -154,14 +166,14 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
             !has_runtime
         };
 
-    if has_legacy || is_legacy_v3_only {
+    if has_legacy_high || is_legacy_v4_only || is_legacy_v3_only {
         let normalized = normalize_legacy_version(raw_version);
         info!(
             old_version = raw_version,
             new_version = normalized,
             "Normalizing legacy version numbering"
         );
-        // Remove legacy rows and insert canonical ones
+        // Replace legacy rows so future calls return the new numbering.
         sqlx::query("DELETE FROM awa.schema_version WHERE version >= 3")
             .execute(&mut *conn)
             .await?;

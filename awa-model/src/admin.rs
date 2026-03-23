@@ -252,7 +252,11 @@ where
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueStats {
     pub queue: String,
+    /// All non-terminal jobs for the queue, including running and waiting_external.
+    pub total_queued: i64,
+    pub scheduled: i64,
     pub available: i64,
+    pub retryable: i64,
     pub running: i64,
     pub failed: i64,
     pub waiting_external: i64,
@@ -648,21 +652,57 @@ pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64, Option<f64>, bool)>(
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            Option<f64>,
+            bool,
+        ),
+    >(
         r#"
+        WITH available_lag AS (
+            SELECT
+                queue,
+                EXTRACT(EPOCH FROM (now() - min(run_at)))::float8 AS lag_seconds
+            FROM awa.jobs_hot
+            WHERE state = 'available'
+            GROUP BY queue
+        ),
+        completed_recent AS (
+            SELECT
+                queue,
+                count(*)::bigint AS completed_last_hour
+            FROM awa.jobs_hot
+            WHERE state = 'completed'
+              AND finalized_at > now() - interval '1 hour'
+            GROUP BY queue
+        )
         SELECT
-            j.queue,
-            count(*) FILTER (WHERE j.state = 'available') AS available,
-            count(*) FILTER (WHERE j.state = 'running') AS running,
-            count(*) FILTER (WHERE j.state = 'failed') AS failed,
-            count(*) FILTER (WHERE j.state = 'waiting_external') AS waiting_external,
-            count(*) FILTER (WHERE j.state = 'completed'
-                AND j.finalized_at > now() - interval '1 hour') AS completed_last_hour,
-            EXTRACT(EPOCH FROM (now() - min(j.run_at) FILTER (WHERE j.state = 'available')))::float8 AS lag_seconds,
+            qs.queue,
+            qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external AS total_queued,
+            qs.scheduled,
+            qs.available,
+            qs.retryable,
+            qs.running,
+            qs.failed,
+            qs.waiting_external,
+            COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
+            al.lag_seconds,
             COALESCE(qm.paused, FALSE) AS paused
-        FROM awa.jobs j
-        LEFT JOIN awa.queue_meta qm ON qm.queue = j.queue
-        GROUP BY j.queue, qm.paused
+        FROM awa.queue_state_counts qs
+        LEFT JOIN available_lag al ON al.queue = qs.queue
+        LEFT JOIN completed_recent cr ON cr.queue = qs.queue
+        LEFT JOIN awa.queue_meta qm ON qm.queue = qs.queue
+        ORDER BY qs.queue
         "#,
     )
     .fetch_all(executor)
@@ -673,7 +713,10 @@ where
         .map(
             |(
                 queue,
+                total_queued,
+                scheduled,
                 available,
+                retryable,
                 running,
                 failed,
                 waiting_external,
@@ -682,7 +725,10 @@ where
                 paused,
             )| QueueStats {
                 queue,
+                total_queued,
+                scheduled,
                 available,
+                retryable,
                 running,
                 failed,
                 waiting_external,
@@ -754,10 +800,27 @@ pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, 
 where
     E: PgExecutor<'e>,
 {
-    let rows =
-        sqlx::query_as::<_, (JobState, i64)>("SELECT state, count(*) FROM awa.jobs GROUP BY state")
-            .fetch_all(executor)
-            .await?;
+    let rows = sqlx::query_as::<_, (JobState, i64)>(
+        r#"
+        SELECT 'scheduled'::awa.job_state, COALESCE(sum(scheduled), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'available'::awa.job_state, COALESCE(sum(available), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'running'::awa.job_state, COALESCE(sum(running), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'completed'::awa.job_state, COALESCE(sum(completed), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'retryable'::awa.job_state, COALESCE(sum(retryable), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'failed'::awa.job_state, COALESCE(sum(failed), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'cancelled'::awa.job_state, COALESCE(sum(cancelled), 0)::bigint FROM awa.queue_state_counts
+        UNION ALL
+        SELECT 'waiting_external'::awa.job_state, COALESCE(sum(waiting_external), 0)::bigint FROM awa.queue_state_counts
+        "#,
+    )
+    .fetch_all(executor)
+    .await?;
 
     Ok(rows.into_iter().collect())
 }
@@ -767,9 +830,11 @@ pub async fn distinct_kinds<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_scalar::<_, String>("SELECT DISTINCT kind FROM awa.jobs ORDER BY kind")
-        .fetch_all(executor)
-        .await?;
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT kind FROM awa.job_kind_catalog WHERE ref_count > 0 ORDER BY kind",
+    )
+    .fetch_all(executor)
+    .await?;
 
     Ok(rows)
 }
@@ -779,10 +844,11 @@ pub async fn distinct_queues<'e, E>(executor: E) -> Result<Vec<String>, AwaError
 where
     E: PgExecutor<'e>,
 {
-    let rows =
-        sqlx::query_scalar::<_, String>("SELECT DISTINCT queue FROM awa.jobs ORDER BY queue")
-            .fetch_all(executor)
-            .await?;
+    let rows = sqlx::query_scalar::<_, String>(
+        "SELECT queue FROM awa.job_queue_catalog WHERE ref_count > 0 ORDER BY queue",
+    )
+    .fetch_all(executor)
+    .await?;
 
     Ok(rows)
 }
