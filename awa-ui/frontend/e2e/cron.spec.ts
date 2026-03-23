@@ -58,6 +58,71 @@ test.describe("Cron page", () => {
     await expect(firstEntry.getByText("Max attempts", { exact: true })).not.toBeVisible();
   });
 
+  test("cron API response includes next_fire_at", async ({ page }) => {
+    const [cronResponse] = await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
+      page.goto("/cron"),
+    ]);
+
+    const cronJobs = await cronResponse.json();
+    if (!Array.isArray(cronJobs) || cronJobs.length === 0) {
+      test.skip();
+      return;
+    }
+
+    // Every cron schedule should have a next_fire_at field
+    for (const job of cronJobs) {
+      expect(job).toHaveProperty("next_fire_at");
+      // next_fire_at should be a non-null ISO timestamp string
+      if (job.next_fire_at !== null) {
+        expect(new Date(job.next_fire_at).getTime()).toBeGreaterThan(Date.now());
+      }
+    }
+  });
+
+  test("cron summary row shows next fire time", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
+      page.goto("/cron"),
+    ]);
+
+    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
+    const hasEntries = await triggerBtn.isVisible().catch(() => false);
+    if (!hasEntries) {
+      test.skip();
+      return;
+    }
+
+    // The summary row should show "in Xm" or "in Xh" for the next fire
+    const firstEntry = page.locator(".rounded-lg.border").first();
+    const nextFireText = firstEntry.locator(".text-success").first();
+    await expect(nextFireText).toBeVisible();
+    const text = await nextFireText.textContent();
+    expect(text).toMatch(/^in \d+[smhd]$/);
+  });
+
+  test("expanded cron detail shows Next fire with timezone", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
+      page.goto("/cron"),
+    ]);
+
+    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
+    const hasEntries = await triggerBtn.isVisible().catch(() => false);
+    if (!hasEntries) {
+      test.skip();
+      return;
+    }
+
+    // Expand the first cron entry
+    const firstEntry = page.locator(".rounded-lg.border").first();
+    const summaryRow = firstEntry.locator(".cursor-pointer").first();
+    await summaryRow.click();
+
+    // Expanded detail should show "Next fire" label
+    await expect(firstEntry.getByText("Next fire")).toBeVisible();
+  });
+
   test("trigger now button creates a job", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),

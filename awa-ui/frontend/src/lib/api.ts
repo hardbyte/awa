@@ -116,6 +116,7 @@ export interface CronJobRow {
   tags: string[];
   metadata: unknown;
   last_enqueued_at: string | null;
+  next_fire_at: string | null;
   created_at: string;
   updated_at: string;
 }

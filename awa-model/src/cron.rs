@@ -269,6 +269,29 @@ where
     Ok(())
 }
 
+/// Compute the next fire time for a cron expression after now.
+///
+/// Returns `None` if the expression or timezone is invalid.
+pub fn next_fire_time(cron_expr: &str, timezone: &str) -> Option<DateTime<Utc>> {
+    next_fire_time_after(cron_expr, timezone, Utc::now())
+}
+
+/// Compute the next fire time for a cron expression after a given timestamp.
+///
+/// Testable variant — accepts an explicit `after` time instead of using the clock.
+/// Returns `None` if the expression or timezone is invalid.
+pub fn next_fire_time_after(
+    cron_expr: &str,
+    timezone: &str,
+    after: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let cron = Cron::new(cron_expr).parse().ok()?;
+    let tz: chrono_tz::Tz = timezone.parse().ok()?;
+    let after_tz = after.with_timezone(&tz);
+    let next = cron.iter_from(after_tz).next()?;
+    Some(next.with_timezone(&Utc))
+}
+
 /// Load all cron job rows from `awa.cron_jobs`.
 pub async fn list_cron_jobs<'e, E>(executor: E) -> Result<Vec<CronJobRow>, AwaError>
 where
@@ -573,5 +596,57 @@ mod tests {
             .max_attempts(0)
             .build_raw("test_job".to_string(), serde_json::json!({}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_next_fire_time_exact() {
+        // At 14:35 UTC, next fire for "every hour at :00" should be 15:00
+        let now = Utc.with_ymd_and_hms(2025, 6, 15, 14, 35, 0).unwrap();
+        let next = next_fire_time_after("0 * * * *", "UTC", now);
+        assert_eq!(
+            next,
+            Some(Utc.with_ymd_and_hms(2025, 6, 15, 15, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_next_fire_time_respects_timezone() {
+        // At 2025-06-15 20:00 UTC, next "9 AM daily" in Auckland should be
+        // 2025-06-15 21:00 UTC (= 2025-06-16 09:00 NZST, UTC+12 in June)
+        let now = Utc.with_ymd_and_hms(2025, 6, 15, 20, 0, 0).unwrap();
+        let next = next_fire_time_after("0 9 * * *", "Pacific/Auckland", now);
+        assert_eq!(
+            next,
+            Some(Utc.with_ymd_and_hms(2025, 6, 15, 21, 0, 0).unwrap())
+        );
+
+        // Same time, UTC schedule — next 9 AM UTC is the next day
+        let next_utc = next_fire_time_after("0 9 * * *", "UTC", now);
+        assert_eq!(
+            next_utc,
+            Some(Utc.with_ymd_and_hms(2025, 6, 16, 9, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_next_fire_time_dst_boundary() {
+        // US/Eastern spring-forward: 2025-03-09 at 2:00 AM clocks jump to 3:00 AM
+        // At 1:30 AM EST (06:30 UTC), next "every hour at :00" should skip 2:00 AM
+        let now = Utc.with_ymd_and_hms(2025, 3, 9, 6, 30, 0).unwrap();
+        let next = next_fire_time_after("0 * * * *", "US/Eastern", now);
+        assert!(next.is_some());
+        // The 2:00 AM hour doesn't exist; croner should give us 3:00 AM EDT (07:00 UTC)
+        let next = next.unwrap();
+        assert!(
+            next >= Utc.with_ymd_and_hms(2025, 3, 9, 7, 0, 0).unwrap(),
+            "should skip the non-existent 2:00 AM, got {next}"
+        );
+    }
+
+    #[test]
+    fn test_next_fire_time_invalid_input() {
+        let now = Utc::now();
+        assert!(next_fire_time_after("not a cron", "UTC", now).is_none());
+        assert!(next_fire_time_after("* * * * *", "Not/A/Zone", now).is_none());
     }
 }
