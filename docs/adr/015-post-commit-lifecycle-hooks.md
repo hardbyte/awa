@@ -6,8 +6,8 @@ Accepted
 
 ## Context
 
-PR #59 added `Worker::on_exhausted()` as a trait method. PR #66 removed it
-after review because it was the wrong abstraction:
+An earlier attempt added `Worker::on_exhausted()` as a trait method, then
+backed it out after review because it was the wrong abstraction:
 
 - It was inaccessible from the typed `register::<T, F>()` path
 - It coupled job execution with follow-up side effects
@@ -101,15 +101,15 @@ instead of depending on executor-local typed state.
 
 ### Trait methods on `Worker`
 
-Rejected. This was the `on_exhausted()` direction from PR #59. It expands the
-`Worker` trait surface, does not help the typed registration path, and mixes
-execution with side-effect policy.
+Rejected. The earlier `on_exhausted()` direction expands the `Worker` trait
+surface, does not help the typed registration path, and mixes execution with
+side-effect policy.
 
 ### Typed per-registration sub-builder
 
-Considered in issue #61, but not adopted. A separate registration builder adds
-API complexity without changing the underlying storage model, which is keyed by
-job kind on `ClientBuilder`.
+Considered, but not adopted. A separate registration builder adds API
+complexity without changing the underlying storage model, which is keyed by job
+kind on `ClientBuilder`.
 
 ### Global untyped hooks only
 
