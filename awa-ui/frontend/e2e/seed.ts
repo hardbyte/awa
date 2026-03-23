@@ -62,7 +62,7 @@ export default async function globalSetup() {
     // If psql isn't available, try docker exec (CI uses service containers)
     try {
       execSync(
-        `docker exec -i $(docker ps -q --filter ancestor=postgres:17-alpine) psql -U ${user} -d ${db} -c "${sql.replace(/"/g, '\\"')}"`,
+        `docker exec -i $(docker ps --format '{{.ID}} {{.Image}}' | awk '$2 ~ /^postgres:/ {print $1; exit}') psql -U ${user} -d ${db} -c "${sql.replace(/"/g, '\\"')}"`,
         { stdio: "pipe", timeout: 10_000 }
       );
       console.log("E2E seed data inserted (via docker)");

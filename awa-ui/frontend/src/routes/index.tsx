@@ -61,15 +61,11 @@ export function DashboardPage() {
     ? Object.values(statsQuery.data).reduce((a, b) => a + b, 0)
     : null;
 
-  // Sort queues by activity (available + running + failed desc), take top N
+  // Sort queues by visible workload so deferred-heavy queues stay prominent.
   const topQueues = queuesQuery.data
     ? [...queuesQuery.data]
         .sort(
-          (a, b) =>
-            b.available +
-            b.running +
-            b.failed -
-            (a.available + a.running + a.failed)
+          (a, b) => b.total_queued + b.failed - (a.total_queued + a.failed)
         )
         .slice(0, DASHBOARD_QUEUE_LIMIT)
     : [];
@@ -316,7 +312,10 @@ export function DashboardPage() {
               <Table aria-label="Queue summary">
                 <TableHeader>
                   <TableColumn isRowHeader>Queue</TableColumn>
+                  <TableColumn>Total queued</TableColumn>
+                  <TableColumn>Scheduled</TableColumn>
                   <TableColumn>Available</TableColumn>
+                  <TableColumn>Retryable</TableColumn>
                   <TableColumn>Running</TableColumn>
                   <TableColumn>Failed</TableColumn>
                   <TableColumn>Waiting</TableColumn>
@@ -342,19 +341,24 @@ export function DashboardPage() {
                           to="/queues/$name"
                           params={{ name: q.queue }}
                           className="text-primary no-underline hover:underline"
-                        >
+                      >
                           {q.queue}
                         </Link>
                       </TableCell>
+                      <TableCell>{q.total_queued.toLocaleString()}</TableCell>
+                      <TableCell>{q.scheduled.toLocaleString()}</TableCell>
                       <TableCell>{q.available.toLocaleString()}</TableCell>
-                      <TableCell>{q.running}</TableCell>
+                      <TableCell>{q.retryable.toLocaleString()}</TableCell>
+                      <TableCell>{q.running.toLocaleString()}</TableCell>
                       <TableCell>
                         <span className={q.failed > 0 ? "text-danger" : ""}>
-                          {q.failed}
+                          {q.failed.toLocaleString()}
                         </span>
                       </TableCell>
                       <TableCell>
-                        {q.waiting_external > 0 ? q.waiting_external : "-"}
+                        {q.waiting_external > 0
+                          ? q.waiting_external.toLocaleString()
+                          : "-"}
                       </TableCell>
                       <TableCell>{q.completed_last_hour}</TableCell>
                       <TableCell>

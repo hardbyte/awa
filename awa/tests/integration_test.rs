@@ -809,9 +809,140 @@ async fn test_admin_queue_stats() {
         .unwrap();
     }
 
+    insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "scheduled@example.com".into(),
+            subject: "Scheduled stats test".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs (kind, queue, args, state, run_at) VALUES ('send_email', $1, '{}'::jsonb, 'retryable', now() + interval '10 minutes')",
+    )
+    .bind(queue)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
     let stats = admin::queue_stats(client.pool()).await.unwrap();
     let stat = stats.iter().find(|s| s.queue == queue).unwrap();
     assert_eq!(stat.available, 3);
+    assert_eq!(stat.scheduled, 1);
+    assert_eq!(stat.retryable, 1);
+    assert_eq!(stat.total_queued, 5);
+}
+
+#[tokio::test]
+async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
+    let client = setup().await;
+    let queue_a = "integ_admin_meta_a";
+    let queue_b = "integ_admin_meta_b";
+    let kind_a = "integ_admin_meta_available_kind";
+    let kind_b = "integ_admin_meta_scheduled_kind";
+    let kind_c = "integ_admin_meta_waiting_kind";
+
+    clean_queue(client.pool(), queue_a).await;
+    clean_queue(client.pool(), queue_b).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
+        .bind(vec![kind_a, kind_b, kind_c])
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let baseline = admin::state_counts(client.pool()).await.unwrap();
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES
+            ($1, $2, '{}'::jsonb, 'available', now()),
+            ($3, $2, '{}'::jsonb, 'scheduled', now() + interval '30 minutes'),
+            ($4, $5, '{}'::jsonb, 'waiting_external', now())
+        "#,
+    )
+    .bind(kind_a)
+    .bind(queue_a)
+    .bind(kind_b)
+    .bind(kind_c)
+    .bind(queue_b)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let counts = admin::state_counts(client.pool()).await.unwrap();
+    assert_eq!(
+        counts.get(&JobState::Available).copied().unwrap_or(0),
+        baseline.get(&JobState::Available).copied().unwrap_or(0) + 1
+    );
+    assert_eq!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
+        baseline.get(&JobState::Scheduled).copied().unwrap_or(0) + 1
+    );
+    assert_eq!(
+        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0),
+        baseline
+            .get(&JobState::WaitingExternal)
+            .copied()
+            .unwrap_or(0)
+            + 1
+    );
+
+    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
+    assert_eq!(queue_a_stats.total_queued, 2);
+    assert_eq!(queue_a_stats.available, 1);
+    assert_eq!(queue_a_stats.scheduled, 1);
+    let queue_b_stats = queues.iter().find(|stat| stat.queue == queue_b).unwrap();
+    assert_eq!(queue_b_stats.total_queued, 1);
+    assert_eq!(queue_b_stats.waiting_external, 1);
+
+    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
+    assert!(kinds.contains(&kind_a.to_string()));
+    assert!(kinds.contains(&kind_b.to_string()));
+    assert!(kinds.contains(&kind_c.to_string()));
+
+    let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
+    assert!(distinct_queues.contains(&queue_a.to_string()));
+    assert!(distinct_queues.contains(&queue_b.to_string()));
+
+    sqlx::query("UPDATE awa.jobs SET state = 'available', run_at = now() WHERE kind = $1")
+        .bind(kind_b)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let counts = admin::state_counts(client.pool()).await.unwrap();
+    assert_eq!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
+        baseline.get(&JobState::Scheduled).copied().unwrap_or(0)
+    );
+    assert_eq!(
+        counts.get(&JobState::Available).copied().unwrap_or(0),
+        baseline.get(&JobState::Available).copied().unwrap_or(0) + 2
+    );
+
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
+        .bind(kind_c)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    assert!(!queues.iter().any(|stat| stat.queue == queue_b));
+
+    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
+    assert!(!kinds.contains(&kind_c.to_string()));
+
+    let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
+    assert!(!distinct_queues.contains(&queue_b.to_string()));
 }
 
 #[tokio::test]

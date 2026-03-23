@@ -30,7 +30,10 @@ export interface JobRow {
 
 export interface QueueStats {
   queue: string;
+  total_queued: number;
+  scheduled: number;
   available: number;
+  retryable: number;
   running: number;
   failed: number;
   waiting_external: number;

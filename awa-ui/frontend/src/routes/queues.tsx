@@ -127,16 +127,22 @@ export function QueuesPage() {
                 )}
               </div>
               <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+                <span className="text-muted-fg">Total queued</span>
+                <span>{q.total_queued.toLocaleString()}</span>
+                <span className="text-muted-fg">Scheduled</span>
+                <span>{q.scheduled.toLocaleString()}</span>
                 <span className="text-muted-fg">Available</span>
-                <span>{q.available}</span>
+                <span>{q.available.toLocaleString()}</span>
+                <span className="text-muted-fg">Retryable</span>
+                <span>{q.retryable.toLocaleString()}</span>
                 <span className="text-muted-fg">Running</span>
-                <span>{q.running}</span>
+                <span>{q.running.toLocaleString()}</span>
                 <span className="text-muted-fg">Failed</span>
-                <span className={q.failed > 0 ? "text-danger" : ""}>{q.failed}</span>
+                <span className={q.failed > 0 ? "text-danger" : ""}>{q.failed.toLocaleString()}</span>
                 {q.waiting_external > 0 && (
                   <>
                     <span className="text-muted-fg">Waiting</span>
-                    <span>{q.waiting_external}</span>
+                    <span>{q.waiting_external.toLocaleString()}</span>
                   </>
                 )}
                 <span className="text-muted-fg">Lag</span>
@@ -179,7 +185,10 @@ export function QueuesPage() {
         <Table aria-label="Queues" className="hidden sm:table">
           <TableHeader>
             <TableColumn isRowHeader>Queue</TableColumn>
+            <TableColumn>Total queued</TableColumn>
+            <TableColumn>Scheduled</TableColumn>
             <TableColumn>Available</TableColumn>
+            <TableColumn>Retryable</TableColumn>
             <TableColumn>Running</TableColumn>
             <TableColumn>Failed</TableColumn>
             <TableColumn>Waiting</TableColumn>
@@ -206,15 +215,18 @@ export function QueuesPage() {
                       {q.queue}
                     </Link>
                   </TableCell>
-                  <TableCell>{q.available}</TableCell>
-                  <TableCell>{q.running}</TableCell>
+                  <TableCell>{q.total_queued.toLocaleString()}</TableCell>
+                  <TableCell>{q.scheduled.toLocaleString()}</TableCell>
+                  <TableCell>{q.available.toLocaleString()}</TableCell>
+                  <TableCell>{q.retryable.toLocaleString()}</TableCell>
+                  <TableCell>{q.running.toLocaleString()}</TableCell>
                   <TableCell>
                     <span className={q.failed > 0 ? "text-danger" : ""}>
-                      {q.failed}
+                      {q.failed.toLocaleString()}
                     </span>
                   </TableCell>
                   <TableCell>
-                    {q.waiting_external > 0 ? q.waiting_external : "-"}
+                    {q.waiting_external > 0 ? q.waiting_external.toLocaleString() : "-"}
                   </TableCell>
                   <TableCell>{q.completed_last_hour}</TableCell>
                   <TableCell>

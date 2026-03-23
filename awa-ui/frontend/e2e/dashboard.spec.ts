@@ -30,6 +30,13 @@ test.describe("Dashboard page", () => {
       page.locator('[data-slot="card-header"]', { hasText: "Queues" })
     ).toBeVisible();
 
+    const queueTable = page.getByRole("grid", { name: "Queue summary" });
+    for (const header of ["Queue", "Total queued", "Scheduled", "Retryable"]) {
+      await expect(
+        queueTable.getByRole("columnheader", { name: header })
+      ).toBeVisible();
+    }
+
     // Seeded e2e_test queue should appear in the queue table
     await expect(page.getByText("e2e_test").first()).toBeVisible();
   });
