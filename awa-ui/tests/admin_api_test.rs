@@ -1,8 +1,15 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 use tower::util::ServiceExt;
+use uuid::Uuid;
+
+fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 async fn setup_pool() -> sqlx::PgPool {
     awa_testing::setup::setup(4).await
@@ -21,6 +28,18 @@ async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
             .execute(pool)
             .await
             .expect("failed to clean queue meta");
+
+        sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = ANY($1)")
+            .bind(queues)
+            .execute(pool)
+            .await
+            .expect("failed to clean queue state counts");
+
+        sqlx::query("DELETE FROM awa.job_queue_catalog WHERE queue = ANY($1)")
+            .bind(queues)
+            .execute(pool)
+            .await
+            .expect("failed to clean queue catalog");
     }
 
     if !kinds.is_empty() {
@@ -29,6 +48,12 @@ async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
             .execute(pool)
             .await
             .expect("failed to clean jobs by kind");
+
+        sqlx::query("DELETE FROM awa.job_kind_catalog WHERE kind = ANY($1)")
+            .bind(kinds)
+            .execute(pool)
+            .await
+            .expect("failed to clean kind catalog");
     }
 }
 
@@ -239,13 +264,20 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
 
 #[tokio::test]
 async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
+    let _guard = test_lock().lock().unwrap();
     let pool = setup_pool().await;
-    let queue_a = "api_stats_meta_a";
-    let queue_b = "api_stats_meta_b";
-    let kind_a = "api_stats_meta_kind_a";
-    let kind_b = "api_stats_meta_kind_b";
-    let kind_c = "api_stats_meta_kind_c";
-    clean_jobs(&pool, &[queue_a, queue_b], &[kind_a, kind_b, kind_c]).await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue_a = format!("api_stats_meta_a_{suffix}");
+    let queue_b = format!("api_stats_meta_b_{suffix}");
+    let kind_a = format!("api_stats_meta_kind_a_{suffix}");
+    let kind_b = format!("api_stats_meta_kind_b_{suffix}");
+    let kind_c = format!("api_stats_meta_kind_c_{suffix}");
+    clean_jobs(
+        &pool,
+        &[queue_a.as_str(), queue_b.as_str()],
+        &[kind_a.as_str(), kind_b.as_str(), kind_c.as_str()],
+    )
+    .await;
 
     let app = awa_ui::router(pool.clone());
     let baseline = get_json(&app, "/api/stats").await;
@@ -259,11 +291,11 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
             ($4, $5, '{}'::jsonb, 'retryable', now() + interval '10 minutes')
         "#,
     )
-    .bind(kind_a)
-    .bind(queue_a)
-    .bind(kind_b)
-    .bind(kind_c)
-    .bind(queue_b)
+    .bind(&kind_a)
+    .bind(&queue_a)
+    .bind(&kind_b)
+    .bind(&kind_c)
+    .bind(&queue_b)
     .execute(&pool)
     .await
     .expect("fixture insert should succeed");
@@ -278,36 +310,51 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
 
     let kinds = get_json(&app, "/api/stats/kinds").await;
     let kinds = kinds.as_array().expect("kinds payload should be an array");
-    assert!(kinds.iter().any(|value| value.as_str() == Some(kind_a)));
-    assert!(kinds.iter().any(|value| value.as_str() == Some(kind_b)));
-    assert!(kinds.iter().any(|value| value.as_str() == Some(kind_c)));
+    assert!(kinds
+        .iter()
+        .any(|value| value.as_str() == Some(kind_a.as_str())));
+    assert!(kinds
+        .iter()
+        .any(|value| value.as_str() == Some(kind_b.as_str())));
+    assert!(kinds
+        .iter()
+        .any(|value| value.as_str() == Some(kind_c.as_str())));
 
     let queues = get_json(&app, "/api/stats/queues").await;
     let queues = queues
         .as_array()
         .expect("queues payload should be an array");
-    assert!(queues.iter().any(|value| value.as_str() == Some(queue_a)));
-    assert!(queues.iter().any(|value| value.as_str() == Some(queue_b)));
+    assert!(queues
+        .iter()
+        .any(|value| value.as_str() == Some(queue_a.as_str())));
+    assert!(queues
+        .iter()
+        .any(|value| value.as_str() == Some(queue_b.as_str())));
 
     sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
-        .bind(kind_c)
+        .bind(&kind_c)
         .execute(&pool)
         .await
         .expect("delete should succeed");
 
     let kinds = get_json(&app, "/api/stats/kinds").await;
     let kinds = kinds.as_array().expect("kinds payload should be an array");
-    assert!(!kinds.iter().any(|value| value.as_str() == Some(kind_c)));
+    assert!(!kinds
+        .iter()
+        .any(|value| value.as_str() == Some(kind_c.as_str())));
 
     let queues = get_json(&app, "/api/stats/queues").await;
     let queues = queues
         .as_array()
         .expect("queues payload should be an array");
-    assert!(!queues.iter().any(|value| value.as_str() == Some(queue_b)));
+    assert!(!queues
+        .iter()
+        .any(|value| value.as_str() == Some(queue_b.as_str())));
 }
 
 #[tokio::test]
 async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
+    let _guard = test_lock().lock().unwrap();
     let pool = setup_pool().await;
     let queue = "api_queue_stats_rollup";
     clean_jobs(&pool, &[queue], &[]).await;
@@ -387,6 +434,7 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
 #[tokio::test]
 #[ignore = "scale validation"]
 async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
+    let _guard = test_lock().lock().unwrap();
     let pool = setup_pool().await;
     let prefix = "api_scale_";
     seed_scale_fixture(&pool, prefix).await;

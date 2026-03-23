@@ -33,7 +33,7 @@ test.describe("Dashboard page", () => {
     const queueTable = page.getByRole("grid", { name: "Queue summary" });
     for (const header of ["Queue", "Total queued", "Scheduled", "Retryable"]) {
       await expect(
-        queueTable.getByRole("columnheader", { name: header })
+        queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();
     }
 

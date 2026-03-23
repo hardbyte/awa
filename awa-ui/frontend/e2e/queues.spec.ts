@@ -27,7 +27,7 @@ test.describe("Queues page", () => {
       "Status",
     ]) {
       await expect(
-        queueTable.getByRole("columnheader", { name: header })
+        queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();
     }
 
@@ -47,7 +47,7 @@ test.describe("Queues page", () => {
     // Queue health and runtime columns should be present
     for (const header of ["Mode", "Capacity", "Rate limit", "Waiting"]) {
       await expect(
-        queueTable.getByRole("columnheader", { name: header })
+        queueTable.getByRole("columnheader", { name: header, exact: true })
       ).toBeVisible();
     }
   });
