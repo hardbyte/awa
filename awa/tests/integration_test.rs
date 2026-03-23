@@ -433,6 +433,7 @@ async fn test_admin_cancel_by_unique_key() {
         SendEmail::kind(),
         Some(queue),
         Some(&serde_json::to_value(&args).unwrap()),
+        None,
     )
     .await
     .unwrap();
@@ -453,6 +454,7 @@ async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
         "nonexistent_kind",
         Some("nonexistent_queue"),
         Some(&serde_json::json!({"id": "does-not-exist"})),
+        None,
     )
     .await
     .unwrap();
@@ -500,6 +502,7 @@ async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
         SendEmail::kind(),
         Some(queue),
         Some(&serde_json::to_value(&args).unwrap()),
+        None,
     )
     .await
     .unwrap();

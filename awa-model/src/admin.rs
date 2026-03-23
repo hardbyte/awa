@@ -55,9 +55,15 @@ where
 
 /// Cancel a job by its unique key components.
 ///
-/// Reconstructs the BLAKE3 unique key from the same inputs used at insert time,
-/// then cancels the matching non-terminal job. Returns `None` if no matching
+/// Reconstructs the BLAKE3 unique key from the same inputs used at insert time
+/// (kind, optional queue, optional args, optional period bucket), then cancels
+/// the single oldest matching non-terminal job. Returns `None` if no matching
 /// job was found (already completed, already cancelled, or never existed).
+///
+/// Only one job is cancelled per call (the oldest by `id`). This is intentional:
+/// unique key enforcement uses a state bitmask, so multiple rows with the same
+/// key can legally coexist (e.g., one `waiting_external` + one `available`).
+/// Cancelling all of them in one shot would be surprising.
 ///
 /// This is useful when the caller knows the job kind and args but not the job ID —
 /// e.g., cancelling a scheduled reminder when the triggering condition is resolved.
@@ -66,21 +72,30 @@ pub async fn cancel_by_unique_key<'e, E>(
     kind: &str,
     queue: Option<&str>,
     args: Option<&serde_json::Value>,
+    period_bucket: Option<i64>,
 ) -> Result<Option<JobRow>, AwaError>
 where
     E: PgExecutor<'e>,
 {
-    let unique_key = crate::unique::compute_unique_key(kind, queue, args, None);
+    let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
 
     let row = sqlx::query_as::<_, JobRow>(
         r#"
+        WITH target AS (
+            SELECT id FROM awa.jobs
+            WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+            ORDER BY id ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        )
         UPDATE awa.jobs
         SET state = 'cancelled', finalized_at = now(),
             callback_id = NULL, callback_timeout_at = NULL,
             callback_filter = NULL, callback_on_complete = NULL,
             callback_on_fail = NULL, callback_transform = NULL
-        WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
-        RETURNING *
+        FROM target
+        WHERE awa.jobs.id = target.id
+        RETURNING awa.jobs.*
         "#,
     )
     .bind(&unique_key)
