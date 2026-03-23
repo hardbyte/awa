@@ -3,8 +3,9 @@
 //! This is the facade crate that re-exports the main types from awa-model,
 //! awa-macros, and awa-worker for ergonomic usage.
 
-// Re-export awa_model so the JobArgs derive macro resolves when users
-// depend only on `awa` (the macro expands to `awa_model::JobArgs`).
+// Re-export awa_model for advanced users and internal consumers.
+// Note: the current JobArgs derive macro still expands to `::awa_model::JobArgs`,
+// so external binaries that want the derive must depend on `awa-model` directly.
 #[doc(hidden)]
 pub use awa_model;
 
