@@ -9,17 +9,17 @@ use std::time::Duration;
 
 /// Proof that this job registered an external callback in the database.
 ///
-/// The public `id` can be sent to the external system. The private field keeps
-/// Rust handlers from constructing this type directly.
+/// The public `id` can be sent to the external system. `#[non_exhaustive]`
+/// keeps external callers from constructing this type directly.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct CallbackGuard {
     pub id: uuid::Uuid,
-    _private: (),
 }
 
 impl CallbackGuard {
     fn new(id: uuid::Uuid) -> Self {
-        Self { id, _private: () }
+        Self { id }
     }
 
     /// Return the callback UUID persisted for this job.

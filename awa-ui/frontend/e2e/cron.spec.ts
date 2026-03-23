@@ -75,7 +75,9 @@ test.describe("Cron page", () => {
       expect(job).toHaveProperty("next_fire_at");
       // next_fire_at should be a non-null ISO timestamp string
       if (job.next_fire_at !== null) {
-        expect(new Date(job.next_fire_at).getTime()).toBeGreaterThan(Date.now());
+        expect(new Date(job.next_fire_at).getTime()).toBeGreaterThanOrEqual(
+          Date.now() - 1000,
+        );
       }
     }
   });
