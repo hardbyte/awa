@@ -252,6 +252,7 @@ where
 #[derive(Debug, Clone, Serialize)]
 pub struct QueueStats {
     pub queue: String,
+    /// All non-terminal jobs for the queue, including running and waiting_external.
     pub total_queued: i64,
     pub scheduled: i64,
     pub available: i64,

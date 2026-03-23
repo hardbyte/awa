@@ -62,7 +62,6 @@ async fn test_migrations_are_idempotent() {
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    // Run three times
     migrations::run(&pool).await.unwrap();
     migrations::run(&pool).await.unwrap();
     migrations::run(&pool).await.unwrap();
@@ -79,17 +78,14 @@ async fn test_step_through_upgrade_preserves_data() {
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    // Step 1: Apply only V1 (canonical schema)
     let v1_sql = migrations::migration_sql();
     let (v1_version, _, v1_up) = &v1_sql[0];
     assert_eq!(*v1_version, 1);
     sqlx::raw_sql(v1_up).execute(&pool).await.unwrap();
 
-    // Verify V1 schema exists
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, 1);
 
-    // Insert test data into V1 schema
     sqlx::raw_sql(
         r#"
         INSERT INTO awa.jobs (kind, queue, args, state, priority)
@@ -105,13 +101,12 @@ async fn test_step_through_upgrade_preserves_data() {
     .await
     .unwrap();
 
-    // Step 2: Run full migrations (should apply V2 + V3)
+    // Step 2: Run full migrations (should apply V2 + V3 + V4)
     migrations::run(&pool).await.unwrap();
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
 
-    // Verify data survived
     let job_count: i64 =
         sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = 'migration_test'")
             .fetch_one(&pool)
@@ -126,7 +121,6 @@ async fn test_step_through_upgrade_preserves_data() {
             .unwrap();
     assert_eq!(cron_count, 1, "Cron schedule should survive migration");
 
-    // Verify new tables from V2 exist
     let has_runtime: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
     )
@@ -135,7 +129,6 @@ async fn test_step_through_upgrade_preserves_data() {
     .unwrap();
     assert!(has_runtime, "runtime_instances table should exist after V2");
 
-    // Verify new column from V3 exists
     let has_maintenance_alive: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'awa' AND table_name = 'runtime_instances' AND column_name = 'maintenance_alive')",
     )
@@ -147,7 +140,28 @@ async fn test_step_through_upgrade_preserves_data() {
         "maintenance_alive column should exist after V3"
     );
 
-    // Clean up
+    let has_queue_state_counts: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        has_queue_state_counts,
+        "queue_state_counts table should exist after V4"
+    );
+
+    let available_count: i64 = sqlx::query_scalar(
+        "SELECT available FROM awa.queue_state_counts WHERE queue = 'migration_test'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        available_count, 1,
+        "V4 backfill should capture existing jobs"
+    );
+
     sqlx::raw_sql("DELETE FROM awa.jobs WHERE queue = 'migration_test'; DELETE FROM awa.cron_jobs WHERE name = 'test_cron'; DELETE FROM awa.queue_meta WHERE queue = 'migration_test'")
         .execute(&pool)
         .await
@@ -161,11 +175,9 @@ async fn test_migration_sql_matches_run() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;
 
-    // Apply via run()
     reset_schema(&pool).await;
     migrations::run(&pool).await.unwrap();
 
-    // Capture the resulting table list
     let tables_from_run: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'awa' ORDER BY table_name",
     )
@@ -173,13 +185,11 @@ async fn test_migration_sql_matches_run() {
     .await
     .unwrap();
 
-    // Apply via migration_sql() on a fresh schema
     reset_schema(&pool).await;
     for (_version, _desc, sql) in migrations::migration_sql() {
         sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
     }
 
-    // Capture the resulting table list
     let tables_from_sql: Vec<String> = sqlx::query_scalar(
         "SELECT table_name FROM information_schema.tables WHERE table_schema = 'awa' ORDER BY table_name",
     )
@@ -192,7 +202,6 @@ async fn test_migration_sql_matches_run() {
         "migration_sql() should produce the same schema as run()"
     );
 
-    // Restore for other tests
     migrations::run(&pool).await.unwrap();
 }
 
@@ -204,11 +213,9 @@ async fn test_legacy_version_upgrade() {
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    // Simulate a 0.3.x database: apply V1 schema but insert legacy version rows (3, 4, 5)
     let v1_sql = &migrations::migration_sql()[0].2;
     sqlx::raw_sql(v1_sql).execute(&pool).await.unwrap();
 
-    // Replace the V1 version row with legacy numbering
     sqlx::raw_sql(
         r#"
         DELETE FROM awa.schema_version;
@@ -219,13 +226,11 @@ async fn test_legacy_version_upgrade() {
     .await
     .unwrap();
 
-    // Apply V2 + V3 SQL manually with legacy numbering
     let v2_sql = &migrations::migration_sql()[1].2;
     let v3_sql = &migrations::migration_sql()[2].2;
     sqlx::raw_sql(v2_sql).execute(&pool).await.unwrap();
     sqlx::raw_sql(v3_sql).execute(&pool).await.unwrap();
 
-    // Replace version rows with legacy numbering
     sqlx::raw_sql(
         r#"
         DELETE FROM awa.schema_version WHERE version IN (2, 3);
@@ -237,7 +242,6 @@ async fn test_legacy_version_upgrade() {
     .await
     .unwrap();
 
-    // Now run() should detect legacy versioning and normalize
     migrations::run(&pool).await.unwrap();
 
     let version = migrations::current_version(&pool).await.unwrap();
@@ -247,12 +251,10 @@ async fn test_legacy_version_upgrade() {
         "Legacy version should be normalized to current"
     );
 
-    // Verify legacy rows were cleaned up (no 4 or 5 remaining)
-    let max_version: i32 =
-        sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM awa.schema_version")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let max_version: i32 = sqlx::query_scalar::<_, i32>("SELECT MAX(version) FROM awa.schema_version")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(
         max_version,
         migrations::CURRENT_VERSION,
@@ -260,7 +262,14 @@ async fn test_legacy_version_upgrade() {
         migrations::CURRENT_VERSION
     );
 
-    // Restore
+    let has_queue_state_counts: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_queue_state_counts, "V4 should be applied after normalization");
+
     migrations::run(&pool).await.unwrap();
 }
 
@@ -272,12 +281,9 @@ async fn test_legacy_v3_only_upgrade() {
     let pool = pool().await;
     reset_schema(&pool).await;
 
-    // Simulate a 0.3.0 database that only applied the canonical schema (V3)
-    // but never got V4/V5. This is version=3 with no runtime_instances table.
     let v1_sql = &migrations::migration_sql()[0].2;
     sqlx::raw_sql(v1_sql).execute(&pool).await.unwrap();
 
-    // Replace version row with legacy numbering (only V3, no V4/V5)
     sqlx::raw_sql(
         r#"
         DELETE FROM awa.schema_version;
@@ -288,7 +294,6 @@ async fn test_legacy_v3_only_upgrade() {
     .await
     .unwrap();
 
-    // Verify runtime_instances does NOT exist yet
     let has_runtime: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
     )
@@ -300,7 +305,6 @@ async fn test_legacy_v3_only_upgrade() {
         "runtime_instances should not exist in legacy V3"
     );
 
-    // run() must detect this as legacy and apply V2 + V3
     migrations::run(&pool).await.unwrap();
 
     let version = migrations::current_version(&pool).await.unwrap();
@@ -310,7 +314,6 @@ async fn test_legacy_v3_only_upgrade() {
         "Legacy V3-only should upgrade to current"
     );
 
-    // Verify V2 table was created
     let has_runtime: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
     )
@@ -319,7 +322,6 @@ async fn test_legacy_v3_only_upgrade() {
     .unwrap();
     assert!(has_runtime, "runtime_instances should exist after upgrade");
 
-    // Verify V3 column was added
     let has_col: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'awa' AND table_name = 'runtime_instances' AND column_name = 'maintenance_alive')",
     )
@@ -328,6 +330,13 @@ async fn test_legacy_v3_only_upgrade() {
     .unwrap();
     assert!(has_col, "maintenance_alive should exist after upgrade");
 
-    // Restore
+    let has_queue_state_counts: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_queue_state_counts, "queue_state_counts should exist after upgrade");
+
     migrations::run(&pool).await.unwrap();
 }

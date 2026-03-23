@@ -2,7 +2,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
 use std::sync::{Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -12,7 +12,11 @@ fn test_lock() -> &'static Mutex<()> {
 }
 
 async fn setup_pool() -> sqlx::PgPool {
-    awa_testing::setup::setup(4).await
+    let pool = awa_testing::setup::setup(4).await;
+    awa_model::migrations::run(&pool)
+        .await
+        .expect("failed to run migrations for admin API tests");
+    pool
 }
 
 async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
@@ -185,81 +189,10 @@ async fn seed_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
         .await
         .expect("enable triggers should succeed");
 
-    sqlx::query(
-        r#"
-        INSERT INTO awa.queue_state_counts (
-            queue, scheduled, available, running, completed,
-            retryable, failed, cancelled, waiting_external
-        )
-        SELECT
-            queue,
-            count(*) FILTER (WHERE state = 'scheduled') AS scheduled,
-            count(*) FILTER (WHERE state = 'available') AS available,
-            count(*) FILTER (WHERE state = 'running') AS running,
-            count(*) FILTER (WHERE state = 'completed') AS completed,
-            count(*) FILTER (WHERE state = 'retryable') AS retryable,
-            count(*) FILTER (WHERE state = 'failed') AS failed,
-            count(*) FILTER (WHERE state = 'cancelled') AS cancelled,
-            count(*) FILTER (WHERE state = 'waiting_external') AS waiting_external
-        FROM (
-            SELECT queue, state FROM awa.jobs_hot WHERE queue LIKE $1
-            UNION ALL
-            SELECT queue, state FROM awa.scheduled_jobs WHERE queue LIKE $1
-        ) AS jobs
-        GROUP BY queue
-        ON CONFLICT (queue) DO UPDATE
-        SET scheduled = EXCLUDED.scheduled,
-            available = EXCLUDED.available,
-            running = EXCLUDED.running,
-            completed = EXCLUDED.completed,
-            retryable = EXCLUDED.retryable,
-            failed = EXCLUDED.failed,
-            cancelled = EXCLUDED.cancelled,
-            waiting_external = EXCLUDED.waiting_external
-        "#,
-    )
-    .bind(&queue_pattern)
-    .execute(&mut *conn)
-    .await
-    .expect("backfill queue counts should succeed");
-
-    sqlx::query(
-        r#"
-        INSERT INTO awa.job_kind_catalog (kind, ref_count)
-        SELECT kind, count(*) AS ref_count
-        FROM (
-            SELECT kind FROM awa.jobs_hot WHERE kind LIKE $1
-            UNION ALL
-            SELECT kind FROM awa.scheduled_jobs WHERE kind LIKE $1
-        ) AS jobs
-        GROUP BY kind
-        ON CONFLICT (kind) DO UPDATE
-        SET ref_count = EXCLUDED.ref_count
-        "#,
-    )
-    .bind(&kind_pattern)
-    .execute(&mut *conn)
-    .await
-    .expect("backfill kind catalog should succeed");
-
-    sqlx::query(
-        r#"
-        INSERT INTO awa.job_queue_catalog (queue, ref_count)
-        SELECT queue, count(*) AS ref_count
-        FROM (
-            SELECT queue FROM awa.jobs_hot WHERE queue LIKE $1
-            UNION ALL
-            SELECT queue FROM awa.scheduled_jobs WHERE queue LIKE $1
-        ) AS jobs
-        GROUP BY queue
-        ON CONFLICT (queue) DO UPDATE
-        SET ref_count = EXCLUDED.ref_count
-        "#,
-    )
-    .bind(&queue_pattern)
-    .execute(&mut *conn)
-    .await
-    .expect("backfill queue catalog should succeed");
+    sqlx::query("SELECT awa.rebuild_admin_metadata()")
+        .execute(&mut *conn)
+        .await
+        .expect("admin metadata rebuild should succeed");
 }
 
 #[tokio::test]
@@ -459,6 +392,11 @@ async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
             .expect("request should succeed");
         let elapsed = started.elapsed();
         assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "{path} took {:?}, expected under 50ms",
+            elapsed
+        );
         println!("{path} {:?}", elapsed);
     }
 

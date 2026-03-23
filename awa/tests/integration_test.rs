@@ -10,7 +10,13 @@ use awa::{
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
+
+fn test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -842,6 +848,7 @@ async fn test_admin_queue_stats() {
 
 #[tokio::test]
 async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
     let client = setup().await;
     let queue_a = "integ_admin_meta_a";
     let queue_b = "integ_admin_meta_b";
@@ -943,6 +950,106 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
 
     let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
     assert!(!distinct_queues.contains(&queue_b.to_string()));
+}
+
+#[tokio::test]
+async fn test_admin_metadata_tracks_scheduled_promotion_path() {
+    let _guard = test_lock().lock().unwrap_or_else(|e| e.into_inner());
+    let client = setup().await;
+    let queue = "integ_admin_meta_promote";
+    let kind = "integ_admin_meta_promote_kind";
+
+    clean_queue(client.pool(), queue).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
+        .bind(kind)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs (kind, queue, args, state, run_at) VALUES ($1, $2, '{}'::jsonb, 'scheduled', now() - interval '1 minute')",
+    )
+    .bind(kind)
+    .bind(queue)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let before = admin::queue_stats(client.pool()).await.unwrap();
+    let before = before.iter().find(|stat| stat.queue == queue).unwrap();
+    assert_eq!(before.scheduled, 1);
+    assert_eq!(before.available, 0);
+    assert_eq!(before.total_queued, 1);
+
+    let promoted: i64 = sqlx::query_scalar(
+        r#"
+        WITH due AS (
+            DELETE FROM awa.scheduled_jobs
+            WHERE id IN (
+                SELECT id
+                FROM awa.scheduled_jobs
+                WHERE queue = $1
+                  AND state = 'scheduled'
+                  AND run_at <= now()
+                ORDER BY run_at ASC, id ASC
+                LIMIT 32
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        ),
+        promoted AS (
+            INSERT INTO awa.jobs_hot (
+                id, kind, queue, args, state, priority, attempt, max_attempts,
+                run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+                created_at, errors, metadata, tags, unique_key, unique_states,
+                callback_id, callback_timeout_at, callback_filter, callback_on_complete,
+                callback_on_fail, callback_transform, run_lease, progress
+            )
+            SELECT
+                id,
+                kind,
+                queue,
+                args,
+                'available'::awa.job_state,
+                priority,
+                attempt,
+                max_attempts,
+                now(),
+                NULL,
+                NULL,
+                attempted_at,
+                finalized_at,
+                created_at,
+                errors,
+                metadata,
+                tags,
+                unique_key,
+                unique_states,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                run_lease,
+                progress
+            FROM due
+            RETURNING id
+        )
+        SELECT count(*)::bigint FROM promoted
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(promoted, 1);
+
+    let after = admin::queue_stats(client.pool()).await.unwrap();
+    let after = after.iter().find(|stat| stat.queue == queue).unwrap();
+    assert_eq!(after.scheduled, 0);
+    assert_eq!(after.available, 1);
+    assert_eq!(after.total_queued, 1);
 }
 
 #[tokio::test]

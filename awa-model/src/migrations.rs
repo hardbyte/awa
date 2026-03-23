@@ -49,8 +49,7 @@ fn normalize_legacy_version(old_version: i32) -> i32 {
 /// V1 bootstraps the canonical schema from scratch; V2+ are incremental
 /// and use `IF NOT EXISTS` guards so they are safe to re-run.
 ///
-/// Handles upgrade from pre-0.4 version numbering (V3/V4/V5/V6 → V1/V2/V3/V4)
-/// by normalizing the legacy version and replacing the old version rows.
+/// by replacing the legacy `schema_version` rows with the new numbering.
 ///
 /// Takes `&PgPool` for ergonomic use from Rust.
 pub async fn run(pool: &PgPool) -> Result<(), AwaError> {
@@ -158,14 +157,14 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
             !has_runtime
         };
 
-        let normalized = normalize_legacy_version(raw_version);
     if has_legacy || is_legacy_v3_only {
+        let normalized = normalize_legacy_version(raw_version);
         info!(
             old_version = raw_version,
             new_version = normalized,
             "Normalizing legacy version numbering"
         );
-        // Remove legacy rows and insert canonical ones.
+        // Replace legacy rows so future calls return the new numbering.
         sqlx::query("DELETE FROM awa.schema_version WHERE version >= 3")
             .execute(&mut *conn)
             .await?;
