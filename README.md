@@ -115,10 +115,14 @@ See [`awa-python/examples/`](awa-python/examples/) for complete runnable scripts
 use awa::{Client, QueueConfig, JobArgs, JobResult, JobError, JobContext, Worker};
 use serde::{Serialize, Deserialize};
 
-#[derive(Debug, Serialize, Deserialize, JobArgs)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SendEmail {
     to: String,
     subject: String,
+}
+
+impl JobArgs for SendEmail {
+    fn kind() -> &'static str { "send_email" }
 }
 
 struct SendEmailWorker;

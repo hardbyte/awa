@@ -4,7 +4,7 @@ This guide takes you from `cargo add` to a job reaching `completed`.
 
 ## Prerequisites
 
-- PostgreSQL 15+ running locally or remotely
+- PostgreSQL running locally or remotely
 - Rust toolchain installed
 - A database URL exported as `DATABASE_URL`
 
@@ -36,10 +36,16 @@ use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::{env, time::Duration};
 
-#[derive(Debug, Serialize, Deserialize, JobArgs)]
+#[derive(Debug, Serialize, Deserialize)]
 struct SendEmail {
     to: String,
     subject: String,
+}
+
+impl JobArgs for SendEmail {
+    fn kind() -> &'static str {
+        "send_email"
+    }
 }
 
 #[tokio::main]
@@ -125,6 +131,7 @@ The UI starts on `http://127.0.0.1:3000` by default.
 
 ## Production Notes
 
+- This quickstart implements `JobArgs` manually to keep the dependency set minimal. If you want `#[derive(JobArgs)]`, add a direct dependency on `awa-model` and derive `awa_model::JobArgs`.
 - `Client::start()` spawns background tasks and returns immediately. Your service should usually stay alive until it receives a shutdown signal.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.

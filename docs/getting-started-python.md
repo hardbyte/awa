@@ -4,7 +4,7 @@ This guide takes you from `pip install` to a job reaching `completed`.
 
 ## Prerequisites
 
-- PostgreSQL 15+ running locally or remotely
+- PostgreSQL running locally or remotely
 - Python 3.10+
 - A database URL exported as `DATABASE_URL`
 

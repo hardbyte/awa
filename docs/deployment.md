@@ -31,7 +31,7 @@ Practical starting point, based on the current runtime internals:
 - the elected leader holds one advisory-lock connection while it remains leader
 - claim, heartbeat, completion, cleanup, and handler SQL all share the same pool
 
-For a dedicated worker process, start with:
+Conservative starting heuristic, not a hard requirement:
 
 ```text
 max_connections >= queue_count + 4
@@ -138,9 +138,17 @@ Awa provides a runtime health API in-process:
 
 It does not provide worker HTTP endpoints by itself. Your application should expose `/healthz` and `/readyz` if your platform expects HTTP probes.
 
+Awa's current `health_check().healthy` result requires:
+
+- Postgres reachable
+- all configured dispatchers alive
+- heartbeat loop alive
+- maintenance loop alive
+- not currently shutting down
+
 Recommended worker probes:
 
-- liveness: Postgres reachable, dispatchers alive, heartbeat alive
+- liveness: same conditions as `health_check().healthy`
 - readiness: not shutting down
 
 `awa serve` is separate; its HTTP server is for the web UI/admin API, not for worker liveness.

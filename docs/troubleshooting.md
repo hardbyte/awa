@@ -94,8 +94,10 @@ That means failover is not instant by default. A short delay after a pod restart
 From the runtime snapshot table or your app health endpoint, confirm:
 
 - at least one live instance exists
-- exactly one healthy instance reports `leader = true`
+- in steady state, one live instance reports `leader = true`
 - the leader also reports `maintenance_alive = true`
+
+During failover there may be a brief window with no leader before the next election retry succeeds.
 
 If no leader appears:
 
@@ -130,10 +132,7 @@ Current runtime defaults:
 - the pod was terminated before graceful shutdown finished
 - the pool was undersized and the runtime could not get connections reliably
 
-For Python workers specifically:
-
-- a blocked event loop does not normally stop heartbeats, because the heartbeat loop runs in Rust
-- if heartbeats still stop, suspect process health or database connectivity first
+For Python workers specifically, the heartbeat loop runs on the Rust runtime rather than the Python event loop. If heartbeats still stop, suspect process health or database connectivity first.
 
 ### Fixes
 
