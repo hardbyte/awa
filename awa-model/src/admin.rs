@@ -53,6 +53,43 @@ where
     .map(Some)
 }
 
+/// Cancel a job by its unique key components.
+///
+/// Reconstructs the BLAKE3 unique key from the same inputs used at insert time,
+/// then cancels the matching non-terminal job. Returns `None` if no matching
+/// job was found (already completed, already cancelled, or never existed).
+///
+/// This is useful when the caller knows the job kind and args but not the job ID —
+/// e.g., cancelling a scheduled reminder when the triggering condition is resolved.
+pub async fn cancel_by_unique_key<'e, E>(
+    executor: E,
+    kind: &str,
+    queue: Option<&str>,
+    args: Option<&serde_json::Value>,
+) -> Result<Option<JobRow>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let unique_key = crate::unique::compute_unique_key(kind, queue, args, None);
+
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'cancelled', finalized_at = now(),
+            callback_id = NULL, callback_timeout_at = NULL,
+            callback_filter = NULL, callback_on_complete = NULL,
+            callback_on_fail = NULL, callback_transform = NULL
+        WHERE unique_key = $1 AND state NOT IN ('completed', 'failed', 'cancelled')
+        RETURNING *
+        "#,
+    )
+    .bind(&unique_key)
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row)
+}
+
 /// Retry all failed jobs of a given kind.
 pub async fn retry_failed_by_kind<'e, E>(executor: E, kind: &str) -> Result<Vec<JobRow>, AwaError>
 where

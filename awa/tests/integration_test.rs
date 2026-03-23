@@ -401,6 +401,116 @@ async fn test_admin_cancel() {
 }
 
 #[tokio::test]
+async fn test_admin_cancel_by_unique_key() {
+    let client = setup().await;
+    let queue = "integ_cancel_by_unique_key";
+    clean_queue(client.pool(), queue).await;
+
+    let args = SendEmail {
+        to: "cancel-by-key@example.com".into(),
+        subject: "Cancel me by key".into(),
+    };
+
+    let job = insert_with(
+        client.pool(),
+        &args,
+        InsertOpts {
+            queue: queue.into(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Cancel using the same kind + queue + args that were used to insert
+    let cancelled = admin::cancel_by_unique_key(
+        client.pool(),
+        SendEmail::kind(),
+        Some(queue),
+        Some(&serde_json::to_value(&args).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    assert!(cancelled.is_some(), "should find and cancel the job");
+    assert_eq!(cancelled.unwrap().id, job.id);
+
+    let fetched = client.get_job(job.id).await.unwrap();
+    assert_eq!(fetched.state, JobState::Cancelled);
+}
+
+#[tokio::test]
+async fn test_admin_cancel_by_unique_key_returns_none_when_not_found() {
+    let client = setup().await;
+
+    let result = admin::cancel_by_unique_key(
+        client.pool(),
+        "nonexistent_kind",
+        Some("nonexistent_queue"),
+        Some(&serde_json::json!({"id": "does-not-exist"})),
+    )
+    .await
+    .unwrap();
+
+    assert!(result.is_none(), "should return None for non-existent job");
+}
+
+#[tokio::test]
+async fn test_admin_cancel_by_unique_key_noop_when_already_completed() {
+    let client = setup().await;
+    let queue = "integ_cancel_by_key_completed";
+    clean_queue(client.pool(), queue).await;
+
+    let args = SendEmail {
+        to: "completed@example.com".into(),
+        subject: "Already done".into(),
+    };
+
+    let job = insert_with(
+        client.pool(),
+        &args,
+        InsertOpts {
+            queue: queue.into(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Manually mark as completed
+    sqlx::query("UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1")
+        .bind(job.id)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // Cancel should return None — job is already terminal
+    let result = admin::cancel_by_unique_key(
+        client.pool(),
+        SendEmail::kind(),
+        Some(queue),
+        Some(&serde_json::to_value(&args).unwrap()),
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        result.is_none(),
+        "should not cancel an already-completed job"
+    );
+}
+
+#[tokio::test]
 async fn test_admin_pause_resume_queue() {
     let client = setup().await;
     let queue = "integ_pause_resume";
