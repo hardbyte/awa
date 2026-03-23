@@ -193,23 +193,24 @@ awa --database-url $DATABASE_URL job list --state failed
 ## Architecture
 
 ```
-┌───────────────┐   ┌───────────────┐
-│ Rust producer  │   │ Python (pip)  │
-└───────┬───────┘   └───────┬───────┘
-        └───────┬───────────┘
-                ▼
-      ┌──────────────────┐
-      │    PostgreSQL     │
-      │   jobs_hot        │
-      │   scheduled_jobs  │
-      └────────┬─────────┘
-               │
-     ┌─────────┼─────────┐
-     ▼         ▼         ▼
-  ┌──────┐  ┌──────┐  ┌──────┐
-  │Worker│  │Worker│  │Worker│
-  │(Rust)│  │(PyO3)│  │(PyO3)│
-  └──────┘  └──────┘  └──────┘
++----------------+   +----------------+
+| Rust producer  |   | Python (pip)   |
++-------+--------+   +--------+-------+
+        |                      |
+        +----------+-----------+
+                   |
+        +----------v-----------+
+        |     PostgreSQL       |
+        |   jobs_hot           |
+        |   scheduled_jobs     |
+        +----------+-----------+
+                   |
+        +----------+----------+
+        |          |          |
+   +----v---+ +---v----+ +---v----+
+   | Worker | | Worker | | Worker |
+   | (Rust) | | (PyO3) | | (PyO3) |
+   +--------+ +--------+ +--------+
 ```
 
 All coordination through Postgres. The Rust runtime owns polling, heartbeats, shutdown, and crash recovery for both languages. Mixed Rust and Python workers coexist on the same queues. See [architecture overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) for full details.
