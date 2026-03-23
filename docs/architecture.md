@@ -346,6 +346,29 @@ client.periodic(
 
 Cron expressions and timezones are validated eagerly at registration time via the `croner` crate and `chrono-tz`.
 
+### Lifecycle Hooks
+
+Builder-side lifecycle hooks let applications react to committed job outcomes
+without growing the `Worker` trait surface:
+
+```rust
+let client = Client::builder(pool)
+    .queue("default", QueueConfig::default())
+    .register::<SendEmail, _, _>(handle_email)
+    .on_event::<SendEmail, _, _>(|event| async move {
+        if let awa::JobEvent::Exhausted { args, error, .. } = event {
+            tracing::error!(to = %args.to, error = %error, "email job exhausted retries");
+        }
+    })
+    .build()?;
+```
+
+Hooks are best-effort, post-commit notifications. They run in detached tasks
+after the job's in-flight permit has been released — a slow or panicking hook
+cannot block queue capacity or delay other jobs. `shutdown()` does not wait
+for hook tasks to complete; in-flight hooks may be dropped during shutdown.
+If the side effect must be durable or retried, enqueue another job instead.
+
 ### Scheduler Flow (Leader-Only)
 
 ```

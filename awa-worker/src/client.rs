@@ -1,5 +1,6 @@
 use crate::completion::CompletionBatcher;
 use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
+use crate::events::{BoxedUntypedEventHandler, JobEvent, UntypedJobEvent};
 use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
@@ -78,6 +79,7 @@ pub struct ClientBuilder {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
     workers: HashMap<String, BoxedWorker>,
+    lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -102,6 +104,7 @@ impl ClientBuilder {
             pool,
             queues: Vec::new(),
             workers: HashMap::new(),
+            lifecycle_handlers: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
@@ -144,6 +147,69 @@ impl ClientBuilder {
             _phantom: std::marker::PhantomData,
         };
         self.workers.insert(kind, Box::new(worker));
+        self
+    }
+
+    /// Register a typed lifecycle event handler for a job kind.
+    ///
+    /// Handlers run only after the corresponding DB state transition commits.
+    /// They are best-effort in-process hooks, not a durable workflow mechanism.
+    /// Capture any shared dependencies you need in the closure environment.
+    pub fn on_event<T, F, Fut>(mut self, handler: F) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: Fn(JobEvent<T>) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let kind = T::kind().to_string();
+        let handler = Arc::new(handler);
+        let erased: BoxedUntypedEventHandler = Arc::new(move |event: UntypedJobEvent| {
+            let handler = handler.clone();
+            Box::pin(async move {
+                let args: T = match serde_json::from_value(event.job().args.clone()) {
+                    Ok(args) => args,
+                    Err(err) => {
+                        warn!(
+                            job_id = event.job().id,
+                            kind = %event.job().kind,
+                            error = %err,
+                            "Failed to deserialize args for lifecycle event handler"
+                        );
+                        return;
+                    }
+                };
+
+                (handler)(event.into_typed(args)).await;
+            })
+        });
+        self.lifecycle_handlers
+            .entry(kind)
+            .or_default()
+            .push(erased);
+        self
+    }
+
+    /// Register an untyped lifecycle event handler for a specific job kind.
+    ///
+    /// Use this with `register_worker(...)` or for cross-cutting logic that
+    /// doesn't need typed args.
+    pub fn on_event_kind<F, Fut>(mut self, kind: impl Into<String>, handler: F) -> Self
+    where
+        F: Fn(UntypedJobEvent) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let kind = kind.into();
+        let handler = Arc::new(handler);
+        let erased: BoxedUntypedEventHandler = Arc::new(move |event: UntypedJobEvent| {
+            let handler = handler.clone();
+            Box::pin(async move {
+                (handler)(event).await;
+            })
+        });
+        self.lifecycle_handlers
+            .entry(kind)
+            .or_default()
+            .push(erased);
         self
     }
 
@@ -322,6 +388,7 @@ impl ClientBuilder {
             pool: self.pool,
             queues: self.queues,
             workers: Arc::new(self.workers),
+            lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
             promote_interval: self.promote_interval,
@@ -396,6 +463,7 @@ pub struct Client {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
     workers: Arc<HashMap<String, BoxedWorker>>,
+    lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -510,6 +578,7 @@ impl Client {
         let executor = Arc::new(JobExecutor::new(
             self.pool.clone(),
             self.workers.clone(),
+            self.lifecycle_handlers.clone(),
             self.in_flight.clone(),
             self.queue_in_flight.clone(),
             self.state.clone(),

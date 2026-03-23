@@ -148,10 +148,15 @@ awa::insert_with(&pool, &SendEmail { to: "alice@example.com".into(), subject: "W
 // Cancel by unique key (e.g., when the triggering condition is resolved)
 awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
 
-// Start workers
+// Start workers with a typed lifecycle hook
 let client = Client::builder(pool)
     .queue("default", QueueConfig::default())
     .register_worker(SendEmailWorker)
+    .on_event::<SendEmail, _, _>(|event| async move {
+        if let awa::JobEvent::Exhausted { args, error, .. } = event {
+            tracing::error!(to = %args.to, error = %error, "email job exhausted retries");
+        }
+    })
     .build()?;
 client.start().await?;
 ```
