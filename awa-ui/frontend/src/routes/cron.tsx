@@ -12,7 +12,7 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
 import { JsonView } from "@/components/JsonView";
-import { timeAgo } from "@/lib/time";
+import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
 
 export function CronPage() {
   const queryClient = useQueryClient();
@@ -101,7 +101,15 @@ export function CronPage() {
                     </Badge>
                   )}
 
-                  <span className="ml-auto text-sm text-muted-fg">
+                  <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
+                    {cj.next_fire_at && (
+                      <span
+                        className="text-success"
+                        title={formatInTimezone(cj.next_fire_at, cj.timezone)}
+                      >
+                        {timeUntil(cj.next_fire_at)}
+                      </span>
+                    )}
                     {cj.last_enqueued_at ? (
                       <span title={new Date(cj.last_enqueued_at).toLocaleString()}>
                         {timeAgo(cj.last_enqueued_at)}
@@ -170,6 +178,18 @@ export function CronPage() {
                       <div>
                         <dt className="text-sm text-muted-fg mb-1">Metadata</dt>
                         <JsonView data={cj.metadata} />
+                      </div>
+                    )}
+
+                    {cj.next_fire_at && (
+                      <div>
+                        <dt className="text-sm text-muted-fg">Next fire</dt>
+                        <dd className="font-medium">
+                          {formatInTimezone(cj.next_fire_at, cj.timezone)}
+                          <span className="ml-2 text-muted-fg font-normal">
+                            ({timeUntil(cj.next_fire_at)})
+                          </span>
+                        </dd>
                       </div>
                     )}
 

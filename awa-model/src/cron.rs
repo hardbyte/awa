@@ -269,6 +269,17 @@ where
     Ok(())
 }
 
+/// Compute the next fire time for a cron expression after now.
+///
+/// Returns `None` if the expression or timezone is invalid.
+pub fn next_fire_time(cron_expr: &str, timezone: &str) -> Option<DateTime<Utc>> {
+    let cron = Cron::new(cron_expr).parse().ok()?;
+    let tz: chrono_tz::Tz = timezone.parse().ok()?;
+    let now_tz = Utc::now().with_timezone(&tz);
+    let next = cron.iter_from(now_tz).next()?;
+    Some(next.with_timezone(&Utc))
+}
+
 /// Load all cron job rows from `awa.cron_jobs`.
 pub async fn list_cron_jobs<'e, E>(executor: E) -> Result<Vec<CronJobRow>, AwaError>
 where
@@ -573,5 +584,43 @@ mod tests {
             .max_attempts(0)
             .build_raw("test_job".to_string(), serde_json::json!({}));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_next_fire_time_returns_future() {
+        let next = next_fire_time("* * * * *", "UTC");
+        assert!(
+            next.is_some(),
+            "every-minute schedule should have a next fire"
+        );
+        let next = next.unwrap();
+        assert!(next > Utc::now(), "next fire should be in the future");
+        // Should be within ~60 seconds for a every-minute schedule
+        let delta = next - Utc::now();
+        assert!(
+            delta.num_seconds() <= 61,
+            "next fire should be within 61 seconds, got {}s",
+            delta.num_seconds()
+        );
+    }
+
+    #[test]
+    fn test_next_fire_time_respects_timezone() {
+        let next_utc = next_fire_time("0 9 * * *", "UTC");
+        let next_nz = next_fire_time("0 9 * * *", "Pacific/Auckland");
+        assert!(next_utc.is_some());
+        assert!(next_nz.is_some());
+        // 9 AM in NZ is different from 9 AM UTC
+        assert_ne!(
+            next_utc.unwrap(),
+            next_nz.unwrap(),
+            "9 AM UTC and 9 AM NZ should be different UTC times"
+        );
+    }
+
+    #[test]
+    fn test_next_fire_time_invalid_input() {
+        assert!(next_fire_time("not a cron", "UTC").is_none());
+        assert!(next_fire_time("* * * * *", "Not/A/Zone").is_none());
     }
 }
