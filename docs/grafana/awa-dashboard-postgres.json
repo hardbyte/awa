@@ -1,0 +1,230 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_POSTGRES",
+      "label": "Awa Postgres",
+      "description": "Postgres datasource pointing at the awa database",
+      "type": "datasource",
+      "pluginId": "grafana-postgresql-datasource",
+      "pluginName": "PostgreSQL"
+    }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "links": [],
+  "panels": [
+    {
+      "title": "Queue Depth by State",
+      "description": "Current job counts per queue, pivoted by state. Sortable — click column headers.",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "align": "right" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "available" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "running" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "available", "desc": true }] },
+      "targets": [
+        {
+          "rawSql": "SELECT queue, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'running')::bigint AS running, count(*) FILTER (WHERE state = 'completed')::bigint AS completed, count(*) FILTER (WHERE state = 'failed')::bigint AS failed, count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled, count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable, count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_ext, count(*) FILTER (WHERE state = 'cancelled')::bigint AS cancelled FROM awa.jobs GROUP BY queue ORDER BY count(*) FILTER (WHERE state = 'available') DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Queue Lag (oldest pending job)",
+      "description": "Age of the oldest available job per queue — sorted by lag descending",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "right" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 200 }] },
+          { "matcher": { "id": "byName", "options": "lag" }, "properties": [
+            { "id": "unit", "value": "s" },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }] } },
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } }
+          ]},
+          { "matcher": { "id": "byName", "options": "pending" }, "properties": [{ "id": "unit", "value": "short" }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "lag", "desc": true }] },
+      "targets": [
+        {
+          "rawSql": "SELECT queue, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(run_at)))::float AS lag FROM awa.jobs_hot WHERE state = 'available' GROUP BY queue ORDER BY lag DESC LIMIT 20",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Completed / Failed (last hour)",
+      "description": "Jobs finalized in the last hour, by queue",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 80, "stacking": { "mode": "normal" } } },
+        "overrides": [
+          { "matcher": { "id": "byRegexp", "options": ".*completed.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+          { "matcher": { "id": "byRegexp", "options": ".*failed.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+        ]
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT date_trunc('minute', finalized_at) AS time, queue || ' ' || state::text AS metric, count(*)::bigint AS value FROM awa.jobs_hot WHERE state IN ('completed', 'failed') AND finalized_at > now() - interval '1 hour' GROUP BY 1, 2 ORDER BY 1",
+          "format": "time_series",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Failed Jobs (recent)",
+      "description": "Most recent failed jobs with error details",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "fieldConfig": {
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "finalized_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
+          { "matcher": { "id": "byName", "options": "id" }, "properties": [{ "id": "custom.width", "value": 80 }] },
+          { "matcher": { "id": "byName", "options": "attempt" }, "properties": [{ "id": "custom.width", "value": 60 }] }
+        ]
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT id, kind, queue, attempt, max_attempts, finalized_at, errors[array_upper(errors, 1)]->>'error' AS last_error FROM awa.jobs_hot WHERE state = 'failed' ORDER BY finalized_at DESC LIMIT 20",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Cron Schedules",
+      "description": "Registered cron schedules with last enqueue time",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "fieldConfig": {
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "last_enqueued_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
+          { "matcher": { "id": "byName", "options": "age" }, "properties": [{ "id": "unit", "value": "s" }] }
+        ]
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT name, cron_expr, timezone, kind, queue, last_enqueued_at, EXTRACT(EPOCH FROM (now() - last_enqueued_at))::float AS age FROM awa.cron_jobs ORDER BY name",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Runtime Instances",
+      "description": "Connected worker instances and their health",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "fieldConfig": {
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "last_seen_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
+          { "matcher": { "id": "byName", "options": "healthy" }, "properties": [
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+            { "id": "mappings", "value": [
+              { "type": "value", "options": { "true": { "text": "Healthy", "color": "green" }, "false": { "text": "Unhealthy", "color": "red" } } }
+            ]}
+          ]}
+        ]
+      },
+      "targets": [
+        {
+          "rawSql": "SELECT hostname, version, healthy, leader, poll_loop_alive, heartbeat_alive, maintenance_alive, shutting_down, last_seen_at, jsonb_array_length(queues) AS queue_count FROM awa.runtime_instances WHERE last_seen_at > now() - interval '5 minutes' ORDER BY hostname",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Total Available",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
+        }
+      },
+      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'available'", "format": "table", "refId": "A" }],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Total Running",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
+        }
+      },
+      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'running'", "format": "table", "refId": "A" }],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Total Failed",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 10 }] }
+        }
+      },
+      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'failed'", "format": "table", "refId": "A" }],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Total Scheduled",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
+        }
+      },
+      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.scheduled_jobs", "format": "table", "refId": "A" }],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Paused Queues",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 24 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
+        }
+      },
+      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.queue_meta WHERE paused = true", "format": "table", "refId": "A" }],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    }
+  ],
+  "schemaVersion": 39,
+  "tags": ["awa", "job-queue", "postgres"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "Awa Job Queue (Postgres)",
+  "uid": "awa-postgres",
+  "version": 1,
+  "refresh": "30s"
+}
