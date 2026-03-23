@@ -27,6 +27,7 @@ impl CallbackGuard {
         self.id
     }
 
+    #[cfg(feature = "__python-bridge")]
     #[doc(hidden)]
     pub fn from_bridge_token(id: uuid::Uuid) -> Self {
         Self::new(id)

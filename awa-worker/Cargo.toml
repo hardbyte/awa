@@ -10,6 +10,7 @@ readme = "README.md"
 [features]
 cel = ["awa-model/cel"]
 anyhow = ["dep:anyhow"]
+__python-bridge = []
 
 [dependencies]
 awa-model.workspace = true

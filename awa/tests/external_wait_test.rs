@@ -60,6 +60,25 @@ impl Worker for ExternalPaymentWorker {
     }
 }
 
+// -- Internal bridge misuse: WaitForCallback without register_callback --
+
+#[cfg(feature = "__python-bridge")]
+struct ForgotCallbackWorker;
+
+#[cfg(feature = "__python-bridge")]
+#[async_trait::async_trait]
+impl Worker for ForgotCallbackWorker {
+    fn kind(&self) -> &'static str {
+        "external_payment"
+    }
+
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        Ok(JobResult::WaitForCallback(
+            awa::CallbackGuard::from_bridge_token(uuid::Uuid::new_v4()),
+        ))
+    }
+}
+
 /// E1: register_callback → WaitForCallback → state = waiting_external, callback_id set
 #[tokio::test]
 async fn test_e1_happy_path_waiting_external() {
@@ -688,4 +707,34 @@ async fn test_e14_migration() {
     migrations::run(&pool).await.unwrap();
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
+/// Internal bridge misuse should still fail the job descriptively at runtime.
+#[cfg(feature = "__python-bridge")]
+#[tokio::test]
+async fn test_wait_for_callback_without_register() {
+    let client = setup().await;
+    let queue = "test_wait_no_register";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 99 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let result = client
+        .work_one_in_queue(&ForgotCallbackWorker, Some(queue))
+        .await
+        .unwrap();
+    assert!(result.is_failed());
+
+    let failed = client.get_job(job.id).await.unwrap();
+    assert_eq!(failed.state, JobState::Failed);
+    assert!(failed.finalized_at.is_some());
 }
