@@ -585,27 +585,21 @@ async fn test_admin_runtime_observability_snapshot() {
     runtime.start().await.unwrap();
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
-    let overview = loop {
+    let instance = loop {
         let overview = wait_for_runtime_snapshot(client.pool(), queue).await;
-        if overview
-            .instances
-            .iter()
-            .any(|instance| instance.maintenance_alive)
-        {
-            break overview;
+        if let Some(instance) = overview.instances.iter().find(|instance| {
+            !instance.stale
+                && instance.maintenance_alive
+                && instance.queues.iter().any(|q| q.queue == queue)
+        }) {
+            break instance.clone();
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "timed out waiting for maintenance loop to become healthy"
+            "timed out waiting for queue-scoped maintenance loop to become healthy"
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     };
-    // Find the instance serving our queue (other tests may leave stale snapshots)
-    let instance = overview
-        .instances
-        .iter()
-        .find(|i| i.queues.iter().any(|q| q.queue == queue))
-        .expect("expected an instance serving our queue");
     assert!(!instance.stale);
     assert!(instance.maintenance_alive);
     let queue_snapshot = instance.queues.iter().find(|q| q.queue == queue).unwrap();
