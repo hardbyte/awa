@@ -1,6 +1,6 @@
 use crate::{
-    AwaError as PyAwaError, CallbackNotFound, DatabaseError, SchemaNotMigrated,
-    SerializationError, UniqueConflict, UnknownJobKind, ValidationError,
+    AwaError as PyAwaError, CallbackNotFound, DatabaseError, SchemaNotMigrated, SerializationError,
+    UniqueConflict, UnknownJobKind, ValidationError,
 };
 use pyo3::PyErr;
 

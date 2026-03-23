@@ -433,6 +433,41 @@ impl PyClient {
         })
     }
 
+    /// Cancel a job by its unique key components (kind + optional queue/args/period).
+    ///
+    /// Reconstructs the BLAKE3 unique key from the same inputs used at insert
+    /// time, then cancels the oldest matching non-terminal job. Returns the
+    /// cancelled job, or None if no matching job was found.
+    #[pyo3(signature = (kind, *, queue=None, args=None, period_bucket=None))]
+    fn cancel_by_unique_key<'py>(
+        &self,
+        py: Python<'py>,
+        kind: String,
+        queue: Option<String>,
+        args: Option<pyo3::Bound<'py, pyo3::types::PyAny>>,
+        period_bucket: Option<i64>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let args_json: Option<serde_json::Value> = args
+            .map(|a| pythonize::depythonize(&a))
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize args: {e}"))
+            })?;
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let row = awa_model::admin::cancel_by_unique_key(
+                &pool,
+                &kind,
+                queue.as_deref(),
+                args_json.as_ref(),
+                period_bucket,
+            )
+            .await
+            .map_err(map_awa_error)?;
+            Ok(row.map(PyJob::from))
+        })
+    }
+
     #[pyo3(signature = (*, kind=None, queue=None))]
     fn retry_failed<'py>(
         &self,
@@ -902,10 +937,9 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let outcome =
-                    awa_model::admin::resolve_callback(&pool, uuid, payload_json, action)
-                        .await
-                        .map_err(map_awa_error)?;
+                let outcome = awa_model::admin::resolve_callback(&pool, uuid, payload_json, action)
+                    .await
+                    .map_err(map_awa_error)?;
                 Ok(resolve_outcome_to_py(outcome))
             })
         })
@@ -1091,6 +1125,39 @@ impl PyClient {
                 let row = awa_model::admin::cancel(&pool, job_id)
                     .await
                     .map_err(map_awa_error)?;
+                Ok(row.map(PyJob::from))
+            })
+        })
+    }
+
+    /// Cancel a job by its unique key components (sync version).
+    #[pyo3(signature = (kind, *, queue=None, args=None, period_bucket=None))]
+    fn cancel_by_unique_key_sync(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        queue: Option<String>,
+        args: Option<pyo3::Bound<'_, pyo3::types::PyAny>>,
+        period_bucket: Option<i64>,
+    ) -> PyResult<Option<PyJob>> {
+        let args_json: Option<serde_json::Value> = args
+            .map(|a| pythonize::depythonize(&a))
+            .transpose()
+            .map_err(|e| {
+                pyo3::exceptions::PyValueError::new_err(format!("Failed to serialize args: {e}"))
+            })?;
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::admin::cancel_by_unique_key(
+                    &pool,
+                    &kind,
+                    queue.as_deref(),
+                    args_json.as_ref(),
+                    period_bucket,
+                )
+                .await
+                .map_err(map_awa_error)?;
                 Ok(row.map(PyJob::from))
             })
         })

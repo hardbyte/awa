@@ -27,20 +27,19 @@ fn derive_kind(name: &str) -> String {
 /// Run migrations against the given database URL.
 #[pyfunction]
 fn migrate<'py>(py: Python<'py>, database_url: String) -> PyResult<Bound<'py, PyAny>> {
-    let result = pyo3_async_runtimes::tokio::get_runtime()
-        .block_on(async {
-            let pool = sqlx::postgres::PgPoolOptions::new()
-                .max_connections(2)
-                .connect(&database_url)
-                .await
-                .map_err(errors::map_connect_error)?;
+    let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url)
+            .await
+            .map_err(errors::map_connect_error)?;
 
-            awa_model::migrations::run(&pool)
-                .await
-                .map_err(errors::map_awa_error)?;
+        awa_model::migrations::run(&pool)
+            .await
+            .map_err(errors::map_awa_error)?;
 
-            Ok::<(), PyErr>(())
-        });
+        Ok::<(), PyErr>(())
+    });
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         result?;
         Ok(())
@@ -90,10 +89,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("ValidationError", m.py().get_type::<ValidationError>())?;
     m.add("TerminalError", m.py().get_type::<TerminalError>())?;
     m.add("DatabaseError", m.py().get_type::<DatabaseError>())?;
-    m.add(
-        "CallbackNotFound",
-        m.py().get_type::<CallbackNotFound>(),
-    )?;
+    m.add("CallbackNotFound", m.py().get_type::<CallbackNotFound>())?;
 
     Ok(())
 }

@@ -10,6 +10,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 
 - **Postgres-only** — one dependency you already have.
 - **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone.
+- **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
 - **Rust and Python workers** — same queues, identical semantics, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Web UI** — dashboard, job inspector, queue management, cron controls.
@@ -130,8 +131,13 @@ impl Worker for SendEmailWorker {
     }
 }
 
-// Insert a job
-awa::insert(&pool, &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() }).await?;
+// Insert a job (with uniqueness)
+awa::insert_with(&pool, &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() },
+    awa::InsertOpts { unique: Some(awa::UniqueOpts { by_args: true, ..Default::default() }), ..Default::default() },
+).await?;
+
+// Cancel by unique key (e.g., when the triggering condition is resolved)
+awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
 
 // Start workers
 let client = Client::builder(pool)
