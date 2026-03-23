@@ -160,6 +160,7 @@ test.describe("Runtime page", () => {
     await expect(instancesGrid).toBeVisible();
     await expect(instancesGrid.getByRole("rowheader", { name: /worker-a/ })).toBeVisible();
     await expect(instancesGrid.getByRole("rowheader", { name: /worker-b/ })).toBeVisible();
+    await expect(instancesGrid.getByText("instance 11111111")).toBeVisible();
     await expect(instancesGrid.getByText("Leader", { exact: true })).toBeVisible();
     await expect(instancesGrid.getByText("Degraded", { exact: true })).toBeVisible();
     const queueGrid = page.getByRole("grid", { name: "Queue runtime summary" });
@@ -167,6 +168,8 @@ test.describe("Runtime page", () => {
     await expect(queueGrid.getByRole("rowheader", { name: "email" })).toBeVisible();
     await expect(queueGrid.getByRole("gridcell", { name: "min 2 / w 3" })).toBeVisible();
     await expect(queueGrid.getByRole("gridcell", { name: "5.5/s (10)" })).toBeVisible();
+    await expect(queueGrid.getByText("global 16")).toBeVisible();
+    await expect(queueGrid.getByText("poll 200ms · deadline 300s · aging 60s")).toBeVisible();
     await expect(queueGrid.getByRole("gridcell", { name: "overflow held 1" })).toBeVisible();
   });
 });

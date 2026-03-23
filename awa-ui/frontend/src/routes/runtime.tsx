@@ -45,6 +45,10 @@ function instanceLabel(instance: RuntimeInstance): string {
   return instance.hostname ?? `pid ${instance.pid}`;
 }
 
+function shortInstanceId(instanceId: string): string {
+  return instanceId.split("-")[0] ?? instanceId;
+}
+
 function healthBadge(instance: RuntimeInstance) {
   if (instance.stale) return <Badge intent="warning">Stale</Badge>;
   if (instance.healthy) return <Badge intent="success">Healthy</Badge>;
@@ -53,6 +57,31 @@ function healthBadge(instance: RuntimeInstance) {
 
 function loopBadge(label: string, healthy: boolean) {
   return <Badge intent={healthy ? "success" : "danger"}>{label}</Badge>;
+}
+
+function postgresBadge(connected: boolean) {
+  return <Badge intent={connected ? "secondary" : "danger"}>{connected ? "db ok" : "db down"}</Badge>;
+}
+
+function shutdownBadge(shuttingDown: boolean) {
+  if (!shuttingDown) return null;
+  return <Badge intent="warning">Shutting down</Badge>;
+}
+
+function queueListLabel(instance: RuntimeInstance): string {
+  if (instance.queues.length === 0) return "No queues";
+  if (instance.queues.length <= 3) {
+    return instance.queues.map((queue) => queue.queue).join(", ");
+  }
+  return `${instance.queues
+    .slice(0, 3)
+    .map((queue) => queue.queue)
+    .join(", ")} +${instance.queues.length - 3}`;
+}
+
+function queueConfigDetails(runtime: QueueRuntimeSummary): string {
+  if (!runtime.config) return "No runtime config snapshot";
+  return `poll ${formatSnapshotInterval(runtime.config.poll_interval_ms)} · deadline ${runtime.config.deadline_duration_secs}s · aging ${runtime.config.priority_aging_interval_secs}s`;
 }
 
 export function RuntimePage() {
@@ -202,10 +231,15 @@ export function RuntimePage() {
                       <div className="text-xs text-muted-fg">
                         {instance.version} · pid {instance.pid}
                       </div>
+                      <div className="text-xs text-muted-fg">
+                        instance {shortInstanceId(instance.instance_id)}
+                      </div>
                     </div>
                     <div className="flex flex-wrap gap-1">
                       {healthBadge(instance)}
                       {instance.leader && <Badge intent="primary">Leader</Badge>}
+                      {postgresBadge(instance.postgres_connected)}
+                      {shutdownBadge(instance.shutting_down)}
                     </div>
                   </div>
                   <div className="mt-3 flex flex-wrap gap-1">
@@ -220,8 +254,12 @@ export function RuntimePage() {
                     <span>{formatSnapshotInterval(instance.snapshot_interval_ms)}</span>
                     <span className="text-muted-fg">Started</span>
                     <span>{timeAgo(instance.started_at)}</span>
+                    <span className="text-muted-fg">DB</span>
+                    <span>{instance.postgres_connected ? "Connected" : "Disconnected"}</span>
+                    <span className="text-muted-fg">Global max</span>
+                    <span>{instance.global_max_workers ?? "—"}</span>
                     <span className="text-muted-fg">Queues</span>
-                    <span>{instance.queues.length}</span>
+                    <span>{queueListLabel(instance)}</span>
                   </div>
                 </div>
               ))}
@@ -244,8 +282,17 @@ export function RuntimePage() {
                       <div className="text-xs text-muted-fg">
                         {instance.version} · pid {instance.pid}
                       </div>
+                      <div className="text-xs text-muted-fg">
+                        instance {shortInstanceId(instance.instance_id)}
+                      </div>
                     </TableCell>
-                    <TableCell>{healthBadge(instance)}</TableCell>
+                    <TableCell>
+                      <div className="flex flex-wrap gap-1">
+                        {healthBadge(instance)}
+                        {postgresBadge(instance.postgres_connected)}
+                        {shutdownBadge(instance.shutting_down)}
+                      </div>
+                    </TableCell>
                     <TableCell>
                       <div className="flex flex-wrap gap-1">
                         {loopBadge("poll", instance.poll_loop_alive)}
@@ -272,7 +319,13 @@ export function RuntimePage() {
                         {formatDateTime(instance.started_at)}
                       </div>
                     </TableCell>
-                    <TableCell>{instance.queues.length}</TableCell>
+                    <TableCell>
+                      <div>{instance.queues.length}</div>
+                      <div className="text-xs text-muted-fg">{queueListLabel(instance)}</div>
+                      <div className="text-xs text-muted-fg">
+                        global {instance.global_max_workers ?? "—"}
+                      </div>
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
@@ -326,6 +379,8 @@ export function RuntimePage() {
                   <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                     <span className="text-muted-fg">Capacity</span>
                     <span>{queueCapacityLabel(queue)}</span>
+                    <span className="text-muted-fg">Global max</span>
+                    <span>{queue.config?.global_max_workers ?? "—"}</span>
                     <span className="text-muted-fg">Rate limit</span>
                     <span>{rateLimitLabel(queue)}</span>
                     <span className="text-muted-fg">In flight</span>
@@ -342,6 +397,9 @@ export function RuntimePage() {
                     </span>
                   </div>
                   <div className="mt-3 text-sm text-muted-fg">
+                    {queueConfigDetails(queue)}
+                  </div>
+                  <div className="mt-1 text-sm text-muted-fg">
                     {queue.stale_instances > 0
                       ? `${queue.stale_instances} stale node snapshot(s)`
                       : queue.overflow_held_total != null
@@ -382,8 +440,16 @@ export function RuntimePage() {
                         "—"
                       )}
                     </TableCell>
-                    <TableCell>{queueCapacityLabel(queue)}</TableCell>
-                    <TableCell>{rateLimitLabel(queue)}</TableCell>
+                    <TableCell>
+                      <div>{queueCapacityLabel(queue)}</div>
+                      <div className="text-xs text-muted-fg">
+                        global {queue.config?.global_max_workers ?? "—"}
+                      </div>
+                    </TableCell>
+                    <TableCell>
+                      <div>{rateLimitLabel(queue)}</div>
+                      <div className="text-xs text-muted-fg">{queueConfigDetails(queue)}</div>
+                    </TableCell>
                     <TableCell>{queue.total_in_flight}</TableCell>
                     <TableCell>
                       <div>{queue.healthy_instances}/{queue.live_instances || queue.instance_count} healthy</div>
