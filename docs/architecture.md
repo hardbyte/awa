@@ -349,7 +349,8 @@ Cron expressions and timezones are validated eagerly at registration time via th
 ### Lifecycle Hooks
 
 Builder-side lifecycle hooks let applications react to committed job outcomes
-without growing the `Worker` trait surface:
+without growing the `Worker` trait surface. See
+[ADR-015](adr/015-post-commit-lifecycle-hooks.md) for the design rationale:
 
 ```rust
 let client = Client::builder(pool)

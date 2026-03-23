@@ -261,6 +261,7 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 - [012: Split hot and deferred job storage](https://github.com/hardbyte/awa/blob/main/docs/adr/012-hot-deferred-job-storage.md)
 - [013: Durable run leases and guarded finalization](https://github.com/hardbyte/awa/blob/main/docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
+- [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
 
 </details>
 
