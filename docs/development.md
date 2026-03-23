@@ -10,27 +10,27 @@ and the version number is burned.
 
 1. **Alpha** — early integration testing:
    ```
-   v0.3.0-alpha.1 → v0.3.0-alpha.2 → ...
+   v0.x.0-alpha.1 → v0.x.0-alpha.2 → ...
    ```
 2. **Release candidate** — feature-complete, verifying in staging:
    ```
-   v0.3.0-rc.1 → v0.3.0-rc.2 → ...
+   v0.x.0-rc.1 → v0.x.0-rc.2 → ...
    ```
 3. **Final release** — CI green, all checks pass:
    ```
-   v0.3.0
+   v0.x.0
    ```
 
 ### Steps
 
 1. Bump version in `Cargo.toml` (workspace), `awa/Cargo.toml` (awa-testing
    ref), `awa-python/Cargo.toml`, and `awa-python/pyproject.toml`.
-2. Commit: `Bump version to 0.3.0-alpha.1`
+2. Commit: `Bump version to 0.x.0-alpha.1`
 3. Push to a branch, wait for CI green.
-4. Tag and push: `git tag v0.3.0-alpha.1 && git push origin v0.3.0-alpha.1`
+4. Tag and push: `git tag v0.x.0-alpha.1 && git push origin v0.x.0-alpha.1`
 5. The Release workflow builds wheels, publishes to crates.io and PyPI, and
    creates a GitHub Release with binary assets.
-6. When ready for final: bump version to `0.3.0`, merge to main, tag `v0.3.0`.
+6. When ready for final: bump version to `0.x.0`, merge to main, tag `v0.x.0`.
 
 ### Why pre-releases matter
 
