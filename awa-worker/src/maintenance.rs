@@ -39,6 +39,7 @@ pub struct MaintenanceService {
     metrics: crate::metrics::AwaMetrics,
     cancel: CancellationToken,
     leader: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
@@ -67,6 +68,7 @@ impl MaintenanceService {
         pool: PgPool,
         metrics: crate::metrics::AwaMetrics,
         leader: Arc<AtomicBool>,
+        alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         periodic_jobs: Arc<Vec<PeriodicJob>>,
         in_flight: InFlightMap,
@@ -76,6 +78,7 @@ impl MaintenanceService {
             metrics,
             cancel,
             leader,
+            alive,
             periodic_jobs,
             in_flight,
             heartbeat_rescue_interval: Duration::from_secs(30),
@@ -170,6 +173,8 @@ impl MaintenanceService {
     /// Run the maintenance loop. Attempts leader election first.
     pub async fn run(&self) {
         info!("Maintenance service starting");
+        self.alive.store(true, Ordering::SeqCst);
+        let _alive_guard = MaintenanceAliveGuard(self.alive.clone());
         self.leader.store(false, Ordering::SeqCst);
 
         loop {
@@ -251,6 +256,7 @@ impl MaintenanceService {
                     }
                     _ = cleanup_timer.tick() => {
                         self.cleanup_completed().await;
+                        self.cleanup_stale_runtime_snapshots().await;
                     }
                     _ = cron_sync_timer.tick() => {
                         self.sync_periodic_jobs_to_db().await;
@@ -791,6 +797,14 @@ impl MaintenanceService {
     }
 }
 
+struct MaintenanceAliveGuard(Arc<AtomicBool>);
+
+impl Drop for MaintenanceAliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
 /// Compute the latest fire time for a cron job row, using its expression and timezone.
 ///
 /// Returns `None` if no fire is due (next occurrence is in the future).
@@ -842,4 +856,20 @@ fn compute_fire_time(
     }
 
     latest_fire
+}
+
+impl MaintenanceService {
+    /// Clean up runtime snapshots older than 24 hours.
+    /// Runs as part of the leader's cleanup cycle (not on every snapshot publish).
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup_runtime_snapshots")]
+    async fn cleanup_stale_runtime_snapshots(&self) {
+        if let Err(err) = awa_model::admin::cleanup_runtime_snapshots(
+            &self.pool,
+            chrono::TimeDelta::try_hours(24).unwrap(),
+        )
+        .await
+        {
+            tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
+        }
+    }
 }

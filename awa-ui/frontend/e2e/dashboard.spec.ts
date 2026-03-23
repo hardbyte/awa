@@ -105,6 +105,52 @@ test.describe("Dashboard page", () => {
     expect(page.url()).toContain("e2e_test");
   });
 
+  test("runtime card renders with stat counters", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.url().includes("/api/runtime") && r.ok()
+      ),
+      page.goto("/"),
+    ]);
+
+    // Runtime card header should be visible
+    await expect(
+      page.locator('[data-slot="card-header"]', { hasText: "Runtime" })
+    ).toBeVisible();
+
+    // Stat counter labels should be present
+    for (const label of ["Live", "Healthy", "Leader", "Stale"]) {
+      await expect(page.getByText(label, { exact: true }).first()).toBeVisible();
+    }
+  });
+
+  test("runtime card shows empty state when no workers running", async ({
+    page,
+  }) => {
+    await Promise.all([
+      page.waitForResponse(
+        (r) => r.url().includes("/api/runtime") && r.ok()
+      ),
+      page.goto("/"),
+    ]);
+
+    // When no workers are running, expect either the table or the empty state text
+    const runtimeCard = page.locator('[data-slot="card-header"]', {
+      hasText: "Runtime",
+    });
+    await expect(runtimeCard).toBeVisible();
+
+    // Either instances are shown (table) or the empty/loading message appears
+    const emptyText = page.getByText(
+      "No runtime snapshots yet"
+    );
+    const table = page.getByRole("grid", { name: "Runtime instances" });
+    const hasTable = await table.isVisible().catch(() => false);
+    const hasEmptyText = await emptyText.isVisible().catch(() => false);
+    // One or the other should be present (if a worker happens to be running, table shows)
+    expect(hasTable || hasEmptyText).toBeTruthy();
+  });
+
   test("recent failure row click navigates to job detail", async ({ page }) => {
     await Promise.all([
       page.waitForResponse(

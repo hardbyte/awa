@@ -25,6 +25,10 @@ pub fn router(pool: PgPool) -> Router {
         .route("/jobs/bulk-cancel", post(handlers::jobs::bulk_cancel))
         // Queues
         .route("/queues", get(handlers::queues::list_queues))
+        .route(
+            "/queues/runtime",
+            get(handlers::runtime::list_queue_runtime),
+        )
         .route("/queues/{queue}/pause", post(handlers::queues::pause_queue))
         .route(
             "/queues/{queue}/resume",
@@ -41,7 +45,9 @@ pub fn router(pool: PgPool) -> Router {
         .route("/stats", get(handlers::stats::get_stats))
         .route("/stats/timeseries", get(handlers::stats::get_timeseries))
         .route("/stats/kinds", get(handlers::stats::get_distinct_kinds))
-        .route("/stats/queues", get(handlers::stats::get_distinct_queues));
+        .route("/stats/queues", get(handlers::stats::get_distinct_queues))
+        // Runtime
+        .route("/runtime", get(handlers::runtime::get_runtime));
 
     Router::new()
         .nest("/api", api)

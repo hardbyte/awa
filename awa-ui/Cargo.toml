@@ -23,3 +23,5 @@ mime_guess = "2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }
+awa-testing = { path = "../awa-testing" }
+tower = "0.5"

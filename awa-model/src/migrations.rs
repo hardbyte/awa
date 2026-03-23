@@ -4,10 +4,14 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 3;
+pub const CURRENT_VERSION: i32 = 5;
 
 /// All migrations in order.
-const MIGRATIONS: &[(i32, &str, &[&str])] = &[(3, "Canonical schema with UI indexes", &[V3_UP])];
+const MIGRATIONS: &[(i32, &str, &[&str])] = &[
+    (3, "Canonical schema with UI indexes", &[V3_UP]),
+    (4, "Runtime observability snapshots", &[V4_UP]),
+    (5, "Maintenance loop health in runtime snapshots", &[V5_UP]),
+];
 
 /// The canonical schema (V3: V2 + BRIN on created_at + GIN on tags).
 const V3_UP: &str = r#"
@@ -414,11 +418,46 @@ INSERT INTO awa.schema_version (version, description)
 VALUES (3, 'Canonical schema with UI indexes');
 "#;
 
+const V4_UP: &str = r#"
+CREATE TABLE IF NOT EXISTS awa.runtime_instances (
+    instance_id          UUID PRIMARY KEY,
+    hostname             TEXT,
+    pid                  INTEGER     NOT NULL,
+    version              TEXT        NOT NULL,
+    started_at           TIMESTAMPTZ NOT NULL,
+    last_seen_at         TIMESTAMPTZ NOT NULL DEFAULT now(),
+    snapshot_interval_ms BIGINT      NOT NULL,
+    healthy              BOOLEAN     NOT NULL,
+    postgres_connected   BOOLEAN     NOT NULL,
+    poll_loop_alive      BOOLEAN     NOT NULL,
+    heartbeat_alive      BOOLEAN     NOT NULL,
+    shutting_down        BOOLEAN     NOT NULL,
+    leader               BOOLEAN     NOT NULL,
+    global_max_workers   INTEGER,
+    queues               JSONB       NOT NULL DEFAULT '[]'::jsonb
+);
+
+CREATE INDEX IF NOT EXISTS idx_awa_runtime_instances_last_seen
+    ON awa.runtime_instances (last_seen_at DESC);
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (4, 'Runtime observability snapshots');
+"#;
+
+const V5_UP: &str = r#"
+ALTER TABLE awa.runtime_instances
+    ADD COLUMN IF NOT EXISTS maintenance_alive BOOLEAN NOT NULL DEFAULT FALSE;
+
+INSERT INTO awa.schema_version (version, description)
+VALUES (5, 'Maintenance loop health in runtime snapshots');
+"#;
+
 /// Run all pending migrations against the database.
 ///
-/// Because Awa does not have external users yet, any pre-canonical `awa`
-/// schema is replaced with the canonical schema rather than upgraded through a
-/// historical chain.
+/// Applies only migrations newer than the current schema version.
+/// The V3 migration bootstraps the canonical schema from scratch;
+/// V4+ are incremental and use `IF NOT EXISTS` / `IF NOT EXISTS` guards
+/// so they are safe to re-run.
 ///
 /// Takes `&PgPool` for ergonomic use from Rust. For a `Send`-safe variant
 /// that takes the pool by value, see [`run_owned`].
@@ -457,17 +496,12 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         return Ok(());
     }
 
-    if has_schema {
-        info!(
-            existing_version = current,
-            "Replacing existing awa schema with canonical schema"
-        );
-        sqlx::raw_sql("DROP SCHEMA awa CASCADE")
-            .execute(&mut *conn)
-            .await?;
-    }
-
+    // Apply only migrations newer than the current version.
+    // V3 bootstraps the full schema; V4+ are incremental patches.
     for &(version, description, steps) in MIGRATIONS {
+        if version <= current {
+            continue;
+        }
         info!(version, description, "Applying migration");
         for step in steps {
             sqlx::raw_sql(step).execute(&mut *conn).await?;
