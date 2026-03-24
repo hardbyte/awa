@@ -132,6 +132,10 @@ export interface TimeseriesBucket {
   count: number;
 }
 
+export interface Capabilities {
+  read_only: boolean;
+}
+
 export interface ListJobsParams {
   state?: string;
   kind?: string;
@@ -238,6 +242,10 @@ export function fetchStats(): Promise<StateCounts> {
 
 export function fetchRuntime(): Promise<RuntimeOverview> {
   return apiFetch("/runtime");
+}
+
+export function fetchCapabilities(): Promise<Capabilities> {
+  return apiFetch("/capabilities");
 }
 
 export function fetchTimeseries(

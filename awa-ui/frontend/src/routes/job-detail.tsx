@@ -4,7 +4,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useParams, Link } from "@tanstack/react-router";
-import { fetchJob, retryJob, cancelJob } from "@/lib/api";
+import { fetchJob, retryJob, cancelJob, fetchCapabilities } from "@/lib/api";
 import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -36,6 +36,11 @@ export function JobDetailPage() {
   const { id } = useParams({ strict: false });
   const jobId = Number(id);
   const queryClient = useQueryClient();
+  const capabilitiesQuery = useQuery({
+    queryKey: ["capabilities"],
+    queryFn: fetchCapabilities,
+  });
+  const readOnly = capabilitiesQuery.data?.read_only ?? false;
 
   const jobQuery = useQuery<JobRow>({
     queryKey: ["job", jobId],
@@ -110,7 +115,7 @@ export function JobDetailPage() {
             intent="primary"
             size="sm"
             onPress={() => retryMutation.mutate()}
-            isDisabled={retryMutation.isPending}
+            isDisabled={readOnly || retryMutation.isPending}
           >
             Retry
           </Button>
@@ -121,7 +126,7 @@ export function JobDetailPage() {
             size="sm"
             className="text-danger"
             onPress={() => cancelMutation.mutate()}
-            isDisabled={cancelMutation.isPending}
+            isDisabled={readOnly || cancelMutation.isPending}
           >
             Cancel
           </Button>

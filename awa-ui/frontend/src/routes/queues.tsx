@@ -8,6 +8,7 @@ import { Link } from "@tanstack/react-router";
 import {
   fetchQueues,
   fetchQueueRuntime,
+  fetchCapabilities,
   pauseQueue,
   resumeQueue,
   drainQueue,
@@ -41,6 +42,11 @@ export function QueuesPage() {
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
   });
+  const capabilitiesQuery = useQuery({
+    queryKey: ["capabilities"],
+    queryFn: fetchCapabilities,
+  });
+  const readOnly = capabilitiesQuery.data?.read_only ?? false;
 
   const pauseMutation = useMutation({
     mutationFn: (queue: string) => pauseQueue(queue, "ui"),
@@ -162,15 +168,31 @@ export function QueuesPage() {
               </div>
               <div className="mt-3 flex gap-2">
                 {q.paused ? (
-                  <Button intent="outline" size="xs" onPress={() => resumeMutation.mutate(q.queue)}>
+                  <Button
+                    intent="outline"
+                    size="xs"
+                    onPress={() => resumeMutation.mutate(q.queue)}
+                    isDisabled={readOnly}
+                  >
                     Resume
                   </Button>
                 ) : (
-                  <Button intent="outline" size="xs" onPress={() => pauseMutation.mutate(q.queue)}>
+                  <Button
+                    intent="outline"
+                    size="xs"
+                    onPress={() => pauseMutation.mutate(q.queue)}
+                    isDisabled={readOnly}
+                  >
                     Pause
                   </Button>
                 )}
-                <Button intent="outline" size="xs" className="text-danger" onPress={() => setDrainTarget(q.queue)}>
+                <Button
+                  intent="outline"
+                  size="xs"
+                  className="text-danger"
+                  onPress={() => setDrainTarget(q.queue)}
+                  isDisabled={readOnly}
+                >
                   Drain
                 </Button>
               </div>
@@ -275,6 +297,7 @@ export function QueuesPage() {
                           intent="outline"
                           size="xs"
                           onPress={() => resumeMutation.mutate(q.queue)}
+                          isDisabled={readOnly}
                         >
                           Resume
                         </Button>
@@ -283,6 +306,7 @@ export function QueuesPage() {
                           intent="outline"
                           size="xs"
                           onPress={() => pauseMutation.mutate(q.queue)}
+                          isDisabled={readOnly}
                         >
                           Pause
                         </Button>
@@ -292,6 +316,7 @@ export function QueuesPage() {
                         size="xs"
                         className="text-danger"
                         onPress={() => setDrainTarget(q.queue)}
+                        isDisabled={readOnly}
                       >
                         Drain
                       </Button>

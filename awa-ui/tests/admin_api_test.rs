@@ -1,6 +1,7 @@
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use serde_json::Value;
+use sqlx::postgres::PgPoolOptions;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
@@ -18,6 +19,22 @@ async fn setup_pool() -> sqlx::PgPool {
         .await
         .expect("failed to run migrations for admin API tests");
     pool
+}
+
+async fn setup_read_only_pool() -> sqlx::PgPool {
+    PgPoolOptions::new()
+        .max_connections(1)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                sqlx::query("SET default_transaction_read_only = on")
+                    .execute(conn)
+                    .await?;
+                Ok(())
+            })
+        })
+        .connect(&awa_testing::setup::database_url())
+        .await
+        .expect("failed to connect read-only test pool")
 }
 
 async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
@@ -79,6 +96,28 @@ async fn get_json(app: &axum::Router, path: &str) -> Value {
         .await
         .expect("response body should read");
     serde_json::from_slice(&body).expect("response should deserialize")
+}
+
+async fn post(app: &axum::Router, path: &str) -> (StatusCode, Value) {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(path)
+                .header("content-type", "application/json")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("request should succeed");
+
+    let status = response.status();
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let json = serde_json::from_slice(&body).expect("response should deserialize");
+    (status, json)
 }
 
 async fn cleanup_scale_fixture(pool: &sqlx::PgPool, prefix: &str) {
@@ -415,6 +454,47 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
             .and_then(Value::as_f64)
             .unwrap_or(0.0)
             > 0.0
+    );
+}
+
+#[tokio::test]
+async fn test_capabilities_endpoint_reports_read_only_mode() {
+    let _guard = test_lock().lock().await;
+    let _writable_pool = setup_pool().await;
+    let read_only_pool = setup_read_only_pool().await;
+    let app = awa_ui::router(read_only_pool);
+
+    let payload = get_json(&app, "/api/capabilities").await;
+    assert_eq!(
+        payload.get("read_only").and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn test_mutation_endpoint_returns_read_only_error() {
+    let _guard = test_lock().lock().await;
+    let writable_pool = setup_pool().await;
+    let kind = format!("read_only_cancel_{}", Uuid::new_v4());
+    let queue = format!("read_only_queue_{}", Uuid::new_v4());
+
+    let job: (i64,) = sqlx::query_as(
+        "INSERT INTO awa.jobs (kind, queue, args) VALUES ($1, $2, '{}'::jsonb) RETURNING id",
+    )
+    .bind(&kind)
+    .bind(&queue)
+    .fetch_one(&writable_pool)
+    .await
+    .expect("fixture insert should succeed");
+
+    let read_only_pool = setup_read_only_pool().await;
+    let app = awa_ui::router(read_only_pool);
+    let (status, payload) = post(&app, &format!("/api/jobs/{}/cancel", job.0)).await;
+
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        payload.get("error").and_then(Value::as_str),
+        Some("awa serve is connected to a read-only database; admin actions are disabled")
     );
 }
 

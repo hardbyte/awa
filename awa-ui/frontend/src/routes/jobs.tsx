@@ -9,6 +9,7 @@ import {
   fetchJobs,
   fetchStats,
   fetchQueues,
+  fetchCapabilities,
   bulkRetry,
   bulkCancel,
   pauseQueue,
@@ -114,6 +115,11 @@ export function JobsPage() {
     queryKey: ["stats"],
     queryFn: fetchStats,
   });
+  const capabilitiesQuery = useQuery({
+    queryKey: ["capabilities"],
+    queryFn: fetchCapabilities,
+  });
+  const readOnly = capabilitiesQuery.data?.read_only ?? false;
 
   const retryMutation = useMutation({
     mutationFn: (ids: number[]) => bulkRetry(ids),
@@ -274,6 +280,7 @@ export function JobsPage() {
                 intent="outline"
                 size="xs"
                 onPress={() => resumeQueueMutation.mutate()}
+                isDisabled={readOnly}
               >
                 Resume
               </Button>
@@ -282,6 +289,7 @@ export function JobsPage() {
                 intent="outline"
                 size="xs"
                 onPress={() => pauseQueueMutation.mutate()}
+                isDisabled={readOnly}
               >
                 Pause
               </Button>
@@ -291,6 +299,7 @@ export function JobsPage() {
               size="xs"
               className="text-danger"
               onPress={() => setShowDrainConfirm(true)}
+              isDisabled={readOnly}
             >
               Drain
             </Button>
@@ -343,7 +352,7 @@ export function JobsPage() {
             intent="primary"
             size="sm"
             onPress={() => retryMutation.mutate(retryableIds)}
-            isDisabled={retryMutation.isPending || retryableIds.length === 0}
+            isDisabled={readOnly || retryMutation.isPending || retryableIds.length === 0}
           >
             Retry{retryableIds.length > 0 ? ` (${retryableIds.length})` : ""}
           </Button>
@@ -352,7 +361,7 @@ export function JobsPage() {
             size="sm"
             className="text-danger"
             onPress={() => setShowCancelConfirm(true)}
-            isDisabled={cancelMutation.isPending || cancellableIds.length === 0}
+            isDisabled={readOnly || cancelMutation.isPending || cancellableIds.length === 0}
           >
             Cancel{cancellableIds.length > 0 ? ` (${cancellableIds.length})` : ""}
           </Button>

@@ -1,5 +1,6 @@
 pub mod error;
 pub mod handlers;
+pub mod state;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
@@ -9,12 +10,15 @@ use rust_embed::Embed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 
+use crate::state::AppState;
+
 #[derive(Embed)]
 #[folder = "static/"]
 struct StaticAssets;
 
 /// Create the awa-ui router with all API routes and static file serving.
 pub fn router(pool: PgPool) -> Router {
+    let state = AppState::new(pool);
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
@@ -46,6 +50,7 @@ pub fn router(pool: PgPool) -> Router {
         .route("/stats/timeseries", get(handlers::stats::get_timeseries))
         .route("/stats/kinds", get(handlers::stats::get_distinct_kinds))
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
+        .route("/capabilities", get(handlers::stats::get_capabilities))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime));
 
@@ -53,7 +58,7 @@ pub fn router(pool: PgPool) -> Router {
         .nest("/api", api)
         .fallback(static_handler)
         .layer(CorsLayer::permissive())
-        .with_state(pool)
+        .with_state(state)
 }
 
 /// Serve embedded static files, falling back to index.html for SPA routing.

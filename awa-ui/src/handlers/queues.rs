@@ -1,16 +1,16 @@
 use axum::extract::{Path, State};
 use axum::Json;
 use serde::Deserialize;
-use sqlx::PgPool;
 
 use awa_model::admin;
 
 use crate::error::ApiError;
+use crate::state::AppState;
 
 pub async fn list_queues(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<admin::QueueStats>>, ApiError> {
-    let stats = admin::queue_stats(&pool).await?;
+    let stats = admin::queue_stats(&state.pool).await?;
     Ok(Json(stats))
 }
 
@@ -20,26 +20,29 @@ pub struct PausePayload {
 }
 
 pub async fn pause_queue(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(queue): Path<String>,
     Json(payload): Json<PausePayload>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    admin::pause_queue(&pool, &queue, payload.paused_by.as_deref()).await?;
+    state.require_writable().await?;
+    admin::pause_queue(&state.pool, &queue, payload.paused_by.as_deref()).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn resume_queue(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(queue): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    admin::resume_queue(&pool, &queue).await?;
+    state.require_writable().await?;
+    admin::resume_queue(&state.pool, &queue).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
 pub async fn drain_queue(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(queue): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    let count = admin::drain_queue(&pool, &queue).await?;
+    state.require_writable().await?;
+    let count = admin::drain_queue(&state.pool, &queue).await?;
     Ok(Json(serde_json::json!({ "drained": count })))
 }

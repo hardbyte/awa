@@ -2,13 +2,13 @@ use axum::extract::{Path, State};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::PgPool;
 
 use awa_model::cron;
 use awa_model::job::JobRow;
 use awa_model::CronJobRow;
 
 use crate::error::ApiError;
+use crate::state::AppState;
 
 /// Enriched cron job response with computed next fire time.
 #[derive(Serialize)]
@@ -21,9 +21,9 @@ pub struct CronJobResponse {
 }
 
 pub async fn list_cron_jobs(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
 ) -> Result<Json<Vec<CronJobResponse>>, ApiError> {
-    let jobs = cron::list_cron_jobs(&pool).await?;
+    let jobs = cron::list_cron_jobs(&state.pool).await?;
     let response: Vec<CronJobResponse> = jobs
         .into_iter()
         .map(|row| {
@@ -35,9 +35,10 @@ pub async fn list_cron_jobs(
 }
 
 pub async fn trigger_cron_job(
-    State(pool): State<PgPool>,
+    State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<JobRow>, ApiError> {
-    let job = cron::trigger_cron_job(&pool, &name).await?;
+    state.require_writable().await?;
+    let job = cron::trigger_cron_job(&state.pool, &name).await?;
     Ok(Json(job))
 }
