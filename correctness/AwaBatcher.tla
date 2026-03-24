@@ -211,6 +211,18 @@ HandlerCleanup(w, j) ==
                    shutdownPhase, dbCompletions>>
 
 (* ────────────────────────────────────────────────────────────────── *)
+(* Handler reset: "done" → "idle" so the worker can claim again.     *)
+(* Models the executor task finishing and being removed from the      *)
+(* in-flight registry.                                               *)
+(* ────────────────────────────────────────────────────────────────── *)
+ResetHandler(w, j) ==
+    /\ handlerPhase[w][j] = "done"
+    /\ taskLease[w][j] = 0
+    /\ handlerPhase' = [handlerPhase EXCEPT ![w][j] = "idle"]
+    /\ UNCHANGED <<jobState, owner, lease, taskLease, batcherPending,
+                   shutdownPhase, dbCompletions>>
+
+(* ────────────────────────────────────────────────────────────────── *)
 (* Shutdown sequencing                                                *)
 (* ────────────────────────────────────────────────────────────────── *)
 ShutdownBegin ==
@@ -254,6 +266,7 @@ Next ==
     \/ \E j \in Jobs : Rescue(j)
     \/ \E j \in Jobs : Promote(j)
     \/ \E w \in Workers, j \in Jobs : HandlerCleanup(w, j)
+    \/ \E w \in Workers, j \in Jobs : ResetHandler(w, j)
     \/ ShutdownBegin
     \/ BatcherDrainStart
     \/ FinishShutdown
