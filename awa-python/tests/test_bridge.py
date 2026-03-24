@@ -7,6 +7,7 @@ to Awa and that transactional atomicity is preserved.
 
 import os
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import pytest
 
@@ -19,6 +20,8 @@ DATABASE_URL = os.environ.get(
 
 # Parse components for asyncpg (which doesn't accept full URLs with ?params)
 _DSN = DATABASE_URL.split("?")[0]
+_SQLALCHEMY_SYNC_DSN = DATABASE_URL.replace("postgres://", "postgresql+psycopg://", 1)
+_SQLALCHEMY_ASYNC_DSN = DATABASE_URL.replace("postgres://", "postgresql+asyncpg://", 1)
 
 
 @dataclass
@@ -43,6 +46,31 @@ def awa_client():
     c = awa.Client(DATABASE_URL)
     c.migrate()
     return c
+
+
+def _configure_django():
+    import django
+    from django.conf import settings
+
+    if settings.configured:
+        return
+
+    parsed = urlparse(DATABASE_URL)
+    settings.configure(
+        SECRET_KEY="awa-test",
+        INSTALLED_APPS=[],
+        DATABASES={
+            "default": {
+                "ENGINE": "django.db.backends.postgresql",
+                "NAME": parsed.path.lstrip("/"),
+                "USER": parsed.username,
+                "PASSWORD": parsed.password,
+                "HOST": parsed.hostname,
+                "PORT": parsed.port or 5432,
+            }
+        },
+    )
+    django.setup()
 
 
 # ---------------------------------------------------------------------------
@@ -195,9 +223,7 @@ async def test_psycopg_async_insert_job(awa_client):
     """Insert a job via psycopg3 AsyncConnection."""
     import psycopg
 
-    async with await psycopg.AsyncConnection.connect(
-        _DSN, row_factory=psycopg.rows.dict_row
-    ) as conn:
+    async with await psycopg.AsyncConnection.connect(_DSN) as conn:
         async with conn.transaction():
             row = await insert_job(
                 conn,
@@ -221,9 +247,7 @@ async def test_psycopg_async_rollback(awa_client):
     import psycopg
 
     job_id = None
-    async with await psycopg.AsyncConnection.connect(
-        _DSN, row_factory=psycopg.rows.dict_row
-    ) as conn:
+    async with await psycopg.AsyncConnection.connect(_DSN) as conn:
         try:
             async with conn.transaction():
                 row = await insert_job(
@@ -242,7 +266,7 @@ async def test_psycopg_async_rollback(awa_client):
                 "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE id = %s", (job_id,)
             )
             row = await cur.fetchone()
-            assert row["cnt"] == 0
+            assert row[0] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -254,9 +278,7 @@ def test_psycopg_sync_insert_job(awa_client):
     """Insert a job via psycopg3 sync Connection."""
     import psycopg
 
-    with psycopg.Connection.connect(
-        _DSN, row_factory=psycopg.rows.dict_row
-    ) as conn:
+    with psycopg.Connection.connect(_DSN) as conn:
         with conn.transaction():
             row = insert_job_sync(
                 conn,
@@ -279,9 +301,7 @@ def test_psycopg_sync_rollback(awa_client):
     import psycopg
 
     job_id = None
-    with psycopg.Connection.connect(
-        _DSN, row_factory=psycopg.rows.dict_row
-    ) as conn:
+    with psycopg.Connection.connect(_DSN) as conn:
         try:
             with conn.transaction():
                 row = insert_job_sync(
@@ -299,28 +319,26 @@ def test_psycopg_sync_rollback(awa_client):
             cur = conn.execute(
                 "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE id = %s", (job_id,)
             )
-            assert cur.fetchone()["cnt"] == 0
+            assert cur.fetchone()[0] == 0
 
 
 def test_psycopg_sync_mixed_with_app_sql(awa_client):
     """Insert app data and Awa job in the same psycopg3 sync transaction."""
     import psycopg
 
-    with psycopg.Connection.connect(
-        _DSN, row_factory=psycopg.rows.dict_row
-    ) as conn:
+    with psycopg.Connection.connect(_DSN) as conn:
         conn.execute(
             "CREATE TABLE IF NOT EXISTS bridge_test_sync_orders "
             "(id SERIAL PRIMARY KEY, email TEXT NOT NULL)"
         )
+        conn.commit()
 
         with conn.transaction():
             cur = conn.execute(
                 "INSERT INTO bridge_test_sync_orders (email) VALUES (%s) RETURNING id",
                 ("sync-mixed@example.com",),
             )
-            order_row = cur.fetchone()
-            order_id = order_row["id"]
+            order_id = cur.fetchone()[0]
 
             row = insert_job_sync(
                 conn,
@@ -364,6 +382,20 @@ def test_serialize_null_bytes():
         awa.bridge._serialize_args({"key": "val\x00ue"})
 
 
+def test_metadata_null_bytes_are_rejected():
+    """Null bytes in metadata should fail before hitting Postgres."""
+    import psycopg
+
+    with psycopg.Connection.connect(_DSN) as conn:
+        with conn.transaction():
+            with pytest.raises(ValueError, match="null bytes"):
+                insert_job_sync(
+                    conn,
+                    BridgeEmail(to="meta@example.com", subject="Nope"),
+                    metadata={"bad": "val\x00ue"},
+                )
+
+
 @pytest.mark.asyncio
 async def test_asyncpg_insert_scheduled_job():
     """A job with future run_at should be in 'scheduled' state."""
@@ -382,6 +414,21 @@ async def test_asyncpg_insert_scheduled_job():
         assert row["state"] == "scheduled"
     finally:
         await conn.close()
+
+
+def test_psycopg_sync_past_run_at_matches_client_semantics():
+    """Explicit run_at should stay scheduled even when already in the past."""
+    import psycopg
+
+    with psycopg.Connection.connect(_DSN) as conn:
+        with conn.transaction():
+            row = insert_job_sync(
+                conn,
+                BridgeEmail(to="past@example.com", subject="Already due"),
+                run_at="2000-01-01T00:00:00+00:00",
+            )
+
+    assert row["state"] == "scheduled"
 
 
 @pytest.mark.asyncio
@@ -403,3 +450,137 @@ async def test_asyncpg_insert_priority_and_max_attempts():
         assert row["max_attempts"] == 5
     finally:
         await conn.close()
+
+
+# ---------------------------------------------------------------------------
+# SQLAlchemy tests
+# ---------------------------------------------------------------------------
+
+
+def test_sqlalchemy_sync_connection_insert_job(awa_client):
+    """Insert a job via SQLAlchemy sync Connection."""
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+
+    engine = sqlalchemy.create_engine(_SQLALCHEMY_SYNC_DSN)
+    try:
+        with engine.begin() as conn:
+            row = insert_job_sync(
+                conn,
+                BridgeEmail(to="sa-conn@example.com", subject="Hello"),
+                queue="bridge_sa_conn",
+            )
+
+        job = awa_client.get_job(row["id"])
+        assert job.queue == "bridge_sa_conn"
+    finally:
+        engine.dispose()
+
+
+def test_sqlalchemy_sync_session_insert_job(awa_client):
+    """Insert a job via SQLAlchemy sync Session."""
+    sqlalchemy = pytest.importorskip("sqlalchemy")
+    orm = pytest.importorskip("sqlalchemy.orm")
+
+    engine = sqlalchemy.create_engine(_SQLALCHEMY_SYNC_DSN)
+    Session = orm.Session
+    try:
+        with Session(engine) as session, session.begin():
+            row = insert_job_sync(
+                session,
+                BridgeEmail(to="sa-session@example.com", subject="Hello"),
+                queue="bridge_sa_session",
+            )
+
+        job = awa_client.get_job(row["id"])
+        assert job.queue == "bridge_sa_session"
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_async_connection_insert_job(awa_client):
+    """Insert a job via SQLAlchemy AsyncConnection."""
+    sqlalchemy_asyncio = pytest.importorskip("sqlalchemy.ext.asyncio")
+
+    engine = sqlalchemy_asyncio.create_async_engine(_SQLALCHEMY_ASYNC_DSN)
+    try:
+        async with engine.begin() as conn:
+            row = await insert_job(
+                conn,
+                BridgeEmail(to="sa-async-conn@example.com", subject="Hello"),
+                queue="bridge_sa_async_conn",
+            )
+
+        job = awa_client.get_job(row["id"])
+        assert job.queue == "bridge_sa_async_conn"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_sqlalchemy_async_session_insert_job(awa_client):
+    """Insert a job via SQLAlchemy AsyncSession."""
+    sqlalchemy_asyncio = pytest.importorskip("sqlalchemy.ext.asyncio")
+
+    engine = sqlalchemy_asyncio.create_async_engine(_SQLALCHEMY_ASYNC_DSN)
+    AsyncSession = sqlalchemy_asyncio.AsyncSession
+    try:
+        async with AsyncSession(engine) as session, session.begin():
+            row = await insert_job(
+                session,
+                BridgeEmail(to="sa-async-session@example.com", subject="Hello"),
+                queue="bridge_sa_async_session",
+            )
+
+        job = awa_client.get_job(row["id"])
+        assert job.queue == "bridge_sa_async_session"
+    finally:
+        await engine.dispose()
+
+
+# ---------------------------------------------------------------------------
+# Django tests
+# ---------------------------------------------------------------------------
+
+
+def test_django_atomic_insert_job(awa_client):
+    """Insert a job inside Django's transaction.atomic()."""
+    pytest.importorskip("django")
+    _configure_django()
+
+    from django.db import connection, transaction
+
+    with transaction.atomic():
+        row = insert_job_sync(
+            connection,
+            BridgeEmail(to="django@example.com", subject="Hello"),
+            queue="bridge_django",
+        )
+
+    job = awa_client.get_job(row["id"])
+    assert job.queue == "bridge_django"
+
+
+def test_django_atomic_rollback():
+    """Jobs inserted in a rolled-back Django atomic block should not persist."""
+    pytest.importorskip("django")
+    _configure_django()
+
+    from django.db import connection, transaction
+
+    job_id = None
+    try:
+        with transaction.atomic():
+            row = insert_job_sync(
+                connection,
+                BridgeEmail(to="django-rollback@example.com", subject="Gone"),
+                queue="bridge_django_rollback",
+            )
+            job_id = row["id"]
+            raise ValueError("force rollback")
+    except ValueError:
+        pass
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT count(*) FROM awa.jobs WHERE id = %s", (job_id,))
+        assert cursor.fetchone()[0] == 0

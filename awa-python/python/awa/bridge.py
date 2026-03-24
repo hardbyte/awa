@@ -33,6 +33,27 @@ Usage with psycopg (sync)::
         with conn.transaction():
             conn.execute("INSERT INTO orders ...")
             job = insert_job_sync(conn, SendEmail(to="a@b.com", subject="Hi"))
+
+Usage with SQLAlchemy::
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import Session
+    from awa.bridge import insert_job_sync
+
+    engine = create_engine("postgresql+psycopg://...")
+    with Session(engine) as session, session.begin():
+        session.execute(...)
+        job = insert_job_sync(session, SendEmail(to="a@b.com", subject="Hi"))
+
+Usage with Django::
+
+    from django.db import connection, transaction
+    from awa.bridge import insert_job_sync
+
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute("INSERT INTO orders ...")
+        job = insert_job_sync(connection, SendEmail(to="a@b.com", subject="Hi"))
 """
 
 from __future__ import annotations
@@ -68,6 +89,17 @@ RETURNING id, kind, queue, args, state, priority, attempt, max_attempts,
           run_at, created_at, metadata, tags
 """
 
+# Named parameters for SQLAlchemy.
+_INSERT_SQL_NAMED = """\
+INSERT INTO awa.jobs
+    (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+VALUES
+    (:kind, :queue, :args, :state, :priority, :max_attempts,
+     COALESCE(:run_at, now()), :metadata, :tags)
+RETURNING id, kind, queue, args, state, priority, attempt, max_attempts,
+          run_at, created_at, metadata, tags
+"""
+
 
 # ---------------------------------------------------------------------------
 # Arg serialization (pure Python, no PyO3 dependency)
@@ -90,11 +122,8 @@ def _reject_null_bytes(obj: Any) -> None:
             _reject_null_bytes(item)
 
 
-def _serialize_args(args: Any) -> str:
-    """Serialize job args to a JSON string.
-
-    Supports dataclasses, pydantic BaseModel, and plain dicts.
-    """
+def _coerce_job_data(args: Any) -> Any:
+    """Convert supported job args to plain JSON-compatible Python data."""
     if dataclasses.is_dataclass(args) and not isinstance(args, type):
         data = dataclasses.asdict(args)
     elif hasattr(args, "model_dump"):
@@ -107,6 +136,13 @@ def _serialize_args(args: Any) -> str:
             f"Job args must be a dataclass, pydantic BaseModel, or dict, "
             f"got {type(args).__name__}"
         )
+
+    return data
+
+
+def _serialize_args(args: Any) -> str:
+    """Serialize job args to a JSON string."""
+    data = _coerce_job_data(args)
 
     # Check for null bytes in raw string values before JSON encoding
     # (json.dumps escapes \x00 to \u0000, so check the source data)
@@ -129,16 +165,8 @@ def _derive_kind(args: Any, kind: str | None) -> str:
 
 
 def _determine_state(run_at: str | datetime | None) -> str:
-    """Return 'scheduled' if run_at is in the future, else 'available'."""
-    if run_at is None:
-        return "available"
-    if isinstance(run_at, str):
-        run_at = datetime.fromisoformat(run_at)
-    if run_at.tzinfo is None:
-        run_at = run_at.replace(tzinfo=timezone.utc)
-    if run_at > datetime.now(timezone.utc):
-        return "scheduled"
-    return "available"
+    """Match Awa insert semantics: any explicit run_at starts as scheduled."""
+    return "scheduled" if run_at is not None else "available"
 
 
 def _normalize_run_at(run_at: str | datetime | None) -> datetime | None:
@@ -160,7 +188,7 @@ def _normalize_run_at(run_at: str | datetime | None) -> datetime | None:
     raise TypeError(f"run_at must be a string or datetime, got {type(run_at).__name__}")
 
 
-def _prepare_params(
+def _prepare_values(
     args: Any,
     *,
     kind: str | None = None,
@@ -170,30 +198,31 @@ def _prepare_params(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     run_at: str | datetime | None = None,
-) -> tuple[str, str, str, str, int, int, datetime | None, str, list[str]]:
-    """Prepare the 9 bind parameters for the INSERT statement.
+) -> dict[str, Any]:
+    """Prepare shared insert values for all bridge backends."""
+    args_data = _coerce_job_data(args)
+    metadata_data = metadata or {}
+    _reject_null_bytes(args_data)
+    _reject_null_bytes(metadata_data)
 
-    Returns (kind, queue, args_json, state, priority, max_attempts,
-             run_at_dt, metadata_json, tags).
-    """
     resolved_kind = _derive_kind(args, kind)
-    args_json = _serialize_args(args)
     state = _determine_state(run_at)
     run_at_dt = _normalize_run_at(run_at)
-    metadata_json = json.dumps(metadata or {})
     resolved_tags = tags if tags is not None else []
 
-    return (
-        resolved_kind,
-        queue,
-        args_json,
-        state,
-        priority,
-        max_attempts,
-        run_at_dt,
-        metadata_json,
-        resolved_tags,
-    )
+    return {
+        "kind": resolved_kind,
+        "queue": queue,
+        "args_data": args_data,
+        "args_json": json.dumps(args_data, default=str),
+        "state": state,
+        "priority": priority,
+        "max_attempts": max_attempts,
+        "run_at": run_at_dt,
+        "metadata_data": metadata_data,
+        "metadata_json": json.dumps(metadata_data, default=str),
+        "tags": resolved_tags,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -211,6 +240,18 @@ def _row_to_dict(row: Any, driver: str) -> dict[str, Any]:
     if hasattr(row, "keys"):
         return {k: row[k] for k in row.keys()}
     # Fallback: already a dict
+    return dict(row)
+
+
+def _row_from_cursor(cursor: Any, row: Any) -> dict[str, Any]:
+    """Convert a DB-API/psycopg row using cursor metadata when needed."""
+    if hasattr(row, "_asdict"):
+        return row._asdict()
+    if hasattr(row, "keys"):
+        return {k: row[k] for k in row.keys()}
+    if cursor.description is not None:
+        columns = [getattr(col, "name", col[0]) for col in cursor.description]
+        return dict(zip(columns, row, strict=False))
     return dict(row)
 
 
@@ -235,10 +276,52 @@ def _detect_driver(conn: Any) -> str:
             return "psycopg_async"
         return "psycopg_sync"
 
+    if module.startswith("sqlalchemy"):
+        cls_name = type(conn).__name__
+        if "Async" in cls_name:
+            return "sqlalchemy_async"
+        return "sqlalchemy_sync"
+
+    if module.startswith("django") or (
+        hasattr(conn, "cursor")
+        and hasattr(conn, "vendor")
+        and getattr(conn, "vendor", None) == "postgresql"
+    ):
+        return "django_sync"
+
     raise TypeError(
         f"Unsupported connection type: {type(conn).__qualname__} "
-        f"(module={module}). Supported drivers: asyncpg, psycopg3."
+        f"(module={module}). Supported drivers: asyncpg, psycopg3, "
+        f"SQLAlchemy, and Django."
     )
+
+
+def _sqlalchemy_text() -> Any:
+    """Build the typed SQLAlchemy text statement lazily."""
+    from sqlalchemy import bindparam, text
+    from sqlalchemy.dialects.postgresql import ARRAY, JSONB
+    from sqlalchemy.types import DateTime, String
+
+    return text(_INSERT_SQL_NAMED).bindparams(
+        bindparam("args", type_=JSONB),
+        bindparam("metadata", type_=JSONB),
+        bindparam("tags", type_=ARRAY(String())),
+        bindparam("run_at", type_=DateTime(timezone=True)),
+    )
+
+
+def _sqlalchemy_params(values: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "kind": values["kind"],
+        "queue": values["queue"],
+        "args": values["args_data"],
+        "state": values["state"],
+        "priority": values["priority"],
+        "max_attempts": values["max_attempts"],
+        "run_at": values["run_at"],
+        "metadata": values["metadata_data"],
+        "tags": values["tags"],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +349,7 @@ async def insert_job(
     Returns a dict with the inserted job's columns (id, kind, queue,
     state, args, etc.).
     """
-    params = _prepare_params(
+    values = _prepare_values(
         args,
         kind=kind,
         queue=queue,
@@ -280,17 +363,46 @@ async def insert_job(
     driver = _detect_driver(conn)
 
     if driver == "asyncpg":
-        row = await conn.fetchrow(_INSERT_SQL_DOLLAR, *params)
+        row = await conn.fetchrow(
+            _INSERT_SQL_DOLLAR,
+            values["kind"],
+            values["queue"],
+            values["args_json"],
+            values["state"],
+            values["priority"],
+            values["max_attempts"],
+            values["run_at"],
+            values["metadata_json"],
+            values["tags"],
+        )
         return _row_to_dict(row, driver)
 
     if driver == "psycopg_async":
-        cursor = await conn.execute(_INSERT_SQL_PERCENT, params)
+        cursor = await conn.execute(
+            _INSERT_SQL_PERCENT,
+            (
+                values["kind"],
+                values["queue"],
+                values["args_json"],
+                values["state"],
+                values["priority"],
+                values["max_attempts"],
+                values["run_at"],
+                values["metadata_json"],
+                values["tags"],
+            ),
+        )
         row = await cursor.fetchone()
-        return _row_to_dict(row, driver)
+        return _row_from_cursor(cursor, row)
+
+    if driver == "sqlalchemy_async":
+        result = await conn.execute(_sqlalchemy_text(), _sqlalchemy_params(values))
+        return dict(result.mappings().one())
 
     raise TypeError(
         f"insert_job() requires an async connection. "
-        f"For sync psycopg3 connections, use insert_job_sync(). "
+        f"For sync psycopg3/SQLAlchemy/Django connections, use "
+        f"insert_job_sync(). "
         f"Got: {type(conn).__qualname__}"
     )
 
@@ -318,7 +430,7 @@ def insert_job_sync(
 
     Returns a dict with the inserted job's columns.
     """
-    params = _prepare_params(
+    values = _prepare_values(
         args,
         kind=kind,
         queue=queue,
@@ -332,12 +444,48 @@ def insert_job_sync(
     driver = _detect_driver(conn)
 
     if driver == "psycopg_sync":
-        cursor = conn.execute(_INSERT_SQL_PERCENT, params)
+        cursor = conn.execute(
+            _INSERT_SQL_PERCENT,
+            (
+                values["kind"],
+                values["queue"],
+                values["args_json"],
+                values["state"],
+                values["priority"],
+                values["max_attempts"],
+                values["run_at"],
+                values["metadata_json"],
+                values["tags"],
+            ),
+        )
         row = cursor.fetchone()
-        return _row_to_dict(row, driver)
+        return _row_from_cursor(cursor, row)
+
+    if driver == "sqlalchemy_sync":
+        result = conn.execute(_sqlalchemy_text(), _sqlalchemy_params(values))
+        return dict(result.mappings().one())
+
+    if driver == "django_sync":
+        with conn.cursor() as cursor:
+            cursor.execute(
+                _INSERT_SQL_PERCENT,
+                (
+                    values["kind"],
+                    values["queue"],
+                    values["args_json"],
+                    values["state"],
+                    values["priority"],
+                    values["max_attempts"],
+                    values["run_at"],
+                    values["metadata_json"],
+                    values["tags"],
+                ),
+            )
+            row = cursor.fetchone()
+            return _row_from_cursor(cursor, row)
 
     raise TypeError(
-        f"insert_job_sync() requires a sync psycopg3 connection. "
-        f"For async connections, use insert_job(). "
+        f"insert_job_sync() requires a sync psycopg3/SQLAlchemy/Django "
+        f"connection. For async connections, use insert_job(). "
         f"Got: {type(conn).__qualname__}"
     )

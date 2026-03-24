@@ -103,7 +103,7 @@ jobs:
       - name: Create venv and install deps
         run: |
           uv venv .venv
-          uv pip install maturin pytest pytest-asyncio
+          uv pip install maturin pytest pytest-asyncio asyncpg django greenlet psycopg psycopg-binary sqlalchemy
       - name: Build extension (maturin develop)
         run: .venv/bin/maturin develop
       - name: Wait for Postgres
