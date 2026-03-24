@@ -201,3 +201,65 @@ pub fn migration_sql() -> Vec<(i32, &'static str, String)> {
         .map(|&(v, d, steps)| (v, d, steps.join("\n")))
         .collect()
 }
+
+/// Get migration SQL for a version range `(from, to]` — `from` is exclusive,
+/// `to` is inclusive. Returns only migrations where `from < version <= to`.
+pub fn migration_sql_range(from: i32, to: i32) -> Vec<(i32, &'static str, String)> {
+    MIGRATIONS
+        .iter()
+        .filter(|&&(v, _, _)| v > from && v <= to)
+        .map(|&(v, d, steps)| (v, d, steps.join("\n")))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn migration_sql_range_all() {
+        let all = migration_sql_range(0, CURRENT_VERSION);
+        assert_eq!(all.len(), MIGRATIONS.len());
+        assert_eq!(all.first().unwrap().0, 1);
+        assert_eq!(all.last().unwrap().0, CURRENT_VERSION);
+    }
+
+    #[test]
+    fn migration_sql_range_subset() {
+        let subset = migration_sql_range(2, CURRENT_VERSION);
+        assert!(subset.iter().all(|(v, _, _)| *v > 2));
+        assert_eq!(subset.len(), (CURRENT_VERSION - 2) as usize);
+    }
+
+    #[test]
+    fn migration_sql_range_single() {
+        let single = migration_sql_range(2, 3);
+        assert_eq!(single.len(), 1);
+        assert_eq!(single[0].0, 3);
+        assert!(!single[0].2.is_empty());
+    }
+
+    #[test]
+    fn migration_sql_range_empty_when_equal() {
+        let empty = migration_sql_range(CURRENT_VERSION, CURRENT_VERSION);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn migration_sql_range_empty_when_inverted() {
+        let empty = migration_sql_range(3, 1);
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn migration_sql_range_matches_full() {
+        let full = migration_sql();
+        let ranged = migration_sql_range(0, CURRENT_VERSION);
+        assert_eq!(full.len(), ranged.len());
+        for (f, r) in full.iter().zip(ranged.iter()) {
+            assert_eq!(f.0, r.0);
+            assert_eq!(f.1, r.1);
+            assert_eq!(f.2, r.2);
+        }
+    }
+}

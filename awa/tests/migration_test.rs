@@ -277,6 +277,60 @@ async fn test_legacy_version_upgrade() {
     migrations::run(&pool).await.unwrap();
 }
 
+// ── migration_sql_range() selection ──────────────────────────────
+
+#[tokio::test]
+async fn test_migration_sql_range_produces_valid_schema() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    // Apply only V1+V2 via range, then verify V2 artifacts exist but V3+ don't.
+    for (_version, _desc, sql) in migrations::migration_sql_range(0, 2) {
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+    }
+
+    let has_runtime: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_runtime, "V2 should create runtime_instances");
+
+    let has_maintenance: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'awa' AND table_name = 'runtime_instances' AND column_name = 'maintenance_alive')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!has_maintenance, "V3 should not be applied yet");
+
+    // Now apply V3+V4 via range and verify.
+    for (_version, _desc, sql) in migrations::migration_sql_range(2, migrations::CURRENT_VERSION) {
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+    }
+
+    let has_maintenance: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'awa' AND table_name = 'runtime_instances' AND column_name = 'maintenance_alive')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_maintenance, "V3 should be applied now");
+
+    let has_admin: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(has_admin, "V4 should be applied now");
+
+    // Full run() should still succeed (idempotent).
+    migrations::run(&pool).await.unwrap();
+}
+
 // ── Legacy V3-only upgrade (0.3.0 exact, no V4/V5) ──────────────
 
 #[tokio::test]

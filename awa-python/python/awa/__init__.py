@@ -23,6 +23,8 @@ from awa._awa import (
     derive_kind,
     migrate,
     migrations,
+    migrations_range,
+    current_migration_version,
     # Exceptions
     AwaError,
     UniqueConflict,
@@ -52,6 +54,8 @@ __all__ = [
     "derive_kind",
     "migrate",
     "migrations",
+    "migrations_range",
+    "current_migration_version",
     "AwaError",
     "UniqueConflict",
     "SchemaNotMigrated",
