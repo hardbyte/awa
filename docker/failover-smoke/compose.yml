@@ -1,0 +1,70 @@
+services:
+  primary:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: awa_failover_test
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_replication_slots=10
+      - -c
+      - hot_standby=on
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d awa_failover_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./primary/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+      - ./primary/init:/docker-entrypoint-initdb.d:ro
+
+  replica:
+    image: postgres:17-alpine
+    depends_on:
+      primary:
+        condition: service_healthy
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: awa_failover_test
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: replpass
+    command:
+      - /bin/sh
+      - /scripts/replica-entrypoint.sh
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d awa_failover_test"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - replica-data:/var/lib/postgresql/data
+      - ./replica/replica-entrypoint.sh:/scripts/replica-entrypoint.sh:ro
+
+  haproxy:
+    build:
+      context: ./haproxy
+    depends_on:
+      primary:
+        condition: service_healthy
+      replica:
+        condition: service_started
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: test
+      POSTGRES_DB: awa_failover_test
+    ports:
+      - "127.0.0.1::5432"
+
+volumes:
+  primary-data:
+  replica-data:
