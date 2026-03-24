@@ -51,21 +51,13 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .expect("Failed to clean queue meta");
 }
 
-async fn clean_queues(pool: &sqlx::PgPool, queues: &[String]) {
-    if queues.is_empty() {
-        return;
-    }
-
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = ANY($1)")
-        .bind(queues)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = ANY($1)")
-        .bind(queues)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue meta");
+async fn reset_runtime_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "TRUNCATE awa.jobs_hot, awa.scheduled_jobs, awa.queue_meta, awa.job_unique_claims, awa.queue_state_counts, awa.job_kind_catalog, awa.job_queue_catalog RESTART IDENTITY CASCADE",
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to reset runtime benchmark state");
 }
 
 #[derive(Debug, Clone)]
@@ -234,12 +226,13 @@ async fn run_enqueue_scenario(
     scenario: &EnqueueScenario,
     jobs_per_producer: i64,
     insert_batch_size: usize,
+    copy_chunk_size: usize,
 ) {
     let producer_queues = scenario.producer_queues();
     let mut unique_queues = producer_queues.clone();
     unique_queues.sort();
     unique_queues.dedup();
-    clean_queues(pool, &unique_queues).await;
+    reset_runtime_state(pool).await;
 
     let barrier = Arc::new(tokio::sync::Barrier::new(scenario.producers + 1));
     let mut tasks = Vec::with_capacity(scenario.producers);
@@ -274,7 +267,9 @@ async fn run_enqueue_scenario(
                     }
                 }
                 EnqueueMode::Copy => {
-                    insert_many_copy_from_pool(&pool, &params).await.unwrap();
+                    for chunk in params.chunks(copy_chunk_size) {
+                        insert_many_copy_from_pool(&pool, chunk).await.unwrap();
+                    }
                 }
             }
         }));
@@ -313,6 +308,7 @@ async fn run_enqueue_scenario(
         "queue_layout": if scenario.same_queue { "same" } else { "distinct" },
         "jobs_per_producer": jobs_per_producer,
         "insert_batch_size": insert_batch_size,
+        "copy_chunk_size": copy_chunk_size,
         "queues": unique_queues,
     });
 
@@ -587,6 +583,7 @@ async fn test_pickup_latency_listen_notify() {
 async fn test_throughput_insert_only() {
     let pool = setup(20).await;
     let queue = "bench_insert_only";
+    reset_runtime_state(&pool).await;
     clean_queue(&pool, queue).await;
 
     let total_jobs: i64 = 10_000;
@@ -674,6 +671,8 @@ async fn test_throughput_copy_insert() {
     let pool = setup(20).await;
     let total_jobs: i64 = 10_000;
     let batch_size: i64 = 1_000;
+    let copy_chunk_size = env_usize("AWA_BENCH_COPY_CHUNK_SIZE", batch_size as usize);
+    reset_runtime_state(&pool).await;
 
     // ── Chunked INSERT baseline ──
     let queue_insert = "bench_copy_insert";
@@ -725,7 +724,9 @@ async fn test_throughput_copy_insert() {
             .unwrap()
         })
         .collect();
-    insert_many_copy_from_pool(&pool, &params).await.unwrap();
+    for chunk in params.chunks(copy_chunk_size) {
+        insert_many_copy_from_pool(&pool, chunk).await.unwrap();
+    }
     let copy_elapsed = copy_start.elapsed();
     let copy_rate = total_jobs as f64 / copy_elapsed.as_secs_f64();
     let copy_count: i64 =
@@ -758,6 +759,7 @@ async fn test_throughput_copy_insert() {
         "producers": 1,
         "queue_layout": "single",
         "insert_batch_size": batch_size,
+        "copy_chunk_size": copy_chunk_size,
         "compared_to": "copy_single",
     });
     if let Some(start) = insert_profile_start.as_ref() {
@@ -784,6 +786,7 @@ async fn test_throughput_copy_insert() {
         "producers": 1,
         "queue_layout": "single",
         "insert_batch_size": batch_size,
+        "copy_chunk_size": copy_chunk_size,
         "compared_to": "insert_single",
     });
     if let Some(start) = copy_profile_start.as_ref() {
@@ -822,6 +825,7 @@ async fn test_enqueue_contention_matrix() {
     let producers = env_usize("AWA_BENCH_CONTENTION_PRODUCERS", 4);
     let jobs_per_producer = env_i64("AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER", 3_000);
     let insert_batch_size = env_usize("AWA_BENCH_INSERT_BATCH_SIZE", 1_000);
+    let copy_chunk_size = env_usize("AWA_BENCH_COPY_CHUNK_SIZE", insert_batch_size);
 
     let pool = setup((producers as u32 * 4).max(20)).await;
 
@@ -865,6 +869,13 @@ async fn test_enqueue_contention_matrix() {
     ];
 
     for scenario in &scenarios {
-        run_enqueue_scenario(&pool, scenario, jobs_per_producer, insert_batch_size).await;
+        run_enqueue_scenario(
+            &pool,
+            scenario,
+            jobs_per_producer,
+            insert_batch_size,
+            copy_chunk_size,
+        )
+        .await;
     }
 }

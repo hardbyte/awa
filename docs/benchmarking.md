@@ -309,6 +309,7 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   AWA_BENCH_CONTENTION_PRODUCERS=4 \
   AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER=3000 \
   AWA_BENCH_INSERT_BATCH_SIZE=1000 \
+  AWA_BENCH_COPY_CHUNK_SIZE=1000 \
   cargo test --package awa --test benchmark_test \
   test_enqueue_contention_matrix -- --exact --ignored --nocapture
 ```
@@ -321,6 +322,15 @@ This emits six JSONL records:
 - `copy_contention_distinct`
 - `insert_contention_same_queue`
 - `copy_contention_same_queue`
+
+The matrix hard-resets Awa runtime tables before each scenario so later cases
+do not inherit a larger or dirtier jobs table from earlier ones.
+
+By default, `AWA_BENCH_COPY_CHUNK_SIZE` should match
+`AWA_BENCH_INSERT_BATCH_SIZE` if you want the closest apples-to-apples
+comparison between chunked `INSERT` and chunked COPY staging. If you want to
+test the current "one bulk COPY per producer" shape instead, set
+`AWA_BENCH_COPY_CHUNK_SIZE` to `AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER`.
 
 The optional Postgres profile block in `metadata.db_profile` is meant to make
 server runs easier to interpret. In particular:
