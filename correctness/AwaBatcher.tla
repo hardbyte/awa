@@ -3,22 +3,47 @@ EXTENDS FiniteSets, Naturals
 (*
     Model of the Awa completion batcher.
 
-    Verifies that the batched completion path preserves the core invariants
-    from AwaCore — lease-guarded finalization, no double-completion, no lost
-    completions on shutdown — while adding the batcher as an intermediate
-    actor between handler return and DB update.
+    The real system (awa-worker/src/completion.rs) batches completed jobs in
+    a sharded in-memory buffer and flushes them to the database in groups of
+    up to 512 every 1ms. This introduces a window where a job has completed
+    in the handler but not yet in the database — during which maintenance
+    can rescue the job and a new worker can re-claim it.
 
-    What this model covers:
-      - Handler completes → result queued in batcher → flush to DB
-      - Batcher flush failure → direct fallback completion
-      - Concurrent rescue while completion is pending in batcher
-      - Shutdown drain: batcher flushes all pending before exit
-      - run_lease guard prevents stale completion from either path
+    The question this model answers: can the batcher + fallback path ever
+    double-complete a job, lose a completion on shutdown, or leave a handler
+    stuck?
+
+    ─── Mapping to Rust code ───
+
+    State variables:
+      jobState, owner, lease   →  awa.jobs_hot row (state, implicit owner, run_lease)
+      taskLease[w][j]          →  ctx.job.run_lease snapshot in executor.rs
+      handlerPhase[w][j]       →  executor control flow after worker.perform() returns
+      batcherPending           →  CompletionBatcherWorker.pending Vec<CompletionRequest>
+
+    Actions → Rust code:
+      Claim              →  dispatcher claim_jobs (UPDATE SET state='running', run_lease+1)
+      HandlerComplete    →  completion_batcher.complete(job.id, job.run_lease) [executor.rs:364]
+      BatcherFlushSuccess→  flush SQL with WHERE run_lease=$2 AND state='running' [completion.rs:150]
+      BatcherFlushStale  →  same SQL, RETURNING returns 0 rows (rescued since enqueue)
+      BatcherFlushFail   →  pool.execute() error → Err sent to handler via oneshot
+      DirectComplete*    →  direct_complete_job() fallback after batcher failure [executor.rs:819]
+      Rescue             →  heartbeat/deadline rescue in maintenance.rs
+      Promote            →  scheduled_jobs → jobs_hot promotion CTE
+      HandlerCleanup     →  handler exits via ctx.is_cancelled() without completing
+      ResetHandler       →  in_flight.remove() after completion path finishes [executor.rs:324]
+
+    Shutdown phases → client.rs:720-765:
+      running        →  normal operation
+      draining       →  dispatch_cancel fired (line 724), awaiting in-flight tasks
+      batcher_drain  →  service_cancel fired (line 755), batcher draining its buffer
+      stopped        →  all service handles joined
 
     Deliberately simplified:
-      - Single shard (real system has 8 independent shards)
-      - No channel capacity limits (batcher channel is 4096 in reality)
-      - Abstract time: flush triggers nondeterministically
+      - Single shard (real system has 8 independent shards — independent per safety)
+      - No channel capacity limits (4096 in reality; overflow falls back to direct)
+      - Flush triggers nondeterministically (real system: 1ms timer or 512-item batch)
+      - Single worker instance (rescue is modeled as external maintenance action)
 *)
 
 Jobs == {"j1", "j2"}
