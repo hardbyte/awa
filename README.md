@@ -9,7 +9,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 ## Features
 
 - **Postgres-only** — one dependency you already have.
-- **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone.
+- **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone. Works with Awa's own transactions or your existing psycopg3/asyncpg/SQLAlchemy/Django connection.
 - **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
 - **Rust and Python workers** — same queues, identical semantics, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
@@ -108,6 +108,22 @@ async with await client.transaction() as tx:
 client = awa.Client("postgres://localhost/mydb")
 client.migrate()
 job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
+```
+
+**ORM transaction bridging** — insert jobs within your existing psycopg3, asyncpg, SQLAlchemy, or Django transaction. No separate Awa connection needed:
+
+```python
+from awa.bridge import insert_job_sync
+
+# Django
+with transaction.atomic():
+    Order.objects.create(...)
+    insert_job_sync(connection, SendEmail(to="alice@example.com", subject="Order confirmed"))
+
+# SQLAlchemy
+with Session(engine) as session, session.begin():
+    session.execute(...)
+    insert_job_sync(session, SendEmail(to="alice@example.com", subject="Order confirmed"))
 ```
 
 See [`examples/python/`](https://github.com/hardbyte/awa/tree/main/examples/python) for complete runnable scripts tested in CI.

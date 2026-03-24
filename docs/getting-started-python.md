@@ -103,6 +103,51 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `awa.Client` provides a synchronous API for Django or Flask — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`, `client.transaction()`).
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
 
+## ORM Transaction Bridging
+
+If you already have a database connection from psycopg3, asyncpg, SQLAlchemy, or Django, you can insert Awa jobs directly within your existing transaction — no separate Awa client connection needed:
+
+```python
+from awa.bridge import insert_job, insert_job_sync
+```
+
+**asyncpg:**
+
+```python
+async with conn.transaction():
+    await conn.execute("INSERT INTO orders ...")
+    job = await insert_job(conn, SendEmail(to="alice@example.com", subject="Order confirmed"))
+```
+
+**Django:**
+
+```python
+from django.db import connection, transaction
+
+with transaction.atomic():
+    Order.objects.create(...)
+    job = insert_job_sync(connection, SendEmail(to="alice@example.com", subject="Order confirmed"))
+```
+
+**SQLAlchemy:**
+
+```python
+with Session(engine) as session, session.begin():
+    session.execute(...)
+    job = insert_job_sync(session, SendEmail(to="alice@example.com", subject="Confirmed"))
+```
+
+**psycopg3 (sync):**
+
+```python
+with psycopg.Connection.connect(dsn) as conn:
+    with conn.transaction():
+        conn.execute("INSERT INTO orders ...")
+        job = insert_job_sync(conn, SendEmail(to="alice@example.com", subject="Confirmed"))
+```
+
+Both functions accept the same keyword arguments as `client.insert()`: `kind`, `queue`, `priority`, `max_attempts`, `tags`, `metadata`, `run_at`. The job is committed or rolled back with your transaction — Postgres triggers handle NOTIFY and all other bookkeeping automatically.
+
 ## More Examples
 
 - [Bundled quickstart example](../awa-python/examples/quickstart.py)
