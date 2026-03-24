@@ -187,7 +187,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for (v, description, sql_text) in &selected {
                     let filename = format!("{dir}/V{v}__{description}.sql");
                     let filename = filename.replace(' ', "_");
-                    std::fs::write(&filename, &sql_text)?;
+                    std::fs::write(&filename, sql_text)?;
                     println!("Extracted: {filename}");
                 }
             } else {
