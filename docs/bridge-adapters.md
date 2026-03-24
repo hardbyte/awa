@@ -111,7 +111,7 @@ let job = tokio_pg::insert_job_raw(
 
 ### Return value
 
-All functions return `awa::JobRow` with the full row from `RETURNING *` — same type as `awa::insert_with`. The only fields not populated are `errors` (Postgres JSONB array, not auto-deserializable by tokio-postgres) and `unique_states` (BIT(8), not directly mappable).
+All functions return `awa::JobRow` with the full row from `RETURNING *` — same type as `awa::insert_with`. The only field not populated is `unique_states` (BIT(8), no direct tokio-postgres mapping). All other fields, including `errors`, are decoded from the database row.
 
 ## Python: psycopg3, asyncpg, SQLAlchemy, Django
 
