@@ -33,7 +33,7 @@ def main():
     # Admin operations
     stats = client.queue_stats()
     for s in stats:
-        print(f"  Queue '{s['queue']}': {s['available']} available, {s['running']} running")
+        print(f"  Queue '{s.queue}': {s.available} available, {s.running} running")
 
     # Read it back
     fetched = client.get_job(job.id)
