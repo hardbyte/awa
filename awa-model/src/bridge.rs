@@ -130,19 +130,9 @@ pub mod tokio_pg {
     }
 
     fn parse_state(state_str: &str) -> Result<JobState, AwaError> {
-        match state_str {
-            "scheduled" => Ok(JobState::Scheduled),
-            "available" => Ok(JobState::Available),
-            "running" => Ok(JobState::Running),
-            "completed" => Ok(JobState::Completed),
-            "retryable" => Ok(JobState::Retryable),
-            "failed" => Ok(JobState::Failed),
-            "cancelled" => Ok(JobState::Cancelled),
-            "waiting_external" => Ok(JobState::WaitingExternal),
-            other => Err(AwaError::Validation(format!(
-                "unexpected job state from database: {other}"
-            ))),
-        }
+        state_str
+            .parse()
+            .map_err(|e: String| AwaError::Validation(e))
     }
 
     /// Decode a column from a tokio-postgres row, mapping errors to
