@@ -24,7 +24,7 @@ pub async fn pause_queue(
     Path(queue): Path<String>,
     Json(payload): Json<PausePayload>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     admin::pause_queue(&state.pool, &queue, payload.paused_by.as_deref()).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -33,7 +33,7 @@ pub async fn resume_queue(
     State(state): State<AppState>,
     Path(queue): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     admin::resume_queue(&state.pool, &queue).await?;
     Ok(Json(serde_json::json!({ "ok": true })))
 }
@@ -42,7 +42,7 @@ pub async fn drain_queue(
     State(state): State<AppState>,
     Path(queue): Path<String>,
 ) -> Result<Json<serde_json::Value>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     let count = admin::drain_queue(&state.pool, &queue).await?;
     Ok(Json(serde_json::json!({ "drained": count })))
 }

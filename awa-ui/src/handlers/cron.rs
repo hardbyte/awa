@@ -38,7 +38,7 @@ pub async fn trigger_cron_job(
     State(state): State<AppState>,
     Path(name): Path<String>,
 ) -> Result<Json<JobRow>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     let job = cron::trigger_cron_job(&state.pool, &name).await?;
     Ok(Json(job))
 }

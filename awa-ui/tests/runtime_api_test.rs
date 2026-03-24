@@ -91,7 +91,9 @@ async fn test_get_runtime_endpoint_returns_runtime_overview() {
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_overview";
     let instance_id = seed_runtime_snapshot(&pool, queue, "runtime-api-worker").await;
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
 
     let response = app
         .oneshot(
@@ -182,7 +184,9 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
     )
     .await;
     mark_runtime_snapshot_stale(&pool, stale_id).await;
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
 
     let response = app
         .oneshot(
@@ -230,7 +234,9 @@ async fn test_get_queue_runtime_endpoint_returns_queue_summary() {
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_queue_summary";
     seed_runtime_snapshot(&pool, queue, "runtime-queue-worker").await;
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
 
     let response = app
         .oneshot(
@@ -367,7 +373,9 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
     .await;
     mark_runtime_snapshot_stale(&pool, stale_id).await;
 
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
     let response = app
         .oneshot(
             Request::builder()

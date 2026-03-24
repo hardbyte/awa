@@ -48,6 +48,6 @@ pub async fn get_capabilities(
     State(state): State<AppState>,
 ) -> Result<Json<Capabilities>, ApiError> {
     Ok(Json(Capabilities {
-        read_only: state.is_read_only().await?,
+        read_only: state.read_only,
     }))
 }

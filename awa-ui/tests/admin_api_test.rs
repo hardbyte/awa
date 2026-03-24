@@ -305,7 +305,9 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
     )
     .await;
 
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
     let baseline = get_json(&app, "/api/stats").await;
 
     sqlx::query(
@@ -407,7 +409,9 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
         .await
         .expect("pause should succeed");
 
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
     let payload = get_json(&app, "/api/queues").await;
     let queue_stats = payload
         .as_array()
@@ -462,7 +466,9 @@ async fn test_capabilities_endpoint_reports_read_only_mode() {
     let _guard = test_lock().lock().await;
     let _writable_pool = setup_pool().await;
     let read_only_pool = setup_read_only_pool().await;
-    let app = awa_ui::router(read_only_pool);
+    let app = awa_ui::router(read_only_pool)
+        .await
+        .expect("router should initialize");
 
     let payload = get_json(&app, "/api/capabilities").await;
     assert_eq!(
@@ -488,7 +494,9 @@ async fn test_mutation_endpoint_returns_read_only_error() {
     .expect("fixture insert should succeed");
 
     let read_only_pool = setup_read_only_pool().await;
-    let app = awa_ui::router(read_only_pool);
+    let app = awa_ui::router(read_only_pool)
+        .await
+        .expect("router should initialize");
     let (status, payload) = post(&app, &format!("/api/jobs/{}/cancel", job.0)).await;
 
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
@@ -504,7 +512,9 @@ async fn test_admin_endpoints_perf_smoke_under_moderate_backlog() {
     let pool = setup_pool().await;
     let prefix = "api_perf_smoke_";
     seed_scale_fixture(&pool, prefix, 20_000, 500, 500, 25, 50).await;
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
 
     assert_admin_endpoints_within_budget(&app, Duration::from_millis(150)).await;
 
@@ -518,7 +528,9 @@ async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
     let pool = setup_pool().await;
     let prefix = "api_scale_";
     seed_scale_fixture(&pool, prefix, 200_000, 2_000, 2_000, 50, 100).await;
-    let app = awa_ui::router(pool.clone());
+    let app = awa_ui::router(pool.clone())
+        .await
+        .expect("router should initialize");
 
     assert_admin_endpoints_within_budget(&app, Duration::from_millis(50)).await;
 

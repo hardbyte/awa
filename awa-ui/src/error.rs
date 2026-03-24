@@ -3,6 +3,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
 /// API error wrapper around AwaError, mapping to HTTP status codes.
+#[derive(Debug)]
 pub enum ApiError {
     Awa(awa_model::AwaError),
     ReadOnly,

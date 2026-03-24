@@ -46,7 +46,7 @@ pub async fn retry_job(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
 ) -> Result<Json<Option<JobRow>>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     let job = admin::retry(&state.pool, job_id).await?;
     Ok(Json(job))
 }
@@ -55,7 +55,7 @@ pub async fn cancel_job(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
 ) -> Result<Json<Option<JobRow>>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     let job = admin::cancel(&state.pool, job_id).await?;
     Ok(Json(job))
 }
@@ -69,7 +69,7 @@ pub async fn bulk_retry(
     State(state): State<AppState>,
     Json(payload): Json<BulkIdsPayload>,
 ) -> Result<Json<Vec<JobRow>>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     let jobs = admin::bulk_retry(&state.pool, &payload.ids).await?;
     Ok(Json(jobs))
 }
@@ -78,7 +78,7 @@ pub async fn bulk_cancel(
     State(state): State<AppState>,
     Json(payload): Json<BulkIdsPayload>,
 ) -> Result<Json<Vec<JobRow>>, ApiError> {
-    state.require_writable().await?;
+    state.require_writable()?;
     let jobs = admin::bulk_cancel(&state.pool, &payload.ids).await?;
     Ok(Json(jobs))
 }
