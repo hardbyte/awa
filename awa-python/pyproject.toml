@@ -37,6 +37,9 @@ module-name = "awa._awa"
 
 [dependency-groups]
 dev = [
+    "asyncpg>=0.31.0",
+    "psycopg>=3.3.3",
+    "psycopg-binary>=3.3.3",
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
 ]
