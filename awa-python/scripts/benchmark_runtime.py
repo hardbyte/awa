@@ -84,6 +84,16 @@ async def reset_runtime_state(client: awa.AsyncClient) -> None:
     )
 
 
+def in_flight_jobs(counts: dict[str, int]) -> int:
+    return (
+        counts.get("available", 0)
+        + counts.get("running", 0)
+        + counts.get("retryable", 0)
+        + counts.get("scheduled", 0)
+        + counts.get("waiting_external", 0)
+    )
+
+
 def pctl_ms(samples: list[float], pct: int) -> float:
     if not samples:
         return 0.0
@@ -533,27 +543,34 @@ async def run_failure_benchmark(
         return None
 
     started = asyncio.get_running_loop().time()
-    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+    final_counts: dict[str, int] = {}
+    drain_time = 0.0
+    client.start(
+        [(queue, max_workers)],
+        poll_interval_ms=poll_interval_ms,
+        heartbeat_interval_ms=50,
+        deadline_rescue_interval_ms=100,
+        callback_rescue_interval_ms=100,
+    )
+    try:
+        # Wait for all jobs to reach a terminal state
+        timeout_at = asyncio.get_running_loop().time() + 60
+        while asyncio.get_running_loop().time() < timeout_at:
+            await asyncio.sleep(0.5)
+            final_counts = await state_counts(client, queue)
+            if in_flight_jobs(final_counts) == 0:
+                break
+        drain_time = asyncio.get_running_loop().time() - started
+    finally:
+        await client.shutdown(timeout_ms=5000)
 
-    # Wait for all jobs to reach a terminal state
-    timeout_at = asyncio.get_running_loop().time() + 60
-    while asyncio.get_running_loop().time() < timeout_at:
-        await asyncio.sleep(0.5)
-        counts = await state_counts(client, queue)
-        in_flight = (
-            counts.get("available", 0)
-            + counts.get("running", 0)
-            + counts.get("retryable", 0)
-            + counts.get("scheduled", 0)
-            + counts.get("waiting_external", 0)
+    timed_out = in_flight_jobs(final_counts) > 0
+    if timed_out:
+        raise RuntimeError(
+            f"Failure benchmark timed out after {drain_time:.2f}s with unfinished jobs: "
+            f"{final_counts}"
         )
-        if in_flight == 0:
-            break
 
-    drain_time = asyncio.get_running_loop().time() - started
-    await client.shutdown(timeout_ms=5000)
-
-    final_counts = await state_counts(client, queue)
     completed = final_counts.get("completed", 0)
     failed = final_counts.get("failed", 0)
     cancelled = final_counts.get("cancelled", 0)

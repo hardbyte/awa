@@ -216,14 +216,23 @@ does failure impact healthy-job throughput?**
 Tests live in `awa/tests/failure_benchmark_test.rs`. Each scenario seeds jobs
 deterministically by mode, starts a Client with aggressive rescue intervals,
 drains to terminal states, and emits both human-readable output and a JSONL
-record.
+record. The full matrix command covers the 10 failure scenarios; the
+stale-heartbeat rescue benchmark is a separate test.
 
 ### Python harness
 
-The Python benchmark (`awa-python/scripts/benchmark_runtime.py`) supports the
-same failure scenarios via `--scenario failures`. The worker returns
-`RetryAfter`, `WaitForCallback`, or raises exceptions based on the job's
-`mode` field.
+The Python benchmark (`awa-python/scripts/benchmark_runtime.py`) supports a
+failure-mode subset via `--scenario failures`:
+
+- `terminal_1pct` / `10pct` / `50pct`
+- `retryable_1pct` / `10pct` / `50pct`
+- `callback_timeout_10pct`
+- `mixed_50pct`
+
+It does not currently include the Rust-only `deadline_hang`, `snooze_once`, or
+`stale_heartbeat_rescue` scenarios. The worker returns `RetryAfter`,
+`WaitForCallback`, `Cancel`, or raises exceptions based on the job's `mode`
+field.
 
 ### Structured output
 
@@ -286,7 +295,7 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
 ### Failure-mode benchmarks (Rust)
 
 ```bash
-# Full matrix (all 10 scenarios + stale heartbeat rescue)
+# Full matrix (10 failure scenarios)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   cargo test --package awa --test failure_benchmark_test \
   test_failure_bench_full_matrix -- --exact --ignored --nocapture

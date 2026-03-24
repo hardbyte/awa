@@ -94,6 +94,37 @@ fn sum_counter_metric(
     total
 }
 
+fn sum_counter_metric_with_attribute(
+    resource_metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    name: &str,
+    attr_name: &str,
+    attr_value: &str,
+) -> u64 {
+    let mut total = 0;
+    for rm in resource_metrics {
+        for scope_metrics in &rm.scope_metrics {
+            for metric in &scope_metrics.metrics {
+                if metric.name != name {
+                    continue;
+                }
+                if let Some(sum) = metric.data.as_any().downcast_ref::<Sum<u64>>() {
+                    total += sum
+                        .data_points
+                        .iter()
+                        .filter(|dp| {
+                            dp.attributes.iter().any(|kv| {
+                                kv.key.as_str() == attr_name && kv.value.as_str() == attr_value
+                            })
+                        })
+                        .map(|dp| dp.value)
+                        .sum::<u64>();
+                }
+            }
+        }
+    }
+    total
+}
+
 // ─── Job types ───────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
@@ -315,8 +346,12 @@ async fn run_scenario(pool: &sqlx::PgPool, config: &ScenarioConfig) {
 
     let rescues = sum_counter_metric(&resource_metrics, "awa.maintenance.rescues");
     let callback_timeouts = sum_counter_metric(&resource_metrics, "awa.job.waiting_external");
-    let deadline_rescued =
-        sum_counter_metric(&resource_metrics, "awa.maintenance.deadline_rescues");
+    let deadline_rescued = sum_counter_metric_with_attribute(
+        &resource_metrics,
+        "awa.maintenance.rescues",
+        "awa.rescue.kind",
+        "deadline",
+    );
 
     // Human-readable output
     println!(
