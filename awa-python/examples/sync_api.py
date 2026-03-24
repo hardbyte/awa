@@ -24,19 +24,19 @@ class SendEmail:
 
 def main():
     client = awa.Client(DATABASE_URL)
-    client.migrate_sync()
+    client.migrate()
 
     # Insert a job synchronously
-    job = client.insert_sync(SendEmail(to="bob@example.com", subject="Hello"))
+    job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
     print(f"Inserted job {job.id} (kind={job.kind})")
 
     # Admin operations
-    stats = client.queue_stats_sync()
+    stats = client.queue_stats()
     for s in stats:
         print(f"  Queue '{s['queue']}': {s['available']} available, {s['running']} running")
 
     # Read it back
-    fetched = client.get_job_sync(job.id)
+    fetched = client.get_job(job.id)
     print(f"Job {fetched.id}: state={fetched.state}, args={fetched.args}")
 
     # Clean up
