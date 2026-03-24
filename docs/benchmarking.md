@@ -265,6 +265,12 @@ with `@@BENCH_JSON@@` for extraction. Schema version 1:
 
 Extract JSONL from mixed stdout: `grep '@@BENCH_JSON@@' output.txt | sed 's/^@@BENCH_JSON@@//'`
 
+For enqueue-only benchmarks (`insert_only_single`, `copy_single`, and the
+contention matrix), the shared schema is reused with both throughput fields set
+to the enqueue rate. Those records also include `"measurement": "enqueue"` in
+`metadata`, plus optional Postgres-side deltas such as `wal_bytes`,
+`temp_bytes_delta`, and `xact_commit_delta`.
+
 ## Interpreting The Results
 
 Some practical guidelines:
@@ -291,6 +297,38 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   cargo test --package awa --test scheduling_benchmark_test \
   test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture
 ```
+
+### Enqueue contention benchmarks
+
+These are the most useful benchmarks when you want to compare single-producer
+enqueue against multi-producer contention, or compare chunked `INSERT` with the
+COPY staging path under concurrent writers.
+
+```bash
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  AWA_BENCH_CONTENTION_PRODUCERS=4 \
+  AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER=3000 \
+  AWA_BENCH_INSERT_BATCH_SIZE=1000 \
+  cargo test --package awa --test benchmark_test \
+  test_enqueue_contention_matrix -- --exact --ignored --nocapture
+```
+
+This emits six JSONL records:
+
+- `insert_single`
+- `copy_single`
+- `insert_contention_distinct`
+- `copy_contention_distinct`
+- `insert_contention_same_queue`
+- `copy_contention_same_queue`
+
+The optional Postgres profile block in `metadata.db_profile` is meant to make
+server runs easier to interpret. In particular:
+
+- `wal_bytes` shows how much WAL the scenario generated
+- `temp_bytes_delta` and `temp_files_delta` show temp-file pressure
+- `xact_commit_delta` helps explain why many small commits degrade throughput
+- `tup_inserted_delta` shows how much table churn the database observed
 
 ### Failure-mode benchmarks (Rust)
 
