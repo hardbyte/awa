@@ -8,11 +8,11 @@ import { Link } from "@tanstack/react-router";
 import {
   fetchQueues,
   fetchQueueRuntime,
-  fetchCapabilities,
   pauseQueue,
   resumeQueue,
   drainQueue,
 } from "@/lib/api";
+import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
@@ -42,11 +42,7 @@ export function QueuesPage() {
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
   });
-  const capabilitiesQuery = useQuery({
-    queryKey: ["capabilities"],
-    queryFn: fetchCapabilities,
-  });
-  const readOnly = capabilitiesQuery.data?.read_only ?? false;
+  const readOnly = useReadOnly();
 
   const pauseMutation = useMutation({
     mutationFn: (queue: string) => pauseQueue(queue, "ui"),

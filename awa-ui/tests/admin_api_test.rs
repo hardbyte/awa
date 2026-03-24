@@ -462,6 +462,21 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
 }
 
 #[tokio::test]
+async fn test_capabilities_endpoint_reports_writable_mode() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let app = awa_ui::router(pool)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, "/api/capabilities").await;
+    assert_eq!(
+        payload.get("read_only").and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+#[tokio::test]
 async fn test_capabilities_endpoint_reports_read_only_mode() {
     let _guard = test_lock().lock().await;
     let _writable_pool = setup_pool().await;

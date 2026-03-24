@@ -9,13 +9,13 @@ import {
   fetchJobs,
   fetchStats,
   fetchQueues,
-  fetchCapabilities,
   bulkRetry,
   bulkCancel,
   pauseQueue,
   resumeQueue,
   drainQueue,
 } from "@/lib/api";
+import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -115,11 +115,7 @@ export function JobsPage() {
     queryKey: ["stats"],
     queryFn: fetchStats,
   });
-  const capabilitiesQuery = useQuery({
-    queryKey: ["capabilities"],
-    queryFn: fetchCapabilities,
-  });
-  const readOnly = capabilitiesQuery.data?.read_only ?? false;
+  const readOnly = useReadOnly();
 
   const retryMutation = useMutation({
     mutationFn: (ids: number[]) => bulkRetry(ids),

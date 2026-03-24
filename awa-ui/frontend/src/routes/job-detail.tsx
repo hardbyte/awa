@@ -4,7 +4,8 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { useParams, Link } from "@tanstack/react-router";
-import { fetchJob, retryJob, cancelJob, fetchCapabilities } from "@/lib/api";
+import { fetchJob, retryJob, cancelJob } from "@/lib/api";
+import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { JobRow } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -36,11 +37,7 @@ export function JobDetailPage() {
   const { id } = useParams({ strict: false });
   const jobId = Number(id);
   const queryClient = useQueryClient();
-  const capabilitiesQuery = useQuery({
-    queryKey: ["capabilities"],
-    queryFn: fetchCapabilities,
-  });
-  const readOnly = capabilitiesQuery.data?.read_only ?? false;
+  const readOnly = useReadOnly();
 
   const jobQuery = useQuery<JobRow>({
     queryKey: ["job", jobId],

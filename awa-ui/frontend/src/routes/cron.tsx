@@ -4,7 +4,8 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { fetchCronJobs, triggerCronJob, fetchCapabilities } from "@/lib/api";
+import { fetchCronJobs, triggerCronJob } from "@/lib/api";
+import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { CronJobRow } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
@@ -17,11 +18,7 @@ import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
 export function CronPage() {
   const queryClient = useQueryClient();
   const [expandedName, setExpandedName] = useState<string | null>(null);
-  const capabilitiesQuery = useQuery({
-    queryKey: ["capabilities"],
-    queryFn: fetchCapabilities,
-  });
-  const readOnly = capabilitiesQuery.data?.read_only ?? false;
+  const readOnly = useReadOnly();
 
   const cronQuery = useQuery<CronJobRow[]>({
     queryKey: ["cron"],
