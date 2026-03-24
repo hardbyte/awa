@@ -54,7 +54,7 @@ async def main():
         await asyncio.sleep(0.01)
         # Simulate 5% failure rate
         if random.random() < 0.05:
-            raise Exception(f"SMTP refused for {job.args['to']}")
+            raise Exception(f"SMTP refused for {job.args.to}")
         sent_count += 1
 
     # ── Periodic schedule ───────────────────────────────────────

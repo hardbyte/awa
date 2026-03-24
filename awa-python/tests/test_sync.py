@@ -244,26 +244,40 @@ def test_insert_many_copy_sync(client):
 
 
 def test_job_state_str_lowercase():
-    """JobState.__str__ returns lowercase string."""
+    """JobState.__str__ returns lowercase string for all variants."""
+    assert str(awa.JobState.Scheduled) == "scheduled"
     assert str(awa.JobState.Available) == "available"
+    assert str(awa.JobState.Running) == "running"
     assert str(awa.JobState.Completed) == "completed"
+    assert str(awa.JobState.Retryable) == "retryable"
+    assert str(awa.JobState.Failed) == "failed"
     assert str(awa.JobState.Cancelled) == "cancelled"
     assert str(awa.JobState.WaitingExternal) == "waiting_external"
-    assert str(awa.JobState.Running) == "running"
-    assert str(awa.JobState.Failed) == "failed"
 
 
 # -- Test 26: queue_stats returns typed QueueStat objects --
 
 
 def test_queue_stats_returns_typed_objects(client):
-    """queue_stats returns QueueStat objects, not dicts."""
+    """queue_stats returns QueueStat objects with correct types and values."""
     client.insert(SyncEmail(to="typed@example.com", subject="Typed"), queue="sync_typed_stats")
     stats = client.queue_stats()
     assert len(stats) > 0
-    stat = stats[0]
+    stat = next(s for s in stats if s.queue == "sync_typed_stats")
     assert isinstance(stat, awa.QueueStat)
-    assert hasattr(stat, "queue")
-    assert hasattr(stat, "available")
-    assert hasattr(stat, "lag_seconds")
-    assert hasattr(stat, "paused")
+    assert stat.queue == "sync_typed_stats"
+    assert isinstance(stat.available, int)
+    assert stat.available >= 1
+    assert isinstance(stat.running, int)
+    assert isinstance(stat.failed, int)
+    assert isinstance(stat.paused, bool)
+    assert stat.lag_seconds is None or isinstance(stat.lag_seconds, float)
+
+
+# -- Test 27: RawClient backwards-compatibility alias --
+
+
+def test_raw_client_alias():
+    """RawClient alias exists and points to the underlying PyO3 class."""
+    assert hasattr(awa, "RawClient")
+    assert awa.RawClient is awa._awa.Client

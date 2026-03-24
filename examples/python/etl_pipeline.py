@@ -76,8 +76,8 @@ async def main():
 
     @client.worker(ImportTable, queue="etl")
     async def handle_import(job):
-        table = job.args["source_table"]
-        batch_size = job.args.get("batch_size", 1000)
+        table = job.args.source_table
+        batch_size = job.args.batch_size
         total = TOTAL_ROWS.get(table, 1000)
 
         # Resume from checkpoint if this is a retry
@@ -113,12 +113,12 @@ async def main():
 
     @client.worker(AggregateMetrics, queue="etl")
     async def handle_aggregate(job):
-        tables = job.args["tables"]
+        tables = job.args.tables
         for i, table in enumerate(tables):
             pct = int(100 * (i + 1) / len(tables))
             job.set_progress(pct, f"Aggregating {table}")
             await asyncio.sleep(0.02)
-        print(f"  ✓ Aggregated {len(tables)} tables for {job.args['date']}")
+        print(f"  ✓ Aggregated {len(tables)} tables for {job.args.date}")
 
     # ── Schedule a daily run ────────────────────────────────────
 
