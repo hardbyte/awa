@@ -145,9 +145,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let (range_from, range_to) = if let Some(v) = version {
                 if v < 1 || v > current_version {
-                    eprintln!(
-                        "Version {v} is out of range. Valid versions: 1..{current_version}"
-                    );
+                    eprintln!("Version {v} is out of range. Valid versions: 1..{current_version}");
                     std::process::exit(1);
                 }
                 (v - 1, v)
@@ -157,8 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .max_connections(2)
                     .connect(&db_url)
                     .await?;
-                let db_version =
-                    awa_model::migrations::current_version(&pool).await?;
+                let db_version = awa_model::migrations::current_version(&pool).await?;
                 (db_version, current_version)
             } else {
                 (from.unwrap_or(0), to.unwrap_or(current_version))
@@ -173,8 +170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 return Ok(());
             }
 
-            let selected =
-                awa_model::migrations::migration_sql_range(range_from, range_to);
+            let selected = awa_model::migrations::migration_sql_range(range_from, range_to);
 
             if selected.is_empty() {
                 println!("No migrations matched the selected range.");
@@ -230,8 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     JobCommands::RetryFailed { kind, queue } => {
                         let count = if let Some(kind) = kind {
-                            let jobs =
-                                awa_model::admin::retry_failed_by_kind(&pool, &kind).await?;
+                            let jobs = awa_model::admin::retry_failed_by_kind(&pool, &kind).await?;
                             jobs.len()
                         } else if let Some(queue) = queue {
                             let jobs =
@@ -288,7 +283,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             for job in &jobs {
                                 println!(
                                     "{:<8} {:<25} {:<10} {:<10} {:<5} {:<5}",
-                                    job.id, &job.kind, &job.queue, job.state, job.attempt,
+                                    job.id,
+                                    &job.kind,
+                                    &job.queue,
+                                    job.state,
+                                    job.attempt,
                                     job.max_attempts,
                                 );
                             }
@@ -354,7 +353,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             println!(
                                 "{:<15} {:<10} {:<10} {:<10} {:<15} {:<10} {:<8}",
-                                "QUEUE", "AVAIL", "RUNNING", "FAILED", "COMPLETED/1H", "LAG(s)",
+                                "QUEUE",
+                                "AVAIL",
+                                "RUNNING",
+                                "FAILED",
+                                "COMPLETED/1H",
+                                "LAG(s)",
                                 "PAUSED"
                             );
                             for stat in &stats {
