@@ -68,7 +68,7 @@ def fetch_rows(table: str, offset: int, limit: int) -> list[dict]:
 
 
 async def main():
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
     print("AWA ETL Pipeline Example\n")
 

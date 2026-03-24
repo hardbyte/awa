@@ -56,7 +56,7 @@ class SendReceipt:
 
 
 async def main():
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
     print("AWA Webhook Payments Example\n")
 

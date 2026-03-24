@@ -42,7 +42,7 @@ class SendEmail:
 
 
 async def main():
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
     print("AWA Email Campaign Example\n")
 

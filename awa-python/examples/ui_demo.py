@@ -154,7 +154,7 @@ async def main() -> None:
     args = parse_args()
     preset = SCALE_PRESETS[args.scale]
 
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
 
     tx = await client.transaction()

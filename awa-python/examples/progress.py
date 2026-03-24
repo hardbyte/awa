@@ -24,7 +24,7 @@ class BatchImport:
 
 
 async def main():
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
 
     @client.worker(BatchImport, queue="etl")
