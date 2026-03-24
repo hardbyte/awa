@@ -237,20 +237,20 @@ where
     );
 
     sqlx::query_as::<_, JobRow>(&query)
-    .bind(&row.kind)
-    .bind(&row.queue)
-    .bind(&row.args)
-    .bind(row.state)
-    .bind(row.priority)
-    .bind(row.max_attempts)
-    .bind(row.run_at)
-    .bind(&row.metadata)
-    .bind(&row.tags)
-    .bind(&row.unique_key)
-    .bind(&row.unique_states)
-    .fetch_one(executor)
-    .await
-    .map_err(map_sqlx_error)
+        .bind(&row.kind)
+        .bind(&row.queue)
+        .bind(&row.args)
+        .bind(row.state)
+        .bind(row.priority)
+        .bind(row.max_attempts)
+        .bind(row.run_at)
+        .bind(&row.metadata)
+        .bind(&row.tags)
+        .bind(&row.unique_key)
+        .bind(&row.unique_states)
+        .fetch_one(executor)
+        .await
+        .map_err(map_sqlx_error)
 }
 
 /// Pre-compute all row values including unique keys from InsertParams.
@@ -427,19 +427,19 @@ pub async fn insert_many_copy(
                 target_table
             );
             let result = sqlx::query_as::<_, JobRow>(&query)
-            .bind(&kind)
-            .bind(&queue)
-            .bind(&args)
-            .bind(&state)
-            .bind(priority)
-            .bind(max_attempts)
-            .bind(run_at)
-            .bind(&metadata)
-            .bind(&tags)
-            .bind(&unique_key)
-            .bind(&unique_states)
-            .fetch_one(&mut *conn)
-            .await;
+                .bind(&kind)
+                .bind(&queue)
+                .bind(&args)
+                .bind(&state)
+                .bind(priority)
+                .bind(max_attempts)
+                .bind(run_at)
+                .bind(&metadata)
+                .bind(&tags)
+                .bind(&unique_key)
+                .bind(&unique_states)
+                .fetch_one(&mut *conn)
+                .await;
 
             match result {
                 Ok(row) => {

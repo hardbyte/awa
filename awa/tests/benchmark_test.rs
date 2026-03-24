@@ -10,7 +10,9 @@
 mod bench_output;
 
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations};
-use awa::{Client, InsertOpts, InsertParams, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa::{
+    Client, InsertOpts, InsertParams, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker,
+};
 use bench_output::{BenchMetrics, BenchmarkResult, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -110,14 +112,13 @@ async fn capture_db_profile_delta(
     start: &DbProfileSnapshot,
 ) -> Option<serde_json::Value> {
     let end = capture_db_profile(pool).await?;
-    let wal_bytes: i64 = sqlx::query_scalar(
-        "SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint",
-    )
-    .bind(&end.wal_insert_lsn)
-    .bind(&start.wal_insert_lsn)
-    .fetch_one(pool)
-    .await
-    .ok()?;
+    let wal_bytes: i64 =
+        sqlx::query_scalar("SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint")
+            .bind(&end.wal_insert_lsn)
+            .bind(&start.wal_insert_lsn)
+            .fetch_one(pool)
+            .await
+            .ok()?;
 
     Some(serde_json::json!({
         "wal_bytes": wal_bytes,
@@ -138,7 +139,9 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queues: &[String]) -> HashMap<S
     .await
     .expect("Failed to fetch queue state counts");
 
-    rows.into_iter().map(|(state, count)| (state, count as u64)).collect()
+    rows.into_iter()
+        .map(|(state, count)| (state, count as u64))
+        .collect()
 }
 
 fn emit_enqueue_result(
@@ -694,13 +697,17 @@ async fn test_throughput_copy_insert() {
     }
     let insert_elapsed = insert_start.elapsed();
     let insert_rate = total_jobs as f64 / insert_elapsed.as_secs_f64();
-    let insert_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'available'")
-            .bind(queue_insert)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(insert_count, total_jobs, "All insert benchmark jobs should be present");
+    let insert_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'available'",
+    )
+    .bind(queue_insert)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        insert_count, total_jobs,
+        "All insert benchmark jobs should be present"
+    );
 
     // ── COPY ──
     let queue_copy = "bench_copy_copy";
@@ -725,13 +732,17 @@ async fn test_throughput_copy_insert() {
     }
     let copy_elapsed = copy_start.elapsed();
     let copy_rate = total_jobs as f64 / copy_elapsed.as_secs_f64();
-    let copy_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'available'")
-            .bind(queue_copy)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(copy_count, total_jobs, "All COPY benchmark jobs should be present");
+    let copy_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'available'",
+    )
+    .bind(queue_copy)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        copy_count, total_jobs,
+        "All COPY benchmark jobs should be present"
+    );
 
     println!(
         "[bench] Chunked INSERT: {} jobs in {:.2}s ({:.0} inserts/sec)",

@@ -3,7 +3,7 @@
 //! Requires a running Postgres instance.
 //! Run with: `cargo test --package awa --test copy_test -- --nocapture`
 
-use awa::model::{insert_many_copy, insert_many_copy_from_pool, migrations};
+use awa::model::{admin, insert_many_copy, insert_many_copy_from_pool, migrations};
 use awa::{InsertOpts, InsertParams, JobState, UniqueOpts};
 use sqlx::postgres::PgPoolOptions;
 
@@ -258,7 +258,90 @@ async fn test_copy_mixed_run_at() {
     assert_eq!(scheduled.state, JobState::Scheduled);
 }
 
-// ── Test 8: Metadata with special chars ─────────────────────────────
+// ── Test 8: Admin metadata tracks direct COPY paths ─────────────────
+
+#[tokio::test]
+async fn test_copy_updates_admin_metadata_for_direct_paths() {
+    let pool = setup().await;
+    let hot_queue = "copy_admin_hot";
+    let scheduled_queue = "copy_admin_scheduled";
+    let hot_kind = "copy_admin_hot_kind";
+    let scheduled_kind = "copy_admin_scheduled_kind";
+
+    clean_queue(&pool, hot_queue).await;
+    clean_queue(&pool, scheduled_queue).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
+        .bind(vec![hot_kind, scheduled_kind])
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let hot_jobs = vec![
+        InsertParams {
+            kind: hot_kind.to_string(),
+            args: serde_json::json!({"seq": 1}),
+            opts: InsertOpts {
+                queue: hot_queue.to_string(),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: hot_kind.to_string(),
+            args: serde_json::json!({"seq": 2}),
+            opts: InsertOpts {
+                queue: hot_queue.to_string(),
+                ..Default::default()
+            },
+        },
+    ];
+    insert_many_copy_from_pool(&pool, &hot_jobs).await.unwrap();
+
+    let scheduled_jobs = vec![
+        InsertParams {
+            kind: scheduled_kind.to_string(),
+            args: serde_json::json!({"seq": 3}),
+            opts: InsertOpts {
+                queue: scheduled_queue.to_string(),
+                run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: scheduled_kind.to_string(),
+            args: serde_json::json!({"seq": 4}),
+            opts: InsertOpts {
+                queue: scheduled_queue.to_string(),
+                run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(45)),
+                ..Default::default()
+            },
+        },
+    ];
+    insert_many_copy_from_pool(&pool, &scheduled_jobs)
+        .await
+        .unwrap();
+
+    let stats = admin::queue_stats(&pool).await.unwrap();
+    let hot_stats = stats.iter().find(|stat| stat.queue == hot_queue).unwrap();
+    assert_eq!(hot_stats.available, 2);
+    assert_eq!(hot_stats.total_queued, 2);
+
+    let scheduled_stats = stats
+        .iter()
+        .find(|stat| stat.queue == scheduled_queue)
+        .unwrap();
+    assert_eq!(scheduled_stats.scheduled, 2);
+    assert_eq!(scheduled_stats.total_queued, 2);
+
+    let kinds = admin::distinct_kinds(&pool).await.unwrap();
+    assert!(kinds.contains(&hot_kind.to_string()));
+    assert!(kinds.contains(&scheduled_kind.to_string()));
+
+    let queues = admin::distinct_queues(&pool).await.unwrap();
+    assert!(queues.contains(&hot_queue.to_string()));
+    assert!(queues.contains(&scheduled_queue.to_string()));
+}
+
+// ── Test 9: Metadata with special chars ─────────────────────────────
 
 #[tokio::test]
 async fn test_copy_metadata_special_chars() {
@@ -287,7 +370,7 @@ async fn test_copy_metadata_special_chars() {
     assert_eq!(result[0].metadata, metadata);
 }
 
-// ── Test 9: Atomicity (transaction rollback) ────────────────────────
+// ── Test 10: Atomicity (transaction rollback) ───────────────────────
 
 #[tokio::test]
 async fn test_copy_atomicity() {
@@ -313,7 +396,7 @@ async fn test_copy_atomicity() {
     assert_eq!(count, 0);
 }
 
-// ── Test 10: COPY within caller-managed transaction ─────────────────
+// ── Test 11: COPY within caller-managed transaction ─────────────────
 
 #[tokio::test]
 async fn test_copy_within_caller_transaction() {
