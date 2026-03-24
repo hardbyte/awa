@@ -393,10 +393,11 @@ async fn run_scenario(pool: &sqlx::PgPool, config: &ScenarioConfig) {
         language: "rust".to_string(),
         seeded: config.total_jobs as u64,
         metrics: BenchMetrics {
-            throughput: BenchThroughput {
+            throughput: Some(BenchThroughput {
                 handler_per_s,
                 db_finalized_per_s: db_per_s,
-            },
+            }),
+            enqueue_per_s: None,
             drain_time_s: Some(drain_time.as_secs_f64()),
             latency_ms: None,
             rescue: rescue_metrics,
@@ -763,10 +764,11 @@ async fn test_failure_bench_stale_heartbeat_rescue() {
         language: "rust".to_string(),
         seeded: total_stale as u64,
         metrics: BenchMetrics {
-            throughput: BenchThroughput {
+            throughput: Some(BenchThroughput {
                 handler_per_s: handler_total as f64 / rescue_time.as_secs_f64(),
                 db_finalized_per_s: total_stale as f64 / rescue_time.as_secs_f64(),
-            },
+            }),
+            enqueue_per_s: None,
             drain_time_s: Some(rescue_time.as_secs_f64()),
             latency_ms: None,
             rescue: Some(BenchRescue {

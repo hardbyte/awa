@@ -237,11 +237,11 @@ field.
 ### Structured output
 
 Both Rust and Python benchmarks emit one JSONL record per scenario, prefixed
-with `@@BENCH_JSON@@` for extraction. Schema version 1:
+with `@@BENCH_JSON@@` for extraction. Schema version 2:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scenario": "terminal_10pct",
   "language": "rust",
   "seeded": 5000,
@@ -266,8 +266,8 @@ with `@@BENCH_JSON@@` for extraction. Schema version 1:
 Extract JSONL from mixed stdout: `grep '@@BENCH_JSON@@' output.txt | sed 's/^@@BENCH_JSON@@//'`
 
 For enqueue-only benchmarks (`insert_only_single`, `copy_single`, and the
-contention matrix), the shared schema is reused with both throughput fields set
-to the enqueue rate. Those records also include `"measurement": "enqueue"` in
+contention matrix), `metrics.enqueue_per_s` is emitted instead of
+`metrics.throughput`. Those records still include `"measurement": "enqueue"` in
 `metadata`, plus optional Postgres-side deltas such as `wal_bytes`,
 `temp_bytes_delta`, and `xact_commit_delta`.
 

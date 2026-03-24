@@ -11,7 +11,7 @@ mod bench_output;
 
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations};
 use awa::{Client, InsertOpts, InsertParams, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
-use bench_output::{BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
+use bench_output::{BenchMetrics, BenchmarkResult, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
@@ -156,12 +156,8 @@ fn emit_enqueue_result(
         language: "rust".to_string(),
         seeded,
         metrics: BenchMetrics {
-            throughput: BenchThroughput {
-                // Enqueue-only benchmarks do not have a handler layer, so both
-                // throughput fields intentionally carry the enqueue rate.
-                handler_per_s: enqueue_rate,
-                db_finalized_per_s: enqueue_rate,
-            },
+            throughput: None,
+            enqueue_per_s: Some(enqueue_rate),
             drain_time_s: Some(elapsed.as_secs_f64()),
             latency_ms: None,
             rescue: None,

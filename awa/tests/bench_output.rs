@@ -1,14 +1,14 @@
 //! Shared benchmark output schema for machine-readable JSONL results.
 //!
 //! Both Rust and Python benchmarks emit one JSON line per scenario using
-//! this schema (schema_version=1). Human-readable summaries go to stdout
+//! this schema (schema_version=2). Human-readable summaries go to stdout
 //! as before; these JSONL records are printed on a separate line prefixed
 //! with `@@BENCH_JSON@@` for easy extraction.
 
 use serde::Serialize;
 use std::collections::HashMap;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Marker prefix so scripts can extract JSONL from mixed stdout.
 pub const JSONL_PREFIX: &str = "@@BENCH_JSON@@";
@@ -27,7 +27,10 @@ pub struct BenchmarkResult {
 
 #[derive(Debug, Serialize)]
 pub struct BenchMetrics {
-    pub throughput: BenchThroughput,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub throughput: Option<BenchThroughput>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enqueue_per_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drain_time_s: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
