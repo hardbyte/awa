@@ -33,6 +33,24 @@ impl fmt::Display for JobState {
     }
 }
 
+impl std::str::FromStr for JobState {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "scheduled" => Ok(JobState::Scheduled),
+            "available" => Ok(JobState::Available),
+            "running" => Ok(JobState::Running),
+            "completed" => Ok(JobState::Completed),
+            "retryable" => Ok(JobState::Retryable),
+            "failed" => Ok(JobState::Failed),
+            "cancelled" => Ok(JobState::Cancelled),
+            "waiting_external" => Ok(JobState::WaitingExternal),
+            other => Err(format!("unknown job state: {other}")),
+        }
+    }
+}
+
 impl JobState {
     /// Bit position for unique_states bitmask.
     pub fn bit_position(&self) -> u8 {

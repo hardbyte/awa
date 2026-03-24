@@ -1,4 +1,5 @@
 pub mod admin;
+pub mod bridge;
 pub mod cron;
 pub mod error;
 pub mod insert;

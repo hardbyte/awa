@@ -5,10 +5,19 @@ use crate::JobArgs;
 use sqlx::postgres::PgConnection;
 use sqlx::{PgExecutor, PgPool};
 
+// ── Shared insert preparation ───────────────────────────────────────────
+//
+// Single source of truth for computing all derived insert values:
+// kind, serialized args, null-byte validation, state, unique_key,
+// unique_states. Used by:
+// - insert_with (single sqlx insert)
+// - precompute_row_values (batch insert_many / insert_many_copy)
+// - bridge adapters (tokio-postgres, etc.)
+
 /// Reject JSON values containing null bytes (`\u0000`), which Postgres
 /// JSONB does not support. Produces a clear validation error instead of
 /// an opaque database error.
-fn reject_null_bytes(value: &serde_json::Value) -> Result<(), AwaError> {
+pub(crate) fn reject_null_bytes(value: &serde_json::Value) -> Result<(), AwaError> {
     match value {
         serde_json::Value::String(s) if s.contains('\0') => Err(AwaError::Validation(
             "job args/metadata must not contain null bytes (\\u0000): Postgres JSONB does not support them".into(),
@@ -34,6 +43,99 @@ fn reject_null_bytes(value: &serde_json::Value) -> Result<(), AwaError> {
     }
 }
 
+/// Pre-computed values for a single job row, ready to bind into any driver.
+///
+/// This is the shared internal representation used by all insert paths.
+pub(crate) struct PreparedRow {
+    pub kind: String,
+    pub queue: String,
+    pub args: serde_json::Value,
+    pub state: JobState,
+    pub priority: i16,
+    pub max_attempts: i16,
+    pub run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub metadata: serde_json::Value,
+    pub tags: Vec<String>,
+    pub unique_key: Option<Vec<u8>>,
+    pub unique_states: Option<String>,
+}
+
+/// Compute unique_key and unique_states from opts.
+fn compute_unique_fields(
+    kind: &str,
+    args: &serde_json::Value,
+    opts: &InsertOpts,
+) -> (Option<Vec<u8>>, Option<String>) {
+    let unique_key = opts.unique.as_ref().map(|u| {
+        compute_unique_key(
+            kind,
+            if u.by_queue { Some(&opts.queue) } else { None },
+            if u.by_args { Some(args) } else { None },
+            u.by_period,
+        )
+    });
+
+    let unique_states = opts.unique.as_ref().map(|u| {
+        // Build a bit string where PG bit position N (leftmost = 0) corresponds
+        // to Rust bit N (least-significant = 0). PostgreSQL's get_bit(bitmask, N)
+        // reads from the left, so we place Rust bit 0 at the leftmost position.
+        let mut bit_string = String::with_capacity(8);
+        for bit_position in 0..8 {
+            if u.states & (1 << bit_position) != 0 {
+                bit_string.push('1');
+            } else {
+                bit_string.push('0');
+            }
+        }
+        bit_string
+    });
+
+    (unique_key, unique_states)
+}
+
+/// Prepare a single row from typed job args and options.
+///
+/// Validates null bytes, determines state, computes unique key.
+pub(crate) fn prepare_row(args: &impl JobArgs, opts: InsertOpts) -> Result<PreparedRow, AwaError> {
+    let kind = args.kind_str().to_string();
+    let args_value = args.to_args()?;
+    prepare_row_raw(kind, args_value, opts)
+}
+
+/// Prepare a single row from raw kind, JSON args, and options.
+pub(crate) fn prepare_row_raw(
+    kind: String,
+    args: serde_json::Value,
+    opts: InsertOpts,
+) -> Result<PreparedRow, AwaError> {
+    reject_null_bytes(&args)?;
+    reject_null_bytes(&opts.metadata)?;
+
+    let state = if opts.run_at.is_some() {
+        JobState::Scheduled
+    } else {
+        JobState::Available
+    };
+
+    let (unique_key, unique_states) = compute_unique_fields(&kind, &args, &opts);
+
+    Ok(PreparedRow {
+        kind,
+        queue: opts.queue,
+        args,
+        state,
+        priority: opts.priority,
+        max_attempts: opts.max_attempts,
+        run_at: opts.run_at,
+        metadata: opts.metadata,
+        tags: opts.tags,
+        unique_key,
+        unique_states,
+    })
+}
+
+// ── sqlx insert functions ───────────────────────────────────────────────
+
 /// Insert a job with default options.
 pub async fn insert<'e, E>(executor: E, args: &impl JobArgs) -> Result<JobRow, AwaError>
 where
@@ -52,142 +154,44 @@ pub async fn insert_with<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let kind = args.kind_str();
-    let args_json = args.to_args()?;
-    reject_null_bytes(&args_json)?;
-    reject_null_bytes(&opts.metadata)?;
+    let row = prepare_row(args, opts)?;
 
-    let state = if opts.run_at.is_some() {
-        JobState::Scheduled
-    } else {
-        JobState::Available
-    };
-
-    let unique_key = opts.unique.as_ref().map(|u| {
-        compute_unique_key(
-            kind,
-            if u.by_queue { Some(&opts.queue) } else { None },
-            if u.by_args { Some(&args_json) } else { None },
-            u.by_period,
-        )
-    });
-
-    let unique_states_bits: Option<String> = opts.unique.as_ref().map(|u| {
-        // Build a bit string where PG bit position N (leftmost = 0) corresponds
-        // to Rust bit N (least-significant = 0). PostgreSQL's get_bit(bitmask, N)
-        // reads from the left, so we place Rust bit 0 at the leftmost position.
-        let mut bit_string = String::with_capacity(8);
-        for bit_position in 0..8 {
-            if u.states & (1 << bit_position) != 0 {
-                bit_string.push('1');
-            } else {
-                bit_string.push('0');
-            }
-        }
-        bit_string
-    });
-
-    let row = sqlx::query_as::<_, JobRow>(
+    sqlx::query_as::<_, JobRow>(
         r#"
         INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
         VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10, $11::bit(8))
         RETURNING *
         "#,
     )
-    .bind(kind)
-    .bind(&opts.queue)
-    .bind(&args_json)
-    .bind(state)
-    .bind(opts.priority)
-    .bind(opts.max_attempts)
-    .bind(opts.run_at)
-    .bind(&opts.metadata)
-    .bind(&opts.tags)
-    .bind(&unique_key)
-    .bind(&unique_states_bits)
+    .bind(&row.kind)
+    .bind(&row.queue)
+    .bind(&row.args)
+    .bind(row.state)
+    .bind(row.priority)
+    .bind(row.max_attempts)
+    .bind(row.run_at)
+    .bind(&row.metadata)
+    .bind(&row.tags)
+    .bind(&row.unique_key)
+    .bind(&row.unique_states)
     .fetch_one(executor)
     .await
     .map_err(|err| {
         if let sqlx::Error::Database(ref db_err) = err {
             if db_err.code().as_deref() == Some("23505") {
-                // Unique constraint violation. The conflicting row ID isn't
-                // available from the PG error message directly — callers can
-                // query by unique_key if they need it.
                 return AwaError::UniqueConflict {
-                    constraint: db_err
-                        .constraint()
-                        .map(|c| c.to_string()),
+                    constraint: db_err.constraint().map(|c| c.to_string()),
                 };
             }
         }
         AwaError::Database(err)
-    })?;
-
-    Ok(row)
-}
-
-/// Pre-computed values for a single job row, shared by `insert_many` and `insert_many_copy`.
-struct RowValues {
-    kind: String,
-    queue: String,
-    args: serde_json::Value,
-    state: JobState,
-    priority: i16,
-    max_attempts: i16,
-    run_at: Option<chrono::DateTime<chrono::Utc>>,
-    metadata: serde_json::Value,
-    tags: Vec<String>,
-    unique_key: Option<Vec<u8>>,
-    unique_states: Option<String>,
+    })
 }
 
 /// Pre-compute all row values including unique keys from InsertParams.
-fn precompute_row_values(jobs: &[InsertParams]) -> Vec<RowValues> {
+fn precompute_rows(jobs: &[InsertParams]) -> Result<Vec<PreparedRow>, AwaError> {
     jobs.iter()
-        .map(|job| {
-            let unique_key = job.opts.unique.as_ref().map(|u| {
-                compute_unique_key(
-                    &job.kind,
-                    if u.by_queue {
-                        Some(job.opts.queue.as_str())
-                    } else {
-                        None
-                    },
-                    if u.by_args { Some(&job.args) } else { None },
-                    u.by_period,
-                )
-            });
-
-            let unique_states = job.opts.unique.as_ref().map(|u| {
-                let mut bit_string = String::with_capacity(8);
-                for bit_position in 0..8 {
-                    if u.states & (1 << bit_position) != 0 {
-                        bit_string.push('1');
-                    } else {
-                        bit_string.push('0');
-                    }
-                }
-                bit_string
-            });
-
-            RowValues {
-                kind: job.kind.clone(),
-                queue: job.opts.queue.clone(),
-                args: job.args.clone(),
-                state: if job.opts.run_at.is_some() {
-                    JobState::Scheduled
-                } else {
-                    JobState::Available
-                },
-                priority: job.opts.priority,
-                max_attempts: job.opts.max_attempts,
-                run_at: job.opts.run_at,
-                metadata: job.opts.metadata.clone(),
-                tags: job.opts.tags.clone(),
-                unique_key,
-                unique_states,
-            }
-        })
+        .map(|job| prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone()))
         .collect()
 }
 
@@ -204,14 +208,8 @@ where
         return Ok(Vec::new());
     }
 
-    // Validate all args/metadata before touching the DB
-    for job in jobs {
-        reject_null_bytes(&job.args)?;
-        reject_null_bytes(&job.opts.metadata)?;
-    }
-
-    let count = jobs.len();
-    let rows = precompute_row_values(jobs);
+    let rows = precompute_rows(jobs)?;
+    let count = rows.len();
 
     // Build multi-row INSERT with all columns including unique_key/unique_states
     let mut query = String::from(
@@ -279,13 +277,7 @@ pub async fn insert_many_copy(
         return Ok(Vec::new());
     }
 
-    // Validate all args/metadata before touching the DB
-    for job in jobs {
-        reject_null_bytes(&job.args)?;
-        reject_null_bytes(&job.opts.metadata)?;
-    }
-
-    let rows = precompute_row_values(jobs);
+    let rows = precompute_rows(jobs)?;
 
     // 1. Create temp staging table (dropped on transaction commit)
     sqlx::query(
@@ -483,8 +475,8 @@ pub async fn insert_many_copy_from_pool(
 
 // ── CSV serialization helpers ────────────────────────────────────────
 
-/// Write one RowValues as a CSV line to the buffer.
-fn write_csv_row(buf: &mut Vec<u8>, row: &RowValues) {
+/// Write one PreparedRow as a CSV line to the buffer.
+fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
     // kind
     write_csv_field(buf, &row.kind);
     buf.push(b',');
@@ -521,7 +513,6 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &RowValues) {
     // unique_key (hex-encoded bytes, or \N for NULL)
     match &row.unique_key {
         Some(key) => {
-            // Encode as hex string (no \x prefix — we use decode(hex) in SQL)
             let hex = hex::encode(key);
             write_csv_field(buf, &hex);
         }
@@ -566,7 +557,6 @@ fn write_pg_text_array(buf: &mut Vec<u8>, values: &[String]) {
         if i > 0 {
             buf.push(b',');
         }
-        // Postgres array elements need quoting if they contain special chars
         if val.is_empty()
             || val.contains(',')
             || val.contains('"')
@@ -576,27 +566,12 @@ fn write_pg_text_array(buf: &mut Vec<u8>, values: &[String]) {
             || val.contains(' ')
             || val.eq_ignore_ascii_case("NULL")
         {
-            // Double-quote the element inside the Postgres array literal.
-            // Inside CSV, the outer " are already handled; we need to
-            // double-quote for both Postgres and CSV escaping.
             buf.push(b'"');
             buf.push(b'"');
             for ch in val.chars() {
                 match ch {
-                    '"' => {
-                        // Postgres array: \" but inside CSV: "" per quote
-                        // So we emit \""  → but CSV sees \"" which is wrong.
-                        // Correct approach: inside a CSV-quoted field,
-                        // literal " becomes "". Inside PG array, " becomes \".
-                        // Combined: \\\"\"  ... this gets complex.
-                        // Simpler: PG array uses \"  and CSV doubles " to "".
-                        // PG inside CSV: \""  (PG backslash-quote, CSV double-quote)
-                        buf.extend_from_slice(b"\\\"\"");
-                    }
-                    '\\' => {
-                        // PG array backslash: \\, but inside CSV " is doubled
-                        buf.extend_from_slice(b"\\\\");
-                    }
+                    '"' => buf.extend_from_slice(b"\\\"\""),
+                    '\\' => buf.extend_from_slice(b"\\\\"),
                     _ => {
                         let mut utf8_buf = [0u8; 4];
                         buf.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());

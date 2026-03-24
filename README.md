@@ -9,7 +9,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 ## Features
 
 - **Postgres-only** — one dependency you already have.
-- **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone. Works with Awa's own transactions or your existing psycopg3/asyncpg/SQLAlchemy/Django connection.
+- **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone. Works with Awa's own transactions, your existing psycopg3/asyncpg/SQLAlchemy/Django connection (Python), or tokio-postgres (Rust).
 - **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
 - **Rust and Python workers** — same queues, identical semantics, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
@@ -176,6 +176,18 @@ let client = Client::builder(pool)
 client.start().await?;
 ```
 
+**tokio-postgres bridge** — insert jobs within existing tokio-postgres transactions (see [bridge adapters](https://github.com/hardbyte/awa/blob/main/docs/bridge-adapters.md)):
+
+```rust
+use awa::bridge::tokio_pg; // requires features = ["tokio-postgres"]
+
+// pg_client is a &mut tokio_postgres::Client (not the Awa Client above)
+let txn = pg_client.transaction().await?;
+txn.execute("INSERT INTO orders ...", &[&order_id]).await?;
+tokio_pg::insert_job(&txn, &SendEmail { to: "alice@example.com".into(), subject: "Confirmed".into() }).await?;
+txn.commit().await?;
+```
+
 ## Installation
 
 ### Python
@@ -251,6 +263,7 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 | [Python getting started](https://github.com/hardbyte/awa/blob/main/docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
 | [Deployment guide](https://github.com/hardbyte/awa/blob/main/docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
 | [Migration guide](https://github.com/hardbyte/awa/blob/main/docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
+| [Bridge adapters](https://github.com/hardbyte/awa/blob/main/docs/bridge-adapters.md) | tokio-postgres, psycopg3, asyncpg, SQLAlchemy, Django bridging |
 | [Configuration reference](https://github.com/hardbyte/awa/blob/main/docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
 | [Troubleshooting](https://github.com/hardbyte/awa/blob/main/docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
 | [Architecture overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) | System design, data flow, state machine, crash recovery |
@@ -278,6 +291,8 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 - [013: Durable run leases and guarded finalization](https://github.com/hardbyte/awa/blob/main/docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
 - [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
+- [016: Bridge adapters for non-sqlx transactional enqueue](https://github.com/hardbyte/awa/blob/main/docs/adr/016-bridge-adapters.md)
+- [017: Python insert-only transaction bridging](https://github.com/hardbyte/awa/blob/main/docs/adr/017-python-transaction-bridging.md)
 
 </details>
 

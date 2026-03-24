@@ -250,18 +250,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         queue,
                         limit,
                     } => {
-                        let state = state.map(|s| match s.as_str() {
-                            "available" => awa_model::JobState::Available,
-                            "running" => awa_model::JobState::Running,
-                            "completed" => awa_model::JobState::Completed,
-                            "failed" => awa_model::JobState::Failed,
-                            "cancelled" => awa_model::JobState::Cancelled,
-                            "retryable" => awa_model::JobState::Retryable,
-                            "scheduled" => awa_model::JobState::Scheduled,
-                            other => {
-                                eprintln!("Unknown state: {other}");
+                        let state = state.map(|s| {
+                            s.parse::<awa_model::JobState>().unwrap_or_else(|e| {
+                                eprintln!("{e}");
                                 std::process::exit(1);
-                            }
+                            })
                         });
 
                         let filter = awa_model::admin::ListJobsFilter {

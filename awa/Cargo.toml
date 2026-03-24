@@ -10,6 +10,7 @@ readme.workspace = true
 [features]
 cel = ["awa-model/cel"]
 anyhow = ["awa-worker/anyhow"]
+tokio-postgres = ["awa-model/tokio-postgres"]
 __python-bridge = ["awa-worker/__python-bridge"]
 
 [dependencies]
