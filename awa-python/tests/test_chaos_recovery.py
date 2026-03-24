@@ -218,7 +218,7 @@ async def _wait_for_line(
 
 
 async def _wait_for_job_state(
-    client: awa.Client, job_id: int, expected_state: str, timeout: float
+    client: awa.AsyncClient, job_id: int, expected_state: str, timeout: float
 ):
     deadline = asyncio.get_running_loop().time() + timeout
 

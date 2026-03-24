@@ -119,7 +119,7 @@ async def main():
 
     stats = await client.queue_stats()
     eq = next((s for s in stats if s.queue == "email"), None)
-    fail_count = (eq or {}).get("failed", 0)
+    fail_count = eq.failed if eq else 0
 
     print(f"\nFirst pass: {sent_count} sent, {fail_count} failed")
 

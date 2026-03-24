@@ -13,7 +13,16 @@ from __future__ import annotations
 
 from typing import Any, Awaitable, Callable, TypeVar
 
-from awa._awa import Client as RawClient
+from awa._awa import (
+    CallbackToken,
+    Client as RawClient,
+    HealthCheck,
+    Job,
+    QueueStat,
+    ResolveResult,
+    SyncTransaction,
+    Transaction,
+)
 
 T = TypeVar("T")
 
@@ -42,43 +51,94 @@ class AsyncClient:
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
         self._raw = RawClient(database_url, max_connections)
 
-    # ── Async operations ────────────────────────────────────────
+    # ── Job operations (async) ──────────────────────────────────
 
-    async def insert(self, args: Any, **kwargs: Any) -> Any:
+    async def insert(
+        self,
+        args: Any,
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
-        return await self._raw.insert(args, **kwargs)
+        return await self._raw.insert(
+            args,
+            kind=kind,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+            run_at=run_at,
+        )
 
-    async def insert_many_copy(self, jobs: list[Any], **kwargs: Any) -> list[Any]:
+    async def insert_many_copy(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> list[Job]:
         """Bulk insert jobs using COPY for high throughput."""
-        return await self._raw.insert_many_copy(jobs, **kwargs)
+        return await self._raw.insert_many_copy(
+            jobs,
+            kind=kind,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+            run_at=run_at,
+        )
 
     async def migrate(self) -> None:
         """Run database migrations."""
         return await self._raw.migrate()
 
-    async def transaction(self) -> Any:
-        """Start an async transaction."""
+    async def transaction(self) -> Transaction:
+        """Start an async transaction (use as async context manager)."""
         return await self._raw.transaction()
 
-    async def get_job(self, job_id: int) -> Any:
+    async def get_job(self, job_id: int) -> Job:
         """Fetch a job by ID."""
         return await self._raw.get_job(job_id)
 
-    async def retry(self, job_id: int) -> Any:
+    async def retry(self, job_id: int) -> Job | None:
         """Retry a failed/cancelled job."""
         return await self._raw.retry(job_id)
 
-    async def cancel(self, job_id: int) -> Any:
+    async def cancel(self, job_id: int) -> Job | None:
         """Cancel a job."""
         return await self._raw.cancel(job_id)
 
-    async def cancel_by_unique_key(self, kind: str, **kwargs: Any) -> Any:
+    async def cancel_by_unique_key(
+        self,
+        kind: str,
+        *,
+        queue: str | None = None,
+        args: Any | None = None,
+        period_bucket: int | None = None,
+    ) -> Job | None:
         """Cancel a job by its unique key components."""
-        return await self._raw.cancel_by_unique_key(kind, **kwargs)
+        return await self._raw.cancel_by_unique_key(
+            kind, queue=queue, args=args, period_bucket=period_bucket
+        )
 
-    async def retry_failed(self, **kwargs: Any) -> list[Any]:
+    async def retry_failed(
+        self, *, kind: str | None = None, queue: str | None = None
+    ) -> list[Job]:
         """Retry all failed jobs matching the filter."""
-        return await self._raw.retry_failed(**kwargs)
+        return await self._raw.retry_failed(kind=kind, queue=queue)
 
     async def discard_failed(self, kind: str) -> int:
         """Delete all failed jobs of a given kind."""
@@ -96,15 +156,24 @@ class AsyncClient:
         """Cancel all pending jobs in a queue."""
         return await self._raw.drain_queue(queue)
 
-    async def queue_stats(self) -> list[Any]:
-        """Per-queue statistics (typed ``QueueStat`` objects)."""
+    async def queue_stats(self) -> list[QueueStat]:
+        """Per-queue statistics."""
         return await self._raw.queue_stats()
 
-    async def list_jobs(self, **kwargs: Any) -> list[Any]:
-        """List jobs with optional state/kind/queue/limit filters."""
-        return await self._raw.list_jobs(**kwargs)
+    async def list_jobs(
+        self,
+        *,
+        state: str | None = None,
+        kind: str | None = None,
+        queue: str | None = None,
+        limit: int = 100,
+    ) -> list[Job]:
+        """List jobs with optional filters."""
+        return await self._raw.list_jobs(
+            state=state, kind=kind, queue=queue, limit=limit
+        )
 
-    async def health_check(self) -> Any:
+    async def health_check(self) -> HealthCheck:
         """Runtime health check."""
         return await self._raw.health_check()
 
@@ -114,23 +183,32 @@ class AsyncClient:
 
     # ── External callbacks (async) ──────────────────────────────
 
-    async def complete_external(self, callback_id: str, payload: Any = None) -> Any:
+    async def complete_external(
+        self, callback_id: str, payload: dict[str, Any] | None = None
+    ) -> Job:
         """Complete a waiting job via external callback."""
         return await self._raw.complete_external(callback_id, payload)
 
-    async def fail_external(self, callback_id: str, error: str) -> Any:
+    async def fail_external(self, callback_id: str, error: str) -> Job:
         """Fail a waiting job via external callback."""
         return await self._raw.fail_external(callback_id, error)
 
-    async def retry_external(self, callback_id: str) -> Any:
+    async def retry_external(self, callback_id: str) -> Job:
         """Retry a waiting job via external callback."""
         return await self._raw.retry_external(callback_id)
 
-    async def resolve_callback(self, callback_id: str, **kwargs: Any) -> Any:
-        """Resolve a callback with CEL expression evaluation."""
-        return await self._raw.resolve_callback(callback_id, **kwargs)
+    async def resolve_callback(
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        default_action: str = "ignore",
+    ) -> ResolveResult:
+        """Resolve a callback with optional CEL expression evaluation."""
+        return await self._raw.resolve_callback(
+            callback_id, payload=payload, default_action=default_action
+        )
 
-    # ── Sync operations (worker lifecycle) ──────────────────────
+    # ── Worker lifecycle (sync — called from async context) ─────
 
     def worker(
         self,
@@ -138,17 +216,69 @@ class AsyncClient:
         *,
         kind: str | None = None,
         queue: str = "default",
-    ) -> Callable:
+    ) -> Callable[[Callable[[Job[T]], Awaitable[Any]]], Callable[[Job[T]], Awaitable[Any]]]:
         """Register a worker handler (decorator)."""
         return self._raw.worker(args_type, kind=kind, queue=queue)
 
-    def periodic(self, name: str, cron_expr: str, args_type: type, args: Any, **kwargs: Any) -> None:
+    def periodic(
+        self,
+        name: str,
+        cron_expr: str,
+        args_type: type[T],
+        args: T,
+        *,
+        timezone: str = "UTC",
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Register a periodic (cron) job schedule."""
-        return self._raw.periodic(name, cron_expr, args_type, args, **kwargs)
+        return self._raw.periodic(
+            name,
+            cron_expr,
+            args_type,
+            args,
+            timezone=timezone,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+        )
 
-    def start(self, queues: Any = None, **kwargs: Any) -> None:
-        """Start the worker runtime. Blocks until started."""
-        return self._raw.start(queues, **kwargs)
+    def start(
+        self,
+        queues: list[tuple[str, int]] | list[dict[str, Any]] | None = None,
+        *,
+        poll_interval_ms: int = 200,
+        global_max_workers: int | None = None,
+        completed_retention_hours: float | None = None,
+        failed_retention_hours: float | None = None,
+        cleanup_batch_size: int | None = None,
+        leader_election_interval_ms: int | None = None,
+        heartbeat_interval_ms: int | None = None,
+        promote_interval_ms: int | None = None,
+        heartbeat_rescue_interval_ms: int | None = None,
+        deadline_rescue_interval_ms: int | None = None,
+        callback_rescue_interval_ms: int | None = None,
+    ) -> None:
+        """Start the worker runtime."""
+        return self._raw.start(
+            queues,
+            poll_interval_ms=poll_interval_ms,
+            global_max_workers=global_max_workers,
+            completed_retention_hours=completed_retention_hours,
+            failed_retention_hours=failed_retention_hours,
+            cleanup_batch_size=cleanup_batch_size,
+            leader_election_interval_ms=leader_election_interval_ms,
+            heartbeat_interval_ms=heartbeat_interval_ms,
+            promote_interval_ms=promote_interval_ms,
+            heartbeat_rescue_interval_ms=heartbeat_rescue_interval_ms,
+            deadline_rescue_interval_ms=deadline_rescue_interval_ms,
+            callback_rescue_interval_ms=callback_rescue_interval_ms,
+        )
 
 
 class Client:
@@ -168,41 +298,92 @@ class Client:
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
         self._raw = RawClient(database_url, max_connections)
 
-    def insert(self, args: Any, **kwargs: Any) -> Any:
+    def insert(
+        self,
+        args: Any,
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
-        return self._raw.insert_sync(args, **kwargs)
+        return self._raw.insert_sync(
+            args,
+            kind=kind,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+            run_at=run_at,
+        )
 
-    def insert_many_copy(self, jobs: list[Any], **kwargs: Any) -> list[Any]:
+    def insert_many_copy(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+    ) -> list[Job]:
         """Bulk insert jobs using COPY for high throughput."""
-        return self._raw.insert_many_copy_sync(jobs, **kwargs)
+        return self._raw.insert_many_copy_sync(
+            jobs,
+            kind=kind,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+            run_at=run_at,
+        )
 
     def migrate(self) -> None:
         """Run database migrations."""
         return self._raw.migrate_sync()
 
-    def transaction(self) -> Any:
+    def transaction(self) -> SyncTransaction:
         """Start a sync transaction (use as context manager)."""
         return self._raw.transaction_sync()
 
-    def get_job(self, job_id: int) -> Any:
+    def get_job(self, job_id: int) -> Job:
         """Fetch a job by ID."""
         return self._raw.get_job_sync(job_id)
 
-    def retry(self, job_id: int) -> Any:
+    def retry(self, job_id: int) -> Job | None:
         """Retry a failed/cancelled job."""
         return self._raw.retry_sync(job_id)
 
-    def cancel(self, job_id: int) -> Any:
+    def cancel(self, job_id: int) -> Job | None:
         """Cancel a job."""
         return self._raw.cancel_sync(job_id)
 
-    def cancel_by_unique_key(self, kind: str, **kwargs: Any) -> Any:
+    def cancel_by_unique_key(
+        self,
+        kind: str,
+        *,
+        queue: str | None = None,
+        args: Any | None = None,
+        period_bucket: int | None = None,
+    ) -> Job | None:
         """Cancel a job by its unique key components."""
-        return self._raw.cancel_by_unique_key_sync(kind, **kwargs)
+        return self._raw.cancel_by_unique_key_sync(
+            kind, queue=queue, args=args, period_bucket=period_bucket
+        )
 
-    def retry_failed(self, **kwargs: Any) -> list[Any]:
+    def retry_failed(
+        self, *, kind: str | None = None, queue: str | None = None
+    ) -> list[Job]:
         """Retry all failed jobs matching the filter."""
-        return self._raw.retry_failed_sync(**kwargs)
+        return self._raw.retry_failed_sync(kind=kind, queue=queue)
 
     def discard_failed(self, kind: str) -> int:
         """Delete all failed jobs of a given kind."""
@@ -220,32 +401,50 @@ class Client:
         """Cancel all pending jobs in a queue."""
         return self._raw.drain_queue_sync(queue)
 
-    def queue_stats(self) -> list[Any]:
-        """Per-queue statistics (typed ``QueueStat`` objects)."""
+    def queue_stats(self) -> list[QueueStat]:
+        """Per-queue statistics."""
         return self._raw.queue_stats_sync()
 
-    def list_jobs(self, **kwargs: Any) -> list[Any]:
-        """List jobs with optional state/kind/queue/limit filters."""
-        return self._raw.list_jobs_sync(**kwargs)
+    def list_jobs(
+        self,
+        *,
+        state: str | None = None,
+        kind: str | None = None,
+        queue: str | None = None,
+        limit: int = 100,
+    ) -> list[Job]:
+        """List jobs with optional filters."""
+        return self._raw.list_jobs_sync(
+            state=state, kind=kind, queue=queue, limit=limit
+        )
 
-    def health_check(self) -> Any:
+    def health_check(self) -> HealthCheck:
         """Runtime health check."""
         return self._raw.health_check_sync()
 
     # ── External callbacks (sync) ───────────────────────────────
 
-    def complete_external(self, callback_id: str, payload: Any = None) -> Any:
+    def complete_external(
+        self, callback_id: str, payload: dict[str, Any] | None = None
+    ) -> Job:
         """Complete a waiting job via external callback."""
         return self._raw.complete_external_sync(callback_id, payload)
 
-    def fail_external(self, callback_id: str, error: str) -> Any:
+    def fail_external(self, callback_id: str, error: str) -> Job:
         """Fail a waiting job via external callback."""
         return self._raw.fail_external_sync(callback_id, error)
 
-    def retry_external(self, callback_id: str) -> Any:
+    def retry_external(self, callback_id: str) -> Job:
         """Retry a waiting job via external callback."""
         return self._raw.retry_external_sync(callback_id)
 
-    def resolve_callback(self, callback_id: str, **kwargs: Any) -> Any:
-        """Resolve a callback with CEL expression evaluation."""
-        return self._raw.resolve_callback_sync(callback_id, **kwargs)
+    def resolve_callback(
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+        default_action: str = "ignore",
+    ) -> ResolveResult:
+        """Resolve a callback with optional CEL expression evaluation."""
+        return self._raw.resolve_callback_sync(
+            callback_id, payload=payload, default_action=default_action
+        )

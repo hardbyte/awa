@@ -157,7 +157,13 @@ pub struct PyQueueStat {
     #[pyo3(get)]
     pub queue: String,
     #[pyo3(get)]
+    pub total_queued: i64,
+    #[pyo3(get)]
+    pub scheduled: i64,
+    #[pyo3(get)]
     pub available: i64,
+    #[pyo3(get)]
+    pub retryable: i64,
     #[pyo3(get)]
     pub running: i64,
     #[pyo3(get)]
@@ -168,14 +174,16 @@ pub struct PyQueueStat {
     pub completed_last_hour: i64,
     #[pyo3(get)]
     pub lag_seconds: Option<f64>,
+    #[pyo3(get)]
+    pub paused: bool,
 }
 
 #[pymethods]
 impl PyQueueStat {
     fn __repr__(&self) -> String {
         format!(
-            "QueueStat(queue='{}', available={}, running={}, failed={})",
-            self.queue, self.available, self.running, self.failed
+            "QueueStat(queue='{}', total_queued={}, available={}, running={}, failed={})",
+            self.queue, self.total_queued, self.available, self.running, self.failed
         )
     }
 }
@@ -597,12 +605,16 @@ impl PyClient {
                         py,
                         PyQueueStat {
                             queue: stat.queue.clone(),
+                            total_queued: stat.total_queued,
+                            scheduled: stat.scheduled,
                             available: stat.available,
+                            retryable: stat.retryable,
                             running: stat.running,
                             failed: stat.failed,
                             waiting_external: stat.waiting_external,
                             completed_last_hour: stat.completed_last_hour,
                             lag_seconds: stat.lag_seconds,
+                            paused: stat.paused,
                         },
                     )?)?;
                 }
@@ -1300,12 +1312,16 @@ impl PyClient {
                     .iter()
                     .map(|s| PyQueueStat {
                         queue: s.queue.clone(),
+                        total_queued: s.total_queued,
+                        scheduled: s.scheduled,
                         available: s.available,
+                        retryable: s.retryable,
                         running: s.running,
                         failed: s.failed,
                         waiting_external: s.waiting_external,
                         completed_last_hour: s.completed_last_hour,
                         lag_seconds: s.lag_seconds,
+                        paused: s.paused,
                     })
                     .collect())
             })

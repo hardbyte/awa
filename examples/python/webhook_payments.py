@@ -133,8 +133,8 @@ async def main():
         payments = next((s for s in stats if s.queue == "payments"), None)
         notifs = next((s for s in stats if s.queue == "notifications"), None)
 
-        p_busy = (payments or {}).get("available", 0) + (payments or {}).get("running", 0)
-        n_busy = (notifs or {}).get("available", 0) + (notifs or {}).get("running", 0)
+        p_busy = (payments.available + payments.running) if payments else 0
+        n_busy = (notifs.available + notifs.running) if notifs else 0
 
         if p_busy == 0 and n_busy == 0:
             print(f"\n✓ All payments processed and receipts sent")
@@ -143,7 +143,7 @@ async def main():
     print("\nQueue stats:")
     for stat in await client.queue_stats():
         if stat.queue in ("payments", "notifications"):
-            print(f"  {stat['queue']}: failed={stat['failed']} completed/hr={stat['completed_last_hour']}")
+            print(f"  {stat.queue}: failed={stat.failed} completed/hr={stat.completed_last_hour}")
 
     await client.shutdown()
 

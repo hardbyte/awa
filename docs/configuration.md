@@ -77,7 +77,8 @@ Then:
 
 ## Python Runtime Configuration
 
-`awa.Client(database_url, max_connections=10)` creates the pool.
+`awa.Client(database_url, max_connections=10)` creates a synchronous client.
+`awa.AsyncClient(database_url, max_connections=10)` has the same constructor for async use.
 
 `client.start(...)` controls worker runtime settings.
 

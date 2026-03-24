@@ -62,7 +62,7 @@ class SendEmail:
     subject: str
 
 async def main():
-    client = awa.Client("postgres://localhost/mydb")
+    client = awa.AsyncClient("postgres://localhost/mydb")
     await client.migrate()
 
     @client.worker(SendEmail, queue="email")
@@ -102,12 +102,12 @@ async with await client.transaction() as tx:
     await tx.insert(SendEmail(to="alice@example.com", subject="Order confirmed"))
 ```
 
-**Sync API** for Django/Flask — every async method has a `_sync` variant:
+**Sync API** for Django/Flask — use `awa.Client` for sync frameworks; all methods are plain (no suffix):
 
 ```python
 client = awa.Client("postgres://localhost/mydb")
-client.migrate_sync()
-job = client.insert_sync(SendEmail(to="bob@example.com", subject="Hello"))
+client.migrate()
+job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
 ```
 
 See [`examples/python/`](https://github.com/hardbyte/awa/tree/main/examples/python) for complete runnable scripts tested in CI.

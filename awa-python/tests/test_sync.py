@@ -238,3 +238,32 @@ def test_insert_many_copy_sync(client):
         assert job.kind == "sync_email"
         assert job.queue == "sync_copy"
         assert job.args["to"] == f"copy{i}@example.com"
+
+
+# -- Test 25: JobState.__str__ returns lowercase --
+
+
+def test_job_state_str_lowercase():
+    """JobState.__str__ returns lowercase string."""
+    assert str(awa.JobState.Available) == "available"
+    assert str(awa.JobState.Completed) == "completed"
+    assert str(awa.JobState.Cancelled) == "cancelled"
+    assert str(awa.JobState.WaitingExternal) == "waiting_external"
+    assert str(awa.JobState.Running) == "running"
+    assert str(awa.JobState.Failed) == "failed"
+
+
+# -- Test 26: queue_stats returns typed QueueStat objects --
+
+
+def test_queue_stats_returns_typed_objects(client):
+    """queue_stats returns QueueStat objects, not dicts."""
+    client.insert(SyncEmail(to="typed@example.com", subject="Typed"), queue="sync_typed_stats")
+    stats = client.queue_stats()
+    assert len(stats) > 0
+    stat = stats[0]
+    assert isinstance(stat, awa.QueueStat)
+    assert hasattr(stat, "queue")
+    assert hasattr(stat, "available")
+    assert hasattr(stat, "lag_seconds")
+    assert hasattr(stat, "paused")
