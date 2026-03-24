@@ -11,9 +11,9 @@ pub use awa_model;
 
 // Re-export core model types (includes JobArgs derive macro via awa-model)
 pub use awa_model::{
-    self as model, admin, insert, insert_many, insert_many_copy, insert_many_copy_from_pool,
-    insert_with, migrations, AwaError, CallbackConfig, DefaultAction, InsertOpts, InsertParams,
-    JobArgs, JobRow, JobState, ResolveOutcome, UniqueOpts,
+    self as model, admin, bridge, insert, insert_many, insert_many_copy,
+    insert_many_copy_from_pool, insert_with, migrations, AwaError, CallbackConfig, DefaultAction,
+    InsertOpts, InsertParams, JobArgs, JobRow, JobState, ResolveOutcome, UniqueOpts,
 };
 
 // Re-export worker runtime

@@ -9,6 +9,7 @@ readme = "README.md"
 
 [features]
 cel = ["dep:cel"]
+tokio-postgres = ["dep:tokio-postgres"]
 
 [dependencies]
 awa-macros.workspace = true
@@ -25,6 +26,7 @@ tracing.workspace = true
 uuid.workspace = true
 hex = "0.4"
 cel = { workspace = true, optional = true }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"], optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full", "test-util"] }

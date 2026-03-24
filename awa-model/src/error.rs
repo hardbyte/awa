@@ -25,6 +25,10 @@ pub enum AwaError {
 
     #[error("database error: {0}")]
     Database(#[source] sqlx::Error),
+
+    #[cfg(feature = "tokio-postgres")]
+    #[error("tokio-postgres error: {0}")]
+    TokioPg(#[source] tokio_postgres::Error),
 }
 
 impl From<sqlx::Error> for AwaError {

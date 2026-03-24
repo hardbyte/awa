@@ -26,7 +26,7 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
       - name: cargo clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
   rust-build:
     name: Rust build
@@ -66,6 +66,40 @@ jobs:
         run: until pg_isready -h localhost -p 5432; do sleep 1; done
       - name: Run tests
         run: cargo test --workspace
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
+  # ─── Rust bridge (tokio-postgres) ──────────────────────
+  rust-bridge-tokio-pg:
+    name: Rust bridge (tokio-postgres)
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Run bridge tests (awa-model)
+        run: cargo test --package awa-model --features tokio-postgres --test bridge_tokio_pg_test
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+      - name: Verify facade re-export compiles
+        run: cargo check --package awa --features tokio-postgres
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
