@@ -126,7 +126,7 @@ pub mod tokio_pg {
                 AwaError::TokioPg(err)
             })?;
 
-        row_to_job_row(&row)
+        JobRow::try_from(&row)
     }
 
     fn parse_state(state_str: &str) -> Result<JobState, AwaError> {
@@ -145,49 +145,53 @@ pub mod tokio_pg {
         }
     }
 
-    /// Convert a `RETURNING *` row into a full [`JobRow`].
-    ///
-    /// Uses `try_get` throughout so decode failures surface as
-    /// `AwaError::Validation` instead of panicking.
-    fn row_to_job_row(row: &::tokio_postgres::Row) -> Result<JobRow, AwaError> {
-        fn col<'a, T: ::tokio_postgres::types::FromSql<'a>>(
-            row: &'a ::tokio_postgres::Row,
-            name: &str,
-        ) -> Result<T, AwaError> {
-            row.try_get(name)
-                .map_err(|e| AwaError::Validation(format!("failed to decode column {name}: {e}")))
+    /// Decode a column from a tokio-postgres row, mapping errors to
+    /// [`AwaError::Validation`] instead of panicking.
+    fn col<'a, T: ::tokio_postgres::types::FromSql<'a>>(
+        row: &'a ::tokio_postgres::Row,
+        name: &str,
+    ) -> Result<T, AwaError> {
+        row.try_get(name)
+            .map_err(|e| AwaError::Validation(format!("failed to decode column {name}: {e}")))
+    }
+
+    impl TryFrom<&::tokio_postgres::Row> for JobRow {
+        type Error = AwaError;
+
+        /// Convert a `RETURNING *, state::text AS state_str` row into a
+        /// full [`JobRow`].
+        fn try_from(row: &::tokio_postgres::Row) -> Result<Self, Self::Error> {
+            let state_str: String = col(row, "state_str")?;
+
+            Ok(JobRow {
+                id: col(row, "id")?,
+                kind: col(row, "kind")?,
+                queue: col(row, "queue")?,
+                args: col(row, "args")?,
+                state: parse_state(&state_str)?,
+                priority: col(row, "priority")?,
+                attempt: col(row, "attempt")?,
+                run_lease: col(row, "run_lease")?,
+                max_attempts: col(row, "max_attempts")?,
+                run_at: col(row, "run_at")?,
+                heartbeat_at: col(row, "heartbeat_at")?,
+                deadline_at: col(row, "deadline_at")?,
+                attempted_at: col(row, "attempted_at")?,
+                finalized_at: col(row, "finalized_at")?,
+                created_at: col(row, "created_at")?,
+                errors: col(row, "errors")?,
+                metadata: col(row, "metadata")?,
+                tags: col(row, "tags")?,
+                unique_key: col(row, "unique_key")?,
+                unique_states: None, // BIT(8) — no direct tokio-postgres mapping
+                callback_id: col(row, "callback_id")?,
+                callback_timeout_at: col(row, "callback_timeout_at")?,
+                callback_filter: col(row, "callback_filter")?,
+                callback_on_complete: col(row, "callback_on_complete")?,
+                callback_on_fail: col(row, "callback_on_fail")?,
+                callback_transform: col(row, "callback_transform")?,
+                progress: col(row, "progress")?,
+            })
         }
-
-        let state_str: String = col(row, "state_str")?;
-
-        Ok(JobRow {
-            id: col(row, "id")?,
-            kind: col(row, "kind")?,
-            queue: col(row, "queue")?,
-            args: col(row, "args")?,
-            state: parse_state(&state_str)?,
-            priority: col(row, "priority")?,
-            attempt: col(row, "attempt")?,
-            run_lease: col(row, "run_lease")?,
-            max_attempts: col(row, "max_attempts")?,
-            run_at: col(row, "run_at")?,
-            heartbeat_at: col(row, "heartbeat_at")?,
-            deadline_at: col(row, "deadline_at")?,
-            attempted_at: col(row, "attempted_at")?,
-            finalized_at: col(row, "finalized_at")?,
-            created_at: col(row, "created_at")?,
-            errors: col(row, "errors")?,
-            metadata: col(row, "metadata")?,
-            tags: col(row, "tags")?,
-            unique_key: col(row, "unique_key")?,
-            unique_states: None, // BIT(8) — no direct tokio-postgres mapping
-            callback_id: col(row, "callback_id")?,
-            callback_timeout_at: col(row, "callback_timeout_at")?,
-            callback_filter: col(row, "callback_filter")?,
-            callback_on_complete: col(row, "callback_on_complete")?,
-            callback_on_fail: col(row, "callback_on_fail")?,
-            callback_transform: col(row, "callback_transform")?,
-            progress: col(row, "progress")?,
-        })
     }
 }
