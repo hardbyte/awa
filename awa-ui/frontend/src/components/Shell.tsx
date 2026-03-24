@@ -1,6 +1,7 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
-import { useIsFetching, useQueryClient } from "@tanstack/react-query";
+import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
+import { fetchCapabilities } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
   NavbarProvider,
@@ -174,6 +175,13 @@ const NAV_ITEMS = [
 export function Shell() {
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;
+  // Show the banner only once we've confirmed read-only (not while loading)
+  const capabilitiesQuery = useQuery({
+    queryKey: ["capabilities"],
+    queryFn: fetchCapabilities,
+    staleTime: 60_000,
+  });
+  const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
   function isActive(to: string): boolean {
     if (to === "/") return currentPath === "/";
@@ -225,6 +233,11 @@ export function Shell() {
       </NavbarMobile>
 
       <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+        {showReadOnlyBanner && (
+          <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-fg">
+            Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
+          </div>
+        )}
         <Outlet />
       </main>
     </NavbarProvider>

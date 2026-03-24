@@ -5,6 +5,7 @@ import {
   useQueryClient,
 } from "@tanstack/react-query";
 import { fetchCronJobs, triggerCronJob } from "@/lib/api";
+import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import type { CronJobRow } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
@@ -17,6 +18,7 @@ import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
 export function CronPage() {
   const queryClient = useQueryClient();
   const [expandedName, setExpandedName] = useState<string | null>(null);
+  const readOnly = useReadOnly();
 
   const cronQuery = useQuery<CronJobRow[]>({
     queryKey: ["cron"],
@@ -126,7 +128,7 @@ export function CronPage() {
                       e.continuePropagation(); // Don't toggle expand
                       triggerMutation.mutate(cj.name);
                     }}
-                    isDisabled={triggerMutation.isPending}
+                    isDisabled={readOnly || triggerMutation.isPending}
                   >
                     Trigger now
                   </Button>

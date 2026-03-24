@@ -319,7 +319,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 },
 
                 Commands::Serve { host, port } => {
-                    let app = awa_ui::router(pool);
+                    let app = awa_ui::router(pool).await?;
                     let addr = format!("{host}:{port}");
                     let listener = tokio::net::TcpListener::bind(&addr).await?;
                     tracing::info!("AWA UI listening on http://{addr}");
