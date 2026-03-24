@@ -12,8 +12,12 @@ results from local runs.
 - Benchmarks live in:
   `awa/tests/benchmark_test.rs`
   `awa/tests/scheduling_benchmark_test.rs`
+  `awa/tests/failure_benchmark_test.rs`
 - Python worker benchmarks live in:
   `awa-python/scripts/benchmark_runtime.py`
+- Shared output schema:
+  `awa/tests/bench_output.rs` (Rust)
+  `awa-python/scripts/bench_output.py` (Python)
 
 These are local engineering benchmarks, not published vendor-style numbers. The
 main goal is to compare shapes, validate architecture changes, and catch
@@ -42,9 +46,18 @@ Steady numbers are the better indicator of sustained runtime behavior.
 The Python benchmark script exercises the real `awa-python` worker path while
 reusing the same database-facing benchmark shapes as the Rust runtime:
 
+**Baseline scenarios** (`--scenario baseline`):
+
 - `copy`: Python client `insert_many_copy` throughput
 - `hot`: sustained worker throughput over pre-seeded `awa.jobs_hot`
 - `scheduled`: sustained deferred promotion over pre-seeded `awa.scheduled_jobs`
+
+**Failure scenarios** (`--scenario failures`):
+
+- `terminal_1pct` / `10pct` / `50pct`: terminal failures
+- `retryable_1pct` / `10pct` / `50pct`: retry-once failures
+- `callback_timeout_10pct`: callback registration with short timeout
+- `mixed_50pct`: rotating through terminal, retryable, and success modes
 
 The worker-focused scenarios seed with SQL directly so the reported number is
 about Python handler dispatch and runtime behavior, not enqueue serialization.
@@ -179,6 +192,70 @@ and a two-tier heartbeat flush. Performance impact was validated:
 - **Sustained hot-path throughput** unchanged at ~8.1k/s after the feature
   was added.
 
+## Failure-Mode Benchmarks
+
+The failure-mode benchmark suite measures throughput, drain time, and recovery
+behaviour when a configurable percentage of jobs fail, retry, hang, or trigger
+rescue paths. This answers a question the happy-path benchmarks cannot: **how
+does failure impact healthy-job throughput?**
+
+### Benchmark matrix
+
+| Scenario | Description |
+|----------|-------------|
+| `terminal_1pct` / `10pct` / `50pct` | N% of jobs fail terminally |
+| `retryable_1pct` / `10pct` / `50pct` | N% of jobs fail once then succeed on retry |
+| `callback_timeout_10pct` | 10% register a callback that times out, then succeed on retry |
+| `deadline_hang_10pct` | 10% hang until deadline rescue fires, then succeed on retry |
+| `snooze_once_10pct` | 10% snooze once, then succeed |
+| `mixed_all_modes` | 50% success, 10% each of terminal/retryable/callback/deadline/snooze |
+| `stale_heartbeat_rescue` | All jobs seeded as "running" with stale heartbeat — measures rescue-to-completion time |
+
+### Rust harness
+
+Tests live in `awa/tests/failure_benchmark_test.rs`. Each scenario seeds jobs
+deterministically by mode, starts a Client with aggressive rescue intervals,
+drains to terminal states, and emits both human-readable output and a JSONL
+record.
+
+### Python harness
+
+The Python benchmark (`awa-python/scripts/benchmark_runtime.py`) supports the
+same failure scenarios via `--scenario failures`. The worker returns
+`RetryAfter`, `WaitForCallback`, or raises exceptions based on the job's
+`mode` field.
+
+### Structured output
+
+Both Rust and Python benchmarks emit one JSONL record per scenario, prefixed
+with `@@BENCH_JSON@@` for extraction. Schema version 1:
+
+```json
+{
+  "schema_version": 1,
+  "scenario": "terminal_10pct",
+  "language": "rust",
+  "seeded": 5000,
+  "metrics": {
+    "throughput": {
+      "handler_per_s": 4200.0,
+      "db_finalized_per_s": 4100.0
+    },
+    "drain_time_s": 1.22,
+    "rescue": {
+      "deadline_rescued": 0,
+      "callback_timeouts": 0
+    }
+  },
+  "outcomes": {
+    "completed": 4500,
+    "failed": 500
+  }
+}
+```
+
+Extract JSONL from mixed stdout: `grep '@@BENCH_JSON@@' output.txt | sed 's/^@@BENCH_JSON@@//'`
+
 ## Interpreting The Results
 
 Some practical guidelines:
@@ -194,7 +271,7 @@ Some practical guidelines:
 
 ## How To Run
 
-Examples:
+### Happy-path benchmarks
 
 ```bash
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
@@ -204,14 +281,43 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   cargo test --package awa --test scheduling_benchmark_test \
   test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture
+```
 
+### Failure-mode benchmarks (Rust)
+
+```bash
+# Full matrix (all 10 scenarios + stale heartbeat rescue)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
-  cargo test --package awa --test scheduling_benchmark_test \
-  test_scheduled_steady_10m_due_6k_per_sec -- --exact --ignored --nocapture
+  cargo test --package awa --test failure_benchmark_test \
+  test_failure_bench_full_matrix -- --exact --ignored --nocapture
 
+# Single scenario
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  cargo test --package awa --test failure_benchmark_test \
+  test_failure_bench_terminal_10pct -- --exact --ignored --nocapture
+
+# Stale heartbeat rescue
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  cargo test --package awa --test failure_benchmark_test \
+  test_failure_bench_stale_heartbeat_rescue -- --exact --ignored --nocapture
+```
+
+### Python benchmarks
+
+```bash
 cd awa-python
 uv run maturin develop
-DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+
+# Baseline scenarios (copy, hot, scheduled)
+PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  uv run python scripts/benchmark_runtime.py --scenario baseline
+
+# Failure scenarios
+PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  uv run python scripts/benchmark_runtime.py --scenario failures
+
+# Everything
+PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   uv run python scripts/benchmark_runtime.py --scenario all
 ```
 

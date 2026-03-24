@@ -10,6 +10,14 @@ from typing import Any
 
 import awa
 
+from bench_output import (
+    BenchLatency,
+    BenchMetrics,
+    BenchmarkResult,
+    BenchRescue,
+    BenchThroughput,
+)
+
 
 DEFAULT_DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -21,7 +29,13 @@ class TimingJob:
     seq: int
 
 
-async def scalar(client: awa.Client, query: str, *args: Any) -> int:
+@dataclass
+class FailureJob:
+    seq: int
+    mode: str
+
+
+async def scalar(client: awa.AsyncClient, query: str, *args: Any) -> int:
     tx = await client.transaction()
     try:
         row = await tx.fetch_one(query, *args)
@@ -30,7 +44,7 @@ async def scalar(client: awa.Client, query: str, *args: Any) -> int:
     return int(row["cnt"])
 
 
-async def execute(client: awa.Client, query: str, *args: Any) -> int:
+async def execute(client: awa.AsyncClient, query: str, *args: Any) -> int:
     tx = await client.transaction()
     try:
         affected = await tx.execute(query, *args)
@@ -41,7 +55,26 @@ async def execute(client: awa.Client, query: str, *args: Any) -> int:
     return affected
 
 
-async def reset_runtime_state(client: awa.Client) -> None:
+async def state_counts(client: awa.AsyncClient, queue: str) -> dict[str, int]:
+    """Query job state distribution for a queue across both tables."""
+    counts: dict[str, int] = {}
+    for table in ("awa.jobs_hot", "awa.scheduled_jobs"):
+        tx = await client.transaction()
+        try:
+            rows = await tx.fetch_all(
+                f"SELECT state::text AS st, count(*)::bigint AS cnt FROM {table} "
+                f"WHERE queue = $1 GROUP BY state",
+                queue,
+            )
+        finally:
+            await tx.rollback()
+        for row in rows:
+            state = row["st"]
+            counts[state] = counts.get(state, 0) + int(row["cnt"])
+    return counts
+
+
+async def reset_runtime_state(client: awa.AsyncClient) -> None:
     await execute(
         client,
         """
@@ -60,8 +93,13 @@ def pctl_ms(samples: list[float], pct: int) -> float:
     return cuts[pct - 1]
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# Existing scenarios: copy, hot, scheduled
+# ═══════════════════════════════════════════════════════════════════════
+
+
 async def run_copy_benchmark(
-    client: awa.Client,
+    client: awa.AsyncClient,
     total_jobs: int,
     chunk_size: int,
 ) -> None:
@@ -77,14 +115,30 @@ async def run_copy_benchmark(
         inserted += len(rows)
     elapsed = asyncio.get_running_loop().time() - started
 
+    throughput = inserted / elapsed
     print(
         f"[py-copy] total_jobs={inserted} chunk_size={chunk_size} "
-        f"elapsed={elapsed:.3f}s throughput={inserted / elapsed:.0f}/s"
+        f"elapsed={elapsed:.3f}s throughput={throughput:.0f}/s"
     )
+
+    BenchmarkResult(
+        scenario="copy",
+        language="python",
+        seeded=inserted,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=throughput,
+                db_finalized_per_s=throughput,
+            ),
+            drain_time_s=elapsed,
+        ),
+        outcomes={"inserted": inserted},
+        metadata={"chunk_size": chunk_size},
+    ).emit()
 
 
 async def run_hot_benchmark(
-    client: awa.Client,
+    client: awa.AsyncClient,
     total_jobs: int,
     warmup_secs: int,
     window_secs: int,
@@ -162,16 +216,38 @@ async def run_hot_benchmark(
 
     handler_delta = handler_returned - handler_before
     completed_delta = completed_after - completed_before
+    handler_per_s = handler_delta / window_secs
+    db_per_s = completed_delta / window_secs
+
     print(
         f"[py-steady-hot] warmup={warmup_secs}s window={window_secs}s "
-        f"handler_returned={handler_delta} ({handler_delta / window_secs:.0f}/s) "
-        f"db_completed_delta={completed_delta} ({completed_delta / window_secs:.0f}/s) "
+        f"handler_returned={handler_delta} ({handler_per_s:.0f}/s) "
+        f"db_completed_delta={completed_delta} ({db_per_s:.0f}/s) "
         f"remaining_hot={remaining_hot}"
     )
 
+    BenchmarkResult(
+        scenario="hot",
+        language="python",
+        seeded=total_jobs,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=handler_per_s,
+                db_finalized_per_s=db_per_s,
+            ),
+        ),
+        outcomes={"completed": completed_delta, "remaining": remaining_hot},
+        metadata={
+            "warmup_secs": warmup_secs,
+            "window_secs": window_secs,
+            "max_workers": max_workers,
+            "poll_interval_ms": poll_interval_ms,
+        },
+    ).emit()
+
 
 async def run_scheduled_benchmark(
-    client: awa.Client,
+    client: awa.AsyncClient,
     total_jobs: int,
     due_rate: int,
     window_secs: int,
@@ -315,18 +391,235 @@ async def run_scheduled_benchmark(
             f"p99={pctl_ms(pickup_lateness_ms, 99):.0f}"
         )
 
+    latency = None
+    if pickup_lateness_ms:
+        latency = BenchLatency(
+            p50=pctl_ms(pickup_lateness_ms, 50),
+            p95=pctl_ms(pickup_lateness_ms, 95),
+            p99=pctl_ms(pickup_lateness_ms, 99),
+        )
 
-async def make_client(args: argparse.Namespace) -> awa.Client:
-    client = awa.Client(args.database_url, max_connections=args.max_connections)
+    BenchmarkResult(
+        scenario="scheduled",
+        language="python",
+        seeded=total_jobs,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=handler_returned / window_secs if window_secs else 0,
+                db_finalized_per_s=completed_total / window_secs if window_secs else 0,
+            ),
+            latency_ms=latency,
+        ),
+        outcomes={
+            "completed": completed_total,
+            "scheduled_remaining": scheduled_remaining,
+        },
+        metadata={"due_rate": due_rate, "window_secs": window_secs},
+    ).emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# New scenarios: mixed failure modes
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def run_failure_benchmark(
+    client: awa.AsyncClient,
+    scenario_name: str,
+    total_jobs: int,
+    failure_pct: int,
+    failure_mode: str,
+    max_workers: int,
+    poll_interval_ms: int,
+) -> None:
+    """Run a benchmark with a configurable percentage of jobs failing.
+
+    failure_mode is one of: terminal, retryable, callback_timeout, mixed.
+    """
+    queue = f"py_bench_{scenario_name}"
+    await reset_runtime_state(client)
+
+    # Determine mode per job
+    success_count = total_jobs - int(total_jobs * failure_pct / 100)
+    failure_count = total_jobs - success_count
+
+    # Seed via SQL for speed — use 'failure_job' kind with mode in args.
+    # Terminal failures get max_attempts=1 so the first exception is final
+    # (Python has no JobError::terminal equivalent — exceptions are retryable).
+    # Mixed mode uses Cancel() for terminal sub-jobs, so max_attempts=5 is fine.
+    # Retryable and callback modes need max_attempts=5 for retry cycles.
+    failure_max_attempts = 1 if failure_mode == "terminal" else 5
+
+    await execute(
+        client,
+        """
+        INSERT INTO awa.jobs_hot
+            (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+        SELECT
+            'failure_job',
+            $1,
+            jsonb_build_object('seq', g, 'mode', 'complete'),
+            'available'::awa.job_state,
+            2,
+            5,
+            now(),
+            '{}'::jsonb,
+            '{}'::text[]
+        FROM generate_series(1, $2) AS g
+        """,
+        queue,
+        success_count,
+    )
+    if failure_count > 0:
+        await execute(
+            client,
+            """
+            INSERT INTO awa.jobs_hot
+                (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+            SELECT
+                'failure_job',
+                $1,
+                jsonb_build_object('seq', $2 + g, 'mode', $3),
+                'available'::awa.job_state,
+                2,
+                $5::smallint,
+                now(),
+                '{}'::jsonb,
+                '{}'::text[]
+            FROM generate_series(1, $4) AS g
+            """,
+            queue,
+            success_count,
+            failure_mode,
+            failure_count,
+            failure_max_attempts,
+        )
+
+    handler_returned = 0
+    callback_timeouts = 0
+
+    @client.worker(FailureJob, queue=queue)
+    async def handle_failure(job: awa.Job) -> Any:
+        nonlocal handler_returned, callback_timeouts
+        handler_returned += 1
+        mode = job.args.mode
+
+        if mode == "complete":
+            return None
+        elif mode == "terminal":
+            # max_attempts=1 ensures first exception is terminal
+            raise Exception("intentional terminal failure")
+        elif mode == "retryable":
+            if job.attempt == 1:
+                return awa.RetryAfter(0.05)
+            return None
+        elif mode == "callback_timeout":
+            if job.attempt == 1:
+                callback_timeouts += 1
+                token = await job.register_callback(timeout_seconds=0.3)
+                return awa.WaitForCallback(token)
+            return None
+        elif mode == "mixed":
+            # Rotate through modes based on seq
+            sub_mode = ["complete", "terminal", "retryable"][job.args.seq % 3]
+            if sub_mode == "complete":
+                return None
+            elif sub_mode == "terminal":
+                return awa.Cancel("intentional mixed terminal failure")
+            elif sub_mode == "retryable":
+                if job.attempt == 1:
+                    return awa.RetryAfter(0.05)
+                return None
+        return None
+
+    started = asyncio.get_running_loop().time()
+    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+
+    # Wait for all jobs to reach a terminal state
+    timeout_at = asyncio.get_running_loop().time() + 60
+    while asyncio.get_running_loop().time() < timeout_at:
+        await asyncio.sleep(0.5)
+        counts = await state_counts(client, queue)
+        in_flight = (
+            counts.get("available", 0)
+            + counts.get("running", 0)
+            + counts.get("retryable", 0)
+            + counts.get("scheduled", 0)
+            + counts.get("waiting_external", 0)
+        )
+        if in_flight == 0:
+            break
+
+    drain_time = asyncio.get_running_loop().time() - started
+    await client.shutdown(timeout_ms=5000)
+
+    final_counts = await state_counts(client, queue)
+    completed = final_counts.get("completed", 0)
+    failed = final_counts.get("failed", 0)
+    cancelled = final_counts.get("cancelled", 0)
+    handler_per_s = handler_returned / drain_time if drain_time > 0 else 0
+    db_per_s = (completed + failed + cancelled) / drain_time if drain_time > 0 else 0
+
+    print(
+        f"[py-{scenario_name}] total={total_jobs} failure_pct={failure_pct}% "
+        f"mode={failure_mode} drain_time={drain_time:.2f}s "
+        f"handler={handler_per_s:.0f}/s db_finalized={db_per_s:.0f}/s "
+        f"completed={completed} failed={failed}"
+    )
+
+    rescue = None
+    if callback_timeouts > 0:
+        rescue = BenchRescue(callback_timeouts=callback_timeouts)
+
+    BenchmarkResult(
+        scenario=scenario_name,
+        language="python",
+        seeded=total_jobs,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=handler_per_s,
+                db_finalized_per_s=db_per_s,
+            ),
+            drain_time_s=drain_time,
+            rescue=rescue,
+        ),
+        outcomes={k: v for k, v in final_counts.items() if v > 0},
+        metadata={
+            "failure_pct": failure_pct,
+            "failure_mode": failure_mode,
+            "max_workers": max_workers,
+        },
+    ).emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Main entry point
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def make_client(args: argparse.Namespace) -> awa.AsyncClient:
+    client = awa.AsyncClient(args.database_url, max_connections=args.max_connections)
     await client.migrate()
     return client
 
 
+FAILURE_SCENARIOS = [
+    ("terminal_1pct", 1, "terminal"),
+    ("terminal_10pct", 10, "terminal"),
+    ("terminal_50pct", 50, "terminal"),
+    ("retryable_1pct", 1, "retryable"),
+    ("retryable_10pct", 10, "retryable"),
+    ("retryable_50pct", 50, "retryable"),
+    ("callback_timeout_10pct", 10, "callback_timeout"),
+    ("mixed_50pct", 50, "mixed"),
+]
+
+
 async def async_main(args: argparse.Namespace) -> None:
-    if args.scenario in {"copy", "all"}:
+    if args.scenario in {"copy", "all", "baseline"}:
         client = await make_client(args)
         await run_copy_benchmark(client, args.copy_total_jobs, args.copy_chunk_size)
-    if args.scenario in {"hot", "all"}:
+    if args.scenario in {"hot", "all", "baseline"}:
         client = await make_client(args)
         await run_hot_benchmark(
             client,
@@ -336,7 +629,7 @@ async def async_main(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
             poll_interval_ms=args.poll_interval_ms,
         )
-    if args.scenario in {"scheduled", "all"}:
+    if args.scenario in {"scheduled", "all", "baseline"}:
         client = await make_client(args)
         await run_scheduled_benchmark(
             client,
@@ -346,6 +639,18 @@ async def async_main(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
             poll_interval_ms=args.poll_interval_ms,
         )
+    if args.scenario in {"failures", "all"}:
+        for scenario_name, failure_pct, failure_mode in FAILURE_SCENARIOS:
+            client = await make_client(args)
+            await run_failure_benchmark(
+                client,
+                scenario_name=scenario_name,
+                total_jobs=args.failure_total_jobs,
+                failure_pct=failure_pct,
+                failure_mode=failure_mode,
+                max_workers=args.max_workers,
+                poll_interval_ms=args.poll_interval_ms,
+            )
 
 
 def parse_args() -> argparse.Namespace:
@@ -357,7 +662,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scenario",
-        choices=["copy", "hot", "scheduled", "all"],
+        choices=["copy", "hot", "scheduled", "baseline", "failures", "all"],
         default="all",
     )
     parser.add_argument("--max-connections", type=int, default=50)
@@ -370,6 +675,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hot-total-jobs", type=int, default=200_000)
     parser.add_argument("--scheduled-total-jobs", type=int, default=2_000_000)
     parser.add_argument("--due-rate", type=int, default=4_000)
+    parser.add_argument("--failure-total-jobs", type=int, default=5_000)
     return parser.parse_args()
 
 
