@@ -50,7 +50,7 @@ class SendEmail:
 
 
 async def main() -> None:
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
 
     @client.worker(SendEmail, queue="email")
     async def handle_email(job):
@@ -100,7 +100,7 @@ The UI starts on `http://127.0.0.1:3000` by default.
 ## Useful Variants
 
 - `await client.migrate()` runs migrations from Python instead of the CLI.
-- `client.insert_sync(...)`, `client.migrate_sync()`, and `client.transaction_sync()` are available for sync frameworks like Django or Flask.
+- `awa.Client` provides a synchronous API for Django or Flask — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`, `client.transaction()`).
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
 
 ## More Examples

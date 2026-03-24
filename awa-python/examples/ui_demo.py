@@ -85,7 +85,7 @@ class RefreshCache:
 
 
 async def wait_for_state(
-    client: awa.Client,
+    client: awa.AsyncClient,
     job_id: int,
     expected_state: awa.JobState,
     *,
@@ -103,7 +103,7 @@ async def wait_for_state(
         await asyncio.sleep(0.1)
 
 
-async def wait_for_cron_sync(client: awa.Client, name: str, *, timeout_seconds: float = 8.0) -> None:
+async def wait_for_cron_sync(client: awa.AsyncClient, name: str, *, timeout_seconds: float = 8.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         tx = await client.transaction()
@@ -120,7 +120,7 @@ async def wait_for_cron_sync(client: awa.Client, name: str, *, timeout_seconds: 
 
 
 async def wait_for_many(
-    client: awa.Client,
+    client: awa.AsyncClient,
     job_ids: list[int],
     expected_state: awa.JobState,
     *,
@@ -154,7 +154,7 @@ async def main() -> None:
     args = parse_args()
     preset = SCALE_PRESETS[args.scale]
 
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
 
     tx = await client.transaction()

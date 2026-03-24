@@ -19,7 +19,7 @@ DATABASE_URL = os.environ.get(
 @pytest.fixture
 async def client():
     """Create a client and run migrations."""
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     # Clean up jobs from previous tests
     # We use a raw transaction for this
@@ -359,9 +359,9 @@ async def test_admin_queue_stats(client):
     )
     stats = await client.queue_stats()
     assert isinstance(stats, list)
-    stat = next((s for s in stats if s["queue"] == "stats_py_test"), None)
+    stat = next((s for s in stats if s.queue == "stats_py_test"), None)
     assert stat is not None
-    assert stat["available"] == 1
+    assert stat.available == 1
 
 
 @pytest.mark.asyncio
@@ -421,7 +421,7 @@ async def test_insert_invalid_run_at_raises_validation_error(client):
 def test_client_connection_errors_use_database_error():
     """Connection failures surface as awa.DatabaseError."""
     with pytest.raises(awa.DatabaseError):
-        awa.Client("postgres://postgres:test@localhost:1/awa_test")
+        awa.AsyncClient("postgres://postgres:test@localhost:1/awa_test")
 
 
 # -- Job repr --

@@ -74,11 +74,11 @@ class GenerateRevenueReport:
     report_name: str
 
 
-def create_client() -> awa.Client:
-    return awa.Client(DATABASE_URL)
+def create_client() -> awa.AsyncClient:
+    return awa.AsyncClient(DATABASE_URL)
 
 
-async def ensure_app_schema(client: awa.Client) -> None:
+async def ensure_app_schema(client: awa.AsyncClient) -> None:
     tx = await client.transaction()
     await tx.execute(
         f"""
@@ -94,7 +94,7 @@ async def ensure_app_schema(client: awa.Client) -> None:
     await tx.commit()
 
 
-async def clear_demo_data(client: awa.Client) -> None:
+async def clear_demo_data(client: awa.AsyncClient) -> None:
     tx = await client.transaction()
     await tx.execute(f"DELETE FROM {ORDERS_TABLE}")
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'store_%'")
@@ -102,7 +102,7 @@ async def clear_demo_data(client: awa.Client) -> None:
     await tx.commit()
 
 
-def register_workers(client: awa.Client, callback_ids: list[str] | None = None) -> None:
+def register_workers(client: awa.AsyncClient, callback_ids: list[str] | None = None) -> None:
     @client.worker(SendOrderConfirmationEmail, queue=EMAIL_QUEUE)
     async def handle_confirmation(job):
         print(
@@ -151,7 +151,7 @@ def register_workers(client: awa.Client, callback_ids: list[str] | None = None) 
 
 
 async def create_checkout(
-    client: awa.Client,
+    client: awa.AsyncClient,
     *,
     customer_email: str,
     total_cents: int,
@@ -192,7 +192,7 @@ async def create_checkout(
     }
 
 
-async def list_recent_orders(client: awa.Client, limit: int = 20) -> list[dict[str, object]]:
+async def list_recent_orders(client: awa.AsyncClient, limit: int = 20) -> list[dict[str, object]]:
     tx = await client.transaction()
     rows = await tx.fetch_all(
         f"""
@@ -207,7 +207,7 @@ async def list_recent_orders(client: awa.Client, limit: int = 20) -> list[dict[s
     return rows
 
 
-async def seed_pending_payments(client: awa.Client, count: int) -> list[int]:
+async def seed_pending_payments(client: awa.AsyncClient, count: int) -> list[int]:
     ids: list[int] = []
     for i in range(count):
         job = await client.insert(
@@ -224,7 +224,7 @@ async def seed_pending_payments(client: awa.Client, count: int) -> list[int]:
     return ids
 
 
-async def seed_failed_syncs(client: awa.Client, count: int) -> list[int]:
+async def seed_failed_syncs(client: awa.AsyncClient, count: int) -> list[int]:
     ids: list[int] = []
     for i in range(count):
         job = await client.insert(
@@ -240,7 +240,7 @@ async def seed_failed_syncs(client: awa.Client, count: int) -> list[int]:
     return ids
 
 
-async def seed_available_cache_jobs(client: awa.Client, count: int) -> None:
+async def seed_available_cache_jobs(client: awa.AsyncClient, count: int) -> None:
     jobs = [
         WarmProductCache(slug=f"/products/demo-{i + 1}")
         for i in range(count)
@@ -253,7 +253,7 @@ async def seed_available_cache_jobs(client: awa.Client, count: int) -> None:
     )
 
 
-async def seed_scheduled_reports(client: awa.Client, count: int) -> None:
+async def seed_scheduled_reports(client: awa.AsyncClient, count: int) -> None:
     for i in range(count):
         await client.insert(
             GenerateRevenueReport(report_name=f"scheduled-revenue-report-{i + 1}"),

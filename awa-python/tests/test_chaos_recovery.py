@@ -22,7 +22,7 @@ class ChaosProbe:
 
 @pytest.fixture
 async def client():
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'chaos_%'")
@@ -218,7 +218,7 @@ async def _wait_for_line(
 
 
 async def _wait_for_job_state(
-    client: awa.Client, job_id: int, expected_state: str, timeout: float
+    client: awa.AsyncClient, job_id: int, expected_state: str, timeout: float
 ):
     deadline = asyncio.get_running_loop().time() + timeout
 

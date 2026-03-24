@@ -18,7 +18,7 @@ DATABASE_URL = os.environ.get(
 
 @pytest.fixture
 async def client():
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     return c
 

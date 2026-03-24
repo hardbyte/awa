@@ -27,7 +27,7 @@ class FailingJob:
 @pytest.fixture
 async def tc():
     """Set up a TestClient."""
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     test_client = AwaTestClient(client)
     await test_client.migrate()
     await test_client.clean()

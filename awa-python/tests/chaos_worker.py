@@ -15,7 +15,7 @@ async def main() -> None:
     queue = os.environ["CHAOS_QUEUE"]
     role = os.environ["CHAOS_ROLE"]
 
-    client = awa.Client(database_url)
+    client = awa.AsyncClient(database_url)
     await client.migrate()
 
     @client.worker(ChaosProbe, queue=queue)

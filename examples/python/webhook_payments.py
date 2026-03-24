@@ -56,7 +56,7 @@ class SendReceipt:
 
 
 async def main():
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
     print("AWA Webhook Payments Example\n")
 
@@ -64,9 +64,9 @@ async def main():
 
     @client.worker(ChargeCustomer, queue="payments")
     async def handle_charge(job):
-        customer_id = job.args["customer_id"]
-        amount = job.args["amount_cents"]
-        idem_key = job.args["idempotency_key"]
+        customer_id = job.args.customer_id
+        amount = job.args.amount_cents
+        idem_key = job.args.idempotency_key
 
         job.set_progress(25, f"Initiating charge for {customer_id}")
         await job.flush_progress()
@@ -93,9 +93,9 @@ async def main():
 
     @client.worker(SendReceipt, queue="notifications")
     async def handle_receipt(job):
-        customer_id = job.args["customer_id"]
-        charge_id = job.args["charge_id"]
-        amount = job.args["amount_cents"]
+        customer_id = job.args.customer_id
+        charge_id = job.args.charge_id
+        amount = job.args.amount_cents
         await asyncio.sleep(0.02)
         print(f"  ✉ Receipt sent to {customer_id}: ${amount/100:.2f} ({charge_id})")
 
@@ -130,11 +130,11 @@ async def main():
     for _ in range(30):
         await asyncio.sleep(1)
         stats = await client.queue_stats()
-        payments = next((s for s in stats if s["queue"] == "payments"), None)
-        notifs = next((s for s in stats if s["queue"] == "notifications"), None)
+        payments = next((s for s in stats if s.queue == "payments"), None)
+        notifs = next((s for s in stats if s.queue == "notifications"), None)
 
-        p_busy = (payments or {}).get("available", 0) + (payments or {}).get("running", 0)
-        n_busy = (notifs or {}).get("available", 0) + (notifs or {}).get("running", 0)
+        p_busy = (payments.available + payments.running) if payments else 0
+        n_busy = (notifs.available + notifs.running) if notifs else 0
 
         if p_busy == 0 and n_busy == 0:
             print(f"\n✓ All payments processed and receipts sent")
@@ -142,8 +142,8 @@ async def main():
 
     print("\nQueue stats:")
     for stat in await client.queue_stats():
-        if stat["queue"] in ("payments", "notifications"):
-            print(f"  {stat['queue']}: failed={stat['failed']} completed/hr={stat['completed_last_hour']}")
+        if stat.queue in ("payments", "notifications"):
+            print(f"  {stat.queue}: failed={stat.failed} completed/hr={stat.completed_last_hour}")
 
     await client.shutdown()
 

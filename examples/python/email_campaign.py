@@ -42,7 +42,7 @@ class SendEmail:
 
 
 async def main():
-    client = awa.Client(DATABASE_URL)
+    client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
     print("AWA Email Campaign Example\n")
 
@@ -54,7 +54,7 @@ async def main():
         await asyncio.sleep(0.01)
         # Simulate 5% failure rate
         if random.random() < 0.05:
-            raise Exception(f"SMTP refused for {job.args['to']}")
+            raise Exception(f"SMTP refused for {job.args.to}")
         sent_count += 1
 
     # ── Periodic schedule ───────────────────────────────────────
@@ -107,9 +107,9 @@ async def main():
     for tick in range(60):
         await asyncio.sleep(1)
         stats = await client.queue_stats()
-        eq = next((s for s in stats if s["queue"] == "email"), None)
+        eq = next((s for s in stats if s.queue == "email"), None)
         if eq:
-            avail, running, failed = eq["available"], eq["running"], eq["failed"]
+            avail, running, failed = eq.available, eq.running, eq.failed
             if tick % 5 == 0:
                 print(f"  avail={avail} running={running} failed={failed}")
             if avail == 0 and running == 0:
@@ -118,8 +118,8 @@ async def main():
     # ── Retry failures ──────────────────────────────────────────
 
     stats = await client.queue_stats()
-    eq = next((s for s in stats if s["queue"] == "email"), None)
-    fail_count = (eq or {}).get("failed", 0)
+    eq = next((s for s in stats if s.queue == "email"), None)
+    fail_count = eq.failed if eq else 0
 
     print(f"\nFirst pass: {sent_count} sent, {fail_count} failed")
 

@@ -28,7 +28,7 @@ from demo_app.shared import (
 
 
 async def wait_for_state(
-    client: awa.Client,
+    client: awa.AsyncClient,
     job_id: int,
     expected_state: awa.JobState,
     *,
@@ -47,7 +47,7 @@ async def wait_for_state(
 
 
 async def wait_for_many(
-    client: awa.Client,
+    client: awa.AsyncClient,
     job_ids: list[int],
     expected_state: awa.JobState,
     *,
@@ -62,7 +62,7 @@ async def wait_for_many(
         )
 
 
-async def wait_for_cron_sync(client: awa.Client, name: str, *, timeout_seconds: float = 10.0) -> None:
+async def wait_for_cron_sync(client: awa.AsyncClient, name: str, *, timeout_seconds: float = 10.0) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
         tx = await client.transaction()
