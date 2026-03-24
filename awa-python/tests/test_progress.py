@@ -15,7 +15,7 @@ DATABASE_URL = os.environ.get(
 
 @pytest.fixture
 async def client():
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'progress_%'")
@@ -249,6 +249,6 @@ async def test_get_job_sync_returns_progress(client):
     await asyncio.sleep(1.0)
     await client.shutdown()
 
-    job = client.get_job_sync(inserted.id)
+    job = client._raw.get_job_sync(inserted.id)
     assert job.progress is not None
     assert job.progress["percent"] == 80

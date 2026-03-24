@@ -87,6 +87,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyCancel>()?;
     m.add_class::<client::PyWaitForCallback>()?;
     m.add_class::<client::PyQueueHealth>()?;
+    m.add_class::<client::PyQueueStat>()?;
     m.add_class::<client::PyHealthCheck>()?;
     m.add_class::<job::PyCallbackToken>()?;
     m.add_class::<client::PyResolveResult>()?;

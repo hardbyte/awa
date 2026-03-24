@@ -15,7 +15,7 @@ DATABASE_URL = os.environ.get(
 
 @pytest.fixture
 async def client():
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'dispatch_%'")
@@ -221,5 +221,5 @@ async def test_logging_bridge():
     logger.setLevel(logging.DEBUG)
     # If the bridge is working, Rust tracing events will show up
     # in Python's logging. We just verify no crash occurs.
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()  # This triggers Rust tracing logs

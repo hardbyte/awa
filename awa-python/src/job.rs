@@ -35,6 +35,26 @@ pub enum PyJobState {
     WaitingExternal,
 }
 
+#[pymethods]
+impl PyJobState {
+    fn __str__(&self) -> &'static str {
+        match self {
+            PyJobState::Scheduled => "scheduled",
+            PyJobState::Available => "available",
+            PyJobState::Running => "running",
+            PyJobState::Completed => "completed",
+            PyJobState::Retryable => "retryable",
+            PyJobState::Failed => "failed",
+            PyJobState::Cancelled => "cancelled",
+            PyJobState::WaitingExternal => "waiting_external",
+        }
+    }
+
+    fn __repr__(&self) -> String {
+        format!("JobState.{:?}", self)
+    }
+}
+
 impl From<JobState> for PyJobState {
     fn from(state: JobState) -> Self {
         match state {

@@ -151,6 +151,35 @@ pub struct PyQueueHealth {
     pub overflow_held: Option<u32>,
 }
 
+#[pyclass(frozen, name = "QueueStat", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyQueueStat {
+    #[pyo3(get)]
+    pub queue: String,
+    #[pyo3(get)]
+    pub available: i64,
+    #[pyo3(get)]
+    pub running: i64,
+    #[pyo3(get)]
+    pub failed: i64,
+    #[pyo3(get)]
+    pub waiting_external: i64,
+    #[pyo3(get)]
+    pub completed_last_hour: i64,
+    #[pyo3(get)]
+    pub lag_seconds: Option<f64>,
+}
+
+#[pymethods]
+impl PyQueueStat {
+    fn __repr__(&self) -> String {
+        format!(
+            "QueueStat(queue='{}', available={}, running={}, failed={})",
+            self.queue, self.available, self.running, self.failed
+        )
+    }
+}
+
 #[pyclass(frozen, name = "HealthCheck", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct PyHealthCheck {
@@ -564,15 +593,18 @@ impl PyClient {
             Python::attach(|py| {
                 let list = pyo3::types::PyList::empty(py);
                 for stat in &stats {
-                    let dict = PyDict::new(py);
-                    dict.set_item("queue", &stat.queue)?;
-                    dict.set_item("available", stat.available)?;
-                    dict.set_item("running", stat.running)?;
-                    dict.set_item("failed", stat.failed)?;
-                    dict.set_item("waiting_external", stat.waiting_external)?;
-                    dict.set_item("completed_last_hour", stat.completed_last_hour)?;
-                    dict.set_item("lag_seconds", stat.lag_seconds)?;
-                    list.append(dict)?;
+                    list.append(Py::new(
+                        py,
+                        PyQueueStat {
+                            queue: stat.queue.clone(),
+                            available: stat.available,
+                            running: stat.running,
+                            failed: stat.failed,
+                            waiting_external: stat.waiting_external,
+                            completed_last_hour: stat.completed_last_hour,
+                            lag_seconds: stat.lag_seconds,
+                        },
+                    )?)?;
                 }
                 Ok(list.unbind())
             })
@@ -1257,28 +1289,25 @@ impl PyClient {
         })
     }
 
-    fn queue_stats_sync(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+    fn queue_stats_sync(&self, py: Python<'_>) -> PyResult<Vec<PyQueueStat>> {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let stats = awa_model::admin::queue_stats(&pool)
                     .await
                     .map_err(map_awa_error)?;
-                Python::attach(|py| {
-                    let list = pyo3::types::PyList::empty(py);
-                    for stat in &stats {
-                        let dict = PyDict::new(py);
-                        dict.set_item("queue", &stat.queue)?;
-                        dict.set_item("available", stat.available)?;
-                        dict.set_item("running", stat.running)?;
-                        dict.set_item("failed", stat.failed)?;
-                        dict.set_item("waiting_external", stat.waiting_external)?;
-                        dict.set_item("completed_last_hour", stat.completed_last_hour)?;
-                        dict.set_item("lag_seconds", stat.lag_seconds)?;
-                        list.append(dict)?;
-                    }
-                    Ok(list.into_any().unbind())
-                })
+                Ok(stats
+                    .iter()
+                    .map(|s| PyQueueStat {
+                        queue: s.queue.clone(),
+                        available: s.available,
+                        running: s.running,
+                        failed: s.failed,
+                        waiting_external: s.waiting_external,
+                        completed_last_hour: s.completed_last_hour,
+                        lag_seconds: s.lag_seconds,
+                    })
+                    .collect())
             })
         })
     }

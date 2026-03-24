@@ -19,7 +19,7 @@ DATABASE_URL = os.environ.get(
 
 @pytest.fixture
 async def client():
-    c = awa.Client(DATABASE_URL)
+    c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'cb_%'")
@@ -264,7 +264,7 @@ async def test_complete_external_sync(client):
     await asyncio.sleep(1.0)
     await client.shutdown()
 
-    completed = client.complete_external_sync(callback_ids[0])
+    completed = client._raw.complete_external_sync(callback_ids[0])
     assert completed.state == awa.JobState.Completed
 
 
@@ -286,7 +286,7 @@ async def test_fail_external_sync(client):
     await asyncio.sleep(1.0)
     await client.shutdown()
 
-    failed = client.fail_external_sync(callback_ids[0], "sync failure")
+    failed = client._raw.fail_external_sync(callback_ids[0], "sync failure")
     assert failed.state == awa.JobState.Failed
 
 
@@ -308,7 +308,7 @@ async def test_retry_external_sync(client):
     await asyncio.sleep(1.0)
     await client.shutdown()
 
-    retried = client.retry_external_sync(callback_ids[0])
+    retried = client._raw.retry_external_sync(callback_ids[0])
     assert retried.state == awa.JobState.Available
 
 
@@ -330,7 +330,7 @@ async def test_resolve_callback_sync(client):
     await asyncio.sleep(1.0)
     await client.shutdown()
 
-    result = client.resolve_callback_sync(callback_ids[0], default_action="complete")
+    result = client._raw.resolve_callback_sync(callback_ids[0], default_action="complete")
     assert result.is_completed()
 
 
