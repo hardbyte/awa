@@ -55,7 +55,7 @@ Expose a public Python bridge module, `awa.bridge`, with insert-only helpers tha
 - **No worker/runtime bridging.** Polling, dispatch, heartbeating, retries, and admin operations remain on Awa's own runtime/client surfaces.
 - **No transaction lifecycle management.** The bridge does not begin, commit, roll back, or manage savepoints for external transactions.
 - **No ORM abstraction layer.** We support specific widely used connection/session types, not arbitrary ORM adapters.
-- **No batch/COPY bridge.** Bridge support is single-job insert only.
+- **No batch/COPY bridge.** The bridge is for app-owned transactional enqueue of one or a few jobs. Awa's high-throughput bulk path is a driver-specific staging-and-COPY implementation, not a thin adapter surface, so bulk ingestion remains on Awa's native sqlx-backed APIs until there is a clear need for per-driver, explicitly tested bulk adapters.
 - **No promise of every wrapper working.** Wrapper compatibility is explicit and test-backed, not implicit.
 
 ## Consequences
