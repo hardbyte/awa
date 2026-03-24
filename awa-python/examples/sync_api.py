@@ -40,7 +40,7 @@ def main():
     print(f"Job {fetched.id}: state={fetched.state}, args={fetched.args}")
 
     # Clean up
-    client.cancel_sync(job.id)
+    client.cancel(job.id)
     print(f"Cancelled job {job.id}")
 
 

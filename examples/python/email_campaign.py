@@ -107,9 +107,9 @@ async def main():
     for tick in range(60):
         await asyncio.sleep(1)
         stats = await client.queue_stats()
-        eq = next((s for s in stats if s["queue"] == "email"), None)
+        eq = next((s for s in stats if s.queue == "email"), None)
         if eq:
-            avail, running, failed = eq["available"], eq["running"], eq["failed"]
+            avail, running, failed = eq.available, eq.running, eq.failed
             if tick % 5 == 0:
                 print(f"  avail={avail} running={running} failed={failed}")
             if avail == 0 and running == 0:
@@ -118,7 +118,7 @@ async def main():
     # ── Retry failures ──────────────────────────────────────────
 
     stats = await client.queue_stats()
-    eq = next((s for s in stats if s["queue"] == "email"), None)
+    eq = next((s for s in stats if s.queue == "email"), None)
     fail_count = (eq or {}).get("failed", 0)
 
     print(f"\nFirst pass: {sent_count} sent, {fail_count} failed")

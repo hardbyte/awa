@@ -156,9 +156,9 @@ async def main():
     for _ in range(60):
         await asyncio.sleep(1)
         stats = await client.queue_stats()
-        etl = next((s for s in stats if s["queue"] == "etl"), None)
+        etl = next((s for s in stats if s.queue == "etl"), None)
         if etl:
-            avail, running = etl["available"], etl["running"]
+            avail, running = etl.available, etl.running
             if avail == 0 and running == 0:
                 print(f"\n✓ All jobs completed")
                 break
