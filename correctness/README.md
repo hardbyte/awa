@@ -48,6 +48,16 @@ What is intentionally not modeled:
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
   post-timeout abandonment / recovery
+- `AwaBatcher.tla` / `AwaBatcher.cfg` / `AwaBatcherLiveness.cfg`: completion
+  batcher model verifying that the async batched completion path (handler →
+  batcher buffer → DB flush) preserves lease-guarded finalization, at-most-once
+  completion, and no-loss-on-shutdown, including the direct fallback path after
+  batcher failure
+- `AwaCbk.tla` / `AwaCbk.cfg` / `AwaCbkLiveness.cfg`: external callback
+  resolution model for the three-way race between complete/fail, timeout rescue,
+  and heartbeat rescue with Postgres row-lock semantics
+- `AwaCron.tla` / `AwaCron.cfg` / `AwaCronLiveness.cfg`: cron double-fire
+  prevention under leader failover with CAS on `last_enqueued_at`
 - `Dockerfile`: Docker-first TLC environment
 - `run-tlc.sh`: convenience wrapper for running TLC from the repo root
 
@@ -58,6 +68,11 @@ From the repository root:
 ```bash
 ./correctness/run-tlc.sh AwaCore.tla
 ./correctness/run-tlc.sh AwaExtended.tla
+./correctness/run-tlc.sh AwaBatcher.tla
+./correctness/run-tlc.sh AwaBatcher.tla AwaBatcherLiveness.cfg
+./correctness/run-tlc.sh AwaCbk.tla
+./correctness/run-tlc.sh AwaCbk.tla AwaCbkLiveness.cfg
+./correctness/run-tlc.sh AwaCron.tla AwaCronLiveness.cfg
 ```
 
 Or directly:
@@ -110,6 +125,26 @@ To keep the state graph finite, `AwaExtended` bounds retries with
 model is deliberately focused on the shutdown / rescue / permit / fairness
 protocol rather than re-exploring the full cancel surface.
 
+`AwaBatcher` models the async completion path between handler return and DB
+update. In the real system, completed jobs are queued in a sharded batcher
+buffer and flushed to the database in batches of up to 512 every 1ms. This
+introduces a window where a job has completed in the handler but not yet in
+the database — during which rescue can fire and re-claim the job.
+
+The model verifies:
+
+- The run_lease SQL guard prevents stale batcher flushes from overwriting a
+  re-claimed job (`BatcherFlushStale`)
+- When the batcher flush fails (DB connection error), the handler falls back
+  to direct single-job completion, which also applies the lease guard
+  (`DirectCompleteSuccess` / `DirectCompleteStale`)
+- A job is DB-completed at most once regardless of path (`AtMostOneCompletion`)
+- Shutdown drains all pending batcher requests before exiting — the
+  `BatcherDrainStart` transition requires all `taskLease` values to be zero
+  and all handlers to be in `idle` or `done` phase
+- Under fairness, every `pending` handler eventually reaches `done` or `idle`
+  (`PendingEventuallyResolved`)
+
 ## Checked Invariants
 
 `AwaCore.cfg` checks:
@@ -137,6 +172,20 @@ protocol rather than re-exploring the full cancel surface.
 - `ServicePhaseConsistency`
 - `LeaderConsistent`
 - `StoppedInstancesQuiescent`
+
+`AwaBatcher.cfg` checks:
+
+- `TypeOK`
+- `AtMostOneCompletion`
+- `RunningOwned`
+- `NonRunningUnowned`
+- `PendingRequestHasValidLease`
+- `ShutdownDrainedBatcher`
+- `ShutdownHandlersDone`
+
+`AwaBatcherLiveness.cfg` additionally checks:
+
+- `PendingEventuallyResolved`
 
 `AwaExtended.cfg` also checks:
 
