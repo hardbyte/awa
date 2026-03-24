@@ -55,6 +55,25 @@ fn migrations() -> Vec<(i32, String, String)> {
         .collect()
 }
 
+/// Get migration SQL for a version range as a list of (version, description, sql) tuples.
+///
+/// `from_version` is exclusive (migrations *after* this version).
+/// `to_version` is inclusive (migrations *up to and including* this version).
+#[pyfunction]
+#[pyo3(signature = (from_version, to_version))]
+fn migrations_range(from_version: i32, to_version: i32) -> Vec<(i32, String, String)> {
+    awa_model::migrations::migration_sql_range(from_version, to_version)
+        .into_iter()
+        .map(|(v, d, s)| (v, d.to_string(), s))
+        .collect()
+}
+
+/// Return the latest migration version known to this build.
+#[pyfunction]
+fn current_migration_version() -> i32 {
+    awa_model::migrations::CURRENT_VERSION
+}
+
 #[pymodule]
 fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Classes
@@ -76,6 +95,8 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;
     m.add_function(wrap_pyfunction!(migrate, m)?)?;
     m.add_function(wrap_pyfunction!(migrations, m)?)?;
+    m.add_function(wrap_pyfunction!(migrations_range, m)?)?;
+    m.add_function(wrap_pyfunction!(current_migration_version, m)?)?;
 
     // Exceptions
     m.add("AwaError", m.py().get_type::<AwaError>())?;
