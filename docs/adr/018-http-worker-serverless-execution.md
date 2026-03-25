@@ -47,8 +47,8 @@ Safeguard 2 is a correctness hardening that benefits all callback users, not jus
                   │
                   ├─ register_callback(timeout)
                   │
-                  ├─ POST /invoke ──────────────────────► function starts
-                  │   { job_id, kind, args,               │
+                  ├─ POST /invoke ────────────────────► function starts
+                  │   { job_id, kind, args,                │
                   │     callback_id, callback_url }        │
                   │                                        │  (does work)
                   ├─ return WaitForCallback                │
@@ -73,7 +73,7 @@ Safeguard 2 is a correctness hardening that benefits all callback users, not jus
                   │
                   ├─ return Retryable error
                   │
-   retryable ◄───┘  (normal backoff, re-dispatched later)
+   retryable ◄──-─┘  (normal backoff, re-dispatched later)
 ```
 
 This reuses 100% of the existing callback infrastructure:
