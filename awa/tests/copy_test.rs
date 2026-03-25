@@ -429,3 +429,35 @@ async fn test_copy_within_caller_transaction() {
         .unwrap();
     assert_eq!(count, 5);
 }
+
+// ── Test 12: Reused staging table within one transaction ────────────
+
+#[tokio::test]
+async fn test_copy_multiple_calls_within_same_transaction() {
+    let pool = setup().await;
+    let queue = "copy_reused_staging";
+    clean_queue(&pool, queue).await;
+
+    let mut tx = pool.begin().await.unwrap();
+
+    let batch_a: Vec<InsertParams> = (0..3).map(|i| make_job(i, queue)).collect();
+    let batch_b: Vec<InsertParams> = (3..6).map(|i| make_job(i, queue)).collect();
+
+    let result_a = insert_many_copy(&mut tx, &batch_a).await.unwrap();
+    let result_b = insert_many_copy(&mut tx, &batch_b).await.unwrap();
+
+    assert_eq!(result_a.len(), 3);
+    assert_eq!(result_b.len(), 3);
+
+    tx.commit().await.unwrap();
+
+    let rows: Vec<i64> = sqlx::query_scalar(
+        "SELECT (args->>'seq')::bigint FROM awa.jobs WHERE queue = $1 ORDER BY 1",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(rows, vec![0, 1, 2, 3, 4, 5]);
+}

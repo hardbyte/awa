@@ -321,10 +321,14 @@ pub async fn insert_many_copy(
         .map(TargetTable::as_str)
         .unwrap_or("awa.jobs");
 
-    // 1. Create temp staging table (dropped on transaction commit)
+    // 1. Create or reuse a session-local staging table.
+    //
+    // Keeping the temp table structure across transactions avoids repeated
+    // catalog churn under concurrent producers while preserving transactional
+    // cleanup of staged rows at commit/rollback boundaries.
     sqlx::query(
         r#"
-        CREATE TEMP TABLE awa_copy_staging (
+        CREATE TEMP TABLE IF NOT EXISTS pg_temp.awa_copy_staging (
             kind        TEXT NOT NULL,
             queue       TEXT NOT NULL,
             args        JSONB NOT NULL,
@@ -336,11 +340,15 @@ pub async fn insert_many_copy(
             tags        TEXT NOT NULL,
             unique_key  TEXT,
             unique_states TEXT
-        ) ON COMMIT DROP
+        ) ON COMMIT DELETE ROWS
         "#,
     )
     .execute(&mut *conn)
     .await?;
+
+    sqlx::query("TRUNCATE TABLE pg_temp.awa_copy_staging")
+        .execute(&mut *conn)
+        .await?;
 
     // 2. COPY data into staging table via CSV
     let mut csv_buf = Vec::with_capacity(rows.len() * 256);
@@ -350,7 +358,7 @@ pub async fn insert_many_copy(
 
     let mut copy_in = conn
         .copy_in_raw(
-            "COPY awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
         )
         .await?;
     copy_in.send(csv_buf).await?;
@@ -393,7 +401,7 @@ pub async fn insert_many_copy(
                 tags::text[],
                 CASE WHEN unique_key = '\N' OR unique_key IS NULL THEN NULL ELSE decode(unique_key, 'hex') END,
                 unique_states
-            FROM awa_copy_staging
+            FROM pg_temp.awa_copy_staging
             "#,
         )
         .fetch_all(&mut *conn)
@@ -486,7 +494,7 @@ pub async fn insert_many_copy(
                 s.tags::text[],
                 CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
                 CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
-            FROM awa_copy_staging s
+            FROM pg_temp.awa_copy_staging s
             RETURNING *
         "#,
             target_table
