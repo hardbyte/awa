@@ -619,9 +619,9 @@ async def run_heartbeat_rescue(
     queue = "py_bench_rescue"
     await reset_runtime_state(client)
 
-    # Seed jobs in running state with stale heartbeat (>90s, the default
-    # staleness threshold) but far-future deadline, so only the heartbeat
-    # sweep path (not deadline rescue) triggers recovery.
+    # Seed jobs in running state with stale heartbeat but far-future deadline,
+    # so only the heartbeat sweep path (not deadline rescue) triggers recovery.
+    # Heartbeat is 10s old; we set staleness threshold to 5s below.
     await execute(
         client,
         """
@@ -632,7 +632,7 @@ async def run_heartbeat_rescue(
             'timing_job', $1, jsonb_build_object('seq', g),
             'running'::awa.job_state, 2, 25, 1,
             now() - interval '10 seconds', '{}'::jsonb, '{}'::text[],
-            now() - interval '5 minutes',
+            now() - interval '10 seconds',
             now() + interval '1 hour'
         FROM generate_series(1, $2) AS g
         """,
@@ -653,6 +653,7 @@ async def run_heartbeat_rescue(
         [(queue, max_workers)],
         poll_interval_ms=poll_interval_ms,
         heartbeat_interval_ms=50,
+        heartbeat_staleness_ms=5_000,
         heartbeat_rescue_interval_ms=500,
         leader_election_interval_ms=100,
     )
