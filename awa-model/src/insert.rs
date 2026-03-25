@@ -5,6 +5,8 @@ use crate::JobArgs;
 use sqlx::postgres::PgConnection;
 use sqlx::{PgExecutor, PgPool};
 
+const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
+
 // ── Shared insert preparation ───────────────────────────────────────────
 //
 // Single source of truth for computing all derived insert values:
@@ -332,14 +334,14 @@ pub async fn insert_many_copy(
             kind        TEXT NOT NULL,
             queue       TEXT NOT NULL,
             args        JSONB NOT NULL,
-            state       TEXT NOT NULL,
+            state       awa.job_state NOT NULL,
             priority    SMALLINT NOT NULL,
             max_attempts SMALLINT NOT NULL,
-            run_at      TEXT,
+            run_at      TIMESTAMPTZ,
             metadata    JSONB NOT NULL,
-            tags        TEXT NOT NULL,
-            unique_key  TEXT,
-            unique_states TEXT
+            tags        TEXT[] NOT NULL,
+            unique_key  BYTEA,
+            unique_states BIT(8)
         ) ON COMMIT DELETE ROWS
         "#,
     )
@@ -358,7 +360,7 @@ pub async fn insert_many_copy(
 
     let mut copy_in = conn
         .copy_in_raw(
-            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
         )
         .await?;
     copy_in.send(csv_buf).await?;
@@ -393,14 +395,14 @@ pub async fn insert_many_copy(
                 kind,
                 queue,
                 args,
-                state,
+                state::text,
                 priority,
                 max_attempts,
-                CASE WHEN run_at = '\N' OR run_at IS NULL THEN NULL ELSE run_at::timestamptz END,
+                run_at,
                 metadata,
-                tags::text[],
-                CASE WHEN unique_key = '\N' OR unique_key IS NULL THEN NULL ELSE decode(unique_key, 'hex') END,
-                unique_states
+                tags,
+                unique_key,
+                unique_states::text
             FROM pg_temp.awa_copy_staging
             "#,
         )
@@ -489,11 +491,11 @@ pub async fn insert_many_copy(
                 s.state::awa.job_state,
                 s.priority,
                 s.max_attempts,
-                CASE WHEN s.run_at = '\N' OR s.run_at IS NULL THEN now() ELSE s.run_at::timestamptz END,
+                COALESCE(s.run_at, now()),
                 s.metadata,
-                s.tags::text[],
-                CASE WHEN s.unique_key = '\N' OR s.unique_key IS NULL THEN NULL ELSE decode(s.unique_key, 'hex') END,
-                CASE WHEN s.unique_states = '\N' OR s.unique_states IS NULL THEN NULL ELSE s.unique_states::bit(8) END
+                s.tags,
+                s.unique_key,
+                s.unique_states
             FROM pg_temp.awa_copy_staging s
             RETURNING *
         "#,
@@ -551,10 +553,10 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
     // max_attempts
     buf.extend_from_slice(row.max_attempts.to_string().as_bytes());
     buf.push(b',');
-    // run_at (TIMESTAMPTZ as RFC 3339, or \N for NULL)
+    // run_at (TIMESTAMPTZ as RFC 3339, or the COPY null sentinel)
     match &row.run_at {
         Some(dt) => write_csv_field(buf, &dt.to_rfc3339()),
-        None => buf.extend_from_slice(b"\\N"),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
     }
     buf.push(b',');
     // metadata (JSONB as text)
@@ -565,19 +567,19 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
     // tags (Postgres text[] literal)
     write_pg_text_array(buf, &row.tags);
     buf.push(b',');
-    // unique_key (hex-encoded bytes, or \N for NULL)
+    // unique_key (bytea hex format, or the COPY null sentinel)
     match &row.unique_key {
         Some(key) => {
-            let hex = hex::encode(key);
-            write_csv_field(buf, &hex);
+            let bytea_hex = format!("\\x{}", hex::encode(key));
+            write_csv_field(buf, &bytea_hex);
         }
-        None => buf.extend_from_slice(b"\\N"),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
     }
     buf.push(b',');
-    // unique_states (bit string, or \N for NULL)
+    // unique_states (bit string, or the COPY null sentinel)
     match &row.unique_states {
         Some(bits) => write_csv_field(buf, bits),
-        None => buf.extend_from_slice(b"\\N"),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
     }
     buf.push(b'\n');
 }
@@ -589,6 +591,7 @@ fn write_csv_field(buf: &mut Vec<u8>, value: &str) {
         || value.contains('\n')
         || value.contains('\r')
         || value.contains('\\')
+        || value == COPY_NULL_SENTINEL
     {
         buf.push(b'"');
         for byte in value.bytes() {
