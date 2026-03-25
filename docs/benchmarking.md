@@ -1,14 +1,17 @@
 # Benchmarking Notes
 
-This document captures the current local benchmark setup and a few reference
-results from local runs.
+This document captures the current benchmark setup and a few reference
+results from both local runs and dedicated-server enqueue comparisons.
 
 ## Test Environment
 
-- Machine: Apple M5 MacBook Air
-- Runtime: local PostgreSQL 17 in OrbStack
-- Database URL used for local tests:
+- Local machine: Apple M5 MacBook Air
+- Local runtime: PostgreSQL 17 in OrbStack
+- Local database URL used for the example commands:
   `postgres://postgres:test@localhost:15432/awa_test`
+- Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
+  a separate Linux host. Those numbers are used only for shape comparison and
+  should not be treated as published throughput claims.
 - Benchmarks live in:
   `awa/tests/benchmark_test.rs`
   `awa/tests/scheduling_benchmark_test.rs`
@@ -63,6 +66,33 @@ The worker-focused scenarios seed with SQL directly so the reported number is
 about Python handler dispatch and runtime behavior, not enqueue serialization.
 
 ## Current Headline Results
+
+### Immediate Enqueue Throughput
+
+The recent enqueue-focused tuning work changed the headline numbers materially:
+
+- homogeneous inserts now route directly to `awa.jobs_hot` or
+  `awa.scheduled_jobs` instead of going through the compatibility view
+- admin metadata maintenance moved from row-level triggers to statement-level
+  trigger batches (`v005`)
+- COPY staging now reuses a session-local temp table and stages typed values
+  instead of reparsing text on the final `INSERT ... SELECT`
+
+Reference results from the current performance branch:
+
+- local laptop (`Apple M5`, debug build):
+  - `insert_only_single`: about `18k inserts/s`
+  - `copy_single`: about `33k inserts/s`
+- dedicated server (`PostgreSQL 17`, debug build):
+  - `insert_only_single`: about `40k inserts/s`
+  - `copy_single`: about `45k inserts/s`
+  - `insert_contention_distinct` (4 producers x 10k): about `110k inserts/s`
+  - `copy_contention_distinct` (4 producers x 10k, chunk 1000): about `70k inserts/s`
+  - `insert_contention_same_queue` (4 producers x 10k): about `121k inserts/s`
+  - `copy_contention_same_queue` (4 producers x 10k, chunk 1000): about `70k inserts/s`
+
+These are engineering comparisons, not product guarantees. Their main value is
+showing where the architecture bottlenecks move after each change.
 
 ### Sustained Hot Path
 

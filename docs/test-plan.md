@@ -58,6 +58,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T55 | COPY: atomic (transaction rollback discards all) | COPY | Implemented |
 | T56 | COPY: within caller-managed transaction | COPY | Implemented |
 | T57 | COPY benchmark: 10K jobs vs chunked INSERT | COPY (bench) | Implemented |
+| T57a | COPY: multiple calls within one caller-managed transaction reuse staging safely | COPY | Implemented |
 | T58 | Python: insert_sync returns Job directly | Sync | Implemented |
 | T59 | Python: migrate_sync idempotent | Sync | Implemented |
 | T60 | Python: cancel_sync / retry_sync | Sync | Implemented |
