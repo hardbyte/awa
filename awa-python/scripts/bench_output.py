@@ -1,7 +1,7 @@
 """Shared benchmark output schema for machine-readable JSONL results.
 
 Both Rust and Python benchmarks emit one JSON line per scenario using
-this schema (schema_version=1). Human-readable summaries go to stdout
+this schema (schema_version=2). Human-readable summaries go to stdout
 as before; JSONL records are printed on a separate line prefixed with
 @@BENCH_JSON@@ for easy extraction.
 """
@@ -12,7 +12,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Any
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 JSONL_PREFIX = "@@BENCH_JSON@@"
 
 
@@ -38,7 +38,8 @@ class BenchRescue:
 
 @dataclass
 class BenchMetrics:
-    throughput: BenchThroughput = field(default_factory=BenchThroughput)
+    throughput: BenchThroughput | None = None
+    enqueue_per_s: float | None = None
     drain_time_s: float | None = None
     latency_ms: BenchLatency | None = None
     rescue: BenchRescue | None = None
@@ -62,10 +63,15 @@ class BenchmarkResult:
             "seeded": self.seeded,
             "metrics": _strip_none(
                 {
-                    "throughput": {
-                        "handler_per_s": self.metrics.throughput.handler_per_s,
-                        "db_finalized_per_s": self.metrics.throughput.db_finalized_per_s,
-                    },
+                    "throughput": (
+                        {
+                            "handler_per_s": self.metrics.throughput.handler_per_s,
+                            "db_finalized_per_s": self.metrics.throughput.db_finalized_per_s,
+                        }
+                        if self.metrics.throughput
+                        else None
+                    ),
+                    "enqueue_per_s": self.metrics.enqueue_per_s,
                     "drain_time_s": self.metrics.drain_time_s,
                     "latency_ms": _strip_none(
                         {

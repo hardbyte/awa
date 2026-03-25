@@ -136,10 +136,7 @@ async def run_copy_benchmark(
         language="python",
         seeded=inserted,
         metrics=BenchMetrics(
-            throughput=BenchThroughput(
-                handler_per_s=throughput,
-                db_finalized_per_s=throughput,
-            ),
+            enqueue_per_s=throughput,
             drain_time_s=elapsed,
         ),
         outcomes={"inserted": inserted},
@@ -245,6 +242,7 @@ async def run_hot_benchmark(
                 handler_per_s=handler_per_s,
                 db_finalized_per_s=db_per_s,
             ),
+            enqueue_per_s=None,
         ),
         outcomes={"completed": completed_delta, "remaining": remaining_hot},
         metadata={
@@ -418,6 +416,7 @@ async def run_scheduled_benchmark(
                 handler_per_s=handler_returned / window_secs if window_secs else 0,
                 db_finalized_per_s=completed_total / window_secs if window_secs else 0,
             ),
+            enqueue_per_s=None,
             latency_ms=latency,
         ),
         outcomes={
@@ -597,6 +596,7 @@ async def run_failure_benchmark(
                 handler_per_s=handler_per_s,
                 db_finalized_per_s=db_per_s,
             ),
+            enqueue_per_s=None,
             drain_time_s=drain_time,
             rescue=rescue,
         ),

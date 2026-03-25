@@ -84,6 +84,9 @@ let version = awa::migrations::current_version(&pool).await?;
 Relevant current behavior:
 
 - pre-0.4 legacy version rows are normalized automatically during upgrade
+- current schema version is `5`
+- the only new schema step in the current performance branch is `v005`, which switches admin metadata maintenance from row-level to statement-level triggers
+- the later COPY throughput improvements are code-only and do not add another migration
 - `SchemaNotMigrated` means your application expects a newer schema than the database currently has
 - there are no bundled down migrations
 

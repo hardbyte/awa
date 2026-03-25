@@ -1,14 +1,17 @@
 # Benchmarking Notes
 
-This document captures the current local benchmark setup and a few reference
-results from local runs.
+This document captures the current benchmark setup and a few reference
+results from both local runs and dedicated-server enqueue comparisons.
 
 ## Test Environment
 
-- Machine: Apple M5 MacBook Air
-- Runtime: local PostgreSQL 17 in OrbStack
-- Database URL used for local tests:
+- Local machine: Apple M5 MacBook Air
+- Local runtime: PostgreSQL 17 in OrbStack
+- Local database URL used for the example commands:
   `postgres://postgres:test@localhost:15432/awa_test`
+- Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
+  a separate Linux host. Those numbers are used only for shape comparison and
+  should not be treated as published throughput claims.
 - Benchmarks live in:
   `awa/tests/benchmark_test.rs`
   `awa/tests/scheduling_benchmark_test.rs`
@@ -63,6 +66,33 @@ The worker-focused scenarios seed with SQL directly so the reported number is
 about Python handler dispatch and runtime behavior, not enqueue serialization.
 
 ## Current Headline Results
+
+### Immediate Enqueue Throughput
+
+The recent enqueue-focused tuning work changed the headline numbers materially:
+
+- homogeneous inserts now route directly to `awa.jobs_hot` or
+  `awa.scheduled_jobs` instead of going through the compatibility view
+- admin metadata maintenance moved from row-level triggers to statement-level
+  trigger batches (`v005`)
+- COPY staging now reuses a session-local temp table and stages typed values
+  instead of reparsing text on the final `INSERT ... SELECT`
+
+Reference results from the current performance branch:
+
+- local laptop (`Apple M5`, debug build):
+  - `insert_only_single`: about `18k inserts/s`
+  - `copy_single`: about `33k inserts/s`
+- dedicated server (`PostgreSQL 17`, debug build):
+  - `insert_only_single`: about `40k inserts/s`
+  - `copy_single`: about `45k inserts/s`
+  - `insert_contention_distinct` (4 producers x 10k): about `110k inserts/s`
+  - `copy_contention_distinct` (4 producers x 10k, chunk 1000): about `70k inserts/s`
+  - `insert_contention_same_queue` (4 producers x 10k): about `121k inserts/s`
+  - `copy_contention_same_queue` (4 producers x 10k, chunk 1000): about `70k inserts/s`
+
+These are engineering comparisons, not product guarantees. Their main value is
+showing where the architecture bottlenecks move after each change.
 
 ### Sustained Hot Path
 
@@ -237,11 +267,11 @@ field.
 ### Structured output
 
 Both Rust and Python benchmarks emit one JSONL record per scenario, prefixed
-with `@@BENCH_JSON@@` for extraction. Schema version 1:
+with `@@BENCH_JSON@@` for extraction. Schema version 2:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "scenario": "terminal_10pct",
   "language": "rust",
   "seeded": 5000,
@@ -264,6 +294,12 @@ with `@@BENCH_JSON@@` for extraction. Schema version 1:
 ```
 
 Extract JSONL from mixed stdout: `grep '@@BENCH_JSON@@' output.txt | sed 's/^@@BENCH_JSON@@//'`
+
+For enqueue-only benchmarks (`insert_only_single`, `copy_single`, and the
+contention matrix), `metrics.enqueue_per_s` is emitted instead of
+`metrics.throughput`. Those records still include `"measurement": "enqueue"` in
+`metadata`, plus optional Postgres-side deltas such as `wal_bytes`,
+`temp_bytes_delta`, and `xact_commit_delta`.
 
 ## Interpreting The Results
 
@@ -291,6 +327,48 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   cargo test --package awa --test scheduling_benchmark_test \
   test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture
 ```
+
+### Enqueue contention benchmarks
+
+These are the most useful benchmarks when you want to compare single-producer
+enqueue against multi-producer contention, or compare chunked `INSERT` with the
+COPY staging path under concurrent writers.
+
+```bash
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  AWA_BENCH_CONTENTION_PRODUCERS=4 \
+  AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER=3000 \
+  AWA_BENCH_INSERT_BATCH_SIZE=1000 \
+  AWA_BENCH_COPY_CHUNK_SIZE=1000 \
+  cargo test --package awa --test benchmark_test \
+  test_enqueue_contention_matrix -- --exact --ignored --nocapture
+```
+
+This emits six JSONL records:
+
+- `insert_single`
+- `copy_single`
+- `insert_contention_distinct`
+- `copy_contention_distinct`
+- `insert_contention_same_queue`
+- `copy_contention_same_queue`
+
+The matrix hard-resets Awa runtime tables before each scenario so later cases
+do not inherit a larger or dirtier jobs table from earlier ones.
+
+By default, `AWA_BENCH_COPY_CHUNK_SIZE` should match
+`AWA_BENCH_INSERT_BATCH_SIZE` if you want the closest apples-to-apples
+comparison between chunked `INSERT` and chunked COPY staging. If you want to
+test the current "one bulk COPY per producer" shape instead, set
+`AWA_BENCH_COPY_CHUNK_SIZE` to `AWA_BENCH_CONTENTION_JOBS_PER_PRODUCER`.
+
+The optional Postgres profile block in `metadata.db_profile` is meant to make
+server runs easier to interpret. In particular:
+
+- `wal_bytes` shows how much WAL the scenario generated
+- `temp_bytes_delta` and `temp_files_delta` show temp-file pressure
+- `xact_commit_delta` helps explain why many small commits degrade throughput
+- `tup_inserted_delta` shows how much table churn the database observed
 
 ### Failure-mode benchmarks (Rust)
 

@@ -4,8 +4,8 @@
 
 use awa::model::{admin, insert_many, insert_with, migrations, InsertOpts, UniqueOpts};
 use awa::{
-    AwaError, BuildError, Client, JobArgs, JobContext, JobError, JobResult, JobState, QueueConfig,
-    RateLimit, Worker,
+    AwaError, BuildError, Client, InsertParams, JobArgs, JobContext, JobError, JobResult, JobState,
+    QueueConfig, RateLimit, Worker,
 };
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
@@ -264,6 +264,86 @@ async fn test_insert_many() {
     assert_eq!(jobs[0].kind, "send_email");
     assert_eq!(jobs[1].kind, "send_email");
     assert!(jobs.iter().all(|j| j.queue == queue));
+}
+
+#[tokio::test]
+async fn test_insert_many_updates_admin_metadata_for_direct_paths() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    let hot_queue = "integ_insert_many_admin_hot";
+    let scheduled_queue = "integ_insert_many_admin_scheduled";
+    let hot_kind = "integ_insert_many_admin_hot_kind";
+    let scheduled_kind = "integ_insert_many_admin_scheduled_kind";
+
+    clean_queue(client.pool(), hot_queue).await;
+    clean_queue(client.pool(), scheduled_queue).await;
+    sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
+        .bind(vec![hot_kind, scheduled_kind])
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    let hot_jobs = vec![
+        InsertParams {
+            kind: hot_kind.to_string(),
+            args: serde_json::json!({"seq": 1}),
+            opts: InsertOpts {
+                queue: hot_queue.to_string(),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: hot_kind.to_string(),
+            args: serde_json::json!({"seq": 2}),
+            opts: InsertOpts {
+                queue: hot_queue.to_string(),
+                ..Default::default()
+            },
+        },
+    ];
+    insert_many(client.pool(), &hot_jobs).await.unwrap();
+
+    let scheduled_jobs = vec![
+        InsertParams {
+            kind: scheduled_kind.to_string(),
+            args: serde_json::json!({"seq": 3}),
+            opts: InsertOpts {
+                queue: scheduled_queue.to_string(),
+                run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(30)),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: scheduled_kind.to_string(),
+            args: serde_json::json!({"seq": 4}),
+            opts: InsertOpts {
+                queue: scheduled_queue.to_string(),
+                run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(45)),
+                ..Default::default()
+            },
+        },
+    ];
+    insert_many(client.pool(), &scheduled_jobs).await.unwrap();
+
+    let stats = admin::queue_stats(client.pool()).await.unwrap();
+    let hot_stats = stats.iter().find(|stat| stat.queue == hot_queue).unwrap();
+    assert_eq!(hot_stats.available, 2);
+    assert_eq!(hot_stats.total_queued, 2);
+
+    let scheduled_stats = stats
+        .iter()
+        .find(|stat| stat.queue == scheduled_queue)
+        .unwrap();
+    assert_eq!(scheduled_stats.scheduled, 2);
+    assert_eq!(scheduled_stats.total_queued, 2);
+
+    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
+    assert!(kinds.contains(&hot_kind.to_string()));
+    assert!(kinds.contains(&scheduled_kind.to_string()));
+
+    let queues = admin::distinct_queues(client.pool()).await.unwrap();
+    assert!(queues.contains(&hot_queue.to_string()));
+    assert!(queues.contains(&scheduled_queue.to_string()));
 }
 
 #[tokio::test]

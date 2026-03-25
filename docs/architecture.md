@@ -119,14 +119,17 @@ For high-throughput ingestion (10K+ jobs), `insert_many_copy` uses PostgreSQL's 
 ```
 insert_many_copy(conn, jobs)
     │
-    ├── CREATE TEMP TABLE awa_copy_staging (...) ON COMMIT DROP
-    ├── COPY awa_copy_staging FROM STDIN (CSV)       ◄── no triggers, no constraints
-    ├── INSERT INTO awa.jobs SELECT ... FROM staging
+    ├── CREATE TEMP TABLE IF NOT EXISTS pg_temp.awa_copy_staging (...) ON COMMIT DELETE ROWS
+    ├── TRUNCATE pg_temp.awa_copy_staging
+    ├── COPY pg_temp.awa_copy_staging FROM STDIN (CSV)
+    ├── INSERT INTO awa.jobs_hot / awa.scheduled_jobs
+    │     (or `awa.jobs` for mixed-state batches)
+    │     SELECT ... FROM staging
     └── unique rows use per-row savepoints to skip duplicates without aborting the batch
         RETURNING *
 ```
 
-Accepts `&mut PgConnection`, so it works within caller-managed transactions. `insert_many_copy_from_pool` is a convenience wrapper that manages its own transaction.
+The staging table is session-local and reused across transactions so repeated COPY calls avoid temp-table catalog churn. Accepts `&mut PgConnection`, so it works within caller-managed transactions. `insert_many_copy_from_pool` is a convenience wrapper that manages its own transaction.
 
 ### Poll and Claim (Dispatcher)
 
