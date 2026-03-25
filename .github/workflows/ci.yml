@@ -15,6 +15,7 @@ jobs:
   rust-lint:
     name: Rust lint (fmt + clippy)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -30,7 +31,9 @@ jobs:
 
   rust-build:
     name: Rust build
+    needs: [rust-lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -42,7 +45,9 @@ jobs:
 
   rust-test:
     name: Rust tests
+    needs: [rust-build]
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -72,7 +77,9 @@ jobs:
   # ─── Rust bridge (tokio-postgres) ──────────────────────
   rust-bridge-tokio-pg:
     name: Rust bridge (tokio-postgres)
+    needs: [rust-lint]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17-alpine
@@ -107,6 +114,7 @@ jobs:
   python-build-test:
     name: Python build + test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:17-alpine
@@ -160,6 +168,7 @@ jobs:
   frontend-lint:
     name: Frontend lint + typecheck
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     defaults:
       run:
         working-directory: awa-ui/frontend
@@ -180,6 +189,7 @@ jobs:
   frontend-e2e:
     name: Frontend E2E tests
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
     services:
@@ -228,6 +238,7 @@ jobs:
   pyo3-spike:
     name: PyO3 async bridge spike
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     defaults:
       run:
         working-directory: spike/pyo3-async
@@ -255,6 +266,7 @@ jobs:
   cli-wheel-build:
     name: CLI wheel build
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -274,7 +286,9 @@ jobs:
   # ─── CLI smoke test ─────────────────────────────────────
   cli-smoke:
     name: CLI smoke test
+    needs: [rust-build]
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     services:
       postgres:
         image: postgres:17-alpine
@@ -319,7 +333,9 @@ jobs:
   # ─── Telemetry validation ─────────────────────────────────────
   telemetry-validation:
     name: Telemetry OTLP validation
+    needs: [rust-build]
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     services:
       postgres:
         image: postgres:18-alpine

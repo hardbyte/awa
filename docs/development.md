@@ -23,8 +23,14 @@ and the version number is burned.
 
 ### Steps
 
-1. Bump version in `Cargo.toml` (workspace), `awa/Cargo.toml` (awa-testing
-   ref), `awa-python/Cargo.toml`, and `awa-python/pyproject.toml`.
+1. Bump version in **all six** locations:
+   - `Cargo.toml` (workspace `[workspace.package].version` **and** three
+     internal-crate deps under `[workspace.dependencies]`)
+   - `awa/Cargo.toml` (`awa-testing` dev-dependency version)
+   - `awa-cli/Cargo.toml` (`awa-ui` dependency version)
+   - `awa-cli/pyproject.toml` (`[project].version` — controls CLI wheel version on PyPI)
+   - `awa-python/Cargo.toml` (`version`, `awa-model`, `awa-worker` dep versions)
+   - `awa-python/pyproject.toml` (`[project].version` — controls SDK wheel version on PyPI)
 2. Commit: `Bump version to 0.x.0-alpha.1`
 3. Push to a branch, wait for CI green.
 4. Tag and push: `git tag v0.x.0-alpha.1 && git push origin v0.x.0-alpha.1`
