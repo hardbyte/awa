@@ -33,6 +33,13 @@ This is the primary mode. The worker:
 4. Returns `JobResult::WaitForCallback(guard)`, parking the job in `waiting_external`.
 5. The serverless function does its work and POSTs back to Awa's callback endpoint.
 
+**Dispatch failure handling:** If step 3 fails (network error, non-2xx from the function platform), the worker must **not** return `WaitForCallback`. Instead, it drops the `CallbackGuard` and returns `JobError::Retryable`. However, the callback_id has already been written to the database in step 2. To prevent a stale callback from a failed dispatch from incorrectly resolving a later retry attempt, two complementary safeguards are required:
+
+1. **HttpWorker clears the callback on dispatch failure.** Before returning the retryable error, the worker calls a new `cancel_callback(pool, job_id, run_lease)` function that NULLs out `callback_id`, `callback_timeout_at`, and all CEL fields — but only if the `run_lease` still matches (preventing races with rescue).
+2. **Callback resolution binds to `run_lease`.** The `complete_external`, `fail_external`, and `resolve_callback` functions currently match by `callback_id` alone (`WHERE callback_id = $1`). This is insufficient when callbacks can become orphaned. These queries must additionally store and verify the `run_lease` that was active when the callback was registered. This can be done by: (a) adding `run_lease` to the `register_callback` write and including it in the resolution WHERE clause, or (b) generating a new `callback_id` that embeds the lease (e.g., as an HMAC component) so stale IDs are cryptographically invalidated. Option (a) is simpler and recommended.
+
+Safeguard 2 is a correctness hardening that benefits all callback users, not just `HttpWorker`. It should be implemented as a prerequisite change before `HttpWorker` ships.
+
 ```
                   Awa dispatcher                         Serverless function
                   ─────────────                         ───────────────────
@@ -52,6 +59,21 @@ This is the primary mode. The worker:
                   │   { "result": ... }
                   │
    completed ◄────┘
+
+   --- Dispatch failure path ---
+
+   available ──► claim job
+                  │
+                  ├─ register_callback(timeout)
+                  │
+                  ├─ POST /invoke ─── ✗ network error / 5xx
+                  │
+                  ├─ cancel_callback(job_id, run_lease)
+                  │   (NULLs callback fields if lease matches)
+                  │
+                  ├─ return Retryable error
+                  │
+   retryable ◄───┘  (normal backoff, re-dispatched later)
 ```
 
 This reuses 100% of the existing callback infrastructure:
@@ -152,16 +174,18 @@ These endpoints already exist in `awa-model::admin` (`complete_external`, `fail_
 
 | Component | Change | Size |
 |---|---|---|
-| `awa-worker/src/http_worker.rs` | New file: `HttpWorker` struct, `Worker` impl, config types | ~200 lines |
+| `awa-model/src/admin.rs` | **Prerequisite:** Add `run_lease` guard to `complete_external`, `fail_external`, `resolve_callback` WHERE clauses; add `cancel_callback` function | ~40 lines |
+| `awa-model/src/admin.rs` | Store `run_lease` in `register_callback` / `register_callback_with_config` | ~10 lines |
+| `awa-worker/src/http_worker.rs` | New file: `HttpWorker` struct, `Worker` impl, config types, dispatch failure handling | ~250 lines |
 | `awa-worker/src/lib.rs` | Re-export `HttpWorkerConfig`, `HttpExecutionMode` | trivial |
 | `awa-worker/src/runtime.rs` | Accept HTTP workers in builder, register in worker map | ~30 lines |
 | `awa-worker/Cargo.toml` | Add `reqwest` dependency (feature-gated behind `http-worker`) | trivial |
 | `awa-ui/src/api.rs` (or new) | Expose callback endpoints as HTTP routes | ~80 lines |
 | `awa-python/src/client.rs` | Expose `http_worker()` config method | ~50 lines |
-| Tests | Integration tests with mock HTTP server | ~150 lines |
+| Tests | Integration tests with mock HTTP server; regression tests for stale callback resolution | ~200 lines |
 | Docs | Configuration reference, deployment examples | ~100 lines |
 
-**No schema changes.** No new job states. No migration.
+**No schema changes.** No new job states. No migration. The `run_lease` column already exists on the jobs table — the change is purely in query logic.
 
 ### Security considerations
 
