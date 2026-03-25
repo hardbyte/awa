@@ -529,7 +529,9 @@ async def run_latency_jitter(
     queue = "py_bench_jitter"
     await reset_runtime_state(client)
 
-    # Seed jobs that become due uniformly over spread_secs
+    # Seed jobs that become due uniformly over spread_secs.
+    # Each job's run_at is its true due time — we compare against that
+    # in the handler to measure actual pickup lateness.
     await execute(
         client,
         """
@@ -539,7 +541,7 @@ async def run_latency_jitter(
             'timing_job', $1, jsonb_build_object('seq', g),
             'scheduled'::awa.job_state, 2, 25,
             now() + make_interval(secs => (g::double precision / $2) * $3),
-            jsonb_build_object('due_offset_ms', ((g::double precision / $2) * $3 * 1000)::bigint),
+            '{}'::jsonb,
             '{}'::text[]
         FROM generate_series(1, $2) AS g
         """,
@@ -549,18 +551,16 @@ async def run_latency_jitter(
     )
 
     pickup_lateness_ms: list[float] = []
-    start_time = datetime.now(timezone.utc)
 
     @client.worker(TimingJob, queue=queue)
     async def handle(job: awa.Job) -> None:
-        due_offset_ms = job.metadata.get("due_offset_ms")
-        if due_offset_ms is not None:
-            scheduled_for = start_time + timedelta(milliseconds=int(due_offset_ms))
-            lateness = max(
-                0.0,
-                (datetime.now(timezone.utc) - scheduled_for).total_seconds() * 1000.0,
-            )
-            pickup_lateness_ms.append(lateness)
+        # job.run_at is the authoritative due time (RFC3339 string from Rust)
+        scheduled_for = datetime.fromisoformat(job.run_at)
+        lateness = max(
+            0.0,
+            (datetime.now(timezone.utc) - scheduled_for).total_seconds() * 1000.0,
+        )
+        pickup_lateness_ms.append(lateness)
         return None
 
     client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
@@ -619,7 +619,9 @@ async def run_heartbeat_rescue(
     queue = "py_bench_rescue"
     await reset_runtime_state(client)
 
-    # Seed jobs directly in running state with expired heartbeat
+    # Seed jobs in running state with stale heartbeat (>90s, the default
+    # staleness threshold) but far-future deadline, so only the heartbeat
+    # sweep path (not deadline rescue) triggers recovery.
     await execute(
         client,
         """
@@ -630,8 +632,8 @@ async def run_heartbeat_rescue(
             'timing_job', $1, jsonb_build_object('seq', g),
             'running'::awa.job_state, 2, 25, 1,
             now() - interval '10 seconds', '{}'::jsonb, '{}'::text[],
-            now() - interval '60 seconds',
-            now() - interval '5 seconds'
+            now() - interval '5 minutes',
+            now() + interval '1 hour'
         FROM generate_series(1, $2) AS g
         """,
         queue,
@@ -651,7 +653,8 @@ async def run_heartbeat_rescue(
         [(queue, max_workers)],
         poll_interval_ms=poll_interval_ms,
         heartbeat_interval_ms=50,
-        deadline_rescue_interval_ms=100,
+        heartbeat_rescue_interval_ms=500,
+        leader_election_interval_ms=100,
     )
 
     deadline = asyncio.get_running_loop().time() + 30
@@ -681,7 +684,7 @@ async def run_heartbeat_rescue(
                 db_finalized_per_s=db_per_s,
             ),
             drain_time_s=drain_time,
-            rescue=BenchRescue(deadline_rescued=total_jobs),
+            rescue=BenchRescue(heartbeat_rescued=completed),
         ),
         outcomes={k: v for k, v in final_counts.items() if v > 0},
         metadata={"max_workers": max_workers},
