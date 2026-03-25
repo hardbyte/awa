@@ -108,7 +108,7 @@ The same CamelCase-to-snake_case kind derivation runs in the Python bridge (`awa
 
 ### Negative
 
-- **CPython version coupling:** The `awa-python` binary is compiled against a specific CPython version (currently 3.12). Different Python versions require separate builds.
+- **CPython version coupling:** The `awa-python` binary is compiled against a specific CPython version. Different Python versions require separate builds.
 - **Single GIL:** Only one Python thread can execute at a time. CPU-bound Python handlers limit parallelism. Mitigation: use `asyncio.to_thread()` for CPU-bound work, or run CPU-heavy jobs in Rust.
 - **Debugging complexity:** Stack traces span Rust and Python. PyO3 exceptions carry traceback information, but mixed-language debugging is inherently harder than single-language.
 - **Build complexity:** `awa-python` requires maturin, a Python virtual environment, and a compatible CPython installation in the build environment. It is excluded from the main Cargo workspace for this reason.
