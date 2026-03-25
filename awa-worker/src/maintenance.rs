@@ -137,6 +137,16 @@ impl MaintenanceService {
         self
     }
 
+    /// Set how long a heartbeat must be stale before the job is rescued (default: 90s).
+    ///
+    /// Should be at least 3× the heartbeat interval to avoid false rescues
+    /// from transient delays. The run-lease guard prevents duplicate completions
+    /// even if a false rescue occurs, but wasted work is still undesirable.
+    pub fn heartbeat_staleness(mut self, staleness: Duration) -> Self {
+        self.heartbeat_staleness = staleness;
+        self
+    }
+
     /// Set the cleanup interval (default: 60s).
     pub fn cleanup_interval(mut self, interval: Duration) -> Self {
         self.cleanup_interval = interval;

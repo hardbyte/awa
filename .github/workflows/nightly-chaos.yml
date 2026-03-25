@@ -165,6 +165,12 @@ jobs:
           set -o pipefail
           PYTHONPATH=scripts .venv/bin/python scripts/benchmark_runtime.py --scenario baseline \
             | tee artifacts/nightly/python-benchmarks.txt
+      - name: Run Python worker benchmarks (sweep, jitter, rescue)
+        run: |
+          set -o pipefail
+          PYTHONPATH=scripts .venv/bin/python scripts/benchmark_runtime.py --scenario workers \
+            --hot-total-jobs 50000 --jitter-total-due 2000 --rescue-total-jobs 500 \
+            | tee artifacts/nightly/python-worker-benchmarks.txt
       - name: Run Python failure-mode benchmarks
         run: |
           set -o pipefail

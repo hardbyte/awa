@@ -261,6 +261,7 @@ class AsyncClient:
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
+        heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
     ) -> None:
@@ -276,6 +277,7 @@ class AsyncClient:
             heartbeat_interval_ms=heartbeat_interval_ms,
             promote_interval_ms=promote_interval_ms,
             heartbeat_rescue_interval_ms=heartbeat_rescue_interval_ms,
+            heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
         )

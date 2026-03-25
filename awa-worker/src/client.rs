@@ -84,6 +84,7 @@ pub struct ClientBuilder {
     heartbeat_interval: Duration,
     promote_interval: Duration,
     heartbeat_rescue_interval: Option<Duration>,
+    heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
     periodic_jobs: Vec<PeriodicJob>,
@@ -109,6 +110,7 @@ impl ClientBuilder {
             heartbeat_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
             heartbeat_rescue_interval: None,
+            heartbeat_staleness: None,
             deadline_rescue_interval: None,
             callback_rescue_interval: None,
             periodic_jobs: Vec::new(),
@@ -244,6 +246,14 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how long a heartbeat must be stale before the job is rescued (default: 90s).
+    ///
+    /// Should be at least 3× the heartbeat interval to avoid false rescues.
+    pub fn heartbeat_staleness(mut self, staleness: Duration) -> Self {
+        self.heartbeat_staleness = Some(staleness);
+        self
+    }
+
     /// Set the deadline rescue interval (default: 30s).
     pub fn deadline_rescue_interval(mut self, interval: Duration) -> Self {
         self.deadline_rescue_interval = Some(interval);
@@ -370,6 +380,22 @@ impl ClientBuilder {
             None
         };
 
+        // Warn if heartbeat_staleness is less than 3× heartbeat_interval
+        if let Some(staleness) = self.heartbeat_staleness {
+            let min_safe = self.heartbeat_interval * 3;
+            if staleness < min_safe {
+                tracing::warn!(
+                    heartbeat_staleness_ms = staleness.as_millis() as u64,
+                    heartbeat_interval_ms = self.heartbeat_interval.as_millis() as u64,
+                    recommended_min_ms = min_safe.as_millis() as u64,
+                    "heartbeat_staleness ({:?}) is less than 3× heartbeat_interval ({:?}); \
+                     this may cause false rescues of jobs that are still running",
+                    staleness,
+                    self.heartbeat_interval,
+                );
+            }
+        }
+
         let metrics = crate::metrics::AwaMetrics::from_global();
         let queue_in_flight = Arc::new(
             self.queues
@@ -393,6 +419,7 @@ impl ClientBuilder {
             heartbeat_interval: self.heartbeat_interval,
             promote_interval: self.promote_interval,
             heartbeat_rescue_interval: self.heartbeat_rescue_interval,
+            heartbeat_staleness: self.heartbeat_staleness,
             deadline_rescue_interval: self.deadline_rescue_interval,
             callback_rescue_interval: self.callback_rescue_interval,
             periodic_jobs: Arc::new(self.periodic_jobs),
@@ -468,6 +495,7 @@ pub struct Client {
     heartbeat_interval: Duration,
     promote_interval: Duration,
     heartbeat_rescue_interval: Option<Duration>,
+    heartbeat_staleness: Option<Duration>,
     deadline_rescue_interval: Option<Duration>,
     callback_rescue_interval: Option<Duration>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
@@ -616,6 +644,9 @@ impl Client {
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
             maintenance = maintenance.heartbeat_rescue_interval(interval);
+        }
+        if let Some(staleness) = self.heartbeat_staleness {
+            maintenance = maintenance.heartbeat_staleness(staleness);
         }
         if let Some(interval) = self.deadline_rescue_interval {
             maintenance = maintenance.deadline_rescue_interval(interval);
