@@ -348,10 +348,6 @@ pub async fn insert_many_copy(
     .execute(&mut *conn)
     .await?;
 
-    sqlx::query("TRUNCATE TABLE pg_temp.awa_copy_staging")
-        .execute(&mut *conn)
-        .await?;
-
     // 2. COPY data into staging table via CSV
     let mut csv_buf = Vec::with_capacity(rows.len() * 256);
     for row in &rows {
@@ -507,13 +503,19 @@ pub async fn insert_many_copy(
             .await?
     };
 
+    // Keep the session-local staging table reusable across multiple COPY calls
+    // within the same outer transaction.
+    sqlx::query("DELETE FROM pg_temp.awa_copy_staging")
+        .execute(&mut *conn)
+        .await?;
+
     Ok(results)
 }
 
 /// Convenience wrapper that acquires a connection from the pool.
 ///
-/// Wraps the operation in a transaction so the ON COMMIT DROP staging table
-/// is cleaned up automatically.
+/// Wraps the operation in a transaction so the staging rows are cleaned up at
+/// commit time even if the caller does not reuse the connection afterward.
 #[tracing::instrument(skip(pool, jobs), fields(job.count = jobs.len()))]
 pub async fn insert_many_copy_from_pool(
     pool: &PgPool,
