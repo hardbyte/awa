@@ -428,7 +428,268 @@ async def run_scheduled_benchmark(
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# New scenarios: mixed failure modes
+# Worker concurrency sweep
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def run_worker_sweep(
+    database_url: str,
+    total_jobs: int,
+    worker_counts: list[int],
+    poll_interval_ms: int,
+) -> None:
+    """Measure throughput at different worker concurrency levels."""
+    for worker_count in worker_counts:
+        client = awa.AsyncClient(
+            database_url,
+            max_connections=max(worker_count + 10, 50),
+        )
+        await client.migrate()
+        queue = f"py_bench_sweep_{worker_count}"
+        await reset_runtime_state(client)
+
+        await execute(
+            client,
+            """
+            INSERT INTO awa.jobs_hot
+                (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+            SELECT
+                'timing_job', $1, jsonb_build_object('seq', g),
+                'available'::awa.job_state, 2, 25, now(), '{}'::jsonb, '{}'::text[]
+            FROM generate_series(1, $2) AS g
+            """,
+            queue,
+            total_jobs,
+        )
+
+        handler_returned = 0
+
+        @client.worker(TimingJob, queue=queue)
+        async def handle(job: awa.Job) -> None:
+            nonlocal handler_returned
+            handler_returned += 1
+            return None
+
+        client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
+        await asyncio.sleep(2)  # warmup
+
+        handler_before = handler_returned
+        completed_before = await scalar(
+            client,
+            "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+            queue,
+        )
+        await asyncio.sleep(10)  # measurement window
+
+        completed_after = await scalar(
+            client,
+            "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+            queue,
+        )
+        await client.shutdown(timeout_ms=5000)
+
+        handler_delta = handler_returned - handler_before
+        completed_delta = completed_after - completed_before
+        handler_per_s = handler_delta / 10
+        db_per_s = completed_delta / 10
+
+        print(
+            f"[py-sweep] workers={worker_count} "
+            f"handler={handler_per_s:.0f}/s db={db_per_s:.0f}/s"
+        )
+
+        BenchmarkResult(
+            scenario=f"sweep_{worker_count}w",
+            language="python",
+            seeded=total_jobs,
+            metrics=BenchMetrics(
+                throughput=BenchThroughput(
+                    handler_per_s=handler_per_s,
+                    db_finalized_per_s=db_per_s,
+                ),
+            ),
+            outcomes={"completed": completed_delta},
+            metadata={"workers": worker_count, "window_secs": 10},
+        ).emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Scheduling latency jitter
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def run_latency_jitter(
+    client: awa.AsyncClient,
+    total_due: int,
+    spread_secs: int,
+    max_workers: int,
+    poll_interval_ms: int,
+) -> None:
+    """Measure pickup latency jitter for scheduled jobs becoming due."""
+    queue = "py_bench_jitter"
+    await reset_runtime_state(client)
+
+    # Seed jobs that become due uniformly over spread_secs
+    await execute(
+        client,
+        """
+        INSERT INTO awa.scheduled_jobs
+            (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+        SELECT
+            'timing_job', $1, jsonb_build_object('seq', g),
+            'scheduled'::awa.job_state, 2, 25,
+            now() + make_interval(secs => (g::double precision / $2) * $3),
+            jsonb_build_object('due_offset_ms', ((g::double precision / $2) * $3 * 1000)::bigint),
+            '{}'::text[]
+        FROM generate_series(1, $2) AS g
+        """,
+        queue,
+        total_due,
+        spread_secs,
+    )
+
+    pickup_lateness_ms: list[float] = []
+    start_time = datetime.now(timezone.utc)
+
+    @client.worker(TimingJob, queue=queue)
+    async def handle(job: awa.Job) -> None:
+        due_offset_ms = job.metadata.get("due_offset_ms")
+        if due_offset_ms is not None:
+            scheduled_for = start_time + timedelta(milliseconds=int(due_offset_ms))
+            lateness = max(
+                0.0,
+                (datetime.now(timezone.utc) - scheduled_for).total_seconds() * 1000.0,
+            )
+            pickup_lateness_ms.append(lateness)
+        return None
+
+    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+
+    # Wait for all jobs to be processed
+    deadline = asyncio.get_running_loop().time() + spread_secs + 30
+    while len(pickup_lateness_ms) < total_due and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+
+    await client.shutdown(timeout_ms=5000)
+
+    completed = len(pickup_lateness_ms)
+    latency = None
+    if pickup_lateness_ms:
+        latency = BenchLatency(
+            p50=pctl_ms(pickup_lateness_ms, 50),
+            p95=pctl_ms(pickup_lateness_ms, 95),
+            p99=pctl_ms(pickup_lateness_ms, 99),
+        )
+        print(
+            f"[py-jitter] total_due={total_due} spread={spread_secs}s completed={completed} "
+            f"p50={latency.p50:.0f}ms p95={latency.p95:.0f}ms p99={latency.p99:.0f}ms"
+        )
+
+    BenchmarkResult(
+        scenario="latency_jitter",
+        language="python",
+        seeded=total_due,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=completed / spread_secs if spread_secs else 0,
+                db_finalized_per_s=completed / spread_secs if spread_secs else 0,
+            ),
+            latency_ms=latency,
+        ),
+        outcomes={"completed": completed, "missed": total_due - completed},
+        metadata={
+            "spread_secs": spread_secs,
+            "max_workers": max_workers,
+        },
+    ).emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Stale heartbeat rescue
+# ═══════════════════════════════════════════════════════════════════════
+
+
+async def run_heartbeat_rescue(
+    client: awa.AsyncClient,
+    total_jobs: int,
+    max_workers: int,
+    poll_interval_ms: int,
+) -> None:
+    """Measure rescue + re-processing of jobs stuck in running state."""
+    queue = "py_bench_rescue"
+    await reset_runtime_state(client)
+
+    # Seed jobs directly in running state with expired heartbeat
+    await execute(
+        client,
+        """
+        INSERT INTO awa.jobs_hot
+            (kind, queue, args, state, priority, max_attempts, attempt,
+             run_at, metadata, tags, heartbeat_at, deadline_at)
+        SELECT
+            'timing_job', $1, jsonb_build_object('seq', g),
+            'running'::awa.job_state, 2, 25, 1,
+            now() - interval '10 seconds', '{}'::jsonb, '{}'::text[],
+            now() - interval '60 seconds',
+            now() - interval '5 seconds'
+        FROM generate_series(1, $2) AS g
+        """,
+        queue,
+        total_jobs,
+    )
+
+    handler_returned = 0
+
+    @client.worker(TimingJob, queue=queue)
+    async def handle(job: awa.Job) -> None:
+        nonlocal handler_returned
+        handler_returned += 1
+        return None
+
+    started = asyncio.get_running_loop().time()
+    client.start(
+        [(queue, max_workers)],
+        poll_interval_ms=poll_interval_ms,
+        heartbeat_interval_ms=50,
+        deadline_rescue_interval_ms=100,
+    )
+
+    deadline = asyncio.get_running_loop().time() + 30
+    while handler_returned < total_jobs and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.5)
+
+    drain_time = asyncio.get_running_loop().time() - started
+    await client.shutdown(timeout_ms=5000)
+
+    final_counts = await state_counts(client, queue)
+    completed = final_counts.get("completed", 0)
+    handler_per_s = handler_returned / drain_time if drain_time > 0 else 0
+    db_per_s = completed / drain_time if drain_time > 0 else 0
+
+    print(
+        f"[py-rescue] total={total_jobs} drain={drain_time:.2f}s "
+        f"handler={handler_per_s:.0f}/s rescued_and_completed={completed}"
+    )
+
+    BenchmarkResult(
+        scenario="heartbeat_rescue",
+        language="python",
+        seeded=total_jobs,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=handler_per_s,
+                db_finalized_per_s=db_per_s,
+            ),
+            drain_time_s=drain_time,
+            rescue=BenchRescue(deadline_rescued=total_jobs),
+        ),
+        outcomes={k: v for k, v in final_counts.items() if v > 0},
+        metadata={"max_workers": max_workers},
+    ).emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Mixed failure modes
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -656,6 +917,30 @@ async def async_main(args: argparse.Namespace) -> None:
             max_workers=args.max_workers,
             poll_interval_ms=args.poll_interval_ms,
         )
+    if args.scenario in {"sweep", "workers", "all"}:
+        await run_worker_sweep(
+            database_url=args.database_url,
+            total_jobs=args.hot_total_jobs,
+            worker_counts=[1, 4, 16, 64, 256],
+            poll_interval_ms=args.poll_interval_ms,
+        )
+    if args.scenario in {"jitter", "workers", "all"}:
+        client = await make_client(args)
+        await run_latency_jitter(
+            client,
+            total_due=args.jitter_total_due,
+            spread_secs=args.jitter_spread_secs,
+            max_workers=args.max_workers,
+            poll_interval_ms=args.poll_interval_ms,
+        )
+    if args.scenario in {"rescue", "workers", "all"}:
+        client = await make_client(args)
+        await run_heartbeat_rescue(
+            client,
+            total_jobs=args.rescue_total_jobs,
+            max_workers=args.max_workers,
+            poll_interval_ms=args.poll_interval_ms,
+        )
     if args.scenario in {"failures", "all"}:
         for scenario_name, failure_pct, failure_mode in FAILURE_SCENARIOS:
             client = await make_client(args)
@@ -679,7 +964,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--scenario",
-        choices=["copy", "hot", "scheduled", "baseline", "failures", "all"],
+        choices=["copy", "hot", "scheduled", "baseline", "sweep", "jitter", "rescue", "workers", "failures", "all"],
         default="all",
     )
     parser.add_argument("--max-connections", type=int, default=50)
@@ -693,6 +978,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scheduled-total-jobs", type=int, default=2_000_000)
     parser.add_argument("--due-rate", type=int, default=4_000)
     parser.add_argument("--failure-total-jobs", type=int, default=5_000)
+    parser.add_argument("--jitter-total-due", type=int, default=2_000)
+    parser.add_argument("--jitter-spread-secs", type=int, default=10)
+    parser.add_argument("--rescue-total-jobs", type=int, default=500)
     return parser.parse_args()
 
 
