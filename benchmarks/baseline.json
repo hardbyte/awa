@@ -1,0 +1,4 @@
+{
+  "_comment": "Benchmark regression thresholds. Populate from a known-good nightly run. Each key is a scenario name from @@BENCH_JSON@@ output. Values are the baseline metrics to compare against (20% tolerance by default).",
+  "_usage": "Extract from nightly artifacts: grep '@@BENCH_JSON@@' artifacts/nightly/*.txt | sed 's/@@BENCH_JSON@@//' | jq -s 'map({(.scenario): {handler_per_s: .metrics.throughput.handler_per_s, enqueue_per_s: .metrics.enqueue_per_s, p99_ms: .metrics.latency_ms.p99}}) | add'"
+}
