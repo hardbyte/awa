@@ -43,7 +43,8 @@ def check_regressions(
     failures = []
 
     for result in results:
-        scenario = result.get("scenario", "unknown")
+        lang = result.get("language", "unknown")
+        scenario = f"{lang}/{result.get('scenario', 'unknown')}"
         bl = baseline.get(scenario)
         if bl is None:
             rows.append(
