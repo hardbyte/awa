@@ -193,6 +193,117 @@ These endpoints already exist in `awa-model::admin` (`complete_external`, `fail_
 - **Request signing:** Outbound POSTs to serverless functions should support configurable auth headers (Bearer tokens, AWS SigV4 via SDK).
 - **Payload sensitivity:** Job args may contain PII. TLS is required. Operators should consider whether args need encryption at rest in the function's logging/observability pipeline.
 
+### Platform-specific notes
+
+#### Supabase Edge Functions
+
+Supabase is a compelling target because Awa's Postgres tables can live in the **same Supabase Postgres instance** that powers the rest of the application. This eliminates the operational overhead of a separate database and means transactional enqueue (ADR-001) works natively with the application's Supabase client.
+
+**Invocation:** Edge Functions are deployed at `https://<project-id>.supabase.co/functions/v1/<function-name>`. HttpWorker POSTs to this URL.
+
+**Auth:** Supabase Edge Functions expect a valid JWT in the `Authorization` header by default (verified against the project's JWT signing keys). For HttpWorker, the simplest approach is to use the project's `service_role` key as a Bearer token in the `headers` config. Functions can also disable JWT verification in `config.toml` and rely on HMAC-signed callback IDs instead.
+
+**Execution limits:** 150s response timeout (free and pro), 400s wall-clock (pro, for background work after initial response). CPU time is limited to 2s. This means:
+- **Sync mode** works well for jobs completing within 150s.
+- **Async mode** is preferred for longer jobs — the function returns a 200 immediately after receiving the job, then does work and calls back within the 400s wall-clock limit. For jobs exceeding 400s, break work into stages or self-host the edge runtime.
+
+**Callback path:** The function calls back to Awa's callback endpoint. If the Awa dispatcher runs outside Supabase (e.g., on a VPS or Kubernetes), the callback URL must be publicly reachable. If the dispatcher runs on the same Supabase project (e.g., as a long-running compute instance), callbacks can stay internal.
+
+**Direct Postgres access:** Edge Functions can query Supabase Postgres via the `supabase-js` client or direct connection string. A function could theoretically call `complete_external` by writing SQL directly — bypassing the HTTP callback entirely. This is a power-user shortcut but couples the function to Awa's schema.
+
+**Example config:**
+```rust
+.http_worker(HttpWorkerConfig {
+    kind: "send_welcome_email",
+    endpoint: "https://myproject.supabase.co/functions/v1/send-email".parse()?,
+    mode: HttpExecutionMode::Async {
+        callback_timeout: Duration::from_secs(300),
+    },
+    headers: vec![("Authorization", "Bearer ${SUPABASE_SERVICE_ROLE_KEY}")],
+    request_timeout: Duration::from_secs(10),
+    callback_config: None,
+})
+```
+
+**Example Supabase Edge Function (Deno/TypeScript):**
+```typescript
+Deno.serve(async (req) => {
+  const { job_id, kind, args, callback_id, callback_url } = await req.json();
+
+  // Do the work
+  const result = await sendEmail(args.to, args.template);
+
+  // Call back to Awa
+  await fetch(callback_url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ result }),
+  });
+
+  return new Response("ok");
+});
+```
+
+#### Cloudflare Workers
+
+Cloudflare Workers run at the edge with sub-millisecond cold starts, making them well-suited for high-volume, latency-sensitive job execution.
+
+**Invocation:** Workers are deployed at `https://<worker-name>.<account>.workers.dev` or custom domain routes. HttpWorker POSTs to this URL.
+
+**Auth:** Worker URLs are public by default. Auth must be implemented in the Worker itself. Recommended: pass a shared secret or HMAC-signed payload in the `Authorization` header, verified in the Worker's `fetch` handler. Cloudflare Access (Zero Trust) can also gate the endpoint with mTLS or JWT.
+
+**Execution limits:**
+
+| Mode | CPU time | Wall-clock | Fit |
+|---|---|---|---|
+| Standard (paid) | 30s CPU | ~30s | Sync mode for fast jobs |
+| Cron Triggers | 15 min | 15 min | Not applicable (push-based) |
+| Queue Consumers | 15 min | 15 min | Alternative dispatch path (see below) |
+
+- **Sync mode** works for jobs completing within ~30s wall-clock.
+- **Async mode** is tricky — a standard Worker has only ~30s to receive the POST, do work, and call back. For longer jobs, use the `ctx.waitUntil()` pattern: return a 200 immediately, then continue processing in the background (limited to the Worker's wall-clock budget).
+- For jobs exceeding 30s, **Durable Objects** (with alarms) provide extended execution with no hard wall-clock limit, billed per duration.
+
+**Postgres via Hyperdrive:** Cloudflare Hyperdrive provides connection pooling to external Postgres databases. Workers can query Awa's Postgres directly using `pg` (node-postgres) through Hyperdrive — enabling the same direct-SQL callback shortcut as Supabase. However, the HttpWorker HTTP callback is preferred for decoupling.
+
+**Cloudflare Queues alternative:** For teams already using Cloudflare Queues, an alternative to HttpWorker's HTTP dispatch is a future `CloudflareQueueWorker` that publishes jobs to a Queue instead of POSTing to a URL. The Queue consumer Worker then gets 15 minutes of execution time. This is out of scope for this ADR but worth noting as a natural extension.
+
+**Example config:**
+```rust
+.http_worker(HttpWorkerConfig {
+    kind: "resize_image",
+    endpoint: "https://job-runner.myaccount.workers.dev/execute".parse()?,
+    mode: HttpExecutionMode::Sync {
+        timeout: Duration::from_secs(25),
+    },
+    headers: vec![("X-Awa-Secret", "${AWA_WORKER_SECRET}")],
+    request_timeout: Duration::from_secs(30),
+    callback_config: None,
+})
+```
+
+**Example Cloudflare Worker:**
+```javascript
+export default {
+  async fetch(request, env) {
+    // Verify auth
+    if (request.headers.get("X-Awa-Secret") !== env.AWA_WORKER_SECRET) {
+      return new Response("Unauthorized", { status: 401 });
+    }
+
+    const { job_id, kind, args, callback_id, callback_url } = await request.json();
+
+    // For sync mode: do work and return result directly
+    const result = await resizeImage(args.url, args.width, args.height);
+    return Response.json({ result });
+
+    // For async mode: acknowledge and process in background
+    // ctx.waitUntil(processAndCallback(callback_url, args));
+    // return new Response("accepted", { status: 202 });
+  }
+};
+```
+
 ### What this is NOT
 
 - **Not a serverless runtime.** Awa still requires at least one always-on process for dispatching, maintenance, and leader election. The serverless function replaces only the job execution step.
