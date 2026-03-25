@@ -65,11 +65,12 @@ reusing the same database-facing benchmark shapes as the Rust runtime:
 The worker-focused scenarios seed with SQL directly so the reported number is
 about Python handler dispatch and runtime behavior, not enqueue serialization.
 
-## Current Headline Results
+## Reference Results
 
 ### Immediate Enqueue Throughput
 
-The recent enqueue-focused tuning work changed the headline numbers materially:
+The enqueue path that is being measured here has a few important architectural
+properties:
 
 - homogeneous inserts now route directly to `awa.jobs_hot` or
   `awa.scheduled_jobs` instead of going through the compatibility view
@@ -78,7 +79,8 @@ The recent enqueue-focused tuning work changed the headline numbers materially:
 - COPY staging now reuses a session-local temp table and stages typed values
   instead of reparsing text on the final `INSERT ... SELECT`
 
-Reference results from the current performance branch:
+Example reference results from one local laptop run and one dedicated server
+run:
 
 - local laptop (`Apple M5`, debug build):
   - `insert_only_single`: about `18k inserts/s`
@@ -92,7 +94,7 @@ Reference results from the current performance branch:
   - `copy_contention_same_queue` (4 producers x 10k, chunk 1000): about `70k inserts/s`
 
 These are engineering comparisons, not product guarantees. Their main value is
-showing where the architecture bottlenecks move after each change.
+showing where the architecture bottlenecks move as the implementation changes.
 
 ### Sustained Hot Path
 
