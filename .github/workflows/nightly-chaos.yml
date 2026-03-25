@@ -11,6 +11,26 @@ env:
   DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
 jobs:
+  postgres-failover-smoke:
+    name: Postgres failover smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - name: Show Docker versions
+        run: |
+          docker --version
+          docker compose version
+      - name: Run Postgres failover smoke test
+        run: cargo test --package awa --test postgres_failover_smoke_test -- --ignored --nocapture
+
   rust-nightly:
     name: Rust nightly benchmarks
     runs-on: ubuntu-latest

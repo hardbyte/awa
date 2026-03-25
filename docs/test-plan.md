@@ -74,6 +74,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T71 | Mixed Rust/Python workers share the same queue correctly | Cross-language resilience | Implemented |
 | T72 | Runtime recovers after terminating Postgres worker backends | Resilience | Implemented |
 | T73 | Sustained mixed workload survives Python node death and Rust node reconnect under load | Resilience | Implemented |
+| T74 | Hot-standby promotion via stable endpoint: reconnect, insert, and scheduled promotion still work after cutover | HA failover | Implemented |
 | B1 | Late completion after rescue is no-op (state guard) | Bug fix | Implemented |
 | B2 | Late completion after cancel is no-op (state guard) | Bug fix | Implemented |
 | B3 | Shutdown waits for in-flight jobs | Bug fix | Implemented |
@@ -149,6 +150,9 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
   AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python" \
   cargo test --package awa --test chaos_suite_test \
   -- --ignored --test-threads=1 --nocapture
+
+# Postgres hot-standby promotion smoke (boots primary + replica + stable proxy endpoint via Docker Compose)
+cargo test --package awa --test postgres_failover_smoke_test -- --ignored --nocapture
 
 # COPY integration tests
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test copy_test -- --nocapture
