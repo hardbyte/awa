@@ -22,7 +22,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Hot/cold storage** — runnable work in a hot table, deferred work in a cold table.
 - **Rate limiting** — per-queue token bucket. **Weighted concurrency** — global worker pool with per-queue guarantees.
 
-Recent engineering benchmarks range from ~5k Python hot-path jobs/sec on a laptop to ~40k immediately-available Rust inserts/sec on dedicated Postgres hardware, with 4-producer enqueue contention runs above ~100k chunked INSERT/sec. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) for methodology, caveats, and the latest COPY-vs-INSERT results.
+Awa ships benchmark harnesses for both Rust and Python, covering hot-path workers, deferred scheduling, failure scenarios, and multi-producer enqueue contention. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) for methodology and sample reference results across laptop and server hardware.
 
 Core concurrency invariants (no duplicate processing after rescue, stale completions rejected, shutdown drain ordering) are checked with [TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md) covering single and multi-instance deployments.
 

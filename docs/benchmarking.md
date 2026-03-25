@@ -1,7 +1,7 @@
 # Benchmarking Notes
 
-This document captures the current benchmark setup and a few reference
-results from both local runs and dedicated-server enqueue comparisons.
+This document captures the benchmark harnesses used in the repo and a few
+reference results from local runs and dedicated-server enqueue comparisons.
 
 ## Test Environment
 
@@ -34,7 +34,7 @@ matters.
 The maintenance service is global to the worker instance. If a benchmark leaves
 behind millions of deferred rows in `awa.scheduled_jobs`, later "hot path"
 benchmarks may accidentally measure background promotion work as well. The
-sustained hot/deferred benchmarks now reset runtime state first to avoid that
+sustained hot/deferred benchmarks reset runtime state first to avoid that
 pollution.
 
 Two benchmark shapes are used:
@@ -65,11 +65,12 @@ reusing the same database-facing benchmark shapes as the Rust runtime:
 The worker-focused scenarios seed with SQL directly so the reported number is
 about Python handler dispatch and runtime behavior, not enqueue serialization.
 
-## Current Headline Results
+## Reference Results
 
 ### Immediate Enqueue Throughput
 
-The recent enqueue-focused tuning work changed the headline numbers materially:
+The enqueue path that is being measured here has a few important architectural
+properties:
 
 - homogeneous inserts now route directly to `awa.jobs_hot` or
   `awa.scheduled_jobs` instead of going through the compatibility view
@@ -78,7 +79,8 @@ The recent enqueue-focused tuning work changed the headline numbers materially:
 - COPY staging now reuses a session-local temp table and stages typed values
   instead of reparsing text on the final `INSERT ... SELECT`
 
-Reference results from the current performance branch:
+Example reference results from one local laptop run and one dedicated server
+run:
 
 - local laptop (`Apple M5`, debug build):
   - `insert_only_single`: about `18k inserts/s`
@@ -92,7 +94,7 @@ Reference results from the current performance branch:
   - `copy_contention_same_queue` (4 producers x 10k, chunk 1000): about `70k inserts/s`
 
 These are engineering comparisons, not product guarantees. Their main value is
-showing where the architecture bottlenecks move after each change.
+showing where the architecture bottlenecks move as the implementation changes.
 
 ### Sustained Hot Path
 
@@ -102,7 +104,7 @@ Measured with `test_runtime_sustained_hot_path` after resetting runtime state:
 - measurement window: 10s
 - queue size seeded: 200,000 immediately-available jobs
 
-Latest observed result:
+Example reference result from one local run:
 
 - handler returns: about `8.1k jobs/s`
 - DB `completed` transitions: about `8.1k jobs/s`
@@ -203,7 +205,8 @@ dispatch and completion activity. Increasing `shared_buffers` from `128 MB` to
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
 
-The current architecture handles 2M deferred / 4k/s comfortably. For 10M+ at
+In these reference runs, the architecture handled 2M deferred / 4k/s
+comfortably. For 10M+ at
 higher due rates, promotion would need to be parallelized (e.g., by queue or
 ID range) or the deferred table partitioned.
 
@@ -259,7 +262,7 @@ failure-mode subset via `--scenario failures`:
 - `callback_timeout_10pct`
 - `mixed_50pct`
 
-It does not currently include the Rust-only `deadline_hang`, `snooze_once`, or
+It does not yet include the Rust-only `deadline_hang`, `snooze_once`, or
 `stale_heartbeat_rescue` scenarios. The worker returns `RetryAfter`,
 `WaitForCallback`, `Cancel`, or raises exceptions based on the job's `mode`
 field.
