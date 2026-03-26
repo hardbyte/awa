@@ -193,6 +193,146 @@ These endpoints already exist in `awa-model::admin` (`complete_external`, `fail_
 - **Request signing:** Outbound POSTs to serverless functions should support configurable auth headers (Bearer tokens, AWS SigV4 via SDK).
 - **Payload sensitivity:** Job args may contain PII. TLS is required. Operators should consider whether args need encryption at rest in the function's logging/observability pipeline.
 
+### Example application architecture
+
+The key question is where the always-on Awa dispatcher runs relative to the serverless functions it invokes. Here are three concrete deployment topologies.
+
+#### Topology A: Supabase-native (smallest footprint)
+
+A SaaS application using Supabase for everything — auth, database, storage, and edge functions. Awa runs as a single lightweight process on a small always-on compute instance (Fly.io, Railway, or a $5 VPS), connected to the same Supabase Postgres.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Supabase Project                                               │
+│                                                                 │
+│  ┌──────────────┐    ┌──────────────────────────────────────┐   │
+│  │  Supabase     │    │  Supabase Postgres                   │   │
+│  │  Auth / API   │    │                                      │   │
+│  │  (PostgREST)  │    │  public.*    ── app tables           │   │
+│  └──────┬───────┘    │  awa.*       ── job queue tables     │   │
+│         │             │                                      │   │
+│         │ INSERT INTO │  ◄── transactional enqueue ──────┐   │   │
+│         │ awa.jobs    │                                  │   │   │
+│         ▼             └────────┬─────────────────────────┼───┘   │
+│  ┌──────────────┐              │ LISTEN/NOTIFY           │       │
+│  │  Edge Funcs   │              │ + polling               │       │
+│  │              │              │                         │       │
+│  │  send-email  │◄─── POST ───┼─────────────┐           │       │
+│  │  resize-img  │              │             │           │       │
+│  │  gen-pdf     │              │             │           │       │
+│  └──────┬───────┘              │             │           │       │
+│         │                      │             │           │       │
+│         │ POST callback        │             │           │       │
+│         ▼                      │             │           │       │
+└─────────────────────────────────┼─────────────┼───────────┼───────┘
+                                 │             │           │
+                          ┌──────┴─────────────┴───────────┴──────┐
+                          │  Awa Dispatcher                        │
+                          │  (Fly.io / Railway / VPS)              │
+                          │                                        │
+                          │  • 1 process, ~50MB RAM                │
+                          │  • Dispatcher + Maintenance + Leader   │
+                          │  • HttpWorker (no local job handlers)  │
+                          │  • Exposes /api/callbacks/* endpoint   │
+                          │                                        │
+                          │  awa worker --http-only                │
+                          └────────────────────────────────────────┘
+```
+
+**Data flow:**
+1. User action → Supabase PostgREST or Edge Function → `INSERT INTO awa.jobs` (same Postgres transaction as business data)
+2. Awa dispatcher (on Fly.io) picks up job via LISTEN/NOTIFY
+3. HttpWorker POSTs to `https://project.supabase.co/functions/v1/send-email`
+4. Edge Function does work, POSTs back to `https://awa.fly.dev/api/callbacks/{id}/complete`
+5. Awa marks job completed
+
+**Cost profile:** ~$3-7/month for the always-on dispatcher. Edge Functions scale to zero. No idle worker costs.
+
+#### Topology B: Kubernetes + Lambda (enterprise mixed workload)
+
+A larger team running Kubernetes for their core services. CPU-heavy jobs (video encoding, ML inference) run on local Awa workers with GPU access. Lightweight jobs (notifications, webhooks) fan out to Lambda for scale-to-zero cost savings.
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Kubernetes Cluster                                  │
+│                                                      │
+│  ┌──────────────────┐    ┌───────────────────────┐   │
+│  │  App Pods         │    │  Awa Workers (2 pods) │   │
+│  │                   │    │                       │   │
+│  │  order-service    │    │  Local handlers:      │   │
+│  │  user-service     │    │    • encode_video     │   │
+│  │  payment-service  │    │    • run_ml_model     │   │
+│  │                   │    │                       │   │
+│  │  (enqueue jobs    │    │  HttpWorkers:         │   │
+│  │   via awa::insert │    │    • send_email → λ   │   │
+│  │   in transaction) │    │    • send_sms → λ     │   │
+│  │                   │    │    • gen_pdf → λ      │   │
+│  └──────────────────┘    │    • sync_crm → λ     │   │
+│                           │                       │   │
+│                           │  Callback endpoint:   │   │
+│                           │    :8080/api/callbacks │   │
+│                           └───────┬───────────────┘   │
+│                                   │                   │
+└───────────────────────────────────┼───────────────────┘
+           │                        │
+           │ sqlx                   │ POST to Lambda URLs
+           ▼                        ▼
+  ┌─────────────────┐    ┌─────────────────────────────┐
+  │  Amazon RDS      │    │  AWS Lambda                  │
+  │  (Postgres)      │    │                              │
+  │                  │    │  send-email (Node.js)        │
+  │  public.*        │    │  send-sms (Python)           │
+  │  awa.*           │    │  gen-pdf (Go)                │
+  └─────────────────┘    │  sync-crm (TypeScript)       │
+                          │                              │
+                          │  → POST callback to          │
+                          │    k8s ingress / ALB          │
+                          └─────────────────────────────┘
+```
+
+**Key insight:** Local and HTTP workers coexist. GPU jobs run on Kubernetes pods with access to local resources. Stateless I/O jobs fan out to Lambda in any language. One Awa deployment orchestrates both.
+
+#### Topology C: Cloudflare-first (edge-native)
+
+An application built on Cloudflare's stack — Workers for API, D1 or external Postgres for data, and Awa for durable job orchestration.
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  Cloudflare Edge                                         │
+│                                                          │
+│  ┌───────────────────┐      ┌────────────────────────┐   │
+│  │  API Worker         │      │  Job Workers            │   │
+│  │                     │      │                         │   │
+│  │  Handles requests,  │      │  resize-image (sync)   │   │
+│  │  enqueues jobs via  │      │  send-webhook (sync)   │   │
+│  │  Hyperdrive SQL     │      │  gen-thumbnail (sync)  │   │
+│  │                     │      │                         │   │
+│  └──────────┬──────────┘      └────────────▲────────────┘   │
+│             │                              │                │
+│             │ INSERT INTO awa.jobs         │ POST (sync)    │
+│             │ (via Hyperdrive)             │ returns result │
+│             ▼                              │                │
+└─────────────┼──────────────────────────────┼────────────────┘
+              │                              │
+     ┌────────┴──────────────────────────────┴───────────┐
+     │  Awa Dispatcher (Fly.io)                           │
+     │                                                    │
+     │  HttpWorkers (sync mode):                          │
+     │    • resize_image → worker.account.workers.dev     │
+     │    • send_webhook → worker.account.workers.dev     │
+     │                                                    │
+     │  Connected to Postgres via direct connection       │
+     └────────────────────┬───────────────────────────────┘
+                          │
+                 ┌────────┴────────┐
+                 │  Postgres        │
+                 │  (Neon / Supabase│
+                 │   / RDS)         │
+                 └─────────────────┘
+```
+
+**Sync mode shines here.** Cloudflare Workers have sub-ms cold starts, so the round-trip penalty is tiny. No callback endpoint needed — the Worker returns the result directly in the HTTP response. The Awa dispatcher is the only always-on component.
+
 ### Platform-specific notes
 
 #### Supabase Edge Functions
@@ -333,5 +473,6 @@ export default {
 - HTTP progress reporting endpoint for long-running async functions.
 - Outbound request signing (AWS SigV4, GCP identity tokens) as built-in auth strategies.
 - Response body mapping to job metadata/output storage.
-- CLI command (`awa worker --http-only`) for running a dispatcher without any local workers.
+- CLI command (`awa worker --http-only`) for running a dispatcher without any local workers — essential for Topology A where no local job handlers exist.
 - Auto-scaling integration (scaling serverless concurrency based on queue depth).
+- WASM producer SDK (`awa-wasm` crate) exposing `prepare_row()`, blake3 unique key computation, and CEL validation for use in Deno/Cloudflare Workers. Blocked today by sqlx/tokio WASM incompatibility for anything beyond the data preparation layer; revisit when WASI-P3 matures.
