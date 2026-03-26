@@ -16,6 +16,7 @@ import {
   drainQueue,
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
+import { CopyButton } from "@/components/CopyButton";
 import { toast } from "@/components/ui/toast";
 import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -455,7 +456,6 @@ export function JobsPage() {
         className="hidden sm:table"
       >
         <TableHeader>
-          <TableColumn>ID</TableColumn>
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn>State</TableColumn>
           <TableColumn>Queue</TableColumn>
@@ -489,8 +489,12 @@ export function JobsPage() {
               }
               className="cursor-pointer"
             >
-              <TableCell className="font-mono text-xs text-muted-fg">{job.id}</TableCell>
-              <TableCell className="font-medium">{job.kind}</TableCell>
+              <TableCell className="font-medium">
+                <div className="group/kind flex items-center gap-1">
+                  {job.kind}
+                  <CopyButton value={String(job.id)} label={`Copy job ID ${job.id}`} />
+                </div>
+              </TableCell>
               <TableCell>
                 <StateBadge state={job.state} />
               </TableCell>
