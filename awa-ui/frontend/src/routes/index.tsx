@@ -80,7 +80,6 @@ export function DashboardPage() {
       {/* Headline counter cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {COUNTER_KEYS.map((key) => {
-          const isLoading = statsQuery.isLoading;
           const count = statsQuery.data?.[key];
           const bg = STATE_CARD_BG[key] ?? "";
           return (
@@ -95,7 +94,7 @@ export function DashboardPage() {
               >
                 <CardContent className="py-4">
                   <div className="text-3xl font-bold tabular-nums">
-                    {isLoading ? (
+                    {statsQuery.isLoading ? (
                       <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
                     ) : (
                       (count ?? 0).toLocaleString()
