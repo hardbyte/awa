@@ -48,6 +48,15 @@ pub fn seed_scale(name: &str) -> SeedScale {
             available_cache_jobs: 1200,
             scheduled_reports: 600,
         },
+        // Lean seed for video recording: just enough to show each state,
+        // few enough that the interesting jobs aren't buried.
+        "video" => SeedScale {
+            completed_orders: 3,
+            failed_syncs: 1,
+            waiting_payments: 1,
+            available_cache_jobs: 3,
+            scheduled_reports: 2,
+        },
         _ => SeedScale {
             completed_orders: 14,
             failed_syncs: 4,
@@ -118,10 +127,16 @@ struct CapturePaymentWorker {
     callback_ids: Option<Arc<Mutex<Vec<Uuid>>>>,
 }
 
+struct CacheWarmWorker;
+
+struct ReportWorker;
+
 fn decode_args<T: for<'de> Deserialize<'de>>(ctx: &JobContext) -> Result<T, JobError> {
     serde_json::from_value(ctx.job.args.clone())
         .map_err(|err| JobError::terminal(err.to_string()))
 }
+
+// ── Email: completes in ~5s with progress ─────────────────────────
 
 #[async_trait::async_trait]
 impl Worker for SendEmailWorker {
@@ -131,13 +146,38 @@ impl Worker for SendEmailWorker {
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let args: SendOrderConfirmationEmail = decode_args(ctx)?;
-        println!(
-            "Sent order confirmation for {} to {}",
-            args.order_id, args.customer_email
+
+        ctx.set_progress(10, "Rendering email template");
+        ctx.flush_progress().await.map_err(JobError::retryable)?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        ctx.set_progress(50, "Connecting to SMTP");
+        ctx.flush_progress().await.map_err(JobError::retryable)?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        ctx.set_progress(90, "Sending email");
+        ctx.flush_progress().await.map_err(JobError::retryable)?;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        ctx.set_progress(100, "Delivered");
+        ctx.update_metadata(json!({
+            "to": args.customer_email,
+            "order_id": args.order_id,
+            "status": "delivered",
+        }))
+        .map_err(|err| JobError::terminal(err.to_string()))?;
+        ctx.flush_progress().await.map_err(JobError::retryable)?;
+
+        tracing::info!(
+            order_id = %args.order_id,
+            to = %args.customer_email,
+            "Sent order confirmation"
         );
         Ok(JobResult::Completed)
     }
 }
+
+// ── Inventory sync: ~60s of batch processing, fails partway ───────
 
 #[async_trait::async_trait]
 impl Worker for InventorySyncWorker {
@@ -147,19 +187,40 @@ impl Worker for InventorySyncWorker {
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let args: SyncInventoryBatch = decode_args(ctx)?;
-        ctx.set_progress(42, "Validated 42% of supplier feed");
-        ctx.update_metadata(json!({
-            "supplier": args.supplier,
-            "last_sku": "SKU-0042",
-            "failure_stage": "price-validation",
-        }))
-        .map_err(|err| JobError::terminal(err.to_string()))?;
+        let total_items = args.total_items.max(10) as usize;
+        let fail_at = total_items * 4 / 10; // fail at ~40%
+
+        for i in 0..total_items {
+            let pct = ((i + 1) as f64 / total_items as f64 * 100.0) as u8;
+            let sku = format!("SKU-{:04}", i + 1);
+
+            ctx.set_progress(pct.min(100), &format!("Validating {sku} ({}/{total_items})", i + 1));
+            ctx.update_metadata(json!({
+                "supplier": args.supplier,
+                "last_sku": sku,
+                "items_processed": i + 1,
+                "items_total": total_items,
+            }))
+            .map_err(|err| JobError::terminal(err.to_string()))?;
+            ctx.flush_progress().await.map_err(JobError::retryable)?;
+
+            // ~3s per item, so 10 items × 3s ≈ 30s before failure
+            tokio::time::sleep(Duration::from_secs(3)).await;
+
+            if i == fail_at {
+                return Err(JobError::terminal(format!(
+                    "supplier feed missing wholesale_price for {sku}"
+                )));
+            }
+        }
+
+        ctx.set_progress(100, "Sync complete");
         ctx.flush_progress().await.map_err(JobError::retryable)?;
-        Err(JobError::terminal(
-            "supplier feed missing wholesale_price".to_string(),
-        ))
+        Ok(JobResult::Completed)
     }
 }
+
+// ── Payment capture: progress then callback park ──────────────────
 
 #[async_trait::async_trait]
 impl Worker for CapturePaymentWorker {
@@ -169,13 +230,22 @@ impl Worker for CapturePaymentWorker {
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let args: CapturePayment = decode_args(ctx)?;
-        ctx.set_progress(95, "Waiting for payment provider callback");
+
+        ctx.set_progress(10, "Validating payment details");
+        ctx.flush_progress().await.map_err(JobError::retryable)?;
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        ctx.set_progress(30, "Creating charge with provider");
         ctx.update_metadata(json!({
             "order_id": args.order_id,
             "payment_ref": args.payment_ref,
             "provider": "stripe",
         }))
         .map_err(|err| JobError::terminal(err.to_string()))?;
+        ctx.flush_progress().await.map_err(JobError::retryable)?;
+        tokio::time::sleep(Duration::from_secs(3)).await;
+
+        ctx.set_progress(60, "Charge created, waiting for provider callback");
         ctx.flush_progress().await.map_err(JobError::retryable)?;
 
         let token = ctx
@@ -188,6 +258,82 @@ impl Worker for CapturePaymentWorker {
         }
 
         Ok(JobResult::WaitForCallback(token))
+    }
+}
+
+// ── Cache warm: ~30s of simulated work ────────────────────────────
+
+#[async_trait::async_trait]
+impl Worker for CacheWarmWorker {
+    fn kind(&self) -> &'static str {
+        WarmProductCache::kind()
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: WarmProductCache = decode_args(ctx)?;
+
+        let steps = [
+            (15, "Fetching product data"),
+            (35, "Resolving variants and pricing"),
+            (55, "Rendering templates"),
+            (75, "Building search index entry"),
+            (90, "Writing to cache"),
+            (100, "Cache warm complete"),
+        ];
+
+        for (pct, msg) in &steps {
+            ctx.set_progress(*pct, msg);
+            ctx.update_metadata(json!({
+                "slug": args.slug,
+                "step": msg,
+            }))
+            .map_err(|err| JobError::terminal(err.to_string()))?;
+            ctx.flush_progress().await.map_err(JobError::retryable)?;
+            // ~5s per step → ~30s total
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+
+        tracing::info!(slug = %args.slug, "Cache warmed");
+        Ok(JobResult::Completed)
+    }
+}
+
+// ── Revenue report: ~45s of simulated generation ──────────────────
+
+#[async_trait::async_trait]
+impl Worker for ReportWorker {
+    fn kind(&self) -> &'static str {
+        GenerateRevenueReport::kind()
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: GenerateRevenueReport = decode_args(ctx)?;
+
+        let steps = [
+            (10, "Querying order data"),
+            (25, "Aggregating revenue by region"),
+            (45, "Computing margins"),
+            (60, "Building charts"),
+            (75, "Formatting PDF"),
+            (85, "Uploading to storage"),
+            (95, "Sending notification"),
+            (100, "Report complete"),
+        ];
+
+        for (pct, msg) in &steps {
+            ctx.set_progress(*pct, msg);
+            ctx.update_metadata(json!({
+                "report_name": args.report_name,
+                "step": msg,
+            }))
+            .map_err(|err| JobError::terminal(err.to_string()))?;
+            ctx.flush_progress().await.map_err(JobError::retryable)?;
+            // ~5-6s per step → ~45s total
+            tokio::time::sleep(Duration::from_millis(5500)).await;
+        }
+
+        tracing::info!(report = %args.report_name, "Report generated");
+        Ok(JobResult::Completed)
     }
 }
 
@@ -268,11 +414,27 @@ pub fn build_demo_client(
                 ..Default::default()
             },
         )
+        .queue(
+            CACHE_QUEUE,
+            QueueConfig {
+                max_workers: 2,
+                ..Default::default()
+            },
+        )
+        .queue(
+            REPORTS_QUEUE,
+            QueueConfig {
+                max_workers: 1,
+                ..Default::default()
+            },
+        )
         .register_worker(SendEmailWorker)
         .register_worker(InventorySyncWorker)
         .register_worker(CapturePaymentWorker {
             callback_ids: callback_ids_for_payments,
         })
+        .register_worker(CacheWarmWorker)
+        .register_worker(ReportWorker)
         .periodic(
             PeriodicJob::builder(CRON_NAME, "0 9 * * *")
                 .queue(REPORTS_QUEUE)
