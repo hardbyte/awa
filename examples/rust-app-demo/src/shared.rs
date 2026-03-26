@@ -187,7 +187,8 @@ impl Worker for InventorySyncWorker {
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let args: SyncInventoryBatch = decode_args(ctx)?;
-        let total_items = args.total_items.max(10) as usize;
+        // Cap at 20 items so the job takes ~40s max (2s per item)
+        let total_items = (args.total_items as usize).clamp(5, 20);
         let fail_at = total_items * 4 / 10; // fail at ~40%
 
         for i in 0..total_items {
@@ -204,8 +205,8 @@ impl Worker for InventorySyncWorker {
             .map_err(|err| JobError::terminal(err.to_string()))?;
             ctx.flush_progress().await.map_err(JobError::retryable)?;
 
-            // ~3s per item, so 10 items × 3s ≈ 30s before failure
-            tokio::time::sleep(Duration::from_secs(3)).await;
+            // ~2s per item → 20 items ≈ 40s, fails at ~16s (40% of 20 items)
+            tokio::time::sleep(Duration::from_secs(2)).await;
 
             if i == fail_at {
                 return Err(JobError::terminal(format!(
