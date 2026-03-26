@@ -124,6 +124,7 @@ async fn test_c1_resolve_no_expressions_default_complete() {
         callback_id,
         Some(serde_json::json!({"status": "ok"})),
         DefaultAction::Complete,
+        None,
     )
     .await
     .unwrap();
@@ -151,6 +152,7 @@ async fn test_c2_resolve_no_expressions_default_ignore() {
         callback_id,
         Some(serde_json::json!({"status": "ok"})),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -187,6 +189,7 @@ async fn test_c3_filter_false_ignored() {
         callback_id,
         Some(serde_json::json!({"status": "test"})),
         DefaultAction::Complete,
+        None,
     )
     .await
     .unwrap();
@@ -222,6 +225,7 @@ async fn test_c4_filter_pass_complete() {
         callback_id,
         Some(serde_json::json!({"status": "live", "event": "charge.succeeded"})),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -256,6 +260,7 @@ async fn test_c5_on_fail_matched() {
         callback_id,
         Some(serde_json::json!({"event": "charge.failed"})),
         DefaultAction::Complete,
+        None,
     )
     .await
     .unwrap();
@@ -302,6 +307,7 @@ async fn test_c6_fail_takes_precedence() {
         callback_id,
         Some(serde_json::json!({"anything": true})),
         DefaultAction::Complete,
+        None,
     )
     .await
     .unwrap();
@@ -336,6 +342,7 @@ async fn test_c7_transform_payload() {
         callback_id,
         Some(serde_json::json!({"amount_cents": 4200})),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -395,6 +402,7 @@ async fn test_c8_invalid_filter_fail_open() {
         callback_id,
         Some(serde_json::json!({"ok": true})),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -450,6 +458,7 @@ async fn test_c9_invalid_transform_fail_open() {
         callback_id,
         Some(payload.clone()),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -493,6 +502,7 @@ async fn test_c10_fallthrough_to_default() {
         callback_id,
         Some(serde_json::json!({"event": "charge.pending"})),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -568,14 +578,26 @@ async fn test_c12_double_resolve() {
     let (_job_id, callback_id) = insert_and_wait(&client, queue, &PlainCallbackWorker).await;
 
     // First resolve succeeds
-    admin::resolve_callback(client.pool(), callback_id, None, DefaultAction::Complete)
-        .await
-        .unwrap();
+    admin::resolve_callback(
+        client.pool(),
+        callback_id,
+        None,
+        DefaultAction::Complete,
+        None,
+    )
+    .await
+    .unwrap();
 
     // Second resolve fails
-    let err = admin::resolve_callback(client.pool(), callback_id, None, DefaultAction::Complete)
-        .await
-        .unwrap_err();
+    let err = admin::resolve_callback(
+        client.pool(),
+        callback_id,
+        None,
+        DefaultAction::Complete,
+        None,
+    )
+    .await
+    .unwrap_err();
 
     match err {
         AwaError::CallbackNotFound { .. } => {}
@@ -633,6 +655,7 @@ async fn test_c14_deeply_nested_payload() {
             }
         })),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -664,6 +687,7 @@ async fn test_c15_missing_field_fail_open() {
         callback_id,
         Some(serde_json::json!({"other": "data"})),
         DefaultAction::Ignore,
+        None,
     )
     .await
     .unwrap();
@@ -674,15 +698,15 @@ async fn test_c15_missing_field_fail_open() {
     assert_eq!(job.state, JobState::WaitingExternal);
 }
 
-// ── C16: resolve_callback rejects running state (only waiting_external) ──
-// Unlike complete_external/fail_external which accept running for race handling,
-// resolve_callback only accepts waiting_external to prevent cross-attempt
-// state corruption.
+// ── C16: resolve_callback accepts running state (race handling) ──
+// A fast callback can arrive before the executor transitions running ->
+// waiting_external. resolve_callback now matches complete_external/fail_external
+// behavior by accepting both states.
 
 #[tokio::test]
-async fn test_c16_resolve_rejects_running() {
+async fn test_c16_resolve_accepts_running() {
     let client = setup().await;
-    let queue = "test_c16_running_rejected";
+    let queue = "test_c16_running_accepted";
     clean_queue(client.pool(), queue).await;
 
     let job = awa::insert_with(
@@ -710,15 +734,20 @@ async fn test_c16_resolve_rejects_running() {
     .await
     .unwrap();
 
-    // resolve_callback should NOT find it (only waiting_external)
-    let err = admin::resolve_callback(client.pool(), callback_id, None, DefaultAction::Complete)
-        .await
-        .unwrap_err();
+    // resolve_callback should now find it (accepts running state)
+    let result = admin::resolve_callback(
+        client.pool(),
+        callback_id,
+        Some(serde_json::json!({"status": "ok"})),
+        DefaultAction::Complete,
+        None,
+    )
+    .await
+    .unwrap();
 
-    match err {
-        AwaError::CallbackNotFound { .. } => {}
-        other => panic!("Expected CallbackNotFound, got: {other:?}"),
-    }
+    assert!(result.is_completed());
+    let updated = client.get_job(job.id).await.unwrap();
+    assert_eq!(updated.state, JobState::Completed);
 }
 
 // ── C17: Concurrent resolve_callback (FOR UPDATE prevents race) ──
@@ -738,10 +767,10 @@ async fn test_c17_concurrent_resolve() {
 
     // Spawn on separate tasks to guarantee true parallel execution
     let h1 = tokio::spawn(async move {
-        admin::resolve_callback(&pool1, callback_id, None, DefaultAction::Complete).await
+        admin::resolve_callback(&pool1, callback_id, None, DefaultAction::Complete, None).await
     });
     let h2 = tokio::spawn(async move {
-        admin::resolve_callback(&pool2, callback_id, None, DefaultAction::Complete).await
+        admin::resolve_callback(&pool2, callback_id, None, DefaultAction::Complete, None).await
     });
 
     let r1 = h1.await.expect("task 1 panicked");
@@ -835,9 +864,15 @@ async fn test_c19_cel_disabled_resolve_error() {
         .unwrap();
 
     // Without cel feature, expressions present → Validation error (non-destructive)
-    let err = admin::resolve_callback(client.pool(), callback_id, None, DefaultAction::Complete)
-        .await
-        .unwrap_err();
+    let err = admin::resolve_callback(
+        client.pool(),
+        callback_id,
+        None,
+        DefaultAction::Complete,
+        None,
+    )
+    .await
+    .unwrap_err();
 
     match err {
         AwaError::Validation(msg) => {

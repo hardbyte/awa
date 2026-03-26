@@ -2,7 +2,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::{admin, migrations};
+use awa::model::{admin, admin::DefaultAction, migrations};
 use awa::{AwaError, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, Worker};
 use awa_testing::TestClient;
 use serde::{Deserialize, Serialize};
@@ -143,6 +143,7 @@ async fn test_e2_complete_external() {
         client.pool(),
         callback_id,
         Some(serde_json::json!({"paid": true})),
+        None,
     )
     .await
     .unwrap();
@@ -178,7 +179,7 @@ async fn test_e3_fail_external() {
     let waiting_job = client.get_job(job.id).await.unwrap();
     let callback_id = waiting_job.callback_id.unwrap();
 
-    let failed = admin::fail_external(client.pool(), callback_id, "payment declined")
+    let failed = admin::fail_external(client.pool(), callback_id, "payment declined", None)
         .await
         .unwrap();
     assert_eq!(failed.state, JobState::Failed);
@@ -217,7 +218,7 @@ async fn test_e4_retry_external() {
     let waiting_job = client.get_job(job.id).await.unwrap();
     let callback_id = waiting_job.callback_id.unwrap();
 
-    let retried = admin::retry_external(client.pool(), callback_id)
+    let retried = admin::retry_external(client.pool(), callback_id, None)
         .await
         .unwrap();
     assert_eq!(retried.state, JobState::Available);
@@ -383,12 +384,12 @@ async fn test_e6_double_completion() {
     let callback_id = waiting_job.callback_id.unwrap();
 
     // First completion succeeds
-    admin::complete_external(client.pool(), callback_id, None)
+    admin::complete_external(client.pool(), callback_id, None, None)
         .await
         .unwrap();
 
     // Second completion fails with CallbackNotFound
-    let err = admin::complete_external(client.pool(), callback_id, None)
+    let err = admin::complete_external(client.pool(), callback_id, None, None)
         .await
         .unwrap_err();
     match err {
@@ -403,7 +404,7 @@ async fn test_e7_wrong_callback_id() {
     let client = setup().await;
     let fake_id = uuid::Uuid::new_v4();
 
-    let err = admin::complete_external(client.pool(), fake_id, None)
+    let err = admin::complete_external(client.pool(), fake_id, None, None)
         .await
         .unwrap_err();
     match err {
@@ -539,7 +540,7 @@ async fn test_e11_race_complete_during_running() {
 
     // Racing: external system completes BEFORE the executor transitions to waiting_external
     // The job is still in 'running' state
-    let completed = admin::complete_external(client.pool(), callback_id, None)
+    let completed = admin::complete_external(client.pool(), callback_id, None, None)
         .await
         .unwrap();
     assert_eq!(completed.state, JobState::Completed);
@@ -617,7 +618,7 @@ async fn test_e12_crash_clears_stale_callback() {
     assert!(rescued[0].callback_timeout_at.is_none());
 
     // Now the stale callback_id should not be found
-    let err = admin::complete_external(client.pool(), callback_id, None)
+    let err = admin::complete_external(client.pool(), callback_id, None, None)
         .await
         .unwrap_err();
     match err {
@@ -686,7 +687,7 @@ async fn test_e13_uniqueness_during_waiting_external() {
 
     // Complete the job — uniqueness should still hold since completed is in bitmask
     let waiting_job = client.get_job(job.id).await.unwrap();
-    admin::complete_external(client.pool(), waiting_job.callback_id.unwrap(), None)
+    admin::complete_external(client.pool(), waiting_job.callback_id.unwrap(), None, None)
         .await
         .unwrap();
 
@@ -707,6 +708,251 @@ async fn test_e14_migration() {
     migrations::run(&pool).await.unwrap();
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
+// ── E15: resolve_callback accepts running state (race condition fix) ──
+
+/// E15: A fast callback arriving before the executor transitions running ->
+/// waiting_external should now be accepted by resolve_callback.
+#[tokio::test]
+async fn test_e15_resolve_callback_during_running_state() {
+    let client = setup().await;
+    let queue = "test_e15_resolve_running";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 60 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Manually set to running with callback_id (simulating register done,
+    // executor hasn't transitioned to waiting_external yet)
+    let callback_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'running', attempt = 1, run_lease = run_lease + 1,
+         heartbeat_at = now(), callback_id = $2, callback_timeout_at = now() + interval '1 hour'
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .bind(callback_id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let result = admin::resolve_callback(
+        client.pool(),
+        callback_id,
+        None,
+        DefaultAction::Complete,
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert!(result.is_completed());
+    let completed = client.get_job(job.id).await.unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+}
+
+// ── E16: Stale callback rejected by run_lease guard ──
+
+/// E16: A callback carrying an old run_lease should be rejected when the job
+/// has been re-claimed with a new lease.
+#[tokio::test]
+async fn test_e16_stale_callback_rejected_by_run_lease() {
+    let client = setup().await;
+    let queue = "test_e16_run_lease";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 61 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Work the job to get it to waiting_external
+    let result = client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+    assert!(result.is_waiting_external());
+
+    let waiting = client.get_job(job.id).await.unwrap();
+    let _old_callback_id = waiting.callback_id.unwrap();
+    let old_lease = waiting.run_lease;
+
+    // Simulate rescue: move job back to available, clearing callback
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'available', callback_id = NULL,
+         callback_timeout_at = NULL, callback_filter = NULL,
+         callback_on_complete = NULL, callback_on_fail = NULL,
+         callback_transform = NULL, attempt = 0, run_at = now()
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    // Re-claim with new lease (work again)
+    let result2 = client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+    assert!(result2.is_waiting_external());
+
+    let reclaimed = client.get_job(job.id).await.unwrap();
+    let new_callback_id = reclaimed.callback_id.unwrap();
+    let new_lease = reclaimed.run_lease;
+    assert_ne!(
+        old_lease, new_lease,
+        "run_lease should increment on re-claim"
+    );
+
+    // Try to complete the NEW callback with the OLD run_lease — should fail
+    let err = admin::complete_external(client.pool(), new_callback_id, None, Some(old_lease))
+        .await
+        .unwrap_err();
+    match err {
+        AwaError::CallbackNotFound { .. } => {}
+        other => panic!("Expected CallbackNotFound, got: {other:?}"),
+    }
+
+    // Complete with correct lease should succeed
+    let completed = admin::complete_external(client.pool(), new_callback_id, None, Some(new_lease))
+        .await
+        .unwrap();
+    assert_eq!(completed.state, JobState::Completed);
+}
+
+// ── E17: cancel_callback clears fields ──
+
+/// E17: cancel_callback with matching lease NULLs all callback fields.
+#[tokio::test]
+async fn test_e17_cancel_callback_clears_fields() {
+    let client = setup().await;
+    let queue = "test_e17_cancel_callback";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 62 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Manually claim and register callback (staying in running state)
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'running', attempt = 1, run_lease = run_lease + 1,
+         heartbeat_at = now() WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let running = client.get_job(job.id).await.unwrap();
+    let run_lease = running.run_lease;
+
+    let _callback_id = admin::register_callback(
+        client.pool(),
+        job.id,
+        run_lease,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+
+    // Verify callback fields are set
+    let with_cb = client.get_job(job.id).await.unwrap();
+    assert!(with_cb.callback_id.is_some());
+    assert!(with_cb.callback_timeout_at.is_some());
+
+    // Cancel callback
+    let cancelled = admin::cancel_callback(client.pool(), job.id, run_lease)
+        .await
+        .unwrap();
+    assert!(cancelled, "cancel_callback should return true");
+
+    // Verify all callback fields are cleared
+    let after = client.get_job(job.id).await.unwrap();
+    assert!(after.callback_id.is_none());
+    assert!(after.callback_timeout_at.is_none());
+    // Job is still running
+    assert_eq!(after.state, JobState::Running);
+}
+
+// ── E18: cancel_callback with wrong lease is a no-op ──
+
+/// E18: cancel_callback with a mismatched run_lease should not clear anything.
+#[tokio::test]
+async fn test_e18_cancel_callback_wrong_lease_noop() {
+    let client = setup().await;
+    let queue = "test_e18_cancel_noop";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 63 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Manually claim and register callback
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'running', attempt = 1, run_lease = run_lease + 1,
+         heartbeat_at = now() WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let running = client.get_job(job.id).await.unwrap();
+    let run_lease = running.run_lease;
+
+    admin::register_callback(
+        client.pool(),
+        job.id,
+        run_lease,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+
+    // Cancel with wrong lease
+    let result = admin::cancel_callback(client.pool(), job.id, run_lease + 999)
+        .await
+        .unwrap();
+    assert!(
+        !result,
+        "cancel_callback with wrong lease should return false"
+    );
+
+    // Callback fields should still be set
+    let after = client.get_job(job.id).await.unwrap();
+    assert!(after.callback_id.is_some());
+    assert!(after.callback_timeout_at.is_some());
 }
 
 /// Internal bridge misuse should still fail the job descriptively at runtime.

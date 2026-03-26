@@ -152,9 +152,7 @@ LoseLeader(i) ==
 BlockingPreconditions(op) ==
     /\ op \in BlockingOps
     /\ callbackId = CbId
-    /\ IF op = "resolve"
-          THEN jobState = "waiting_external"
-          ELSE jobState \in {"waiting_external", "running"}
+    /\ jobState \in {"waiting_external", "running"}
 
 \* Phase 1a: Try to lock. Row is free -> acquire lock.
 BlockingTryLock(op) ==
@@ -212,7 +210,7 @@ FailExecute ==
 \* the FOR UPDATE lock. CEL evaluation is abstracted as nondeterministic choice.
 ResolveCompleteExecute ==
     /\ rowLock = "resolve"
-    /\ jobState = "waiting_external"
+    /\ jobState \in {"waiting_external", "running"}
     /\ callbackId = CbId
     /\ jobState' = "completed"
     /\ callbackId' = NoCb
@@ -225,7 +223,7 @@ ResolveCompleteExecute ==
 
 ResolveFailExecute ==
     /\ rowLock = "resolve"
-    /\ jobState = "waiting_external"
+    /\ jobState \in {"waiting_external", "running"}
     /\ callbackId = CbId
     /\ jobState' = "failed"
     /\ callbackId' = NoCb
@@ -238,7 +236,7 @@ ResolveFailExecute ==
 
 ResolveIgnoreRelease ==
     /\ rowLock = "resolve"
-    /\ jobState = "waiting_external"
+    /\ jobState \in {"waiting_external", "running"}
     /\ callbackId = CbId
     /\ rowLock' = NoLock
     /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, blockedOps>>
@@ -400,7 +398,7 @@ LockHolderConsistent ==
     /\ rowLock = "fail" =>
         (callbackId = CbId /\ jobState \in {"waiting_external", "running"})
     /\ rowLock = "resolve" =>
-        (jobState = "waiting_external" /\ callbackId = CbId)
+        (jobState \in {"waiting_external", "running"} /\ callbackId = CbId)
     /\ rowLock = "timeout_rescue" =>
         (jobState = "waiting_external" /\ callbackId = CbId /\ callbackTimedOut)
     /\ rowLock = "heartbeat_rescue" =>

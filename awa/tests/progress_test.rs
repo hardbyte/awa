@@ -568,7 +568,7 @@ async fn test_complete_external_clears_progress() {
     let callback_id = waiting.callback_id.expect("callback_id should be set");
 
     // Complete externally
-    let completed = admin::complete_external(tc.pool(), callback_id, None)
+    let completed = admin::complete_external(tc.pool(), callback_id, None, None)
         .await
         .unwrap();
     assert_eq!(completed.state, JobState::Completed);
@@ -608,7 +608,7 @@ async fn test_fail_external_preserves_progress() {
     };
     let callback_id = waiting.callback_id.expect("callback_id should be set");
 
-    let failed = admin::fail_external(tc.pool(), callback_id, "external error")
+    let failed = admin::fail_external(tc.pool(), callback_id, "external error", None)
         .await
         .unwrap();
     assert_eq!(failed.state, JobState::Failed);
