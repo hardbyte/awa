@@ -16,7 +16,6 @@ import {
   drainQueue,
 } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
-import { CopyButton } from "@/components/CopyButton";
 import { toast } from "@/components/ui/toast";
 import type { JobRow, ListJobsParams, StateCounts, QueueStats } from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
@@ -490,10 +489,8 @@ export function JobsPage() {
               className="cursor-pointer"
             >
               <TableCell className="font-medium">
-                <div className="group/kind flex items-center gap-1">
-                  {job.kind}
-                  <CopyButton value={String(job.id)} label={`Copy job ID ${job.id}`} />
-                </div>
+                {job.kind}
+                <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
               </TableCell>
               <TableCell>
                 <StateBadge state={job.state} />
