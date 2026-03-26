@@ -455,6 +455,7 @@ export function JobsPage() {
         className="hidden sm:table"
       >
         <TableHeader>
+          <TableColumn>ID</TableColumn>
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn>State</TableColumn>
           <TableColumn>Queue</TableColumn>
@@ -488,6 +489,7 @@ export function JobsPage() {
               }
               className="cursor-pointer"
             >
+              <TableCell className="font-mono text-xs text-muted-fg">{job.id}</TableCell>
               <TableCell className="font-medium">{job.kind}</TableCell>
               <TableCell>
                 <StateBadge state={job.state} />
@@ -555,7 +557,7 @@ export function JobsPage() {
           {jobs.length > 0 && (
             <span className="text-sm text-muted-fg">
               Showing {jobs.length} job{jobs.length !== 1 ? "s" : ""}
-              {total !== undefined && ` of ~${total.toLocaleString()}`}
+              {total !== undefined && ` of ${total.toLocaleString()} total`}
             </span>
           )}
         </div>
