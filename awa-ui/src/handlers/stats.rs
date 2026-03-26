@@ -12,7 +12,11 @@ use crate::state::{AppState, Capabilities};
 pub async fn get_stats(
     State(state): State<AppState>,
 ) -> Result<Json<HashMap<JobState, i64>>, ApiError> {
-    let counts = admin::state_counts(&state.pool).await?;
+    let pool = state.pool.clone();
+    let counts = state
+        .cache
+        .get_or_fetch("stats", || admin::state_counts(&pool))
+        .await?;
     Ok(Json(counts))
 }
 
@@ -49,5 +53,6 @@ pub async fn get_capabilities(
 ) -> Result<Json<Capabilities>, ApiError> {
     Ok(Json(Capabilities {
         read_only: state.read_only,
+        poll_interval_ms: state.poll_interval_ms,
     }))
 }

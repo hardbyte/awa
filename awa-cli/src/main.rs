@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
@@ -58,6 +60,24 @@ enum Commands {
         /// Port to listen on
         #[arg(long, default_value = "3000")]
         port: u16,
+        /// Maximum number of database connections
+        #[arg(long, default_value = "10", env = "AWA_POOL_MAX")]
+        pool_size: u32,
+        /// Minimum idle connections kept open
+        #[arg(long, default_value = "2", env = "AWA_POOL_MIN")]
+        pool_min: u32,
+        /// Seconds before an idle connection is closed
+        #[arg(long, default_value = "300", env = "AWA_POOL_IDLE_TIMEOUT")]
+        pool_idle_timeout: u64,
+        /// Maximum lifetime of a connection in seconds
+        #[arg(long, default_value = "1800", env = "AWA_POOL_MAX_LIFETIME")]
+        pool_max_lifetime: u64,
+        /// Seconds to wait when acquiring a connection
+        #[arg(long, default_value = "10", env = "AWA_POOL_ACQUIRE_TIMEOUT")]
+        pool_acquire_timeout: u64,
+        /// Cache TTL for dashboard queries in seconds
+        #[arg(long, default_value = "5", env = "AWA_CACHE_TTL")]
+        cache_ttl: u64,
     },
 }
 
@@ -191,10 +211,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Extracted: {filename}");
                 }
             } else {
-                // Default: apply migrations to DB.
+                // Default: apply migrations to DB (sequential DDL).
                 let db_url = require_pool(&cli.database_url)?;
                 let pool = PgPoolOptions::new()
-                    .max_connections(5)
+                    .max_connections(1)
                     .connect(&db_url)
                     .await?;
                 awa_model::migrations::run(&pool).await?;
@@ -202,16 +222,46 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // All remaining commands require a database connection.
+        // Serve gets its own tuned pool — handle it before the generic CLI pool.
+        Commands::Serve {
+            host,
+            port,
+            pool_size,
+            pool_min,
+            pool_idle_timeout,
+            pool_max_lifetime,
+            pool_acquire_timeout,
+            cache_ttl,
+        } => {
+            let db_url = require_pool(&cli.database_url)?;
+            let pool = PgPoolOptions::new()
+                .max_connections(pool_size)
+                .min_connections(pool_min)
+                .idle_timeout(Duration::from_secs(pool_idle_timeout))
+                .max_lifetime(Duration::from_secs(pool_max_lifetime))
+                .acquire_timeout(Duration::from_secs(pool_acquire_timeout))
+                .connect(&db_url)
+                .await?;
+
+            let cache_ttl = Duration::from_secs(cache_ttl);
+            let app = awa_ui::router(pool, cache_ttl).await?;
+            let addr = format!("{host}:{port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            tracing::info!("AWA UI listening on http://{addr}");
+            axum::serve(listener, app).await?;
+        }
+
+        // All remaining CLI commands are single-shot (one query, then exit)
+        // so a single connection is sufficient.
         command => {
             let db_url = require_pool(&cli.database_url)?;
             let pool = PgPoolOptions::new()
-                .max_connections(5)
+                .max_connections(1)
                 .connect(&db_url)
                 .await?;
 
             match command {
-                Commands::Migrate { .. } => unreachable!(),
+                Commands::Migrate { .. } | Commands::Serve { .. } => unreachable!(),
 
                 Commands::Job { command } => match command {
                     JobCommands::Retry { id } => {
@@ -317,14 +367,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
                     }
                 },
-
-                Commands::Serve { host, port } => {
-                    let app = awa_ui::router(pool).await?;
-                    let addr = format!("{host}:{port}");
-                    let listener = tokio::net::TcpListener::bind(&addr).await?;
-                    tracing::info!("AWA UI listening on http://{addr}");
-                    axum::serve(listener, app).await?;
-                }
 
                 Commands::Queue { command } => match command {
                     QueueCommands::Pause { queue } => {

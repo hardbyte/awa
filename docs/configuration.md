@@ -151,10 +151,21 @@ The `awa` CLI currently supports these global flags:
 
 `serve` adds:
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--host` | `127.0.0.1` | Bind host |
-| `--port` | `3000` | Bind port |
+| Flag | Env var | Default | Meaning |
+|---|---|---|---|
+| `--host` | | `127.0.0.1` | Bind host |
+| `--port` | | `3000` | Bind port |
+| `--pool-size` | `AWA_POOL_MAX` | `10` | Maximum database connections |
+| `--pool-min` | `AWA_POOL_MIN` | `2` | Minimum idle connections kept open |
+| `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Seconds before an idle connection is closed |
+| `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Maximum lifetime of a connection in seconds |
+| `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Seconds to wait when acquiring a connection |
+| `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Server-side cache TTL for dashboard queries in seconds |
+
+The cache deduplicates repeated poll requests from the frontend — multiple
+browser tabs or rapid polling cycles within the TTL window hit memory rather
+than the database. The frontend polling interval is derived from the cache TTL
+(minimum 5 s) and served via the `/api/capabilities` endpoint.
 
 ## Environment Variables
 
@@ -163,13 +174,19 @@ These are the direct environment-variable integrations in the current codebase:
 | Variable | Consumer | Meaning |
 |---|---|---|
 | `DATABASE_URL` | `awa` CLI | Default value for `--database-url` |
+| `AWA_POOL_MAX` | `awa serve` | Maximum database connections (default `10`) |
+| `AWA_POOL_MIN` | `awa serve` | Minimum idle connections (default `2`) |
+| `AWA_POOL_IDLE_TIMEOUT` | `awa serve` | Idle connection timeout in seconds (default `300`) |
+| `AWA_POOL_MAX_LIFETIME` | `awa serve` | Max connection lifetime in seconds (default `1800`) |
+| `AWA_POOL_ACQUIRE_TIMEOUT` | `awa serve` | Connection acquire timeout in seconds (default `10`) |
+| `AWA_CACHE_TTL` | `awa serve` | Dashboard query cache TTL in seconds (default `5`) |
 | `RUST_LOG` | `awa` CLI and any app using `tracing_subscriber` env filters | Log filter, for example `RUST_LOG=info` |
 | `HOSTNAME` | Rust worker runtime | Optional hostname recorded in runtime snapshots |
 
 Notes:
 
 - the Rust and Python libraries do not require `DATABASE_URL`; your code can pass the URL directly
-- Awa does not currently expose QueueConfig or ClientBuilder options through dedicated env vars
+- all `AWA_*` env vars can also be set via the corresponding `--flag` on the `serve` subcommand
 
 ## Defaults Worth Remembering
 

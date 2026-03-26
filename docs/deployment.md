@@ -49,7 +49,7 @@ Examples:
 - three queues plus handler SQL: start around `12-20`
 - combined API + worker process: either use separate pools or size for both workloads explicitly
 
-The Python client defaults to `max_connections=10`. The `awa` CLI uses a pool size of `5`.
+The Python client defaults to `max_connections=10`. `awa serve` defaults to a pool of `10` connections (configurable via `--pool-size` / `AWA_POOL_MAX`). Other CLI subcommands use a single connection.
 
 ## Docker
 

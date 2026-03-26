@@ -28,19 +28,23 @@ import {
 } from "@/components/ui/table";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
+import { usePollInterval } from "@/hooks/use-poll-interval";
 
 export function QueuesPage() {
   const queryClient = useQueryClient();
   const [drainTarget, setDrainTarget] = useState<string | null>(null);
+  const pollInterval = usePollInterval();
 
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
+    refetchInterval: pollInterval,
   });
 
   const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
+    refetchInterval: pollInterval,
   });
   const readOnly = useReadOnly();
 

@@ -14,6 +14,7 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { timeAgo } from "@/lib/time";
+import { usePollInterval } from "@/hooks/use-poll-interval";
 import {
   formatDateTime,
   formatSnapshotInterval,
@@ -30,14 +31,18 @@ import {
 } from "@/components/RuntimeDisplay";
 
 export function RuntimePage() {
+  const pollInterval = usePollInterval();
+
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
+    refetchInterval: pollInterval,
   });
 
   const queueRuntimeQuery = useQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
+    refetchInterval: pollInterval,
   });
 
   const runtime = runtimeQuery.data;

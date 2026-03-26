@@ -10,7 +10,11 @@ use crate::state::AppState;
 pub async fn list_queues(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<admin::QueueStats>>, ApiError> {
-    let stats = admin::queue_stats(&state.pool).await?;
+    let pool = state.pool.clone();
+    let stats = state
+        .cache
+        .get_or_fetch("queues", || admin::queue_stats(&pool))
+        .await?;
     Ok(Json(stats))
 }
 

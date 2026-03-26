@@ -36,7 +36,7 @@ async fn test_cron_api_includes_next_fire_at() {
     let schedule_name = "cron_api_test_next_fire";
     seed_cron_schedule(&pool, schedule_name).await;
 
-    let app = awa_ui::router(pool.clone())
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
     let resp = app

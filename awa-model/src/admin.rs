@@ -800,23 +800,32 @@ pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, 
 where
     E: PgExecutor<'e>,
 {
+    // Single scan of queue_state_counts — sums all columns in one pass
+    // then unpivots via VALUES join.
     let rows = sqlx::query_as::<_, (JobState, i64)>(
         r#"
-        SELECT 'scheduled'::awa.job_state, COALESCE(sum(scheduled), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'available'::awa.job_state, COALESCE(sum(available), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'running'::awa.job_state, COALESCE(sum(running), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'completed'::awa.job_state, COALESCE(sum(completed), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'retryable'::awa.job_state, COALESCE(sum(retryable), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'failed'::awa.job_state, COALESCE(sum(failed), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'cancelled'::awa.job_state, COALESCE(sum(cancelled), 0)::bigint FROM awa.queue_state_counts
-        UNION ALL
-        SELECT 'waiting_external'::awa.job_state, COALESCE(sum(waiting_external), 0)::bigint FROM awa.queue_state_counts
+        SELECT v.state, v.total FROM (
+            SELECT
+                COALESCE(sum(scheduled), 0)::bigint      AS scheduled,
+                COALESCE(sum(available), 0)::bigint      AS available,
+                COALESCE(sum(running), 0)::bigint        AS running,
+                COALESCE(sum(completed), 0)::bigint      AS completed,
+                COALESCE(sum(retryable), 0)::bigint      AS retryable,
+                COALESCE(sum(failed), 0)::bigint         AS failed,
+                COALESCE(sum(cancelled), 0)::bigint      AS cancelled,
+                COALESCE(sum(waiting_external), 0)::bigint AS waiting_external
+            FROM awa.queue_state_counts
+        ) s,
+        LATERAL (VALUES
+            ('scheduled'::awa.job_state,        s.scheduled),
+            ('available'::awa.job_state,        s.available),
+            ('running'::awa.job_state,          s.running),
+            ('completed'::awa.job_state,        s.completed),
+            ('retryable'::awa.job_state,        s.retryable),
+            ('failed'::awa.job_state,           s.failed),
+            ('cancelled'::awa.job_state,        s.cancelled),
+            ('waiting_external'::awa.job_state, s.waiting_external)
+        ) AS v(state, total)
         "#,
     )
     .fetch_all(executor)
