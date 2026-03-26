@@ -996,6 +996,7 @@ pub async fn complete_external<'e, E>(
     executor: E,
     callback_id: Uuid,
     _payload: Option<serde_json::Value>,
+    run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError>
 where
     E: PgExecutor<'e>,
@@ -1015,10 +1016,12 @@ where
             deadline_at = NULL,
             progress = NULL
         WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
+          AND ($2::bigint IS NULL OR run_lease = $2)
         RETURNING *
         "#,
     )
     .bind(callback_id)
+    .bind(run_lease)
     .fetch_optional(executor)
     .await?;
 
@@ -1034,6 +1037,7 @@ pub async fn fail_external<'e, E>(
     executor: E,
     callback_id: Uuid,
     error: &str,
+    run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError>
 where
     E: PgExecutor<'e>,
@@ -1057,11 +1061,13 @@ where
                 'at', now()
             )::jsonb
         WHERE callback_id = $1 AND state IN ('waiting_external', 'running')
+          AND ($3::bigint IS NULL OR run_lease = $3)
         RETURNING *
         "#,
     )
     .bind(callback_id)
     .bind(error)
+    .bind(run_lease)
     .fetch_optional(executor)
     .await?;
 
@@ -1079,7 +1085,11 @@ where
 /// terminal transitions, retry puts the job back to `available`. Allowing
 /// retry from `running` would risk concurrent dispatch if the original
 /// handler hasn't finished yet.
-pub async fn retry_external<'e, E>(executor: E, callback_id: Uuid) -> Result<JobRow, AwaError>
+pub async fn retry_external<'e, E>(
+    executor: E,
+    callback_id: Uuid,
+    run_lease: Option<i64>,
+) -> Result<JobRow, AwaError>
 where
     E: PgExecutor<'e>,
 {
@@ -1099,16 +1109,51 @@ where
             heartbeat_at = NULL,
             deadline_at = NULL
         WHERE callback_id = $1 AND state = 'waiting_external'
+          AND ($2::bigint IS NULL OR run_lease = $2)
         RETURNING *
         "#,
     )
     .bind(callback_id)
+    .bind(run_lease)
     .fetch_optional(executor)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
         callback_id: callback_id.to_string(),
     })
+}
+
+/// Cancel (clear) a registered callback for a running job.
+///
+/// Best-effort cleanup: returns `Ok(true)` if a row was updated,
+/// `Ok(false)` if no match (already resolved, rescued, or wrong lease).
+/// Callers should not treat `false` as an error.
+pub async fn cancel_callback<'e, E>(
+    executor: E,
+    job_id: i64,
+    run_lease: i64,
+) -> Result<bool, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET callback_id = NULL,
+            callback_timeout_at = NULL,
+            callback_filter = NULL,
+            callback_on_complete = NULL,
+            callback_on_fail = NULL,
+            callback_transform = NULL
+        WHERE id = $1 AND callback_id IS NOT NULL AND state = 'running' AND run_lease = $2
+        "#,
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .execute(executor)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
 }
 
 // ── CEL callback expressions ──────────────────────────────────────────
@@ -1286,19 +1331,26 @@ pub async fn resolve_callback(
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     default_action: DefaultAction,
+    run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
     let mut tx = pool.begin().await?;
 
     // Query jobs_hot directly (not the awa.jobs UNION ALL view) because
     // FOR UPDATE is not reliably supported on UNION views. Waiting_external
-    // jobs are always in jobs_hot (the check constraint on scheduled_jobs
-    // only allows scheduled/retryable).
+    // and running jobs are always in jobs_hot (the check constraint on
+    // scheduled_jobs only allows scheduled/retryable).
+    //
+    // Accepts both 'waiting_external' and 'running' to handle the race where
+    // a fast callback arrives before the executor transitions running ->
+    // waiting_external (matching complete_external/fail_external behavior).
     let job = sqlx::query_as::<_, JobRow>(
         "SELECT * FROM awa.jobs_hot WHERE callback_id = $1
-         AND state = 'waiting_external'
+         AND state IN ('waiting_external', 'running')
+         AND ($2::bigint IS NULL OR run_lease = $2)
          FOR UPDATE",
     )
     .bind(callback_id)
+    .bind(run_lease)
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(AwaError::CallbackNotFound {

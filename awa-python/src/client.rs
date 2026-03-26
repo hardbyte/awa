@@ -851,7 +851,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let row = awa_model::admin::complete_external(&pool, uuid, payload_json)
+            let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
                 .await
                 .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
@@ -868,7 +868,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let row = awa_model::admin::fail_external(&pool, uuid, &error)
+            let row = awa_model::admin::fail_external(&pool, uuid, &error, None)
                 .await
                 .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
@@ -884,7 +884,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let row = awa_model::admin::retry_external(&pool, uuid)
+            let row = awa_model::admin::retry_external(&pool, uuid, None)
                 .await
                 .map_err(map_awa_error)?;
             Ok(PyJob::from(row))
@@ -907,7 +907,7 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let row = awa_model::admin::complete_external(&pool, uuid, payload_json)
+                let row = awa_model::admin::complete_external(&pool, uuid, payload_json, None)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
@@ -926,7 +926,7 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let row = awa_model::admin::fail_external(&pool, uuid, &error)
+                let row = awa_model::admin::fail_external(&pool, uuid, &error, None)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
@@ -940,7 +940,7 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let row = awa_model::admin::retry_external(&pool, uuid)
+                let row = awa_model::admin::retry_external(&pool, uuid, None)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
@@ -967,9 +967,10 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let outcome = awa_model::admin::resolve_callback(&pool, uuid, payload_json, action)
-                .await
-                .map_err(map_awa_error)?;
+            let outcome =
+                awa_model::admin::resolve_callback(&pool, uuid, payload_json, action, None)
+                    .await
+                    .map_err(map_awa_error)?;
             Ok(resolve_outcome_to_py(outcome))
         })
     }
@@ -992,9 +993,10 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let outcome = awa_model::admin::resolve_callback(&pool, uuid, payload_json, action)
-                    .await
-                    .map_err(map_awa_error)?;
+                let outcome =
+                    awa_model::admin::resolve_callback(&pool, uuid, payload_json, action, None)
+                        .await
+                        .map_err(map_awa_error)?;
                 Ok(resolve_outcome_to_py(outcome))
             })
         })
