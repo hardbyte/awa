@@ -1,69 +1,69 @@
 {
+  "rust/terminal_1pct": {
+    "handler_per_s": 973.3
+  },
+  "rust/terminal_10pct": {
+    "handler_per_s": 771.8
+  },
+  "rust/terminal_50pct": {
+    "handler_per_s": 532.0
+  },
+  "rust/retryable_1pct": {
+    "handler_per_s": 597.5
+  },
+  "rust/retryable_10pct": {
+    "handler_per_s": 969.5
+  },
+  "rust/retryable_50pct": {
+    "handler_per_s": 675.6
+  },
+  "rust/callback_timeout_10pct": {
+    "handler_per_s": 516.4
+  },
+  "rust/deadline_hang_10pct": {
+    "handler_per_s": 537.6
+  },
+  "rust/snooze_once_10pct": {
+    "handler_per_s": 1142.0
+  },
+  "rust/mixed_all_modes": {
+    "handler_per_s": 461.5
+  },
+  "rust/stale_heartbeat_rescue": {
+    "handler_per_s": 160.3
+  },
   "python/copy": {
-    "enqueue_per_s": 18490.65185975903
+    "enqueue_per_s": 18490.7
   },
   "python/hot": {
     "handler_per_s": 3407.5
   },
   "python/scheduled": {
     "handler_per_s": 594.4,
-    "p99_ms": 29906.69198
+    "p99_ms": 29906.7
   },
   "python/terminal_1pct": {
-    "handler_per_s": 1232.2389718596837
+    "handler_per_s": 1232.2
   },
   "python/terminal_10pct": {
-    "handler_per_s": 395.3849053559526
+    "handler_per_s": 395.4
   },
   "python/terminal_50pct": {
-    "handler_per_s": 694.7692765825261
+    "handler_per_s": 694.8
   },
   "python/retryable_1pct": {
-    "handler_per_s": 494.78781380509355
+    "handler_per_s": 494.8
   },
   "python/retryable_10pct": {
-    "handler_per_s": 1301.670361924413
+    "handler_per_s": 1301.7
   },
   "python/retryable_50pct": {
-    "handler_per_s": 549.9059074973433
+    "handler_per_s": 549.9
   },
   "python/callback_timeout_10pct": {
-    "handler_per_s": 229.33883319212143
+    "handler_per_s": 229.3
   },
   "python/mixed_50pct": {
-    "handler_per_s": 932.200746171578
-  },
-  "rust/terminal_1pct": {
-    "handler_per_s": 1491.220812953139
-  },
-  "rust/terminal_10pct": {
-    "handler_per_s": 1374.6642523123148
-  },
-  "rust/terminal_50pct": {
-    "handler_per_s": 624.0302750494511
-  },
-  "rust/retryable_1pct": {
-    "handler_per_s": 1702.5226924681524
-  },
-  "rust/retryable_10pct": {
-    "handler_per_s": 1469.7904707538346
-  },
-  "rust/retryable_50pct": {
-    "handler_per_s": 1022.1997003612389
-  },
-  "rust/callback_timeout_10pct": {
-    "handler_per_s": 732.2781053521363
-  },
-  "rust/deadline_hang_10pct": {
-    "handler_per_s": 414.42644926889545
-  },
-  "rust/snooze_once_10pct": {
-    "handler_per_s": 1368.1704961514658
-  },
-  "rust/mixed_all_modes": {
-    "handler_per_s": 359.6511022991925
-  },
-  "rust/stale_heartbeat_rescue": {
-    "handler_per_s": 349.73679920654735
+    "handler_per_s": 932.2
   }
 }

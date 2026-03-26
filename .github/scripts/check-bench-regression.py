@@ -15,7 +15,8 @@ from pathlib import Path
 
 JSONL_PREFIX = "@@BENCH_JSON@@"
 # Regressing more than this fraction below baseline triggers a failure.
-DEFAULT_TOLERANCE = 0.20  # 20%
+# 30% accommodates GitHub-hosted runner variance (shared VMs).
+DEFAULT_TOLERANCE = 0.30  # 30%
 
 
 def load_baseline(path: Path) -> dict:

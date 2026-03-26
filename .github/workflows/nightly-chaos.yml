@@ -195,6 +195,8 @@ jobs:
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      issues: write
     steps:
       - uses: actions/checkout@v4
       - name: Build issue body
