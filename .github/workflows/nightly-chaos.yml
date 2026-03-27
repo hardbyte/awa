@@ -105,6 +105,7 @@ jobs:
             | tee artifacts/nightly/rust-failure-matrix.txt
       - name: Run stale-heartbeat rescue benchmark
         if: always()
+        timeout-minutes: 5
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
