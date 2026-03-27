@@ -404,7 +404,10 @@ export function JobsPage() {
                 }
               >
                 <div className="flex items-center gap-2">
-                  <span className="font-medium">{job.kind}</span>
+                  <span className="font-medium">
+                    {job.kind}
+                    <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                  </span>
                   <StateBadge state={job.state} />
                   {job.priority !== 2 && (
                     <Badge
