@@ -34,7 +34,7 @@ jobs:
   rust-nightly:
     name: Rust nightly benchmarks
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     defaults:
       run:
         shell: bash
@@ -73,12 +73,14 @@ jobs:
       - name: Create artifact directory
         run: mkdir -p artifacts/nightly
       - name: Run sustained hot-path benchmark
+        timeout-minutes: 5
         run: |
           set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
             test_runtime_sustained_hot_path -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-hot.txt
       - name: Run Rust chaos suite
+        timeout-minutes: 5
         run: |
           set -o pipefail
           export AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python"
@@ -87,6 +89,7 @@ jobs:
             | tee artifacts/nightly/rust-chaos.txt
       - name: Run sustained deferred benchmark
         if: always()
+        timeout-minutes: 15
         run: |
           set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
@@ -94,6 +97,7 @@ jobs:
             | tee artifacts/nightly/rust-scheduled-2m-4k.txt
       - name: Run failure-mode benchmark matrix
         if: always()
+        timeout-minutes: 10
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
