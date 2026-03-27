@@ -86,18 +86,21 @@ jobs:
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-chaos.txt
       - name: Run sustained deferred benchmark
+        if: always()
         run: |
           set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
             test_scheduled_steady_2m_due_4k_per_sec -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-scheduled-2m-4k.txt
       - name: Run failure-mode benchmark matrix
+        if: always()
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
             test_failure_bench_full_matrix -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-failure-matrix.txt
       - name: Run stale-heartbeat rescue benchmark
+        if: always()
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
