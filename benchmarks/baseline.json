@@ -1,6 +1,6 @@
 {
   "rust/terminal_1pct": {
-    "handler_per_s": 973.3
+    "handler_per_s": 859.0
   },
   "rust/terminal_10pct": {
     "handler_per_s": 771.8
@@ -21,10 +21,10 @@
     "handler_per_s": 516.4
   },
   "rust/deadline_hang_10pct": {
-    "handler_per_s": 537.6
+    "handler_per_s": 363.0
   },
   "rust/snooze_once_10pct": {
-    "handler_per_s": 1142.0
+    "handler_per_s": 710.0
   },
   "rust/mixed_all_modes": {
     "handler_per_s": 461.5
