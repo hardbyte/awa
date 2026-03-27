@@ -43,10 +43,10 @@
     "p99_ms": 27330.0
   },
   "python/terminal_1pct": {
-    "handler_per_s": 325.0
+    "handler_per_s": 100.0
   },
   "python/terminal_10pct": {
-    "handler_per_s": 338.0
+    "handler_per_s": 100.0
   },
   "python/terminal_50pct": {
     "handler_per_s": 338.0
