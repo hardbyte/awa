@@ -43,27 +43,27 @@
     "p99_ms": 27330.0
   },
   "python/terminal_1pct": {
-    "handler_per_s": 453.9
+    "handler_per_s": 325.0
   },
   "python/terminal_10pct": {
-    "handler_per_s": 513.4
+    "handler_per_s": 338.0
   },
   "python/terminal_50pct": {
-    "handler_per_s": 381.3
+    "handler_per_s": 338.0
   },
   "python/retryable_1pct": {
-    "handler_per_s": 1261.5
+    "handler_per_s": 117.0
   },
   "python/retryable_10pct": {
-    "handler_per_s": 418.0
+    "handler_per_s": 369.0
   },
   "python/retryable_50pct": {
-    "handler_per_s": 435.3
+    "handler_per_s": 269.0
   },
   "python/callback_timeout_10pct": {
-    "handler_per_s": 210.1
+    "handler_per_s": 55.0
   },
   "python/mixed_50pct": {
-    "handler_per_s": 455.6
+    "handler_per_s": 216.0
   }
 }
