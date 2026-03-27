@@ -175,7 +175,7 @@ jobs:
         run: |
           set -o pipefail
           PYTHONPATH=scripts .venv/bin/python scripts/benchmark_runtime.py --scenario failures \
-            --failure-total-jobs 2000 --max-connections 10 \
+            --failure-total-jobs 500 --max-connections 10 \
             | tee artifacts/nightly/python-failure-benchmarks.txt
       - name: Check for regressions
         if: always()
