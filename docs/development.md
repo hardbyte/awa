@@ -47,6 +47,37 @@ tags avoid this because:
 - If a pre-release has problems, you bump to `-alpha.2` instead of fighting
   immutable registries
 
+## Crate Dependencies
+
+```
+awa-macros  (proc-macro, no runtime deps)
+    │
+    ▼
+awa-model   (core types + SQL, re-exports awa-macros::JobArgs)
+    │
+    ├──────────────┬──────────────┐
+    ▼              ▼              ▼
+awa-worker     awa-ui          awa-cli
+    │          (axum API +       (depends on awa-ui)
+    │           embedded UI)
+    ├──────────────┐
+    ▼              ▼
+awa (facade)   awa-testing
+                   │
+                   ▼
+              awa-python (PyO3 bridge, separate workspace)
+```
+
+Key dependencies per crate:
+
+| Crate | Key deps |
+|-------|----------|
+| `awa-model` | sqlx, blake3, serde, chrono, chrono-tz, croner |
+| `awa-worker` | awa-model, tokio, opentelemetry |
+| `awa-ui` | awa-model, axum, rust-embed |
+| `awa-cli` | awa-model, awa-ui, axum, clap |
+| `awa-python` | awa-model, awa-worker, pyo3, pyo3-async-runtimes |
+
 ## Running Tests
 
 ```bash

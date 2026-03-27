@@ -12,43 +12,15 @@ The Rust runtime owns all queue machinery -- polling, heartbeating, crash recove
 awa (workspace)
 ├── awa-macros        proc-macro crate: #[derive(JobArgs)] and CamelCase→snake_case
 ├── awa-model         Core types, SQL, migrations, insert/admin/cron APIs
-│   └── depends on: awa-macros, sqlx, blake3, serde, chrono, chrono-tz, croner
 ├── awa-worker        Runtime: Client, Dispatcher, Executor, Heartbeat, Maintenance, Metrics
-│   └── depends on: awa-model, sqlx, tokio, opentelemetry, croner, chrono-tz
 ├── awa               Facade crate re-exporting awa-model + awa-worker
-│   └── depends on: awa-model, awa-macros, awa-worker
 ├── awa-testing       Test utilities (TestClient, WorkResult)
-│   └── depends on: awa-model, awa-worker
-├── awa-ui            Web UI: axum REST API + embedded React/IntentUI frontend
-│   └── depends on: awa-model, axum, rust-embed, tokio, serde
+├── awa-ui            Web UI: axum REST API + embedded React/TypeScript frontend
 ├── awa-cli           CLI binary: migrations, job/queue/cron admin, web UI server
-│   └── depends on: awa-model, awa-ui, axum, clap
 └── awa-python        PyO3 cdylib: Python bindings (separate Cargo workspace)
-    └── depends on: awa-model, awa-worker, pyo3, pyo3-async-runtimes
 ```
 
-### Dependency Graph
-
-```
-awa-macros  (proc-macro, no runtime deps)
-    │
-    ▼
-awa-model   (core types + SQL, re-exports awa-macros::JobArgs)
-    │
-    ├──────────────┬──────────────┐
-    ▼              ▼              ▼
-awa-worker     awa-ui          awa-cli
-    │          (axum API +       (depends on awa-ui)
-    │           embedded UI)
-    ├──────────────┐
-    ▼              ▼
-awa (facade)   awa-testing
-                   │
-                   ▼
-              awa-python (PyO3 bridge, separate workspace)
-```
-
-`awa-python` is excluded from the main workspace because it has its own `pyproject.toml` and build toolchain (maturin).
+`awa-model` is the foundation — everything depends on it. `awa-worker` adds the runtime (dispatch, heartbeat, maintenance). `awa` is a facade re-exporting both. `awa-ui` and `awa-cli` are leaf crates for the web dashboard and CLI respectively. `awa-python` lives in a separate Cargo workspace with its own `pyproject.toml` and maturin build toolchain.
 
 ## Job Lifecycle State Machine
 
