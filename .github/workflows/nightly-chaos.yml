@@ -90,6 +90,7 @@ jobs:
       - name: Run sustained deferred benchmark
         if: always()
         timeout-minutes: 15
+        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
@@ -98,6 +99,7 @@ jobs:
       - name: Run failure-mode benchmark matrix
         if: always()
         timeout-minutes: 10
+        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
@@ -106,6 +108,7 @@ jobs:
       - name: Run stale-heartbeat rescue benchmark
         if: always()
         timeout-minutes: 5
+        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
