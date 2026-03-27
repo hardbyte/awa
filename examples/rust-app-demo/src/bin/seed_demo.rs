@@ -23,6 +23,7 @@ fn parse_scale() -> &'static str {
             return match args.next().as_deref() {
                 Some("small") => "small",
                 Some("large") => "large",
+                Some("video") => "video",
                 _ => "medium",
             };
         }
@@ -92,38 +93,50 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .await?;
 
-    client.start().await?;
+    // For "video" scale, don't start workers or wait for state transitions.
+    // Jobs stay in their initial states (available, scheduled) so the user
+    // can start workers separately and watch progress live in the UI.
+    let callback_id = if scale_name == "video" {
+        // Still need to briefly start the client to sync the cron schedule,
+        // but don't process any jobs.
+        client.start().await?;
+        wait_for_cron_sync(&pool, Duration::from_secs(10)).await?;
+        client.shutdown(Duration::from_secs(2)).await;
+        None
+    } else {
+        client.start().await?;
 
-    wait_for_many(
-        &pool,
-        &receipt_job_ids,
-        JobState::Completed,
-        Duration::from_secs(12),
-    )
-    .await?;
-    wait_for_many(
-        &pool,
-        &failed_ids,
-        JobState::Failed,
-        Duration::from_secs(12),
-    )
-    .await?;
-    wait_for_many(
-        &pool,
-        &waiting_ids,
-        JobState::WaitingExternal,
-        Duration::from_secs(12),
-    )
-    .await?;
-    wait_for_cron_sync(&pool, Duration::from_secs(10)).await?;
+        wait_for_many(
+            &pool,
+            &receipt_job_ids,
+            JobState::Completed,
+            Duration::from_secs(12),
+        )
+        .await?;
+        wait_for_many(
+            &pool,
+            &failed_ids,
+            JobState::Failed,
+            Duration::from_secs(60),
+        )
+        .await?;
+        wait_for_many(
+            &pool,
+            &waiting_ids,
+            JobState::WaitingExternal,
+            Duration::from_secs(30),
+        )
+        .await?;
+        wait_for_cron_sync(&pool, Duration::from_secs(10)).await?;
 
-    client.shutdown(Duration::from_secs(5)).await;
+        client.shutdown(Duration::from_secs(5)).await;
 
-    let callback_id = callback_ids
-        .lock()
-        .expect("callback id lock")
-        .first()
-        .copied();
+        callback_ids
+            .lock()
+            .expect("callback id lock")
+            .first()
+            .copied()
+    };
 
     println!("\nRust demo data ready");
     println!("====================");
