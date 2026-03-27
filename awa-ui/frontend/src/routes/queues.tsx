@@ -267,16 +267,22 @@ export function QueuesPage() {
                   <TableCell>{rateLimitLabel(runtime)}</TableCell>
                   <TableCell>
                     <div className="text-sm">
-                      <div>{runtimeHealthLabel(runtime)} healthy</div>
-                      {runtime?.config_mismatch ? (
-                        <div className="text-warning-fg">Config mismatch</div>
-                      ) : runtime ? (
-                        <div className="text-muted-fg">
-                          {runtime.stale_instances > 0
-                            ? `${runtime.stale_instances} stale`
-                            : `${runtime.instance_count} nodes`}
-                        </div>
-                      ) : null}
+                      {runtime ? (
+                        <>
+                          <div>{runtimeHealthLabel(runtime)} healthy</div>
+                          {runtime.config_mismatch ? (
+                            <div className="text-warning-fg">Config mismatch</div>
+                          ) : (
+                            <div className="text-muted-fg">
+                              {runtime.stale_instances > 0
+                                ? `${runtime.stale_instances} stale`
+                                : `${runtime.instance_count} nodes`}
+                            </div>
+                          )}
+                        </>
+                      ) : (
+                        <span className="text-muted-fg">—</span>
+                      )}
                     </div>
                   </TableCell>
                   <TableCell>

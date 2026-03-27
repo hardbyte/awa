@@ -80,7 +80,7 @@ export function DashboardPage() {
       {/* Headline counter cards */}
       <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
         {COUNTER_KEYS.map((key) => {
-          const count = statsQuery.data?.[key] ?? 0;
+          const count = statsQuery.data?.[key];
           const bg = STATE_CARD_BG[key] ?? "";
           return (
             <Link
@@ -94,7 +94,11 @@ export function DashboardPage() {
               >
                 <CardContent className="py-4">
                   <div className="text-3xl font-bold tabular-nums">
-                    {count.toLocaleString()}
+                    {statsQuery.isLoading ? (
+                      <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
+                    ) : (
+                      (count ?? 0).toLocaleString()
+                    )}
                   </div>
                   <div className="mt-1.5">
                     <StateBadge state={key} />
@@ -108,7 +112,13 @@ export function DashboardPage() {
           <Card className="bg-success-subtle/50 text-center transition-colors hover:opacity-80">
             <CardContent className="py-4">
               <div className="text-3xl font-bold tabular-nums">
-                {completedPerHour != null ? completedPerHour.toLocaleString() : "—"}
+                {queuesQuery.isLoading ? (
+                  <span className="inline-block h-9 w-12 animate-pulse rounded bg-muted" />
+                ) : completedPerHour != null ? (
+                  completedPerHour.toLocaleString()
+                ) : (
+                  "—"
+                )}
               </div>
               <div className="mt-1.5 text-xs text-muted-fg">completed/hr</div>
             </CardContent>

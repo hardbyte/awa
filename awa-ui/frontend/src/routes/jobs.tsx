@@ -404,7 +404,10 @@ export function JobsPage() {
                 }
               >
                 <div className="flex items-center gap-2">
-                  <span className="font-medium">{job.kind}</span>
+                  <span className="font-medium">
+                    {job.kind}
+                    <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                  </span>
                   <StateBadge state={job.state} />
                   {job.priority !== 2 && (
                     <Badge
@@ -488,7 +491,10 @@ export function JobsPage() {
               }
               className="cursor-pointer"
             >
-              <TableCell className="font-medium">{job.kind}</TableCell>
+              <TableCell className="font-medium">
+                {job.kind}
+                <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+              </TableCell>
               <TableCell>
                 <StateBadge state={job.state} />
               </TableCell>
@@ -555,7 +561,7 @@ export function JobsPage() {
           {jobs.length > 0 && (
             <span className="text-sm text-muted-fg">
               Showing {jobs.length} job{jobs.length !== 1 ? "s" : ""}
-              {total !== undefined && ` of ~${total.toLocaleString()}`}
+              {total !== undefined && ` of ${total.toLocaleString()} total`}
             </span>
           )}
         </div>

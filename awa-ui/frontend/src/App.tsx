@@ -15,8 +15,12 @@ import { QueueDetailPage } from "./routes/queue-detail";
 import { CronPage } from "./routes/cron";
 import { RuntimePage } from "./routes/runtime";
 import { RuntimeInstancePage } from "./routes/runtime-detail";
+import { NotFoundPage } from "./routes/not-found";
 
-const rootRoute = createRootRoute({ component: Shell });
+const rootRoute = createRootRoute({
+  component: Shell,
+  notFoundComponent: NotFoundPage,
+});
 
 const dashboardRoute = createRoute({
   getParentRoute: () => rootRoute,
