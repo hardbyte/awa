@@ -127,6 +127,27 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | OT2 | OTLP export: awa.job.claimed reaches collector | Telemetry (E2E) | Implemented |
 | OT3 | OTLP export: awa.dispatch.claim_batches reaches collector | Telemetry (E2E) | Implemented |
 | OT4 | OTLP export: awa.job.duration histogram reaches collector | Telemetry (E2E) | Implemented |
+| FB1 | Failure-mode benchmark: terminal 1/10/50% throughput | Failure bench | Implemented |
+| FB2 | Failure-mode benchmark: retryable 1/10/50% throughput | Failure bench | Implemented |
+| FB3 | Failure-mode benchmark: callback timeout 10% with rescue | Failure bench | Implemented |
+| FB4 | Failure-mode benchmark: deadline hang 10% with rescue | Failure bench | Implemented |
+| FB5 | Failure-mode benchmark: snooze once 10% | Failure bench | Implemented |
+| FB6 | Failure-mode benchmark: mixed all modes | Failure bench | Implemented |
+| FB7 | Stale-heartbeat rescue benchmark (orphaned running jobs) | Failure bench | Implemented |
+| FB8 | Python failure benchmark: terminal/retryable/callback/mixed | Failure bench | Implemented |
+| TLA1 | TLA+ AwaCore: lease-guarded finalization, stale completion rejected | Formal model | Implemented |
+| TLA2 | TLA+ AwaExtended: shutdown/rescue/permit/fairness protocol | Formal model | Implemented |
+| TLA3 | TLA+ AwaCbk: at-most-once callback resolution under three-way race | Formal model | Implemented |
+| TLA4 | TLA+ AwaCron: no duplicate fire under leader failover | Formal model | Implemented |
+| TLA5 | TLA+ AwaBatcher: at-most-once completion through batcher+fallback path | Formal model | Implemented |
+| BR1 | tokio-postgres bridge: commit/rollback atomicity | Bridge | Implemented |
+| BR2 | tokio-postgres bridge: lease guard prevents stale completion | Bridge | Implemented |
+| BR3 | tokio-postgres bridge: unique conflict mapping | Bridge | Implemented |
+| BR4 | Python bridge: asyncpg/psycopg/SQLAlchemy/Django insert | Bridge | Implemented |
+| RO1 | Read-only serve: capabilities endpoint reports read_only | UI (admin) | Implemented |
+| RO2 | Read-only serve: mutation endpoints return 503 | UI (admin) | Implemented |
+| RO3 | Read-only serve: frontend disables admin buttons | UI (admin) | Implemented |
+| HA1 | Postgres failover smoke: primary→replica cutover, insert + promote | HA failover | Implemented |
 
 ## Running Tests
 
@@ -166,6 +187,26 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 
 # COPY benchmark
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test benchmark_test test_throughput_copy_insert -- --ignored --nocapture
+
+# Failure-mode benchmark matrix (Rust)
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test failure_benchmark_test test_failure_bench_full_matrix -- --exact --ignored --nocapture
+
+# Stale-heartbeat rescue benchmark
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test failure_benchmark_test test_failure_bench_stale_heartbeat_rescue -- --exact --ignored --nocapture
+
+# Python failure-mode benchmarks
+cd awa-python && PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run python scripts/benchmark_runtime.py --scenario failures
+
+# TLA+ correctness models (requires Docker)
+./correctness/run-tlc.sh AwaCore.tla
+./correctness/run-tlc.sh AwaExtended.tla
+./correctness/run-tlc.sh AwaBatcher.tla
+./correctness/run-tlc.sh AwaBatcher.tla AwaBatcherLiveness.cfg
+./correctness/run-tlc.sh AwaCbk.tla
+./correctness/run-tlc.sh AwaCron.tla AwaCronLiveness.cfg
+
+# tokio-postgres bridge tests
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa-model --test bridge_tokio_pg_test -- --ignored --nocapture
 
 # Bug fix tests (state guard, unique conflict field)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test executor_guard_test -- --nocapture
