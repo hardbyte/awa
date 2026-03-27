@@ -33,37 +33,37 @@
     "handler_per_s": 160.3
   },
   "python/copy": {
-    "enqueue_per_s": 18490.7
+    "enqueue_per_s": 17804.8
   },
   "python/hot": {
-    "handler_per_s": 3407.5
+    "handler_per_s": 2827.5
   },
   "python/scheduled": {
-    "handler_per_s": 594.4,
-    "p99_ms": 29906.7
+    "handler_per_s": 837.3,
+    "p99_ms": 27330.0
   },
   "python/terminal_1pct": {
-    "handler_per_s": 1232.2
+    "handler_per_s": 453.9
   },
   "python/terminal_10pct": {
-    "handler_per_s": 395.4
+    "handler_per_s": 513.4
   },
   "python/terminal_50pct": {
-    "handler_per_s": 694.8
+    "handler_per_s": 381.3
   },
   "python/retryable_1pct": {
-    "handler_per_s": 494.8
+    "handler_per_s": 1261.5
   },
   "python/retryable_10pct": {
-    "handler_per_s": 1301.7
+    "handler_per_s": 418.0
   },
   "python/retryable_50pct": {
-    "handler_per_s": 549.9
+    "handler_per_s": 435.3
   },
   "python/callback_timeout_10pct": {
-    "handler_per_s": 229.3
+    "handler_per_s": 210.1
   },
   "python/mixed_50pct": {
-    "handler_per_s": 932.2
+    "handler_per_s": 455.6
   }
 }
