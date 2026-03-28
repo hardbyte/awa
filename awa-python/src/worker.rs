@@ -4,7 +4,6 @@ use awa_model::JobRow;
 use awa_worker::{JobContext, JobError, JobResult, Worker};
 use pyo3::prelude::*;
 use std::fmt;
-use tracing::warn;
 
 #[derive(Debug)]
 struct PythonHandlerError {
@@ -129,10 +128,6 @@ fn classify_handler_result(value: Py<PyAny>) -> PyResult<JobResult> {
     })
 }
 
-/// Maximum traceback lines stored in the DB `errors` JSONB array.
-/// Full tracebacks go to structured logs for debugging.
-const MAX_DB_TRACEBACK_LINES: usize = 10;
-
 fn classify_python_error(err: PyErr, force_terminal: bool) -> JobError {
     Python::attach(|py| {
         let error_type = err
@@ -145,7 +140,11 @@ fn classify_python_error(err: PyErr, force_terminal: bool) -> JobError {
             .traceback(py)
             .and_then(|tb| tb.format().ok())
             .unwrap_or_default();
-
+        let formatted = if traceback.is_empty() {
+            format!("{error_type}: {error_message}")
+        } else {
+            format!("{error_type}: {error_message}\n{traceback}")
+        };
         let is_terminal = force_terminal
             || py
                 .import("awa")
@@ -153,47 +152,10 @@ fn classify_python_error(err: PyErr, force_terminal: bool) -> JobError {
                 .map(|terminal| err.get_type(py).is_subclass(&terminal).unwrap_or(false))
                 .unwrap_or(false);
 
-        // Structured log with discrete fields for filtering/alerting.
-        // The full traceback goes here (not truncated) so operators can
-        // search by exception_type or grep for specific frames.
-        warn!(
-            python.exception_type = %error_type,
-            python.message = %error_message,
-            python.terminal = is_terminal,
-            python.traceback = %traceback,
-            "Python handler error"
-        );
-
-        // For the DB errors array, truncate the traceback to keep row size
-        // reasonable. Full trace is in structured logs above.
-        let truncated_tb = if traceback.is_empty() {
-            String::new()
-        } else {
-            let lines: Vec<&str> = traceback.lines().collect();
-            if lines.len() <= MAX_DB_TRACEBACK_LINES {
-                traceback.clone()
-            } else {
-                let kept: Vec<&str> = lines[lines.len() - MAX_DB_TRACEBACK_LINES..].to_vec();
-                format!(
-                    "... ({} frames truncated, full trace in logs)\n{}",
-                    lines.len() - MAX_DB_TRACEBACK_LINES,
-                    kept.join("\n")
-                )
-            }
-        };
-
-        let db_message = if truncated_tb.is_empty() {
-            format!("{error_type}: {error_message}")
-        } else {
-            format!("{error_type}: {error_message}\n{truncated_tb}")
-        };
-
         if is_terminal {
-            JobError::terminal(db_message)
+            JobError::terminal(formatted)
         } else {
-            JobError::retryable(PythonHandlerError {
-                message: db_message,
-            })
+            JobError::retryable(PythonHandlerError { message: formatted })
         }
     })
 }
