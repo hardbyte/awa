@@ -42,7 +42,7 @@ async def test_worker_dispatch_completes_jobs(client):
     # Track completed jobs
     completed = []
 
-    @client.worker(DispatchEmail, queue=queue)
+    @client.task(DispatchEmail, queue=queue)
     async def handle_email(job):
         completed.append(job.args.to)
         return None  # Completed
@@ -74,7 +74,7 @@ async def test_worker_dispatch_retries_on_error(client):
     """Handler exceptions cause jobs to become retryable."""
     queue = "dispatch_retry"
 
-    @client.worker(DispatchFailing, queue=queue)
+    @client.task(DispatchFailing, queue=queue)
     async def handle_failing(job):
         raise ValueError("transient failure")
 
@@ -107,7 +107,7 @@ async def test_worker_dispatch_handles_cancel(client):
     """Handler returning Cancel marks job as cancelled."""
     queue = "dispatch_cancel"
 
-    @client.worker(DispatchEmail, queue=queue)
+    @client.task(DispatchEmail, queue=queue)
     async def handle_cancel(job):
         return awa.Cancel(reason="not needed")
 
@@ -134,7 +134,7 @@ async def test_worker_dispatch_shutdown_is_clean(client):
     """Shutdown stops the dispatch loop without errors."""
     queue = "dispatch_shutdown"
 
-    @client.worker(DispatchEmail, queue=queue)
+    @client.task(DispatchEmail, queue=queue)
     async def handle(job):
         return None
 
@@ -159,7 +159,7 @@ async def test_worker_dispatch_shutdown_signals_cancellation(client):
     started = asyncio.Event()
     observed = asyncio.Event()
 
-    @client.worker(DispatchEmail, queue=queue)
+    @client.task(DispatchEmail, queue=queue)
     async def handle(job):
         started.set()
         while not job.is_cancelled():
@@ -183,7 +183,7 @@ async def test_worker_dispatch_health_check(client):
     """Health check reflects the Rust runtime state while workers are running."""
     queue = "dispatch_health"
 
-    @client.worker(DispatchEmail, queue=queue)
+    @client.task(DispatchEmail, queue=queue)
     async def handle(job):
         await asyncio.sleep(0.05)
         return None
@@ -201,9 +201,9 @@ async def test_worker_dispatch_health_check(client):
 
 @pytest.mark.asyncio
 async def test_worker_dispatch_validates_registered_queue(client):
-    """start() rejects configurations that ignore @client.worker queue declarations."""
+    """start() rejects configurations that ignore @client.task queue declarations."""
 
-    @client.worker(DispatchEmail, queue="dispatch_declared")
+    @client.task(DispatchEmail, queue="dispatch_declared")
     async def handle(job):
         return None
 

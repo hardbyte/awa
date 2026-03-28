@@ -74,7 +74,7 @@ async def main():
 
     # ── Worker handlers (WORKER PROCESS in production) ────────────
 
-    @client.worker(ImportTable, queue="etl")
+    @client.task(ImportTable, queue="etl")
     async def handle_import(job):
         table = job.args.source_table
         batch_size = job.args.batch_size
@@ -111,7 +111,7 @@ async def main():
 
         print(f"  ✓ {table}: imported {rows_imported} rows")
 
-    @client.worker(AggregateMetrics, queue="etl")
+    @client.task(AggregateMetrics, queue="etl")
     async def handle_aggregate(job):
         tables = job.args.tables
         for i, table in enumerate(tables):

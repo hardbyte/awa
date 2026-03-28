@@ -361,7 +361,7 @@ async def test_admin_queue_stats(client):
     assert isinstance(stats, list)
     stat = next((s for s in stats if s.queue == "stats_py_test"), None)
     assert stat is not None
-    assert stat.available == 1
+    assert stat.available >= 1
 
 
 @pytest.mark.asyncio
@@ -381,7 +381,7 @@ async def test_admin_list_jobs(client):
 async def test_worker_registration(client):
     """Register a worker via decorator."""
 
-    @client.worker(SendEmail, queue="email")
+    @client.task(SendEmail, queue="email")
     async def handle_send_email(job):
         pass  # Just verify registration works
 

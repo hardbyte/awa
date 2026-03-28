@@ -42,7 +42,7 @@ async def test_periodic_registration(client):
     """periodic() registers a cron schedule that appears in cron_jobs table."""
     queue = "periodic_reg"
 
-    @client.worker(DailyReport, queue=queue)
+    @client.task(DailyReport, queue=queue)
     async def handle(job):
         return None
 
@@ -80,7 +80,7 @@ async def test_periodic_with_metadata_and_tags(client):
     """periodic() propagates metadata and tags to the cron_jobs table."""
     queue = "periodic_meta"
 
-    @client.worker(HourlySync, queue=queue)
+    @client.task(HourlySync, queue=queue)
     async def handle(job):
         return None
 
@@ -119,7 +119,7 @@ async def test_periodic_invalid_cron_expr(client):
     """periodic() with invalid cron expression raises an error."""
     queue = "periodic_invalid"
 
-    @client.worker(DailyReport, queue=queue)
+    @client.task(DailyReport, queue=queue)
     async def handle(job):
         return None
 
@@ -138,7 +138,7 @@ async def test_periodic_invalid_timezone(client):
     """periodic() with invalid timezone raises an error."""
     queue = "periodic_bad_tz"
 
-    @client.worker(DailyReport, queue=queue)
+    @client.task(DailyReport, queue=queue)
     async def handle(job):
         return None
 
@@ -168,7 +168,7 @@ async def test_periodic_fires_and_executes(client):
     queue = "periodic_fire"
     executed = []
 
-    @client.worker(DailyReport, queue=queue)
+    @client.task(DailyReport, queue=queue)
     async def handle(job):
         executed.append(job.args)
         return None

@@ -103,6 +103,8 @@ pub struct PyJob {
     progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
     /// Progress JSON from the job row (for queried jobs).
     progress_json: Option<serde_json::Value>,
+    /// Error history from the job row (array of {error, attempt, at} objects).
+    errors_json: Option<Vec<serde_json::Value>>,
     pub run_at: DateTime<Utc>,
     pub deadline_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
@@ -128,6 +130,7 @@ impl Clone for PyJob {
             pool: self.pool.clone(),
             progress_buffer: self.progress_buffer.clone(),
             progress_json: self.progress_json.clone(),
+            errors_json: self.errors_json.clone(),
             run_at: self.run_at,
             deadline_at: self.deadline_at,
             created_at: self.created_at,
@@ -177,6 +180,25 @@ impl PyJob {
             .as_ref()
             .map(|flag| flag.load(Ordering::SeqCst))
             .unwrap_or(false)
+    }
+
+    /// Error history — list of dicts with 'error', 'attempt', and 'at' keys.
+    /// Empty list for jobs that haven't errored.
+    #[getter]
+    fn errors(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
+        match &self.errors_json {
+            Some(errors) => {
+                let list = pyo3::types::PyList::empty(py);
+                for err in errors {
+                    list.append(json_to_py(py, err)?)?;
+                }
+                Ok(list.into_any().unbind())
+            }
+            None => {
+                let list = pyo3::types::PyList::empty(py);
+                Ok(list.into_any().unbind())
+            }
+        }
     }
 
     /// Get progress as a Python dict, or None if no progress has been set.
@@ -407,6 +429,7 @@ impl PyJob {
 impl From<JobRow> for PyJob {
     fn from(row: JobRow) -> Self {
         let progress_json = row.progress.clone();
+        let errors_json = row.errors.clone();
         PyJob {
             id: row.id,
             kind: row.kind,
@@ -424,6 +447,7 @@ impl From<JobRow> for PyJob {
             pool: None,
             progress_buffer: None,
             progress_json,
+            errors_json,
             run_at: row.run_at,
             deadline_at: row.deadline_at,
             created_at: row.created_at,

@@ -9,7 +9,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 ## Features
 
 - **Postgres-only** — one dependency you already have.
-- **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone. Works with Awa's own transactions, your existing psycopg3/asyncpg/SQLAlchemy/Django connection (Python), or tokio-postgres (Rust).
+- **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone.
 - **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
 - **Rust and Python workers** — same queues, identical semantics, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
@@ -22,7 +22,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Hot/cold storage** — runnable work in a hot table, deferred work in a cold table.
 - **Rate limiting** — per-queue token bucket. **Weighted concurrency** — global worker pool with per-queue guarantees.
 
-Awa ships benchmark harnesses for both Rust and Python, covering hot-path workers, deferred scheduling, failure scenarios, and multi-producer enqueue contention. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) for methodology and sample reference results across laptop and server hardware.
+Local benchmarks show ~8k jobs/sec sustained throughput (Rust workers), ~5k jobs/sec (Python workers), and sub-10ms p50 pickup latency. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) for methodology and caveats.
 
 Core concurrency invariants (no duplicate processing after rescue, stale completions rejected, shutdown drain ordering) are checked with [TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md) covering single and multi-instance deployments.
 
@@ -65,7 +65,7 @@ async def main():
     client = awa.AsyncClient("postgres://localhost/mydb")
     await client.migrate()
 
-    @client.worker(SendEmail, queue="email")
+    @client.task(SendEmail, queue="email")
     async def handle_email(job):
         print(f"Sending to {job.args.to}: {job.args.subject}")
 
@@ -84,7 +84,7 @@ asyncio.run(main())
 **Progress tracking** — checkpoint and resume on retry:
 
 ```python
-@client.worker(BatchImport, queue="etl")
+@client.task(BatchImport, queue="etl")
 async def handle_import(job):
     last_id = (job.progress or {}).get("metadata", {}).get("last_id", 0)
     for item in fetch_items(after=last_id):
@@ -108,22 +108,6 @@ async with await client.transaction() as tx:
 client = awa.Client("postgres://localhost/mydb")
 client.migrate()
 job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
-```
-
-**ORM transaction bridging** — insert jobs within your existing psycopg3, asyncpg, SQLAlchemy, or Django transaction. No separate Awa connection needed:
-
-```python
-from awa.bridge import insert_job_sync
-
-# Django
-with transaction.atomic():
-    Order.objects.create(...)
-    insert_job_sync(connection, SendEmail(to="alice@example.com", subject="Order confirmed"))
-
-# SQLAlchemy
-with Session(engine) as session, session.begin():
-    session.execute(...)
-    insert_job_sync(session, SendEmail(to="alice@example.com", subject="Order confirmed"))
 ```
 
 See [`examples/python/`](https://github.com/hardbyte/awa/tree/main/examples/python) for complete runnable scripts tested in CI.
@@ -174,18 +158,6 @@ let client = Client::builder(pool)
     })
     .build()?;
 client.start().await?;
-```
-
-**tokio-postgres bridge** — insert jobs within existing tokio-postgres transactions (see [bridge adapters](https://github.com/hardbyte/awa/blob/main/docs/bridge-adapters.md)):
-
-```rust
-use awa::bridge::tokio_pg; // requires features = ["tokio-postgres"]
-
-// pg_client is a &mut tokio_postgres::Client (not the Awa Client above)
-let txn = pg_client.transaction().await?;
-txn.execute("INSERT INTO orders ...", &[&order_id]).await?;
-tokio_pg::insert_job(&txn, &SendEmail { to: "alice@example.com".into(), subject: "Confirmed".into() }).await?;
-txn.commit().await?;
 ```
 
 ## Installation
@@ -263,7 +235,6 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 | [Python getting started](https://github.com/hardbyte/awa/blob/main/docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
 | [Deployment guide](https://github.com/hardbyte/awa/blob/main/docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
 | [Migration guide](https://github.com/hardbyte/awa/blob/main/docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
-| [Bridge adapters](https://github.com/hardbyte/awa/blob/main/docs/bridge-adapters.md) | tokio-postgres, psycopg3, asyncpg, SQLAlchemy, Django bridging |
 | [Configuration reference](https://github.com/hardbyte/awa/blob/main/docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
 | [Troubleshooting](https://github.com/hardbyte/awa/blob/main/docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
 | [Architecture overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) | System design, data flow, state machine, crash recovery |
@@ -291,8 +262,6 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 - [013: Durable run leases and guarded finalization](https://github.com/hardbyte/awa/blob/main/docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
 - [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
-- [016: Bridge adapters for non-sqlx transactional enqueue](https://github.com/hardbyte/awa/blob/main/docs/adr/016-bridge-adapters.md)
-- [017: Python insert-only transaction bridging](https://github.com/hardbyte/awa/blob/main/docs/adr/017-python-transaction-bridging.md)
 
 </details>
 

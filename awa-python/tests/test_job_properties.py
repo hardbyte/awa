@@ -107,7 +107,7 @@ async def test_deadline_set_during_execution(client):
     queue = "props_deadline_running"
     observed_deadline = []
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         # During execution, the job should have a deadline
         fetched = await client.get_job(job.id)
@@ -141,7 +141,7 @@ async def test_progress_readable_on_retrying_job(client):
     """Progress set during execution is readable via get_job on a retrying job."""
     queue = "props_progress_retry"
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         job.set_progress(65, "two thirds done")
         job.update_metadata({"batch": 42})
@@ -166,7 +166,7 @@ async def test_progress_cleared_on_completed_job(client):
     """Completed jobs have progress cleared to None."""
     queue = "props_progress_complete"
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         job.set_progress(100, "done")
         return None
@@ -187,7 +187,7 @@ async def test_progress_preserved_on_failed_job(client):
     """Failed jobs retain their progress for operator inspection."""
     queue = "props_progress_fail"
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         job.set_progress(10, "about to fail")
         raise awa.TerminalError("fatal")
@@ -209,7 +209,7 @@ async def test_progress_preserved_on_cancelled_job(client):
     """Cancelled jobs retain their progress."""
     queue = "props_progress_cancel"
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         job.set_progress(50, "cancelling")
         return awa.Cancel("user request")
@@ -235,7 +235,7 @@ async def test_progress_readable_during_execution(client):
     queue = "props_progress_live"
     observations = []
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         assert job.progress is None  # no prior progress
 
@@ -272,7 +272,7 @@ async def test_progress_clamped_to_100(client):
     queue = "props_progress_clamp"
     values = []
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         job.set_progress(200, "over")
         values.append(job.progress["percent"])
@@ -296,7 +296,7 @@ async def test_update_metadata_shallow_merge(client):
     queue = "props_meta_merge"
     results = []
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         job.update_metadata({"a": 1, "b": 2})
         job.update_metadata({"b": 99, "c": 3})  # overwrites b, adds c
@@ -320,7 +320,7 @@ async def test_update_metadata_rejects_non_dict(client):
     queue = "props_meta_bad"
     errors = []
 
-    @client.worker(PropsJob, queue=queue)
+    @client.task(PropsJob, queue=queue)
     async def handle(job):
         try:
             job.update_metadata("not a dict")

@@ -27,7 +27,7 @@ async def main():
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
 
-    @client.worker(BatchImport, queue="etl")
+    @client.task(BatchImport, queue="etl")
     async def handle_import(job):
         # On retry, resume from the last checkpoint
         last_id = (job.progress or {}).get("metadata", {}).get("last_id", 0)

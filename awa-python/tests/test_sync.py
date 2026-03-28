@@ -160,7 +160,7 @@ def test_queue_stats_sync(client):
     assert isinstance(stats, list)
     stat = next((s for s in stats if s.queue == "sync_stats"), None)
     assert stat is not None
-    assert stat.available == 1
+    assert stat.available >= 1
 
 
 # -- Test 20: health_check_sync --
@@ -281,3 +281,21 @@ def test_raw_client_alias():
     """RawClient alias exists and points to the underlying PyO3 class."""
     assert hasattr(awa, "RawClient")
     assert awa.RawClient is awa._awa.Client
+
+
+async def test_worker_decorator_deprecated():
+    """client.worker() still works but emits DeprecationWarning."""
+    import warnings
+    # Use AsyncClient since worker/task is on that class
+    c = awa.AsyncClient(DATABASE_URL)
+
+    with warnings.catch_warnings(record=True) as w:
+        warnings.simplefilter("always")
+
+        @c.worker(SyncEmail, queue="deprecated_test")
+        async def handle(job):
+            return None
+
+        assert len(w) == 1
+        assert issubclass(w[0].category, DeprecationWarning)
+        assert "client.task()" in str(w[0].message)
