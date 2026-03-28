@@ -1078,3 +1078,173 @@ async fn test_heartbeat_callback_not_found_for_completed_job() {
         "Heartbeat on completed job should return CallbackNotFound, got: {result:?}"
     );
 }
+
+// ── Sequential callbacks (resume from wait) ─────────────────────
+
+#[tokio::test]
+async fn test_sequential_callback_resume() {
+    let client = setup().await;
+    let queue = "test_sequential_resume";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 300 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    // Claim and start execution
+    client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+
+    // Job should be waiting for callback
+    let waiting = client.get_job(job.id).await.unwrap();
+    assert_eq!(waiting.state, JobState::WaitingExternal);
+    let callback_id = waiting.callback_id.unwrap();
+
+    // Resume with payload (not complete — the handler would continue)
+    let resumed = admin::resume_external(
+        client.pool(),
+        callback_id,
+        Some(serde_json::json!({"payment_id": "pay_123", "amount": 42.50})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(resumed.state, JobState::Running);
+
+    // The payload should be stored in metadata
+    let result = resumed.metadata.get("_awa_callback_result");
+    assert!(result.is_some(), "Resume payload should be in metadata");
+    assert_eq!(
+        result.unwrap().get("payment_id").and_then(|v| v.as_str()),
+        Some("pay_123")
+    );
+
+    // Heartbeat should be refreshed
+    assert!(
+        resumed.heartbeat_at.is_some(),
+        "Heartbeat should be refreshed on resume"
+    );
+}
+
+#[tokio::test]
+async fn test_resume_then_complete() {
+    let client = setup().await;
+    let queue = "test_resume_complete";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 301 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+
+    let waiting = client.get_job(job.id).await.unwrap();
+    let cb1 = waiting.callback_id.unwrap();
+
+    // First callback: resume
+    admin::resume_external(
+        client.pool(),
+        cb1,
+        Some(serde_json::json!({"step": 1})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    // Job is now running — register a second callback (use current run_lease)
+    let resumed_job = client.get_job(job.id).await.unwrap();
+    let cb2 = admin::register_callback(
+        client.pool(),
+        job.id,
+        resumed_job.run_lease,
+        std::time::Duration::from_secs(3600),
+    )
+    .await
+    .unwrap();
+
+    // Transition to waiting_external for second wait
+    sqlx::query(
+        "UPDATE awa.jobs SET state = 'waiting_external', heartbeat_at = NULL WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    // Second callback: complete (not resume)
+    let completed = admin::complete_external(
+        client.pool(),
+        cb2,
+        Some(serde_json::json!({"step": 2, "final": true})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(completed.state, JobState::Completed);
+}
+
+#[tokio::test]
+async fn test_resume_not_found_after_complete() {
+    let client = setup().await;
+    let queue = "test_resume_not_found";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 302 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+
+    let waiting = client.get_job(job.id).await.unwrap();
+    let callback_id = waiting.callback_id.unwrap();
+
+    // Complete normally first
+    admin::complete_external(client.pool(), callback_id, None, None)
+        .await
+        .unwrap();
+
+    // Resume on a completed job should fail
+    let result = admin::resume_external(
+        client.pool(),
+        callback_id,
+        Some(serde_json::json!({"too": "late"})),
+        None,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(awa::AwaError::CallbackNotFound { .. })),
+        "Resume after complete should fail: {result:?}"
+    );
+}

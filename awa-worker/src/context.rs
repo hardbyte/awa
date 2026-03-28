@@ -152,6 +152,105 @@ impl JobContext {
         Ok(CallbackGuard::new(callback_id))
     }
 
+    /// Wait for an external callback to resolve, then resume with the payload.
+    ///
+    /// This enables sequential callbacks: the handler can register a callback,
+    /// wait for it, process the result, register another callback, wait again,
+    /// and so on — all within a single handler invocation.
+    ///
+    /// The handler's async task suspends while waiting. The job transitions to
+    /// `waiting_external`. When `resume_external(callback_id, payload)` is
+    /// called, the job transitions back to `running` and this method returns
+    /// the payload.
+    ///
+    /// The handler holds its permit (worker slot) during the wait. For very
+    /// long waits, consider whether the single-shot `WaitForCallback` pattern
+    /// (which releases the permit) is more appropriate.
+    ///
+    /// ```ignore
+    /// let token = ctx.register_callback(Duration::from_secs(3600)).await?;
+    /// send_to_external_system(token.id());
+    /// let payload = ctx.wait_for_callback(token).await?;
+    /// // Handler resumes here with the external system's response
+    /// ```
+    pub async fn wait_for_callback(
+        &self,
+        _guard: CallbackGuard,
+    ) -> Result<serde_json::Value, AwaError> {
+        // Transition to waiting_external
+        let result = sqlx::query(
+            r#"
+            UPDATE awa.jobs
+            SET state = 'waiting_external',
+                heartbeat_at = NULL,
+                deadline_at = NULL
+            WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id IS NOT NULL
+            "#,
+        )
+        .bind(self.job.id)
+        .bind(self.job.run_lease)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(AwaError::Validation(
+                "wait_for_callback: job is not in running state with a registered callback".into(),
+            ));
+        }
+
+        // Poll DB until the callback is resolved (state changes from waiting_external).
+        // resume_external sets state to 'running' and stores payload in metadata.
+        loop {
+            // Check for cancellation (shutdown, deadline)
+            if self.is_cancelled() {
+                return Err(AwaError::Validation(
+                    "job cancelled while waiting for callback".into(),
+                ));
+            }
+
+            let row: Option<(awa_model::JobState, serde_json::Value)> =
+                sqlx::query_as("SELECT state, metadata FROM awa.jobs WHERE id = $1")
+                    .bind(self.job.id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            match row {
+                Some((awa_model::JobState::Running, metadata)) => {
+                    // Resumed! Extract the callback result from metadata.
+                    let payload = metadata
+                        .get("_awa_callback_result")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+
+                    // Clean up the reserved metadata key
+                    sqlx::query(
+                        "UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1",
+                    )
+                    .bind(self.job.id)
+                    .execute(&self.pool)
+                    .await?;
+
+                    return Ok(payload);
+                }
+                Some((awa_model::JobState::WaitingExternal, _)) => {
+                    // Still waiting — sleep and poll again
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                Some((state, _)) => {
+                    // Job was rescued, cancelled, or otherwise moved out of waiting
+                    return Err(AwaError::Validation(format!(
+                        "job left waiting_external unexpectedly: state={state:?}"
+                    )));
+                }
+                None => {
+                    return Err(AwaError::Validation(
+                        "job not found during callback wait".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Set structured progress (0-100 with message). Sync — writes to in-memory buffer.
     ///
     /// `percent` is clamped to 0-100. For progress without a message, pass `""`.
