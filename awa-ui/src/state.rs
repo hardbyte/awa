@@ -1,17 +1,16 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Serialize;
 use sqlx::PgPool;
 
-use crate::cache::ResponseCache;
+use crate::cache::DashboardCache;
 use crate::error::ApiError;
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub read_only: bool,
-    pub cache: Arc<ResponseCache>,
+    pub cache: DashboardCache,
     /// Suggested frontend poll interval — at least as long as the cache TTL
     /// so clients don't poll faster than the cache can refresh.
     pub poll_interval_ms: u64,
@@ -23,7 +22,7 @@ impl AppState {
         Self {
             pool,
             read_only,
-            cache: Arc::new(ResponseCache::new(cache_ttl)),
+            cache: DashboardCache::new(cache_ttl),
             poll_interval_ms,
         }
     }

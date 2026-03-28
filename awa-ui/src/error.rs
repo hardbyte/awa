@@ -21,6 +21,20 @@ impl From<sqlx::Error> for ApiError {
     }
 }
 
+impl From<std::sync::Arc<crate::cache::CacheError>> for ApiError {
+    fn from(err: std::sync::Arc<crate::cache::CacheError>) -> Self {
+        // Moka wraps try_get_with errors in Arc. Extract the inner AwaError
+        // if we're the only holder, otherwise create a database-level error
+        // from the description.
+        let cache_err = std::sync::Arc::try_unwrap(err).unwrap_or_else(|arc| (*arc).clone());
+        ApiError::Awa(
+            std::sync::Arc::try_unwrap(cache_err.0).unwrap_or_else(|arc| {
+                awa_model::AwaError::Database(sqlx::Error::Protocol(arc.to_string()))
+            }),
+        )
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, message) = match self {
