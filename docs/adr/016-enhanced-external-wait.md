@@ -1,4 +1,4 @@
-# ADR-016: Enhanced External Wait — Sequential Callbacks and Heartbeats
+# ADR-016: Sequential Callbacks and Callback Heartbeats
 
 ## Status
 
