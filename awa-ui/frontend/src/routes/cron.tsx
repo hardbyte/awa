@@ -14,15 +14,18 @@ import { Button } from "@/components/ui/button";
 import { CronExpr } from "@/components/CronExpr";
 import { JsonView } from "@/components/JsonView";
 import { timeAgo, timeUntil, formatInTimezone } from "@/lib/time";
+import { usePollInterval } from "@/hooks/use-poll-interval";
 
 export function CronPage() {
   const queryClient = useQueryClient();
   const [expandedName, setExpandedName] = useState<string | null>(null);
   const readOnly = useReadOnly();
+  const poll = usePollInterval();
 
   const cronQuery = useQuery<CronJobRow[]>({
     queryKey: ["cron"],
     queryFn: fetchCronJobs,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const triggerMutation = useMutation({

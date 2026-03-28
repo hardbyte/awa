@@ -4,13 +4,21 @@ use serde::Deserialize;
 
 use awa_model::admin;
 
+use crate::cache::CacheError;
 use crate::error::ApiError;
 use crate::state::AppState;
 
 pub async fn list_queues(
     State(state): State<AppState>,
 ) -> Result<Json<Vec<admin::QueueStats>>, ApiError> {
-    let stats = admin::queue_stats(&state.pool).await?;
+    let pool = state.pool.clone();
+    let stats = state
+        .cache
+        .queues
+        .try_get_with((), async {
+            admin::queue_stats(&pool).await.map_err(CacheError::from)
+        })
+        .await?;
     Ok(Json(stats))
 }
 

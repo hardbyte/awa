@@ -6,13 +6,21 @@ use std::collections::HashMap;
 use awa_model::admin;
 use awa_model::job::JobState;
 
+use crate::cache::CacheError;
 use crate::error::ApiError;
 use crate::state::{AppState, Capabilities};
 
 pub async fn get_stats(
     State(state): State<AppState>,
 ) -> Result<Json<HashMap<JobState, i64>>, ApiError> {
-    let counts = admin::state_counts(&state.pool).await?;
+    let pool = state.pool.clone();
+    let counts = state
+        .cache
+        .stats
+        .try_get_with((), async {
+            admin::state_counts(&pool).await.map_err(CacheError::from)
+        })
+        .await?;
     Ok(Json(counts))
 }
 
@@ -49,5 +57,6 @@ pub async fn get_capabilities(
 ) -> Result<Json<Capabilities>, ApiError> {
     Ok(Json(Capabilities {
         read_only: state.read_only,
+        poll_interval_ms: state.poll_interval_ms,
     }))
 }

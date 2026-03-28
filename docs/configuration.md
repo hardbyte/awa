@@ -1,184 +1,134 @@
-# Configuration Reference
+# Configuration
 
-This document covers the public runtime knobs for Rust, Python, and the CLI.
+AWA has three configuration surfaces: the **Rust runtime** (`ClientBuilder` + `QueueConfig`), the **Python runtime** (`client.start()`), and the **CLI** (`awa serve`, `awa job`, etc). This guide explains how they work rather than listing every option — use `--help`, IDE autocomplete, or the source for exhaustive reference.
 
-## QueueConfig
+## How configuration flows
 
-Rust workers configure each queue with `QueueConfig`.
+```
+┌────────────────────────────────────┐
+│  Worker process (Rust or Python)   │
+│  ─ QueueConfig per queue           │
+│  ─ ClientBuilder for runtime knobs │
+│  ─ Connects directly to Postgres   │
+└──────────────┬─────────────────────┘
+               │
+          PostgreSQL
+               │
+┌──────────────┴─────────────────────┐
+│  awa serve  (admin UI + API)       │
+│  ─ CLI flags / AWA_* env vars      │
+│  ─ Read-only safe (auto-detected)  │
+└────────────────────────────────────┘
+```
 
-| Field | Default | Meaning |
-|---|---|---|
-| `max_workers` | `50` | Maximum concurrent jobs for the queue in hard-reserved mode |
-| `poll_interval` | `200ms` | Poll fallback interval when no `NOTIFY` arrives |
-| `deadline_duration` | `5m` | Hard limit for a running attempt before deadline rescue |
-| `priority_aging_interval` | `60s` | How quickly lower-priority jobs age toward fairness |
-| `rate_limit` | `None` | Optional token bucket: `RateLimit { max_rate, burst }` |
-| `min_workers` | `0` | Guaranteed capacity in weighted mode |
-| `weight` | `1` | Overflow share in weighted mode |
+Workers and the UI server are separate processes. Workers own all queue machinery — the UI is a read-mostly dashboard with optional admin actions.
 
-### RateLimit
+## Queue configuration
 
-| Field | Default | Meaning |
-|---|---|---|
-| `max_rate` | none | Sustained jobs/sec allowed for the queue |
-| `burst` | `ceil(max_rate)` when `0` | Maximum burst size |
+Every queue needs a `QueueConfig`. The two fundamental choices are:
 
-Validation:
+1. **Hard-reserved mode** (default) — each queue gets a fixed `max_workers` slot count
+2. **Weighted mode** — call `global_max_workers(N)` to share a pool, with `min_workers` as a floor and `weight` for overflow
 
-- `max_rate` must be `> 0`
-- `weight` must be `> 0`
-
-## ClientBuilder
-
-Rust worker runtime configuration lives on `ClientBuilder`.
-
-| Method | Effective default | Meaning |
-|---|---|---|
-| `queue(name, config)` | required | Adds a queue; at least one queue must be configured |
-| `register::<T, _, _>(handler)` | none | Registers a typed Rust worker |
-| `register_worker(worker)` | none | Registers a raw `Worker` implementation |
-| `state(value)` | none | Adds shared typed state for `ctx.extract::<T>()` |
-| `heartbeat_interval(duration)` | `30s` | Heartbeat write interval |
-| `promote_interval(duration)` | `250ms` | Scheduled/retryable promotion tick |
-| `heartbeat_rescue_interval(duration)` | `30s` | Stale-heartbeat rescue tick |
-| `deadline_rescue_interval(duration)` | `30s` | Deadline rescue tick |
-| `callback_rescue_interval(duration)` | `30s` | Waiting-callback timeout rescue tick |
-| `leader_election_interval(duration)` | `10s` | Retry interval for non-leaders |
-| `leader_check_interval(duration)` | `30s` | Health check for the leader lock connection |
-| `global_max_workers(n)` | disabled | Enables weighted mode with a shared overflow pool |
-| `completed_retention(duration)` | `24h` | Retention for completed jobs |
-| `failed_retention(duration)` | `72h` | Retention for failed/cancelled jobs |
-| `cleanup_batch_size(n)` | `1000` | Max rows deleted per cleanup pass |
-| `cleanup_interval(duration)` | `60s` | Cleanup tick |
-| `queue_retention(queue, policy)` | none | Per-queue retention override |
-| `runtime_snapshot_interval(duration)` | `10s` | How often runtime health snapshots are published |
-| `periodic(job)` | none | Registers a cron schedule |
-| `build()` | none | Validates and constructs the runtime |
-
-Build validation:
-
-- at least one queue must exist
-- `cleanup_batch_size` must be `> 0`
-- in weighted mode, `sum(min_workers) <= global_max_workers`
-
-## Weighted Mode
-
-Weighted mode is enabled only when you call:
+### Rust
 
 ```rust
-.global_max_workers(N)
+let client = Client::builder()
+    .queue("email", QueueConfig {
+        max_workers: 20,
+        rate_limit: Some(RateLimit { max_rate: 50.0, burst: 50 }),
+        ..Default::default()
+    })
+    .queue("reports", QueueConfig {
+        max_workers: 5,
+        deadline_duration: Duration::from_secs(600),
+        ..Default::default()
+    })
+    .register::<SendEmail, _, _>(handle_email)
+    .register::<GenerateReport, _, _>(handle_report)
+    .build(&pool)
+    .await?;
 ```
 
-Then:
+The key `QueueConfig` fields:
 
-- `min_workers` becomes the guaranteed floor
-- `weight` controls overflow share
-- `max_workers` is no longer the primary capacity knob
+| Field | Default | When you'd change it |
+|---|---|---|
+| `max_workers` | `50` | Always — this is your concurrency cap per queue |
+| `rate_limit` | `None` | External API rate limits, backpressure |
+| `deadline_duration` | `5m` | Long-running jobs that need more time |
+| `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
+| `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 
-## Python Runtime Configuration
+### Python
 
-`awa.Client(database_url, max_connections=10)` creates a synchronous client.
-`awa.AsyncClient(database_url, max_connections=10)` has the same constructor for async use.
-
-`client.start(...)` controls worker runtime settings.
-
-### Queue Config Shapes
-
-Hard-reserved mode supports tuple form:
+Tuple form for simple cases, dict form for full control:
 
 ```python
-client.start([("email", 10)])
-```
+# Hard-reserved — just (name, max_workers)
+client.start([("email", 10), ("reports", 5)])
 
-Dict form is also supported:
-
-```python
+# Dict form — rate limiting, weighted mode, retention
 client.start([
-    {"name": "email", "max_workers": 10, "rate_limit": (100.0, 100)}
+    {"name": "email", "max_workers": 10, "rate_limit": (50.0, 50)},
+    {"name": "reports", "max_workers": 5},
 ])
 ```
 
-Weighted mode requires dict form:
+Weighted mode requires dict form and `global_max_workers`:
 
 ```python
 client.start(
-    [{"name": "email", "min_workers": 5, "weight": 2}],
+    [{"name": "email", "min_workers": 5, "weight": 2},
+     {"name": "reports", "min_workers": 2, "weight": 1}],
     global_max_workers=20,
 )
 ```
 
-### Python `start()` kwargs
+### Weighted mode
 
-| Kwarg | Default | Meaning |
-|---|---|---|
-| `poll_interval_ms` | `200` | Poll fallback interval |
-| `global_max_workers` | `None` | Enables weighted mode |
-| `completed_retention_hours` | runtime default | Completed retention |
-| `failed_retention_hours` | runtime default | Failed/cancelled retention |
-| `cleanup_batch_size` | runtime default | Cleanup batch size |
-| `leader_election_interval_ms` | runtime default | Leader retry interval |
-| `heartbeat_interval_ms` | runtime default | Heartbeat interval |
-| `promote_interval_ms` | runtime default | Scheduled promotion interval |
-| `heartbeat_rescue_interval_ms` | runtime default | Stale-heartbeat rescue interval |
-| `deadline_rescue_interval_ms` | runtime default | Deadline rescue interval |
-| `callback_rescue_interval_ms` | runtime default | Callback-timeout rescue interval |
+Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Each queue's `min_workers` is guaranteed; remaining capacity is distributed by `weight`. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.
 
-### Python Queue Dict Keys
+## Runtime tuning
 
-| Key | Required | Meaning |
-|---|---|---|
-| `name` | yes | Queue name |
-| `max_workers` | hard-reserved mode | Queue concurrency cap |
-| `min_workers` | weighted mode | Guaranteed floor |
-| `weight` | no, default `1` | Overflow share |
-| `rate_limit` | no | `(max_rate: float, burst: int)` |
-| `retention` | no | `{"completed_hours": ..., "failed_hours": ...}` |
+`ClientBuilder` (Rust) and `client.start()` kwargs (Python) control maintenance loop intervals. The defaults are sensible for most workloads — you'd typically only touch these for:
 
-Validation rules:
+- **Heartbeat interval** (`30s`) — lower if you need faster crash detection
+- **Retention** (`24h` completed, `72h` failed) — raise if you need longer history, lower to reduce table size
+- **Cleanup batch size** (`1000`) — raise for high-throughput systems to avoid frequent cleanup passes
 
-- tuple form is not allowed with `global_max_workers`
-- weighted mode requires explicit queue configs
-- a dict cannot contain both `max_workers` and `min_workers`
-- every worker queue declared with `@client.task(..., queue=...)` must be configured in `start()`
+All intervals have `_ms` suffixed kwargs in Python (e.g. `heartbeat_interval_ms=15000`).
 
-## CLI Configuration
+## CLI and `awa serve`
 
-The `awa` CLI currently supports these global flags:
+The CLI reads `DATABASE_URL` from the environment or `--database-url`. All subcommands except `serve` use a single database connection.
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--database-url` | `DATABASE_URL` env var | Postgres connection string |
+`awa serve` starts the admin UI and API. It has its own connection pool and response cache, configurable via CLI flags or environment variables:
 
-`serve` adds:
+```
+awa serve --pool-max 10 --cache-ttl 5
+```
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--host` | `127.0.0.1` | Bind host |
-| `--port` | `3000` | Bind port |
+Every flag has a corresponding `AWA_*` environment variable (shown in `--help`):
 
-## Environment Variables
+| Flag | Env var | Default | Purpose |
+|---|---|---|---|
+| `--pool-max` | `AWA_POOL_MAX` | `10` | Max database connections |
+| `--pool-min` | `AWA_POOL_MIN` | `2` | Min idle connections |
+| `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Idle connection timeout (seconds) |
+| `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Max connection lifetime (seconds) |
+| `--pool-acquire-timeout` | `AWA_POOL_ACQUIRE_TIMEOUT` | `10` | Connection acquire timeout (seconds) |
+| `--cache-ttl` | `AWA_CACHE_TTL` | `5` | Dashboard query cache TTL (seconds) |
 
-These are the direct environment-variable integrations in the current codebase:
+### Dashboard cache
 
-| Variable | Consumer | Meaning |
-|---|---|---|
-| `DATABASE_URL` | `awa` CLI | Default value for `--database-url` |
-| `RUST_LOG` | `awa` CLI and any app using `tracing_subscriber` env filters | Log filter, for example `RUST_LOG=info` |
-| `HOSTNAME` | Rust worker runtime | Optional hostname recorded in runtime snapshots |
+The cache deduplicates repeated poll requests — multiple browser tabs or rapid refresh cycles within the TTL window hit memory rather than the database. The frontend polling interval is derived from the cache TTL (minimum 5s) and served via `/api/capabilities`, so clients automatically back off to match the server's refresh rate.
 
-Notes:
+If you're connecting to a read replica, increase `--cache-ttl` to reduce load. The dashboard will feel slightly less real-time but won't overwhelm the replica.
 
-- the Rust and Python libraries do not require `DATABASE_URL`; your code can pass the URL directly
-- Awa does not currently expose QueueConfig or ClientBuilder options through dedicated env vars
+### Read-only mode
 
-## Defaults Worth Remembering
-
-- heartbeat interval: `30s`
-- stale-heartbeat rescue tick: `30s`
-- stale-heartbeat cutoff: about `90s`
-- deadline duration: `5m`
-- leader retry interval: `10s`
-- promotion tick: `250ms`
+`awa serve` auto-detects read-only databases (replicas, read-only transactions) and disables mutation endpoints (retry, cancel, pause, drain). The frontend hides the corresponding buttons. No configuration needed.
 
 ## Next
 

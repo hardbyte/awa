@@ -17,6 +17,7 @@ import { Badge } from "@/components/ui/badge";
 import { LagValue } from "@/components/LagValue";
 import { timeAgo } from "@/lib/time";
 import { DASHBOARD_QUEUE_LIMIT } from "@/lib/constants";
+import { usePollInterval } from "@/hooks/use-poll-interval";
 
 /** Background tint per state for counter cards */
 const STATE_CARD_BG: Record<string, string> = {
@@ -32,25 +33,30 @@ const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_ex
 
 export function DashboardPage() {
   const navigate = useNavigate();
+  const poll = usePollInterval();
 
   const statsQuery = useQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const failedQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", { state: "failed", limit: 10 }],
     queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const completedPerHour = queuesQuery.data

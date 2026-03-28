@@ -134,6 +134,8 @@ export interface TimeseriesBucket {
 
 export interface Capabilities {
   read_only: boolean;
+  /** Server-suggested polling interval in milliseconds. */
+  poll_interval_ms: number;
 }
 
 export interface ListJobsParams {

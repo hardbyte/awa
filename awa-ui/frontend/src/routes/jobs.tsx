@@ -38,8 +38,8 @@ import {
   PAGE_SIZES,
   RETRYABLE_STATES,
   TERMINAL_STATES,
-  POLL,
 } from "@/lib/constants";
+import { usePollInterval } from "@/hooks/use-poll-interval";
 
 const STATES = [
   "all",
@@ -104,16 +104,18 @@ export function JobsPage() {
   };
 
   const hasSel = selected.size > 0;
+  const poll = usePollInterval();
 
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
-    refetchInterval: hasSel ? false : POLL.FAST,
+    refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
   });
 
   const statsQuery = useQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
   const readOnly = useReadOnly();
 

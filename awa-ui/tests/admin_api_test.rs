@@ -305,7 +305,7 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
     )
     .await;
 
-    let app = awa_ui::router(pool.clone())
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
     let baseline = get_json(&app, "/api/stats").await;
@@ -409,7 +409,7 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
         .await
         .expect("pause should succeed");
 
-    let app = awa_ui::router(pool.clone())
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
     let payload = get_json(&app, "/api/queues").await;
@@ -465,7 +465,7 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
 async fn test_capabilities_endpoint_reports_writable_mode() {
     let _guard = test_lock().lock().await;
     let pool = setup_pool().await;
-    let app = awa_ui::router(pool)
+    let app = awa_ui::router(pool, std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
 
@@ -474,6 +474,11 @@ async fn test_capabilities_endpoint_reports_writable_mode() {
         payload.get("read_only").and_then(Value::as_bool),
         Some(false)
     );
+    // Duration::ZERO cache TTL → min clamp of 5000ms poll interval
+    assert_eq!(
+        payload.get("poll_interval_ms").and_then(Value::as_u64),
+        Some(5_000)
+    );
 }
 
 #[tokio::test]
@@ -481,7 +486,7 @@ async fn test_capabilities_endpoint_reports_read_only_mode() {
     let _guard = test_lock().lock().await;
     let _writable_pool = setup_pool().await;
     let read_only_pool = setup_read_only_pool().await;
-    let app = awa_ui::router(read_only_pool)
+    let app = awa_ui::router(read_only_pool, std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
 
@@ -489,6 +494,26 @@ async fn test_capabilities_endpoint_reports_read_only_mode() {
     assert_eq!(
         payload.get("read_only").and_then(Value::as_bool),
         Some(true)
+    );
+    assert_eq!(
+        payload.get("poll_interval_ms").and_then(Value::as_u64),
+        Some(5_000)
+    );
+}
+
+#[tokio::test]
+async fn test_capabilities_poll_interval_scales_with_cache_ttl() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let app = awa_ui::router(pool, std::time::Duration::from_secs(15))
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, "/api/capabilities").await;
+    assert_eq!(
+        payload.get("poll_interval_ms").and_then(Value::as_u64),
+        Some(15_000),
+        "poll_interval_ms should match cache TTL when TTL > 5s minimum"
     );
 }
 
@@ -509,7 +534,7 @@ async fn test_mutation_endpoint_returns_read_only_error() {
     .expect("fixture insert should succeed");
 
     let read_only_pool = setup_read_only_pool().await;
-    let app = awa_ui::router(read_only_pool)
+    let app = awa_ui::router(read_only_pool, std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
     let (status, payload) = post(&app, &format!("/api/jobs/{}/cancel", job.0)).await;
@@ -527,7 +552,7 @@ async fn test_admin_endpoints_perf_smoke_under_moderate_backlog() {
     let pool = setup_pool().await;
     let prefix = "api_perf_smoke_";
     seed_scale_fixture(&pool, prefix, 20_000, 500, 500, 25, 50).await;
-    let app = awa_ui::router(pool.clone())
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
 
@@ -543,7 +568,7 @@ async fn test_admin_endpoints_scale_with_large_deferred_backlog() {
     let pool = setup_pool().await;
     let prefix = "api_scale_";
     seed_scale_fixture(&pool, prefix, 200_000, 2_000, 2_000, 50, 100).await;
-    let app = awa_ui::router(pool.clone())
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
 

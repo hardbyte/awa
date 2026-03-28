@@ -1,6 +1,9 @@
+pub mod cache;
 pub mod error;
 pub mod handlers;
 pub mod state;
+
+use std::time::Duration;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
@@ -17,9 +20,9 @@ use crate::state::{detect_read_only, AppState};
 struct StaticAssets;
 
 /// Create the awa-ui router with all API routes and static file serving.
-pub async fn router(pool: PgPool) -> Result<Router, sqlx::Error> {
+pub async fn router(pool: PgPool, cache_ttl: Duration) -> Result<Router, sqlx::Error> {
     let read_only = detect_read_only(&pool).await?;
-    let state = AppState::new(pool, read_only);
+    let state = AppState::new(pool, read_only, cache_ttl);
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
