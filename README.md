@@ -65,7 +65,7 @@ async def main():
     client = awa.AsyncClient("postgres://localhost/mydb")
     await client.migrate()
 
-    @client.worker(SendEmail, queue="email")
+    @client.task(SendEmail, queue="email")
     async def handle_email(job):
         print(f"Sending to {job.args.to}: {job.args.subject}")
 
@@ -84,7 +84,7 @@ asyncio.run(main())
 **Progress tracking** — checkpoint and resume on retry:
 
 ```python
-@client.worker(BatchImport, queue="etl")
+@client.task(BatchImport, queue="etl")
 async def handle_import(job):
     last_id = (job.progress or {}).get("metadata", {}).get("last_id", 0)
     for item in fetch_items(after=last_id):

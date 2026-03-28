@@ -52,7 +52,7 @@ class SendEmail:
 async def main() -> None:
     client = awa.AsyncClient(DATABASE_URL)
 
-    @client.worker(SendEmail, queue="email")
+    @client.task(SendEmail, queue="email")
     async def handle_email(job):
         print(f"sending email to {job.args.to}: {job.args.subject}")
 

@@ -24,7 +24,7 @@ async def main() -> None:
     await client.migrate()
 
     if mode == "worker_chaos_probe":
-        @client.worker(ChaosProbe, queue=queue)
+        @client.task(ChaosProbe, queue=queue)
         async def handle(job):
             print(
                 f"START mode={mode} pid={os.getpid()} job_id={job.id} marker={job.args.marker}",
@@ -53,7 +53,7 @@ async def main() -> None:
             os.environ.get("MIXED_LEADER_ELECTION_INTERVAL_MS", "60000")
         )
 
-        @client.worker(SimpleChaosJob, queue=queue)
+        @client.task(SimpleChaosJob, queue=queue)
         async def handle(job):
             print(
                 f"START mode={mode} pid={os.getpid()} job_id={job.id} seq={job.args.seq}",

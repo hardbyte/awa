@@ -29,7 +29,7 @@ async def main():
     await client.migrate()
 
     # Define a worker
-    @client.worker(SendEmail, queue="email")
+    @client.task(SendEmail, queue="email")
     async def handle_email(job):
         print(f"Sending email to {job.args.to}: {job.args.subject}")
 

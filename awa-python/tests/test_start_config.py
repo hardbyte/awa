@@ -36,7 +36,7 @@ async def test_tuple_form_backward_compat(client):
     """start([("q", 10)]) still works."""
     queue = "cfg_tuple_compat"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -53,7 +53,7 @@ async def test_dict_config_with_rate_limit(client):
     """Dict form with rate_limit starts successfully."""
     queue = "cfg_dict_rl"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -71,7 +71,7 @@ async def test_global_max_workers(client):
     """start() with global_max_workers enters weighted mode."""
     queue = "cfg_weighted"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -90,7 +90,7 @@ async def test_tuple_plus_global_max_workers_raises(client):
     """Tuple form is not supported with global_max_workers."""
     queue = "cfg_tuple_global"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -106,7 +106,7 @@ async def test_both_max_and_min_workers_raises(client):
     """Cannot specify both max_workers and min_workers."""
     queue = "cfg_both"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -124,7 +124,7 @@ async def test_zero_weight_raises(client):
     """weight=0 raises ValueError."""
     queue = "cfg_zero_weight"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -142,7 +142,7 @@ async def test_global_max_workers_requires_explicit_queues(client):
     """global_max_workers without explicit queues raises ValueError."""
     queue = "cfg_global_no_queues"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -158,7 +158,7 @@ async def test_dict_missing_name_raises(client):
     """Dict without 'name' key raises ValueError."""
     queue = "cfg_no_name"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -174,7 +174,7 @@ async def test_rate_limit_wrong_type_raises(client):
     """rate_limit that's not a (float, int) tuple raises TypeError."""
     queue = "cfg_bad_rl"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -192,7 +192,7 @@ async def test_retention_kwargs_accepted(client):
     """start() with retention kwargs starts successfully."""
     queue = "cfg_retention"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 
@@ -210,7 +210,7 @@ async def test_per_queue_retention_in_dict_config(client):
     """Dict form with per-queue retention config starts successfully."""
     queue = "cfg_per_queue_retention"
 
-    @client.worker(ConfigTestJob, queue=queue)
+    @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
         return None
 

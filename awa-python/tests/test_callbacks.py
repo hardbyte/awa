@@ -41,7 +41,7 @@ async def test_register_callback_and_wait(client):
     queue = "cb_register"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -70,7 +70,7 @@ async def test_complete_external(client):
     queue = "cb_complete"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -93,7 +93,7 @@ async def test_complete_external_without_payload(client):
     queue = "cb_complete_no_payload"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -118,7 +118,7 @@ async def test_fail_external(client):
     queue = "cb_fail"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -143,7 +143,7 @@ async def test_retry_external(client):
     queue = "cb_retry"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -168,7 +168,7 @@ async def test_resolve_callback_default_complete(client):
     queue = "cb_resolve_complete"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -194,7 +194,7 @@ async def test_resolve_callback_default_ignore(client):
     queue = "cb_resolve_ignore"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -223,7 +223,7 @@ async def test_resolve_callback_default_fail(client):
     queue = "cb_resolve_fail"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -252,7 +252,7 @@ async def test_complete_external_sync(client):
     queue = "cb_complete_sync"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -274,7 +274,7 @@ async def test_fail_external_sync(client):
     queue = "cb_fail_sync"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -296,7 +296,7 @@ async def test_retry_external_sync(client):
     queue = "cb_retry_sync"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)
@@ -318,7 +318,7 @@ async def test_resolve_callback_sync(client):
     queue = "cb_resolve_sync"
     callback_ids = []
 
-    @client.worker(ExternalTask, queue=queue)
+    @client.task(ExternalTask, queue=queue)
     async def handle(job):
         token = await job.register_callback(timeout_seconds=60)
         callback_ids.append(token.id)

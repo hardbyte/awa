@@ -48,7 +48,7 @@ async def main():
 
     sent_count = 0
 
-    @client.worker(SendEmail, queue="email")
+    @client.task(SendEmail, queue="email")
     async def handle_email(job):
         nonlocal sent_count
         await asyncio.sleep(0.01)
