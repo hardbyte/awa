@@ -189,6 +189,7 @@ The UI is read/write admin surface. Put it behind your normal authentication, ne
 
 ## Next
 
+- [PostgreSQL roles and privileges](security.md)
 - [Migration guide](migrations.md)
-- [Configuration reference](configuration.md)
+- [Configuration](configuration.md)
 - [Troubleshooting](troubleshooting.md)
