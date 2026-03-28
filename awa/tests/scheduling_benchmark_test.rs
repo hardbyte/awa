@@ -991,6 +991,12 @@ async fn run_scheduled_steady_benchmark(
     .execute(&pool)
     .await
     .expect("Failed to seed scheduled backlog");
+    // Update planner statistics so the partial index on (run_at, id) is used
+    // instead of a full bitmap scan. Critical at 10M+ rows.
+    sqlx::query("ANALYZE awa.scheduled_jobs")
+        .execute(&pool)
+        .await
+        .expect("Failed to analyze scheduled_jobs");
     let seed_elapsed = seed_start.elapsed();
 
     let due_rows = due_rate * window_secs;

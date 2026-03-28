@@ -611,23 +611,23 @@ impl MaintenanceService {
         Ok(())
     }
 
-    async fn promote_due_batch(
-        &self,
-        state: &'static str,
-    ) -> Result<(usize, HashSet<String>), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let promote_start = std::time::Instant::now();
-        let promoted_rows: Vec<(String,)> = sqlx::query_as(
+    /// SQL template for promotion. The state literal is injected directly
+    /// (not as a parameter) so the planner can match the partial index on
+    /// `(run_at, id) WHERE state = '<state>'`. With a parameter, the planner
+    /// cannot prove the partial index applies and falls back to a full
+    /// bitmap scan on multi-million-row tables.
+    fn promote_sql(state: &'static str) -> String {
+        format!(
             r#"
             WITH due AS (
                 DELETE FROM awa.scheduled_jobs
                 WHERE id IN (
                     SELECT id
                     FROM awa.scheduled_jobs
-                    WHERE state = $1::awa.job_state
+                    WHERE state = '{state}'::awa.job_state
                       AND run_at <= now()
                     ORDER BY run_at ASC, id ASC
-                    LIMIT $2
+                    LIMIT $1
                     FOR UPDATE SKIP LOCKED
                 )
                 RETURNING *
@@ -672,12 +672,21 @@ impl MaintenanceService {
                 RETURNING queue
             )
             SELECT queue FROM promoted
-            "#,
+            "#
         )
-        .bind(state)
-        .bind(PROMOTE_BATCH_SIZE)
-        .fetch_all(&mut *tx)
-        .await?;
+    }
+
+    async fn promote_due_batch(
+        &self,
+        state: &'static str,
+    ) -> Result<(usize, HashSet<String>), sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let promote_start = std::time::Instant::now();
+        let sql = Self::promote_sql(state);
+        let promoted_rows: Vec<(String,)> = sqlx::query_as(&sql)
+            .bind(PROMOTE_BATCH_SIZE)
+            .fetch_all(&mut *tx)
+            .await?;
 
         let promoted = promoted_rows.len();
         self.metrics
