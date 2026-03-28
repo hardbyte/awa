@@ -206,6 +206,44 @@ fix (v0.5.0) eliminated the bottleneck entirely.
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
 
+### Concurrent Multi-Queue Lifecycle
+
+Measured with `concurrent_lifecycle_test.rs`. Four queues (`email:32`,
+`payments:16`, `analytics:64`, `webhooks:16` workers), 128 total workers,
+full insert → claim → execute → complete lifecycle.
+
+Queue-count sweep with 128 total workers, pool=50, 20k jobs (release mode):
+
+| Config | Workers/queue | Throughput | Per-worker |
+|--------|--------------|------------|------------|
+| 1 queue × 128 | 128 | `~1.9k/s` | `~14/s` |
+| 2 queues × 64 | 64 | `~2.0k/s` | `~15/s` |
+| 4 queues × 32 | 32 | `~350/s` | `~2.7/s` |
+
+**Key finding**: 1-queue and 2-queue throughput is essentially identical,
+but 4 queues drops 5-6x. The cliff between 2 and 4 queues indicates
+that the per-queue dispatcher overhead (separate claim query, PgListener,
+semaphore) compounds non-linearly when many small queues share a pool.
+
+For comparison, the hot-path benchmark (200k pre-seeded into `jobs_hot`
+via SQL) reaches `~10k/s` because it bypasses insert triggers and has a
+fully warmed dispatch pipeline. The lifecycle benchmarks exercise the
+complete path including job-state triggers and notification.
+
+**Tuning guidelines**:
+
+- Size the connection pool to at least `num_queues * 4 + 20`. With
+  4 queues, that's 36+ connections.
+- Prefer fewer queues with larger worker pools over many small queues.
+  2 queues × 64 workers performs the same as 1 × 128.
+- Use multi-queue for isolation, priority, or rate limiting — not for
+  throughput.
+
+A unified cross-queue claim query (one SQL round-trip claiming across all
+queues via `LATERAL JOIN`) could eliminate the per-queue dispatch overhead.
+Prototyping shows 16ms for 48 jobs across 2 queues — comparable to
+single-queue performance. This is tracked as a future optimization.
+
 ### Progress Feature Overhead
 
 The structured progress feature (ADR-014) adds a `progress JSONB` column
