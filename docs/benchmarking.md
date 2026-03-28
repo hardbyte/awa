@@ -104,10 +104,10 @@ Measured with `test_runtime_sustained_hot_path` after resetting runtime state:
 - measurement window: 10s
 - queue size seeded: 200,000 immediately-available jobs
 
-Example reference result from one local run:
+Example reference result from one local run (release mode):
 
-- handler returns: about `8.1k jobs/s`
-- DB `completed` transitions: about `8.1k jobs/s`
+- handler returns: about `9.2k jobs/s`
+- DB `completed` transitions: about `9.2k jobs/s`
 
 This benchmark always enables the in-memory OpenTelemetry exporter so the
 runtime metrics path is exercised while measuring.
@@ -180,7 +180,7 @@ Result:
 This validates the architecture at a realistic production scale: 2M deferred
 rows with 4k/s throughput and sub-millisecond promotion.
 
-### Scaling Limit: 10M Deferred at 6k/s
+### High-Rate Deferred Frontier: 10M at 6k/s
 
 Measured with `test_scheduled_steady_10m_due_6k_per_sec`:
 
@@ -190,19 +190,14 @@ Measured with `test_scheduled_steady_10m_due_6k_per_sec`:
 
 Result:
 
-- only `~20k–57k` of the `60,000` target jobs promoted in the window
-- promotion batches: `10–21` batches at `1.7–3.6s` mean (`5–8s` max)
-- pickup lateness: `p50 ~12s`, `p99 ~15–21s`
-- claim and completion latency remained healthy (`11–20 ms` mean)
+- `58,686` of `60,000` target jobs completed within the window (98%)
+- per-second completions: `2942, 6834, 6907, 4758, 5915, 5662, 7246, 6446, 5305, 6671`
+- pickup lateness: `p50`: `0 ms`, `p95`: `310 ms`, `p99`: `476 ms`
+- promotion: `242` batches, mean `6.4 ms`, max `99 ms`
 
-The bottleneck is promotion, not dispatch or completion. The promotion query
-(`DELETE FROM scheduled_jobs` + `INSERT INTO jobs_hot` in a single CTE) runs in
-`~50 ms` in isolation but degrades to multi-second latency under concurrent load.
-
-Investigation showed this is caused by WAL/IO pressure from operating on the
-2.5 GB `scheduled_jobs` table (heap + 566 MB partial index) under concurrent
-dispatch and completion activity. Increasing `shared_buffers` from `128 MB` to
-`2 GB` did not help — the bottleneck is write-path contention, not cache misses.
+This rate was previously a documented scaling limit (only 20-57k of 60k
+promoted, promotion at 1.7-3.6s per batch). The literal-state promotion
+fix (v0.5.0) eliminated the bottleneck entirely.
 
 **Key tuning parameters for promotion throughput:**
 
@@ -210,11 +205,6 @@ dispatch and completion activity. Increasing `shared_buffers` from `128 MB` to
 - `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
-
-In these reference runs, the architecture handled 2M deferred / 4k/s
-comfortably. For 10M+ at
-higher due rates, promotion would need to be parallelized (e.g., by queue or
-ID range) or the deferred table partitioned.
 
 ### Progress Feature Overhead
 
