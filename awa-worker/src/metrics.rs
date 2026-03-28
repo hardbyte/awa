@@ -10,7 +10,7 @@
 //! - Units declared via `.with_unit()` using UCUM notation
 //! - No unit suffix in metric names (exporters append automatically)
 
-use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use std::time::Duration;
 
 /// Awa worker metrics backed by OpenTelemetry.
@@ -56,6 +56,12 @@ pub struct AwaMetrics {
     pub maintenance_rescues: Counter<u64>,
     /// Total jobs parked for external callback.
     pub jobs_waiting_external: Counter<u64>,
+    /// Current queue depth per state — how many jobs are in each state per queue.
+    pub queue_depth: Gauge<i64>,
+    /// Queue lag — age of the oldest available job per queue.
+    pub queue_lag_seconds: Gauge<f64>,
+    /// Time from job creation to claim — the user-visible queuing latency.
+    pub wait_duration_seconds: Histogram<f64>,
 }
 
 impl AwaMetrics {
@@ -162,6 +168,21 @@ impl AwaMetrics {
                 .with_description("Number of jobs parked for external callback")
                 .with_unit("{job}")
                 .build(),
+            queue_depth: meter
+                .i64_gauge("awa.queue.depth")
+                .with_description("Current number of jobs per queue and state")
+                .with_unit("{job}")
+                .build(),
+            queue_lag_seconds: meter
+                .f64_gauge("awa.queue.lag")
+                .with_description("Age of the oldest available job per queue")
+                .with_unit("s")
+                .build(),
+            wait_duration_seconds: meter
+                .f64_histogram("awa.job.wait_duration")
+                .with_description("Time from job creation to claim")
+                .with_unit("s")
+                .build(),
         }
     }
 
@@ -253,6 +274,33 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.jobs_in_flight.add(delta, &attrs);
+    }
+
+    /// Record queue depth for a specific state.
+    pub fn record_queue_depth(&self, queue: &str, state: &str, count: i64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.job.state", state.to_string()),
+        ];
+        self.queue_depth.record(count, &attrs);
+    }
+
+    /// Record queue lag (age of oldest available job).
+    pub fn record_queue_lag(&self, queue: &str, lag_seconds: f64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.queue_lag_seconds.record(lag_seconds, &attrs);
+    }
+
+    /// Record job wait duration (time from creation to claim).
+    pub fn record_wait_duration(&self, queue: &str, seconds: f64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.wait_duration_seconds.record(seconds, &attrs);
     }
 }
 

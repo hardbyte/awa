@@ -315,6 +315,7 @@ async fn test_otlp_metrics_reach_prometheus() {
             },
         )
         .register::<TelemetryJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+        .queue_stats_interval(Duration::from_secs(2))
         .build()
         .expect("Failed to build client");
 
@@ -394,6 +395,17 @@ async fn test_otlp_metrics_reach_prometheus() {
         wait_for_metric(&http, "awa_job_duration_seconds_count", 1.0, timeout).await;
     eprintln!("  awa.job.duration count = {duration_count}");
 
+    // Queue health metrics (new)
+    // awa.job.wait_duration (unit: s) → awa_job_wait_duration_seconds_count
+    let wait_duration_count =
+        wait_for_metric(&http, "awa_job_wait_duration_seconds_count", 1.0, timeout).await;
+    eprintln!("  awa.job.wait_duration count = {wait_duration_count}");
+
+    // awa.queue.depth (unit: {job}, gauge) → awa_queue_depth
+    // Gauge values may be 0 after all jobs complete, so just check it exists (>= 0)
+    let queue_depth = wait_for_metric(&http, "awa_queue_depth", 0.0, timeout).await;
+    eprintln!("  awa.queue.depth = {queue_depth}");
+
     // 7. Assertions (wait_for_metric already panics on timeout, but
     //    let's be explicit about what we expected).
     assert!(
@@ -411,6 +423,10 @@ async fn test_otlp_metrics_reach_prometheus() {
     assert!(
         duration_count >= 1.0,
         "Expected awa.job.duration count >= 1, got {duration_count}"
+    );
+    assert!(
+        wait_duration_count >= 1.0,
+        "Expected awa.job.wait_duration count >= 1, got {wait_duration_count}"
     );
 
     // Clean up.

@@ -562,6 +562,15 @@ impl Dispatcher {
         if !jobs.is_empty() {
             self.metrics
                 .record_job_claimed(&self.queue, jobs.len() as u64);
+            for job in &jobs {
+                if let Some(attempted_at) = job.attempted_at {
+                    let wait_secs =
+                        (attempted_at - job.created_at).num_milliseconds() as f64 / 1000.0;
+                    if wait_secs >= 0.0 {
+                        self.metrics.record_wait_duration(&self.queue, wait_secs);
+                    }
+                }
+            }
         }
 
         // Phase 4: Release excess permits if DB had fewer jobs
