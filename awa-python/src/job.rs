@@ -418,6 +418,112 @@ impl PyJob {
         })
     }
 
+    /// Wait for an external callback to resolve, then resume with the payload.
+    ///
+    /// This enables sequential callbacks: register a callback, wait for it,
+    /// process the result, register another, wait again — all within a single
+    /// handler invocation.
+    ///
+    /// The handler's async task suspends while waiting. When
+    /// ``resume_external(callback_id, payload)`` is called, this method
+    /// returns the payload.
+    fn wait_for_callback<'py>(
+        &self,
+        py: Python<'py>,
+        token: PyRef<'_, PyCallbackToken>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        use crate::errors::map_awa_error;
+        let pool = self.pool.clone().ok_or_else(|| {
+            pyo3::exceptions::PyRuntimeError::new_err(
+                "wait_for_callback is only available during job execution",
+            )
+        })?;
+        let cancelled = self.cancelled.clone();
+        let job_id = self.id;
+        let run_lease = self.run_lease;
+        let _token_id = token.id.clone(); // consume the token
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            // Transition to waiting_external
+            let result = sqlx::query(
+                r#"
+                UPDATE awa.jobs
+                SET state = 'waiting_external',
+                    heartbeat_at = NULL,
+                    deadline_at = NULL
+                WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id IS NOT NULL
+                "#,
+            )
+            .bind(job_id)
+            .bind(run_lease)
+            .execute(&pool)
+            .await
+            .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+
+            if result.rows_affected() == 0 {
+                return Err(map_awa_error(awa_model::AwaError::Validation(
+                    "wait_for_callback: job is not in running state with a registered callback"
+                        .into(),
+                )));
+            }
+
+            // Poll DB until the callback is resolved
+            loop {
+                // Check for cancellation
+                if let Some(ref flag) = cancelled {
+                    if flag.load(std::sync::atomic::Ordering::SeqCst) {
+                        return Err(map_awa_error(awa_model::AwaError::Validation(
+                            "job cancelled while waiting for callback".into(),
+                        )));
+                    }
+                }
+
+                let row: Option<(awa_model::JobState, serde_json::Value)> =
+                    sqlx::query_as("SELECT state, metadata FROM awa.jobs WHERE id = $1")
+                        .bind(job_id)
+                        .fetch_optional(&pool)
+                        .await
+                        .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+
+                match row {
+                    Some((awa_model::JobState::Running, metadata)) => {
+                        // Resumed! Extract callback result from metadata.
+                        let payload = metadata
+                            .get("_awa_callback_result")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::Null);
+
+                        // Clean up the reserved metadata key
+                        sqlx::query(
+                            "UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1",
+                        )
+                        .bind(job_id)
+                        .execute(&pool)
+                        .await
+                        .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+
+                        // Return payload as Python object
+                        return Python::attach(|py| json_to_py(py, &payload));
+                    }
+                    Some((awa_model::JobState::WaitingExternal, _)) => {
+                        // Still waiting — sleep and poll again
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    Some((state, _)) => {
+                        return Err(map_awa_error(awa_model::AwaError::Validation(format!(
+                            "job left waiting_external unexpectedly: state={state:?}"
+                        ))));
+                    }
+                    None => {
+                        return Err(map_awa_error(awa_model::AwaError::Validation(
+                            "job not found during callback wait".into(),
+                        )));
+                    }
+                }
+            }
+        })
+    }
+
     fn __repr__(&self) -> String {
         format!(
             "Job(id={}, kind='{}', queue='{}', state={:?}, attempt={})",

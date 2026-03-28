@@ -891,6 +891,56 @@ impl PyClient {
         })
     }
 
+    /// Resume a waiting job via external callback, returning it to running state.
+    ///
+    /// The handler resumes with the payload data. Use this for sequential
+    /// callback patterns where the job needs to continue execution.
+    #[pyo3(signature = (callback_id, payload=None))]
+    fn resume_external<'py>(
+        &self,
+        py: Python<'py>,
+        callback_id: String,
+        payload: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let payload_json = payload
+            .as_ref()
+            .map(|value| Python::attach(|py| py_to_json(py, value.bind(py))))
+            .transpose()?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&callback_id)
+                .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+            let row = awa_model::admin::resume_external(&pool, uuid, payload_json, None)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyJob::from(row))
+        })
+    }
+
+    #[pyo3(signature = (callback_id, payload=None))]
+    fn resume_external_sync(
+        &self,
+        py: Python<'_>,
+        callback_id: String,
+        payload: Option<Py<PyAny>>,
+    ) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        let payload_json = payload
+            .as_ref()
+            .map(|value| py_to_json(py, value.bind(py)))
+            .transpose()?;
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let uuid = uuid::Uuid::parse_str(&callback_id)
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+                let row = awa_model::admin::resume_external(&pool, uuid, payload_json, None)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
+        })
+    }
+
     /// Reset the callback timeout for a long-running external operation.
     #[pyo3(signature = (callback_id, timeout_seconds=3600.0))]
     fn heartbeat_callback<'py>(
