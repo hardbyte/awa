@@ -212,27 +212,32 @@ Measured with `concurrent_lifecycle_test.rs`. Four queues (`email:32`,
 `payments:16`, `analytics:64`, `webhooks:16` workers), 128 total workers,
 full insert → claim → execute → complete lifecycle.
 
-| Scenario | Jobs | Queues | Workers | Throughput |
-|----------|------|--------|---------|------------|
-| Single-queue hot-path | 200k pre-seeded | 1 | 256 | `~9.2k/s` |
-| Multi-queue drain (pre-seeded) | 8k | 4 | 128 | `~440/s` |
-| Multi-queue concurrent (insert + consume) | 10k | 4 | 128 | `~260/s` |
+Queue-count sweep with 128 total workers, pool=50, 20k jobs (release mode):
 
-The per-worker throughput gap between single-queue and multi-queue workloads
-is primarily caused by **connection pool contention**: each queue has its own
-dispatcher acquiring pool connections for `FOR UPDATE SKIP LOCKED` claims,
-and the completion batcher competes for the same pool. With 4 dispatchers,
-4 PgListeners, heartbeat, and maintenance all sharing a 30-connection pool,
-claim latency rises from ~6ms to ~52ms and completion flush from ~5ms to ~53ms.
+| Config | Workers/queue | Throughput | Per-worker |
+|--------|--------------|------------|------------|
+| 1 queue × 128 | 128 | `~1.9k/s` | `~14/s` |
+| 2 queues × 64 | 64 | `~2.0k/s` | `~15/s` |
+| 4 queues × 32 | 32 | `~350/s` | `~2.7/s` |
 
-**Tuning guideline**: size the connection pool to at least `num_queues * 4 +
-total_workers / 10`. For the 4-queue / 128-worker config above, that's ~29
-connections minimum.
+**Key finding**: 1-queue and 2-queue throughput is essentially identical,
+but 4 queues drops 5-6x. The cliff between 2 and 4 queues indicates
+that the per-queue dispatcher overhead (separate claim query, PgListener,
+semaphore) compounds non-linearly when many small queues share a pool.
 
-For workloads that need maximum throughput, consolidating into fewer queues
-with larger worker pools is more efficient than spreading across many
-queues. Multi-queue is the right trade-off when queue isolation, priority,
-or rate limiting matters more than raw throughput.
+For comparison, the hot-path benchmark (200k pre-seeded into `jobs_hot`
+via SQL) reaches `~10k/s` because it bypasses insert triggers and has a
+fully warmed dispatch pipeline. The lifecycle benchmarks exercise the
+complete path including job-state triggers and notification.
+
+**Tuning guidelines**:
+
+- Size the connection pool to at least `num_queues * 4 + 20`. With
+  4 queues, that's 36+ connections.
+- Prefer fewer queues with larger worker pools over many small queues.
+  2 queues × 64 workers performs the same as 1 × 128.
+- Use multi-queue for isolation, priority, or rate limiting — not for
+  throughput.
 
 A unified cross-queue claim query (one SQL round-trip claiming across all
 queues via `LATERAL JOIN`) could eliminate the per-queue dispatch overhead.

@@ -394,11 +394,11 @@ async fn run_lifecycle_benchmark(pool: &sqlx::PgPool, config: &LifecycleConfig) 
 // ═══════════════════════════════════════════════════════════════════════
 
 /// Small scale: 4 queues × 2.5k jobs = 10k total, 4 producers.
-/// Quick validation that the concurrent setup works.
+/// Pool sized for 4 queues: ~6 infrastructure + headroom for claims/flushes.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_lifecycle_10k() {
-    let pool = setup(30).await;
+    let pool = setup(50).await;
     run_lifecycle_benchmark(
         &pool,
         &LifecycleConfig {
@@ -406,18 +406,19 @@ async fn test_concurrent_lifecycle_10k() {
             jobs_per_kind: 2_500,
             producer_batch_size: 500,
             producers_per_kind: 1,
-            window_secs: 30,
+            window_secs: 60,
         },
     )
     .await;
 }
 
-/// Pre-seeded drain: 4 queues × 2k jobs = 8k total, no concurrent producers.
+/// Pre-seeded drain: 4 queues × 5k jobs = 20k total, no concurrent producers.
 /// Measures pure multi-queue consumption throughput without insert contention.
+/// Pool sized for 4 queues with adequate headroom.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
-async fn test_concurrent_drain_8k() {
-    let pool = setup(30).await;
+async fn test_concurrent_drain_20k() {
+    let pool = setup(50).await;
     reset_runtime_state(&pool).await;
 
     let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
@@ -432,7 +433,7 @@ async fn test_concurrent_drain_8k() {
         ("analytics_job", "lifecycle_analytics"),
         ("webhook_job", "lifecycle_webhooks"),
     ];
-    let per_kind: i64 = 2_000;
+    let per_kind: i64 = 5_000;
     let total = per_kind * kinds.len() as i64;
 
     // Pre-seed all jobs
@@ -684,12 +685,245 @@ async fn test_concurrent_drain_8k() {
     .emit();
 }
 
+/// Queue-count sweep: 1, 2, and 4 queues, 128 total workers, 20k jobs.
+/// Isolates the effect of queue count on throughput with a well-configured pool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn test_concurrent_queue_sweep() {
+    // 1 queue × 128 workers
+    {
+        let pool = setup(50).await;
+        reset_runtime_state(&pool).await;
+
+        let total: i64 = 20_000;
+        let params: Vec<_> = (0..total)
+            .map(|i| {
+                awa::model::insert::params_with(
+                    &EmailJob { seq: i },
+                    InsertOpts {
+                        queue: "sweep_q1".to_string(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        for chunk in params.chunks(1000) {
+            insert_many(&pool, chunk).await.unwrap();
+        }
+
+        let counter = Arc::new(AtomicU64::new(0));
+        let client = Client::builder(pool.clone())
+            .queue(
+                "sweep_q1",
+                QueueConfig {
+                    max_workers: 128,
+                    poll_interval: Duration::from_millis(50),
+                    ..QueueConfig::default()
+                },
+            )
+            .register_worker(CountingWorker {
+                kind: "email_job",
+                counter: counter.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let started = Instant::now();
+        client.start().await.unwrap();
+        loop {
+            if counter.load(Ordering::Relaxed) >= total as u64 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "1-queue sweep timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let elapsed = started.elapsed();
+        client.shutdown(Duration::from_secs(5)).await;
+        println!(
+            "[sweep] 1 queue × 128 workers: {} jobs in {:.2}s ({:.0}/s)",
+            total,
+            elapsed.as_secs_f64(),
+            total as f64 / elapsed.as_secs_f64()
+        );
+    }
+
+    // 2 queues × 64 workers
+    {
+        let pool = setup(50).await;
+        reset_runtime_state(&pool).await;
+
+        let per_queue: i64 = 10_000;
+        for (kind_name, queue) in &[("email_job", "sweep_q1"), ("payment_job", "sweep_q2")] {
+            let params: Vec<_> = (0..per_queue)
+                .map(|i| {
+                    let opts = InsertOpts {
+                        queue: queue.to_string(),
+                        ..Default::default()
+                    };
+                    match *kind_name {
+                        "email_job" => {
+                            awa::model::insert::params_with(&EmailJob { seq: i }, opts).unwrap()
+                        }
+                        _ => awa::model::insert::params_with(&PaymentJob { seq: i }, opts).unwrap(),
+                    }
+                })
+                .collect();
+            for chunk in params.chunks(1000) {
+                insert_many(&pool, chunk).await.unwrap();
+            }
+        }
+
+        let c1 = Arc::new(AtomicU64::new(0));
+        let c2 = Arc::new(AtomicU64::new(0));
+        let client = Client::builder(pool.clone())
+            .queue(
+                "sweep_q1",
+                QueueConfig {
+                    max_workers: 64,
+                    poll_interval: Duration::from_millis(50),
+                    ..QueueConfig::default()
+                },
+            )
+            .queue(
+                "sweep_q2",
+                QueueConfig {
+                    max_workers: 64,
+                    poll_interval: Duration::from_millis(50),
+                    ..QueueConfig::default()
+                },
+            )
+            .register_worker(CountingWorker {
+                kind: "email_job",
+                counter: c1.clone(),
+            })
+            .register_worker(CountingWorker {
+                kind: "payment_job",
+                counter: c2.clone(),
+            })
+            .build()
+            .unwrap();
+
+        let total = per_queue * 2;
+        let started = Instant::now();
+        client.start().await.unwrap();
+        loop {
+            let done = c1.load(Ordering::Relaxed) + c2.load(Ordering::Relaxed);
+            if done >= total as u64 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "2-queue sweep timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let elapsed = started.elapsed();
+        client.shutdown(Duration::from_secs(5)).await;
+        println!(
+            "[sweep] 2 queues × 64 workers: {} jobs in {:.2}s ({:.0}/s)",
+            total,
+            elapsed.as_secs_f64(),
+            total as f64 / elapsed.as_secs_f64()
+        );
+    }
+
+    // 4 queues × 32 workers
+    {
+        let pool = setup(50).await;
+        reset_runtime_state(&pool).await;
+
+        let per_queue: i64 = 5_000;
+        let queue_configs = [
+            ("email_job", "sweep_q1"),
+            ("payment_job", "sweep_q2"),
+            ("analytics_job", "sweep_q3"),
+            ("webhook_job", "sweep_q4"),
+        ];
+        for (kind_name, queue) in &queue_configs {
+            let params: Vec<_> = (0..per_queue)
+                .map(|i| {
+                    let opts = InsertOpts {
+                        queue: queue.to_string(),
+                        ..Default::default()
+                    };
+                    match *kind_name {
+                        "email_job" => {
+                            awa::model::insert::params_with(&EmailJob { seq: i }, opts).unwrap()
+                        }
+                        "payment_job" => {
+                            awa::model::insert::params_with(&PaymentJob { seq: i }, opts).unwrap()
+                        }
+                        "analytics_job" => {
+                            awa::model::insert::params_with(&AnalyticsJob { seq: i }, opts).unwrap()
+                        }
+                        _ => awa::model::insert::params_with(&WebhookJob { seq: i }, opts).unwrap(),
+                    }
+                })
+                .collect();
+            for chunk in params.chunks(1000) {
+                insert_many(&pool, chunk).await.unwrap();
+            }
+        }
+
+        let counters: Vec<Arc<AtomicU64>> = (0..4).map(|_| Arc::new(AtomicU64::new(0))).collect();
+        let mut builder = Client::builder(pool.clone());
+        for (i, (_, queue)) in queue_configs.iter().enumerate() {
+            builder = builder.queue(
+                *queue,
+                QueueConfig {
+                    max_workers: 32,
+                    poll_interval: Duration::from_millis(50),
+                    ..QueueConfig::default()
+                },
+            );
+            let kind = match i {
+                0 => "email_job",
+                1 => "payment_job",
+                2 => "analytics_job",
+                _ => "webhook_job",
+            };
+            builder = builder.register_worker(CountingWorker {
+                kind,
+                counter: counters[i].clone(),
+            });
+        }
+        let client = builder.build().unwrap();
+
+        let total = per_queue * 4;
+        let started = Instant::now();
+        client.start().await.unwrap();
+        loop {
+            let done: u64 = counters.iter().map(|c| c.load(Ordering::Relaxed)).sum();
+            if done >= total as u64 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(120),
+                "4-queue sweep timed out"
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        let elapsed = started.elapsed();
+        client.shutdown(Duration::from_secs(5)).await;
+        println!(
+            "[sweep] 4 queues × 32 workers: {} jobs in {:.2}s ({:.0}/s)",
+            total,
+            elapsed.as_secs_f64(),
+            total as f64 / elapsed.as_secs_f64()
+        );
+    }
+}
+
 /// Medium scale: 4 queues × 10k jobs = 40k total, 8 producers (2 per kind).
 /// Exercises concurrent insert contention + dispatch saturation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_lifecycle_40k() {
-    let pool = setup(30).await;
+    let pool = setup(50).await;
     run_lifecycle_benchmark(
         &pool,
         &LifecycleConfig {
@@ -697,7 +931,7 @@ async fn test_concurrent_lifecycle_40k() {
             jobs_per_kind: 10_000,
             producer_batch_size: 500,
             producers_per_kind: 2,
-            window_secs: 60,
+            window_secs: 120,
         },
     )
     .await;
@@ -708,7 +942,7 @@ async fn test_concurrent_lifecycle_40k() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore]
 async fn test_concurrent_lifecycle_100k() {
-    let pool = setup(40).await;
+    let pool = setup(50).await;
     run_lifecycle_benchmark(
         &pool,
         &LifecycleConfig {
@@ -716,7 +950,7 @@ async fn test_concurrent_lifecycle_100k() {
             jobs_per_kind: 25_000,
             producer_batch_size: 1_000,
             producers_per_kind: 4,
-            window_secs: 120,
+            window_secs: 180,
         },
     )
     .await;
