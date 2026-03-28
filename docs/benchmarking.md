@@ -218,15 +218,26 @@ full insert → claim → execute → complete lifecycle.
 | Multi-queue drain (pre-seeded) | 8k | 4 | 128 | `~440/s` |
 | Multi-queue concurrent (insert + consume) | 10k | 4 | 128 | `~260/s` |
 
-The 10-20x per-worker throughput gap between single-queue and multi-queue
-workloads is expected: each queue has its own dispatcher doing
-`FOR UPDATE SKIP LOCKED` claims independently, and multi-queue setups
-multiply the connection and lock contention.
+The per-worker throughput gap between single-queue and multi-queue workloads
+is primarily caused by **connection pool contention**: each queue has its own
+dispatcher acquiring pool connections for `FOR UPDATE SKIP LOCKED` claims,
+and the completion batcher competes for the same pool. With 4 dispatchers,
+4 PgListeners, heartbeat, and maintenance all sharing a 30-connection pool,
+claim latency rises from ~6ms to ~52ms and completion flush from ~5ms to ~53ms.
+
+**Tuning guideline**: size the connection pool to at least `num_queues * 4 +
+total_workers / 10`. For the 4-queue / 128-worker config above, that's ~29
+connections minimum.
 
 For workloads that need maximum throughput, consolidating into fewer queues
 with larger worker pools is more efficient than spreading across many
 queues. Multi-queue is the right trade-off when queue isolation, priority,
 or rate limiting matters more than raw throughput.
+
+A unified cross-queue claim query (one SQL round-trip claiming across all
+queues via `LATERAL JOIN`) could eliminate the per-queue dispatch overhead.
+Prototyping shows 16ms for 48 jobs across 2 queues — comparable to
+single-queue performance. This is tracked as a future optimization.
 
 ### Progress Feature Overhead
 

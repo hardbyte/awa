@@ -420,6 +420,12 @@ async fn test_concurrent_drain_8k() {
     let pool = setup(30).await;
     reset_runtime_state(&pool).await;
 
+    let exporter = opentelemetry_sdk::metrics::InMemoryMetricExporter::default();
+    let meter_provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
     let kinds: &[(&str, &str)] = &[
         ("email_job", "lifecycle_email"),
         ("payment_job", "lifecycle_payments"),
@@ -549,6 +555,82 @@ async fn test_concurrent_drain_8k() {
     let drain_elapsed = started.elapsed();
     client.shutdown(Duration::from_secs(5)).await;
 
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to get metrics");
+
+    // Print claim and completion metrics for diagnosis
+    for rm in &resource_metrics {
+        for scope_metrics in &rm.scope_metrics {
+            for metric in &scope_metrics.metrics {
+                if metric.name.starts_with("awa.dispatch")
+                    || metric.name.starts_with("awa.completion")
+                {
+                    if let Some(sum) = metric
+                        .data
+                        .as_any()
+                        .downcast_ref::<opentelemetry_sdk::metrics::data::Sum<u64>>()
+                    {
+                        let total: u64 = sum.data_points.iter().map(|dp| dp.value).sum();
+                        println!("[metrics] {}: total={total}", metric.name);
+                    }
+                    if let Some(hist) = metric
+                        .data
+                        .as_any()
+                        .downcast_ref::<opentelemetry_sdk::metrics::data::Histogram<f64>>(
+                    ) {
+                        let mut count = 0u64;
+                        let mut sum = 0.0f64;
+                        let mut max = 0.0f64;
+                        for dp in &hist.data_points {
+                            count += dp.count;
+                            sum += dp.sum;
+                            if let Some(m) = dp.max {
+                                max = max.max(m);
+                            }
+                        }
+                        let mean = if count > 0 { sum / count as f64 } else { 0.0 };
+                        println!(
+                            "[metrics] {}: count={count} mean_ms={:.3} max_ms={:.3}",
+                            metric.name,
+                            mean * 1000.0,
+                            max * 1000.0
+                        );
+                    }
+                    if let Some(hist) = metric
+                        .data
+                        .as_any()
+                        .downcast_ref::<opentelemetry_sdk::metrics::data::Histogram<u64>>(
+                    ) {
+                        let mut count = 0u64;
+                        let mut sum = 0u64;
+                        let mut max = 0u64;
+                        for dp in &hist.data_points {
+                            count += dp.count;
+                            sum += dp.sum;
+                            if let Some(m) = dp.max {
+                                max = max.max(m);
+                            }
+                        }
+                        let mean = if count > 0 {
+                            sum as f64 / count as f64
+                        } else {
+                            0.0
+                        };
+                        println!(
+                            "[metrics] {}: count={count} mean={mean:.1} max={max}",
+                            metric.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+    let _ = meter_provider.shutdown();
+
     let handler_total = email_count.load(Ordering::Relaxed)
         + payment_count.load(Ordering::Relaxed)
         + analytics_count.load(Ordering::Relaxed)
@@ -556,11 +638,11 @@ async fn test_concurrent_drain_8k() {
     let drain_rate = handler_total as f64 / drain_elapsed.as_secs_f64();
 
     println!(
-        "[lifecycle] drain_20k: {handler_total} jobs drained in {:.2}s ({drain_rate:.0}/s)",
+        "[lifecycle] drain: {handler_total} jobs drained in {:.2}s ({drain_rate:.0}/s)",
         drain_elapsed.as_secs_f64()
     );
     println!(
-        "[lifecycle] drain_20k per-kind: email={} payment={} analytics={} webhook={}",
+        "[lifecycle] drain per-kind: email={} payment={} analytics={} webhook={}",
         email_count.load(Ordering::Relaxed),
         payment_count.load(Ordering::Relaxed),
         analytics_count.load(Ordering::Relaxed),
