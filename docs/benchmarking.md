@@ -206,6 +206,28 @@ fix (v0.5.0) eliminated the bottleneck entirely.
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
 
+### Concurrent Multi-Queue Lifecycle
+
+Measured with `concurrent_lifecycle_test.rs`. Four queues (`email:32`,
+`payments:16`, `analytics:64`, `webhooks:16` workers), 128 total workers,
+full insert → claim → execute → complete lifecycle.
+
+| Scenario | Jobs | Queues | Workers | Throughput |
+|----------|------|--------|---------|------------|
+| Single-queue hot-path | 200k pre-seeded | 1 | 256 | `~9.2k/s` |
+| Multi-queue drain (pre-seeded) | 8k | 4 | 128 | `~440/s` |
+| Multi-queue concurrent (insert + consume) | 10k | 4 | 128 | `~260/s` |
+
+The 10-20x per-worker throughput gap between single-queue and multi-queue
+workloads is expected: each queue has its own dispatcher doing
+`FOR UPDATE SKIP LOCKED` claims independently, and multi-queue setups
+multiply the connection and lock contention.
+
+For workloads that need maximum throughput, consolidating into fewer queues
+with larger worker pools is more efficient than spreading across many
+queues. Multi-queue is the right trade-off when queue isolation, priority,
+or rate limiting matters more than raw throughput.
+
 ### Progress Feature Overhead
 
 The structured progress feature (ADR-014) adds a `progress JSONB` column
