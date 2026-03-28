@@ -33,30 +33,30 @@ const COUNTER_KEYS = ["available", "running", "failed", "scheduled", "waiting_ex
 
 export function DashboardPage() {
   const navigate = useNavigate();
-  const pollInterval = usePollInterval();
+  const poll = usePollInterval();
 
   const statsQuery = useQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const failedQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", { state: "failed", limit: 10 }],
     queryFn: () => fetchJobs({ state: "failed", limit: 10 }),
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const completedPerHour = queuesQuery.data

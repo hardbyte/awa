@@ -54,11 +54,11 @@ function attentionItems(instance: RuntimeInstance): string[] {
 
 export function RuntimeInstancePage() {
   const { instanceId } = useParams({ strict: false });
-  const pollInterval = usePollInterval();
+  const poll = usePollInterval();
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   if (runtimeQuery.isLoading) {

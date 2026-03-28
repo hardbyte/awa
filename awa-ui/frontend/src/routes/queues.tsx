@@ -33,18 +33,18 @@ import { usePollInterval } from "@/hooks/use-poll-interval";
 export function QueuesPage() {
   const queryClient = useQueryClient();
   const [drainTarget, setDrainTarget] = useState<string | null>(null);
-  const pollInterval = usePollInterval();
+  const poll = usePollInterval();
 
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
     queryFn: fetchQueues,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
   const readOnly = useReadOnly();
 

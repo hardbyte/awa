@@ -104,18 +104,18 @@ export function JobsPage() {
   };
 
   const hasSel = selected.size > 0;
-  const pollInterval = usePollInterval();
+  const poll = usePollInterval();
 
   const jobsQuery = useQuery<JobRow[]>({
     queryKey: ["jobs", params],
     queryFn: () => fetchJobs(params),
-    refetchInterval: hasSel ? false : pollInterval,
+    refetchInterval: hasSel ? false : poll.interval, staleTime: poll.staleTime,
   });
 
   const statsQuery = useQuery<StateCounts>({
     queryKey: ["stats"],
     queryFn: fetchStats,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
   const readOnly = useReadOnly();
 

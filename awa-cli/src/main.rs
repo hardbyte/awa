@@ -62,7 +62,7 @@ enum Commands {
         port: u16,
         /// Maximum number of database connections
         #[arg(long, default_value = "10", env = "AWA_POOL_MAX")]
-        pool_size: u32,
+        pool_max: u32,
         /// Minimum idle connections kept open
         #[arg(long, default_value = "2", env = "AWA_POOL_MIN")]
         pool_min: u32,
@@ -226,7 +226,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Serve {
             host,
             port,
-            pool_size,
+            pool_max,
             pool_min,
             pool_idle_timeout,
             pool_max_lifetime,
@@ -235,7 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let db_url = require_pool(&cli.database_url)?;
             let pool = PgPoolOptions::new()
-                .max_connections(pool_size)
+                .max_connections(pool_max)
                 .min_connections(pool_min)
                 .idle_timeout(Duration::from_secs(pool_idle_timeout))
                 .max_lifetime(Duration::from_secs(pool_max_lifetime))
@@ -243,8 +243,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .connect(&db_url)
                 .await?;
 
-            let cache_ttl = Duration::from_secs(cache_ttl);
-            let app = awa_ui::router(pool, cache_ttl).await?;
+            let cache_duration = Duration::from_secs(cache_ttl);
+            let app = awa_ui::router(pool, cache_duration).await?;
             let addr = format!("{host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!("AWA UI listening on http://{addr}");

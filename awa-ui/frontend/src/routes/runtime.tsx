@@ -31,18 +31,18 @@ import {
 } from "@/components/RuntimeDisplay";
 
 export function RuntimePage() {
-  const pollInterval = usePollInterval();
+  const poll = usePollInterval();
 
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const queueRuntimeQuery = useQuery<QueueRuntimeSummary[]>({
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const runtime = runtimeQuery.data;

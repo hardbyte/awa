@@ -155,7 +155,7 @@ The `awa` CLI currently supports these global flags:
 |---|---|---|---|
 | `--host` | | `127.0.0.1` | Bind host |
 | `--port` | | `3000` | Bind port |
-| `--pool-size` | `AWA_POOL_MAX` | `10` | Maximum database connections |
+| `--pool-max` | `AWA_POOL_MAX` | `10` | Maximum database connections |
 | `--pool-min` | `AWA_POOL_MIN` | `2` | Minimum idle connections kept open |
 | `--pool-idle-timeout` | `AWA_POOL_IDLE_TIMEOUT` | `300` | Seconds before an idle connection is closed |
 | `--pool-max-lifetime` | `AWA_POOL_MAX_LIFETIME` | `1800` | Maximum lifetime of a connection in seconds |

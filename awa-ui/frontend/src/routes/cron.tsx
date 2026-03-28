@@ -20,12 +20,12 @@ export function CronPage() {
   const queryClient = useQueryClient();
   const [expandedName, setExpandedName] = useState<string | null>(null);
   const readOnly = useReadOnly();
-  const pollInterval = usePollInterval();
+  const poll = usePollInterval();
 
   const cronQuery = useQuery<CronJobRow[]>({
     queryKey: ["cron"],
     queryFn: fetchCronJobs,
-    refetchInterval: pollInterval,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
   const triggerMutation = useMutation({

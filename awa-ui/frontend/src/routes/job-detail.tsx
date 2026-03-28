@@ -23,7 +23,7 @@ import { ProgressDisplay } from "@/components/ProgressDisplay";
 import { Copyable } from "@/components/CopyButton";
 import { CopyButton } from "@/components/CopyButton";
 import { JobTimeline } from "@/components/JobTimeline";
-import { usePollInterval } from "@/hooks/use-poll-interval";
+import { POLL } from "@/lib/constants";
 
 function hasMetadata(job: JobRow): boolean {
   return (
@@ -39,13 +39,11 @@ export function JobDetailPage() {
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
 
-  const pollInterval = usePollInterval();
-
   const jobQuery = useQuery<JobRow>({
     queryKey: ["job", jobId],
     queryFn: () => fetchJob(jobId),
     enabled: !isNaN(jobId),
-    refetchInterval: pollInterval,
+    refetchInterval: POLL.FAST,
   });
 
   const retryMutation = useMutation({
