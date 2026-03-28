@@ -210,6 +210,23 @@ class AsyncClient:
 
     # ── Worker lifecycle (sync — called from async context) ─────
 
+    def task(
+        self,
+        args_type: type[T],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+    ) -> Callable[[Callable[[Job[T]], Awaitable[Any]]], Callable[[Job[T]], Awaitable[Any]]]:
+        """Register a task handler (decorator).
+
+        Example::
+
+            @client.task(SendEmail, queue="email")
+            async def handle(job):
+                send_email(job.args.to, job.args.subject)
+        """
+        return self._raw.worker(args_type, kind=kind, queue=queue)
+
     def worker(
         self,
         args_type: type[T],
@@ -217,8 +234,14 @@ class AsyncClient:
         kind: str | None = None,
         queue: str = "default",
     ) -> Callable[[Callable[[Job[T]], Awaitable[Any]]], Callable[[Job[T]], Awaitable[Any]]]:
-        """Register a worker handler (decorator)."""
-        return self._raw.worker(args_type, kind=kind, queue=queue)
+        """Deprecated: use ``task()`` instead."""
+        import warnings
+        warnings.warn(
+            "client.worker() is deprecated, use client.task() instead",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        return self.task(args_type, kind=kind, queue=queue)
 
     def periodic(
         self,
@@ -261,7 +284,6 @@ class AsyncClient:
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
-        heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
     ) -> None:
@@ -277,7 +299,6 @@ class AsyncClient:
             heartbeat_interval_ms=heartbeat_interval_ms,
             promote_interval_ms=promote_interval_ms,
             heartbeat_rescue_interval_ms=heartbeat_rescue_interval_ms,
-            heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
         )

@@ -139,7 +139,7 @@ Validation rules:
 - tuple form is not allowed with `global_max_workers`
 - weighted mode requires explicit queue configs
 - a dict cannot contain both `max_workers` and `min_workers`
-- every worker queue declared with `@client.worker(..., queue=...)` must be configured in `start()`
+- every worker queue declared with `@client.task(..., queue=...)` must be configured in `start()`
 
 ## CLI Configuration
 

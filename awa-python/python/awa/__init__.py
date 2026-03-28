@@ -38,7 +38,6 @@ from awa._awa import (
     CallbackNotFound,
 )
 
-from awa.bridge import insert_job, insert_job_sync
 from awa.client import AsyncClient, Client
 
 __all__ = [
@@ -63,9 +62,6 @@ __all__ = [
     "RetryAfter",
     "Snooze",
     "Cancel",
-    # Bridge (ORM/driver transaction bridging)
-    "insert_job",
-    "insert_job_sync",
     # Functions
     "derive_kind",
     "migrate",

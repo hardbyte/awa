@@ -18,7 +18,7 @@ async def main() -> None:
     client = awa.AsyncClient(database_url)
     await client.migrate()
 
-    @client.worker(ChaosProbe, queue=queue)
+    @client.task(ChaosProbe, queue=queue)
     async def handle(job):
         print(
             f"START role={role} pid={os.getpid()} job_id={job.id} attempt={job.attempt}",

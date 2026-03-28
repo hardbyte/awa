@@ -35,7 +35,7 @@ async def test_set_progress_from_handler(client):
     queue = "progress_pp1"
     flushed = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         job.set_progress(50, "halfway there")
         await job.flush_progress()
@@ -62,7 +62,7 @@ async def test_update_metadata_from_handler(client):
     queue = "progress_pp2"
     verified = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         job.set_progress(25, "starting")
         job.update_metadata({"batch": 1, "cursor": "abc"})
@@ -93,7 +93,7 @@ async def test_flush_progress_immediate(client):
     queue = "progress_pp3"
     flush_verified = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         job.set_progress(42, "flushing now")
         await job.flush_progress()
@@ -122,7 +122,7 @@ async def test_progress_property_returns_dict(client):
     queue = "progress_pp4"
     progress_read = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         # Initially None (no progress set on fresh job)
         assert job.progress is None
@@ -152,7 +152,7 @@ async def test_progress_persists_across_retry(client):
     queue = "progress_pp5"
     attempt_data = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         if job.attempt == 1:
             # First attempt: set checkpoint and request retry
@@ -185,7 +185,7 @@ async def test_get_job_returns_progress(client):
     queue = "progress_pp6"
     retried = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         if job.attempt == 1:
             job.set_progress(70, "external read test")
@@ -214,7 +214,7 @@ async def test_flush_progress_sync(client):
     queue = "progress_pp7"
     flushed = []
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         job.set_progress(33, "sync flush")
         job.flush_progress_sync()
@@ -236,7 +236,7 @@ async def test_get_job_sync_returns_progress(client):
     """get_job_sync() returns a Job with progress."""
     queue = "progress_pp8"
 
-    @client.worker(ProgressArgs, queue=queue)
+    @client.task(ProgressArgs, queue=queue)
     async def handle(job):
         if job.attempt == 1:
             job.set_progress(80, "sync read")

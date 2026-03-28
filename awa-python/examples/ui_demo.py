@@ -166,11 +166,11 @@ async def main() -> None:
 
     callback_ids: list[str] = []
 
-    @client.worker(SendEmail, queue="ui_demo_email")
+    @client.task(SendEmail, queue="ui_demo_email")
     async def handle_email(job):
         print(f"Sent welcome email to {job.args.to}")
 
-    @client.worker(ImportCustomers, queue="ui_demo_etl")
+    @client.task(ImportCustomers, queue="ui_demo_etl")
     async def handle_import(job):
         job.set_progress(35, "Validated 3 of 8 rows")
         job.update_metadata(
@@ -183,7 +183,7 @@ async def main() -> None:
         await job.flush_progress()
         raise awa.TerminalError("missing required column: email")
 
-    @client.worker(AwaitApproval, queue="ui_demo_callbacks")
+    @client.task(AwaitApproval, queue="ui_demo_callbacks")
     async def handle_approval(job):
         job.set_progress(90, "Waiting for external approval")
         job.update_metadata({"invoice_id": job.args.invoice_id, "provider": "stripe"})

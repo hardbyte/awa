@@ -62,7 +62,7 @@ async def main():
 
     # ── Register workers ────────────────────────────────────────
 
-    @client.worker(ChargeCustomer, queue="payments")
+    @client.task(ChargeCustomer, queue="payments")
     async def handle_charge(job):
         customer_id = job.args.customer_id
         amount = job.args.amount_cents
@@ -91,7 +91,7 @@ async def main():
 
         print(f"  ✓ Charged {customer_id}: ${amount/100:.2f} → {charge_id}")
 
-    @client.worker(SendReceipt, queue="notifications")
+    @client.task(SendReceipt, queue="notifications")
     async def handle_receipt(job):
         customer_id = job.args.customer_id
         charge_id = job.args.charge_id
