@@ -197,6 +197,16 @@ class AsyncClient:
         """Retry a waiting job via external callback."""
         return await self._raw.retry_external(callback_id)
 
+    async def heartbeat_callback(
+        self, callback_id: str, timeout_seconds: float = 3600.0
+    ) -> Job:
+        """Reset the callback timeout for a long-running external operation.
+
+        Call periodically to signal "still working" without completing the job.
+        Resets the timeout deadline to ``now() + timeout_seconds``.
+        """
+        return await self._raw.heartbeat_callback(callback_id, timeout_seconds)
+
     async def resolve_callback(
         self,
         callback_id: str,
@@ -460,6 +470,12 @@ class Client:
     def retry_external(self, callback_id: str) -> Job:
         """Retry a waiting job via external callback."""
         return self._raw.retry_external_sync(callback_id)
+
+    def heartbeat_callback(
+        self, callback_id: str, timeout_seconds: float = 3600.0
+    ) -> Job:
+        """Reset the callback timeout for a long-running external operation."""
+        return self._raw.heartbeat_callback_sync(callback_id, timeout_seconds)
 
     def resolve_callback(
         self,

@@ -891,6 +891,46 @@ impl PyClient {
         })
     }
 
+    /// Reset the callback timeout for a long-running external operation.
+    #[pyo3(signature = (callback_id, timeout_seconds=3600.0))]
+    fn heartbeat_callback<'py>(
+        &self,
+        py: Python<'py>,
+        callback_id: String,
+        timeout_seconds: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let uuid = uuid::Uuid::parse_str(&callback_id)
+                .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+            let timeout = Duration::from_secs_f64(timeout_seconds);
+            let row = awa_model::admin::heartbeat_callback(&pool, uuid, timeout)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyJob::from(row))
+        })
+    }
+
+    fn heartbeat_callback_sync(
+        &self,
+        py: Python<'_>,
+        callback_id: String,
+        timeout_seconds: Option<f64>,
+    ) -> PyResult<PyJob> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let uuid = uuid::Uuid::parse_str(&callback_id)
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
+                let timeout = Duration::from_secs_f64(timeout_seconds.unwrap_or(3600.0));
+                let row = awa_model::admin::heartbeat_callback(&pool, uuid, timeout)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyJob::from(row))
+            })
+        })
+    }
+
     #[pyo3(signature = (callback_id, payload=None))]
     fn complete_external_sync(
         &self,

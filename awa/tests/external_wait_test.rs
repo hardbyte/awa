@@ -984,3 +984,97 @@ async fn test_wait_for_callback_without_register() {
     assert_eq!(failed.state, JobState::Failed);
     assert!(failed.finalized_at.is_some());
 }
+
+// ── Heartbeat callback ─────────────────────────────────────────
+
+#[tokio::test]
+async fn test_heartbeat_callback_resets_timeout() {
+    let client = setup().await;
+    let queue = "test_heartbeat_callback";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 200 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+
+    // Verify job is waiting
+    let waiting = client.get_job(job.id).await.unwrap();
+    assert_eq!(waiting.state, JobState::WaitingExternal);
+    let original_timeout = waiting.callback_timeout_at.expect("should have timeout");
+    let callback_id = waiting.callback_id.expect("should have callback_id");
+
+    // Heartbeat with a 2-hour timeout
+    let updated = admin::heartbeat_callback(
+        client.pool(),
+        callback_id,
+        std::time::Duration::from_secs(7200),
+    )
+    .await
+    .unwrap();
+
+    // Timeout should be extended
+    assert_eq!(updated.state, JobState::WaitingExternal);
+    let new_timeout = updated
+        .callback_timeout_at
+        .expect("should still have timeout");
+    assert!(
+        new_timeout > original_timeout,
+        "Heartbeat should extend timeout: old={original_timeout}, new={new_timeout}"
+    );
+}
+
+#[tokio::test]
+async fn test_heartbeat_callback_not_found_for_completed_job() {
+    let client = setup().await;
+    let queue = "test_heartbeat_not_found";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 201 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client
+        .work_one_in_queue(&ExternalPaymentWorker, Some(queue))
+        .await
+        .unwrap();
+
+    let waiting = client.get_job(job.id).await.unwrap();
+    let callback_id = waiting.callback_id.unwrap();
+
+    // Complete the job first
+    admin::complete_external(client.pool(), callback_id, None, None)
+        .await
+        .unwrap();
+
+    // Heartbeat on a completed job should fail
+    let result = admin::heartbeat_callback(
+        client.pool(),
+        callback_id,
+        std::time::Duration::from_secs(3600),
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(awa::AwaError::CallbackNotFound { .. })),
+        "Heartbeat on completed job should return CallbackNotFound, got: {result:?}"
+    );
+}

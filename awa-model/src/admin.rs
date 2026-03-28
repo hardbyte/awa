@@ -1132,6 +1132,41 @@ where
     })
 }
 
+/// Reset the callback timeout for a long-running external operation.
+///
+/// External systems call this periodically to signal "still working" without
+/// completing the job. Resets `callback_timeout_at` to `now() + timeout`.
+/// The job stays in `waiting_external`.
+///
+/// Returns the updated job row, or `CallbackNotFound` if the callback ID
+/// doesn't match a waiting job.
+pub async fn heartbeat_callback<'e, E>(
+    executor: E,
+    callback_id: Uuid,
+    timeout: std::time::Duration,
+) -> Result<JobRow, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let timeout_secs = timeout.as_secs_f64();
+    let row = sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET callback_timeout_at = now() + make_interval(secs => $2)
+        WHERE callback_id = $1 AND state = 'waiting_external'
+        RETURNING *
+        "#,
+    )
+    .bind(callback_id)
+    .bind(timeout_secs)
+    .fetch_optional(executor)
+    .await?;
+
+    row.ok_or(AwaError::CallbackNotFound {
+        callback_id: callback_id.to_string(),
+    })
+}
+
 /// Cancel (clear) a registered callback for a running job.
 ///
 /// Best-effort cleanup: returns `Ok(true)` if a row was updated,
