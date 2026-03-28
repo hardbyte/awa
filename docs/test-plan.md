@@ -127,6 +127,8 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | OT2 | OTLP export: awa.job.claimed reaches collector | Telemetry (E2E) | Implemented |
 | OT3 | OTLP export: awa.dispatch.claim_batches reaches collector | Telemetry (E2E) | Implemented |
 | OT4 | OTLP export: awa.job.duration histogram reaches collector | Telemetry (E2E) | Implemented |
+| SP1 | Scheduled promotion 10M rows: literal-state query uses partial index | Promotion perf | Implemented |
+| SP2 | Scheduled promotion 2M/4k: all 40k due jobs promoted and completed | Promotion perf | Implemented |
 | FB1 | Failure-mode benchmark: terminal 1/10/50% throughput | Failure bench | Implemented |
 | FB2 | Failure-mode benchmark: retryable 1/10/50% throughput | Failure bench | Implemented |
 | FB3 | Failure-mode benchmark: callback timeout 10% with rescue | Failure bench | Implemented |
