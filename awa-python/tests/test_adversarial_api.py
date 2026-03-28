@@ -221,10 +221,16 @@ async def test_handler_exception_preserves_type():
 
     stored = await client.get_job(job.id)
     assert str(stored.state) == "failed"
-    # Note: Job.errors is not currently exposed in the Python API.
-    # The error is stored in the DB and visible via SQL / the web UI.
-    # Structured error logging (python.exception_type, python.message)
-    # is the primary way to inspect handler errors programmatically.
+
+    # Errors are exposed as a list of dicts
+    assert isinstance(stored.errors, list)
+    assert len(stored.errors) >= 1
+    last_error = stored.errors[-1]
+    assert "error" in last_error
+    assert "attempt" in last_error
+    assert "at" in last_error
+    assert "ValueError" in last_error["error"]
+    assert "bad value" in last_error["error"]
 
 
 async def test_terminal_error_in_handler():
