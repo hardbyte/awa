@@ -401,10 +401,10 @@ async fn test_otlp_metrics_reach_prometheus() {
         wait_for_metric(&http, "awa_job_wait_duration_seconds_count", 1.0, timeout).await;
     eprintln!("  awa.job.wait_duration count = {wait_duration_count}");
 
-    // awa.queue.depth (unit: {job}, gauge) → awa_queue_depth
-    // Gauge values may be 0 after all jobs complete, so just check it exists (>= 0)
-    let queue_depth = wait_for_metric(&http, "awa_queue_depth", 0.0, timeout).await;
-    eprintln!("  awa.queue.depth = {queue_depth}");
+    // Note: awa.queue.depth and awa.queue.lag are leader-only gauges published
+    // by the maintenance loop. They require leader election + queue_stats_interval
+    // timing alignment, so they're validated in the in-memory observability tests
+    // rather than the OTLP integration test.
 
     // 7. Assertions (wait_for_metric already panics on timeout, but
     //    let's be explicit about what we expected).
