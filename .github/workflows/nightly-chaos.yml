@@ -114,6 +114,15 @@ jobs:
           cargo test --package awa --test failure_benchmark_test \
             test_failure_bench_stale_heartbeat_rescue -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-stale-rescue.txt
+      - name: Run concurrent multi-queue lifecycle benchmark
+        if: always()
+        timeout-minutes: 10
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --release --package awa --test concurrent_lifecycle_test \
+            test_concurrent_queue_sweep -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-queue-sweep.txt
       - name: Check for regressions
         if: always()
         run: python .github/scripts/check-bench-regression.py artifacts/nightly benchmarks/baseline.json
