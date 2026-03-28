@@ -10,6 +10,7 @@ readme.workspace = true
 [features]
 cel = ["awa-model/cel"]
 anyhow = ["awa-worker/anyhow"]
+http-worker = ["awa-worker/http-worker"]
 tokio-postgres = ["awa-model/tokio-postgres"]
 __python-bridge = ["awa-worker/__python-bridge"]
 
@@ -32,5 +33,6 @@ opentelemetry_sdk = { workspace = true, features = ["testing"] }
 opentelemetry = { workspace = true, features = ["testing"] }
 opentelemetry-otlp = { version = "0.29", features = ["grpc-tonic"] }
 tracing-opentelemetry = "0.28"
-reqwest = { version = "0.12", features = ["json"] }
+reqwest.workspace = true
+axum.workspace = true
 tracing = { workspace = true }

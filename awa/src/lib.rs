@@ -23,3 +23,6 @@ pub use awa_worker::{
     PeriodicJobBuilder, QueueCapacity, QueueConfig, QueueHealth, RateLimit, RetentionPolicy,
     UntypedJobEvent, Worker,
 };
+
+#[cfg(feature = "http-worker")]
+pub use awa_worker::{HttpWorker, HttpWorkerConfig, HttpWorkerMode};

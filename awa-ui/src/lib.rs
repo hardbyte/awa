@@ -56,7 +56,20 @@ pub async fn router(pool: PgPool, cache_ttl: Duration) -> Result<Router, sqlx::E
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
         .route("/capabilities", get(handlers::stats::get_capabilities))
         // Runtime
-        .route("/runtime", get(handlers::runtime::get_runtime));
+        .route("/runtime", get(handlers::runtime::get_runtime))
+        // Callbacks (for HTTP workers and external systems)
+        .route(
+            "/callbacks/{callback_id}/complete",
+            post(handlers::callbacks::complete_callback),
+        )
+        .route(
+            "/callbacks/{callback_id}/fail",
+            post(handlers::callbacks::fail_callback),
+        )
+        .route(
+            "/callbacks/{callback_id}/heartbeat",
+            post(handlers::callbacks::heartbeat_callback),
+        );
 
     Ok(Router::new()
         .nest("/api", api)
