@@ -69,7 +69,7 @@
     },
     {
       "title": "Queue Depth",
-      "description": "Jobs available for processing per queue \u2014 backlog size",
+      "description": "Current jobs by queue and state, stacked to show backlog shape and execution pressure",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -88,7 +88,33 @@
               "mode": "normal"
             }
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "available$" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "light-blue", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "running$" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "failed$" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "scheduled$" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "retryable$" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "waiting_external$" },
+            "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }]
+          }
+        ]
       },
       "targets": [
         {
@@ -102,6 +128,18 @@
         {
           "expr": "awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=\"failed\"}",
           "legendFormat": "{{awa_job_queue}} failed"
+        },
+        {
+          "expr": "awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=\"scheduled\"}",
+          "legendFormat": "{{awa_job_queue}} scheduled"
+        },
+        {
+          "expr": "awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=\"retryable\"}",
+          "legendFormat": "{{awa_job_queue}} retryable"
+        },
+        {
+          "expr": "awa_queue_depth{awa_job_queue=~\"$queue\", awa_job_state=\"waiting_external\"}",
+          "legendFormat": "{{awa_job_queue}} waiting external"
         }
       ],
       "datasource": {
@@ -126,7 +164,21 @@
             "lineWidth": 2,
             "fillOpacity": 0
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "^p50 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^p95 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^p99 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
       },
       "targets": [
         {
@@ -301,7 +353,21 @@
             "lineWidth": 2,
             "fillOpacity": 0
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "^p50 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^p95 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^p99 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }]
+          }
+        ]
       },
       "targets": [
         {
@@ -372,7 +438,17 @@
             "lineWidth": 2,
             "fillOpacity": 0
           }
-        }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byRegexp", "options": "^p50 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "^p95 " },
+            "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }]
+          }
+        ]
       },
       "targets": [
         {
@@ -430,7 +506,7 @@
       },
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "ops",
           "custom": {
             "drawStyle": "bars",
             "lineWidth": 1,
@@ -560,8 +636,8 @@
       }
     },
     {
-      "title": "Jobs Inserted / Waiting External",
-      "description": "Job insertion rate and callback-parked jobs",
+      "title": "Claims / Waiting External",
+      "description": "Queue consumption rate alongside jobs parked for external callbacks",
       "type": "timeseries",
       "gridPos": {
         "h": 8,
@@ -582,13 +658,13 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "inserted"
+              "options": "claimed"
             },
             "properties": [
               {
                 "id": "color",
                 "value": {
-                  "fixedColor": "blue",
+                  "fixedColor": "light-blue",
                   "mode": "fixed"
                 }
               }
@@ -613,11 +689,11 @@
       },
       "targets": [
         {
-          "expr": "sum(rate(awa_job_inserted_total[$__rate_interval]))",
-          "legendFormat": "inserted"
+          "expr": "sum(rate(awa_job_claimed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "claimed"
         },
         {
-          "expr": "sum(rate(awa_job_waiting_external_total[$__rate_interval]))",
+          "expr": "sum(rate(awa_job_waiting_external_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
           "legendFormat": "waiting_external"
         }
       ],
