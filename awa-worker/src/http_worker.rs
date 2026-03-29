@@ -106,6 +106,9 @@ impl HttpWorker {
         let client = builder.build().expect("failed to build HTTP client");
 
         Self {
+            // Leak the kind string to satisfy Worker::kind() -> &'static str.
+            // Workers are registered once at startup and live for the process
+            // lifetime, so this is a deliberate ~16-byte-per-kind trade-off.
             kind: Box::leak(kind.into_boxed_str()),
             client,
             config,

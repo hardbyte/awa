@@ -435,7 +435,7 @@ class Client:
     def heartbeat_callback_sync(
         self,
         callback_id: str,
-        timeout_seconds: float | None = None,
+        timeout_seconds: float = 3600.0,
     ) -> Job[dict[str, Any]]: ...
     def resolve_callback_sync(
         self,

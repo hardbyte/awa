@@ -1017,26 +1017,20 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     assert!(distinct_queues.contains(&queue_a.to_string()));
     assert!(distinct_queues.contains(&queue_b.to_string()));
 
-    // Snapshot counts just before the UPDATE to get a tight baseline.
-    let pre_update = admin::state_counts(client.pool()).await.unwrap();
-
     sqlx::query("UPDATE awa.jobs SET state = 'available', run_at = now() WHERE kind = $1")
         .bind(kind_b)
         .execute(client.pool())
         .await
         .unwrap();
 
-    let counts = admin::state_counts(client.pool()).await.unwrap();
-    // We moved 1 job from scheduled to available.
-    assert!(
-        counts.get(&JobState::Scheduled).copied().unwrap_or(0)
-            <= pre_update.get(&JobState::Scheduled).copied().unwrap_or(0),
-        "scheduled count should not have increased after promoting kind_b"
-    );
-    assert!(
-        counts.get(&JobState::Available).copied().unwrap_or(0)
-            > pre_update.get(&JobState::Available).copied().unwrap_or(0),
-        "expected at least 1 more available job after promoting kind_b"
+    // Verify the promotion via queue-specific stats (immune to concurrent
+    // test interference) rather than global count deltas.
+    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
+    assert_eq!(queue_a_stats.available, 2, "kind_b should now be available");
+    assert_eq!(
+        queue_a_stats.scheduled, 0,
+        "no scheduled jobs should remain"
     );
 
     sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
