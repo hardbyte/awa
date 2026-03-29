@@ -19,8 +19,10 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -37,6 +39,11 @@ fn otlp_endpoint() -> String {
 
 fn prometheus_url() -> String {
     std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://localhost:9090".to_string())
+}
+
+fn ignored_test_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
 async fn setup_pool() -> sqlx::PgPool {
@@ -74,7 +81,15 @@ struct FailureModeTelemetryJob {
     mode: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct DashboardTelemetryJob {
+    mode: String,
+    sleep_ms: u64,
+}
+
 struct FailureModeWorker;
+
+struct DashboardWorker;
 
 #[async_trait]
 impl Worker for FailureModeWorker {
@@ -113,6 +128,70 @@ impl Worker for FailureModeWorker {
             }
             other => Err(JobError::terminal(format!(
                 "unknown telemetry test mode: {other}"
+            ))),
+        }
+    }
+}
+
+#[async_trait]
+impl Worker for DashboardWorker {
+    fn kind(&self) -> &'static str {
+        "dashboard_telemetry_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let args: DashboardTelemetryJob =
+            serde_json::from_value(ctx.job.args.clone()).map_err(JobError::retryable)?;
+
+        match args.mode.as_str() {
+            "complete" => {
+                if args.sleep_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(args.sleep_ms)).await;
+                }
+                Ok(JobResult::Completed)
+            }
+            "cancel" => Ok(JobResult::Cancel(
+                "intentional dashboard telemetry cancellation".to_string(),
+            )),
+            "terminal_fail" => Err(JobError::terminal(
+                "intentional dashboard telemetry failure",
+            )),
+            "retry_once" => {
+                if ctx.job.attempt == 1 {
+                    Ok(JobResult::RetryAfter(Duration::from_secs(3600)))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "callback_timeout" => {
+                if ctx.job.attempt == 1 {
+                    let callback = ctx
+                        .register_callback(Duration::from_secs(3600))
+                        .await
+                        .map_err(JobError::retryable)?;
+                    Ok(JobResult::WaitForCallback(callback))
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            "deadline_rescue" | "heartbeat_rescue" => {
+                if ctx.job.attempt == 1 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+                    loop {
+                        if ctx.is_cancelled() {
+                            return Ok(JobResult::Completed);
+                        }
+                        if std::time::Instant::now() >= deadline {
+                            return Ok(JobResult::Completed);
+                        }
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                } else {
+                    Ok(JobResult::Completed)
+                }
+            }
+            other => Err(JobError::terminal(format!(
+                "unknown dashboard telemetry mode: {other}"
             ))),
         }
     }
@@ -160,6 +239,30 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
         if start.elapsed() > Duration::from_secs(30) {
             panic!("Timed out waiting for {min} {state} jobs in queue {queue}; only {count} found");
         }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: &str) {
+    let start = std::time::Instant::now();
+    loop {
+        let current_state: String =
+            sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to query job state");
+
+        if current_state == state {
+            return;
+        }
+
+        if start.elapsed() > Duration::from_secs(30) {
+            panic!(
+                "Timed out waiting for job {job_id} to reach state {state}; current state: {current_state}"
+            );
+        }
+
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -215,6 +318,8 @@ struct PromData {
 
 #[derive(Debug, Deserialize)]
 struct PromResult {
+    #[serde(default)]
+    metric: std::collections::BTreeMap<String, String>,
     value: (f64, String),
 }
 
@@ -241,6 +346,82 @@ async fn prom_query(client: &reqwest::Client, metric: &str) -> Option<f64> {
         }
     }
     found.then_some(total)
+}
+
+async fn prom_query_series(client: &reqwest::Client, metric: &str) -> Vec<(String, f64)> {
+    let url = format!("{}/api/v1/query", prometheus_url());
+    let resp = match client.get(&url).query(&[("query", metric)]).send().await {
+        Ok(resp) => resp,
+        Err(_) => return Vec::new(),
+    };
+
+    let body: PromResponse = match resp.json().await {
+        Ok(body) => body,
+        Err(_) => return Vec::new(),
+    };
+
+    if body.status != "success" {
+        return Vec::new();
+    }
+
+    body.data
+        .result
+        .into_iter()
+        .filter_map(|result| {
+            let value = result.value.1.parse::<f64>().ok()?;
+            let labels = if result.metric.is_empty() {
+                "value".to_string()
+            } else {
+                result
+                    .metric
+                    .into_iter()
+                    .filter(|(key, _)| key != "__name__")
+                    .map(|(key, value)| format!("{key}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            Some((labels, value))
+        })
+        .collect()
+}
+
+async fn wait_for_series(
+    client: &reqwest::Client,
+    metric: &str,
+    min_series: usize,
+    timeout: Duration,
+) -> Vec<(String, f64)> {
+    let start = std::time::Instant::now();
+    loop {
+        let series = prom_query_series(client, metric).await;
+        if series.len() >= min_series {
+            return series;
+        }
+
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for {metric} to return at least {min_series} series after {timeout:?}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+fn print_panel_report(title: &str, series: &[(String, f64)]) {
+    let observed = series
+        .iter()
+        .map(|(labels, value)| format!("{labels}={value:.4}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    eprintln!("panel: {title} -> {observed}");
+}
+
+fn named_series(name: &str, series: Vec<(String, f64)>) -> Vec<(String, f64)> {
+    series
+        .into_iter()
+        .map(|(labels, value)| (format!("{name} {labels}"), value))
+        .collect()
 }
 
 /// Retry a Prometheus query until it returns a value >= threshold or timeout.
@@ -277,6 +458,10 @@ async fn wait_for_metric(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_otlp_metrics_reach_prometheus() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "telemetry_otlp_test";
     clean_queue(&pool, queue).await;
@@ -315,6 +500,7 @@ async fn test_otlp_metrics_reach_prometheus() {
             },
         )
         .register::<TelemetryJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+        .queue_stats_interval(Duration::from_secs(2))
         .build()
         .expect("Failed to build client");
 
@@ -394,6 +580,17 @@ async fn test_otlp_metrics_reach_prometheus() {
         wait_for_metric(&http, "awa_job_duration_seconds_count", 1.0, timeout).await;
     eprintln!("  awa.job.duration count = {duration_count}");
 
+    // Queue health metrics (new)
+    // awa.job.wait_duration (unit: s) → awa_job_wait_duration_seconds_count
+    let wait_duration_count =
+        wait_for_metric(&http, "awa_job_wait_duration_seconds_count", 1.0, timeout).await;
+    eprintln!("  awa.job.wait_duration count = {wait_duration_count}");
+
+    // Note: awa.queue.depth and awa.queue.lag are leader-only gauges published
+    // by the maintenance loop. They require leader election + queue_stats_interval
+    // timing alignment, so they're validated in the in-memory observability tests
+    // rather than the OTLP integration test.
+
     // 7. Assertions (wait_for_metric already panics on timeout, but
     //    let's be explicit about what we expected).
     assert!(
@@ -412,6 +609,10 @@ async fn test_otlp_metrics_reach_prometheus() {
         duration_count >= 1.0,
         "Expected awa.job.duration count >= 1, got {duration_count}"
     );
+    assert!(
+        wait_duration_count >= 1.0,
+        "Expected awa.job.wait_duration count >= 1, got {wait_duration_count}"
+    );
 
     // Clean up.
     let _ = meter_provider.shutdown();
@@ -423,6 +624,10 @@ async fn test_otlp_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_failure_path_metrics_reach_prometheus() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "telemetry_failure_path";
     clean_queue(&pool, queue).await;
@@ -581,6 +786,10 @@ async fn test_failure_path_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_collector_death_does_not_block_job_processing() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "telemetry_collector_death";
     clean_queue(&pool, queue).await;
@@ -696,4 +905,568 @@ async fn test_collector_death_does_not_block_job_processing() {
     client.shutdown(Duration::from_secs(5)).await;
     let _ = meter_provider.shutdown();
     eprintln!("Collector-death resilience test passed!");
+}
+
+/// Exercises the Grafana dashboard queries against a live LGTM stack and prints
+/// a per-panel report so we can verify every panel has observed data.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn dashboard_panels_have_observed_data() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
+    let pool = setup_pool().await;
+    let queue = "grafana_demo";
+    clean_queue(&pool, queue).await;
+
+    let meter_provider = build_otlp_meter_provider(&otlp_endpoint(), "awa-grafana-demo");
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(50),
+                ..Default::default()
+            },
+        )
+        .register::<TelemetryJob, _, _>(|args: TelemetryJob, _ctx| async move {
+            let sleep_ms = if args.value.starts_with("slow") {
+                4_000
+            } else {
+                20
+            };
+            tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            Ok(JobResult::Completed)
+        })
+        .register_worker(DashboardWorker)
+        .queue_stats_interval(Duration::from_secs(1))
+        .heartbeat_interval(Duration::from_millis(100))
+        .heartbeat_rescue_interval(Duration::from_millis(150))
+        .deadline_rescue_interval(Duration::from_millis(150))
+        .callback_rescue_interval(Duration::from_millis(150))
+        .promote_interval(Duration::from_millis(100))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(100))
+        .build()
+        .expect("Failed to build client");
+
+    client.start().await.expect("Failed to start client");
+    wait_for_leader(&client, Duration::from_secs(5)).await;
+
+    // Phase 1: generate non-backlog metrics (failures, retries, callbacks,
+    // promotions, rescues, cancellations).
+    let cancelled_job = insert_with(
+        &pool,
+        &DashboardTelemetryJob {
+            mode: "cancel".into(),
+            sleep_ms: 0,
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to insert cancelled demo job");
+
+    for _ in 0..2 {
+        insert_with(
+            &pool,
+            &DashboardTelemetryJob {
+                mode: "terminal_fail".into(),
+                sleep_ms: 0,
+            },
+            InsertOpts {
+                queue: queue.into(),
+                max_attempts: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert terminal failure demo job");
+    }
+
+    let retry_job_ids = {
+        let mut job_ids = Vec::new();
+        for _ in 0..2 {
+            let job = insert_with(
+                &pool,
+                &DashboardTelemetryJob {
+                    mode: "retry_once".into(),
+                    sleep_ms: 0,
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    max_attempts: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert retry demo job");
+            job_ids.push(job.id);
+        }
+        job_ids
+    };
+
+    let callback_job_ids = {
+        let mut job_ids = Vec::new();
+        for _ in 0..2 {
+            let job = insert_with(
+                &pool,
+                &DashboardTelemetryJob {
+                    mode: "callback_timeout".into(),
+                    sleep_ms: 0,
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    max_attempts: 3,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert callback demo job");
+            job_ids.push(job.id);
+        }
+        job_ids
+    };
+
+    let deadline_job = insert_with(
+        &pool,
+        &DashboardTelemetryJob {
+            mode: "deadline_rescue".into(),
+            sleep_ms: 0,
+        },
+        InsertOpts {
+            queue: queue.into(),
+            max_attempts: 3,
+            deadline_duration: Some(chrono::Duration::hours(1)),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to insert deadline rescue demo job");
+
+    let heartbeat_job = insert_with(
+        &pool,
+        &DashboardTelemetryJob {
+            mode: "heartbeat_rescue".into(),
+            sleep_ms: 0,
+        },
+        InsertOpts {
+            queue: queue.into(),
+            max_attempts: 3,
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to insert heartbeat rescue demo job");
+
+    let scheduled_job_ids = {
+        let mut job_ids = Vec::new();
+        for index in 0..2 {
+            let job = insert_with(
+                &pool,
+                &TelemetryJob {
+                    value: format!("scheduled-{index}"),
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    run_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("Failed to insert scheduled demo job");
+            job_ids.push(job.id);
+        }
+        job_ids
+    };
+
+    wait_for_job_state(&pool, cancelled_job.id, "cancelled").await;
+    wait_for_job_count(&pool, queue, "failed", 2).await;
+    wait_for_job_count(&pool, queue, "retryable", 2).await;
+    wait_for_job_count(&pool, queue, "waiting_external", 2).await;
+    wait_for_job_state(&pool, deadline_job.id, "running").await;
+    wait_for_job_state(&pool, heartbeat_job.id, "running").await;
+    wait_for_job_count(&pool, queue, "scheduled", 2).await;
+
+    // Let the queue depth gauge capture retryable/waiting_external/scheduled.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    sqlx::query(
+        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' WHERE id = ANY($1)",
+    )
+    .bind(&callback_job_ids)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate callback timeouts");
+
+    sqlx::query("UPDATE awa.jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)")
+        .bind(&retry_job_ids)
+        .execute(&pool)
+        .await
+        .expect("Failed to backdate retryable jobs");
+
+    sqlx::query("UPDATE awa.jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)")
+        .bind(&scheduled_job_ids)
+        .execute(&pool)
+        .await
+        .expect("Failed to backdate scheduled jobs");
+
+    sqlx::query("UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1")
+        .bind(deadline_job.id)
+        .execute(&pool)
+        .await
+        .expect("Failed to backdate deadline rescue job");
+
+    sqlx::query("UPDATE awa.jobs SET heartbeat_at = now() - interval '5 minutes' WHERE id = $1")
+        .bind(heartbeat_job.id)
+        .execute(&pool)
+        .await
+        .expect("Failed to backdate heartbeat rescue job");
+
+    wait_for_job_count(&pool, queue, "completed", 6).await;
+    wait_for_job_count(&pool, queue, "failed", 2).await;
+
+    // Phase 2: create current backlog so gauge/stat panels are populated now.
+    for index in 0..10 {
+        insert_with(
+            &pool,
+            &TelemetryJob {
+                value: format!("slow-{index}"),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert slow demo job");
+    }
+
+    for index in 0..6 {
+        insert_with(
+            &pool,
+            &TelemetryJob {
+                value: format!("fast-{index}"),
+            },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert fast demo job");
+    }
+
+    wait_for_job_count(&pool, queue, "running", 4).await;
+    wait_for_job_count(&pool, queue, "available", 2).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    meter_provider
+        .force_flush()
+        .expect("flush before panel queries");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
+    let http = reqwest::Client::new();
+    let timeout = Duration::from_secs(60);
+    let queue_match = queue;
+
+    let queue_lag = wait_for_series(
+        &http,
+        &format!("awa_queue_lag_seconds{{awa_job_queue=\"{queue_match}\"}}"),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Queue Lag", &queue_lag);
+
+    let queue_depth = wait_for_series(
+        &http,
+        &format!(
+            "awa_queue_depth{{awa_job_queue=\"{queue_match}\", awa_job_state=~\"available|running|failed|scheduled|retryable|waiting_external\"}}"
+        ),
+        6,
+        timeout,
+    )
+    .await;
+    print_panel_report("Queue Depth", &queue_depth);
+
+    let mut job_wait = Vec::new();
+    job_wait.extend(named_series(
+        "p50",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_wait.extend(named_series(
+        "p95",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_wait.extend(named_series(
+        "p99",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_wait_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    print_panel_report("Job Wait Time", &job_wait);
+
+    let mut job_throughput = Vec::new();
+    job_throughput.extend(named_series(
+        "completed",
+        wait_for_series(
+            &http,
+            &format!("sum(rate(awa_job_completed_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_throughput.extend(named_series(
+        "failed",
+        wait_for_series(
+            &http,
+            &format!("sum(rate(awa_job_failed_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_throughput.extend(named_series(
+        "retried",
+        wait_for_series(
+            &http,
+            &format!("sum(rate(awa_job_retried_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_throughput.extend(named_series(
+        "cancelled",
+        wait_for_series(
+            &http,
+            &format!("sum(rate(awa_job_cancelled_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    print_panel_report("Job Throughput", &job_throughput);
+
+    let in_flight = wait_for_series(
+        &http,
+        &format!("sum by (awa_job_queue) (awa_job_in_flight{{awa_job_queue=\"{queue_match}\"}})"),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("In-Flight Jobs", &in_flight);
+
+    let mut job_duration = Vec::new();
+    job_duration.extend(named_series(
+        "p50",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_duration.extend(named_series(
+        "p95",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    job_duration.extend(named_series(
+        "p99",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.99, sum by (le, awa_job_queue) (rate(awa_job_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    print_panel_report("Job Duration", &job_duration);
+
+    let throughput_by_kind = wait_for_series(
+        &http,
+        &format!(
+            "topk(10, sum by (awa_job_kind) (rate(awa_job_completed_total{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+        ),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Throughput by Kind", &throughput_by_kind);
+
+    let mut claim_latency = Vec::new();
+    claim_latency.extend(named_series(
+        "p50",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.50, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    claim_latency.extend(named_series(
+        "p95",
+        wait_for_series(
+            &http,
+            &format!(
+                "histogram_quantile(0.95, sum by (le, awa_job_queue) (rate(awa_dispatch_claim_duration_seconds_bucket{{awa_job_queue=\"{queue_match}\"}}[5m])))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    print_panel_report("Claim Latency", &claim_latency);
+
+    let claim_batch_size = wait_for_series(
+        &http,
+        &format!(
+            "sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_sum{{awa_job_queue=\"{queue_match}\"}}[5m])) / sum by (awa_job_queue) (rate(awa_dispatch_claim_batch_size_count{{awa_job_queue=\"{queue_match}\"}}[5m]))"
+        ),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Claim Batch Size", &claim_batch_size);
+
+    let rescues = wait_for_series(
+        &http,
+        "sum by (awa_rescue_kind) (rate(awa_maintenance_rescues_total[5m]))",
+        3,
+        timeout,
+    )
+    .await;
+    print_panel_report("Maintenance Rescues", &rescues);
+
+    let completion_flush = wait_for_series(
+        &http,
+        "histogram_quantile(0.95, sum by (le) (rate(awa_completion_flush_duration_seconds_bucket[5m])))",
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Completion Flush Performance", &completion_flush);
+
+    let promotion = wait_for_series(
+        &http,
+        "sum by (awa_job_state) (rate(awa_maintenance_promote_batch_size_sum[5m]))",
+        2,
+        timeout,
+    )
+    .await;
+    print_panel_report("Promotion Throughput", &promotion);
+
+    let mut claims_waiting_external = Vec::new();
+    claims_waiting_external.extend(named_series(
+        "claimed",
+        wait_for_series(
+            &http,
+            &format!("sum(rate(awa_job_claimed_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    claims_waiting_external.extend(named_series(
+        "waiting_external",
+        wait_for_series(
+            &http,
+            &format!(
+                "sum(rate(awa_job_waiting_external_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"
+            ),
+            1,
+            timeout,
+        )
+        .await,
+    ));
+    print_panel_report("Claims / Waiting External", &claims_waiting_external);
+
+    let error_rate = wait_for_series(
+        &http,
+        &format!(
+            "sum(rate(awa_job_failed_total{{awa_job_queue=\"{queue_match}\"}}[5m])) / (sum(rate(awa_job_completed_total{{awa_job_queue=\"{queue_match}\"}}[5m])) + sum(rate(awa_job_failed_total{{awa_job_queue=\"{queue_match}\"}}[5m])) + 1e-10)"
+        ),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Error Rate", &error_rate);
+
+    let jobs_in_flight = wait_for_series(
+        &http,
+        &format!("sum(awa_job_in_flight{{awa_job_queue=\"{queue_match}\"}})"),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Jobs In Flight", &jobs_in_flight);
+
+    let throughput = wait_for_series(
+        &http,
+        &format!("sum(rate(awa_job_completed_total{{awa_job_queue=\"{queue_match}\"}}[5m]))"),
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Throughput", &throughput);
+
+    let rescues_5m = wait_for_series(
+        &http,
+        "sum(increase(awa_maintenance_rescues_total[5m]))",
+        1,
+        timeout,
+    )
+    .await;
+    print_panel_report("Rescues (5m)", &rescues_5m);
+
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider.force_flush().expect("flush");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let _ = meter_provider.shutdown();
+    eprintln!("Dashboard validated at http://localhost:3200/d/awa-job-queue/awa-job-queue");
 }

@@ -58,6 +58,7 @@ pub struct MaintenanceService {
     failed_retention: Duration,
     cleanup_batch_size: i64,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
+    queue_stats_interval: Duration,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -95,6 +96,7 @@ impl MaintenanceService {
             failed_retention: Duration::from_secs(259200),   // 72h
             cleanup_batch_size: 1000,
             queue_retention_overrides: HashMap::new(),
+            queue_stats_interval: Duration::from_secs(30),
         }
     }
 
@@ -171,6 +173,12 @@ impl MaintenanceService {
         self
     }
 
+    /// Set the interval for publishing queue depth/lag metrics (default: 30s).
+    pub fn queue_stats_interval(mut self, interval: Duration) -> Self {
+        self.queue_stats_interval = interval;
+        self
+    }
+
     /// Set per-queue retention overrides.
     pub fn queue_retention_overrides(
         mut self,
@@ -228,6 +236,7 @@ impl MaintenanceService {
             let mut cron_sync_timer = tokio::time::interval(self.cron_sync_interval);
             let mut cron_eval_timer = tokio::time::interval(self.cron_eval_interval);
             let mut leader_check_timer = tokio::time::interval(self.leader_check_interval);
+            let mut queue_stats_timer = tokio::time::interval(self.queue_stats_interval);
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -238,6 +247,7 @@ impl MaintenanceService {
             cron_sync_timer.tick().await;
             cron_eval_timer.tick().await;
             leader_check_timer.tick().await;
+            queue_stats_timer.tick().await;
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
@@ -273,6 +283,9 @@ impl MaintenanceService {
                     }
                     _ = cron_eval_timer.tick() => {
                         self.evaluate_cron_schedules().await;
+                    }
+                    _ = queue_stats_timer.tick() => {
+                        self.publish_queue_health_metrics().await;
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -889,6 +902,41 @@ impl MaintenanceService {
         .await
         {
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
+        }
+    }
+
+    /// Publish queue depth and lag as OTel gauge metrics.
+    #[tracing::instrument(skip(self), name = "maintenance.queue_stats")]
+    async fn publish_queue_health_metrics(&self) {
+        let stats = match awa_model::admin::queue_stats(&self.pool).await {
+            Ok(stats) => stats,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to query queue stats for metrics");
+                return;
+            }
+        };
+
+        for queue_stat in &stats {
+            let queue = &queue_stat.queue;
+
+            // Depth per state
+            self.metrics
+                .record_queue_depth(queue, "available", queue_stat.available);
+            self.metrics
+                .record_queue_depth(queue, "running", queue_stat.running);
+            self.metrics
+                .record_queue_depth(queue, "failed", queue_stat.failed);
+            self.metrics
+                .record_queue_depth(queue, "scheduled", queue_stat.scheduled);
+            self.metrics
+                .record_queue_depth(queue, "retryable", queue_stat.retryable);
+            self.metrics
+                .record_queue_depth(queue, "waiting_external", queue_stat.waiting_external);
+
+            // Lag
+            if let Some(lag_seconds) = queue_stat.lag_seconds {
+                self.metrics.record_queue_lag(queue, lag_seconds);
+            }
         }
     }
 }

@@ -406,6 +406,33 @@ async fn test_job_execution_emits_otel_metrics() {
         total_duration_count
     );
 
+    // Assert awa.job.wait_duration histogram has data points
+    let wait_metrics = metrics_by_name.get("awa.job.wait_duration");
+    assert!(
+        wait_metrics.is_some(),
+        "Expected 'awa.job.wait_duration' metric, found metrics: {:?}",
+        metrics_by_name.keys().collect::<Vec<_>>()
+    );
+    let wait_histogram = wait_metrics
+        .unwrap()
+        .iter()
+        .find_map(|m| m.data.as_any().downcast_ref::<Histogram<f64>>());
+    assert!(
+        wait_histogram.is_some(),
+        "Expected Histogram<f64> aggregation for awa.job.wait_duration"
+    );
+    let total_wait_count: u64 = wait_histogram
+        .unwrap()
+        .data_points
+        .iter()
+        .map(|dp| dp.count)
+        .sum();
+    assert!(
+        total_wait_count >= 1,
+        "Expected at least one wait_duration data point, got count={}",
+        total_wait_count
+    );
+
     // Assert awa.job.in_flight gauge returned to 0
     // The UpDownCounter is represented as a non-monotonic Sum. After shutdown
     // and force_flush, the last reported value per attribute set should be 0.
