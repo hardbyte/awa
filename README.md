@@ -17,8 +17,11 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
 - **Periodic/cron jobs** — leader-elected scheduler with timezone support and atomic enqueue.
 - **Webhook callbacks** — park jobs for external completion with optional CEL expression filtering.
+- **Sequential callbacks** — `wait_for_callback()` suspends a handler mid-execution; `resume_external()` wakes it with a payload. Enables multi-step orchestration within a single handler.
+- **HTTP Worker** — feature-gated `Worker` that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-blake3 callback auth.
 - **LISTEN/NOTIFY wakeup** — sub-10ms pickup latency.
-- **OpenTelemetry** — 20 built-in metrics (counters, histograms, gauges) for Prometheus/Grafana.
+- **Production alerting metrics** — queue depth, lag, and wait-duration histogram via OpenTelemetry.
+- **OpenTelemetry** — 20+ built-in metrics (counters, histograms, gauges) for Prometheus/Grafana.
 - **Hot/cold storage** — runnable work in a hot table, deferred work in a cold table.
 - **Rate limiting** — per-queue token bucket. **Weighted concurrency** — global worker pool with per-queue guarantees.
 
@@ -110,6 +113,32 @@ client.migrate()
 job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
 ```
 
+**Sequential callbacks** — suspend a handler, wait for an external system, then resume:
+
+```python
+@client.task(ProcessPayment, queue="payments")
+async def handle_payment(job):
+    token = await job.register_callback(timeout_seconds=3600)
+    send_to_payment_gateway(token.id, job.args.amount)
+    result = await job.wait_for_callback(token)
+    # result contains the payload from resume_external()
+    await record_payment(job.args.order_id, result)
+```
+
+The external system calls `await client.resume_external(callback_id, {"status": "paid"})` to wake the handler.
+
+**Periodic jobs** — leader-elected cron scheduling with timezone support:
+
+```python
+client.periodic(
+    "daily_report", "0 9 * * *",
+    GenerateReport, GenerateReport(format="pdf"),
+    timezone="Pacific/Auckland",
+)
+```
+
+6-field expressions with seconds precision are also supported: `"*/15 * * * * *"` fires every 15 seconds.
+
 See [`examples/python/`](https://github.com/hardbyte/awa/tree/main/examples/python) for complete runnable scripts tested in CI.
 
 ## Rust Example
@@ -173,7 +202,7 @@ pip install awa-cli      # CLI: migrations, queue admin, web UI
 
 ```toml
 [dependencies]
-awa = "0.4"
+awa = "0.5"
 ```
 
 ### CLI
@@ -236,6 +265,7 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 | [Deployment guide](https://github.com/hardbyte/awa/blob/main/docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
 | [Migration guide](https://github.com/hardbyte/awa/blob/main/docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
 | [Configuration reference](https://github.com/hardbyte/awa/blob/main/docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
+| [Security & Postgres roles](https://github.com/hardbyte/awa/blob/main/docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
 | [Troubleshooting](https://github.com/hardbyte/awa/blob/main/docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
 | [Architecture overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) | System design, data flow, state machine, crash recovery |
 | [Web UI design](https://github.com/hardbyte/awa/blob/main/docs/ui-design.md) | API endpoints, pages, component library |
@@ -262,6 +292,8 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 - [013: Durable run leases and guarded finalization](https://github.com/hardbyte/awa/blob/main/docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
 - [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
+- [016: Sequential callbacks and callback heartbeats](https://github.com/hardbyte/awa/blob/main/docs/adr/016-enhanced-external-wait.md)
+- [018: HTTP Worker for serverless job dispatch](https://github.com/hardbyte/awa/blob/main/docs/adr/018-http-worker.md)
 
 </details>
 
