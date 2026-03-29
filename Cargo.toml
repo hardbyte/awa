@@ -12,7 +12,7 @@ members = [
 exclude = ["awa-python", "spike"]
 
 [workspace.package]
-version = "0.5.0-alpha.0"
+version = "0.5.0-alpha.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 description = "Postgres-native background job queue — transactional enqueue, heartbeat crash recovery, SKIP LOCKED dispatch"
@@ -23,9 +23,9 @@ categories = ["database", "asynchronous", "web-programming"]
 
 [workspace.dependencies]
 # Internal crates
-awa-model = { path = "awa-model", version = "0.5.0-alpha.0" }
-awa-macros = { path = "awa-macros", version = "0.5.0-alpha.0" }
-awa-worker = { path = "awa-worker", version = "0.5.0-alpha.0" }
+awa-model = { path = "awa-model", version = "0.5.0-alpha.1" }
+awa-macros = { path = "awa-macros", version = "0.5.0-alpha.1" }
+awa-worker = { path = "awa-worker", version = "0.5.0-alpha.1" }
 
 # Database
 sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "chrono", "json", "migrate", "uuid"] }
