@@ -128,6 +128,7 @@ awa --database-url "$DATABASE_URL" queue stats
 
 ## Next
 
+- [PostgreSQL roles and privileges](security.md)
 - [Deployment guide](deployment.md)
-- [Configuration reference](configuration.md)
+- [Configuration](configuration.md)
 - [Troubleshooting](troubleshooting.md)

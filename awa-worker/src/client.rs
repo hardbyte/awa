@@ -97,6 +97,7 @@ pub struct ClientBuilder {
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     runtime_snapshot_interval: Duration,
+    queue_stats_interval: Option<Duration>,
 }
 
 impl ClientBuilder {
@@ -123,6 +124,7 @@ impl ClientBuilder {
             cleanup_interval: None,
             queue_retention_overrides: HashMap::new(),
             runtime_snapshot_interval: Duration::from_secs(10),
+            queue_stats_interval: None,
         }
     }
 
@@ -342,6 +344,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Set how often queue depth/lag metrics are published (default: 30s).
+    pub fn queue_stats_interval(mut self, interval: Duration) -> Self {
+        self.queue_stats_interval = Some(interval);
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -459,6 +467,7 @@ impl ClientBuilder {
             cleanup_batch_size: self.cleanup_batch_size,
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
+            queue_stats_interval: self.queue_stats_interval,
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
             runtime_instance_id: Uuid::new_v4(),
@@ -541,6 +550,7 @@ pub struct Client {
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
+    queue_stats_interval: Option<Duration>,
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
     runtime_instance_id: Uuid,
@@ -691,6 +701,9 @@ impl Client {
         if !self.queue_retention_overrides.is_empty() {
             maintenance =
                 maintenance.queue_retention_overrides(self.queue_retention_overrides.clone());
+        }
+        if let Some(interval) = self.queue_stats_interval {
+            maintenance = maintenance.queue_stats_interval(interval);
         }
         service_handles.push(tokio::spawn(async move {
             maintenance.run().await;

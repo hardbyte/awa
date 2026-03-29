@@ -193,7 +193,8 @@ If you expose the callback receiver endpoints for `HttpWorker`, also configure
 
 ## Next
 
+- [PostgreSQL roles and privileges](security.md)
 - [Migration guide](migrations.md)
-- [Configuration reference](configuration.md)
+- [Configuration](configuration.md)
 - [Security notes](security.md)
 - [Troubleshooting](troubleshooting.md)

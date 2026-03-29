@@ -6,6 +6,9 @@ A pre-built Grafana dashboard for monitoring Awa job queue metrics via Prometheu
 
 | Panel | Type | What it shows |
 |-------|------|---------------|
+| **Queue Lag** | Time series | Age of the oldest available job per queue |
+| **Queue Depth** | Stacked time series | Current jobs by queue and state (available, running, failed, scheduled, retryable, waiting external) |
+| **Job Wait Time (p50/p95/p99)** | Time series | Time from job creation to claim |
 | **Job Throughput** | Time series | Completed, failed, retried, cancelled jobs/sec |
 | **In-Flight Jobs** | Time series | Currently executing jobs by queue (stacked) |
 | **Job Duration (p50/p95/p99)** | Time series | Execution time percentiles by queue |
@@ -15,11 +18,13 @@ A pre-built Grafana dashboard for monitoring Awa job queue metrics via Prometheu
 | **Maintenance Rescues** | Bars | Heartbeat, deadline, callback_timeout rescues |
 | **Completion Flush Performance** | Time series | Batch completion write latency |
 | **Promotion Throughput** | Time series | Scheduled/retryable jobs promoted per second |
-| **Jobs Inserted / Waiting External** | Time series | Insertion rate and callback-parked job rate |
+| **Claims / Waiting External** | Time series | Queue claim rate and callback-parked job rate |
 | **Error Rate** | Stat | Failed / (completed + failed) percentage |
 | **Jobs In Flight** | Stat | Total executing jobs with threshold colours |
 | **Throughput** | Stat | Total completed/sec (5m average) |
 | **Rescues (5m)** | Stat | Recent rescue count with threshold colours |
+
+Color semantics are consistent across panels: green for healthy/fast paths, orange for warning/tail latency or retries, red for failures/high tail latency, blue for queue intake/backlog, and yellow for callback/external wait states.
 
 ## Setup
 
