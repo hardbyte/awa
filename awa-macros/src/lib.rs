@@ -1,6 +1,8 @@
 use proc_macro::TokenStream;
+use proc_macro2::Span;
+use proc_macro_crate::{crate_name, FoundCrate};
 use quote::quote;
-use syn::{parse_macro_input, DeriveInput, LitStr};
+use syn::{parse_macro_input, DeriveInput, Ident, LitStr};
 
 /// Derive macro for job argument types.
 ///
@@ -53,12 +55,31 @@ pub fn derive_job_args(input: TokenStream) -> TokenStream {
 
     let kind_str = custom_kind.unwrap_or_else(|| camel_to_snake(&name.to_string()));
 
-    // Resolve the trait path directly through `awa_model`.
-    // This means external crates using the derive currently need a direct
-    // dependency on `awa-model`, even if they otherwise depend on the `awa`
-    // facade crate for runtime APIs.
+    // Resolve the path to awa_model::JobArgs. Users may depend on either
+    // the `awa` facade crate or `awa-model` directly. We check for `awa`
+    // first (which re-exports awa_model), then fall back to `awa-model`.
+    let model_path = if let Ok(found) = crate_name("awa") {
+        // User depends on the `awa` facade which re-exports awa_model.
+        let ident = match found {
+            FoundCrate::Itself => Ident::new("awa", Span::call_site()),
+            FoundCrate::Name(name) => Ident::new(&name, Span::call_site()),
+        };
+        quote!(::#ident::awa_model)
+    } else if let Ok(found) = crate_name("awa-model") {
+        // User depends on awa-model directly.
+        match found {
+            FoundCrate::Itself => quote!(crate),
+            FoundCrate::Name(name) => {
+                let ident = Ident::new(&name, Span::call_site());
+                quote!(::#ident)
+            }
+        }
+    } else {
+        quote!(::awa_model)
+    };
+
     let expanded = quote! {
-        impl ::awa_model::JobArgs for #name {
+        impl #model_path::JobArgs for #name {
             fn kind() -> &'static str {
                 #kind_str
             }
