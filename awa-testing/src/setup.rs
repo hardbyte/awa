@@ -48,7 +48,12 @@ pub async fn setup(max_connections: u32) -> PgPool {
     pool
 }
 
-/// Delete all jobs and queue metadata for a specific queue.
+/// Delete all jobs, queue metadata, and admin caches for a specific queue.
+///
+/// Explicitly deletes the `queue_state_counts` row to prevent accumulated
+/// cache drift from affecting assertions. The DELETE trigger normally handles
+/// this, but concurrent test runs against a shared DB can cause small delta
+/// errors that compound over time.
 pub async fn clean_queue(pool: &PgPool, queue: &str) {
     sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
         .bind(queue)
@@ -60,6 +65,11 @@ pub async fn clean_queue(pool: &PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue meta");
+    sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue state counts");
 }
 
 /// Query job state counts for a queue, returning a map of state -> count.
