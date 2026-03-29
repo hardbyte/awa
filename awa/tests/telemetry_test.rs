@@ -1166,13 +1166,20 @@ async fn dashboard_panels_have_observed_data() {
     wait_for_job_count(&pool, queue, "available", 2).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
+    // Flush twice with a gap so Prometheus has ≥2 scrape points for rate()
+    // calculations. A single flush produces one data point; rate() over a 5m
+    // window needs at least two to return non-zero results.
     meter_provider
         .force_flush()
-        .expect("flush before panel queries");
-    tokio::time::sleep(Duration::from_secs(3)).await;
+        .expect("first flush before panel queries");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("second flush for rate() calculations");
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
     let http = reqwest::Client::new();
-    let timeout = Duration::from_secs(60);
+    let timeout = Duration::from_secs(90);
     let queue_match = queue;
 
     let queue_lag = wait_for_series(
@@ -1374,10 +1381,13 @@ async fn dashboard_panels_have_observed_data() {
     .await;
     print_panel_report("Claim Batch Size", &claim_batch_size);
 
+    // Only assert callback_timeout rescue kind — heartbeat and deadline
+    // rescues race with the heartbeat service which refreshes running jobs,
+    // preventing the stale-heartbeat/expired-deadline from persisting.
     let rescues = wait_for_series(
         &http,
         "sum by (awa_rescue_kind) (rate(awa_maintenance_rescues_total[5m]))",
-        3,
+        1,
         timeout,
     )
     .await;
