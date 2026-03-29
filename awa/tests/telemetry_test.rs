@@ -19,8 +19,10 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 // ── Helpers ──────────────────────────────────────────────────────────
@@ -37,6 +39,11 @@ fn otlp_endpoint() -> String {
 
 fn prometheus_url() -> String {
     std::env::var("PROMETHEUS_URL").unwrap_or_else(|_| "http://localhost:9090".to_string())
+}
+
+fn ignored_test_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
 async fn setup_pool() -> sqlx::PgPool {
@@ -451,6 +458,10 @@ async fn wait_for_metric(
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_otlp_metrics_reach_prometheus() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "telemetry_otlp_test";
     clean_queue(&pool, queue).await;
@@ -613,6 +624,10 @@ async fn test_otlp_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_failure_path_metrics_reach_prometheus() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "telemetry_failure_path";
     clean_queue(&pool, queue).await;
@@ -771,6 +786,10 @@ async fn test_failure_path_metrics_reach_prometheus() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn test_collector_death_does_not_block_job_processing() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "telemetry_collector_death";
     clean_queue(&pool, queue).await;
@@ -893,6 +912,10 @@ async fn test_collector_death_does_not_block_job_processing() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn dashboard_panels_have_observed_data() {
+    let _permit = ignored_test_gate()
+        .acquire_owned()
+        .await
+        .expect("ignored test gate should be available");
     let pool = setup_pool().await;
     let queue = "grafana_demo";
     clean_queue(&pool, queue).await;
