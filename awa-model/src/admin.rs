@@ -1260,6 +1260,119 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+// ── Sequential callback wait helpers ─────────────────────────────────
+//
+// These functions extract the DB-interaction logic for `wait_for_callback`
+// so that both the Rust `JobContext` and the Python bridge call the same
+// code paths.
+
+/// Result of a single poll iteration inside `wait_for_callback`.
+#[derive(Debug)]
+pub enum CallbackPollResult {
+    /// The callback was resolved and the payload is ready.
+    Resolved(serde_json::Value),
+    /// Still waiting — caller should sleep and poll again.
+    Pending,
+    /// The callback token is stale (a different callback is current).
+    Stale {
+        token: Uuid,
+        current: Uuid,
+        state: JobState,
+    },
+    /// The job left the wait unexpectedly (rescued, cancelled, etc.).
+    UnexpectedState { token: Uuid, state: JobState },
+    /// The job was not found.
+    NotFound,
+}
+
+/// Transition a running job to `waiting_external` for the given callback.
+///
+/// Returns `Ok(true)` if the transition succeeded, `Ok(false)` if the row
+/// did not match (the caller should check for an early-resume race).
+pub async fn enter_callback_wait(
+    pool: &PgPool,
+    job_id: i64,
+    run_lease: i64,
+    callback_id: Uuid,
+) -> Result<bool, AwaError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'waiting_external',
+            heartbeat_at = NULL,
+            deadline_at = NULL
+        WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id = $3
+        "#,
+    )
+    .bind(job_id)
+    .bind(run_lease)
+    .bind(callback_id)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() > 0)
+}
+
+/// Check the current state of a job during callback wait.
+///
+/// Handles the early-resume race: if `resume_external` won the race before
+/// the handler transitioned to `waiting_external`, the callback result is
+/// already in metadata and this returns `Resolved`.
+pub async fn check_callback_state(
+    pool: &PgPool,
+    job_id: i64,
+    callback_id: Uuid,
+) -> Result<CallbackPollResult, AwaError> {
+    let row: Option<(JobState, Option<Uuid>, serde_json::Value)> =
+        sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await?;
+
+    match row {
+        Some((JobState::Running, None, metadata))
+            if metadata.get("_awa_callback_result").is_some() =>
+        {
+            let payload = take_callback_payload(pool, job_id, metadata).await?;
+            Ok(CallbackPollResult::Resolved(payload))
+        }
+        Some((state, Some(current_callback_id), _)) if current_callback_id != callback_id => {
+            Ok(CallbackPollResult::Stale {
+                token: callback_id,
+                current: current_callback_id,
+                state,
+            })
+        }
+        Some((JobState::WaitingExternal, Some(current), _)) if current == callback_id => {
+            Ok(CallbackPollResult::Pending)
+        }
+        Some((state, _, _)) => Ok(CallbackPollResult::UnexpectedState {
+            token: callback_id,
+            state,
+        }),
+        None => Ok(CallbackPollResult::NotFound),
+    }
+}
+
+/// Extract the `_awa_callback_result` key from metadata and clean it up.
+pub async fn take_callback_payload(
+    pool: &PgPool,
+    job_id: i64,
+    metadata: serde_json::Value,
+) -> Result<serde_json::Value, AwaError> {
+    let payload = metadata
+        .get("_awa_callback_result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    sqlx::query("UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+
+    Ok(payload)
+}
+
 // ── CEL callback expressions ──────────────────────────────────────────
 
 /// Configuration for CEL callback expressions.

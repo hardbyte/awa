@@ -51,10 +51,11 @@ fn verify_signature(
         .map_err(|_| ApiError::unauthorized("invalid X-Awa-Signature header"))?;
 
     let expected = blake3::keyed_hash(&secret, callback_id.as_bytes());
-    if expected.to_hex().as_str() == provided {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized("invalid callback signature"))
+    // Parse the provided hex into a Hash so the comparison uses blake3's
+    // constant-time PartialEq implementation.
+    match blake3::Hash::from_hex(provided) {
+        Ok(provided_hash) if expected == provided_hash => Ok(()),
+        _ => Err(ApiError::unauthorized("invalid callback signature")),
     }
 }
 

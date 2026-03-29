@@ -258,5 +258,7 @@ pub fn verify_callback_signature(
     provided_signature: &str,
 ) -> bool {
     let expected = blake3::keyed_hash(hmac_secret, callback_id.as_bytes());
-    expected.to_hex().as_str() == provided_signature
+    // Parse the provided hex into a Hash so the comparison uses blake3's
+    // constant-time PartialEq implementation.
+    blake3::Hash::from_hex(provided_signature).is_ok_and(|h| expected == h)
 }

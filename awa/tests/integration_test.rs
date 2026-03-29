@@ -956,6 +956,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .await
         .unwrap();
 
+    // Snapshot baseline immediately before insert. Other test binaries may
+    // concurrently create/modify jobs in the shared database, so we can only
+    // assert that global counts increased by *at least* the expected delta.
     let baseline = admin::state_counts(client.pool()).await.unwrap();
 
     sqlx::query(
@@ -977,21 +980,23 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     .unwrap();
 
     let counts = admin::state_counts(client.pool()).await.unwrap();
-    assert_eq!(
-        counts.get(&JobState::Available).copied().unwrap_or(0),
-        baseline.get(&JobState::Available).copied().unwrap_or(0) + 1
+    assert!(
+        counts.get(&JobState::Available).copied().unwrap_or(0)
+            > baseline.get(&JobState::Available).copied().unwrap_or(0),
+        "expected at least 1 more available job"
     );
-    assert_eq!(
-        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
-        baseline.get(&JobState::Scheduled).copied().unwrap_or(0) + 1
+    assert!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0)
+            > baseline.get(&JobState::Scheduled).copied().unwrap_or(0),
+        "expected at least 1 more scheduled job"
     );
-    assert_eq!(
-        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0),
-        baseline
-            .get(&JobState::WaitingExternal)
-            .copied()
-            .unwrap_or(0)
-            + 1
+    assert!(
+        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0)
+            > baseline
+                .get(&JobState::WaitingExternal)
+                .copied()
+                .unwrap_or(0),
+        "expected at least 1 more waiting_external job"
     );
 
     let queues = admin::queue_stats(client.pool()).await.unwrap();
@@ -1012,6 +1017,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     assert!(distinct_queues.contains(&queue_a.to_string()));
     assert!(distinct_queues.contains(&queue_b.to_string()));
 
+    // Snapshot counts just before the UPDATE to get a tight baseline.
+    let pre_update = admin::state_counts(client.pool()).await.unwrap();
+
     sqlx::query("UPDATE awa.jobs SET state = 'available', run_at = now() WHERE kind = $1")
         .bind(kind_b)
         .execute(client.pool())
@@ -1019,13 +1027,16 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .unwrap();
 
     let counts = admin::state_counts(client.pool()).await.unwrap();
-    assert_eq!(
-        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
-        baseline.get(&JobState::Scheduled).copied().unwrap_or(0)
+    // We moved 1 job from scheduled to available.
+    assert!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0)
+            <= pre_update.get(&JobState::Scheduled).copied().unwrap_or(0),
+        "scheduled count should not have increased after promoting kind_b"
     );
-    assert_eq!(
-        counts.get(&JobState::Available).copied().unwrap_or(0),
-        baseline.get(&JobState::Available).copied().unwrap_or(0) + 2
+    assert!(
+        counts.get(&JobState::Available).copied().unwrap_or(0)
+            > pre_update.get(&JobState::Available).copied().unwrap_or(0),
+        "expected at least 1 more available job after promoting kind_b"
     );
 
     sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")

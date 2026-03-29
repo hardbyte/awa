@@ -85,18 +85,10 @@ enum Commands {
 }
 
 fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
-    if secret.len() != 64 {
-        return Err("callback HMAC secret must be exactly 64 hex characters".into());
-    }
-
-    let mut key = [0u8; 32];
-    for (index, byte) in key.iter_mut().enumerate() {
-        let start = index * 2;
-        let end = start + 2;
-        *byte = u8::from_str_radix(&secret[start..end], 16)
-            .map_err(|_| "callback HMAC secret must be valid hex".to_string())?;
-    }
-    Ok(key)
+    let bytes =
+        hex::decode(secret).map_err(|_| "callback HMAC secret must be valid hex".to_string())?;
+    <[u8; 32]>::try_from(bytes.as_slice())
+        .map_err(|_| "callback HMAC secret must be exactly 32 bytes (64 hex characters)".into())
 }
 
 #[derive(Subcommand)]

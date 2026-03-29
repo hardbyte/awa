@@ -432,7 +432,11 @@ impl PyJob {
         py: Python<'py>,
         token: PyRef<'_, PyCallbackToken>,
     ) -> PyResult<Bound<'py, PyAny>> {
+        use awa_model::admin::{
+            check_callback_state, enter_callback_wait, CallbackPollResult,
+        };
         use crate::errors::map_awa_error;
+
         let pool = self.pool.clone().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
                 "wait_for_callback is only available during job execution",
@@ -447,67 +451,30 @@ impl PyJob {
         })?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            // Transition to waiting_external
-            let result = sqlx::query(
-                r#"
-                UPDATE awa.jobs
-                SET state = 'waiting_external',
-                    heartbeat_at = NULL,
-                    deadline_at = NULL
-                WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id = $3
-                "#,
-            )
-            .bind(job_id)
-            .bind(run_lease)
-            .bind(token_uuid)
-            .execute(&pool)
-            .await
-            .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
-
-            if result.rows_affected() == 0 {
-                let current: Option<(
-                    awa_model::JobState,
-                    Option<uuid::Uuid>,
-                    serde_json::Value,
-                )> = sqlx::query_as(
-                    "SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1",
-                )
-                .bind(job_id)
-                .fetch_optional(&pool)
+            let entered = enter_callback_wait(&pool, job_id, run_lease, token_uuid)
                 .await
-                .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+                .map_err(map_awa_error)?;
 
-                match current {
-                    Some((awa_model::JobState::Running, None, metadata))
-                        if metadata.get("_awa_callback_result").is_some() =>
-                    {
-                        let payload = metadata
-                            .get("_awa_callback_result")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-                        sqlx::query(
-                            "UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1",
-                        )
-                        .bind(job_id)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+            if !entered {
+                match check_callback_state(&pool, job_id, token_uuid)
+                    .await
+                    .map_err(map_awa_error)?
+                {
+                    CallbackPollResult::Resolved(payload) => {
                         return Python::attach(|py| json_to_py(py, &payload));
                     }
-                    Some((state, Some(current_callback_id), _))
-                        if current_callback_id != token_uuid =>
-                    {
+                    CallbackPollResult::Pending => { /* Already in waiting_external */ }
+                    CallbackPollResult::Stale { token, current, state } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
-                            "wait_for_callback: token {token_id} is stale; current callback is {current_callback_id} in state {state:?}"
+                            "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
                         ))));
                     }
-                    Some((awa_model::JobState::WaitingExternal, Some(_), _)) => {}
-                    Some((state, _, _)) => {
+                    CallbackPollResult::UnexpectedState { token, state } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
-                            "wait_for_callback: job is not waiting on callback {token_id}; state={state:?}"
+                            "wait_for_callback: job is not waiting on callback {token}; state={state:?}"
                         ))));
                     }
-                    None => {
+                    CallbackPollResult::NotFound => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(
                             "job not found during callback wait".into(),
                         )));
@@ -517,7 +484,6 @@ impl PyJob {
 
             // Poll DB until the callback is resolved
             loop {
-                // Check for cancellation
                 if let Some(ref flag) = cancelled {
                     if flag.load(std::sync::atomic::Ordering::SeqCst) {
                         return Err(map_awa_error(awa_model::AwaError::Validation(
@@ -526,54 +492,27 @@ impl PyJob {
                     }
                 }
 
-                let row: Option<(awa_model::JobState, Option<uuid::Uuid>, serde_json::Value)> =
-                    sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
-                        .bind(job_id)
-                        .fetch_optional(&pool)
-                        .await
-                        .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
-
-                match row {
-                    Some((awa_model::JobState::Running, None, metadata))
-                        if metadata.get("_awa_callback_result").is_some() =>
-                    {
-                        // Resumed! Extract callback result from metadata.
-                        let payload = metadata
-                            .get("_awa_callback_result")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::Null);
-
-                        // Clean up the reserved metadata key
-                        sqlx::query(
-                            "UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1",
-                        )
-                        .bind(job_id)
-                        .execute(&pool)
-                        .await
-                        .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
-
-                        // Return payload as Python object
+                match check_callback_state(&pool, job_id, token_uuid)
+                    .await
+                    .map_err(map_awa_error)?
+                {
+                    CallbackPollResult::Resolved(payload) => {
                         return Python::attach(|py| json_to_py(py, &payload));
                     }
-                    Some((awa_model::JobState::WaitingExternal, Some(current_callback_id), _))
-                        if current_callback_id == token_uuid =>
-                    {
-                        // Still waiting — sleep and poll again
+                    CallbackPollResult::Pending => {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
-                    Some((state, Some(current_callback_id), _))
-                        if current_callback_id != token_uuid =>
-                    {
+                    CallbackPollResult::Stale { token, current, state } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
-                            "wait_for_callback: token {token_id} is stale; current callback is {current_callback_id} in state {state:?}"
+                            "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
                         ))));
                     }
-                    Some((state, _, _)) => {
+                    CallbackPollResult::UnexpectedState { token, state } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
-                            "job left wait_for_callback unexpectedly for token {token_id}: state={state:?}"
+                            "job left wait_for_callback unexpectedly for token {token}: state={state:?}"
                         ))));
                     }
-                    None => {
+                    CallbackPollResult::NotFound => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(
                             "job not found during callback wait".into(),
                         )));

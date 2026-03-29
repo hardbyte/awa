@@ -188,6 +188,7 @@ dependencies = [
  "axum",
  "chrono",
  "clap",
+ "hex",
  "serde_json",
  "sqlx",
  "tokio",
