@@ -293,6 +293,7 @@ All coordination through Postgres. The Rust runtime owns polling, heartbeats, sh
 - [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
 - [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
 - [016: Sequential callbacks and callback heartbeats](https://github.com/hardbyte/awa/blob/main/docs/adr/016-enhanced-external-wait.md)
+- [017: Python insert-only transaction bridging](https://github.com/hardbyte/awa/blob/main/docs/adr/017-python-transaction-bridging.md)
 - [018: HTTP Worker for serverless job dispatch](https://github.com/hardbyte/awa/blob/main/docs/adr/018-http-worker.md)
 
 </details>
