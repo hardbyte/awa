@@ -5,8 +5,8 @@ reference results from local runs and dedicated-server enqueue comparisons.
 
 ## Test Environment
 
-- Local machine: Apple M5 MacBook Air
-- Local runtime: PostgreSQL 17 in OrbStack
+- Local machine: Apple M5 MacBook Air (16 GB)
+- Local runtime: PostgreSQL 17 in Docker (OrbStack)
 - Local database URL used for the example commands:
   `postgres://postgres:test@localhost:15432/awa_test`
 - Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
@@ -82,16 +82,13 @@ properties:
 Example reference results from one local laptop run and one dedicated server
 run:
 
-- local laptop (`Apple M5`, debug build):
-  - `insert_only_single`: about `18k inserts/s`
-  - `copy_single`: about `33k inserts/s`
-- dedicated server (`PostgreSQL 17`, debug build):
-  - `insert_only_single`: about `40k inserts/s`
-  - `copy_single`: about `45k inserts/s`
-  - `insert_contention_distinct` (4 producers x 10k): about `110k inserts/s`
-  - `copy_contention_distinct` (4 producers x 10k, chunk 1000): about `70k inserts/s`
-  - `insert_contention_same_queue` (4 producers x 10k): about `121k inserts/s`
-  - `copy_contention_same_queue` (4 producers x 10k, chunk 1000): about `70k inserts/s`
+- local laptop (`Apple M5`, release build, v0.5.0-alpha.0):
+  - `insert_only_single`: about `30k inserts/s`
+  - `copy_single`: about `43k inserts/s`
+  - `insert_contention_distinct` (4 producers x 3k): about `46k inserts/s`
+  - `copy_contention_distinct` (4 producers x 3k, chunk 1000): about `100k inserts/s`
+  - `insert_contention_same_queue` (4 producers x 3k): about `95k inserts/s`
+  - `copy_contention_same_queue` (4 producers x 3k, chunk 1000): about `67k inserts/s`
 
 These are engineering comparisons, not product guarantees. Their main value is
 showing where the architecture bottlenecks move as the implementation changes.
@@ -104,30 +101,25 @@ Measured with `test_runtime_sustained_hot_path` after resetting runtime state:
 - measurement window: 10s
 - queue size seeded: 200,000 immediately-available jobs
 
-Example reference result from one local run (release mode):
+Example reference result from one local run (release mode, v0.5.0-alpha.0):
 
-- handler returns: about `9.2k jobs/s`
-- DB `completed` transitions: about `9.2k jobs/s`
+- handler returns: about `5.6k jobs/s`
+- DB `completed` transitions: about `5.6k jobs/s`
 
-This benchmark always enables the in-memory OpenTelemetry exporter so the
-runtime metrics path is exercised while measuring.
+This benchmark enables the in-memory OpenTelemetry exporter and the
+production alerting metrics path (queue depth, lag, wait-duration histogram).
+The v0.5.0 metrics instrumentation adds overhead compared to v0.4.x numbers
+(~9k/s) — the trade-off is production-grade observability by default.
 
 ### Python Runtime Baseline
 
 Measured with `awa-python/scripts/benchmark_runtime.py` on the same local
 database:
 
-- `insert_many_copy`: about `15.6k jobs/s` (`50,000` jobs in `3.20s`)
+- `insert_many_copy`: about `16.2k jobs/s` (`50,000` jobs in `3.09s`)
 - sustained hot path:
-  - handler returns: about `4.9k jobs/s`
-  - DB `completed` transitions: about `4.8k jobs/s`
-- sustained deferred frontier, `2,000,000` deferred rows with `4,000/s` due:
-  - all `40,000` due jobs were eventually picked and completed
-  - about `36.6k` completed within the 10-second measurement window
-  - pickup lateness:
-    - `p50`: about `243 ms`
-    - `p95`: about `700 ms`
-    - `p99`: about `794 ms`
+  - handler returns: about `3.2k jobs/s`
+  - DB `completed` transitions: about `3.1k jobs/s`
 
 These runs isolate the Python worker path. Seed data is inserted with SQL so
 the runtime number is not dominated by Python-side enqueue serialization.
@@ -140,17 +132,17 @@ Measured with `test_scheduled_steady_10m_due_1k_per_sec`:
 - due rate target: `1,000` jobs/s
 - measurement window: 10s
 
-Isolated 4-thread Tokio runtime result (release mode):
+Isolated 4-thread Tokio runtime result (release mode, v0.5.0-alpha.0):
 
 - `9,000` of `10,000` due jobs completed within the window
 - per-second completions: `0, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000, 1000`
   — perfectly steady after the first-tick startup delay
 - pickup lateness:
-  - `p50`: `261 ms`
-  - `p95`: `364 ms`
-  - `p99`: `401 ms`
-- promotion: `298` batches, mean `4.0 ms`, max `37 ms`
-- claim latency: mean `3.9 ms`
+  - `p50`: `229 ms`
+  - `p95`: `332 ms`
+  - `p99`: `343 ms`
+- promotion: `354` batches, mean `4.3 ms`, max `59 ms`
+- claim latency: mean `5.0 ms`
 
 This demonstrates that the hot/deferred split with literal-state promotion
 queries handles a 10M-row deferred frontier with steady, predictable throughput.
@@ -170,15 +162,15 @@ Measured with `test_scheduled_steady_2m_due_4k_per_sec`:
 - due rate target: `4,000` jobs/s
 - measurement window: 10s
 
-Result:
+Result (v0.5.0-alpha.0):
 
 - all `40,000` due jobs were picked and completed
-- pickup lateness: `p50`: `0 ms`, `p95`: `0 ms`, `p99`: `0 ms`
-- promotion: `216` batches, mean `5.1 ms`, max `80 ms`
-- claim latency: mean `6.3 ms`
+- pickup lateness: `p50`: `0 ms`, `p95`: `0 ms`, `p99`: `57 ms`
+- promotion: `214` batches, mean `10.0 ms`, max `176 ms`
+- claim latency: mean `12.4 ms`
 
 This validates the architecture at a realistic production scale: 2M deferred
-rows with 4k/s throughput and sub-millisecond promotion.
+rows with 4k/s throughput and reliable promotion.
 
 ### High-Rate Deferred Frontier: 10M at 6k/s
 
@@ -256,8 +248,9 @@ and a two-tier heartbeat flush. Performance impact was validated:
 - **Completion batcher** adds `progress = NULL` to the batch UPDATE. This
   is a constant-time write to a nullable column with no measurable impact
   (batcher throughput remains ~78k/s in unit benchmarks).
-- **Sustained hot-path throughput** unchanged at ~8.1k/s after the feature
-  was added.
+- **Sustained hot-path throughput** was unchanged when the progress feature
+  was added. Current hot-path throughput (~5.6k/s) reflects the additional
+  v0.5.0 OTel metrics instrumentation, not progress overhead.
 
 ## Failure-Mode Benchmarks
 
