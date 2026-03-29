@@ -14,6 +14,16 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::RwLock;
 
+fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
+    if !timeout_seconds.is_finite() || timeout_seconds.is_sign_negative() {
+        return Err(map_awa_error(awa_model::AwaError::Validation(
+            "timeout_seconds must be a finite, non-negative number".into(),
+        )));
+    }
+
+    Ok(Duration::from_secs_f64(timeout_seconds))
+}
+
 /// Python result types for worker handlers.
 #[pyclass(frozen, name = "RetryAfter", skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -953,7 +963,7 @@ impl PyClient {
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let uuid = uuid::Uuid::parse_str(&callback_id)
                 .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-            let timeout = Duration::from_secs_f64(timeout_seconds);
+            let timeout = validate_timeout_seconds(timeout_seconds)?;
             let row = awa_model::admin::heartbeat_callback(&pool, uuid, timeout)
                 .await
                 .map_err(map_awa_error)?;
@@ -972,7 +982,7 @@ impl PyClient {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let uuid = uuid::Uuid::parse_str(&callback_id)
                     .map_err(|e| map_awa_error(awa_model::AwaError::Validation(e.to_string())))?;
-                let timeout = Duration::from_secs_f64(timeout_seconds.unwrap_or(3600.0));
+                let timeout = validate_timeout_seconds(timeout_seconds.unwrap_or(3600.0))?;
                 let row = awa_model::admin::heartbeat_callback(&pool, uuid, timeout)
                     .await
                     .map_err(map_awa_error)?;

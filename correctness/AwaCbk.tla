@@ -114,8 +114,9 @@ RegisterCallback(i) ==
     /\ UNCHANGED <<jobState, heartbeatFresh, owner, lease, taskLease, leader,
                    callbackGen, rowLock, blockedOps>>
 
-\* Handler returns WaitForCallback (UPDATE WHERE state='running' AND callback_id IS NOT NULL).
-\* Same blocking semantics as RegisterCallback.
+\* Handler enters waiting only if the specific callback_id it registered is
+\* still current. If resume_external wins the race first, callbackId is already
+\* cleared and the handler observes the stored payload while remaining running.
 EnterWaiting(i) ==
     /\ jobState = "running"
     /\ owner = i
@@ -227,9 +228,9 @@ FailExecute ==
     /\ rowLock' = NoLock
     /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
-\* resume_external: transition waiting_external -> running.
-\* Clears callback_id, refreshes heartbeat, advances callback generation.
-\* The handler resumes and can register a new callback.
+\* resume_external: transition waiting_external -> running, or win the race
+\* before EnterWaiting executes. In both cases it clears callback_id,
+\* refreshes heartbeat, and advances callback generation.
 ResumeExecute ==
     /\ rowLock = "resume"
     /\ jobState \in {"waiting_external", "running"}

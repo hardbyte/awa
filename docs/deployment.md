@@ -187,8 +187,13 @@ awa --database-url "$DATABASE_URL" serve --host 0.0.0.0 --port 3000
 
 The UI is read/write admin surface. Put it behind your normal authentication, network policy, and ingress controls.
 
+If you expose the callback receiver endpoints for `HttpWorker`, also configure
+`AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) so `awa-ui` verifies
+`X-Awa-Signature` on callback requests.
+
 ## Next
 
 - [Migration guide](migrations.md)
 - [Configuration reference](configuration.md)
+- [Security notes](security.md)
 - [Troubleshooting](troubleshooting.md)

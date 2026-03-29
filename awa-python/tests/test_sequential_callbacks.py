@@ -107,9 +107,7 @@ async def test_resume_then_stale_callback_rejected(client):
     await client.shutdown()
 
     # Resume first callback
-    resumed = await client.resume_external(
-        callback_ids[0], payload={"step": "payment"}
-    )
+    resumed = await client.resume_external(callback_ids[0], payload={"step": "payment"})
     assert resumed.state == awa.JobState.Running
 
     # The old callback is consumed — resume again should fail
@@ -147,7 +145,9 @@ async def test_resume_external_without_payload(client):
     assert resumed.state == awa.JobState.Running
 
     updated = await client.get_job(job.id)
-    assert updated.metadata.get("_awa_callback_result") is None  # null in JSON = None in Python
+    assert (
+        updated.metadata.get("_awa_callback_result") is None
+    )  # null in JSON = None in Python
 
 
 # ── resume_external error paths ──────────────────────────────────────
@@ -241,9 +241,7 @@ async def test_resume_external_sync(client):
     await asyncio.sleep(1.0)
     await client.shutdown()
 
-    resumed = client._raw.resume_external_sync(
-        callback_ids[0], payload={"sync": True}
-    )
+    resumed = client._raw.resume_external_sync(callback_ids[0], payload={"sync": True})
     assert resumed.state == awa.JobState.Running
 
 
@@ -303,6 +301,21 @@ async def test_heartbeat_after_resume_fails(client):
         await client.heartbeat_callback(callback_ids[0])
 
 
+@pytest.mark.asyncio
+async def test_heartbeat_invalid_timeout_rejected(client):
+    """heartbeat_callback rejects negative timeout values."""
+    with pytest.raises(awa.ValidationError):
+        await client.heartbeat_callback(str(uuid.uuid4()), timeout_seconds=-1.0)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_invalid_timeout_sync_rejected(client):
+    """Sync heartbeat_callback rejects invalid timeout values."""
+    sync_client = awa.Client(DATABASE_URL)
+    with pytest.raises(awa.ValidationError):
+        sync_client.heartbeat_callback(str(uuid.uuid4()), timeout_seconds=float("nan"))
+
+
 # ── wait_for_callback (in-handler sequential) ────────────────────────
 
 
@@ -336,9 +349,7 @@ async def test_wait_for_callback_happy_path(client):
     await asyncio.sleep(0.5)
 
     # Resume with payload
-    await client.resume_external(
-        callback_ids[0], payload={"answer": 42}
-    )
+    await client.resume_external(callback_ids[0], payload={"answer": 42})
 
     # Wait for the handler to process the payload and complete
     await asyncio.sleep(1.5)

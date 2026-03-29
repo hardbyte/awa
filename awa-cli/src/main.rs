@@ -78,7 +78,25 @@ enum Commands {
         /// Cache TTL for dashboard queries in seconds
         #[arg(long, default_value = "5", env = "AWA_CACHE_TTL")]
         cache_ttl: u64,
+        /// Hex-encoded 32-byte key used to verify callback signatures.
+        #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET")]
+        callback_hmac_secret: Option<String>,
     },
+}
+
+fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
+    if secret.len() != 64 {
+        return Err("callback HMAC secret must be exactly 64 hex characters".into());
+    }
+
+    let mut key = [0u8; 32];
+    for (index, byte) in key.iter_mut().enumerate() {
+        let start = index * 2;
+        let end = start + 2;
+        *byte = u8::from_str_radix(&secret[start..end], 16)
+            .map_err(|_| "callback HMAC secret must be valid hex".to_string())?;
+    }
+    Ok(key)
 }
 
 #[derive(Subcommand)]
@@ -232,6 +250,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_max_lifetime,
             pool_acquire_timeout,
             cache_ttl,
+            callback_hmac_secret,
         } => {
             let db_url = require_pool(&cli.database_url)?;
             let pool = PgPoolOptions::new()
@@ -244,7 +263,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
 
             let cache_duration = Duration::from_secs(cache_ttl);
-            let app = awa_ui::router(pool, cache_duration).await?;
+            let callback_hmac_secret = callback_hmac_secret
+                .as_deref()
+                .map(parse_callback_hmac_secret)
+                .transpose()
+                .map_err(|err| format!("invalid callback HMAC secret: {err}"))?;
+            let app =
+                awa_ui::router_with_callback_secret(pool, cache_duration, callback_hmac_secret)
+                    .await?;
             let addr = format!("{host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
             tracing::info!("AWA UI listening on http://{addr}");

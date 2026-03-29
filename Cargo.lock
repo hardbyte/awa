@@ -247,6 +247,7 @@ dependencies = [
  "awa-model",
  "awa-testing",
  "axum",
+ "blake3",
  "chrono",
  "mime_guess",
  "moka",

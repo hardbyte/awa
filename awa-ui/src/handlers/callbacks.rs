@@ -4,6 +4,7 @@
 //! enabling serverless functions to resolve callbacks via HTTP.
 
 use axum::extract::{Path, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -34,15 +35,50 @@ fn default_heartbeat_timeout() -> f64 {
     3600.0
 }
 
+fn verify_signature(
+    headers: &HeaderMap,
+    callback_id: &str,
+    state: &AppState,
+) -> Result<(), ApiError> {
+    let Some(secret) = state.callback_hmac_secret else {
+        return Ok(());
+    };
+
+    let provided = headers
+        .get("X-Awa-Signature")
+        .ok_or_else(|| ApiError::unauthorized("missing X-Awa-Signature header"))?
+        .to_str()
+        .map_err(|_| ApiError::unauthorized("invalid X-Awa-Signature header"))?;
+
+    let expected = blake3::keyed_hash(&secret, callback_id.as_bytes());
+    if expected.to_hex().as_str() == provided {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized("invalid callback signature"))
+    }
+}
+
+fn parse_timeout(timeout_seconds: f64) -> Result<std::time::Duration, ApiError> {
+    if !timeout_seconds.is_finite() || timeout_seconds.is_sign_negative() {
+        return Err(ApiError::Awa(awa_model::AwaError::Validation(
+            "timeout_seconds must be a finite, non-negative number".into(),
+        )));
+    }
+
+    Ok(std::time::Duration::from_secs_f64(timeout_seconds))
+}
+
 /// POST /api/callbacks/:callback_id/complete
 ///
 /// Completes a waiting job with an optional payload.
 pub async fn complete_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(callback_id): Path<String>,
     Json(body): Json<CompletePayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_writable()?;
+    verify_signature(&headers, &callback_id, &state)?;
     let uuid = uuid::Uuid::parse_str(&callback_id)
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
@@ -61,10 +97,12 @@ pub async fn complete_callback(
 /// Fails a waiting job with an error message.
 pub async fn fail_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(callback_id): Path<String>,
     Json(body): Json<FailPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_writable()?;
+    verify_signature(&headers, &callback_id, &state)?;
     let uuid = uuid::Uuid::parse_str(&callback_id)
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
@@ -83,14 +121,16 @@ pub async fn fail_callback(
 /// Extends the callback timeout for a long-running operation.
 pub async fn heartbeat_callback(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(callback_id): Path<String>,
     Json(body): Json<HeartbeatPayload>,
 ) -> Result<impl IntoResponse, ApiError> {
     state.require_writable()?;
+    verify_signature(&headers, &callback_id, &state)?;
     let uuid = uuid::Uuid::parse_str(&callback_id)
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
-    let timeout = std::time::Duration::from_secs_f64(body.timeout_seconds);
+    let timeout = parse_timeout(body.timeout_seconds)?;
     let job = awa_model::admin::heartbeat_callback(&state.pool, uuid, timeout).await?;
     Ok((
         StatusCode::OK,

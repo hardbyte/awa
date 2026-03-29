@@ -175,8 +175,10 @@ impl JobContext {
     /// ```
     pub async fn wait_for_callback(
         &self,
-        _guard: CallbackGuard,
+        guard: CallbackGuard,
     ) -> Result<serde_json::Value, AwaError> {
+        let callback_id = guard.id();
+
         // Transition to waiting_external
         let result = sqlx::query(
             r#"
@@ -184,18 +186,49 @@ impl JobContext {
             SET state = 'waiting_external',
                 heartbeat_at = NULL,
                 deadline_at = NULL
-            WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id IS NOT NULL
+            WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id = $3
             "#,
         )
         .bind(self.job.id)
         .bind(self.job.run_lease)
+        .bind(callback_id)
         .execute(&self.pool)
         .await?;
 
         if result.rows_affected() == 0 {
-            return Err(AwaError::Validation(
-                "wait_for_callback: job is not in running state with a registered callback".into(),
-            ));
+            let current: Option<(awa_model::JobState, Option<uuid::Uuid>, serde_json::Value)> =
+                sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
+                    .bind(self.job.id)
+                    .fetch_optional(&self.pool)
+                    .await?;
+
+            match current {
+                Some((awa_model::JobState::Running, None, metadata))
+                    if metadata.get("_awa_callback_result").is_some() =>
+                {
+                    return take_callback_payload(&self.pool, self.job.id, metadata).await;
+                }
+                Some((state, Some(current_callback_id), _))
+                    if current_callback_id != callback_id =>
+                {
+                    return Err(AwaError::Validation(format!(
+                        "wait_for_callback: token {callback_id} is stale; current callback is {current_callback_id} in state {state:?}"
+                    )));
+                }
+                Some((awa_model::JobState::WaitingExternal, Some(_), _)) => {
+                    // Already transitioned to waiting_external for this callback.
+                }
+                Some((state, _, _)) => {
+                    return Err(AwaError::Validation(format!(
+                        "wait_for_callback: job is not waiting on callback {callback_id}; state={state:?}"
+                    )));
+                }
+                None => {
+                    return Err(AwaError::Validation(
+                        "job not found during callback wait".into(),
+                    ));
+                }
+            }
         }
 
         // Poll DB until the callback is resolved (state changes from waiting_external).
@@ -208,38 +241,35 @@ impl JobContext {
                 ));
             }
 
-            let row: Option<(awa_model::JobState, serde_json::Value)> =
-                sqlx::query_as("SELECT state, metadata FROM awa.jobs WHERE id = $1")
+            let row: Option<(awa_model::JobState, Option<uuid::Uuid>, serde_json::Value)> =
+                sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
                     .bind(self.job.id)
                     .fetch_optional(&self.pool)
                     .await?;
 
             match row {
-                Some((awa_model::JobState::Running, metadata)) => {
-                    // Resumed! Extract the callback result from metadata.
-                    let payload = metadata
-                        .get("_awa_callback_result")
-                        .cloned()
-                        .unwrap_or(serde_json::Value::Null);
-
-                    // Clean up the reserved metadata key
-                    sqlx::query(
-                        "UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1",
-                    )
-                    .bind(self.job.id)
-                    .execute(&self.pool)
-                    .await?;
-
-                    return Ok(payload);
+                Some((awa_model::JobState::Running, None, metadata))
+                    if metadata.get("_awa_callback_result").is_some() =>
+                {
+                    return take_callback_payload(&self.pool, self.job.id, metadata).await;
                 }
-                Some((awa_model::JobState::WaitingExternal, _)) => {
+                Some((awa_model::JobState::WaitingExternal, Some(current_callback_id), _))
+                    if current_callback_id == callback_id =>
+                {
                     // Still waiting — sleep and poll again
                     tokio::time::sleep(Duration::from_millis(200)).await;
                 }
-                Some((state, _)) => {
+                Some((state, Some(current_callback_id), _))
+                    if current_callback_id != callback_id =>
+                {
+                    return Err(AwaError::Validation(format!(
+                        "wait_for_callback: token {callback_id} is stale; current callback is {current_callback_id} in state {state:?}"
+                    )));
+                }
+                Some((state, _, _)) => {
                     // Job was rescued, cancelled, or otherwise moved out of waiting
                     return Err(AwaError::Validation(format!(
-                        "job left waiting_external unexpectedly: state={state:?}"
+                        "job left wait_for_callback unexpectedly for token {callback_id}: state={state:?}"
                     )));
                 }
                 None => {
@@ -318,4 +348,22 @@ impl JobContext {
     pub fn progress_buffer(&self) -> Arc<std::sync::Mutex<ProgressState>> {
         self.progress.clone()
     }
+}
+
+async fn take_callback_payload(
+    pool: &PgPool,
+    job_id: i64,
+    metadata: serde_json::Value,
+) -> Result<serde_json::Value, AwaError> {
+    let payload = metadata
+        .get("_awa_callback_result")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+
+    sqlx::query("UPDATE awa.jobs SET metadata = metadata - '_awa_callback_result' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+
+    Ok(payload)
 }

@@ -1281,6 +1281,71 @@ impl Worker for SequentialWaitWorker {
     }
 }
 
+struct EarlyResumeWorker {
+    callback_id_tx: tokio::sync::mpsc::Sender<uuid::Uuid>,
+    resume_gate_rx: tokio::sync::Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    result_tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, AwaError>>,
+}
+
+#[async_trait::async_trait]
+impl Worker for EarlyResumeWorker {
+    fn kind(&self) -> &'static str {
+        "external_payment"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let guard = ctx
+            .register_callback(Duration::from_secs(3600))
+            .await
+            .map_err(JobError::retryable)?;
+
+        let callback_id = guard.id();
+        let _ = self.callback_id_tx.send(callback_id).await;
+
+        if let Some(receiver) = self.resume_gate_rx.lock().await.take() {
+            let _ = receiver.await;
+        }
+
+        let payload = ctx.wait_for_callback(guard).await;
+        let _ = self.result_tx.send(payload).await;
+        Ok(JobResult::Completed)
+    }
+}
+
+struct WrongTokenWorker {
+    callback_id_tx: tokio::sync::mpsc::Sender<uuid::Uuid>,
+    result_tx: tokio::sync::mpsc::Sender<Result<serde_json::Value, AwaError>>,
+}
+
+#[async_trait::async_trait]
+impl Worker for WrongTokenWorker {
+    fn kind(&self) -> &'static str {
+        "external_payment"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let first_guard = ctx
+            .register_callback(Duration::from_secs(3600))
+            .await
+            .map_err(JobError::retryable)?;
+        let _ = self.callback_id_tx.send(first_guard.id()).await;
+
+        ctx.wait_for_callback(first_guard.clone())
+            .await
+            .map_err(JobError::retryable)?;
+
+        let second_guard = ctx
+            .register_callback(Duration::from_secs(3600))
+            .await
+            .map_err(JobError::retryable)?;
+        let _ = self.callback_id_tx.send(second_guard.id()).await;
+
+        let result = ctx.wait_for_callback(first_guard).await;
+        let _ = self.result_tx.send(result).await;
+        Ok(JobResult::Completed)
+    }
+}
+
 /// E19: Full wait_for_callback flow — handler suspends, resume_external wakes it.
 #[tokio::test]
 async fn test_e19_wait_for_callback_happy_path() {
@@ -1379,6 +1444,198 @@ async fn test_e19_wait_for_callback_happy_path() {
         .expect("handler should finish")
         .expect("handler panicked");
     assert!(matches!(result, Ok(JobResult::Completed)));
+}
+
+/// E19b: Resume can win the race before wait_for_callback transitions to waiting_external.
+#[tokio::test]
+async fn test_e19b_wait_for_callback_handles_early_resume() {
+    let client = setup().await;
+    let queue = "test_e19b_early_resume";
+    clean_queue(client.pool(), queue).await;
+
+    let job = awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 4001 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (cb_tx, mut cb_rx) = tokio::sync::mpsc::channel(1);
+    let (resume_gate_tx, resume_gate_rx) = tokio::sync::oneshot::channel();
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(1);
+
+    let claimed: JobRow = sqlx::query_as(
+        r#"
+        WITH claimed AS (
+            SELECT id FROM awa.jobs
+            WHERE state = 'available' AND kind = 'external_payment' AND queue = $1
+            LIMIT 1 FOR UPDATE SKIP LOCKED
+        )
+        UPDATE awa.jobs
+        SET state = 'running', attempt = attempt + 1, run_lease = run_lease + 1,
+            attempted_at = now(), heartbeat_at = now(), deadline_at = now() + interval '5 minutes'
+        FROM claimed WHERE awa.jobs.id = claimed.id
+        RETURNING awa.jobs.*
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+
+    let pool = client.pool().clone();
+    let worker = EarlyResumeWorker {
+        callback_id_tx: cb_tx,
+        resume_gate_rx: tokio::sync::Mutex::new(Some(resume_gate_rx)),
+        result_tx,
+    };
+
+    let handler_task = tokio::spawn(async move {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state: Arc<
+            std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send + Sync>>,
+        > = Arc::new(std::collections::HashMap::new());
+        let progress = Arc::new(std::sync::Mutex::new(
+            awa_worker::context::ProgressState::new(claimed.progress.clone()),
+        ));
+        let ctx = JobContext::new(claimed, cancel, state, pool, progress);
+        worker.perform(&ctx).await
+    });
+
+    let callback_id = tokio::time::timeout(Duration::from_secs(5), cb_rx.recv())
+        .await
+        .expect("timeout waiting for callback_id")
+        .expect("channel closed");
+
+    admin::resume_external(
+        client.pool(),
+        callback_id,
+        Some(serde_json::json!({"answer": 7})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let _ = resume_gate_tx.send(());
+
+    let payload = tokio::time::timeout(Duration::from_secs(5), result_rx.recv())
+        .await
+        .expect("timeout waiting for result")
+        .expect("channel closed")
+        .expect("wait_for_callback should succeed after early resume");
+    assert_eq!(payload["answer"], 7);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), handler_task)
+        .await
+        .expect("handler should finish")
+        .expect("handler panicked");
+    assert!(matches!(result, Ok(JobResult::Completed)));
+
+    let final_job = client.get_job(job.id).await.unwrap();
+    assert_eq!(final_job.state, JobState::Running);
+    assert!(
+        final_job.metadata.get("_awa_callback_result").is_none(),
+        "reserved callback metadata should be cleaned up"
+    );
+}
+
+/// E19c: wait_for_callback rejects a stale token after a new callback is registered.
+#[tokio::test]
+async fn test_e19c_wait_for_callback_rejects_stale_token() {
+    let client = setup().await;
+    let queue = "test_e19c_stale_token";
+    clean_queue(client.pool(), queue).await;
+
+    awa::insert_with(
+        client.pool(),
+        &ExternalPayment { order_id: 4002 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let (cb_tx, mut cb_rx) = tokio::sync::mpsc::channel(2);
+    let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(1);
+
+    let claimed: JobRow = sqlx::query_as(
+        r#"
+        WITH claimed AS (
+            SELECT id FROM awa.jobs
+            WHERE state = 'available' AND kind = 'external_payment' AND queue = $1
+            LIMIT 1 FOR UPDATE SKIP LOCKED
+        )
+        UPDATE awa.jobs
+        SET state = 'running', attempt = attempt + 1, run_lease = run_lease + 1,
+            attempted_at = now(), heartbeat_at = now(), deadline_at = now() + interval '5 minutes'
+        FROM claimed WHERE awa.jobs.id = claimed.id
+        RETURNING awa.jobs.*
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+
+    let worker = WrongTokenWorker {
+        callback_id_tx: cb_tx,
+        result_tx,
+    };
+
+    let pool = client.pool().clone();
+    let run = tokio::spawn(async move {
+        let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let state: Arc<
+            std::collections::HashMap<std::any::TypeId, Box<dyn std::any::Any + Send + Sync>>,
+        > = Arc::new(std::collections::HashMap::new());
+        let progress = Arc::new(std::sync::Mutex::new(
+            awa_worker::context::ProgressState::new(claimed.progress.clone()),
+        ));
+        let ctx = JobContext::new(claimed, cancel, state, pool, progress);
+        worker.perform(&ctx).await
+    });
+
+    let cb1 = tokio::time::timeout(Duration::from_secs(5), cb_rx.recv())
+        .await
+        .expect("timeout waiting for first callback")
+        .expect("channel closed");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    admin::resume_external(
+        client.pool(),
+        cb1,
+        Some(serde_json::json!({"ok": true})),
+        None,
+    )
+    .await
+    .unwrap();
+
+    let cb2 = tokio::time::timeout(Duration::from_secs(5), cb_rx.recv())
+        .await
+        .expect("timeout waiting for second callback")
+        .expect("channel closed");
+    assert_ne!(cb1, cb2);
+
+    let err = tokio::time::timeout(Duration::from_secs(5), result_rx.recv())
+        .await
+        .expect("timeout waiting for stale-token result")
+        .expect("channel closed")
+        .expect_err("stale token should be rejected");
+    assert!(
+        err.to_string().contains("stale"),
+        "expected stale token validation error, got {err:?}"
+    );
+
+    let outcome = tokio::time::timeout(Duration::from_secs(5), run)
+        .await
+        .expect("worker should finish")
+        .expect("worker task panicked");
+    assert!(matches!(outcome, Ok(JobResult::Completed)));
 }
 
 /// E20: Two sequential callbacks via admin API (no runtime, direct DB).

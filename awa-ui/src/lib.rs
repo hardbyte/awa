@@ -21,8 +21,17 @@ struct StaticAssets;
 
 /// Create the awa-ui router with all API routes and static file serving.
 pub async fn router(pool: PgPool, cache_ttl: Duration) -> Result<Router, sqlx::Error> {
+    router_with_callback_secret(pool, cache_ttl, None).await
+}
+
+/// Create the awa-ui router with optional callback signature verification.
+pub async fn router_with_callback_secret(
+    pool: PgPool,
+    cache_ttl: Duration,
+    callback_hmac_secret: Option<[u8; 32]>,
+) -> Result<Router, sqlx::Error> {
     let read_only = detect_read_only(&pool).await?;
-    let state = AppState::new(pool, read_only, cache_ttl);
+    let state = AppState::new(pool, read_only, cache_ttl, callback_hmac_secret);
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
