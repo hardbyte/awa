@@ -20,7 +20,7 @@ async def main() -> None:
     queue = os.environ["MIXED_QUEUE"]
     mode = os.environ["MIXED_MODE"]
 
-    client = awa.Client(database_url)
+    client = awa.AsyncClient(database_url)
     await client.migrate()
 
     if mode == "worker_chaos_probe":
