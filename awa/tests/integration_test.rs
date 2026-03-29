@@ -956,6 +956,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .await
         .unwrap();
 
+    // Snapshot baseline immediately before insert. Other test binaries may
+    // concurrently create/modify jobs in the shared database, so we can only
+    // assert that global counts increased by *at least* the expected delta.
     let baseline = admin::state_counts(client.pool()).await.unwrap();
 
     sqlx::query(
@@ -977,21 +980,23 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     .unwrap();
 
     let counts = admin::state_counts(client.pool()).await.unwrap();
-    assert_eq!(
-        counts.get(&JobState::Available).copied().unwrap_or(0),
-        baseline.get(&JobState::Available).copied().unwrap_or(0) + 1
+    assert!(
+        counts.get(&JobState::Available).copied().unwrap_or(0)
+            > baseline.get(&JobState::Available).copied().unwrap_or(0),
+        "expected at least 1 more available job"
     );
-    assert_eq!(
-        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
-        baseline.get(&JobState::Scheduled).copied().unwrap_or(0) + 1
+    assert!(
+        counts.get(&JobState::Scheduled).copied().unwrap_or(0)
+            > baseline.get(&JobState::Scheduled).copied().unwrap_or(0),
+        "expected at least 1 more scheduled job"
     );
-    assert_eq!(
-        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0),
-        baseline
-            .get(&JobState::WaitingExternal)
-            .copied()
-            .unwrap_or(0)
-            + 1
+    assert!(
+        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0)
+            > baseline
+                .get(&JobState::WaitingExternal)
+                .copied()
+                .unwrap_or(0),
+        "expected at least 1 more waiting_external job"
     );
 
     let queues = admin::queue_stats(client.pool()).await.unwrap();
@@ -1018,14 +1023,14 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .await
         .unwrap();
 
-    let counts = admin::state_counts(client.pool()).await.unwrap();
+    // Verify the promotion via queue-specific stats (immune to concurrent
+    // test interference) rather than global count deltas.
+    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
+    assert_eq!(queue_a_stats.available, 2, "kind_b should now be available");
     assert_eq!(
-        counts.get(&JobState::Scheduled).copied().unwrap_or(0),
-        baseline.get(&JobState::Scheduled).copied().unwrap_or(0)
-    );
-    assert_eq!(
-        counts.get(&JobState::Available).copied().unwrap_or(0),
-        baseline.get(&JobState::Available).copied().unwrap_or(0) + 2
+        queue_a_stats.scheduled, 0,
+        "no scheduled jobs should remain"
     );
 
     sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")

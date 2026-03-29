@@ -5,6 +5,8 @@ pub mod dispatcher;
 pub mod events;
 pub mod executor;
 pub mod heartbeat;
+#[cfg(feature = "http-worker")]
+pub mod http_worker;
 pub mod maintenance;
 pub mod metrics;
 mod runtime;
@@ -18,3 +20,6 @@ pub use events::{JobEvent, UntypedJobEvent};
 pub use executor::{JobError, JobResult, Worker};
 pub use maintenance::RetentionPolicy;
 pub use metrics::AwaMetrics;
+
+#[cfg(feature = "http-worker")]
+pub use http_worker::{HttpWorker, HttpWorkerConfig, HttpWorkerMode};

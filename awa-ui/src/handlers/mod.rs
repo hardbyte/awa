@@ -1,3 +1,4 @@
+pub mod callbacks;
 pub mod cron;
 pub mod jobs;
 pub mod queues;

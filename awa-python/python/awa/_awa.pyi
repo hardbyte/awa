@@ -92,6 +92,7 @@ class Job(Generic[T]):
         on_fail: str | None = None,
         transform: str | None = None,
     ) -> CallbackToken: ...
+    async def wait_for_callback(self, token: CallbackToken) -> Any: ...
 
 class ResolveResult:
     @property
@@ -341,6 +342,16 @@ class Client:
     async def retry_external(
         self, callback_id: str
     ) -> Job[dict[str, Any]]: ...
+    async def resume_external(
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Job[dict[str, Any]]: ...
+    async def heartbeat_callback(
+        self,
+        callback_id: str,
+        timeout_seconds: float = 3600.0,
+    ) -> Job[dict[str, Any]]: ...
     async def resolve_callback(
         self,
         callback_id: str,
@@ -415,6 +426,16 @@ class Client:
     ) -> Job[dict[str, Any]]: ...
     def retry_external_sync(
         self, callback_id: str
+    ) -> Job[dict[str, Any]]: ...
+    def resume_external_sync(
+        self,
+        callback_id: str,
+        payload: dict[str, Any] | None = None,
+    ) -> Job[dict[str, Any]]: ...
+    def heartbeat_callback_sync(
+        self,
+        callback_id: str,
+        timeout_seconds: float = 3600.0,
     ) -> Job[dict[str, Any]]: ...
     def resolve_callback_sync(
         self,

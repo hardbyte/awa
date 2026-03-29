@@ -11,18 +11,25 @@ pub struct AppState {
     pub pool: PgPool,
     pub read_only: bool,
     pub cache: DashboardCache,
+    pub callback_hmac_secret: Option<[u8; 32]>,
     /// Suggested frontend poll interval — at least as long as the cache TTL
     /// so clients don't poll faster than the cache can refresh.
     pub poll_interval_ms: u64,
 }
 
 impl AppState {
-    pub fn new(pool: PgPool, read_only: bool, cache_ttl: Duration) -> Self {
+    pub fn new(
+        pool: PgPool,
+        read_only: bool,
+        cache_ttl: Duration,
+        callback_hmac_secret: Option<[u8; 32]>,
+    ) -> Self {
         let poll_interval_ms = cache_ttl.as_millis().max(5_000) as u64;
         Self {
             pool,
             read_only,
             cache: DashboardCache::new(cache_ttl),
+            callback_hmac_secret,
             poll_interval_ms,
         }
     }

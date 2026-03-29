@@ -21,8 +21,17 @@ struct StaticAssets;
 
 /// Create the awa-ui router with all API routes and static file serving.
 pub async fn router(pool: PgPool, cache_ttl: Duration) -> Result<Router, sqlx::Error> {
+    router_with_callback_secret(pool, cache_ttl, None).await
+}
+
+/// Create the awa-ui router with optional callback signature verification.
+pub async fn router_with_callback_secret(
+    pool: PgPool,
+    cache_ttl: Duration,
+    callback_hmac_secret: Option<[u8; 32]>,
+) -> Result<Router, sqlx::Error> {
     let read_only = detect_read_only(&pool).await?;
-    let state = AppState::new(pool, read_only, cache_ttl);
+    let state = AppState::new(pool, read_only, cache_ttl, callback_hmac_secret);
     let api = Router::new()
         // Jobs
         .route("/jobs", get(handlers::jobs::list_jobs))
@@ -56,7 +65,20 @@ pub async fn router(pool: PgPool, cache_ttl: Duration) -> Result<Router, sqlx::E
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
         .route("/capabilities", get(handlers::stats::get_capabilities))
         // Runtime
-        .route("/runtime", get(handlers::runtime::get_runtime));
+        .route("/runtime", get(handlers::runtime::get_runtime))
+        // Callbacks (for HTTP workers and external systems)
+        .route(
+            "/callbacks/{callback_id}/complete",
+            post(handlers::callbacks::complete_callback),
+        )
+        .route(
+            "/callbacks/{callback_id}/fail",
+            post(handlers::callbacks::fail_callback),
+        )
+        .route(
+            "/callbacks/{callback_id}/heartbeat",
+            post(handlers::callbacks::heartbeat_callback),
+        );
 
     Ok(Router::new()
         .nest("/api", api)

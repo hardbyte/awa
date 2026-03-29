@@ -141,9 +141,26 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | FB8 | Python failure benchmark: terminal/retryable/callback/mixed | Failure bench | Implemented |
 | TLA1 | TLA+ AwaCore: lease-guarded finalization, stale completion rejected | Formal model | Implemented |
 | TLA2 | TLA+ AwaExtended: shutdown/rescue/permit/fairness protocol | Formal model | Implemented |
-| TLA3 | TLA+ AwaCbk: at-most-once callback resolution under three-way race | Formal model | Implemented |
+| TLA3 | TLA+ AwaCbk: at-most-once callback resolution under three-way race + sequential resume | Formal model | Implemented |
 | TLA4 | TLA+ AwaCron: no duplicate fire under leader failover | Formal model | Implemented |
 | TLA5 | TLA+ AwaBatcher: at-most-once completion through batcher+fallback path | Formal model | Implemented |
+| SC1 | wait_for_callback: handler suspends, resume_external wakes with payload | Sequential callbacks | Implemented |
+| SC2 | Two sequential callbacks via admin API: resume cb1 → register cb2 → complete cb2 | Sequential callbacks | Implemented |
+| SC3 | Timeout during second callback wait → retryable | Sequential callbacks | Implemented |
+| SC4 | Heartbeat extends timeout during sequential wait | Sequential callbacks | Implemented |
+| SC5 | Concurrent resume attempts: exactly one succeeds | Sequential callbacks | Implemented |
+| SC6 | Resume with wrong run_lease rejected | Sequential callbacks | Implemented |
+| SC7 | Crash/rescue after resume: heartbeat rescue catches stale running job | Sequential callbacks | Implemented |
+| SC8 | Admin cancel after resume: job cancelled in running state | Sequential callbacks | Implemented |
+| SC9 | Resume preserves existing metadata fields | Sequential callbacks | Implemented |
+| SC10 | fail_external on second callback after resume | Sequential callbacks | Implemented |
+| SC11 | resolve_callback on second callback after resume | Sequential callbacks | Implemented |
+| SC12 | retry_external on second callback resets job | Sequential callbacks | Implemented |
+| SC13 | Python: resume_external transitions to running with payload | Sequential callbacks (Py) | Implemented |
+| SC14 | Python: wait_for_callback happy path — handler suspends and resumes | Sequential callbacks (Py) | Implemented |
+| SC15 | Python: two sequential wait_for_callback cycles in single handler | Sequential callbacks (Py) | Implemented |
+| SC16 | Python: heartbeat during wait extends timeout | Sequential callbacks (Py) | Implemented |
+| SC17 | Python: double resume fails with CallbackNotFound | Sequential callbacks (Py) | Implemented |
 | BR1 | tokio-postgres bridge: commit/rollback atomicity | Bridge | Implemented |
 | BR2 | tokio-postgres bridge: lease guard prevents stale completion | Bridge | Implemented |
 | BR3 | tokio-postgres bridge: unique conflict mapping | Bridge | Implemented |
@@ -201,12 +218,19 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 # Python failure-mode benchmarks
 cd awa-python && PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run python scripts/benchmark_runtime.py --scenario failures
 
+# Sequential callback tests (Rust)
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test external_wait_test -- --test-threads=1 --nocapture
+
+# Sequential callback tests (Python)
+cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_sequential_callbacks.py -v
+
 # TLA+ correctness models (requires Docker)
 ./correctness/run-tlc.sh AwaCore.tla
 ./correctness/run-tlc.sh AwaExtended.tla
 ./correctness/run-tlc.sh AwaBatcher.tla
 ./correctness/run-tlc.sh AwaBatcher.tla AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh AwaCbk.tla
+./correctness/run-tlc.sh AwaCbk.tla AwaCbkLiveness.cfg
 ./correctness/run-tlc.sh AwaCron.tla AwaCronLiveness.cfg
 
 # Concurrent multi-queue lifecycle benchmarks

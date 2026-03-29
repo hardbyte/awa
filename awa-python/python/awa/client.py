@@ -197,6 +197,16 @@ class AsyncClient:
         """Retry a waiting job via external callback."""
         return await self._raw.retry_external(callback_id)
 
+    async def resume_external(
+        self, callback_id: str, payload: dict[str, Any] | None = None
+    ) -> Job:
+        """Resume a waiting job via external callback, returning it to running.
+
+        Use this for sequential callback patterns where the handler needs to
+        continue execution with the callback payload.
+        """
+        return await self._raw.resume_external(callback_id, payload)
+
     async def heartbeat_callback(
         self, callback_id: str, timeout_seconds: float = 3600.0
     ) -> Job:
@@ -470,6 +480,12 @@ class Client:
     def retry_external(self, callback_id: str) -> Job:
         """Retry a waiting job via external callback."""
         return self._raw.retry_external_sync(callback_id)
+
+    def resume_external(
+        self, callback_id: str, payload: dict[str, Any] | None = None
+    ) -> Job:
+        """Resume a waiting job via external callback, returning it to running."""
+        return self._raw.resume_external_sync(callback_id, payload)
 
     def heartbeat_callback(
         self, callback_id: str, timeout_seconds: float = 3600.0

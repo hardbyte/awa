@@ -152,6 +152,103 @@ impl JobContext {
         Ok(CallbackGuard::new(callback_id))
     }
 
+    /// Wait for an external callback to resolve, then resume with the payload.
+    ///
+    /// This enables sequential callbacks: the handler can register a callback,
+    /// wait for it, process the result, register another callback, wait again,
+    /// and so on — all within a single handler invocation.
+    ///
+    /// The handler's async task suspends while waiting. The job transitions to
+    /// `waiting_external`. When `resume_external(callback_id, payload)` is
+    /// called, the job transitions back to `running` and this method returns
+    /// the payload.
+    ///
+    /// The handler holds its permit (worker slot) during the wait. For very
+    /// long waits, consider whether the single-shot `WaitForCallback` pattern
+    /// (which releases the permit) is more appropriate.
+    ///
+    /// ```ignore
+    /// let token = ctx.register_callback(Duration::from_secs(3600)).await?;
+    /// send_to_external_system(token.id());
+    /// let payload = ctx.wait_for_callback(token).await?;
+    /// // Handler resumes here with the external system's response
+    /// ```
+    pub async fn wait_for_callback(
+        &self,
+        guard: CallbackGuard,
+    ) -> Result<serde_json::Value, AwaError> {
+        use awa_model::admin::{check_callback_state, enter_callback_wait, CallbackPollResult};
+
+        let callback_id = guard.id();
+
+        // Transition to waiting_external
+        let entered =
+            enter_callback_wait(&self.pool, self.job.id, self.job.run_lease, callback_id).await?;
+
+        if !entered {
+            // The UPDATE didn't match — check for early-resume race.
+            match check_callback_state(&self.pool, self.job.id, callback_id).await? {
+                CallbackPollResult::Resolved(payload) => return Ok(payload),
+                CallbackPollResult::Pending => { /* Already in waiting_external */ }
+                CallbackPollResult::Stale {
+                    token,
+                    current,
+                    state,
+                } => {
+                    return Err(AwaError::Validation(format!(
+                        "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
+                    )));
+                }
+                CallbackPollResult::UnexpectedState { token, state } => {
+                    return Err(AwaError::Validation(format!(
+                        "wait_for_callback: job is not waiting on callback {token}; state={state:?}"
+                    )));
+                }
+                CallbackPollResult::NotFound => {
+                    return Err(AwaError::Validation(
+                        "job not found during callback wait".into(),
+                    ));
+                }
+            }
+        }
+
+        // Poll DB until the callback is resolved (state changes from waiting_external).
+        // resume_external sets state to 'running' and stores payload in metadata.
+        loop {
+            if self.is_cancelled() {
+                return Err(AwaError::Validation(
+                    "job cancelled while waiting for callback".into(),
+                ));
+            }
+
+            match check_callback_state(&self.pool, self.job.id, callback_id).await? {
+                CallbackPollResult::Resolved(payload) => return Ok(payload),
+                CallbackPollResult::Pending => {
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+                CallbackPollResult::Stale {
+                    token,
+                    current,
+                    state,
+                } => {
+                    return Err(AwaError::Validation(format!(
+                        "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
+                    )));
+                }
+                CallbackPollResult::UnexpectedState { token, state } => {
+                    return Err(AwaError::Validation(format!(
+                        "job left wait_for_callback unexpectedly for token {token}: state={state:?}"
+                    )));
+                }
+                CallbackPollResult::NotFound => {
+                    return Err(AwaError::Validation(
+                        "job not found during callback wait".into(),
+                    ));
+                }
+            }
+        }
+    }
+
     /// Set structured progress (0-100 with message). Sync — writes to in-memory buffer.
     ///
     /// `percent` is clamped to 0-100. For progress without a message, pass `""`.

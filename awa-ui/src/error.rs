@@ -7,6 +7,7 @@ use serde_json::json;
 pub enum ApiError {
     Awa(awa_model::AwaError),
     ReadOnly,
+    Unauthorized(String),
 }
 
 impl From<awa_model::AwaError> for ApiError {
@@ -43,6 +44,7 @@ impl IntoResponse for ApiError {
                 "awa serve is connected to a read-only database; admin actions are disabled"
                     .to_string(),
             ),
+            ApiError::Unauthorized(message) => (StatusCode::UNAUTHORIZED, message),
             ApiError::Awa(err) => match &err {
                 awa_model::AwaError::JobNotFound { .. } => (StatusCode::NOT_FOUND, err.to_string()),
                 awa_model::AwaError::CallbackNotFound { .. } => {
@@ -77,5 +79,9 @@ impl IntoResponse for ApiError {
 impl ApiError {
     pub fn read_only() -> Self {
         ApiError::ReadOnly
+    }
+
+    pub fn unauthorized(message: impl Into<String>) -> Self {
+        ApiError::Unauthorized(message.into())
     }
 }

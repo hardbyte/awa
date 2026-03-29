@@ -25,7 +25,7 @@ use tracing_subscriber::Layer;
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgres://postgres:awa@localhost:5432/awa_test".to_string())
+        .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
 async fn pool() -> sqlx::PgPool {

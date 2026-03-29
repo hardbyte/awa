@@ -47,6 +47,7 @@ thiserror = "2"
 
 # Crypto
 blake3 = "1"
+hex = "0.4"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -66,6 +67,9 @@ cel = { version = "0.13", features = ["json"] }
 
 # CLI
 clap = { version = "4", features = ["derive", "env"] }
+
+# HTTP client
+reqwest = { version = "0.12", features = ["json"] }
 
 # Web
 axum = "0.8"

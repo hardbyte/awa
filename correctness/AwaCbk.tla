@@ -2,29 +2,33 @@
 EXTENDS FiniteSets, Naturals
 
 (*
-  External callback resolution model — with Postgres row-lock semantics.
+  External callback resolution model — with Postgres row-lock semantics
+  and sequential callback support (resume from wait).
 
   Verifies the three-way race between:
-    1. External system calling complete_external / fail_external / resolve_callback
+    1. External system calling complete_external / fail_external /
+       resolve_callback / resume_external
     2. Maintenance leader running rescue_expired_callbacks (timeout)
     3. Heartbeat rescue clearing stale callback after worker crash
+
+  Sequential callbacks: after resume_external transitions the job from
+  waiting_external back to running, the handler can register a NEW
+  callback, enter waiting_external again, and the cycle repeats.
+  Each callback lifecycle gets its own at-most-once resolution guarantee.
 
   Unlike a naive atomic-action model, this version models Postgres row-level
   locking to verify that the concurrency control actually prevents double
   resolution:
 
-  - complete_external and fail_external are plain UPDATEs: if the row is
-    locked, they BLOCK until the lock is released, then re-evaluate the
-    WHERE clause against the new row state.
+  - complete_external, fail_external, and resume_external are plain UPDATEs:
+    if the row is locked, they BLOCK until the lock is released, then
+    re-evaluate the WHERE clause against the new row state.
   - resolve_callback does SELECT ... FOR UPDATE: if the row is locked, it
     BLOCKS until the lock is released, then re-checks callback_id + state
     before deciding Complete / Fail / Ignore.
   - rescue_expired_callbacks uses FOR UPDATE SKIP LOCKED: if the row is
     locked, it skips and returns 0 rows.
   - heartbeat rescue also uses FOR UPDATE SKIP LOCKED.
-
-  The model splits each resolution path into lock-acquire + execute phases
-  to expose the interleaving window that atomic-action models hide.
 *)
 
 Instances == {"i1", "i2"}
@@ -32,10 +36,11 @@ NoInstance == "none"
 NoCb == "none"
 CbId == "cb1"
 MaxLease == 3
+MaxCallbackGen == 2   \* Allow up to 2 callback lifecycles per job run
 
 JobStates == {"available", "running", "waiting_external", "completed", "retryable", "failed"}
 TerminalStates == {"completed", "retryable", "failed"}
-BlockingOps == {"complete", "fail", "resolve"}
+BlockingOps == {"complete", "fail", "resolve", "resume"}
 
 \* Row lock states. NoLock means the row is unlocked.
 \* Other values identify which operation holds the lock.
@@ -51,12 +56,14 @@ VARIABLES
     lease,             \* DB run_lease counter (incremented on each claim)
     taskLease,         \* Per-instance: the lease value when they started the task
     leader,            \* Maintenance leader (or NoInstance)
-    resolved,          \* Count of successful callback resolutions (safety target)
+    resolved,          \* Resolutions in current callback generation (safety target)
+    callbackGen,       \* Which callback lifecycle we're on (0 = first, 1 = second, etc.)
     rowLock,           \* Who holds the Postgres row lock: NoLock or LockKinds
     blockedOps         \* External operations currently blocked on the row lock
 
 vars == <<jobState, callbackId, callbackTimedOut, heartbeatFresh,
-          owner, lease, taskLease, leader, resolved, rowLock, blockedOps>>
+          owner, lease, taskLease, leader, resolved, callbackGen,
+          rowLock, blockedOps>>
 
 \* ─── Initial state ────────────────────────────────────────
 
@@ -70,6 +77,7 @@ Init ==
     /\ taskLease = [i \in Instances |-> 0]
     /\ leader = NoInstance
     /\ resolved = 0
+    /\ callbackGen = 0
     /\ rowLock = NoLock
     /\ blockedOps = {}
 
@@ -86,6 +94,7 @@ Claim(i) ==
     /\ lease' = lease + 1
     /\ heartbeatFresh' = TRUE
     /\ taskLease' = [taskLease EXCEPT ![i] = lease + 1]
+    /\ callbackGen' = 0
     /\ UNCHANGED <<callbackId, callbackTimedOut, leader, resolved, rowLock, blockedOps>>
 
 \* Handler registers callback (UPDATE WHERE state='running' AND run_lease=$4).
@@ -97,14 +106,17 @@ RegisterCallback(i) ==
     /\ owner = i
     /\ taskLease[i] = lease
     /\ callbackId = NoCb
+    /\ callbackGen < MaxCallbackGen
     /\ rowLock = NoLock
     /\ callbackId' = CbId
     /\ callbackTimedOut' = FALSE
-    /\ resolved' = 0
-    /\ UNCHANGED <<jobState, heartbeatFresh, owner, lease, taskLease, leader, rowLock, blockedOps>>
+    /\ resolved' = 0      \* Reset resolution counter for this callback generation
+    /\ UNCHANGED <<jobState, heartbeatFresh, owner, lease, taskLease, leader,
+                   callbackGen, rowLock, blockedOps>>
 
-\* Handler returns WaitForCallback (UPDATE WHERE state='running' AND callback_id IS NOT NULL).
-\* Same blocking semantics as RegisterCallback.
+\* Handler enters waiting only if the specific callback_id it registered is
+\* still current. If resume_external wins the race first, callbackId is already
+\* cleared and the handler observes the stored payload while remaining running.
 EnterWaiting(i) ==
     /\ jobState = "running"
     /\ owner = i
@@ -113,7 +125,8 @@ EnterWaiting(i) ==
     /\ rowLock = NoLock
     /\ jobState' = "waiting_external"
     /\ heartbeatFresh' = FALSE
-    /\ UNCHANGED <<callbackId, callbackTimedOut, owner, lease, taskLease, leader, resolved, rowLock, blockedOps>>
+    /\ UNCHANGED <<callbackId, callbackTimedOut, owner, lease, taskLease, leader,
+                   resolved, callbackGen, rowLock, blockedOps>>
 
 \* Timeout deadline passes.
 TimeoutExpires ==
@@ -121,31 +134,36 @@ TimeoutExpires ==
     /\ callbackId = CbId
     /\ ~callbackTimedOut
     /\ callbackTimedOut' = TRUE
-    /\ UNCHANGED <<jobState, callbackId, heartbeatFresh, owner, lease, taskLease, leader, resolved, rowLock, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, heartbeatFresh, owner, lease, taskLease,
+                   leader, resolved, callbackGen, rowLock, blockedOps>>
 
 \* Heartbeat becomes stale.
 HeartbeatStale ==
     /\ jobState = "running"
     /\ heartbeatFresh
     /\ heartbeatFresh' = FALSE
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, owner, lease, taskLease, leader, resolved, rowLock, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, owner, lease, taskLease,
+                   leader, resolved, callbackGen, rowLock, blockedOps>>
 
-\* Promote retryable → available.
+\* Promote retryable -> available.
 PromoteRetryable ==
     /\ jobState = "retryable"
     /\ jobState' = "available"
-    /\ UNCHANGED <<callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, rowLock, blockedOps>>
+    /\ UNCHANGED <<callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease,
+                   leader, resolved, callbackGen, rowLock, blockedOps>>
 
 \* Leader election.
 AcquireLeader(i) ==
     /\ leader = NoInstance
     /\ leader' = i
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, resolved, rowLock, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, resolved, callbackGen, rowLock, blockedOps>>
 
 LoseLeader(i) ==
     /\ leader = i
     /\ leader' = NoInstance
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, resolved, rowLock, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, resolved, callbackGen, rowLock, blockedOps>>
 
 \* ─── External callback resolution: blocking UPDATE / FOR UPDATE ─────
 
@@ -160,7 +178,8 @@ BlockingTryLock(op) ==
     /\ rowLock = NoLock
     /\ op \notin blockedOps
     /\ rowLock' = op
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, leader, resolved, callbackGen, blockedOps>>
 
 \* Phase 1b: Row is locked by someone else -> block (wait for lock).
 BlockingBlock(op) ==
@@ -169,7 +188,8 @@ BlockingBlock(op) ==
     /\ rowLock # op
     /\ op \notin blockedOps
     /\ blockedOps' = blockedOps \cup {op}
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, rowLock>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, leader, resolved, callbackGen, rowLock>>
 
 \* Phase 1c: Lock released while an external op is blocked -> re-evaluate.
 \* If preconditions still hold, acquire lock. Otherwise give up.
@@ -179,9 +199,11 @@ BlockingReEvaluate(op) ==
     /\ IF BlockingPreconditions(op)
           THEN /\ rowLock' = op
                /\ blockedOps' = blockedOps \ {op}
-               /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved>>
+               /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh,
+                              owner, lease, taskLease, leader, resolved, callbackGen>>
           ELSE /\ blockedOps' = blockedOps \ {op}
-               /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, rowLock>>
+               /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh,
+                              owner, lease, taskLease, leader, resolved, callbackGen, rowLock>>
 
 \* Phase 2: Execute UPDATE paths.
 CompleteExecute ==
@@ -193,7 +215,7 @@ CompleteExecute ==
     /\ owner' = NoInstance
     /\ resolved' = resolved + 1
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
 FailExecute ==
     /\ rowLock = "fail"
@@ -204,7 +226,23 @@ FailExecute ==
     /\ owner' = NoInstance
     /\ resolved' = resolved + 1
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
+
+\* resume_external: transition waiting_external -> running, or win the race
+\* before EnterWaiting executes. In both cases it clears callback_id,
+\* refreshes heartbeat, and advances callback generation.
+ResumeExecute ==
+    /\ rowLock = "resume"
+    /\ jobState \in {"waiting_external", "running"}
+    /\ callbackId = CbId
+    /\ jobState' = "running"
+    /\ callbackId' = NoCb
+    /\ callbackTimedOut' = FALSE
+    /\ heartbeatFresh' = TRUE     \* Resume refreshes heartbeat
+    /\ resolved' = resolved + 1   \* This callback lifecycle is resolved
+    /\ callbackGen' = callbackGen + 1  \* Advance to next callback generation
+    /\ rowLock' = NoLock
+    /\ UNCHANGED <<owner, lease, taskLease, leader, blockedOps>>
 
 \* resolve_callback chooses between Complete / Fail / Ignore after acquiring
 \* the FOR UPDATE lock. CEL evaluation is abstracted as nondeterministic choice.
@@ -219,7 +257,7 @@ ResolveCompleteExecute ==
     /\ owner' = NoInstance
     /\ resolved' = resolved + 1
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
 ResolveFailExecute ==
     /\ rowLock = "resolve"
@@ -232,21 +270,22 @@ ResolveFailExecute ==
     /\ owner' = NoInstance
     /\ resolved' = resolved + 1
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
 ResolveIgnoreRelease ==
     /\ rowLock = "resolve"
     /\ jobState \in {"waiting_external", "running"}
     /\ callbackId = CbId
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, leader, resolved, callbackGen, blockedOps>>
 
 \* ─── rescue_expired_callbacks: SKIP LOCKED UPDATE ─────────
 \*
 \* Uses FOR UPDATE SKIP LOCKED in the inner SELECT.
 \* If the row is locked, it returns 0 rows — the outer UPDATE does nothing.
 
-\* Phase 1: Try to lock. Free → lock. Locked → skip (no-op).
+\* Phase 1: Try to lock. Free -> lock. Locked -> skip (no-op).
 TimeoutTryLock(i) ==
     /\ leader = i
     /\ jobState = "waiting_external"
@@ -254,7 +293,8 @@ TimeoutTryLock(i) ==
     /\ callbackTimedOut
     /\ rowLock = NoLock
     /\ rowLock' = "timeout_rescue"
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, leader, resolved, callbackGen, blockedOps>>
 
 \* Phase 2: Execute (lock held). Production can yield retryable or failed
 \* depending on max_attempts; model both outcomes.
@@ -267,7 +307,7 @@ TimeoutRetryExecute ==
     /\ owner' = NoInstance
     /\ resolved' = resolved + 1
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
 TimeoutFailExecute ==
     /\ rowLock = "timeout_rescue"
@@ -278,11 +318,11 @@ TimeoutFailExecute ==
     /\ owner' = NoInstance
     /\ resolved' = resolved + 1
     /\ rowLock' = NoLock
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
 \* ─── rescue_stale_heartbeats: SKIP LOCKED UPDATE ──────────
 
-\* Phase 1: Try to lock. Free → lock. Locked → skip.
+\* Phase 1: Try to lock. Free -> lock. Locked -> skip.
 HeartbeatTryLock(i) ==
     /\ leader = i
     /\ jobState = "running"
@@ -291,7 +331,8 @@ HeartbeatTryLock(i) ==
     /\ ~heartbeatFresh
     /\ rowLock = NoLock
     /\ rowLock' = "heartbeat_rescue"
-    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease, taskLease, leader, resolved, blockedOps>>
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, leader, resolved, callbackGen, blockedOps>>
 
 \* Phase 2: Execute (lock held). Clears callback_id.
 HeartbeatExecute ==
@@ -303,7 +344,7 @@ HeartbeatExecute ==
     /\ owner' = NoInstance
     /\ rowLock' = NoLock
     /\ resolved' = resolved + 1
-    /\ UNCHANGED <<lease, taskLease, leader, blockedOps>>
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
 
 \* ─── Specification ────────────────────────────────────────
 
@@ -316,6 +357,7 @@ Next ==
     \/ \E op \in BlockingOps : BlockingReEvaluate(op)
     \/ CompleteExecute
     \/ FailExecute
+    \/ ResumeExecute
     \/ ResolveCompleteExecute
     \/ ResolveFailExecute
     \/ ResolveIgnoreRelease
@@ -339,6 +381,7 @@ StableNext ==
     \/ \E op \in BlockingOps : BlockingReEvaluate(op)
     \/ CompleteExecute
     \/ FailExecute
+    \/ ResumeExecute
     \/ ResolveCompleteExecute
     \/ ResolveFailExecute
     \/ ResolveIgnoreRelease
@@ -367,10 +410,13 @@ TypeOK ==
     /\ taskLease \in [Instances -> 0..MaxLease]
     /\ leader \in Instances \cup {NoInstance}
     /\ resolved \in 0..1
+    /\ callbackGen \in 0..(MaxCallbackGen + 1)
     /\ rowLock \in {NoLock} \cup LockKinds
     /\ blockedOps \subseteq BlockingOps
 
 \* CRITICAL SAFETY: at most one resolution per callback lifecycle.
+\* Each time a callback is registered, `resolved` resets to 0.
+\* It can increment to at most 1 before the callback_id is cleared.
 AtMostOnceResolution ==
     resolved <= 1
 
@@ -399,6 +445,8 @@ LockHolderConsistent ==
         (callbackId = CbId /\ jobState \in {"waiting_external", "running"})
     /\ rowLock = "resolve" =>
         (jobState \in {"waiting_external", "running"} /\ callbackId = CbId)
+    /\ rowLock = "resume" =>
+        (jobState \in {"waiting_external", "running"} /\ callbackId = CbId)
     /\ rowLock = "timeout_rescue" =>
         (jobState = "waiting_external" /\ callbackId = CbId /\ callbackTimedOut)
     /\ rowLock = "heartbeat_rescue" =>
@@ -407,6 +455,15 @@ LockHolderConsistent ==
 \* A blocked operation never appears as the current lock holder.
 BlockedNotSelfLocked ==
     rowLock = NoLock \/ rowLock \notin blockedOps
+
+\* Callback generation never exceeds the maximum.
+CallbackGenBounded ==
+    callbackGen <= MaxCallbackGen + 1
+
+\* After resume, the handler can only register another callback if within bounds.
+\* This is enforced by RegisterCallback's callbackGen < MaxCallbackGen guard.
+ResumePreservesOwner ==
+    rowLock = "resume" => owner \in Instances
 
 \* ─── Liveness (under availability) ────────────────────────
 
@@ -419,6 +476,7 @@ FairnessAssumptions ==
     /\ WF_vars(TimeoutFailExecute)
     /\ WF_vars(CompleteExecute)
     /\ WF_vars(FailExecute)
+    /\ WF_vars(ResumeExecute)
     /\ WF_vars(ResolveCompleteExecute)
     /\ WF_vars(ResolveFailExecute)
     /\ WF_vars(ResolveIgnoreRelease)

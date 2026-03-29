@@ -31,8 +31,11 @@ INSERT ──► scheduled ──► available ──► running ──► compl
                │              ▲           │
                │              │           ├──► retryable ──► available (via promotion)
                │              │           │
-               │              │           ├──► waiting_external ──► completed/failed
-               │              │           │         (webhook callback)
+               │              │           ├──► waiting_external ──► running ──► ...
+               │              │           │            │
+               │              │           │            ├──► completed/failed/retryable/cancelled
+               │              │           │            └──► running (resume_external)
+               │              │           │         (external callback / sequential wait)
                │              │           │
                │              │           ├──► failed (max attempts exhausted or terminal error)
                │              │           │
@@ -54,7 +57,7 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 | `retryable` | Failed but eligible for retry after backoff |
 | `failed` | Exhausted max attempts or terminal error (terminal) |
 | `cancelled` | Cancelled by handler or admin (terminal) |
-| `waiting_external` | Parked for webhook callback completion |
+| `waiting_external` | Parked for external callback completion or sequential resume |
 
 Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled).
 
@@ -233,6 +236,47 @@ Every running attempt carries a durable `run_lease` token that is incremented at
 
 Successful `Completed` outcomes are flushed through a small batched finalizer. The worker does not release local in-flight tracking or capacity until the batch flush acknowledges success or stale rejection, so shutdown drain and heartbeat semantics still match the correctness model. Locally, in-flight attempts are tracked in a sharded registry keyed by `(job_id, run_lease)` rather than a single global lock, which preserves the lease model while reducing executor/heartbeat contention.
 
+### External Callbacks and Sequential Waits
+
+External callback support has two related execution patterns:
+
+1. `JobResult::WaitForCallback` parks the job in `waiting_external` and releases the handler task.
+2. `ctx.wait_for_callback(token)` / `job.wait_for_callback(token)` parks the job in `waiting_external` but keeps the same handler task alive so it can resume in-process and continue with later steps.
+
+Sequential waits work like this:
+
+```text
+register_callback(callback_id)
+  -> wait_for_callback(callback_id)
+  -> state = waiting_external
+
+resume_external(callback_id, payload)
+  -> state = running
+  -> callback_id cleared
+  -> payload stored in metadata._awa_callback_result
+
+wait_for_callback(...)
+  -> consumes metadata._awa_callback_result
+  -> continues handler execution
+```
+
+Two details matter for correctness:
+
+- `wait_for_callback` is token-specific. It only waits on the callback ID it registered and rejects stale tokens once a new callback is registered.
+- `resume_external` is accepted while the job is still `running` as well as `waiting_external`, so an early callback can win the race before the handler finishes its transition into `waiting_external`.
+
+This is the behavior captured by the callback TLA+ model.
+
+### HTTP Callback Receiver
+
+`awa-ui` can expose callback receiver endpoints for `HttpWorker` and other external systems:
+
+- `POST /api/callbacks/:callback_id/complete`
+- `POST /api/callbacks/:callback_id/fail`
+- `POST /api/callbacks/:callback_id/heartbeat`
+
+When `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) is configured on `awa serve`, these endpoints require a valid `X-Awa-Signature` header derived from the callback ID using the shared 32-byte BLAKE3 key.
+
 ### Promotion (Scheduled → Available)
 
 Future-dated and retryable jobs live in `awa.scheduled_jobs` until their `run_at` time arrives. The maintenance leader promotes due jobs into the hot table in bounded batches, using partial due-time indexes so large deferred frontiers do not require scanning the execution table:
@@ -387,7 +431,7 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 - At claim time, `deadline_at = now() + deadline_duration` is set (default: 5 minutes).
 - The maintenance leader periodically scans for running jobs where `deadline_at < now()` and transitions them to `retryable`.
 - After rescue, the maintenance service signals cancellation to the in-flight handler via `ctx.is_cancelled()`, so long-running handlers can observe the deadline and exit gracefully.
-- **Catches:** Infinite loops, hung I/O, deadlocks, GIL-blocked Python handlers that prevent heartbeat updates.
+- **Catches:** Infinite loops, hung I/O, deadlocks, and other runaway handlers even when the worker process is still alive and heartbeating.
 
 ### Leader Election
 

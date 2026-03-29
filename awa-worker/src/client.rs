@@ -224,6 +224,22 @@ impl ClientBuilder {
         self
     }
 
+    /// Register an HTTP worker that dispatches jobs to a remote endpoint.
+    ///
+    /// In async mode the worker POSTs the job and parks in `waiting_external`.
+    /// In sync mode the worker awaits the HTTP response directly.
+    ///
+    /// Requires the `http-worker` feature.
+    #[cfg(feature = "http-worker")]
+    pub fn http_worker(
+        self,
+        kind: impl Into<String>,
+        config: crate::http_worker::HttpWorkerConfig,
+    ) -> Self {
+        let worker = crate::http_worker::HttpWorker::new(kind.into(), config);
+        self.register_worker(worker)
+    }
+
     /// Add shared state accessible via `ctx.extract::<T>()`.
     pub fn state<T: Any + Send + Sync + Clone>(mut self, value: T) -> Self {
         self.state.insert(TypeId::of::<T>(), Box::new(value));

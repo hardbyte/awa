@@ -63,9 +63,13 @@ async def handle(job):
 
 **Implementation:** `wait_for_callback(token)` is a new method on `JobContext` / `Job` that:
 1. Transitions the job to `waiting_external` (same as today's `WaitForCallback` return)
-2. Suspends the handler's async task (using a tokio `oneshot` channel)
-3. When `complete_external(callback_id, payload, resume=true)` fires, the executor receives the payload and sends it through the channel
-4. The handler resumes with the payload data
+2. Suspends the handler's async task and polls the job row until the callback resolves
+3. `resume_external(callback_id, payload)` transitions the job back to `running` and stores the payload in `metadata._awa_callback_result`
+4. The handler consumes that payload and resumes execution
+
+The wait is token-specific: the handler only waits on the exact callback ID it registered, and stale tokens are rejected once a newer callback is registered.
+
+`resume_external` also accepts the job while it is still `running` to handle the early-callback race where the external system responds before the handler finishes its transition into `waiting_external`.
 
 The job stays in `running` → `waiting_external` → `running` → `waiting_external` → ... → `completed` without being re-dispatched. The existing heartbeat keeps the job alive between waits. The run_lease stays valid throughout.
 
@@ -135,7 +139,7 @@ No schema changes — reuses existing `callback_timeout_at` column.
 ## Implementation Notes
 
 1. `heartbeat_callback` — new SQL function, admin endpoint, Python/Rust API method. No schema changes.
-2. `wait_for_callback` on JobContext/Job — suspends handler using tokio oneshot channel. Executor holds the receiver; `complete_external` with `resume=true` sends the payload through it.
+2. `wait_for_callback` on JobContext/Job — transitions to `waiting_external`, then polls the job row until `resume_external` stores the callback payload and returns the job to `running`.
 3. Update TLA+ models for the new `waiting_external → running` resume transition.
 4. CLI/UI: add visibility for "waiting for callback #N" in the job detail view.
 5. Documented example patterns in `/docs/callbacks.md`.
