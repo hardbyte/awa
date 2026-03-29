@@ -844,7 +844,7 @@ fn compute_fire_time(
     row: &CronJobRow,
     now: chrono::DateTime<Utc>,
 ) -> Option<chrono::DateTime<Utc>> {
-    let cron = match Cron::new(&row.cron_expr).parse() {
+    let cron = match Cron::new(&row.cron_expr).with_seconds_optional().parse() {
         Ok(c) => c,
         Err(err) => {
             error!(cron_name = %row.name, error = %err, "Invalid cron expression in database");

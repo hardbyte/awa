@@ -330,6 +330,54 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
+  # ─── Chaos smoke test ─────────────────────────────────────────
+  # Lightweight version of the nightly chaos suite — catches Python
+  # interop regressions (e.g., wrong client class) on every PR without
+  # the full benchmark/soak overhead.
+  chaos-smoke:
+    name: Chaos smoke (mixed Rust + Python)
+    needs: [rust-build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: awa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Create Python venv for mixed-fleet test
+        run: |
+          python -m venv awa-python/.venv
+          awa-python/.venv/bin/pip install --upgrade pip maturin
+      - name: Build Python extension
+        run: cd awa-python && .venv/bin/maturin develop
+      - name: Wait for Postgres
+        run: until pg_isready -h localhost -p 5432; do sleep 1; done
+      - name: Run mixed Rust + Python worker smoke test
+        run: |
+          export AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python"
+          cargo test --package awa --test chaos_suite_test \
+            test_mixed_rust_and_python_workers_share_same_queue \
+            -- --exact --ignored --nocapture
+        env:
+          DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
+
   # ─── Telemetry validation ─────────────────────────────────────
   telemetry-validation:
     name: Telemetry OTLP validation

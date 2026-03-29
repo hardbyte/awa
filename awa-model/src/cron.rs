@@ -66,6 +66,7 @@ impl PeriodicJob {
         after: Option<DateTime<Utc>>,
     ) -> Option<DateTime<Utc>> {
         let cron = Cron::new(&self.cron_expr)
+            .with_seconds_optional()
             .parse()
             .expect("cron_expr was validated at build time");
 
@@ -172,6 +173,7 @@ impl PeriodicJobBuilder {
     pub fn build_raw(self, kind: String, args: serde_json::Value) -> Result<PeriodicJob, AwaError> {
         // Validate cron expression
         Cron::new(&self.cron_expr)
+            .with_seconds_optional()
             .parse()
             .map_err(|err| AwaError::Validation(format!("invalid cron expression: {err}")))?;
 
@@ -285,7 +287,7 @@ pub fn next_fire_time_after(
     timezone: &str,
     after: DateTime<Utc>,
 ) -> Option<DateTime<Utc>> {
-    let cron = Cron::new(cron_expr).parse().ok()?;
+    let cron = Cron::new(cron_expr).with_seconds_optional().parse().ok()?;
     let tz: chrono_tz::Tz = timezone.parse().ok()?;
     let after_tz = after.with_timezone(&tz);
     let next = cron.iter_from(after_tz).next()?;
@@ -648,5 +650,84 @@ mod tests {
         let now = Utc::now();
         assert!(next_fire_time_after("not a cron", "UTC", now).is_none());
         assert!(next_fire_time_after("* * * * *", "Not/A/Zone", now).is_none());
+    }
+
+    // ── 6-field cron (seconds precision) ──────────────────────────
+
+    #[test]
+    fn test_six_field_cron_accepted_by_builder() {
+        let result = PeriodicJob::builder("test", "30 0 9 * * *")
+            .build_raw("test_job".to_string(), serde_json::json!({}));
+        assert!(result.is_ok(), "6-field cron should be accepted");
+    }
+
+    #[test]
+    fn test_six_field_cron_every_15_seconds() {
+        // "*/15 * * * * *" = every 15 seconds
+        let result = PeriodicJob::builder("fast", "*/15 * * * * *")
+            .build_raw("fast_job".to_string(), serde_json::json!({}));
+        assert!(result.is_ok(), "every-15-seconds cron should be accepted");
+    }
+
+    #[test]
+    fn test_six_field_next_fire_time() {
+        // "30 0 9 * * *" = daily at 09:00:30 UTC
+        let now = Utc.with_ymd_and_hms(2025, 6, 15, 8, 0, 0).unwrap();
+        let next = next_fire_time_after("30 0 9 * * *", "UTC", now);
+        assert_eq!(
+            next,
+            Some(
+                Utc.with_ymd_and_hms(2025, 6, 15, 9, 0, 0).unwrap() + chrono::Duration::seconds(30)
+            ),
+            "should fire at 09:00:30"
+        );
+    }
+
+    #[test]
+    fn test_six_field_every_15_seconds_next_fire() {
+        // "*/15 * * * * *" at 14:35:07 → next fire at 14:35:15
+        let now = Utc.with_ymd_and_hms(2025, 6, 15, 14, 35, 7).unwrap();
+        let next = next_fire_time_after("*/15 * * * * *", "UTC", now);
+        assert_eq!(
+            next,
+            Some(Utc.with_ymd_and_hms(2025, 6, 15, 14, 35, 15).unwrap()),
+            "should fire at next 15-second boundary"
+        );
+    }
+
+    #[test]
+    fn test_five_field_still_works() {
+        // Ensure 5-field expressions continue to work as before
+        let result = PeriodicJob::builder("classic", "0 9 * * *")
+            .build_raw("classic_job".to_string(), serde_json::json!({}));
+        assert!(result.is_ok(), "5-field cron should still be accepted");
+
+        let now = Utc.with_ymd_and_hms(2025, 6, 15, 8, 0, 0).unwrap();
+        let next = next_fire_time_after("0 9 * * *", "UTC", now);
+        assert_eq!(
+            next,
+            Some(Utc.with_ymd_and_hms(2025, 6, 15, 9, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn test_six_field_latest_fire_time() {
+        // Verify latest_fire_time also handles 6-field
+        let job = PeriodicJob::builder("sec_job", "0 */5 * * * *")
+            .build_raw("sec_job".to_string(), serde_json::json!({}))
+            .unwrap();
+
+        let now = Utc.with_ymd_and_hms(2025, 6, 15, 12, 7, 0).unwrap();
+        let latest = job.latest_fire_time(now, None);
+        assert!(
+            latest.is_some(),
+            "6-field cron should produce a latest fire time"
+        );
+        // "0 */5 * * * *" = at second 0 of every 5th minute
+        // At 12:07:00, latest fire was 12:05:00
+        assert_eq!(
+            latest.unwrap(),
+            Utc.with_ymd_and_hms(2025, 6, 15, 12, 5, 0).unwrap()
+        );
     }
 }
