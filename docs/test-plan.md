@@ -1,7 +1,5 @@
 # AWA — Validation Test Plan
 
-Run after Phase 2 (Rust core + Python client complete). Pass all = ship.
-
 Tests run against real Postgres 15+ (not managed services). Dedicated test database.
 All tests are automated and run in CI.
 
@@ -9,175 +7,207 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 
 ## Test Matrix
 
-| # | Test | Category | Status |
-|---|---|---|---|
-| T1 | No duplicate processing (100k jobs) | Correctness | Implemented |
-| T4 | `kill -9` crash recovery | Crash recovery | Implemented |
-| T5 | Deadline rescue (hung job) | Crash recovery | Implemented |
-| T6 | Transactional atomicity (Rust) | Correctness | Implemented |
-| T7 | Transactional atomicity (Python) | Correctness | Implemented |
-| T8 | Uniqueness under contention | Correctness | Implemented |
-| T9 | Hash cross-language consistency | Correctness | Implemented |
-| T10 | Priority ordering | Correctness | Implemented |
-| T12 | Queue isolation | Isolation | Implemented |
-| T13 | Queue pause/resume | Admin | Implemented |
-| T18 | Backoff timing | Correctness | Implemented |
-| T19 | Snooze semantics | Correctness | Implemented |
-| T20 | Terminal error semantics | Correctness | Implemented |
-| T21 | Deserialization failure | Correctness | Implemented |
-| T22 | Pool exhaustion resilience | Resilience | Implemented |
-| T26 | Migration idempotency | Migration | Implemented |
-| T27 | Admin ops under load | Admin | Implemented |
-| T28 | Tracing spans emitted on job execution | Observability | Implemented |
-| T29 | OTel metrics emitted (completed, duration, in_flight) | Observability | Implemented |
-| T30 | OTel failure metrics emitted | Observability | Implemented |
-| T31 | Throughput >= 3,000 jobs/sec (Rust workers, debug build) | Benchmark | Implemented |
-| T32 | Pickup latency p50 < 50ms (LISTEN/NOTIFY) | Benchmark | Implemented |
-| T33 | Insert throughput >= 10,000 inserts/sec | Benchmark | Implemented |
-| T34 | V2 migration creates `awa.cron_jobs` table | Migration | Implemented |
-| T35 | UPSERT sync: inserts new, updates changed, does NOT delete others | Cron | Implemented |
-| T36 | Atomic CTE: mark + insert succeeds, returns job row | Cron | Implemented |
-| T37 | Atomic CTE: second call returns 0 rows (dedup) | Cron | Implemented |
-| T38 | Multi-deployment: disjoint schedules coexist (no orphan deletion) | Cron | Implemented |
-| T39 | No backfill: only latest missed fire enqueued | Cron | Implemented |
-| T40 | End-to-end: register periodic + start → job appears with cron metadata | Cron | Implemented |
-| T41 | Tags and metadata propagate from schedule to enqueued job | Cron | Implemented |
-| T42 | Cron expression validation at build time | Cron (unit) | Implemented |
-| T43 | Timezone validation at build time | Cron (unit) | Implemented |
-| T44 | DST spring-forward: at most one fire | Cron (unit) | Implemented |
-| T45 | DST fall-back: exactly one fire | Cron (unit) | Implemented |
-| T46 | First registration (NULL last_enqueued_at): enqueues most recent past fire | Cron (unit) | Implemented |
-| T47 | COPY: empty input returns empty vec | COPY | Implemented |
-| T48 | COPY: single job matches single insert | COPY | Implemented |
-| T49 | COPY: 1000 jobs all inserted with correct kind/queue/state | COPY | Implemented |
-| T50 | COPY: args with special chars (JSON quotes, newlines, commas, tabs, backslashes, unicode) round-trip | COPY | Implemented |
-| T51 | COPY: tags with pathological values (commas, quotes, braces, backslashes, whitespace, NULL, empty) round-trip | COPY | Implemented |
-| T52 | COPY: unique constraint handled via DO NOTHING | COPY | Implemented |
-| T53 | COPY: mixed run_at (NULL=available, future=scheduled) | COPY | Implemented |
-| T54 | COPY: metadata with special chars round-trips | COPY | Implemented |
-| T55 | COPY: atomic (transaction rollback discards all) | COPY | Implemented |
-| T56 | COPY: within caller-managed transaction | COPY | Implemented |
-| T57 | COPY benchmark: 10K jobs vs chunked INSERT | COPY (bench) | Implemented |
-| T57a | COPY: multiple calls within one caller-managed transaction reuse staging safely | COPY | Implemented |
-| T58 | Python: insert_sync returns Job directly | Sync | Implemented |
-| T59 | Python: migrate_sync idempotent | Sync | Implemented |
-| T60 | Python: cancel_sync / retry_sync | Sync | Implemented |
-| T61 | Python: retry_failed_sync | Sync | Implemented |
-| T62 | Python: discard_failed_sync | Sync | Implemented |
-| T63 | Python: pause/resume/drain_queue_sync | Sync | Implemented |
-| T64 | Python: list_jobs_sync with filters | Sync | Implemented |
-| T65 | Python: queue_stats_sync | Sync | Implemented |
-| T66 | Python: health_check_sync | Sync | Implemented |
-| T67 | Python: transaction_sync context manager commit | Sync | Implemented |
-| T68 | Python: transaction_sync context manager rollback on exception | Sync | Implemented |
-| T69 | Python: sync methods work from non-async context | Sync | Implemented |
-| T70 | Python: insert_many_copy_sync | Sync | Implemented |
-| T71 | Mixed Rust/Python workers share the same queue correctly | Cross-language resilience | Implemented |
-| T72 | Runtime recovers after terminating Postgres worker backends | Resilience | Implemented |
-| T73 | Sustained mixed workload survives Python node death and Rust node reconnect under load | Resilience | Implemented |
-| T74 | Hot-standby promotion via stable endpoint: reconnect, insert, and scheduled promotion still work after cutover | HA failover | Implemented |
-| B1 | Late completion after rescue is no-op (state guard) | Bug fix | Implemented |
-| B2 | Late completion after cancel is no-op (state guard) | Bug fix | Implemented |
-| B3 | Shutdown waits for in-flight jobs | Bug fix | Implemented |
-| B4 | Heartbeat alive during shutdown drain | Bug fix | Implemented |
-| B5 | Deadline rescue signals ctx.is_cancelled() | Bug fix | Implemented |
-| B6 | UniqueConflict.constraint field has constraint name | Bug fix | Implemented |
-| RL1 | No rate limit — fast dispatch | Rate limit | Implemented |
-| RL2 | Rate limit throttles dispatch (10/sec, 30 jobs) | Rate limit | Implemented |
-| RL3 | Burst 20, rate 5/sec — burst then throttle | Rate limit | Implemented |
-| RL4 | Rate limit + low max_workers — concurrency is bottleneck | Rate limit | Implemented |
-| RL5 | Invalid rate limit (max_rate <= 0) rejected | Rate limit | Implemented |
-| RL6 | Zero weight rejected | Rate limit | Implemented |
-| W5 | Hard-reserved backward compat | Weighted | Implemented |
-| W6 | Idle overflow to loaded queue | Weighted | Implemented |
-| W7 | Floor guarantee under load (min_workers) | Weighted | Implemented |
-| W8 | Global cap not exceeded (global_max_workers) | Weighted | Implemented |
-| W9 | min_workers sum > global rejected (BuildError) | Weighted | Implemented |
-| W10 | Weight proportionality (3:1 ratio) | Weighted | Implemented |
-| W11 | Permit-before-claim — no orphan running jobs | Weighted | Implemented |
-| W12 | Health check reports weighted capacity | Weighted | Implemented |
-| W13 | Health check reports hard-reserved capacity | Weighted | Implemented |
-| P12 | Python: Dict config with rate_limit starts | Python config | Implemented |
-| P13 | Python: global_max_workers weighted mode | Python config | Implemented |
-| P14 | Python: Backward compat tuple form | Python config | Implemented |
-| P15 | Python: tuple + global_max_workers raises | Python config | Implemented |
-| P16 | Python: both max_workers and min_workers raises | Python config | Implemented |
-| PR1 | set_progress + flush → percent persisted | Progress | Implemented |
-| PR2 | update_metadata shallow-merge | Progress | Implemented |
-| PR3 | Multiple set_progress → only last value | Progress | Implemented |
-| PR4 | flush_progress immediate DB write (verified inside handler) | Progress | Implemented |
-| PR5 | Progress survives rescue (stale heartbeat) | Progress | Implemented |
-| PR6 | Completed job → progress = NULL | Progress | Implemented |
-| PR7 | RetryAfter → next attempt sees previous progress | Progress | Implemented |
-| PR8 | No progress set → no overhead | Progress | Implemented |
-| PR9 | set_progress(101) → clamped to 100 (verified via DB) | Progress | Implemented |
-| PR10 | WaitForCallback preserves progress | Progress | Implemented |
-| PR11 | complete_external clears progress | Progress | Implemented |
-| PR12 | fail_external preserves progress | Progress | Implemented |
-| PR13 | Callback timeout rescue preserves progress | Progress | Implemented |
-| PR14 | Terminal failure preserves progress | Progress | Implemented |
-| PR15 | Cancel preserves progress | Progress | Implemented |
-| PR16 | Full lifecycle (real Client): complete clears, retry preserves checkpoint | Progress | Implemented |
-| PP1 | Python: set_progress from handler persists after flush | Progress (Py) | Implemented |
-| PP2 | Python: update_metadata shallow-merges into progress.metadata | Progress (Py) | Implemented |
-| PP3 | Python: flush_progress immediate DB write | Progress (Py) | Implemented |
-| PP4 | Python: job.progress property returns dict during execution | Progress (Py) | Implemented |
-| PP5 | Python: progress persists across retry (checkpoint) | Progress (Py) | Implemented |
-| OT1 | OTLP export: awa.job.completed reaches collector | Telemetry (E2E) | Implemented |
-| OT2 | OTLP export: awa.job.claimed reaches collector | Telemetry (E2E) | Implemented |
-| OT3 | OTLP export: awa.dispatch.claim_batches reaches collector | Telemetry (E2E) | Implemented |
-| OT4 | OTLP export: awa.job.duration histogram reaches collector | Telemetry (E2E) | Implemented |
-| CL1 | Concurrent multi-queue lifecycle: 4 queues, concurrent producers + consumers | Lifecycle bench | Implemented |
-| CL2 | Multi-queue drain: 4 queues pre-seeded, measure pure consumption throughput | Lifecycle bench | Implemented |
-| SP1 | Scheduled promotion 10M rows: literal-state query uses partial index | Promotion perf | Implemented |
-| SP2 | Scheduled promotion 2M/4k: all 40k due jobs promoted and completed | Promotion perf | Implemented |
-| FB1 | Failure-mode benchmark: terminal 1/10/50% throughput | Failure bench | Implemented |
-| FB2 | Failure-mode benchmark: retryable 1/10/50% throughput | Failure bench | Implemented |
-| FB3 | Failure-mode benchmark: callback timeout 10% with rescue | Failure bench | Implemented |
-| FB4 | Failure-mode benchmark: deadline hang 10% with rescue | Failure bench | Implemented |
-| FB5 | Failure-mode benchmark: snooze once 10% | Failure bench | Implemented |
-| FB6 | Failure-mode benchmark: mixed all modes | Failure bench | Implemented |
-| FB7 | Stale-heartbeat rescue benchmark (orphaned running jobs) | Failure bench | Implemented |
-| FB8 | Python failure benchmark: terminal/retryable/callback/mixed | Failure bench | Implemented |
-| TLA1 | TLA+ AwaCore: lease-guarded finalization, stale completion rejected | Formal model | Implemented |
-| TLA2 | TLA+ AwaExtended: shutdown/rescue/permit/fairness protocol | Formal model | Implemented |
-| TLA3 | TLA+ AwaCbk: at-most-once callback resolution under three-way race + sequential resume | Formal model | Implemented |
-| TLA4 | TLA+ AwaCron: no duplicate fire under leader failover | Formal model | Implemented |
-| TLA5 | TLA+ AwaBatcher: at-most-once completion through batcher+fallback path | Formal model | Implemented |
-| SC1 | wait_for_callback: handler suspends, resume_external wakes with payload | Sequential callbacks | Implemented |
-| SC2 | Two sequential callbacks via admin API: resume cb1 → register cb2 → complete cb2 | Sequential callbacks | Implemented |
-| SC3 | Timeout during second callback wait → retryable | Sequential callbacks | Implemented |
-| SC4 | Heartbeat extends timeout during sequential wait | Sequential callbacks | Implemented |
-| SC5 | Concurrent resume attempts: exactly one succeeds | Sequential callbacks | Implemented |
-| SC6 | Resume with wrong run_lease rejected | Sequential callbacks | Implemented |
-| SC7 | Crash/rescue after resume: heartbeat rescue catches stale running job | Sequential callbacks | Implemented |
-| SC8 | Admin cancel after resume: job cancelled in running state | Sequential callbacks | Implemented |
-| SC9 | Resume preserves existing metadata fields | Sequential callbacks | Implemented |
-| SC10 | fail_external on second callback after resume | Sequential callbacks | Implemented |
-| SC11 | resolve_callback on second callback after resume | Sequential callbacks | Implemented |
-| SC12 | retry_external on second callback resets job | Sequential callbacks | Implemented |
-| SC13 | Python: resume_external transitions to running with payload | Sequential callbacks (Py) | Implemented |
-| PE1 | Python: callback timeout rescue → retryable (remaining attempts) | Callback edge cases (Py) | Implemented |
-| PE2 | Python: callback timeout rescue → failed (max attempts exhausted) | Callback edge cases (Py) | Implemented |
-| PE3 | Python: double complete_external → CallbackNotFound | Callback edge cases (Py) | Implemented |
-| PE4 | Python: admin cancel while waiting_external → cancelled | Callback edge cases (Py) | Implemented |
-| PE5 | Python: admin retry while waiting_external → available | Callback edge cases (Py) | Implemented |
-| PE6 | Python: drain_queue cancels waiting_external jobs | Callback edge cases (Py) | Implemented |
-| PE7 | Python: complete_external during running state (early callback race) | Callback edge cases (Py) | Implemented |
-| PE8 | Python: stale callback rejected after rescue and re-claim | Callback edge cases (Py) | Implemented |
-| PE9 | Python: callback timeout rescued end-to-end by live runtime | Callback edge cases (Py) | Implemented |
-| SC14 | Python: wait_for_callback happy path — handler suspends and resumes | Sequential callbacks (Py) | Implemented |
-| SC15 | Python: two sequential wait_for_callback cycles in single handler | Sequential callbacks (Py) | Implemented |
-| SC16 | Python: heartbeat during wait extends timeout | Sequential callbacks (Py) | Implemented |
-| SC17 | Python: double resume fails with CallbackNotFound | Sequential callbacks (Py) | Implemented |
-| BR1 | tokio-postgres bridge: commit/rollback atomicity | Bridge | Implemented |
-| BR2 | tokio-postgres bridge: lease guard prevents stale completion | Bridge | Implemented |
-| BR3 | tokio-postgres bridge: unique conflict mapping | Bridge | Implemented |
-| BR4 | Python bridge: asyncpg/psycopg/SQLAlchemy/Django insert | Bridge | Implemented |
-| RO1 | Read-only serve: capabilities endpoint reports read_only | UI (admin) | Implemented |
-| RO2 | Read-only serve: mutation endpoints return 503 | UI (admin) | Implemented |
-| RO3 | Read-only serve: frontend disables admin buttons | UI (admin) | Implemented |
-| HA1 | Postgres failover smoke: primary→replica cutover, insert + promote | HA failover | Implemented |
+**Rust** = Rust integration test, **Py** = Python test, **TLA+** = TLC model check, **Both** = cross-language.
+
+### Correctness & Crash Recovery
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| T1 | No duplicate processing (100k jobs) | ✓ | |
+| T4 | `kill -9` crash recovery | ✓ | |
+| T5 | Deadline rescue (hung job) | ✓ | |
+| T6 | Transactional atomicity | ✓ | |
+| T7 | Transactional atomicity (Python) | | ✓ |
+| T8 | Uniqueness under contention | ✓ | ✓ |
+| T9 | Hash cross-language consistency | ✓ | |
+| T10 | Priority ordering | ✓ | |
+| T12 | Queue isolation | ✓ | |
+| T18 | Backoff timing | ✓ | |
+| T19 | Snooze semantics | ✓ | |
+| T20 | Terminal error semantics | ✓ | |
+| T21 | Deserialization failure | ✓ | |
+| B1 | Late completion after rescue is no-op | ✓ | |
+| B2 | Late completion after cancel is no-op | ✓ | |
+| B3 | Shutdown waits for in-flight jobs | ✓ | |
+| B4 | Heartbeat alive during shutdown drain | ✓ | |
+| B5 | Deadline rescue signals ctx.is_cancelled() | ✓ | |
+| B6 | UniqueConflict.constraint field | ✓ | |
+
+### Uniqueness (Python)
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| T8 | Uniqueness under contention (10 concurrent producers) | ✓ | |
+| PU1 | Unique insert happy path | | ✓ |
+| PU2 | Duplicate rejected (UniqueConflict) | | ✓ |
+| PU3 | by_queue: different queues allowed | | ✓ |
+| PU4 | by_queue: same queue rejected | | ✓ |
+| PU5 | by_args: different args allowed | | ✓ |
+| PU6 | by_period: same bucket rejected | | ✓ |
+| PU7 | by_period: different bucket allowed | | ✓ |
+| PU8 | Unicode args hash consistently | | ✓ |
+| PU9 | Nested dict args hash consistently | | ✓ |
+| PU10 | Empty args hash consistently | | ✓ |
+| PU11 | Large args (~100KB) hash consistently | | ✓ |
+| PU12 | No unique_opts allows duplicates | | ✓ |
+| PU13 | Sync insert with unique_opts | | ✓ |
+
+### Admin & Resilience
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| T13 | Queue pause/resume | ✓ | |
+| T22 | Pool exhaustion resilience | ✓ | |
+| T26 | Migration idempotency | ✓ | |
+| T27 | Admin ops under load | ✓ | |
+| T72 | Runtime recovers after terminating Postgres backends | ✓ | |
+| T71 | Mixed Rust/Python workers share queue | Both | Both |
+| T73 | Sustained mixed workload survives node failure | Both | Both |
+| T74 | Hot-standby promotion | ✓ | |
+| HA1 | Postgres failover smoke | ✓ | |
+
+### External Callbacks
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| E1 | register_callback + WaitForCallback → waiting_external | ✓ | ✓ |
+| E2 | complete_external → completed | ✓ | ✓ |
+| E3 | fail_external → failed | ✓ | ✓ |
+| E4 | retry_external → available | ✓ | ✓ |
+| E5/PE1-2 | Callback timeout rescue (retryable + failed) | ✓ | ✓ |
+| E6/PE3 | Double completion → CallbackNotFound | ✓ | ✓ |
+| E7 | Wrong callback_id → CallbackNotFound | ✓ | ✓ |
+| E8/PE4 | Admin cancel while waiting_external | ✓ | ✓ |
+| E9/PE5 | Admin retry while waiting_external | ✓ | ✓ |
+| E10/PE6 | drain_queue includes waiting_external | ✓ | ✓ |
+| E11/PE7 | Race: complete during running (before WaitForCallback) | ✓ | ✓ |
+| E12 | Crash clears stale callback | ✓ | |
+| E13 | Uniqueness during waiting_external | ✓ | |
+| E15 | resolve_callback accepts running state | ✓ | |
+| E16/PE8 | Stale callback rejected after rescue | ✓ | ✓ |
+| E17 | cancel_callback clears fields | ✓ | |
+| E18 | cancel_callback wrong lease is noop | ✓ | |
+| PE9 | Callback timeout rescued end-to-end by live runtime | | ✓ |
+
+### CEL Callback Expressions
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| C1-C2 | resolve_callback default actions (complete/ignore) | ✓ | ✓ |
+| C3-C4 | Filter expressions (pass/fail) | ✓ | |
+| C5-C6 | on_fail takes precedence over on_complete | ✓ | |
+| C7 | Transform payload | ✓ | |
+| C8-C9 | Invalid CEL fail-open | ✓ | |
+| C10 | Fallthrough to default action | ✓ | |
+| C11 | Invalid CEL at registration → validation error | ✓ | |
+| C12 | Double resolve → CallbackNotFound | ✓ | |
+| C14-C15 | Deeply nested / missing field (fail-open) | ✓ | |
+| C16 | resolve_callback accepts running state | ✓ | |
+| C17 | Concurrent resolve (FOR UPDATE prevents race) | ✓ | |
+| C18-C19 | CEL disabled: registration + resolution errors | ✓ | |
+
+### Sequential Callbacks
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| SC1 | wait_for_callback: suspend + resume | ✓ | ✓ (SC14) |
+| SC2 | Two sequential callbacks via admin API | ✓ | ✓ (SC15) |
+| SC3 | Timeout during second callback → retryable | ✓ | |
+| SC4/SC16 | Heartbeat extends timeout during wait | ✓ | ✓ |
+| SC5 | Concurrent resume: exactly one succeeds | ✓ | |
+| SC6 | Resume with wrong run_lease rejected | ✓ | |
+| SC7 | Crash/rescue after resume | ✓ | |
+| SC8 | Admin cancel after resume | ✓ | |
+| SC9 | Resume preserves metadata | ✓ | ✓ |
+| SC10-SC12 | fail/resolve/retry on second callback | ✓ | |
+| SC13 | resume_external transitions to running with payload | | ✓ |
+| SC17 | Double resume fails with CallbackNotFound | | ✓ |
+
+### HTTP Worker
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| HW1 | Sync mode 200 → completed | ✓ | — |
+| HW2 | Sync mode 500 → retryable | ✓ | — |
+| HW3 | Sync mode 400 → terminal fail | ✓ | — |
+| HW4 | Async mode 202 → callback complete | ✓ | — |
+| HW5 | Async mode 503 → retryable | ✓ | — |
+| HW6 | Async unreachable → retryable | ✓ | — |
+| HW7 | Custom headers | ✓ | — |
+| HW8 | HMAC signature | ✓ | — |
+| HW9 | Callback URL construction | ✓ | — |
+
+*HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not exposed to Python.*
+
+### Python SDK
+
+| # | Test | Py |
+|---|------|----|
+| T58-T70 | Sync API variants (insert, cancel, retry, drain, list, etc.) | ✓ |
+| P12-P16 | start() config validation (dict, tuple, weighted, errors) | ✓ |
+| P17 | start() accepts all maintenance interval kwargs | ✓ |
+| PP1-PP5 | Progress tracking (set, merge, flush, checkpoint) | ✓ |
+| BR4 | Bridge: asyncpg/psycopg/SQLAlchemy/Django insert | ✓ |
+
+### Cron / Periodic Jobs
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| T34-T46 | Cron: migration, upsert, atomic CTE, dedup, backfill, DST | ✓ | |
+| T40-T41 | End-to-end periodic + metadata propagation | ✓ | |
+
+### COPY Batch Ingestion
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| T47-T57a | COPY: empty, single, 1000, special chars, tags, unique, atomic | ✓ | ✓ |
+
+### Rate Limiting & Weighted Concurrency
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| RL1-RL6 | Rate limit: fast, throttle, burst, bottleneck, invalid | ✓ | |
+| W5-W13 | Weighted: backward compat, overflow, floor, cap, proportionality | ✓ | |
+
+### Observability
+
+| # | Test | Rust |
+|---|------|------|
+| T28-T30 | Tracing spans + OTel metrics | ✓ |
+| OT1-OT4 | OTLP export end-to-end | ✓ |
+
+### Bridge Adapters
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| BR1-BR3 | tokio-postgres bridge: atomicity, lease guard, unique conflict | ✓ | |
+| BR4 | Python bridge: asyncpg/psycopg/SQLAlchemy/Django | | ✓ |
+
+### UI (Admin)
+
+| # | Test | Rust |
+|---|------|------|
+| RO1-RO3 | Read-only serve: capabilities, mutations blocked, UI disables | ✓ |
+
+### Benchmarks
+
+| # | Test | Rust | Py |
+|---|------|------|----|
+| T31-T33 | Throughput + latency + insert speed | ✓ | |
+| CL1-CL2 | Concurrent multi-queue lifecycle | ✓ | |
+| SP1-SP2 | Scheduled promotion at scale | ✓ | |
+| FB1-FB7 | Failure modes: terminal, retryable, callback, deadline, mixed | ✓ | |
+| FB8 | Failure modes (Python) | | ✓ |
+
+### Formal Models (TLA+)
+
+| # | Model | Invariants |
+|---|-------|------------|
+| TLA1 | AwaCore | Lease-guarded finalization, stale completion rejected |
+| TLA2 | AwaExtended | Shutdown/rescue/permit/fairness protocol |
+| TLA3 | AwaCbk | At-most-once callback resolution, sequential resume |
+| TLA4 | AwaCron | No duplicate fire under leader failover |
+| TLA5 | AwaBatcher | At-most-once completion, DirectCompleteFail recovery |
 
 ## Running Tests
 

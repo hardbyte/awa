@@ -1,7 +1,9 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
 use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error};
 use crate::job::{py_to_json, PyJob};
-use crate::transaction::{insert_raw_job, parse_run_at, PySyncTransaction, PyTransaction};
+use crate::transaction::{
+    insert_raw_job, parse_run_at, parse_unique_opts, PySyncTransaction, PyTransaction,
+};
 use crate::worker::PythonWorker;
 use awa_model::admin::ListJobsFilter;
 use awa_model::{InsertOpts, InsertParams, JobState, PeriodicJob};
@@ -280,7 +282,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
@@ -293,11 +295,12 @@ impl PyClient {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (kind_str, args_json, metadata_json, run_at) = Python::attach(|py| {
+            let (kind_str, args_json, metadata_json, run_at, unique) = Python::attach(|py| {
                 let args_bound = args.bind(py);
                 let kind_str = match kind {
                     Some(k) => k,
@@ -315,11 +318,16 @@ impl PyClient {
                     .as_ref()
                     .map(|value| parse_run_at(py, value.bind(py)))
                     .transpose()?;
+                let unique = unique_opts
+                    .as_ref()
+                    .map(|value| parse_unique_opts(py, value.bind(py)))
+                    .transpose()?;
                 Ok::<_, PyErr>((
                     kind_str,
                     serialize_args(py, args_bound)?,
                     metadata_json,
                     run_at,
+                    unique,
                 ))
             })?;
 
@@ -334,6 +342,7 @@ impl PyClient {
                     run_at,
                     metadata: metadata_json,
                     tags,
+                    unique,
                     ..Default::default()
                 },
             )
@@ -1184,7 +1193,7 @@ impl PyClient {
 
     // ── Sync counterparts ───────────────────────────────────────────
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_sync(
         &self,
@@ -1197,6 +1206,7 @@ impl PyClient {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let pool = self.pool.clone();
         let args_bound = args.bind(py);
@@ -1217,6 +1227,10 @@ impl PyClient {
             .map(|value| parse_run_at(py, value.bind(py)))
             .transpose()?;
         let args_json = serialize_args(py, args_bound)?;
+        let unique = unique_opts
+            .as_ref()
+            .map(|value| parse_unique_opts(py, value.bind(py)))
+            .transpose()?;
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -1231,6 +1245,7 @@ impl PyClient {
                         run_at: run_at_dt,
                         metadata: metadata_json,
                         tags,
+                        unique,
                         ..Default::default()
                     },
                 )

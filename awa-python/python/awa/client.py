@@ -64,6 +64,7 @@ class AsyncClient:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
         return await self._raw.insert(
@@ -75,6 +76,7 @@ class AsyncClient:
             tags=tags if tags is not None else [],
             metadata=metadata,
             run_at=run_at,
+            unique_opts=unique_opts,
         )
 
     async def insert_many_copy(
@@ -354,6 +356,7 @@ class Client:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
         return self._raw.insert_sync(
@@ -365,6 +368,7 @@ class Client:
             tags=tags if tags is not None else [],
             metadata=metadata,
             run_at=run_at,
+            unique_opts=unique_opts,
         )
 
     def insert_many_copy(

@@ -169,6 +169,7 @@ class Transaction:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def insert_many(
         self,
@@ -208,6 +209,7 @@ class SyncTransaction:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     def insert_many(
         self,
@@ -247,6 +249,7 @@ class Client:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def migrate(self) -> None: ...
     async def transaction(self) -> Transaction: ...
@@ -371,6 +374,7 @@ class Client:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     def migrate_sync(self) -> None: ...
     def transaction_sync(self) -> SyncTransaction: ...
