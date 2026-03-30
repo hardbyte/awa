@@ -311,3 +311,79 @@ def test_unique_insert_sync():
             queue="uniq_sync",
             unique_opts={"by_args": True},
         )
+
+
+# ── Transactional unique insert ──────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_unique_insert_in_transaction(client):
+    """Unique insert within a transaction works."""
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_tx'")
+
+    job = await tx.insert(
+        SendEmail(to="tx@example.com", subject="Tx"),
+        queue="uniq_tx",
+        unique_opts={"by_args": True},
+    )
+    assert job.id > 0
+    await tx.commit()
+
+    # Outside the transaction, duplicate should be rejected
+    with pytest.raises(awa.UniqueConflict):
+        await client.insert(
+            SendEmail(to="tx@example.com", subject="Tx"),
+            queue="uniq_tx",
+            unique_opts={"by_args": True},
+        )
+
+
+@pytest.mark.asyncio
+async def test_unique_insert_transaction_rollback(client):
+    """Unique insert in a rolled-back transaction doesn't block future inserts."""
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_tx_rb'")
+    await tx.commit()
+
+    # Insert inside a transaction that will be rolled back
+    tx = await client.transaction()
+    await tx.insert(
+        SendEmail(to="rollback@example.com", subject="Rollback"),
+        queue="uniq_tx_rb",
+        unique_opts={"by_args": True},
+    )
+    await tx.rollback()
+
+    # After rollback, the same unique key should be available
+    job = await client.insert(
+        SendEmail(to="rollback@example.com", subject="Rollback"),
+        queue="uniq_tx_rb",
+        unique_opts={"by_args": True},
+    )
+    assert job.id > 0
+
+
+def test_unique_insert_in_sync_transaction():
+    """Sync transactional unique insert works."""
+    c = awa.Client(DATABASE_URL)
+    c.migrate()
+    tx = c.transaction()
+    tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_stx'")
+    tx.commit()
+
+    tx = c.transaction()
+    job = tx.insert(
+        SendEmail(to="stx@example.com", subject="SyncTx"),
+        queue="uniq_stx",
+        unique_opts={"by_args": True},
+    )
+    assert job.id > 0
+    tx.commit()
+
+    with pytest.raises(awa.UniqueConflict):
+        c.insert(
+            SendEmail(to="stx@example.com", subject="SyncTx"),
+            queue="uniq_stx",
+            unique_opts={"by_args": True},
+        )

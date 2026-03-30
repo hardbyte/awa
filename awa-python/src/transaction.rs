@@ -120,7 +120,7 @@ impl PyTransaction {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
@@ -133,10 +133,17 @@ impl PyTransaction {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         let prepared = Python::attach(|py| {
             prepare_insert(py, args.bind(py), kind, metadata.as_ref(), run_at.as_ref())
+        })?;
+        let unique = Python::attach(|py| {
+            unique_opts
+                .as_ref()
+                .map(|value| parse_unique_opts(py, value.bind(py)))
+                .transpose()
         })?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -153,6 +160,7 @@ impl PyTransaction {
                     run_at: prepared.run_at,
                     metadata: prepared.metadata_json,
                     tags,
+                    unique,
                     ..Default::default()
                 },
             )
@@ -576,7 +584,7 @@ impl PySyncTransaction {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &self,
@@ -589,8 +597,13 @@ impl PySyncTransaction {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let prepared = prepare_insert(py, args.bind(py), kind, metadata.as_ref(), run_at.as_ref())?;
+        let unique = unique_opts
+            .as_ref()
+            .map(|value| parse_unique_opts(py, value.bind(py)))
+            .transpose()?;
         let tx = self.tx.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -607,6 +620,7 @@ impl PySyncTransaction {
                         run_at: prepared.run_at,
                         metadata: prepared.metadata_json,
                         tags,
+                        unique,
                         ..Default::default()
                     },
                 )
