@@ -41,8 +41,12 @@ async fn setup() -> TestClient {
     setup_with_connections(2).await
 }
 
-/// Clean only jobs and queue_meta for a specific queue.
+/// Clean only jobs, queue_meta, and admin caches for a specific queue.
 /// Call this at the start of each test to remove leftovers from previous runs.
+/// Explicitly deletes the queue_state_counts row to prevent accumulated cache
+/// drift from affecting assertions (the DELETE trigger should handle this, but
+/// concurrent test runs against a shared DB can cause small delta errors that
+/// compound over time).
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
     sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
         .bind(queue)
@@ -54,6 +58,11 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue meta");
+    sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = $1")
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to clean queue state counts");
 }
 
 async fn wait_for_runtime_snapshot(
