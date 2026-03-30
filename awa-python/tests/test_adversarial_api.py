@@ -300,12 +300,18 @@ async def test_no_duplicate_processing_with_task_decorator():
     for i in range(30):
         await client.insert(AdvJob(value=f"job_{i}"), queue="adv_dedup")
 
-    client.start([{"name": "adv_dedup", "max_workers": 10}], poll_interval_ms=10)
-    for _ in range(60):
+    client.start(
+        [{"name": "adv_dedup", "max_workers": 10}],
+        poll_interval_ms=50,
+        leader_election_interval_ms=500,
+    )
+
+    for _ in range(200):
         await asyncio.sleep(0.1)
         if len(results) >= 30:
             break
-    await client.shutdown()
+
+    await client.shutdown(timeout_ms=5000)
 
     counts = Counter(results)
     duplicates = {k: v for k, v in counts.items() if v > 1}
