@@ -157,6 +157,15 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | SC11 | resolve_callback on second callback after resume | Sequential callbacks | Implemented |
 | SC12 | retry_external on second callback resets job | Sequential callbacks | Implemented |
 | SC13 | Python: resume_external transitions to running with payload | Sequential callbacks (Py) | Implemented |
+| PE1 | Python: callback timeout rescue → retryable (remaining attempts) | Callback edge cases (Py) | Implemented |
+| PE2 | Python: callback timeout rescue → failed (max attempts exhausted) | Callback edge cases (Py) | Implemented |
+| PE3 | Python: double complete_external → CallbackNotFound | Callback edge cases (Py) | Implemented |
+| PE4 | Python: admin cancel while waiting_external → cancelled | Callback edge cases (Py) | Implemented |
+| PE5 | Python: admin retry while waiting_external → available | Callback edge cases (Py) | Implemented |
+| PE6 | Python: drain_queue cancels waiting_external jobs | Callback edge cases (Py) | Implemented |
+| PE7 | Python: complete_external during running state (early callback race) | Callback edge cases (Py) | Implemented |
+| PE8 | Python: stale callback rejected after rescue and re-claim | Callback edge cases (Py) | Implemented |
+| PE9 | Python: callback timeout rescued end-to-end by live runtime | Callback edge cases (Py) | Implemented |
 | SC14 | Python: wait_for_callback happy path — handler suspends and resumes | Sequential callbacks (Py) | Implemented |
 | SC15 | Python: two sequential wait_for_callback cycles in single handler | Sequential callbacks (Py) | Implemented |
 | SC16 | Python: heartbeat during wait extends timeout | Sequential callbacks (Py) | Implemented |
