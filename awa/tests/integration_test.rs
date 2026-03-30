@@ -334,6 +334,9 @@ async fn test_insert_many_updates_admin_metadata_for_direct_paths() {
     ];
     insert_many(client.pool(), &scheduled_jobs).await.unwrap();
 
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let stats = admin::queue_stats(client.pool()).await.unwrap();
     let hot_stats = stats.iter().find(|stat| stat.queue == hot_queue).unwrap();
     assert_eq!(hot_stats.available, 2);
@@ -939,6 +942,9 @@ async fn test_admin_queue_stats() {
     .await
     .unwrap();
 
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let stats = admin::queue_stats(client.pool()).await.unwrap();
     let stat = stats.iter().find(|s| s.queue == queue).unwrap();
     assert_eq!(stat.available, 3);
@@ -968,6 +974,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     // Snapshot baseline immediately before insert. Other test binaries may
     // concurrently create/modify jobs in the shared database, so we can only
     // assert that global counts increased by *at least* the expected delta.
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let baseline = admin::state_counts(client.pool()).await.unwrap();
 
     sqlx::query(
@@ -988,6 +997,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     .await
     .unwrap();
 
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let counts = admin::state_counts(client.pool()).await.unwrap();
     assert!(
         counts.get(&JobState::Available).copied().unwrap_or(0)
@@ -1034,6 +1046,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
 
     // Verify the promotion via queue-specific stats (immune to concurrent
     // test interference) rather than global count deltas.
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let queues = admin::queue_stats(client.pool()).await.unwrap();
     let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
     assert_eq!(queue_a_stats.available, 2, "kind_b should now be available");
@@ -1048,6 +1063,9 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .await
         .unwrap();
 
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let queues = admin::queue_stats(client.pool()).await.unwrap();
     assert!(!queues.iter().any(|stat| stat.queue == queue_b));
 
@@ -1081,6 +1099,9 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     .await
     .unwrap();
 
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let before = admin::queue_stats(client.pool()).await.unwrap();
     let before = before.iter().find(|stat| stat.queue == queue).unwrap();
     assert_eq!(before.scheduled, 1);
@@ -1151,6 +1172,9 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     .unwrap();
     assert_eq!(promoted, 1);
 
+    admin::recompute_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
     let after = admin::queue_stats(client.pool()).await.unwrap();
     let after = after.iter().find(|stat| stat.queue == queue).unwrap();
     assert_eq!(after.scheduled, 0);

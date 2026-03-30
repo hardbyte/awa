@@ -948,7 +948,7 @@ impl MaintenanceService {
     /// Publish queue depth and lag as OTel gauge metrics.
     #[tracing::instrument(skip(self), name = "maintenance.queue_stats")]
     async fn publish_queue_health_metrics(&self) {
-        let stats = match awa_model::admin::queue_stats_cached(&self.pool).await {
+        let stats = match awa_model::admin::queue_stats(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to query queue stats for metrics");

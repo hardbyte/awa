@@ -158,6 +158,14 @@ class AsyncClient:
         """Cancel all pending jobs in a queue."""
         return await self._raw.drain_queue(queue)
 
+    async def flush_admin_metadata(self) -> None:
+        """Drain dirty keys and recompute cached admin counters.
+
+        Call before ``queue_stats()`` in tests without a running
+        maintenance leader to ensure the cache is fresh.
+        """
+        return await self._raw.flush_admin_metadata()
+
     async def queue_stats(self) -> list[QueueStat]:
         """Per-queue statistics."""
         return await self._raw.queue_stats()
@@ -449,6 +457,10 @@ class Client:
     def drain_queue(self, queue: str) -> int:
         """Cancel all pending jobs in a queue."""
         return self._raw.drain_queue_sync(queue)
+
+    def flush_admin_metadata(self) -> None:
+        """Drain dirty keys and recompute cached admin counters."""
+        return self._raw.flush_admin_metadata_sync()
 
     def queue_stats(self) -> list[QueueStat]:
         """Per-queue statistics."""

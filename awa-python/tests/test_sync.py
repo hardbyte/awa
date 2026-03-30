@@ -156,6 +156,7 @@ def test_queue_stats_sync(client):
     client.insert(
         SyncEmail(to="stats@example.com", subject="Stats"), queue="sync_stats"
     )
+    client.flush_admin_metadata()
     stats = client.queue_stats()
     assert isinstance(stats, list)
     stat = next((s for s in stats if s.queue == "sync_stats"), None)
@@ -261,6 +262,7 @@ def test_job_state_str_lowercase():
 def test_queue_stats_returns_typed_objects(client):
     """queue_stats returns QueueStat objects with correct types and values."""
     client.insert(SyncEmail(to="typed@example.com", subject="Typed"), queue="sync_typed_stats")
+    client.flush_admin_metadata()
     stats = client.queue_stats()
     assert len(stats) > 0
     stat = next(s for s in stats if s.queue == "sync_typed_stats")

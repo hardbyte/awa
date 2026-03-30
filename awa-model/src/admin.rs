@@ -649,20 +649,13 @@ where
 
 /// Get statistics for all queues.
 ///
-/// Drains any dirty keys first (recomputing exact counts from base tables
-/// for recently-touched queues), then reads from the `queue_state_counts`
-/// cache. This ensures callers always see up-to-date data without relying
-/// on the maintenance leader's recompute cycle.
-pub async fn queue_stats(pool: &PgPool) -> Result<Vec<QueueStats>, AwaError> {
-    // Drain dirty keys before reading — ensures cache is fresh
-    let _ = recompute_dirty_admin_metadata(pool).await;
-    queue_stats_cached(pool).await
-}
-
-/// Read queue statistics from the cache table without draining dirty keys.
-/// Used by the metrics publisher which runs on the maintenance leader
-/// (dirty keys are drained separately on a faster timer).
-pub async fn queue_stats_cached<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
+/// Reads from the `queue_state_counts` cache table. The cache is kept
+/// fresh by the maintenance leader's dirty-key recompute (~2s) and full
+/// reconciliation (~60s). Also warmed during `migrate()`.
+///
+/// For exact-at-this-instant counts (e.g., in tests without a running
+/// maintenance leader), call `recompute_dirty_admin_metadata()` first.
+pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
 where
     E: PgExecutor<'e>,
 {
@@ -811,14 +804,8 @@ where
 
 /// Count jobs grouped by state.
 ///
-/// Drains dirty keys first, then reads from the cache table.
-pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaError> {
-    let _ = recompute_dirty_admin_metadata(pool).await;
-    state_counts_cached(pool).await
-}
-
-/// Read state counts from cache without draining dirty keys.
-pub async fn state_counts_cached<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, AwaError>
+/// Reads from the `queue_state_counts` cache table.
+pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, AwaError>
 where
     E: PgExecutor<'e>,
 {
@@ -858,13 +845,15 @@ where
 
 /// Return all distinct job kinds.
 ///
-/// Drains dirty keys first to ensure the catalog is up-to-date.
-pub async fn distinct_kinds(pool: &PgPool) -> Result<Vec<String>, AwaError> {
-    let _ = recompute_dirty_admin_metadata(pool).await;
+/// Reads from the `job_kind_catalog` cache table.
+pub async fn distinct_kinds<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT kind FROM awa.job_kind_catalog WHERE ref_count > 0 ORDER BY kind",
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     Ok(rows)
@@ -872,13 +861,15 @@ pub async fn distinct_kinds(pool: &PgPool) -> Result<Vec<String>, AwaError> {
 
 /// Return all distinct queue names.
 ///
-/// Drains dirty keys first to ensure the catalog is up-to-date.
-pub async fn distinct_queues(pool: &PgPool) -> Result<Vec<String>, AwaError> {
-    let _ = recompute_dirty_admin_metadata(pool).await;
+/// Reads from the `job_queue_catalog` cache table.
+pub async fn distinct_queues<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT queue FROM awa.job_queue_catalog WHERE ref_count > 0 ORDER BY queue",
     )
-    .fetch_all(pool)
+    .fetch_all(executor)
     .await?;
 
     Ok(rows)
