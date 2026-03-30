@@ -251,13 +251,9 @@ BEGIN
             DELETE FROM awa.queue_state_counts WHERE queue = dirty_q;
         END IF;
 
-        -- Upsert queue catalog
-        SELECT count(*) INTO v_ref_count
-        FROM (
-            SELECT 1 FROM awa.jobs_hot WHERE queue = dirty_q
-            UNION ALL
-            SELECT 1 FROM awa.scheduled_jobs WHERE queue = dirty_q
-        ) t;
+        -- Upsert queue catalog (ref_count derived from state counts already computed)
+        v_ref_count := v_scheduled + v_available + v_running + v_completed
+                     + v_retryable + v_failed + v_cancelled + v_waiting_external;
 
         IF v_ref_count > 0 THEN
             INSERT INTO awa.job_queue_catalog (queue, ref_count)
