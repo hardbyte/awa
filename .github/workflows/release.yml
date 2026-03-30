@@ -192,16 +192,23 @@ jobs:
           pattern: "{binary-*,wheels-*,cli-wheels-*}"
           merge-multiple: true
 
-      - name: Create draft release with assets
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          generate_release_notes: true
-          prerelease: ${{ contains(github.ref_name, 'alpha') || contains(github.ref_name, 'beta') || contains(github.ref_name, 'rc') }}
-          fail_on_unmatched_files: false
-          files: |
-            *.tar.gz
-            *.whl
+      - name: Upload assets to GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          # Create the release if it doesn't already exist
+          if ! gh release view "$tag" --json tagName >/dev/null 2>&1; then
+            prerelease_flag=""
+            if echo "$tag" | grep -qE 'alpha|beta|rc'; then
+              prerelease_flag="--prerelease"
+            fi
+            gh release create "$tag" --title "$tag" --generate-notes $prerelease_flag
+          fi
+          # Upload all artifacts (skip duplicates)
+          for f in *.tar.gz *.whl; do
+            [ -e "$f" ] && gh release upload "$tag" "$f" --clobber || true
+          done
 
   # ─── Python wheels (maturin) ─────────────────────────────────────────
   python-wheels:
