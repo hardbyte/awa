@@ -12,7 +12,8 @@ pub mod unique;
 pub use admin::{
     CallbackConfig, DefaultAction, ListJobsFilter, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
     QueueRuntimeSnapshot, QueueRuntimeSummary, QueueStats, RateLimitSnapshot, ResolveOutcome,
-    RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket,
+    RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket, TickOptions,
+    TickResult,
 };
 pub use cron::{CronJobRow, PeriodicJob, PeriodicJobBuilder};
 pub use error::AwaError;

@@ -92,6 +92,35 @@ impl PyWaitForCallback {
     }
 }
 
+/// Result of a `tick()` invocation.
+#[pyclass(frozen, name = "TickResult", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct PyTickResult {
+    #[pyo3(get)]
+    pub promoted_scheduled: u64,
+    #[pyo3(get)]
+    pub promoted_retryable: u64,
+    #[pyo3(get)]
+    pub rescued_heartbeat: u64,
+    #[pyo3(get)]
+    pub rescued_deadline: u64,
+    #[pyo3(get)]
+    pub rescued_callback: u64,
+    #[pyo3(get)]
+    pub cleaned_up: u64,
+}
+
+#[pymethods]
+impl PyTickResult {
+    fn __repr__(&self) -> String {
+        format!(
+            "TickResult(promoted_scheduled={}, promoted_retryable={}, rescued_heartbeat={}, rescued_deadline={}, rescued_callback={}, cleaned_up={})",
+            self.promoted_scheduled, self.promoted_retryable, self.rescued_heartbeat,
+            self.rescued_deadline, self.rescued_callback, self.cleaned_up,
+        )
+    }
+}
+
 /// Result of `resolve_callback`.
 #[pyclass(frozen, name = "ResolveResult", skip_from_py_object)]
 #[derive(Debug, Clone)]
@@ -694,6 +723,28 @@ impl PyClient {
                 shutting_down: false,
                 leader: false,
                 queues: HashMap::new(),
+            })
+        })
+    }
+
+    /// Run a single bounded maintenance pass (promote, rescue, cleanup).
+    ///
+    /// Designed for serverless or low-traffic deployments where no persistent
+    /// worker process is running. Call from a scheduled function or as a
+    /// background task after each request.
+    fn tick<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = awa_model::admin::tick(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(PyTickResult {
+                promoted_scheduled: result.promoted_scheduled,
+                promoted_retryable: result.promoted_retryable,
+                rescued_heartbeat: result.rescued_heartbeat,
+                rescued_deadline: result.rescued_deadline,
+                rescued_callback: result.rescued_callback,
+                cleaned_up: result.cleaned_up,
             })
         })
     }
@@ -1493,6 +1544,26 @@ impl PyClient {
                     shutting_down: false,
                     leader: false,
                     queues: HashMap::new(),
+                })
+            })
+        })
+    }
+
+    /// Run a single bounded maintenance pass (sync version).
+    fn tick_sync(&self, py: Python<'_>) -> PyResult<PyTickResult> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let result = awa_model::admin::tick(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(PyTickResult {
+                    promoted_scheduled: result.promoted_scheduled,
+                    promoted_retryable: result.promoted_retryable,
+                    rescued_heartbeat: result.rescued_heartbeat,
+                    rescued_deadline: result.rescued_deadline,
+                    rescued_callback: result.rescued_callback,
+                    cleaned_up: result.cleaned_up,
                 })
             })
         })

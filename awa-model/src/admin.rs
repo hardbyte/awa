@@ -1863,3 +1863,293 @@ fn apply_transform(job: &JobRow, payload_value: &serde_json::Value) -> serde_jso
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// Tick: stateless, bounded maintenance for serverless deployments
+// ---------------------------------------------------------------------------
+
+/// Result of a single `tick()` invocation.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TickResult {
+    /// Number of scheduled jobs promoted to available.
+    pub promoted_scheduled: u64,
+    /// Number of retryable jobs promoted to available.
+    pub promoted_retryable: u64,
+    /// Number of jobs rescued from stale heartbeats.
+    pub rescued_heartbeat: u64,
+    /// Number of jobs rescued from expired deadlines.
+    pub rescued_deadline: u64,
+    /// Number of jobs rescued from expired callback timeouts.
+    pub rescued_callback: u64,
+    /// Number of terminal jobs cleaned up.
+    pub cleaned_up: u64,
+}
+
+/// Default batch limit for each tick step.
+const TICK_BATCH_LIMIT: i64 = 500;
+
+/// Run a single bounded maintenance pass.
+///
+/// This is the stateless equivalent of what `MaintenanceService` does on a
+/// timer-driven loop with leader election. It is designed for serverless or
+/// low-traffic deployments where no persistent worker process is running.
+///
+/// Each step is bounded by `TICK_BATCH_LIMIT` so the function completes in
+/// predictable time. Call it on a schedule (e.g., every 1–5 minutes from
+/// Cloud Scheduler, pg_cron, or a framework background task).
+///
+/// Unlike the full maintenance service, `tick()` does NOT:
+/// - Hold an advisory lock (leader election)
+/// - Signal in-flight job cancellation (no local worker)
+/// - Evaluate cron schedules (use the persistent worker for cron)
+/// - Publish OTel metrics
+///
+/// It DOES:
+/// 1. Promote scheduled → available (bounded batch)
+/// 2. Promote retryable → available (bounded batch)
+/// 3. Rescue stale heartbeats (bounded batch)
+/// 4. Rescue expired deadlines (bounded batch)
+/// 5. Rescue expired callback timeouts (bounded batch)
+/// 6. Clean up completed/failed jobs past retention (bounded batch)
+pub async fn tick(pool: &PgPool) -> Result<TickResult, AwaError> {
+    tick_with_options(pool, TickOptions::default()).await
+}
+
+/// Options for customizing a `tick()` invocation.
+#[derive(Debug, Clone)]
+pub struct TickOptions {
+    /// Maximum jobs to process per step (default: 500).
+    pub batch_limit: i64,
+    /// Heartbeat staleness threshold (default: 90s).
+    pub heartbeat_staleness_secs: u64,
+    /// Retention for completed jobs (default: 24h).
+    pub completed_retention_secs: u64,
+    /// Retention for failed/cancelled jobs (default: 72h).
+    pub failed_retention_secs: u64,
+}
+
+impl Default for TickOptions {
+    fn default() -> Self {
+        Self {
+            batch_limit: TICK_BATCH_LIMIT,
+            heartbeat_staleness_secs: 90,
+            completed_retention_secs: 86400,
+            failed_retention_secs: 259200,
+        }
+    }
+}
+
+/// Run a single bounded maintenance pass with custom options.
+pub async fn tick_with_options(pool: &PgPool, opts: TickOptions) -> Result<TickResult, AwaError> {
+    let mut result = TickResult::default();
+
+    // 1. Promote scheduled → available
+    result.promoted_scheduled = tick_promote(pool, "scheduled", opts.batch_limit).await?;
+
+    // 2. Promote retryable → available
+    result.promoted_retryable = tick_promote(pool, "retryable", opts.batch_limit).await?;
+
+    // 3. Rescue stale heartbeats
+    result.rescued_heartbeat =
+        tick_rescue_heartbeats(pool, opts.heartbeat_staleness_secs, opts.batch_limit).await?;
+
+    // 4. Rescue expired deadlines
+    result.rescued_deadline = tick_rescue_deadlines(pool, opts.batch_limit).await?;
+
+    // 5. Rescue expired callback timeouts
+    result.rescued_callback = tick_rescue_callbacks(pool, opts.batch_limit).await?;
+
+    // 6. Cleanup terminal jobs
+    result.cleaned_up = tick_cleanup(
+        pool,
+        opts.completed_retention_secs,
+        opts.failed_retention_secs,
+        opts.batch_limit,
+    )
+    .await?;
+
+    Ok(result)
+}
+
+/// Promote due jobs of a given state (scheduled or retryable) to available.
+///
+/// Uses the same literal-state-injection pattern as `MaintenanceService` to
+/// ensure the Postgres planner can use the partial index on `(run_at, id)`.
+async fn tick_promote(pool: &PgPool, state: &str, limit: i64) -> Result<u64, AwaError> {
+    // Validate state to prevent SQL injection (only two valid values)
+    assert!(
+        state == "scheduled" || state == "retryable",
+        "tick_promote: invalid state"
+    );
+
+    let sql = format!(
+        r#"
+        WITH due AS (
+            DELETE FROM awa.scheduled_jobs
+            WHERE id IN (
+                SELECT id
+                FROM awa.scheduled_jobs
+                WHERE state = '{state}'::awa.job_state
+                  AND run_at <= now()
+                ORDER BY run_at ASC, id ASC
+                LIMIT $1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING *
+        )
+        INSERT INTO awa.jobs_hot (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter, callback_on_complete,
+            callback_on_fail, callback_transform, run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args, 'available'::awa.job_state, priority,
+            attempt, max_attempts, now(), NULL, NULL, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            NULL, NULL, NULL, NULL, NULL, NULL, run_lease, progress
+        FROM due
+        "#
+    );
+
+    let result = sqlx::query(&sql).bind(limit).execute(pool).await?;
+    Ok(result.rows_affected())
+}
+
+async fn tick_rescue_heartbeats(
+    pool: &PgPool,
+    staleness_secs: u64,
+    limit: i64,
+) -> Result<u64, AwaError> {
+    let staleness = format!("{staleness_secs} seconds");
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'retryable',
+            finalized_at = now(),
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            callback_filter = NULL,
+            callback_on_complete = NULL,
+            callback_on_fail = NULL,
+            callback_transform = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'heartbeat stale: worker presumed dead (via tick)',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (
+            SELECT id FROM awa.jobs
+            WHERE state = 'running'
+              AND heartbeat_at < now() - $1::interval
+            LIMIT $2
+            FOR UPDATE SKIP LOCKED
+        )
+        "#,
+    )
+    .bind(&staleness)
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn tick_rescue_deadlines(pool: &PgPool, limit: i64) -> Result<u64, AwaError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'retryable',
+            finalized_at = now(),
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            callback_filter = NULL,
+            callback_on_complete = NULL,
+            callback_on_fail = NULL,
+            callback_transform = NULL,
+            errors = errors || jsonb_build_object(
+                'error', 'hard deadline exceeded (via tick)',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (
+            SELECT id FROM awa.jobs
+            WHERE state = 'running'
+              AND deadline_at IS NOT NULL
+              AND deadline_at < now()
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        "#,
+    )
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn tick_rescue_callbacks(pool: &PgPool, limit: i64) -> Result<u64, AwaError> {
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
+            finalized_at = now(),
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            callback_filter = NULL,
+            callback_on_complete = NULL,
+            callback_on_fail = NULL,
+            callback_transform = NULL,
+            run_at = CASE WHEN attempt >= max_attempts THEN run_at
+                     ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
+            errors = errors || jsonb_build_object(
+                'error', 'callback timed out (via tick)',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (
+            SELECT id FROM awa.jobs
+            WHERE state = 'waiting_external'
+              AND callback_timeout_at IS NOT NULL
+              AND callback_timeout_at < now()
+            LIMIT $1
+            FOR UPDATE SKIP LOCKED
+        )
+        "#,
+    )
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
+async fn tick_cleanup(
+    pool: &PgPool,
+    completed_retention_secs: u64,
+    failed_retention_secs: u64,
+    limit: i64,
+) -> Result<u64, AwaError> {
+    let completed_retention = format!("{completed_retention_secs} seconds");
+    let failed_retention = format!("{failed_retention_secs} seconds");
+    let result = sqlx::query(
+        r#"
+        DELETE FROM awa.jobs_hot
+        WHERE id IN (
+            SELECT id FROM awa.jobs_hot
+            WHERE (state = 'completed' AND finalized_at < now() - $1::interval)
+               OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval)
+            LIMIT $3
+        )
+        "#,
+    )
+    .bind(&completed_retention)
+    .bind(&failed_retention)
+    .bind(limit)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}

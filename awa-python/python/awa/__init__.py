@@ -13,6 +13,8 @@ from awa._awa import (
     CallbackToken,
     WaitForCallback,
     ResolveResult,
+    # Tick
+    TickResult,
     # Transaction
     Transaction,
     SyncTransaction,
@@ -55,6 +57,8 @@ __all__ = [
     "CallbackToken",
     "WaitForCallback",
     "ResolveResult",
+    # Tick
+    "TickResult",
     # Transaction
     "Transaction",
     "SyncTransaction",

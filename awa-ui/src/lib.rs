@@ -66,6 +66,8 @@ pub async fn router_with_callback_secret(
         .route("/capabilities", get(handlers::stats::get_capabilities))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime))
+        // Tick (serverless maintenance)
+        .route("/tick", post(handlers::tick::tick))
         // Callbacks (for HTTP workers and external systems)
         .route(
             "/callbacks/{callback_id}/complete",

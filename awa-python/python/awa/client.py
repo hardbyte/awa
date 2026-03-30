@@ -21,6 +21,7 @@ from awa._awa import (
     QueueStat,
     ResolveResult,
     SyncTransaction,
+    TickResult,
     Transaction,
 )
 
@@ -176,6 +177,15 @@ class AsyncClient:
     async def health_check(self) -> HealthCheck:
         """Runtime health check."""
         return await self._raw.health_check()
+
+    async def tick(self) -> TickResult:
+        """Run a single bounded maintenance pass (promote, rescue, cleanup).
+
+        Designed for serverless or low-traffic deployments where no persistent
+        worker process is running. Call from a scheduled function or as a
+        framework background task after each request.
+        """
+        return await self._raw.tick()
 
     async def shutdown(self, timeout_ms: int = 2000) -> None:
         """Graceful shutdown with drain timeout."""
@@ -464,6 +474,14 @@ class Client:
     def health_check(self) -> HealthCheck:
         """Runtime health check."""
         return self._raw.health_check_sync()
+
+    def tick(self) -> TickResult:
+        """Run a single bounded maintenance pass (promote, rescue, cleanup).
+
+        Designed for serverless or low-traffic deployments where no persistent
+        worker process is running.
+        """
+        return self._raw.tick_sync()
 
     # ── External callbacks (sync) ───────────────────────────────
 
