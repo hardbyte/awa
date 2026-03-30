@@ -206,6 +206,28 @@ async def test_retention_kwargs_accepted(client):
 
 
 @pytest.mark.asyncio
+async def test_maintenance_interval_kwargs_accepted(client):
+    """start() accepts all maintenance interval kwargs including heartbeat_staleness_ms."""
+    queue = "cfg_maintenance_intervals"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    client.start(
+        [(queue, 4)],
+        heartbeat_interval_ms=100,
+        heartbeat_staleness_ms=5_000,
+        heartbeat_rescue_interval_ms=500,
+        deadline_rescue_interval_ms=1_000,
+        callback_rescue_interval_ms=1_000,
+        leader_election_interval_ms=200,
+        promote_interval_ms=500,
+    )
+    await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_per_queue_retention_in_dict_config(client):
     """Dict form with per-queue retention config starts successfully."""
     queue = "cfg_per_queue_retention"
