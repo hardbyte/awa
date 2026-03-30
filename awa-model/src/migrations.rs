@@ -90,20 +90,19 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         0
     };
 
-    if has_schema && current == CURRENT_VERSION {
+    if !(has_schema && current == CURRENT_VERSION) {
+        for &(version, description, steps) in MIGRATIONS {
+            if version <= current {
+                continue;
+            }
+            info!(version, description, "Applying migration");
+            for step in steps {
+                sqlx::raw_sql(step).execute(&mut *conn).await?;
+            }
+            info!(version, "Migration applied");
+        }
+    } else {
         info!(version = current, "Schema is up to date");
-        return Ok(());
-    }
-
-    for &(version, description, steps) in MIGRATIONS {
-        if version <= current {
-            continue;
-        }
-        info!(version, description, "Applying migration");
-        for step in steps {
-            sqlx::raw_sql(step).execute(&mut *conn).await?;
-        }
-        info!(version, "Migration applied");
     }
 
     // Ensure the admin metadata cache is warm. Since v006 removed the
@@ -116,9 +115,12 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
     .fetch_one(&mut *conn)
     .await?;
     if has_refresh {
-        sqlx::raw_sql("SELECT awa.refresh_admin_metadata()")
+        // Best-effort: if concurrent migrations race, one may fail with a
+        // deadlock or lock conflict. The next migrate() or maintenance
+        // leader refresh will correct it.
+        let _ = sqlx::raw_sql("SELECT awa.refresh_admin_metadata()")
             .execute(&mut *conn)
-            .await?;
+            .await;
     }
 
     Ok(())
