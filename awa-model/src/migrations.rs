@@ -106,6 +106,21 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         info!(version, "Migration applied");
     }
 
+    // Ensure the admin metadata cache is warm. Since v006 removed the
+    // synchronous triggers on jobs_hot, the cache is only updated by the
+    // maintenance leader. Refreshing here guarantees queue_stats() and
+    // state_counts() return accurate data immediately after migrate().
+    let has_refresh: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'refresh_admin_metadata' AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'awa'))",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_refresh {
+        sqlx::raw_sql("SELECT awa.refresh_admin_metadata()")
+            .execute(&mut *conn)
+            .await?;
+    }
+
     Ok(())
 }
 

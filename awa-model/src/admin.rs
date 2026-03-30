@@ -648,6 +648,10 @@ where
 }
 
 /// Get statistics for all queues.
+///
+/// Reads from the `queue_state_counts` cache table, which is refreshed
+/// periodically by the maintenance leader (~30s). The cache is also
+/// populated during migration, so it is warm from first boot.
 pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -796,6 +800,8 @@ where
 }
 
 /// Count jobs grouped by state.
+///
+/// Reads from the `queue_state_counts` cache table.
 pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, AwaError>
 where
     E: PgExecutor<'e>,
