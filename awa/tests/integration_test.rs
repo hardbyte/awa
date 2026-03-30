@@ -334,7 +334,7 @@ async fn test_insert_many_updates_admin_metadata_for_direct_paths() {
     ];
     insert_many(client.pool(), &scheduled_jobs).await.unwrap();
 
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let stats = admin::queue_stats(client.pool()).await.unwrap();
@@ -942,7 +942,7 @@ async fn test_admin_queue_stats() {
     .await
     .unwrap();
 
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let stats = admin::queue_stats(client.pool()).await.unwrap();
@@ -974,7 +974,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     // Snapshot baseline immediately before insert. Other test binaries may
     // concurrently create/modify jobs in the shared database, so we can only
     // assert that global counts increased by *at least* the expected delta.
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let baseline = admin::state_counts(client.pool()).await.unwrap();
@@ -997,7 +997,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     .await
     .unwrap();
 
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let counts = admin::state_counts(client.pool()).await.unwrap();
@@ -1046,7 +1046,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
 
     // Verify the promotion via queue-specific stats (immune to concurrent
     // test interference) rather than global count deltas.
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let queues = admin::queue_stats(client.pool()).await.unwrap();
@@ -1063,7 +1063,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         .await
         .unwrap();
 
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let queues = admin::queue_stats(client.pool()).await.unwrap();
@@ -1099,7 +1099,7 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     .await
     .unwrap();
 
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let before = admin::queue_stats(client.pool()).await.unwrap();
@@ -1172,7 +1172,7 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     .unwrap();
     assert_eq!(promoted, 1);
 
-    admin::recompute_dirty_admin_metadata(client.pool())
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
     let after = admin::queue_stats(client.pool()).await.unwrap();

@@ -611,13 +611,13 @@ impl PyClient {
         })
     }
 
-    /// Drain dirty keys and recompute exact cached rows for recently-touched
-    /// queues/kinds. Call before queue_stats() in tests without a maintenance
-    /// leader to ensure the cache is fresh.
+    /// Drain ALL dirty keys and recompute cached admin counters until the
+    /// backlog is empty. Call before queue_stats() in tests without a
+    /// maintenance leader to ensure the cache is fully fresh.
     fn flush_admin_metadata<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            awa_model::admin::recompute_dirty_admin_metadata(&pool)
+            awa_model::admin::flush_dirty_admin_metadata(&pool)
                 .await
                 .map_err(map_awa_error)?;
             Ok(())
@@ -628,7 +628,7 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::admin::recompute_dirty_admin_metadata(&pool)
+                awa_model::admin::flush_dirty_admin_metadata(&pool)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(())

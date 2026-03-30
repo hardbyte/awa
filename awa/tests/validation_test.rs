@@ -1081,7 +1081,7 @@ async fn t27_admin_ops_under_load() {
     awa_model::admin::resume_queue(&pool, queue).await.unwrap();
 
     // Queue stats should reflect current state
-    awa_model::admin::recompute_dirty_admin_metadata(&pool)
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
         .await
         .unwrap();
     let stats = awa_model::admin::queue_stats(&pool).await.unwrap();

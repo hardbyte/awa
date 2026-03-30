@@ -158,9 +158,41 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 
     let raw_version = version.unwrap_or(0);
 
+    // If max version is within the current MIGRATIONS range and the expected
+    // tables exist, this is a current install — skip legacy detection.
+    if (1..=CURRENT_VERSION).contains(&raw_version) {
+        // Quick check: does the schema match what we expect at this version?
+        // If queue_state_counts exists, we're past v4 in the current numbering.
+        let has_admin_tables: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(false);
+
+        // Current v4+ has queue_state_counts. If we're at v4+ and have
+        // the table, this is definitely a current install.
+        if raw_version >= 4 && has_admin_tables {
+            return Ok(raw_version);
+        }
+        // Current v1-v3 don't have queue_state_counts.
+        if raw_version <= 3 {
+            let has_runtime: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or(false);
+            // v2+ has runtime_instances. If present, current install.
+            if (raw_version >= 2 && has_runtime) || raw_version == 1 {
+                return Ok(raw_version);
+            }
+        }
+    }
+
     // Detect legacy version numbering from pre-0.4 releases.
-    // Version 5/6 are always legacy. Version 4 is legacy only if the new
-    // admin metadata schema is absent.
+    // Legacy installs used a different numbering scheme where v3-v6 mapped
+    // to what is now v1-v4.
     let has_legacy_high: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM awa.schema_version WHERE version >= 6)")
             .fetch_one(&mut *conn)

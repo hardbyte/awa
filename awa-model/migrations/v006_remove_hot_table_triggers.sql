@@ -99,19 +99,27 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION awa.mark_dirty_keys_update() RETURNS trigger AS $$
 BEGIN
+    -- Only mark dirty when queue, kind, or state actually changed.
+    -- Heartbeat and progress-only updates don't affect admin caches.
     INSERT INTO awa.admin_dirty_queues (queue)
     SELECT DISTINCT queue FROM (
-        SELECT queue FROM old_rows
+        SELECT o.queue FROM old_rows o JOIN new_rows n ON o.id = n.id
+        WHERE o.queue IS DISTINCT FROM n.queue
+           OR o.state IS DISTINCT FROM n.state
         UNION
-        SELECT queue FROM new_rows
+        SELECT n.queue FROM old_rows o JOIN new_rows n ON o.id = n.id
+        WHERE o.queue IS DISTINCT FROM n.queue
+           OR o.state IS DISTINCT FROM n.state
     ) t ORDER BY queue
     ON CONFLICT (queue) DO NOTHING;
 
     INSERT INTO awa.admin_dirty_kinds (kind)
     SELECT DISTINCT kind FROM (
-        SELECT kind FROM old_rows
+        SELECT o.kind FROM old_rows o JOIN new_rows n ON o.id = n.id
+        WHERE o.kind IS DISTINCT FROM n.kind
         UNION
-        SELECT kind FROM new_rows
+        SELECT n.kind FROM old_rows o JOIN new_rows n ON o.id = n.id
+        WHERE o.kind IS DISTINCT FROM n.kind
     ) t ORDER BY kind
     ON CONFLICT (kind) DO NOTHING;
 

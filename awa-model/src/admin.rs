@@ -875,17 +875,35 @@ where
     Ok(rows)
 }
 
-/// Drain dirty keys and recompute exact cached rows for recently-touched
-/// queues and kinds. Returns the number of dirty keys processed.
+/// Drain one batch of dirty keys and recompute exact cached rows.
+/// Returns the number of dirty keys processed in this batch.
 ///
-/// Called frequently by the maintenance leader (~1-2s) as the primary
-/// cache update mechanism. Uses per-queue indexes for targeted recompute
-/// rather than full table scans.
+/// Called frequently by the maintenance leader (~2s). Uses per-queue
+/// indexes for targeted recompute rather than full table scans.
 pub async fn recompute_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
     let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
         .fetch_one(pool)
         .await?;
     Ok(count)
+}
+
+/// Drain ALL dirty keys until the backlog is empty.
+///
+/// Use in tests or admin tooling where you need the cache to be fully
+/// consistent before reading. In production, prefer the maintenance
+/// leader's periodic single-batch drain.
+pub async fn flush_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
+    let mut total = 0i32;
+    loop {
+        let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
+            .fetch_one(pool)
+            .await?;
+        total += count;
+        if count == 0 {
+            break;
+        }
+    }
+    Ok(total)
 }
 
 /// Full reconciliation of admin metadata counters from base tables.
