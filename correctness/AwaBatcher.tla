@@ -193,6 +193,15 @@ DirectCompleteStale(w, j) ==
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ UNCHANGED <<jobState, owner, lease, batcherPending, shutdownPhase, dbCompletions>>
 
+(* Direct completion also fails (e.g., connection error).             *)
+(* The handler gives up; the job stays "running" in the DB and relies *)
+(* on heartbeat rescue to eventually move it to "retryable".          *)
+DirectCompleteFail(w, j) ==
+    /\ handlerPhase[w][j] = "fallback"
+    /\ handlerPhase' = [handlerPhase EXCEPT ![w][j] = "done"]
+    /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
+    /\ UNCHANGED <<jobState, owner, lease, batcherPending, shutdownPhase, dbCompletions>>
+
 (* ────────────────────────────────────────────────────────────────── *)
 (* Handler error: job fails terminally (no batcher involved)         *)
 (* ────────────────────────────────────────────────────────────────── *)
@@ -287,6 +296,7 @@ Next ==
     \/ \E req \in batcherPending : BatcherFlushFail(req)
     \/ \E w \in Workers, j \in Jobs : DirectCompleteSuccess(w, j)
     \/ \E w \in Workers, j \in Jobs : DirectCompleteStale(w, j)
+    \/ \E w \in Workers, j \in Jobs : DirectCompleteFail(w, j)
     \/ \E w \in Workers, j \in Jobs : HandlerFail(w, j)
     \/ \E j \in Jobs : Rescue(j)
     \/ \E j \in Jobs : Promote(j)
@@ -304,7 +314,10 @@ FairSpec == Spec
     /\ WF_vars(\E req \in batcherPending : BatcherFlushStale(req))
     /\ WF_vars(\E w \in Workers, j \in Jobs : DirectCompleteSuccess(w, j))
     /\ WF_vars(\E w \in Workers, j \in Jobs : DirectCompleteStale(w, j))
+    /\ WF_vars(\E w \in Workers, j \in Jobs : DirectCompleteFail(w, j))
+    /\ WF_vars(\E j \in Jobs : Rescue(j))
     /\ WF_vars(\E j \in Jobs : Promote(j))
+    /\ WF_vars(\E w \in Workers, j \in Jobs : ResetHandler(w, j))
     /\ WF_vars(BatcherDrainStart)
     /\ WF_vars(FinishShutdown)
 

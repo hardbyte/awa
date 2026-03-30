@@ -151,6 +151,7 @@ maintenance can rescue the job and a new worker can re-claim it.
 | `BatcherFlushStale` | Same SQL, `RETURNING` returns 0 rows (job rescued between enqueue and flush) |
 | `BatcherFlushFail` | `pool.execute()` error → `Err` sent to handler via oneshot channel |
 | `DirectComplete*` | `direct_complete_job()` fallback after batcher failure (`executor.rs:819`) |
+| `DirectCompleteFail` | `direct_complete_job()` returns `Err` — job stays `running`, rescued by heartbeat |
 | `Rescue` | Heartbeat/deadline rescue in `maintenance.rs` |
 | `Promote` | `scheduled_jobs` → `jobs_hot` promotion CTE |
 | `ResetHandler` | `in_flight.remove((job_id, run_lease))` after completion path finishes (`executor.rs:324`) |
@@ -166,6 +167,9 @@ maintenance can rescue the job and a new worker can re-claim it.
 - Shutdown drains all pending batcher requests before exiting — the
   `BatcherDrainStart` transition requires all `taskLease` values to be zero
   and all handlers to be in `idle` or `done` phase
+- When both batch and direct completion fail (`DirectCompleteFail`), the
+  handler exits cleanly ("done") and the job stays `running` in the DB,
+  relying on heartbeat `Rescue` → `Promote` to retry
 - Under fairness, every `pending` handler eventually reaches `done` or `idle`
   (`PendingEventuallyResolved`)
 

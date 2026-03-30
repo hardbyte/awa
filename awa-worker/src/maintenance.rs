@@ -285,6 +285,7 @@ impl MaintenanceService {
                         self.evaluate_cron_schedules().await;
                     }
                     _ = queue_stats_timer.tick() => {
+                        self.refresh_admin_metadata().await;
                         self.publish_queue_health_metrics().await;
                     }
                     _ = leader_check_timer.tick() => {
@@ -902,6 +903,19 @@ impl MaintenanceService {
         .await
         {
             tracing::warn!(error = %err, "Failed to clean up stale runtime snapshots");
+        }
+    }
+
+    /// Refresh admin metadata counters (queue_state_counts, catalogs).
+    ///
+    /// Since migration v006 removed the synchronous triggers from jobs_hot,
+    /// this periodic refresh keeps the counters reasonably up-to-date for
+    /// admin dashboards and metrics without introducing lock contention on
+    /// the completion hot path.
+    #[tracing::instrument(skip(self), name = "maintenance.refresh_admin_metadata")]
+    async fn refresh_admin_metadata(&self) {
+        if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
+            tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
     }
 

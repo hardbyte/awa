@@ -326,6 +326,7 @@ class Client:
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
+        heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
     ) -> None: ...

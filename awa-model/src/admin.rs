@@ -862,6 +862,20 @@ where
     Ok(rows)
 }
 
+/// Incrementally refresh admin metadata counters (queue_state_counts,
+/// job_kind_catalog, job_queue_catalog) from the current jobs_hot and
+/// scheduled_jobs tables. Unlike the SQL `rebuild_admin_metadata()` which
+/// TRUNCATEs, this uses upserts so concurrent readers see consistent data.
+///
+/// Called periodically by the maintenance leader after the synchronous
+/// triggers on jobs_hot were removed in migration v006.
+pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
+    sqlx::query("SELECT awa.refresh_admin_metadata()")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 /// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.
 pub async fn bulk_retry<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
 where
