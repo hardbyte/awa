@@ -189,6 +189,13 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 |---|------|------|
 | RO1-RO3 | Read-only serve: capabilities, mutations blocked, UI disables | ✓ |
 
+### Admin Metadata Guardrails
+
+| # | Test | Rust |
+|---|------|------|
+| AM1 | Heartbeat/progress-only UPDATEs do not dirty queues or kinds | ✓ |
+| AM2 | flush_dirty_admin_metadata() drains backlog > 100 keys | ✓ |
+
 ### Benchmarks
 
 | # | Test | Rust | Py |
@@ -198,6 +205,16 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | SP1-SP2 | Scheduled promotion at scale | ✓ | |
 | FB1-FB7 | Failure modes: terminal, retryable, callback, deadline, mixed | ✓ | |
 | FB8 | Failure modes (Python) | | ✓ |
+
+### Dirty-key trigger overhead (measured v0.5.1, debug build, Docker PG 17)
+
+Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
+
+| Config | Throughput | Overhead |
+|--------|-----------|----------|
+| No triggers (baseline) | 1963/s | — |
+| Noop PL/pgSQL trigger | 1855/s | 5.5% |
+| Full dirty-key triggers | 1832/s | **~7%** |
 
 ### Formal Models (TLA+)
 

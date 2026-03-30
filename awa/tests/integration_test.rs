@@ -1182,6 +1182,148 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     assert_eq!(after.total_queued, 1);
 }
 
+/// Heartbeat and progress-only UPDATEs must NOT dirty queues or kinds.
+/// The dirty-key UPDATE trigger filters via JOIN on old_rows/new_rows,
+/// only inserting dirty keys when queue, kind, or state actually changed.
+#[tokio::test]
+async fn test_heartbeat_progress_updates_do_not_dirty_admin_metadata() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+    let queue = "integ_no_dirty_heartbeat";
+    clean_queue(client.pool(), queue).await;
+
+    // Insert and claim a job so it's in 'running' state
+    insert_with(
+        client.pool(),
+        &SendEmail {
+            to: "hb@example.com".into(),
+            subject: "HB".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE awa.jobs_hot SET state = 'running', attempt = 1, heartbeat_at = now() WHERE queue = $1",
+    )
+    .bind(queue)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    // Flush dirty keys from the insert + state change above
+    admin::flush_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
+
+    // Clear the dirty tables completely
+    sqlx::query("DELETE FROM awa.admin_dirty_queues")
+        .execute(client.pool())
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.admin_dirty_kinds")
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // Heartbeat-only update (no state/queue/kind change)
+    sqlx::query("UPDATE awa.jobs_hot SET heartbeat_at = now() WHERE queue = $1")
+        .bind(queue)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // Progress-only update
+    sqlx::query("UPDATE awa.jobs_hot SET progress = '{\"percent\": 50}'::jsonb WHERE queue = $1")
+        .bind(queue)
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // Verify no dirty keys were created
+    let dirty_queues: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues")
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    let dirty_kinds: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_kinds")
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        dirty_queues, 0,
+        "heartbeat/progress should not dirty queues"
+    );
+    assert_eq!(dirty_kinds, 0, "heartbeat/progress should not dirty kinds");
+}
+
+/// flush_dirty_admin_metadata() must drain the entire backlog, not just
+/// one 100-key batch.
+#[tokio::test]
+async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
+    let _guard = test_lock().lock().await;
+    let client = setup().await;
+
+    // Clean up
+    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue LIKE 'integ_flush_backlog_%'")
+        .execute(client.pool())
+        .await
+        .unwrap();
+
+    // Insert jobs across >100 distinct queues to create a backlog larger than one batch
+    for i in 0..120 {
+        let queue = format!("integ_flush_backlog_{i:03}");
+        insert_with(
+            client.pool(),
+            &SendEmail {
+                to: "flush@example.com".into(),
+                subject: format!("Flush {i}"),
+            },
+            InsertOpts {
+                queue,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    // Verify we have >100 dirty queues
+    let dirty_before: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues")
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    assert!(
+        dirty_before > 100,
+        "should have >100 dirty queues, got {dirty_before}"
+    );
+
+    // flush should drain ALL of them
+    let flushed = admin::flush_dirty_admin_metadata(client.pool())
+        .await
+        .unwrap();
+    assert!(
+        flushed >= 120,
+        "should have flushed >=120 keys, got {flushed}"
+    );
+
+    let dirty_after: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues")
+        .fetch_one(client.pool())
+        .await
+        .unwrap();
+    assert_eq!(dirty_after, 0, "all dirty queues should be drained");
+
+    // Verify the cache is accurate for a sample queue
+    let stats = admin::queue_stats(client.pool()).await.unwrap();
+    let stat = stats
+        .iter()
+        .find(|s| s.queue == "integ_flush_backlog_000")
+        .unwrap();
+    assert_eq!(stat.available, 1);
+}
+
 #[tokio::test]
 async fn test_admin_list_jobs() {
     let _guard = test_lock().lock().await;

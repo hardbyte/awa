@@ -26,7 +26,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (5, "Statement-level admin metadata triggers", &[V5_UP]),
     (
         6,
-        "Remove hot-table triggers, async counter refresh",
+        "Dirty-key statement triggers for deadlock-free admin metadata",
         &[V6_UP],
     ),
 ];

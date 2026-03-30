@@ -649,12 +649,16 @@ where
 
 /// Get statistics for all queues.
 ///
-/// Reads from the `queue_state_counts` cache table. The cache is kept
-/// fresh by the maintenance leader's dirty-key recompute (~2s) and full
-/// reconciliation (~60s). Also warmed during `migrate()`.
+/// Hybrid read: per-state counts come from the `queue_state_counts`
+/// cache table (eventually consistent, ~2s lag), while `lag_seconds`
+/// and `completed_last_hour` are computed live from `jobs_hot`.
 ///
-/// For exact-at-this-instant counts (e.g., in tests without a running
-/// maintenance leader), call `recompute_dirty_admin_metadata()` first.
+/// The cache is kept fresh by the maintenance leader's dirty-key
+/// recompute (~2s) and full reconciliation (~60s). Also warmed during
+/// `migrate()`.
+///
+/// For exact cached counts in tests without a running maintenance
+/// leader, call `flush_dirty_admin_metadata()` first.
 pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
 where
     E: PgExecutor<'e>,
