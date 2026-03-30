@@ -59,6 +59,8 @@ pub struct MaintenanceService {
     cleanup_batch_size: i64,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Duration,
+    dirty_key_recompute_interval: Duration,
+    metadata_reconciliation_interval: Duration,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -97,6 +99,8 @@ impl MaintenanceService {
             cleanup_batch_size: 1000,
             queue_retention_overrides: HashMap::new(),
             queue_stats_interval: Duration::from_secs(30),
+            dirty_key_recompute_interval: Duration::from_secs(2),
+            metadata_reconciliation_interval: Duration::from_secs(60),
         }
     }
 
@@ -237,6 +241,9 @@ impl MaintenanceService {
             let mut cron_eval_timer = tokio::time::interval(self.cron_eval_interval);
             let mut leader_check_timer = tokio::time::interval(self.leader_check_interval);
             let mut queue_stats_timer = tokio::time::interval(self.queue_stats_interval);
+            let mut dirty_key_timer = tokio::time::interval(self.dirty_key_recompute_interval);
+            let mut metadata_reconciliation_timer =
+                tokio::time::interval(self.metadata_reconciliation_interval);
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -248,6 +255,8 @@ impl MaintenanceService {
             cron_eval_timer.tick().await;
             leader_check_timer.tick().await;
             queue_stats_timer.tick().await;
+            dirty_key_timer.tick().await;
+            metadata_reconciliation_timer.tick().await;
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
@@ -285,8 +294,13 @@ impl MaintenanceService {
                         self.evaluate_cron_schedules().await;
                     }
                     _ = queue_stats_timer.tick() => {
-                        self.refresh_admin_metadata().await;
                         self.publish_queue_health_metrics().await;
+                    }
+                    _ = dirty_key_timer.tick() => {
+                        self.recompute_dirty_admin_metadata().await;
+                    }
+                    _ = metadata_reconciliation_timer.tick() => {
+                        self.refresh_admin_metadata().await;
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -906,12 +920,24 @@ impl MaintenanceService {
         }
     }
 
-    /// Refresh admin metadata counters (queue_state_counts, catalogs).
-    ///
-    /// Since migration v006 removed the synchronous triggers from jobs_hot,
-    /// this periodic refresh keeps the counters reasonably up-to-date for
-    /// admin dashboards and metrics without introducing lock contention on
-    /// the completion hot path.
+    /// Drain dirty keys and recompute exact cached rows for recently-touched
+    /// queues and kinds. This is the primary cache update mechanism — called
+    /// every ~2s to keep dashboard counters fresh.
+    #[tracing::instrument(skip(self), name = "maintenance.recompute_dirty_metadata")]
+    async fn recompute_dirty_admin_metadata(&self) {
+        match awa_model::admin::recompute_dirty_admin_metadata(&self.pool).await {
+            Ok(count) if count > 0 => {
+                tracing::debug!(count, "Recomputed dirty admin metadata keys");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to recompute dirty admin metadata");
+            }
+            _ => {}
+        }
+    }
+
+    /// Full reconciliation of admin metadata from base tables.
+    /// Safety net for any drift — runs infrequently (~60s).
     #[tracing::instrument(skip(self), name = "maintenance.refresh_admin_metadata")]
     async fn refresh_admin_metadata(&self) {
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
@@ -922,7 +948,7 @@ impl MaintenanceService {
     /// Publish queue depth and lag as OTel gauge metrics.
     #[tracing::instrument(skip(self), name = "maintenance.queue_stats")]
     async fn publish_queue_health_metrics(&self) {
-        let stats = match awa_model::admin::queue_stats(&self.pool).await {
+        let stats = match awa_model::admin::queue_stats_cached(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to query queue stats for metrics");
