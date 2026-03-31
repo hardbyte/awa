@@ -1,76 +1,16 @@
 # Awa Correctness Models
 
-This directory contains TLA+ correctness models for the Awa worker runtime.
+This directory contains the TLA+ models used to check concurrency and protocol
+invariants in Awa.
 
-It contains small TLA+ models for the coordination protocol behind the worker
-runtime. The goal is to check the concurrency invariants that are easy to miss
-with integration tests:
+## Layout
 
-- a rescued or cancelled job cannot be finalized by a stale worker
-- graceful shutdown stops new claims before drain and keeps heartbeat alive
-- a non-abandoned running job always has reserved capacity
-- weighted overflow never exceeds the global cap
-- a contending queue eventually receives overflow capacity under the modeled fairness assumptions
-- drain timeout / abandonment is modeled explicitly so shutdown-to-zero behavior can be explored without violating the safety invariants
-
-What is modeled:
-
-- abstract job states
-- explicit attempt / lease identity for running attempts
-- two worker instances with separate local state and shared database-facing job state
-- worker ownership plus a separate per-instance in-flight task registry
-- reservation vs claim vs execution as separate protocol stages
-- service lifecycles for dispatchers, heartbeat, and maintenance
-- leader failover for maintenance
-- abstract heartbeat freshness and deadline expiry
-- guarded finalize rejection for stale completions
-- bounded batch reservations per worker
-- lightweight per-instance, per-queue dispatch budgets
-- local permits plus weighted overflow permits with derived contention
-- drain timeout that can abandon jobs mid-drain so another instance must recover them
-
-What is intentionally not modeled:
-
-- SQL text / `SKIP LOCKED`
-- LISTEN/NOTIFY wakeups
-- Python bridge details
-- real-time token bucket math for rate limiting
-- unbounded retry histories; `AwaExtended` caps attempts so TLC can close the
-  state graph
-- full advisory-lock mechanics; leadership is an abstract exclusive token
-- exact permit identity per task attempt; the model is job-centric and approximates task-held capacity closely enough to check the protocol invariants
-
-## Files
-
-- `AwaCore.tla` / `AwaCore.cfg`: focused model for rescue, admin cancel, and
-  stale completion protection
-- `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
-  sequencing, split permit/claim/execute stages, leader failover, weighted
-  overflow capacity, bounded batch behavior, abstract rate limiting, and
-  post-timeout abandonment / recovery
-- `AwaBatcher.tla` / `AwaBatcher.cfg` / `AwaBatcherLiveness.cfg`: completion
-  batcher model verifying that the async batched completion path (handler →
-  batcher buffer → DB flush) preserves lease-guarded finalization, at-most-once
-  completion, and no-loss-on-shutdown, including the direct fallback path after
-  batcher failure
-- `AwaCbk.tla` / `AwaCbk.cfg` / `AwaCbkLiveness.cfg`: external callback
-  resolution model for the three-way race between complete/fail, timeout rescue,
-  and heartbeat rescue with Postgres row-lock semantics
-- `AwaDispatchClaim.tla` / `AwaDispatchClaimOld.cfg` /
-  `AwaDispatchClaimNew.cfg`: focused dispatcher-claim model for the stale
-  candidate race from issue #134; includes retry cycles so `attempt > 1` is
-  exercised as a legitimate path; the old config intentionally fails the
-  `NoDuplicateClaim` invariant and the new config re-checks availability at
-  claim time
-- `AwaViewTrigger.tla` / `AwaViewTrigger.cfg` / `AwaViewTriggerOld.cfg`:
-  INSTEAD OF UPDATE trigger concurrency model for the `awa.jobs` UNION ALL
-  view; the trigger implements UPDATE as DELETE + INSERT for cross-table
-  moves, and the v006 fix adds a version check (state, run_lease,
-  callback_id) on the DELETE so concurrent callers can't both succeed on
-  state-changing operations; the old config models the v001 bug from #132
-- `AwaCron.tla` / `AwaCron.cfg` / `AwaCronLiveness.cfg`: cron double-fire
-  prevention under leader failover with CAS on `last_enqueued_at`
-- `Dockerfile`: Docker-first TLC environment
+- `core/`: smallest safety-focused models for lease guards, rescue, admin
+  cancel, and completion batching
+- `protocol/`: larger protocol models for shutdown, permits, rescue, and
+  leader failover
+- `races/`: focused models for specific bug classes and tricky interleavings
+- `Dockerfile`: Docker image for TLC
 - `run-tlc.sh`: convenience wrapper for running TLC from the repo root
 
 ## Running TLC
@@ -96,57 +36,23 @@ Or directly:
 ```bash
 docker build -t awa-tlaplus -f correctness/Dockerfile correctness
 docker run --rm -v "$PWD/correctness:/work" awa-tlaplus \
-  -config /work/AwaExtended.cfg /work/AwaExtended.tla
+  -config /work/protocol/AwaExtended.cfg /work/protocol/AwaExtended.tla
 ```
 
-## Model Notes
+## Choosing A Model
 
-`AwaCore` is the smallest useful model. It now encodes a minimal lease-guarded
-finalization protocol:
+- start with `core/AwaCore.tla` for lease-guard and stale-finalization safety
+- use `protocol/AwaExtended.tla` for shutdown, permit, rescue, and failover
+  protocol questions
+- use `races/` for feature-specific or bug-specific interleavings that sit below
+  the abstraction boundary of the larger protocol models
 
-- `Claim` increments a durable `lease`
-- `StartTask` snapshots that lease into `taskLease`
-- `FinalizeAccepted` requires `taskLease = lease`
-- `FinalizeRejected` models the late-completion cleanup path after rescue,
-  cancel, or reclaim
+## Notes
 
-That maps much more closely to the Rust `run_lease` guard than the older
-owner-only core model.
-
-Like the extended model, the core model bounds lease growth (`MaxLease == 2`)
-so TLC explores a finite reclaim/finalize surface instead of an unbounded loop.
-
-`AwaExtended` adds:
-
-- `Instances = {"i1", "i2"}` with per-instance `inFlight`, `taskLease`,
-  `cancelRequested`, `rateBudget`, and service lifecycles
-- shared database-facing job state via `jobState`, `attempt`, `lease`, and `dbOwner`
-- `dispatchersAlive`, `heartbeatAlive`, `maintenanceAlive`, and
-  `shutdownPhase = "running" | "stop_claim" | "draining" | "stopped"`
-- `permitHolder[j]` / `permitKind[j]` distinct from execution ownership
-- `heartbeatFresh[j]` and `deadlineExpired[j]`
-- `leader` as the abstract maintenance lease holder
-- local permit floors via `MinWorkers`
-- weighted overflow via `Weight`, `GlobalOverflow`, and derived queue contention
-- `BatchMax` and per-instance `rateBudget[i][q]` as bounded abstractions of
-  dispatcher batching and queue-level rate limiting
-- `DeferredRowsIdle`, which captures the hot/deferred storage split by requiring
-  `retryable` jobs to have no live owner, permit, or in-flight task
-- `DrainTimeout(i)`, `Abandoned(j)`, and `RecoverableAbandoned(j)` so one
-  instance can abandon a running or claimed attempt and another still-running
-  instance must rescue it
-
-To keep the state graph finite, `AwaExtended` bounds retries with
-`MaxAttempts == 2`. Admin cancel remains covered in `AwaCore`; the extended
-model is deliberately focused on the shutdown / rescue / permit / fairness
-protocol rather than re-exploring the full cancel surface.
-
-`AwaBatcher` models the async completion path between handler return and DB
-update. In the real system (`awa-worker/src/completion.rs`), completed jobs
-are queued in a sharded in-memory buffer and flushed to the database in
-batches of up to 512 every 1ms. This introduces a window where a job has
-completed in the handler but not yet in the database — during which
-maintenance can rescue the job and a new worker can re-claim it.
+- The larger models intentionally abstract above raw SQL text, `SKIP LOCKED`,
+  and trigger mechanics.
+- When a bug lives below that boundary, prefer adding a small focused race
+  model rather than forcing the entire SQL detail into `AwaExtended`.
 
 ### Mapping to Rust code
 
