@@ -679,9 +679,8 @@ async def run_heartbeat_rescue(
         await asyncio.sleep(0.5)
 
     drain_time = asyncio.get_running_loop().time() - started
-    await client.shutdown(timeout_ms=5000)
-
     final_counts = await state_counts(client, queue)
+    await client.shutdown(timeout_ms=5000)
     completed = final_counts.get("completed", 0)
     handler_per_s = handler_returned / drain_time if drain_time > 0 else 0
     db_per_s = completed / drain_time if drain_time > 0 else 0

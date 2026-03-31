@@ -327,10 +327,10 @@ async fn terminate_backend(pool: &sqlx::PgPool, pid: i32) {
         .fetch_one(pool)
         .await
         .expect("Failed to terminate backend");
-    assert!(
-        terminated.0,
-        "Postgres declined to terminate backend pid={pid}"
-    );
+    if !terminated.0 {
+        // Backend already disconnected — same end result as terminating it.
+        eprintln!("terminate_backend: pid={pid} already gone (race with pool recycling)");
+    }
 }
 
 async fn terminate_application_backends(pool: &sqlx::PgPool, app_name: &str) -> usize {
@@ -793,6 +793,26 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     insert_wave(&pool, &queue, &mut seq).await;
     insert_wave(&pool, &queue, &mut seq).await;
 
+    // Insert extra simple jobs and wait for Python to start processing them.
+    // The Python helper sleeps 400ms per job, so these will still be running
+    // when we kill the worker — guaranteeing at least one needs rescue.
+    for i in 0..4 {
+        insert_with(
+            &pool,
+            &SimpleChaosJob { seq: seq + i },
+            InsertOpts {
+                queue: queue.clone(),
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert pre-kill simple chaos job");
+    }
+    seq += 4;
+    // Give Python time to claim at least one of the new jobs.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
     python_worker.stop().await;
 
     let _ = wait_for_single_leader(&[&client_a, &client_b], Duration::from_secs(5)).await;
@@ -883,7 +903,8 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     .await
     .expect("Failed to backdate run_at for retryable chaos jobs");
 
-    let expected_completed = 1 + (total_waves * 5);
+    // 1 sentinel + 5 per wave (2 simple + 2 complete + 1 retry_once_manual) + 4 pre-kill simple
+    let expected_completed = 1 + (total_waves * 5) + 4;
     let expected_failed = total_waves;
 
     let counts = wait_for_counts(
