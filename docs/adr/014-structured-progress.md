@@ -69,9 +69,9 @@ progress is no longer relevant). All other transitions preserve progress:
 retries and snoozes preserve it for checkpoint resumption, failures and
 cancellations preserve it for operator inspection. Rescue operations
 (stale heartbeat, expired deadline, callback timeout) preserve progress
-implicitly because the rescue queries go through the `awa.jobs` view and
-don't include `progress` in the SET clause — the INSTEAD OF trigger
-forwards the existing value.
+because the rescue queries in `maintenance.rs` target `awa.jobs_hot`
+directly and don't include `progress` in the SET clause — PostgreSQL
+leaves unmentioned columns unchanged.
 
 ### Shallow merge for metadata
 
