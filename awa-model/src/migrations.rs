@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 5;
+pub const CURRENT_VERSION: i32 = 6;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -24,6 +24,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (3, "Maintenance loop health in runtime snapshots", &[V3_UP]),
     (4, "Admin metadata cache tables", &[V4_UP]),
     (5, "Statement-level admin metadata triggers", &[V5_UP]),
+    (
+        6,
+        "Dirty-key statement triggers for deadlock-free admin metadata",
+        &[V6_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -31,6 +36,7 @@ const V2_UP: &str = include_str!("../migrations/v002_runtime_instances.sql");
 const V3_UP: &str = include_str!("../migrations/v003_maintenance_health.sql");
 const V4_UP: &str = include_str!("../migrations/v004_admin_metadata.sql");
 const V5_UP: &str = include_str!("../migrations/v005_admin_metadata_stmt_triggers.sql");
+const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -84,20 +90,37 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         0
     };
 
-    if has_schema && current == CURRENT_VERSION {
+    if !(has_schema && current == CURRENT_VERSION) {
+        for &(version, description, steps) in MIGRATIONS {
+            if version <= current {
+                continue;
+            }
+            info!(version, description, "Applying migration");
+            for step in steps {
+                sqlx::raw_sql(step).execute(&mut *conn).await?;
+            }
+            info!(version, "Migration applied");
+        }
+    } else {
         info!(version = current, "Schema is up to date");
-        return Ok(());
     }
 
-    for &(version, description, steps) in MIGRATIONS {
-        if version <= current {
-            continue;
-        }
-        info!(version, description, "Applying migration");
-        for step in steps {
-            sqlx::raw_sql(step).execute(&mut *conn).await?;
-        }
-        info!(version, "Migration applied");
+    // Ensure the admin metadata cache is warm. Since v006 removed the
+    // synchronous triggers on jobs_hot, the cache is only updated by the
+    // maintenance leader. Refreshing here guarantees queue_stats() and
+    // state_counts() return accurate data immediately after migrate().
+    let has_refresh: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_proc WHERE proname = 'refresh_admin_metadata' AND pronamespace = (SELECT oid FROM pg_namespace WHERE nspname = 'awa'))",
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if has_refresh {
+        // Best-effort: if concurrent migrations race, one may fail with a
+        // deadlock or lock conflict. The next migrate() or maintenance
+        // leader refresh will correct it.
+        let _ = sqlx::raw_sql("SELECT awa.refresh_admin_metadata()")
+            .execute(&mut *conn)
+            .await;
     }
 
     Ok(())
@@ -135,9 +158,41 @@ async fn current_version_conn(conn: &mut PgConnection) -> Result<i32, AwaError> 
 
     let raw_version = version.unwrap_or(0);
 
+    // If max version is within the current MIGRATIONS range and the expected
+    // tables exist, this is a current install — skip legacy detection.
+    if (1..=CURRENT_VERSION).contains(&raw_version) {
+        // Quick check: does the schema match what we expect at this version?
+        // If queue_state_counts exists, we're past v4 in the current numbering.
+        let has_admin_tables: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'queue_state_counts')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .unwrap_or(false);
+
+        // Current v4+ has queue_state_counts. If we're at v4+ and have
+        // the table, this is definitely a current install.
+        if raw_version >= 4 && has_admin_tables {
+            return Ok(raw_version);
+        }
+        // Current v1-v3 don't have queue_state_counts.
+        if raw_version <= 3 {
+            let has_runtime: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'runtime_instances')",
+            )
+            .fetch_one(&mut *conn)
+            .await
+            .unwrap_or(false);
+            // v2+ has runtime_instances. If present, current install.
+            if (raw_version >= 2 && has_runtime) || raw_version == 1 {
+                return Ok(raw_version);
+            }
+        }
+    }
+
     // Detect legacy version numbering from pre-0.4 releases.
-    // Version 5/6 are always legacy. Version 4 is legacy only if the new
-    // admin metadata schema is absent.
+    // Legacy installs used a different numbering scheme where v3-v6 mapped
+    // to what is now v1-v4.
     let has_legacy_high: bool =
         sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM awa.schema_version WHERE version >= 6)")
             .fetch_one(&mut *conn)

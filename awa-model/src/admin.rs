@@ -648,6 +648,17 @@ where
 }
 
 /// Get statistics for all queues.
+///
+/// Hybrid read: per-state counts come from the `queue_state_counts`
+/// cache table (eventually consistent, ~2s lag), while `lag_seconds`
+/// and `completed_last_hour` are computed live from `jobs_hot`.
+///
+/// The cache is kept fresh by the maintenance leader's dirty-key
+/// recompute (~2s) and full reconciliation (~60s). Also warmed during
+/// `migrate()`.
+///
+/// For exact cached counts in tests without a running maintenance
+/// leader, call `flush_dirty_admin_metadata()` first.
 pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -796,6 +807,8 @@ where
 }
 
 /// Count jobs grouped by state.
+///
+/// Reads from the `queue_state_counts` cache table.
 pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -835,6 +848,8 @@ where
 }
 
 /// Return all distinct job kinds.
+///
+/// Reads from the `job_kind_catalog` cache table.
 pub async fn distinct_kinds<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -849,6 +864,8 @@ where
 }
 
 /// Return all distinct queue names.
+///
+/// Reads from the `job_queue_catalog` cache table.
 pub async fn distinct_queues<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
 where
     E: PgExecutor<'e>,
@@ -860,6 +877,50 @@ where
     .await?;
 
     Ok(rows)
+}
+
+/// Drain one batch of dirty keys and recompute exact cached rows.
+/// Returns the number of dirty keys processed in this batch.
+///
+/// Called frequently by the maintenance leader (~2s). Uses per-queue
+/// indexes for targeted recompute rather than full table scans.
+pub async fn recompute_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
+    let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
+        .fetch_one(pool)
+        .await?;
+    Ok(count)
+}
+
+/// Drain ALL dirty keys until the backlog is empty.
+///
+/// Use in tests or admin tooling where you need the cache to be fully
+/// consistent before reading. Each call to the underlying SQL function
+/// acquires a blocking advisory lock, so concurrent callers serialize
+/// rather than skip.
+pub async fn flush_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
+    let mut total = 0i32;
+    loop {
+        let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
+            .fetch_one(pool)
+            .await?;
+        total += count;
+        if count == 0 {
+            break;
+        }
+    }
+    Ok(total)
+}
+
+/// Full reconciliation of admin metadata counters from base tables.
+///
+/// Called infrequently by the maintenance leader (~60s) as a safety net
+/// to correct any drift from skipped dirty keys. Also called during
+/// migrate() to warm the cache.
+pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
+    sqlx::query("SELECT awa.refresh_admin_metadata()")
+        .execute(pool)
+        .await?;
+    Ok(())
 }
 
 /// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.

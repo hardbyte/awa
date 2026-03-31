@@ -1,7 +1,8 @@
 use crate::args::{derive_kind, get_type_class_name, serialize_args};
 use crate::errors::{map_awa_error, map_sqlx_error, state_error, validation_error};
 use crate::job::{json_to_py, py_to_json, PyJob};
-use awa_model::{InsertOpts, JobRow, JobState};
+use awa_model::unique::compute_unique_key;
+use awa_model::{InsertOpts, JobRow, JobState, UniqueOpts};
 use chrono::{DateTime, NaiveDateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -119,7 +120,7 @@ impl PyTransaction {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
@@ -132,10 +133,17 @@ impl PyTransaction {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         let prepared = Python::attach(|py| {
             prepare_insert(py, args.bind(py), kind, metadata.as_ref(), run_at.as_ref())
+        })?;
+        let unique = Python::attach(|py| {
+            unique_opts
+                .as_ref()
+                .map(|value| parse_unique_opts(py, value.bind(py)))
+                .transpose()
         })?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -152,6 +160,7 @@ impl PyTransaction {
                     run_at: prepared.run_at,
                     metadata: prepared.metadata_json,
                     tags,
+                    unique,
                     ..Default::default()
                 },
             )
@@ -343,6 +352,33 @@ fn parse_datetime_str(value: &str) -> PyResult<DateTime<Utc>> {
     Ok(DateTime::from_naive_utc_and_offset(naive, Utc))
 }
 
+/// Parse a Python dict into UniqueOpts.
+///
+/// Accepted keys: by_queue (bool), by_args (bool), by_period (int), states (int bitmask).
+/// All keys are optional and default to UniqueOpts::default().
+pub fn parse_unique_opts(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<UniqueOpts> {
+    let dict = value
+        .downcast::<PyDict>()
+        .map_err(|_| validation_error("unique_opts must be a dict"))?;
+
+    let mut opts = UniqueOpts::default();
+
+    if let Some(val) = dict.get_item("by_queue")? {
+        opts.by_queue = val.extract::<bool>()?;
+    }
+    if let Some(val) = dict.get_item("by_args")? {
+        opts.by_args = val.extract::<bool>()?;
+    }
+    if let Some(val) = dict.get_item("by_period")? {
+        opts.by_period = Some(val.extract::<i64>()?);
+    }
+    if let Some(val) = dict.get_item("states")? {
+        opts.states = val.extract::<u8>()?;
+    }
+
+    Ok(opts)
+}
+
 pub async fn insert_raw_job<'e, E>(
     executor: E,
     kind: &str,
@@ -358,10 +394,27 @@ where
         JobState::Available
     };
 
+    let unique_key = opts.unique.as_ref().map(|u| {
+        compute_unique_key(
+            kind,
+            if u.by_queue { Some(&opts.queue) } else { None },
+            if u.by_args { Some(args_json) } else { None },
+            u.by_period,
+        )
+    });
+
+    let unique_states: Option<String> = opts.unique.as_ref().map(|u| {
+        let mut bits = String::with_capacity(8);
+        for bit in 0..8 {
+            bits.push(if u.states & (1 << bit) != 0 { '1' } else { '0' });
+        }
+        bits
+    });
+
     sqlx::query_as::<_, JobRow>(
         r#"
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
-        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9)
+        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10, $11::bit(8))
         RETURNING *
         "#,
     )
@@ -374,6 +427,8 @@ where
     .bind(opts.run_at)
     .bind(&opts.metadata)
     .bind(&opts.tags)
+    .bind(&unique_key)
+    .bind(&unique_states)
     .fetch_one(executor)
     .await
     .map_err(awa_model::AwaError::from)
@@ -529,7 +584,7 @@ impl PySyncTransaction {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &self,
@@ -542,8 +597,13 @@ impl PySyncTransaction {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let prepared = prepare_insert(py, args.bind(py), kind, metadata.as_ref(), run_at.as_ref())?;
+        let unique = unique_opts
+            .as_ref()
+            .map(|value| parse_unique_opts(py, value.bind(py)))
+            .transpose()?;
         let tx = self.tx.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -560,6 +620,7 @@ impl PySyncTransaction {
                         run_at: prepared.run_at,
                         metadata: prepared.metadata_json,
                         tags,
+                        unique,
                         ..Default::default()
                     },
                 )

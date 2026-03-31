@@ -64,6 +64,7 @@ class AsyncClient:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
         return await self._raw.insert(
@@ -75,6 +76,7 @@ class AsyncClient:
             tags=tags if tags is not None else [],
             metadata=metadata,
             run_at=run_at,
+            unique_opts=unique_opts,
         )
 
     async def insert_many_copy(
@@ -155,6 +157,14 @@ class AsyncClient:
     async def drain_queue(self, queue: str) -> int:
         """Cancel all pending jobs in a queue."""
         return await self._raw.drain_queue(queue)
+
+    async def flush_admin_metadata(self) -> None:
+        """Drain dirty keys and recompute cached admin counters.
+
+        Call before ``queue_stats()`` in tests without a running
+        maintenance leader to ensure the cache is fresh.
+        """
+        return await self._raw.flush_admin_metadata()
 
     async def queue_stats(self) -> list[QueueStat]:
         """Per-queue statistics."""
@@ -304,6 +314,7 @@ class AsyncClient:
         heartbeat_interval_ms: int | None = None,
         promote_interval_ms: int | None = None,
         heartbeat_rescue_interval_ms: int | None = None,
+        heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
     ) -> None:
@@ -319,6 +330,7 @@ class AsyncClient:
             heartbeat_interval_ms=heartbeat_interval_ms,
             promote_interval_ms=promote_interval_ms,
             heartbeat_rescue_interval_ms=heartbeat_rescue_interval_ms,
+            heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
         )
@@ -352,6 +364,7 @@ class Client:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
         return self._raw.insert_sync(
@@ -363,6 +376,7 @@ class Client:
             tags=tags if tags is not None else [],
             metadata=metadata,
             run_at=run_at,
+            unique_opts=unique_opts,
         )
 
     def insert_many_copy(
@@ -443,6 +457,10 @@ class Client:
     def drain_queue(self, queue: str) -> int:
         """Cancel all pending jobs in a queue."""
         return self._raw.drain_queue_sync(queue)
+
+    def flush_admin_metadata(self) -> None:
+        """Drain dirty keys and recompute cached admin counters."""
+        return self._raw.flush_admin_metadata_sync()
 
     def queue_stats(self) -> list[QueueStat]:
         """Per-queue statistics."""

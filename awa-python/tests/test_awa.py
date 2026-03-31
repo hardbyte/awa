@@ -357,6 +357,7 @@ async def test_admin_queue_stats(client):
     await client.insert(
         SendEmail(to="stats@example.com", subject="Stats"), queue="stats_py_test"
     )
+    await client.flush_admin_metadata()
     stats = await client.queue_stats()
     assert isinstance(stats, list)
     stat = next((s for s in stats if s.queue == "stats_py_test"), None)

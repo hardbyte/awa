@@ -510,7 +510,7 @@ Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch 
 
 ### Queue Statistics (SQL)
 
-The `stats.sql` query and `admin::queue_stats()` function provide per-queue depth, lag, and throughput metrics directly from Postgres, suitable for Grafana dashboards or CLI monitoring (`awa queue stats`).
+The `admin::queue_stats()` function is a hybrid read: per-state counts come from the `queue_state_counts` cache table (eventually consistent, ~2s lag from the maintenance leader's dirty-key recompute), while `lag_seconds` and `completed_last_hour` are computed live from `jobs_hot`. The cache is maintained by dirty-key statement triggers on `jobs_hot` and `scheduled_jobs` that mark touched queues/kinds for targeted recompute — no synchronous counter updates on the hot path. For exact cached counts (e.g., in tests), call `flush_dirty_admin_metadata()` first. Full reconciliation via `refresh_admin_metadata()` runs every ~60s as a safety net.
 
 ## Web UI
 

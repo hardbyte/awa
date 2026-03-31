@@ -328,6 +328,9 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
     .await
     .expect("fixture insert should succeed");
 
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
+        .await
+        .unwrap();
     let stats = get_json(&app, "/api/stats").await;
     let available = stats["available"].as_i64().unwrap_or(0);
     let scheduled = stats["scheduled"].as_i64().unwrap_or(0);
@@ -365,6 +368,9 @@ async fn test_stats_and_catalog_endpoints_reflect_cached_admin_metadata() {
         .await
         .expect("delete should succeed");
 
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
+        .await
+        .unwrap();
     let kinds = get_json(&app, "/api/stats/kinds").await;
     let kinds = kinds.as_array().expect("kinds payload should be an array");
     assert!(!kinds
@@ -409,6 +415,9 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
         .await
         .expect("pause should succeed");
 
+    awa_model::admin::flush_dirty_admin_metadata(&pool)
+        .await
+        .unwrap();
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");

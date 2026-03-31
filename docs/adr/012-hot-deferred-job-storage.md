@@ -68,6 +68,10 @@ boundary intact across both physical tables.
   costs if benchmarks or runtime code accidentally use the view on the hot path
 - Requires explicit care in tests and admin paths to query the right physical
   table when measuring behavior
+- Lock-taking queries (`SELECT ... FOR UPDATE`, rescue operations) must target
+  the physical tables directly, not the `awa.jobs` view — `FOR UPDATE` is not
+  reliably supported on UNION ALL views, and the view's INSTEAD OF trigger
+  uses DELETE+INSERT which does not provide true row-level update atomicity
 
 ## Notes
 
