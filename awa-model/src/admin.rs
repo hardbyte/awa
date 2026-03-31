@@ -894,18 +894,36 @@ pub async fn recompute_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaErr
 /// Drain ALL dirty keys until the backlog is empty.
 ///
 /// Use in tests or admin tooling where you need the cache to be fully
-/// consistent before reading. In production, prefer the maintenance
-/// leader's periodic single-batch drain.
+/// consistent before reading. Retries if another caller holds the
+/// advisory lock (returns 0 without draining). In production, prefer
+/// the maintenance leader's periodic single-batch drain.
 pub async fn flush_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
     let mut total = 0i32;
+    let mut retries = 0;
     loop {
         let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
             .fetch_one(pool)
             .await?;
         total += count;
-        if count == 0 {
+        if count > 0 {
+            retries = 0;
+            continue;
+        }
+        // count == 0: either truly empty, or another caller holds the lock.
+        // Check if dirty keys remain.
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM awa.admin_dirty_queues) + (SELECT count(*) FROM awa.admin_dirty_kinds)",
+        )
+        .fetch_one(pool)
+        .await?;
+        if remaining == 0 {
             break;
         }
+        retries += 1;
+        if retries > 50 {
+            break; // Give up after ~5s of retrying
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     Ok(total)
 }
