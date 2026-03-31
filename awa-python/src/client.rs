@@ -353,6 +353,19 @@ impl PyClient {
         })
     }
 
+    /// Close the connection pool, releasing all database connections.
+    ///
+    /// Call after `shutdown()` to release connections, or call directly
+    /// if the client was used only for queries (no workers started).
+    /// If workers are running, call `shutdown()` first.
+    fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            pool.close().await;
+            Ok(())
+        })
+    }
+
     fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         // Run synchronously via block_on then return an already-resolved future
@@ -1277,6 +1290,16 @@ impl PyClient {
                 .await
                 .map_err(map_awa_error)?;
                 Ok(PyJob::from(row))
+            })
+        })
+    }
+
+    fn close_sync(&self, py: Python<'_>) -> PyResult<()> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                pool.close().await;
+                Ok(())
             })
         })
     }

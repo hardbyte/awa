@@ -33,23 +33,36 @@ class AsyncClient:
     Use this when your application runs in an async context (FastAPI,
     Starlette, standalone async scripts, worker processes).
 
-    Example::
+    Supports ``async with`` for automatic pool cleanup::
+
+        async with awa.AsyncClient("postgres://localhost/mydb") as client:
+            await client.migrate()
+            await client.insert(SendEmail(to="alice@example.com", subject="Hi"))
+            # pool is closed automatically on exit
+
+    For worker processes::
 
         client = awa.AsyncClient("postgres://localhost/mydb")
         await client.migrate()
 
-        @client.worker(SendEmail, queue="email")
+        @client.task(SendEmail, queue="email")
         async def handle(job):
             print(f"Sending to {job.args.to}")
 
-        await client.insert(SendEmail(to="alice@example.com", subject="Hi"))
         client.start([("email", 2)])
         ...
         await client.shutdown()
+        await client.close()
     """
 
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
         self._raw = RawClient(database_url, max_connections)
+
+    async def __aenter__(self) -> "AsyncClient":
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
 
     # ── Job operations (async) ──────────────────────────────────
 
@@ -188,8 +201,22 @@ class AsyncClient:
         return await self._raw.health_check()
 
     async def shutdown(self, timeout_ms: int = 2000) -> None:
-        """Graceful shutdown with drain timeout."""
+        """Graceful shutdown: stop workers and drain in-flight jobs.
+
+        The connection pool remains open so you can still query the
+        database after shutdown (e.g. to verify final state). Call
+        :meth:`close` when you're done to release all connections.
+        """
         return await self._raw.shutdown(timeout_ms)
+
+    async def close(self) -> None:
+        """Close the connection pool, releasing all database connections.
+
+        After ``close()`` any attempt to use the client raises
+        ``DatabaseError``. Call this when you're done with the client
+        to avoid leaking connections.
+        """
+        return await self._raw.close()
 
     # ── External callbacks (async) ──────────────────────────────
 
@@ -352,6 +379,16 @@ class Client:
 
     def __init__(self, database_url: str, max_connections: int = 10) -> None:
         self._raw = RawClient(database_url, max_connections)
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
+
+    def close(self) -> None:
+        """Close the connection pool, releasing all database connections."""
+        return self._raw.close_sync()
 
     def insert(
         self,

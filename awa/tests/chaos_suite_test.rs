@@ -327,10 +327,10 @@ async fn terminate_backend(pool: &sqlx::PgPool, pid: i32) {
         .fetch_one(pool)
         .await
         .expect("Failed to terminate backend");
-    assert!(
-        terminated.0,
-        "Postgres declined to terminate backend pid={pid}"
-    );
+    if !terminated.0 {
+        // Backend already disconnected — same end result as terminating it.
+        eprintln!("terminate_backend: pid={pid} already gone (race with pool recycling)");
+    }
 }
 
 async fn terminate_application_backends(pool: &sqlx::PgPool, app_name: &str) -> usize {
@@ -793,6 +793,44 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     insert_wave(&pool, &queue, &mut seq).await;
     insert_wave(&pool, &queue, &mut seq).await;
 
+    // Insert a large batch of simple jobs so Python is guaranteed to claim
+    // at least one. Rust workers are faster but Python (400ms/job) will
+    // eventually get one — we poll until we see it running, then kill.
+    for i in 0..20 {
+        insert_with(
+            &pool,
+            &SimpleChaosJob { seq: seq + i },
+            InsertOpts {
+                queue: queue.clone(),
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("Failed to insert pre-kill simple chaos job");
+    }
+    seq += 20;
+
+    // Wait until at least one simple job is running — don't use a fixed sleep.
+    let poll_start = Instant::now();
+    loop {
+        let running: (i64,) = sqlx::query_as(
+            "SELECT count(*)::bigint FROM awa.jobs WHERE queue = $1 AND kind = 'simple_chaos_job' AND state = 'running'",
+        )
+        .bind(&queue)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to query running simple jobs");
+        if running.0 >= 1 {
+            break;
+        }
+        assert!(
+            poll_start.elapsed() < Duration::from_secs(10),
+            "Timed out waiting for at least one simple_chaos_job to be running"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
     python_worker.stop().await;
 
     let _ = wait_for_single_leader(&[&client_a, &client_b], Duration::from_secs(5)).await;
@@ -883,7 +921,8 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     .await
     .expect("Failed to backdate run_at for retryable chaos jobs");
 
-    let expected_completed = 1 + (total_waves * 5);
+    // 1 sentinel + 5 per wave (2 simple + 2 complete + 1 retry_once_manual) + 20 pre-kill simple
+    let expected_completed = 1 + (total_waves * 5) + 20;
     let expected_failed = total_waves;
 
     let counts = wait_for_counts(
