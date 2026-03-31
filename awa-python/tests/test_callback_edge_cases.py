@@ -7,7 +7,6 @@ Covers scenarios that were previously only tested in Rust:
   - E9:  Admin retry while waiting_external
   - E10: Drain queue includes waiting_external jobs
   - E11: Race: complete_external during running (before WaitForCallback)
-  - E13: Uniqueness enforced during waiting_external
   - E16: Stale callback rejected by run_lease
 """
 
