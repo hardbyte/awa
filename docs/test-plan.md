@@ -281,13 +281,15 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/test_sequential_callbacks.py -v
 
 # TLA+ correctness models (requires Docker)
-./correctness/run-tlc.sh AwaCore.tla
-./correctness/run-tlc.sh AwaExtended.tla
-./correctness/run-tlc.sh AwaBatcher.tla
-./correctness/run-tlc.sh AwaBatcher.tla AwaBatcherLiveness.cfg
-./correctness/run-tlc.sh AwaCbk.tla
-./correctness/run-tlc.sh AwaCbk.tla AwaCbkLiveness.cfg
-./correctness/run-tlc.sh AwaCron.tla AwaCronLiveness.cfg
+./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh protocol/AwaExtended.tla
+./correctness/run-tlc.sh core/AwaBatcher.tla
+./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
+./correctness/run-tlc.sh races/AwaCbk.tla
+./correctness/run-tlc.sh races/AwaCbk.tla races/AwaCbkLiveness.cfg
+./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimNew.cfg
 
 # Concurrent multi-queue lifecycle benchmarks
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --release --package awa --test concurrent_lifecycle_test -- --ignored --nocapture

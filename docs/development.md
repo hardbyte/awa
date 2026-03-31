@@ -94,8 +94,8 @@ uv run maturin develop
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run pytest tests/ -v
 
 # TLA+ correctness models
-./correctness/run-tlc.sh AwaCore.tla
-./correctness/run-tlc.sh AwaExtended.tla
+./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh protocol/AwaExtended.tla
 ```
 
 ## Pre-commit Checks (Rust)
