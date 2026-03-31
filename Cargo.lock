@@ -156,7 +156,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "awa"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -181,7 +181,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "awa-model",
  "awa-ui",
@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -208,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -229,7 +229,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -244,7 +244,7 @@ dependencies = [
 
 [[package]]
 name = "awa-ui"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "awa-model",
  "awa-testing",
@@ -266,7 +266,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.5.1-alpha.2"
+version = "0.5.1-alpha.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1184,18 +1184,18 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hybrid-array"
-version = "0.4.9"
+version = "0.4.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1a79f2aff40c18ab8615ddc5caa9eb5b96314aef18fe5823090f204ad988e813"
+checksum = "3944cf8cf766b40e2a1a333ee5e9b563f854d5fa49d6a8ca2764e97c6eddb214"
 dependencies = [
  "typenum",
 ]
 
 [[package]]
 name = "hyper"
-version = "1.8.1"
+version = "1.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2ab2d4f250c3d7b1c9fcdff1cece94ea4e2dfbec68614f7b87cb205f24ca9d11"
+checksum = "6299f016b246a94207e63da54dbe807655bf9e00044f73ded42c3ac5305fbcca"
 dependencies = [
  "atomic-waker",
  "bytes",
@@ -1208,7 +1208,6 @@ dependencies = [
  "httpdate",
  "itoa",
  "pin-project-lite",
- "pin-utils",
  "smallvec",
  "tokio",
  "want",
@@ -2006,12 +2005,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pin-utils"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b870d8c151b6f2fb93e84a13146138f05d02ed11c7e7c54f8826aaaf7c9f184"
 
 [[package]]
 name = "pkcs1"
@@ -3197,18 +3190,18 @@ dependencies = [
 
 [[package]]
 name = "toml_datetime"
-version = "1.1.0+spec-1.1.0"
+version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "97251a7c317e03ad83774a8752a7e81fb6067740609f75ea2b585b569a59198f"
+checksum = "3165f65f62e28e0115a00b2ebdd37eb6f3b641855f9d636d3cd4103767159ad7"
 dependencies = [
  "serde_core",
 ]
 
 [[package]]
 name = "toml_edit"
-version = "0.25.8+spec-1.1.0"
+version = "0.25.9+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "16bff38f1d86c47f9ff0647e6838d7bb362522bdf44006c7068c2b1e606f1f3c"
+checksum = "da053d28fe57e2c9d21b48261e14e7b4c8b670b54d2c684847b91feaf4c7dac5"
 dependencies = [
  "indexmap",
  "toml_datetime",
@@ -3218,9 +3211,9 @@ dependencies = [
 
 [[package]]
 name = "toml_parser"
-version = "1.1.0+spec-1.1.0"
+version = "1.1.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2334f11ee363607eb04df9b8fc8a13ca1715a72ba8662a26ac285c98aabb4011"
+checksum = "39ca317ebc49f06bd748bfba29533eac9485569dc9bf80b849024b025e814fb9"
 dependencies = [
  "winnow",
 ]
