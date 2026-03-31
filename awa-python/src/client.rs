@@ -1294,6 +1294,16 @@ impl PyClient {
         })
     }
 
+    fn close_sync(&self, py: Python<'_>) -> PyResult<()> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                pool.close().await;
+                Ok(())
+            })
+        })
+    }
+
     fn migrate_sync(&self, py: Python<'_>) -> PyResult<()> {
         let pool = self.pool.clone();
         py.detach(|| {
