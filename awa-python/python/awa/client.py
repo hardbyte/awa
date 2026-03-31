@@ -188,14 +188,20 @@ class AsyncClient:
         return await self._raw.health_check()
 
     async def shutdown(self, timeout_ms: int = 2000) -> None:
-        """Graceful shutdown with drain timeout. Also closes the connection pool."""
+        """Graceful shutdown: stop workers and drain in-flight jobs.
+
+        The connection pool remains open so you can still query the
+        database after shutdown (e.g. to verify final state). Call
+        :meth:`close` when you're done to release all connections.
+        """
         return await self._raw.shutdown(timeout_ms)
 
     async def close(self) -> None:
         """Close the connection pool, releasing all database connections.
 
-        Called automatically by :meth:`shutdown`. Use this directly if
-        the client was only used for queries (no workers started).
+        After ``close()`` any attempt to use the client raises
+        ``DatabaseError``. Call this when you're done with the client
+        to avoid leaking connections.
         """
         return await self._raw.close()
 

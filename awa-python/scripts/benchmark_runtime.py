@@ -220,6 +220,7 @@ async def run_hot_benchmark(
     )
 
     await client.shutdown(timeout_ms=5000)
+    await client.close()
 
     handler_delta = handler_returned - handler_before
     completed_delta = completed_after - completed_before
@@ -381,6 +382,7 @@ async def run_scheduled_benchmark(
     )
 
     await client.shutdown(timeout_ms=5000)
+    await client.close()
 
     print(
         f"[py-steady-scheduled] seeded={total_jobs} due_rate={due_rate}/s "
@@ -503,6 +505,7 @@ async def _run_single_sweep(
         queue,
     )
     await client.shutdown(timeout_ms=5000)
+    await client.close()
 
     handler_delta = handler_returned - handler_before
     completed_delta = completed_after - completed_before
@@ -587,6 +590,7 @@ async def run_latency_jitter(
         await asyncio.sleep(0.5)
 
     await client.shutdown(timeout_ms=5000)
+    await client.close()
 
     completed = len(pickup_lateness_ms)
     latency = None
@@ -681,6 +685,7 @@ async def run_heartbeat_rescue(
     drain_time = asyncio.get_running_loop().time() - started
     final_counts = await state_counts(client, queue)
     await client.shutdown(timeout_ms=5000)
+    await client.close()
     completed = final_counts.get("completed", 0)
     handler_per_s = handler_returned / drain_time if drain_time > 0 else 0
     db_per_s = completed / drain_time if drain_time > 0 else 0
@@ -842,6 +847,7 @@ async def run_failure_benchmark(
         drain_time = asyncio.get_running_loop().time() - started
     finally:
         await client.shutdown(timeout_ms=5000)
+    await client.close()
 
     timed_out = in_flight_jobs(final_counts) > 0
     if timed_out:

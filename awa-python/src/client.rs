@@ -882,14 +882,10 @@ impl PyClient {
     #[pyo3(signature = (timeout_ms=2000))]
     fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").take();
-        let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
-            // Close the connection pool so connections are released immediately
-            // rather than lingering until the Python object is garbage collected.
-            pool.close().await;
             Ok(())
         })
     }
