@@ -245,13 +245,12 @@ async fn test_stale_candidate_cannot_reclaim_running_row() {
     .unwrap();
     assert_eq!(second_claim, None, "stale candidate must not re-claim row");
 
-    let final_row: (String, i16, i64) = sqlx::query_as(
-        "SELECT state::text, attempt, run_lease FROM awa.jobs WHERE id = $1",
-    )
-    .bind(candidate_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let final_row: (String, i16, i64) =
+        sqlx::query_as("SELECT state::text, attempt, run_lease FROM awa.jobs WHERE id = $1")
+            .bind(candidate_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(final_row, ("running".to_string(), 1, 1));
 }
 
