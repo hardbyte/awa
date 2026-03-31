@@ -355,8 +355,9 @@ impl PyClient {
 
     /// Close the connection pool, releasing all database connections.
     ///
-    /// Called automatically by `shutdown()`, but can also be called
-    /// directly if the client was used only for queries (no workers).
+    /// Call after `shutdown()` to release connections, or call directly
+    /// if the client was used only for queries (no workers started).
+    /// If workers are running, call `shutdown()` first.
     fn close<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {

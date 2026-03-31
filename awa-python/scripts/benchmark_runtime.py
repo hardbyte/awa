@@ -847,7 +847,7 @@ async def run_failure_benchmark(
         drain_time = asyncio.get_running_loop().time() - started
     finally:
         await client.shutdown(timeout_ms=5000)
-    await client.close()
+        await client.close()
 
     timed_out = in_flight_jobs(final_counts) > 0
     if timed_out:
