@@ -1243,20 +1243,19 @@ async fn test_heartbeat_progress_updates_do_not_dirty_admin_metadata() {
         .await
         .unwrap();
 
-    // Verify no dirty keys were created
-    let dirty_queues: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues")
-        .fetch_one(client.pool())
-        .await
-        .unwrap();
-    let dirty_kinds: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_kinds")
-        .fetch_one(client.pool())
-        .await
-        .unwrap();
+    // Verify no dirty key was created for THIS queue.
+    // We check by queue name (unique to this test) rather than count(*)
+    // because concurrent parallel tests may dirty other queues/kinds.
+    let dirty_for_queue: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues WHERE queue = $1")
+            .bind(queue)
+            .fetch_one(client.pool())
+            .await
+            .unwrap();
     assert_eq!(
-        dirty_queues, 0,
-        "heartbeat/progress should not dirty queues"
+        dirty_for_queue, 0,
+        "heartbeat/progress should not dirty this queue"
     );
-    assert_eq!(dirty_kinds, 0, "heartbeat/progress should not dirty kinds");
 }
 
 /// flush_dirty_admin_metadata() must drain the entire backlog, not just
