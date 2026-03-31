@@ -269,6 +269,7 @@ impl PyClient {
             .block_on(async {
                 PgPoolOptions::new()
                     .max_connections(max_connections)
+                    .acquire_timeout(Duration::from_secs(30))
                     .connect(&database_url)
                     .await
             })
