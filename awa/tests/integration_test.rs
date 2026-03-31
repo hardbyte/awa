@@ -1289,14 +1289,13 @@ async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
         .unwrap();
     }
 
-    // flush should drain ALL dirty keys (ours plus any from concurrent tests).
-    // We can't assert on the pre-flush count because the advisory lock in
-    // recompute_dirty_admin_metadata serializes callers, and another test
-    // may have drained some keys already.
-    let flushed = admin::flush_dirty_admin_metadata(client.pool())
+    // Flush all dirty keys. We don't assert on the count because a
+    // concurrent migrate() or parallel test may have already drained
+    // them via refresh_admin_metadata(). The important assertion is
+    // that the cache is correct afterward.
+    admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    assert!(flushed > 0, "should have flushed some keys, got {flushed}");
 
     let dirty_after: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues")
         .fetch_one(client.pool())
