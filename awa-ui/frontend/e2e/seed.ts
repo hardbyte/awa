@@ -59,6 +59,10 @@ export default async function globalSetup() {
     -- Cancelled job
     INSERT INTO awa.jobs (kind, queue, state, args, priority, attempt, max_attempts, tags, finalized_at)
     VALUES ('e2e_job', 'e2e_test', 'cancelled', '{"test": true}', 2, 1, 5, '{e2e}', now());
+
+    -- Flush dirty admin metadata so queue_stats cache is fresh for E2E tests
+    -- (awa serve does not run a maintenance leader)
+    SELECT awa.recompute_dirty_admin_metadata(100);
   `;
 
   try {

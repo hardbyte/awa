@@ -196,6 +196,14 @@ DECLARE
     v_waiting_external BIGINT;
     v_ref_count BIGINT;
 BEGIN
+    -- Serialize concurrent callers. Without this, two callers draining
+    -- different dirty queues can deadlock on job_queue_catalog/job_kind_catalog
+    -- upserts. The advisory lock is session-scoped and released at commit.
+    IF NOT pg_try_advisory_xact_lock(1098018130) THEN
+        -- Another caller is already recomputing; skip this cycle.
+        RETURN 0;
+    END IF;
+
     -- Drain dirty queues
     FOR dirty_q IN
         DELETE FROM awa.admin_dirty_queues
