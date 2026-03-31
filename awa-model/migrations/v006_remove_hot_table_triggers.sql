@@ -276,11 +276,22 @@ CREATE TRIGGER trg_scheduled_jobs_dirty_keys_update
     FOR EACH STATEMENT
     EXECUTE FUNCTION awa.mark_dirty_keys_update();
 
--- ── Step 6: Targeted recompute function ─────────────────────────────
+-- ── Step 6: Cache table writers ──────────────────────────────────────
 --
--- Drains dirty keys and recomputes exact cached rows from base tables.
--- Uses the (queue, state) index for efficient per-queue counts.
--- Called frequently by the maintenance leader (every ~1-5s).
+-- LOCKING CONTRACT: any function that mutates queue_state_counts,
+-- job_kind_catalog, or job_queue_catalog MUST acquire advisory lock
+-- 1098018130 (pg_advisory_xact_lock) before writing. This serializes
+-- the two writer paths — targeted recompute and full refresh — and
+-- prevents deadlocks on the cache table rows.
+--
+-- This lock is narrow and low-frequency:
+--   - recompute: ~2s maintenance timer, one 100-key batch per call
+--   - refresh: ~60s reconciliation timer, or once at migrate()
+-- The protected tables are the same three shared cache tables.
+-- Do NOT extend this lock to other paths.
+--
+-- Targeted recompute: drains dirty keys and recomputes exact cached
+-- rows from base tables using the (queue, state) index.
 
 CREATE OR REPLACE FUNCTION awa.recompute_dirty_admin_metadata(
     p_batch_size INT DEFAULT 100
@@ -413,6 +424,14 @@ $$ LANGUAGE plpgsql;
 
 CREATE OR REPLACE FUNCTION awa.refresh_admin_metadata() RETURNS VOID AS $$
 BEGIN
+    -- Serialize against recompute_dirty_admin_metadata() — both functions
+    -- upsert into queue_state_counts/job_kind_catalog/job_queue_catalog.
+    -- Without this, concurrent callers deadlock on the cache table rows.
+    PERFORM pg_advisory_xact_lock(1098018130);
+
+    -- Clear dirty keys since a full refresh supersedes pending recomputes.
+    TRUNCATE awa.admin_dirty_queues, awa.admin_dirty_kinds;
+
     -- Refresh queue_state_counts
     WITH current_counts AS (
         SELECT
