@@ -12,8 +12,11 @@ low-level or too specialized for the larger protocol model.
   Covers cron double-fire prevention under leader failover.
 - `AwaDispatchClaim.tla` / `AwaDispatchClaimOld.cfg` /
   `AwaDispatchClaimNew.cfg`
-  Focused proof for issue #134. The old config reproduces the stale-candidate
-  double-claim; the new config models the availability re-check and passes.
+  Focused proof for issue #134. Includes retry cycles (completed → available)
+  so `attempt > 1` is exercised as a legitimate path. Uses `NoDuplicateClaim`
+  invariant (claims-per-available-round ≤ 1) instead of absolute attempt count.
+  The old config reproduces the stale-candidate double-claim; the new config
+  models the availability re-check and passes.
 
 ## When To Use
 
