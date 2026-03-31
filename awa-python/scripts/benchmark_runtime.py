@@ -922,6 +922,7 @@ async def async_main(args: argparse.Namespace) -> None:
     if args.scenario in {"copy", "all", "baseline"}:
         client = await make_client(args)
         await run_copy_benchmark(client, args.copy_total_jobs, args.copy_chunk_size)
+        await client.close()
     if args.scenario in {"hot", "all", "baseline"}:
         client = await make_client(args)
         await run_hot_benchmark(
