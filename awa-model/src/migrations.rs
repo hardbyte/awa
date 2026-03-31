@@ -115,12 +115,14 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
     .fetch_one(&mut *conn)
     .await?;
     if has_refresh {
-        // Best-effort: if concurrent migrations race, one may fail with a
-        // deadlock or lock conflict. The next migrate() or maintenance
-        // leader refresh will correct it.
-        let _ = sqlx::raw_sql("SELECT awa.refresh_admin_metadata()")
-            .execute(&mut *conn)
-            .await;
+        // Best-effort cache warmup. Uses a short statement timeout to avoid
+        // blocking if a previous runtime's maintenance leader is still
+        // holding the cache advisory lock during a slow shutdown.
+        let _ = sqlx::raw_sql(
+            "SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata()",
+        )
+        .execute(&mut *conn)
+        .await;
     }
 
     Ok(())
