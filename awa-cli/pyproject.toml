@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "awa-cli"
-version = "0.5.1"
+version = "0.5.1a0"
 description = "CLI for the Awa Postgres-native job queue (migrations, admin, serve)"
 readme = "README.md"
 requires-python = ">=3.10"
