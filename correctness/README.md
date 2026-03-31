@@ -62,6 +62,12 @@ What is intentionally not modeled:
   exercised as a legitimate path; the old config intentionally fails the
   `NoDuplicateClaim` invariant and the new config re-checks availability at
   claim time
+- `AwaViewTrigger.tla` / `AwaViewTrigger.cfg` / `AwaViewTriggerOld.cfg`:
+  INSTEAD OF UPDATE trigger concurrency model for the `awa.jobs` UNION ALL
+  view; the trigger implements UPDATE as DELETE + INSERT for cross-table
+  moves, and the v006 fix adds a version check (state, run_lease,
+  callback_id) on the DELETE so concurrent callers can't both succeed on
+  state-changing operations; the old config models the v001 bug from #132
 - `AwaCron.tla` / `AwaCron.cfg` / `AwaCronLiveness.cfg`: cron double-fire
   prevention under leader failover with CAS on `last_enqueued_at`
 - `Dockerfile`: Docker-first TLC environment
@@ -72,15 +78,17 @@ What is intentionally not modeled:
 From the repository root:
 
 ```bash
-./correctness/run-tlc.sh AwaCore.tla
-./correctness/run-tlc.sh AwaExtended.tla
-./correctness/run-tlc.sh AwaBatcher.tla
-./correctness/run-tlc.sh AwaBatcher.tla AwaBatcherLiveness.cfg
-./correctness/run-tlc.sh AwaCbk.tla
-./correctness/run-tlc.sh AwaCbk.tla AwaCbkLiveness.cfg
-./correctness/run-tlc.sh AwaDispatchClaim.tla AwaDispatchClaimOld.cfg
-./correctness/run-tlc.sh AwaDispatchClaim.tla AwaDispatchClaimNew.cfg
-./correctness/run-tlc.sh AwaCron.tla AwaCronLiveness.cfg
+./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh core/AwaBatcher.tla
+./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
+./correctness/run-tlc.sh protocol/AwaExtended.tla
+./correctness/run-tlc.sh races/AwaCbk.tla
+./correctness/run-tlc.sh races/AwaCbk.tla races/AwaCbkLiveness.cfg
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimNew.cfg
+./correctness/run-tlc.sh races/AwaViewTrigger.tla
+./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
+./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
 ```
 
 Or directly:

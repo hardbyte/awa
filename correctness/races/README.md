@@ -17,6 +17,12 @@ low-level or too specialized for the larger protocol model.
   invariant (claims-per-available-round ≤ 1) instead of absolute attempt count.
   The old config reproduces the stale-candidate double-claim; the new config
   models the availability re-check and passes.
+- `AwaViewTrigger.tla` / `AwaViewTrigger.cfg` / `AwaViewTriggerOld.cfg`
+  INSTEAD OF UPDATE trigger concurrency on the `awa.jobs` UNION ALL view
+  (#132). The trigger implements UPDATE as DELETE + INSERT for cross-table
+  moves; the v006 fix adds a version check (state, run_lease, callback_id)
+  so concurrent callers can't both succeed on state-changing operations.
+  The old config reproduces the double-apply race.
 
 ## When To Use
 
@@ -33,4 +39,6 @@ low-level or too specialized for the larger protocol model.
 ./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
 ./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
 ./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimNew.cfg
+./correctness/run-tlc.sh races/AwaViewTrigger.tla
+./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
 ```
