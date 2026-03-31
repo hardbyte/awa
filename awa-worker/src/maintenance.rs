@@ -445,7 +445,7 @@ impl MaintenanceService {
                     'at', now()
                 )::jsonb
             WHERE id IN (
-                SELECT id FROM awa.jobs
+                SELECT id FROM awa.jobs_hot
                 WHERE state = 'running'
                   AND heartbeat_at < now() - $1::interval
                 LIMIT 500
@@ -496,7 +496,7 @@ impl MaintenanceService {
                     'at', now()
                 )::jsonb
             WHERE id IN (
-                SELECT id FROM awa.jobs
+                SELECT id FROM awa.jobs_hot
                 WHERE state = 'running'
                   AND deadline_at IS NOT NULL
                   AND deadline_at < now()
@@ -547,7 +547,7 @@ impl MaintenanceService {
                     'at', now()
                 )::jsonb
             WHERE id IN (
-                SELECT id FROM awa.jobs
+                SELECT id FROM awa.jobs_hot
                 WHERE state = 'waiting_external'
                   AND callback_timeout_at IS NOT NULL
                   AND callback_timeout_at < now()

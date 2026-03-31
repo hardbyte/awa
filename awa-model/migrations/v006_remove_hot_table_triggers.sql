@@ -17,6 +17,109 @@
 --   - Bounded drift localized to recently-touched queues/kinds
 --   - Full reconciliation via refresh_admin_metadata() as safety net
 
+-- ── Step 0: Fix concurrent UPDATE race in awa.jobs view trigger ─────
+--
+-- The v001 INSTEAD OF UPDATE trigger on awa.jobs implements UPDATE as
+-- DELETE + INSERT to handle cross-table state transitions (hot ↔ scheduled).
+-- The DELETE used only WHERE id = $1, so a concurrent UPDATE could delete
+-- a row just re-inserted by another transaction (same id, different state).
+-- Both callers saw success — violating at-most-once callback resolution.
+--
+-- Fix: the DELETE now checks state, run_lease, and callback_id from OLD,
+-- so it only removes the exact version it was handed. If a concurrent
+-- transaction already modified the row, the DELETE matches 0 rows and
+-- RETURN NULL tells PostgreSQL to skip this row (0 rows in RETURNING).
+--
+-- Also changes rescue queries from awa.jobs view to awa.jobs_hot directly,
+-- since FOR UPDATE on UNION ALL views is not reliably supported.
+
+CREATE OR REPLACE FUNCTION awa.write_jobs_view() RETURNS trigger AS $$
+DECLARE
+    target_table TEXT;
+    source_table TEXT;
+    rows_deleted INTEGER;
+BEGIN
+    IF TG_OP = 'INSERT' THEN
+        NEW.id := COALESCE(NEW.id, nextval('awa.jobs_id_seq'));
+        NEW.queue := COALESCE(NEW.queue, 'default');
+        NEW.args := COALESCE(NEW.args, '{}'::jsonb);
+        NEW.state := COALESCE(NEW.state, 'available'::awa.job_state);
+        NEW.priority := COALESCE(NEW.priority, 2);
+        NEW.attempt := COALESCE(NEW.attempt, 0);
+        NEW.max_attempts := COALESCE(NEW.max_attempts, 25);
+        NEW.run_at := COALESCE(NEW.run_at, now());
+        NEW.created_at := COALESCE(NEW.created_at, now());
+        NEW.errors := COALESCE(NEW.errors, '{}'::jsonb[]);
+        NEW.metadata := COALESCE(NEW.metadata, '{}'::jsonb);
+        NEW.tags := COALESCE(NEW.tags, '{}'::text[]);
+        NEW.run_lease := COALESCE(NEW.run_lease, 0);
+    END IF;
+
+    IF TG_OP = 'DELETE' THEN
+        source_table := CASE
+            WHEN OLD.state IN ('scheduled'::awa.job_state, 'retryable'::awa.job_state)
+                THEN 'awa.scheduled_jobs'
+            ELSE 'awa.jobs_hot'
+        END;
+        EXECUTE format('DELETE FROM %s WHERE id = $1', source_table) USING OLD.id;
+        RETURN OLD;
+    END IF;
+
+    IF TG_OP = 'UPDATE' THEN
+        source_table := CASE
+            WHEN OLD.state IN ('scheduled'::awa.job_state, 'retryable'::awa.job_state)
+                THEN 'awa.scheduled_jobs'
+            ELSE 'awa.jobs_hot'
+        END;
+        -- Optimistic concurrency: only delete the exact version from OLD.
+        -- If a concurrent transaction already modified this row (changing
+        -- state, run_lease, or callback_id), the DELETE matches 0 rows
+        -- and we return NULL — the caller sees 0 rows from RETURNING.
+        EXECUTE format(
+            'DELETE FROM %s WHERE id = $1 AND state = $2 AND run_lease = $3 AND callback_id IS NOT DISTINCT FROM $4',
+            source_table
+        ) USING OLD.id, OLD.state, OLD.run_lease, OLD.callback_id;
+        GET DIAGNOSTICS rows_deleted = ROW_COUNT;
+
+        IF rows_deleted = 0 THEN
+            RETURN NULL;
+        END IF;
+    END IF;
+
+    target_table := CASE
+        WHEN NEW.state IN ('scheduled'::awa.job_state, 'retryable'::awa.job_state)
+            THEN 'awa.scheduled_jobs'
+        ELSE 'awa.jobs_hot'
+    END;
+
+    EXECUTE format(
+        'INSERT INTO %s (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter, callback_on_complete,
+            callback_on_fail, callback_transform, run_lease, progress
+        ) VALUES (
+            $1, $2, $3, $4, $5, $6, $7, $8,
+            $9, $10, $11, $12, $13,
+            $14, $15, $16, $17, $18, $19,
+            $20, $21, $22, $23,
+            $24, $25, $26, $27
+        )',
+        target_table
+    )
+    USING
+        NEW.id, NEW.kind, NEW.queue, NEW.args, NEW.state, NEW.priority, NEW.attempt,
+        NEW.max_attempts, NEW.run_at, NEW.heartbeat_at, NEW.deadline_at, NEW.attempted_at,
+        NEW.finalized_at, NEW.created_at, NEW.errors, NEW.metadata, NEW.tags,
+        NEW.unique_key, NEW.unique_states, NEW.callback_id, NEW.callback_timeout_at,
+        NEW.callback_filter, NEW.callback_on_complete, NEW.callback_on_fail,
+        NEW.callback_transform, NEW.run_lease, NEW.progress;
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
 -- ── Step 1: Drop v005 statement-level triggers on jobs_hot ──────────
 
 DROP TRIGGER IF EXISTS trg_jobs_hot_admin_metadata_insert_stmt ON awa.jobs_hot;
