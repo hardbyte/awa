@@ -118,8 +118,10 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         // Best-effort cache warmup. Uses a short statement timeout to avoid
         // blocking if a previous runtime's maintenance leader is still
         // holding the cache advisory lock during a slow shutdown.
+        // Wrapped in an explicit transaction because SET LOCAL is only
+        // effective inside a transaction block (not in autocommit mode).
         let _ = sqlx::raw_sql(
-            "SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata()",
+            "BEGIN; SET LOCAL statement_timeout = '5s'; SELECT awa.refresh_admin_metadata(); COMMIT;",
         )
         .execute(&mut *conn)
         .await;
