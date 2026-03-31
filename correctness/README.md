@@ -268,3 +268,50 @@ needs an extra environment assumption such as "some instance remains running".
 - Permit ownership is modeled at the job-row level. This is accurate enough for
   the checked invariants, but it is still an abstraction of the real Rust task
   handles and `DispatchPermit` lifetimes.
+
+## Bugs the Models Did Not Catch
+
+### Concurrent UPDATE race on the `awa.jobs` view (v0.5.1, #132)
+
+The `awa.jobs` UNION ALL view's INSTEAD OF UPDATE trigger implemented UPDATE
+as DELETE + INSERT. The DELETE matched only on `id`, so when two concurrent
+callers (e.g., two `resume_external` calls) raced on the same callback_id:
+
+1. Both callers found the row in the view (both saw `callback_id = X`)
+2. Both entered the trigger with identical `OLD` records
+3. Transaction A's DELETE succeeded; transaction B's DELETE (after A committed)
+   found and deleted A's freshly re-inserted row
+4. Both INSERTs succeeded — both callers observed success
+
+This violated at-most-once callback resolution: two callers both returned
+a `JobRow` for the same callback, with A's state change silently lost.
+
+**Why the TLA+ models missed it:**
+
+1. **Wrong abstraction boundary.** The models explicitly do not cover SQL
+   text, trigger mechanics, or the `awa.jobs` compatibility view
+   (see Known Divergences above). `AwaCbk` models a logical row with
+   row-lock semantics — it assumes a plain Postgres UPDATE that blocks,
+   re-evaluates, and returns 0 rows if the WHERE clause no longer matches.
+   The DELETE+INSERT trigger with stale `OLD` inputs is not representable
+   in that abstraction.
+
+2. **Assumes row-level UPDATE atomicity.** In `AwaCbk.tla`, blocked
+   callback operations wait on `rowLock`, then re-evaluate preconditions
+   after the lock is released. This accurately models a normal row UPDATE.
+   It does not model "executor picked a row from a UNION ALL view, passed
+   a snapshot `OLD` to a trigger function, which then did a DELETE + INSERT
+   carrying that stale snapshot."
+
+3. **Does not track per-operation results.** The model checks `AtMostOnce
+   Resolution` (at most one DB state transition), but this race can produce
+   a plausible final DB state while still letting two callers observe success.
+   That is an API linearizability bug. The model does not track per-caller
+   return values (Success vs CallbackNotFound), so it had no way to detect
+   the symptom.
+
+**Fix (v006 migration):** The trigger's DELETE now checks `state`, `run_lease`,
+and `callback_id` from `OLD`. After a concurrent transaction modifies the row,
+the second caller's DELETE matches 0 rows → `RETURN NULL` → 0 rows in
+`RETURNING` → `CallbackNotFound`. This restores the optimistic concurrency
+semantics that the TLA+ model assumes.
