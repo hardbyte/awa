@@ -1446,6 +1446,9 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     .await
     .expect("Failed to backdate callback_timeout_at");
 
+    // After leader failover, the follower must: win election, start rescue
+    // timer, rescue 12 timed-out callbacks (retryable → promoted → claimed →
+    // completed). On slow CI runners this chain can take >15s.
     let counts = wait_for_counts(
         &pool,
         &queue,
@@ -1456,7 +1459,7 @@ async fn test_leader_failover_rescues_callback_timeouts() {
                 && state_count(counts, "scheduled") == 0
                 && state_count(counts, "running") == 0
         },
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     )
     .await;
 
