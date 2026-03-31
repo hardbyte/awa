@@ -8,7 +8,7 @@ use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, PeriodicJob, QueueConfig, Worker,
 };
 use chrono::{DateTime, Utc};
-use opentelemetry_sdk::metrics::data::{Histogram, Sum};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -116,9 +116,9 @@ fn find_metric<'a>(
 ) -> Vec<&'a opentelemetry_sdk::metrics::data::Metric> {
     let mut out = Vec::new();
     for rm in resource_metrics {
-        for scope_metrics in &rm.scope_metrics {
-            for metric in &scope_metrics.metrics {
-                if metric.name == name {
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name {
                     out.push(metric);
                 }
             }
@@ -133,9 +133,12 @@ fn print_counter_metric(
 ) {
     let total: u64 = find_metric(resource_metrics, name)
         .into_iter()
-        .filter_map(|metric| metric.data.as_any().downcast_ref::<Sum<u64>>())
-        .flat_map(|sum| sum.data_points.iter())
-        .map(|dp| dp.value)
+        .filter_map(|metric| match metric.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+            _ => None,
+        })
+        .flat_map(|sum| sum.data_points())
+        .map(|dp| dp.value())
         .sum();
     println!("[metrics] {name}: total={total}");
 }
@@ -148,11 +151,11 @@ fn print_histogram_metric_u64(
     let mut sum = 0u64;
     let mut max = 0u64;
     for metric in find_metric(resource_metrics, name) {
-        if let Some(hist) = metric.data.as_any().downcast_ref::<Histogram<u64>>() {
-            for dp in &hist.data_points {
-                count += dp.count;
-                sum += dp.sum;
-                if let Some(dp_max) = dp.max {
+        if let AggregatedMetrics::U64(MetricData::Histogram(hist)) = metric.data() {
+            for dp in hist.data_points() {
+                count += dp.count();
+                sum += dp.sum();
+                if let Some(dp_max) = dp.max() {
                     max = max.max(dp_max);
                 }
             }
@@ -174,11 +177,11 @@ fn print_histogram_metric_f64(
     let mut sum = 0.0f64;
     let mut max = 0.0f64;
     for metric in find_metric(resource_metrics, name) {
-        if let Some(hist) = metric.data.as_any().downcast_ref::<Histogram<f64>>() {
-            for dp in &hist.data_points {
-                count += dp.count;
-                sum += dp.sum;
-                if let Some(dp_max) = dp.max {
+        if let AggregatedMetrics::F64(MetricData::Histogram(hist)) = metric.data() {
+            for dp in hist.data_points() {
+                count += dp.count();
+                sum += dp.sum();
+                if let Some(dp_max) = dp.max() {
                     max = max.max(dp_max);
                 }
             }

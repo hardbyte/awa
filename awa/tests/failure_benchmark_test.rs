@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use awa::model::migrations;
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use bench_output::{BenchMetrics, BenchRescue, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
-use opentelemetry_sdk::metrics::data::Sum;
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -81,11 +81,11 @@ fn sum_counter_metric(
 ) -> u64 {
     let mut total = 0;
     for rm in resource_metrics {
-        for scope_metrics in &rm.scope_metrics {
-            for metric in &scope_metrics.metrics {
-                if metric.name == name {
-                    if let Some(sum) = metric.data.as_any().downcast_ref::<Sum<u64>>() {
-                        total += sum.data_points.iter().map(|dp| dp.value).sum::<u64>();
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() == name {
+                    if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                        total += sum.data_points().map(|dp| dp.value()).sum::<u64>();
                     }
                 }
             }
@@ -102,21 +102,20 @@ fn sum_counter_metric_with_attribute(
 ) -> u64 {
     let mut total = 0;
     for rm in resource_metrics {
-        for scope_metrics in &rm.scope_metrics {
-            for metric in &scope_metrics.metrics {
-                if metric.name != name {
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() != name {
                     continue;
                 }
-                if let Some(sum) = metric.data.as_any().downcast_ref::<Sum<u64>>() {
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
                     total += sum
-                        .data_points
-                        .iter()
+                        .data_points()
                         .filter(|dp| {
-                            dp.attributes.iter().any(|kv| {
+                            dp.attributes().any(|kv| {
                                 kv.key.as_str() == attr_name && kv.value.as_str() == attr_value
                             })
                         })
-                        .map(|dp| dp.value)
+                        .map(|dp| dp.value())
                         .sum::<u64>();
                 }
             }
