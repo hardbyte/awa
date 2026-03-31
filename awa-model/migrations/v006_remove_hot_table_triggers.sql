@@ -196,13 +196,12 @@ DECLARE
     v_waiting_external BIGINT;
     v_ref_count BIGINT;
 BEGIN
-    -- Serialize concurrent callers. Without this, two callers draining
+    -- Serialize concurrent callers. Without this, two callers processing
     -- different dirty queues can deadlock on job_queue_catalog/job_kind_catalog
-    -- upserts. The advisory lock is session-scoped and released at commit.
-    IF NOT pg_try_advisory_xact_lock(1098018130) THEN
-        -- Another caller is already recomputing; skip this cycle.
-        RETURN 0;
-    END IF;
+    -- upserts. Uses a blocking advisory lock (released at commit) so callers
+    -- wait rather than skip, ensuring flush_dirty_admin_metadata() actually
+    -- drains all keys.
+    PERFORM pg_advisory_xact_lock(1098018130);
 
     -- Drain dirty queues
     FOR dirty_q IN
