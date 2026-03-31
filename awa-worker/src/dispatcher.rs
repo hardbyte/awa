@@ -524,6 +524,7 @@ impl Dispatcher {
                 SELECT jobs.id
                 FROM awa.jobs_hot AS jobs
                 JOIN candidates ON candidates.id = jobs.id
+                WHERE jobs.state = 'available'
                 ORDER BY
                   GREATEST(1, candidates.priority - FLOOR(EXTRACT(EPOCH FROM (now() - candidates.run_at)) / $4)::int) ASC,
                   candidates.run_at ASC,
@@ -540,6 +541,7 @@ impl Dispatcher {
                 deadline_at = now() + make_interval(secs => $3)
             FROM claimed
             WHERE awa.jobs_hot.id = claimed.id
+              AND awa.jobs_hot.state = 'available'
             RETURNING awa.jobs_hot.*
             "#,
         )
