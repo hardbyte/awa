@@ -174,6 +174,86 @@ async fn test_concurrent_claim_no_double_dispatch() {
     assert_eq!(total_claimed, 100, "All 100 jobs should be claimed");
 }
 
+#[tokio::test]
+async fn test_stale_candidate_cannot_reclaim_running_row() {
+    let pool = setup().await;
+    let queue = "scale_stale_candidate";
+    clean_queue(&pool, queue).await;
+
+    let job = insert_with(
+        &pool,
+        &ScaleJob { index: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let candidate_id: i64 = sqlx::query_scalar(
+        r#"
+        SELECT id FROM awa.jobs_hot
+        WHERE state = 'available' AND queue = $1
+        ORDER BY run_at ASC, id ASC
+        LIMIT 1
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(candidate_id, job.id);
+
+    let first_claim: Option<(String, i16, i64)> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'running',
+            attempt = attempt + 1,
+            run_lease = run_lease + 1,
+            attempted_at = now(),
+            heartbeat_at = now(),
+            deadline_at = now() + interval '5 minutes'
+        WHERE id = $1
+          AND state = 'available'
+        RETURNING state::text, attempt, run_lease
+        "#,
+    )
+    .bind(candidate_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(first_claim, Some(("running".to_string(), 1, 1)));
+
+    let second_claim: Option<(String, i16, i64)> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'running',
+            attempt = attempt + 1,
+            run_lease = run_lease + 1,
+            attempted_at = now(),
+            heartbeat_at = now(),
+            deadline_at = now() + interval '5 minutes'
+        WHERE id = $1
+          AND state = 'available'
+        RETURNING state::text, attempt, run_lease
+        "#,
+    )
+    .bind(candidate_id)
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert_eq!(second_claim, None, "stale candidate must not re-claim row");
+
+    let final_row: (String, i16, i64) =
+        sqlx::query_as("SELECT state::text, attempt, run_lease FROM awa.jobs WHERE id = $1")
+            .bind(candidate_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(final_row, ("running".to_string(), 1, 1));
+}
+
 // ── Priority aging reordering ─────────────────────────────────────────
 
 #[tokio::test]

@@ -56,6 +56,18 @@ What is intentionally not modeled:
 - `AwaCbk.tla` / `AwaCbk.cfg` / `AwaCbkLiveness.cfg`: external callback
   resolution model for the three-way race between complete/fail, timeout rescue,
   and heartbeat rescue with Postgres row-lock semantics
+- `AwaDispatchClaim.tla` / `AwaDispatchClaimOld.cfg` /
+  `AwaDispatchClaimNew.cfg`: focused dispatcher-claim model for the stale
+  candidate race from issue #134; includes retry cycles so `attempt > 1` is
+  exercised as a legitimate path; the old config intentionally fails the
+  `NoDuplicateClaim` invariant and the new config re-checks availability at
+  claim time
+- `AwaViewTrigger.tla` / `AwaViewTrigger.cfg` / `AwaViewTriggerOld.cfg`:
+  INSTEAD OF UPDATE trigger concurrency model for the `awa.jobs` UNION ALL
+  view; the trigger implements UPDATE as DELETE + INSERT for cross-table
+  moves, and the v006 fix adds a version check (state, run_lease,
+  callback_id) on the DELETE so concurrent callers can't both succeed on
+  state-changing operations; the old config models the v001 bug from #132
 - `AwaCron.tla` / `AwaCron.cfg` / `AwaCronLiveness.cfg`: cron double-fire
   prevention under leader failover with CAS on `last_enqueued_at`
 - `Dockerfile`: Docker-first TLC environment
@@ -66,13 +78,17 @@ What is intentionally not modeled:
 From the repository root:
 
 ```bash
-./correctness/run-tlc.sh AwaCore.tla
-./correctness/run-tlc.sh AwaExtended.tla
-./correctness/run-tlc.sh AwaBatcher.tla
-./correctness/run-tlc.sh AwaBatcher.tla AwaBatcherLiveness.cfg
-./correctness/run-tlc.sh AwaCbk.tla
-./correctness/run-tlc.sh AwaCbk.tla AwaCbkLiveness.cfg
-./correctness/run-tlc.sh AwaCron.tla AwaCronLiveness.cfg
+./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh core/AwaBatcher.tla
+./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
+./correctness/run-tlc.sh protocol/AwaExtended.tla
+./correctness/run-tlc.sh races/AwaCbk.tla
+./correctness/run-tlc.sh races/AwaCbk.tla races/AwaCbkLiveness.cfg
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimNew.cfg
+./correctness/run-tlc.sh races/AwaViewTrigger.tla
+./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
+./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
 ```
 
 Or directly:
@@ -270,6 +286,53 @@ needs an extra environment assumption such as "some instance remains running".
   handles and `DispatchPermit` lifetimes.
 
 ## Bugs the Models Did Not Catch
+
+### Dispatcher stale-candidate double claim (v0.5.1-alpha.0, #134)
+
+The hot-path dispatcher claim SQL selected candidate IDs from `awa.jobs_hot`,
+then later locked and updated those rows to `running`. The locking/update step
+did not re-check `state = 'available'`, so a row that was chosen while
+available could still be claimed again after another worker had already moved it
+to `running`.
+
+In production terms the bad transition was:
+
+1. worker A claims `available -> running`, incrementing `attempt` and
+   `run_lease`
+2. worker B still has the same row in its stale candidate set
+3. worker B locks the row later and performs `running -> running`, incrementing
+   `attempt` and `run_lease` again
+
+That produced exactly the observed flake in the callback failover chaos test:
+one attempt-1 handler lost ownership before `register_callback()`, the same job
+was re-dispatched as attempt 2 and completed, and the test got stuck at
+`{"waiting_external": 11, "completed": 1}` before failover even started.
+
+**Why the TLA+ model missed it:**
+
+1. **The abstraction boundary is above SQL candidate staleness.**
+   `AwaExtended.tla` models `Reserve*` and `ClaimReserved` as acting on the
+   current logical row state. `ClaimReserved(i, j)` requires `jobState[j] =
+   "available"` at claim time, which is the behavior the SQL should have had.
+   It does not model a two-phase SQL path of:
+   `select candidate ids -> later lock row -> later update row` with the row
+   state changing in between.
+
+2. **The model assumed the claim step revalidated availability.**
+   The checked invariants reason about the logical claim transition
+   `available -> running`. The real bug was that the implementation violated
+   that assumption by omitting the final `state = 'available'` recheck during
+   the locked update.
+
+3. **Generated traces already showed the shape once the abstraction was too
+   weak.** Some historical `AwaExtended` trace artifacts contain
+   `running -> running` / `attempt+1` transitions. Those traces are a sign that
+   the model's reserve/claim split was permissive enough to allow the same bad
+   shape, but the checked invariants did not explicitly forbid it.
+
+**Fix:** The dispatcher SQL now re-checks `jobs.state = 'available'` both in the
+locked `claimed` CTE and in the final `UPDATE ... WHERE` clause. This restores
+the claim semantics that `AwaExtended` was already intending to model.
 
 ### Concurrent UPDATE race on the `awa.jobs` view (v0.5.1, #132)
 
