@@ -439,12 +439,22 @@ async def run_worker_sweep(
     total_jobs: int,
     worker_counts: list[int],
     poll_interval_ms: int,
+    max_pool_connections: int = 80,
 ) -> None:
-    """Measure throughput at different worker concurrency levels."""
+    """Measure throughput at different worker concurrency levels.
+
+    ``max_pool_connections`` caps the sqlx pool size per iteration so that
+    the total never exceeds Postgres ``max_connections`` (default 100).
+    Previous iterations that timed-out leaked their pool, so a hard cap
+    prevents connection exhaustion that would hang subsequent benchmarks.
+    """
     for worker_count in worker_counts:
         try:
             await asyncio.wait_for(
-                _run_single_sweep(database_url, total_jobs, worker_count, poll_interval_ms),
+                _run_single_sweep(
+                    database_url, total_jobs, worker_count, poll_interval_ms,
+                    max_pool_connections=max_pool_connections,
+                ),
                 timeout=60,
             )
         except asyncio.TimeoutError:
@@ -456,80 +466,96 @@ async def _run_single_sweep(
     total_jobs: int,
     worker_count: int,
     poll_interval_ms: int,
+    *,
+    max_pool_connections: int = 80,
 ) -> None:
     """Run a single sweep iteration with a given worker count."""
+    # Cap pool size to stay within Postgres max_connections (default 100).
+    # Workers share the pool, so contention is fine — exhaustion is not.
+    pool_size = min(max(worker_count + 10, 50), max_pool_connections)
     client = awa.AsyncClient(
         database_url,
-        max_connections=max(worker_count + 10, 50),
+        max_connections=pool_size,
     )
     await client.migrate()
     queue = f"py_bench_sweep_{worker_count}"
-    await reset_runtime_state(client)
 
-    await execute(
-        client,
-        """
-        INSERT INTO awa.jobs_hot
-            (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
-        SELECT
-            'timing_job', $1, jsonb_build_object('seq', g),
-            'available'::awa.job_state, 2, 25, now(), '{}'::jsonb, '{}'::text[]
-        FROM generate_series(1, $2) AS g
-        """,
-        queue,
-        total_jobs,
-    )
+    try:
+        await reset_runtime_state(client)
 
-    handler_returned = 0
+        await execute(
+            client,
+            """
+            INSERT INTO awa.jobs_hot
+                (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+            SELECT
+                'timing_job', $1, jsonb_build_object('seq', g),
+                'available'::awa.job_state, 2, 25, now(), '{}'::jsonb, '{}'::text[]
+            FROM generate_series(1, $2) AS g
+            """,
+            queue,
+            total_jobs,
+        )
 
-    @client.task(TimingJob, queue=queue)
-    async def handle(job: awa.Job) -> None:
-        nonlocal handler_returned
-        handler_returned += 1
-        return None
+        handler_returned = 0
 
-    client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
-    await asyncio.sleep(2)  # warmup
+        @client.task(TimingJob, queue=queue)
+        async def handle(job: awa.Job) -> None:
+            nonlocal handler_returned
+            handler_returned += 1
+            return None
 
-    handler_before = handler_returned
-    completed_before = await scalar(
-        client,
-        "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
-        queue,
-    )
-    await asyncio.sleep(10)  # measurement window
+        client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
+        await asyncio.sleep(2)  # warmup
 
-    completed_after = await scalar(
-        client,
-        "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
-        queue,
-    )
-    await client.shutdown(timeout_ms=5000)
-    await client.close()
+        handler_before = handler_returned
+        completed_before = await scalar(
+            client,
+            "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+            queue,
+        )
+        await asyncio.sleep(10)  # measurement window
 
-    handler_delta = handler_returned - handler_before
-    completed_delta = completed_after - completed_before
-    handler_per_s = handler_delta / 10
-    db_per_s = completed_delta / 10
+        completed_after = await scalar(
+            client,
+            "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+            queue,
+        )
 
-    print(
-        f"[py-sweep] workers={worker_count} "
-        f"handler={handler_per_s:.0f}/s db={db_per_s:.0f}/s"
-    )
+        handler_delta = handler_returned - handler_before
+        completed_delta = completed_after - completed_before
+        handler_per_s = handler_delta / 10
+        db_per_s = completed_delta / 10
 
-    BenchmarkResult(
-        scenario=f"sweep_{worker_count}w",
-        language="python",
-        seeded=total_jobs,
-        metrics=BenchMetrics(
-            throughput=BenchThroughput(
-                handler_per_s=handler_per_s,
-                db_finalized_per_s=db_per_s,
+        print(
+            f"[py-sweep] workers={worker_count} "
+            f"handler={handler_per_s:.0f}/s db={db_per_s:.0f}/s"
+        )
+
+        BenchmarkResult(
+            scenario=f"sweep_{worker_count}w",
+            language="python",
+            seeded=total_jobs,
+            metrics=BenchMetrics(
+                throughput=BenchThroughput(
+                    handler_per_s=handler_per_s,
+                    db_finalized_per_s=db_per_s,
+                ),
             ),
-        ),
-        outcomes={"completed": completed_delta},
-        metadata={"workers": worker_count, "window_secs": 10},
-    ).emit()
+            outcomes={"completed": completed_delta},
+            metadata={"workers": worker_count, "window_secs": 10},
+        ).emit()
+    finally:
+        # Always release connections — even on timeout/cancellation — so
+        # subsequent benchmarks in the same process can connect to Postgres.
+        try:
+            await client.shutdown(timeout_ms=5000)
+        except Exception:
+            pass
+        try:
+            await client.close()
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════

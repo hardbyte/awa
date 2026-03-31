@@ -28,7 +28,8 @@ async def client():
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'chaos_%'")
     await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'chaos_%'")
     await tx.commit()
-    return c
+    yield c
+    await c.close()
 
 
 @pytest.mark.asyncio
