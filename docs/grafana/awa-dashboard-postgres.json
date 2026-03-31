@@ -16,7 +16,7 @@
   "panels": [
     {
       "title": "Queue Depth by State",
-      "description": "Current job counts per queue, pivoted by state. Sortable — click column headers.",
+      "description": "Current job counts per queue, pivoted by state. Eventually consistent (~2s). Sortable — click column headers.",
       "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "fieldConfig": {
@@ -31,7 +31,7 @@
       "options": { "sortBy": [{ "displayName": "available", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, count(*) FILTER (WHERE state = 'available')::bigint AS available, count(*) FILTER (WHERE state = 'running')::bigint AS running, count(*) FILTER (WHERE state = 'completed')::bigint AS completed, count(*) FILTER (WHERE state = 'failed')::bigint AS failed, count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled, count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable, count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_ext, count(*) FILTER (WHERE state = 'cancelled')::bigint AS cancelled FROM awa.jobs GROUP BY queue ORDER BY count(*) FILTER (WHERE state = 'available') DESC",
+          "rawSql": "SELECT queue, available, running, completed, failed, scheduled, retryable, waiting_external AS waiting_ext, cancelled FROM awa.queue_state_counts ORDER BY available DESC",
           "format": "table",
           "refId": "A"
         }
@@ -154,6 +154,7 @@
     },
     {
       "title": "Total Available",
+      "description": "Eventually consistent (~2s)",
       "type": "stat",
       "gridPos": { "h": 4, "w": 4, "x": 0, "y": 24 },
       "fieldConfig": {
@@ -162,7 +163,7 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
         }
       },
-      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'available'", "format": "table", "refId": "A" }],
+      "targets": [{ "rawSql": "SELECT COALESCE(sum(available), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
@@ -175,7 +176,7 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
         }
       },
-      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'running'", "format": "table", "refId": "A" }],
+      "targets": [{ "rawSql": "SELECT COALESCE(sum(running), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
@@ -188,7 +189,7 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 10 }] }
         }
       },
-      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'failed'", "format": "table", "refId": "A" }],
+      "targets": [{ "rawSql": "SELECT COALESCE(sum(failed), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
@@ -201,7 +202,7 @@
           "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
         }
       },
-      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.scheduled_jobs", "format": "table", "refId": "A" }],
+      "targets": [{ "rawSql": "SELECT COALESCE(sum(scheduled), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
@@ -225,6 +226,6 @@
   "timezone": "",
   "title": "Awa Job Queue (Postgres)",
   "uid": "awa-postgres",
-  "version": 1,
+  "version": 2,
   "refresh": "30s"
 }
