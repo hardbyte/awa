@@ -10,7 +10,7 @@
 
 use awa::model::{insert_with, migrations, InsertOpts};
 use awa::{Client, JobArgs, JobError, JobResult, JobState, QueueConfig};
-use opentelemetry_sdk::metrics::data::{Histogram, Sum};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -343,10 +343,10 @@ async fn test_job_execution_emits_otel_metrics() {
     let mut metrics_by_name: HashMap<String, Vec<&opentelemetry_sdk::metrics::data::Metric>> =
         HashMap::new();
     for rm in &resource_metrics {
-        for scope_metrics in &rm.scope_metrics {
-            for metric in &scope_metrics.metrics {
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
                 metrics_by_name
-                    .entry(metric.name.to_string())
+                    .entry(metric.name().to_string())
                     .or_default()
                     .push(metric);
             }
@@ -363,16 +363,18 @@ async fn test_job_execution_emits_otel_metrics() {
     let completed_sum = completed_metrics
         .unwrap()
         .iter()
-        .find_map(|m| m.data.as_any().downcast_ref::<Sum<u64>>());
+        .find_map(|m| match m.data() {
+            AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+            _ => None,
+        });
     assert!(
         completed_sum.is_some(),
         "Expected Sum<u64> aggregation for awa.job.completed"
     );
     let total_completed: u64 = completed_sum
         .unwrap()
-        .data_points
-        .iter()
-        .map(|dp| dp.value)
+        .data_points()
+        .map(|dp| dp.value())
         .sum();
     assert!(
         total_completed >= 1,
@@ -389,16 +391,18 @@ async fn test_job_execution_emits_otel_metrics() {
     let duration_histogram = duration_metrics
         .unwrap()
         .iter()
-        .find_map(|m| m.data.as_any().downcast_ref::<Histogram<f64>>());
+        .find_map(|m| match m.data() {
+            AggregatedMetrics::F64(MetricData::Histogram(hist)) => Some(hist),
+            _ => None,
+        });
     assert!(
         duration_histogram.is_some(),
         "Expected Histogram<f64> aggregation for awa.job.duration"
     );
     let total_duration_count: u64 = duration_histogram
         .unwrap()
-        .data_points
-        .iter()
-        .map(|dp| dp.count)
+        .data_points()
+        .map(|dp| dp.count())
         .sum();
     assert!(
         total_duration_count >= 1,
@@ -413,19 +417,18 @@ async fn test_job_execution_emits_otel_metrics() {
         "Expected 'awa.job.wait_duration' metric, found metrics: {:?}",
         metrics_by_name.keys().collect::<Vec<_>>()
     );
-    let wait_histogram = wait_metrics
-        .unwrap()
-        .iter()
-        .find_map(|m| m.data.as_any().downcast_ref::<Histogram<f64>>());
+    let wait_histogram = wait_metrics.unwrap().iter().find_map(|m| match m.data() {
+        AggregatedMetrics::F64(MetricData::Histogram(hist)) => Some(hist),
+        _ => None,
+    });
     assert!(
         wait_histogram.is_some(),
         "Expected Histogram<f64> aggregation for awa.job.wait_duration"
     );
     let total_wait_count: u64 = wait_histogram
         .unwrap()
-        .data_points
-        .iter()
-        .map(|dp| dp.count)
+        .data_points()
+        .map(|dp| dp.count())
         .sum();
     assert!(
         total_wait_count >= 1,
@@ -439,14 +442,13 @@ async fn test_job_execution_emits_otel_metrics() {
     // We check the last data point rather than summing all points, since
     // intermediate exports may have captured non-zero in-flight counts.
     if let Some(in_flight_metrics) = metrics_by_name.get("awa.job.in_flight") {
-        if let Some(in_flight_sum) = in_flight_metrics
-            .iter()
-            .find_map(|m| m.data.as_any().downcast_ref::<Sum<i64>>())
-        {
+        if let Some(in_flight_sum) = in_flight_metrics.iter().find_map(|m| match m.data() {
+            AggregatedMetrics::I64(MetricData::Sum(sum)) => Some(sum),
+            _ => None,
+        }) {
             let max_in_flight: i64 = in_flight_sum
-                .data_points
-                .iter()
-                .map(|dp| dp.value)
+                .data_points()
+                .map(|dp| dp.value())
                 .max()
                 .unwrap_or(0);
             assert!(
@@ -527,10 +529,10 @@ async fn test_failed_job_emits_failure_metrics() {
     let mut metrics_by_name: HashMap<String, Vec<&opentelemetry_sdk::metrics::data::Metric>> =
         HashMap::new();
     for rm in &resource_metrics {
-        for scope_metrics in &rm.scope_metrics {
-            for metric in &scope_metrics.metrics {
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
                 metrics_by_name
-                    .entry(metric.name.to_string())
+                    .entry(metric.name().to_string())
                     .or_default()
                     .push(metric);
             }
@@ -544,20 +546,15 @@ async fn test_failed_job_emits_failure_metrics() {
         "Expected 'awa.job.failed' metric, found metrics: {:?}",
         metrics_by_name.keys().collect::<Vec<_>>()
     );
-    let failed_sum = failed_metrics
-        .unwrap()
-        .iter()
-        .find_map(|m| m.data.as_any().downcast_ref::<Sum<u64>>());
+    let failed_sum = failed_metrics.unwrap().iter().find_map(|m| match m.data() {
+        AggregatedMetrics::U64(MetricData::Sum(sum)) => Some(sum),
+        _ => None,
+    });
     assert!(
         failed_sum.is_some(),
         "Expected Sum<u64> aggregation for awa.job.failed"
     );
-    let total_failed: u64 = failed_sum
-        .unwrap()
-        .data_points
-        .iter()
-        .map(|dp| dp.value)
-        .sum();
+    let total_failed: u64 = failed_sum.unwrap().data_points().map(|dp| dp.value()).sum();
     assert!(
         total_failed >= 1,
         "Expected awa.job.failed >= 1, got {}",
