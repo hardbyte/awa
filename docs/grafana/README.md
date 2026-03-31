@@ -1,8 +1,13 @@
-# Grafana Dashboard for Awa
+# Grafana Dashboards for Awa
 
-A pre-built Grafana dashboard for monitoring Awa job queue metrics via Prometheus.
+Two dashboards are provided:
 
-## Panels
+- **`awa-dashboard.json`** — Prometheus / OTel metrics dashboard. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows time-series metrics: throughput, latency, queue depth, rescues, completion flush performance.
+- **`awa-dashboard-postgres.json`** — SQL dashboard querying Postgres directly. No collector needed. Shows queue depth, lag, recent failures, cron schedules, runtime instances. Queue depth and stat panels read from `queue_state_counts` (cache table, eventually consistent within the ~2s dirty-key recompute window). Lag and recent failure panels use targeted queries on `jobs_hot` with appropriate indexes.
+
+## Prometheus / OTel Dashboard
+
+### Panels
 
 | Panel | Type | What it shows |
 |-------|------|---------------|
