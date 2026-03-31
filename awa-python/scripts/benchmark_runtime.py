@@ -178,7 +178,7 @@ async def run_hot_benchmark(
 
     handler_returned = 0
 
-    @client.worker(TimingJob, queue=queue)
+    @client.task(TimingJob, queue=queue)
     async def handle(job: awa.Job) -> None:
         nonlocal handler_returned
         handler_returned += 1
@@ -291,7 +291,7 @@ async def run_scheduled_benchmark(
     pickup_lateness_ms: list[float] = []
     schedule_started_at: datetime | None = None
 
-    @client.worker(TimingJob, queue=queue)
+    @client.task(TimingJob, queue=queue)
     async def handle(job: awa.Job) -> None:
         nonlocal handler_returned
         handler_returned += 1
@@ -440,77 +440,93 @@ async def run_worker_sweep(
 ) -> None:
     """Measure throughput at different worker concurrency levels."""
     for worker_count in worker_counts:
-        client = awa.AsyncClient(
-            database_url,
-            max_connections=max(worker_count + 10, 50),
-        )
-        await client.migrate()
-        queue = f"py_bench_sweep_{worker_count}"
-        await reset_runtime_state(client)
+        try:
+            await asyncio.wait_for(
+                _run_single_sweep(database_url, total_jobs, worker_count, poll_interval_ms),
+                timeout=60,
+            )
+        except asyncio.TimeoutError:
+            print(f"[py-sweep] workers={worker_count} TIMED OUT after 60s — skipping")
 
-        await execute(
-            client,
-            """
-            INSERT INTO awa.jobs_hot
-                (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
-            SELECT
-                'timing_job', $1, jsonb_build_object('seq', g),
-                'available'::awa.job_state, 2, 25, now(), '{}'::jsonb, '{}'::text[]
-            FROM generate_series(1, $2) AS g
-            """,
-            queue,
-            total_jobs,
-        )
 
-        handler_returned = 0
+async def _run_single_sweep(
+    database_url: str,
+    total_jobs: int,
+    worker_count: int,
+    poll_interval_ms: int,
+) -> None:
+    """Run a single sweep iteration with a given worker count."""
+    client = awa.AsyncClient(
+        database_url,
+        max_connections=max(worker_count + 10, 50),
+    )
+    await client.migrate()
+    queue = f"py_bench_sweep_{worker_count}"
+    await reset_runtime_state(client)
 
-        @client.worker(TimingJob, queue=queue)
-        async def handle(job: awa.Job) -> None:
-            nonlocal handler_returned
-            handler_returned += 1
-            return None
+    await execute(
+        client,
+        """
+        INSERT INTO awa.jobs_hot
+            (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+        SELECT
+            'timing_job', $1, jsonb_build_object('seq', g),
+            'available'::awa.job_state, 2, 25, now(), '{}'::jsonb, '{}'::text[]
+        FROM generate_series(1, $2) AS g
+        """,
+        queue,
+        total_jobs,
+    )
 
-        client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
-        await asyncio.sleep(2)  # warmup
+    handler_returned = 0
 
-        handler_before = handler_returned
-        completed_before = await scalar(
-            client,
-            "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
-            queue,
-        )
-        await asyncio.sleep(10)  # measurement window
+    @client.task(TimingJob, queue=queue)
+    async def handle(job: awa.Job) -> None:
+        nonlocal handler_returned
+        handler_returned += 1
+        return None
 
-        completed_after = await scalar(
-            client,
-            "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
-            queue,
-        )
-        await client.shutdown(timeout_ms=5000)
+    client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
+    await asyncio.sleep(2)  # warmup
 
-        handler_delta = handler_returned - handler_before
-        completed_delta = completed_after - completed_before
-        handler_per_s = handler_delta / 10
-        db_per_s = completed_delta / 10
+    handler_before = handler_returned
+    completed_before = await scalar(
+        client,
+        "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+        queue,
+    )
+    await asyncio.sleep(10)  # measurement window
 
-        print(
-            f"[py-sweep] workers={worker_count} "
-            f"handler={handler_per_s:.0f}/s db={db_per_s:.0f}/s"
-        )
+    completed_after = await scalar(
+        client,
+        "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+        queue,
+    )
+    await client.shutdown(timeout_ms=5000)
 
-        BenchmarkResult(
-            scenario=f"sweep_{worker_count}w",
-            language="python",
-            seeded=total_jobs,
-            metrics=BenchMetrics(
-                throughput=BenchThroughput(
-                    handler_per_s=handler_per_s,
-                    db_finalized_per_s=db_per_s,
-                ),
+    handler_delta = handler_returned - handler_before
+    completed_delta = completed_after - completed_before
+    handler_per_s = handler_delta / 10
+    db_per_s = completed_delta / 10
+
+    print(
+        f"[py-sweep] workers={worker_count} "
+        f"handler={handler_per_s:.0f}/s db={db_per_s:.0f}/s"
+    )
+
+    BenchmarkResult(
+        scenario=f"sweep_{worker_count}w",
+        language="python",
+        seeded=total_jobs,
+        metrics=BenchMetrics(
+            throughput=BenchThroughput(
+                handler_per_s=handler_per_s,
+                db_finalized_per_s=db_per_s,
             ),
-            outcomes={"completed": completed_delta},
-            metadata={"workers": worker_count, "window_secs": 10},
-        ).emit()
+        ),
+        outcomes={"completed": completed_delta},
+        metadata={"workers": worker_count, "window_secs": 10},
+    ).emit()
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -552,7 +568,7 @@ async def run_latency_jitter(
 
     pickup_lateness_ms: list[float] = []
 
-    @client.worker(TimingJob, queue=queue)
+    @client.task(TimingJob, queue=queue)
     async def handle(job: awa.Job) -> None:
         # job.run_at is the authoritative due time (RFC3339 string from Rust)
         scheduled_for = datetime.fromisoformat(job.run_at)
@@ -642,7 +658,7 @@ async def run_heartbeat_rescue(
 
     handler_returned = 0
 
-    @client.worker(TimingJob, queue=queue)
+    @client.task(TimingJob, queue=queue)
     async def handle(job: awa.Job) -> None:
         nonlocal handler_returned
         handler_returned += 1
@@ -772,7 +788,7 @@ async def run_failure_benchmark(
     handler_returned = 0
     callback_timeouts = 0
 
-    @client.worker(FailureJob, queue=queue)
+    @client.task(FailureJob, queue=queue)
     async def handle_failure(job: awa.Job) -> Any:
         nonlocal handler_returned, callback_timeouts
         handler_returned += 1
