@@ -389,7 +389,7 @@ impl PyClient {
                 rt.block_on(awa_model::migrations::run(&pool))
             })
             .await
-            .map_err(|e| map_awa_error(awa_model::AwaError::Database(sqlx::Error::Protocol(e.to_string()))))?
+            .map_err(|e| state_error(format!("migration task failed: {e}")))?
             .map_err(map_awa_error)?;
             Ok(())
         })
