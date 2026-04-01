@@ -52,7 +52,7 @@ async def main():
     job = await client.insert(BatchImport(total_items=5), queue="etl")
     print(f"Inserted job {job.id}")
 
-    client.start([("etl", 1)])
+    await client.start([("etl", 1)])
     await asyncio.sleep(3)
     await client.shutdown()
 

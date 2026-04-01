@@ -292,7 +292,7 @@ async def main() -> None:
     failed_ids.append(failed_job.id)
     waiting_ids.append(waiting_job.id)
 
-    client.start(
+    await client.start(
         [("ui_demo_email", 2), ("ui_demo_etl", 1), ("ui_demo_callbacks", 1)],
         leader_election_interval_ms=100,
         heartbeat_interval_ms=100,

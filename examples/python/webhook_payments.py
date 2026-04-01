@@ -11,7 +11,7 @@ Demonstrates:
 In production you'd split this into:
 - A checkout API (FastAPI/Django) that calls client.insert(ChargeCustomer(...))
   when a customer clicks "Pay" — this is the "Enqueue payment jobs" section
-- A worker process: client.start([("payments", 4), ("notifications", 2)])
+- A worker process: await client.start([("payments", 4), ("notifications", 2)])
   as a separate deployment
 - The charge handler enqueues receipt jobs — picked up by the notifications
   worker (same or different process on that queue)
@@ -122,7 +122,7 @@ async def main():
 
     # ── Start workers and monitor ───────────────────────────────
 
-    client.start(
+    await client.start(
         [("payments", 2), ("notifications", 1)],
         leader_election_interval_ms=500,
     )

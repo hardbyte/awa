@@ -10,7 +10,7 @@ Demonstrates:
 
 In production you'd split this into:
 - A scheduler/API that enqueues ImportTable jobs (the "Enqueue jobs" section)
-- A worker process running `client.start([("etl", 3)])` as a separate
+- A worker process running `await client.start([("etl", 3)])` as a separate
   deployment (e.g. k8s Deployment with replicas=2)
 - The periodic schedule is registered on the worker and evaluated by
   whichever instance wins leader election
@@ -151,7 +151,7 @@ async def main():
 
     # ── Start workers and monitor ───────────────────────────────
 
-    client.start([("etl", 3)], leader_election_interval_ms=500)
+    await client.start([("etl", 3)], leader_election_interval_ms=500)
 
     for _ in range(60):
         await asyncio.sleep(1)

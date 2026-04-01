@@ -49,7 +49,7 @@ class AsyncClient:
         async def handle(job):
             print(f"Sending to {job.args.to}")
 
-        client.start([("email", 2)])
+        await client.start([("email", 2)])
         ...
         await client.shutdown()
         await client.close()

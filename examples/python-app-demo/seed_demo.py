@@ -130,7 +130,7 @@ async def main() -> None:
         metadata={"app": "demo-shop", "hero": True},
     )
 
-    client.start(
+    await client.start(
         [(EMAIL_QUEUE, 2), (OPS_QUEUE, 1), (PAYMENTS_QUEUE, 1)],
         leader_election_interval_ms=100,
         heartbeat_interval_ms=100,

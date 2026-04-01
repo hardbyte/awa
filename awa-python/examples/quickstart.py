@@ -41,7 +41,7 @@ async def main():
     print(f"Inserted job {job.id} (kind={job.kind}, state={job.state})")
 
     # Start processing
-    client.start([("email", 2)])
+    await client.start([("email", 2)])
     await asyncio.sleep(1)
     await client.shutdown()
 
