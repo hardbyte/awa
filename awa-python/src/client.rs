@@ -267,11 +267,17 @@ impl PyClient {
     fn new(_py: Python<'_>, database_url: String, max_connections: u32) -> PyResult<Self> {
         let pool = pyo3_async_runtimes::tokio::get_runtime()
             .block_on(async {
-                PgPoolOptions::new()
-                    .max_connections(max_connections)
-                    .acquire_timeout(Duration::from_secs(30))
-                    .connect(&database_url)
-                    .await
+                tokio::time::timeout(
+                    Duration::from_secs(30),
+                    PgPoolOptions::new()
+                        .max_connections(max_connections)
+                        .acquire_timeout(Duration::from_secs(30))
+                        .connect(&database_url),
+                )
+                .await
+                .map_err(|_| {
+                    sqlx::Error::PoolTimedOut
+                })?
             })
             .map_err(map_connect_error)?;
 
