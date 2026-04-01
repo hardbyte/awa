@@ -44,7 +44,7 @@ async def test_set_progress_from_handler(client):
 
     await client.insert(ProgressArgs(data="pp1"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -79,7 +79,7 @@ async def test_update_metadata_from_handler(client):
 
     await client.insert(ProgressArgs(data="pp2"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -108,7 +108,7 @@ async def test_flush_progress_immediate(client):
 
     await client.insert(ProgressArgs(data="pp3"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -138,7 +138,7 @@ async def test_progress_property_returns_dict(client):
 
     await client.insert(ProgressArgs(data="pp4"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -168,7 +168,7 @@ async def test_progress_persists_across_retry(client):
 
     await client.insert(ProgressArgs(data="pp5"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(2.0)  # Give time for retry
     await client.shutdown()
 
@@ -195,7 +195,7 @@ async def test_get_job_returns_progress(client):
 
     inserted = await client.insert(ProgressArgs(data="pp6"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -223,7 +223,7 @@ async def test_flush_progress_sync(client):
 
     await client.insert(ProgressArgs(data="pp7"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -245,7 +245,7 @@ async def test_get_job_sync_returns_progress(client):
 
     inserted = await client.insert(ProgressArgs(data="pp8"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 

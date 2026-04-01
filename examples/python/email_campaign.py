@@ -11,7 +11,7 @@ Demonstrates:
 In production you'd split this into:
 - A marketing service that bulk-enqueues campaign emails (the insert_many_copy
   section) — triggered by an admin action or scheduled campaign
-- A worker process: client.start([("email", 10)]) as a separate deployment
+- A worker process: await client.start([("email", 10)]) as a separate deployment
 - An admin/ops script or the web UI for retry_failed, queue_stats, drain
 - The periodic schedule runs on the worker (leader evaluates it)
 
@@ -101,7 +101,7 @@ async def main():
 
     # ── Process ─────────────────────────────────────────────────
 
-    client.start([("email", 5)], leader_election_interval_ms=500)
+    await client.start([("email", 5)], leader_election_interval_ms=500)
 
     print("Processing...")
     for tick in range(60):

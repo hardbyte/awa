@@ -56,7 +56,7 @@ async def main() -> None:
     async def handle_email(job):
         print(f"sending email to {job.args.to}: {job.args.subject}")
 
-    client.start([("email", 2)])
+    await client.start([("email", 2)])
 
     job = await client.insert(
         SendEmail(to="alice@example.com", subject="Welcome"),

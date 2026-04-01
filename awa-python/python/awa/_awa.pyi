@@ -317,7 +317,7 @@ class Client:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
     ) -> None: ...
-    def start(
+    async def start(
         self,
         queues: list[tuple[str, int]] | list[dict[str, Any]] | None = None,
         *,

@@ -17,7 +17,7 @@ async def main() -> None:
     await client.migrate()
     await ensure_app_schema(client)
     register_workers(client)
-    client.start(
+    await client.start(
         [(EMAIL_QUEUE, 2), (OPS_QUEUE, 1), (PAYMENTS_QUEUE, 1)],
         leader_election_interval_ms=1000,
         heartbeat_interval_ms=1000,

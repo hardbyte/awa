@@ -50,7 +50,7 @@ async def test_resume_external_transitions_to_running(client):
 
     await client.insert(SeqTask(order_id=1), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -75,7 +75,7 @@ async def test_resume_external_stores_payload_in_metadata(client):
 
     job = await client.insert(SeqTask(order_id=2), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -102,7 +102,7 @@ async def test_resume_then_stale_callback_rejected(client):
 
     job = await client.insert(SeqTask(order_id=3), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -137,7 +137,7 @@ async def test_resume_external_without_payload(client):
 
     job = await client.insert(SeqTask(order_id=4), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -182,7 +182,7 @@ async def test_resume_after_complete_fails(client):
 
     await client.insert(SeqTask(order_id=5), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -208,7 +208,7 @@ async def test_double_resume_fails(client):
 
     await client.insert(SeqTask(order_id=6), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -237,7 +237,7 @@ async def test_resume_external_sync(client):
 
     await client.insert(SeqTask(order_id=7), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -262,7 +262,7 @@ async def test_heartbeat_during_wait(client):
 
     await client.insert(SeqTask(order_id=8), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -289,7 +289,7 @@ async def test_heartbeat_after_resume_fails(client):
 
     await client.insert(SeqTask(order_id=9), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -336,7 +336,7 @@ async def test_wait_for_callback_happy_path(client):
 
     job = await client.insert(SeqTask(order_id=10), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
 
     # Wait for the handler to register the callback and enter waiting
     for _ in range(20):
@@ -386,7 +386,7 @@ async def test_wait_for_callback_two_sequential(client):
 
     job = await client.insert(SeqTask(order_id=11), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
 
     # Wait for first callback registration
     for _ in range(20):

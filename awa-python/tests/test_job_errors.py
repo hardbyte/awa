@@ -62,7 +62,7 @@ async def test_completed_job_has_empty_errors(client):
         return None
 
     job = await client.insert(ErrorTestJob(action="succeed"), queue="err_completed")
-    client.start([("err_completed", 1)], poll_interval_ms=10)
+    await client.start([("err_completed", 1)], poll_interval_ms=10)
     await asyncio.sleep(1)
     await client.shutdown()
 
@@ -88,7 +88,7 @@ async def test_terminal_error_appears_in_errors(client):
         queue="err_terminal",
         max_attempts=5,  # lots of retries — but terminal skips them
     )
-    client.start([("err_terminal", 1)], poll_interval_ms=10)
+    await client.start([("err_terminal", 1)], poll_interval_ms=10)
     await asyncio.sleep(2)
     await client.shutdown()
 
@@ -124,7 +124,7 @@ async def test_multiple_retries_accumulate_errors(client):
         queue="err_multi",
         max_attempts=3,
     )
-    client.start(
+    await client.start(
         [("err_multi", 1)],
         poll_interval_ms=10,
         promote_interval_ms=100,
@@ -166,7 +166,7 @@ async def test_error_entry_shape(client):
         queue="err_shape",
         max_attempts=1,
     )
-    client.start([("err_shape", 1)], poll_interval_ms=10)
+    await client.start([("err_shape", 1)], poll_interval_ms=10)
     await asyncio.sleep(2)
     await client.shutdown()
 
@@ -205,7 +205,7 @@ async def test_sync_client_exposes_errors(client, sync_client):
         queue="err_sync",
         max_attempts=1,
     )
-    client.start([("err_sync", 1)], poll_interval_ms=10)
+    await client.start([("err_sync", 1)], poll_interval_ms=10)
     await asyncio.sleep(2)
     await client.shutdown()
 

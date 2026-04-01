@@ -182,7 +182,7 @@ Cause:
 Fix:
 
 ```python
-client.start(
+await client.start(
     [{"name": "email", "min_workers": 5, "weight": 2}],
     global_max_workers=20,
 )

@@ -184,7 +184,7 @@ async def run_hot_benchmark(
         handler_returned += 1
         return None
 
-    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+    await client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
     await asyncio.sleep(warmup_secs)
 
     handler_before = handler_returned
@@ -307,7 +307,7 @@ async def run_scheduled_benchmark(
             pickup_lateness_ms.append(lateness_ms)
         return None
 
-    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+    await client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
     await asyncio.sleep(1)
 
     await execute(
@@ -505,7 +505,7 @@ async def _run_single_sweep(
             handler_returned += 1
             return None
 
-        client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
+        await client.start([(queue, worker_count)], poll_interval_ms=poll_interval_ms)
         await asyncio.sleep(2)  # warmup
 
         handler_before = handler_returned
@@ -608,7 +608,7 @@ async def run_latency_jitter(
         pickup_lateness_ms.append(lateness)
         return None
 
-    client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
+    await client.start([(queue, max_workers)], poll_interval_ms=poll_interval_ms)
 
     # Wait for all jobs to be processed
     deadline = asyncio.get_running_loop().time() + spread_secs + 30
@@ -695,7 +695,7 @@ async def run_heartbeat_rescue(
         return None
 
     started = asyncio.get_running_loop().time()
-    client.start(
+    await client.start(
         [(queue, max_workers)],
         poll_interval_ms=poll_interval_ms,
         heartbeat_interval_ms=50,
@@ -855,7 +855,7 @@ async def run_failure_benchmark(
     started = asyncio.get_running_loop().time()
     final_counts: dict[str, int] = {}
     drain_time = 0.0
-    client.start(
+    await client.start(
         [(queue, max_workers)],
         poll_interval_ms=poll_interval_ms,
         heartbeat_interval_ms=50,

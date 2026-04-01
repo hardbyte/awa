@@ -55,7 +55,7 @@ async def test_worker_dispatch_completes_jobs(client):
         )
 
     # Start workers and let them run briefly
-    client.start([(queue, 5)])
+    await client.start([(queue, 5)])
     await asyncio.sleep(1.0)  # Give workers time to process
     await client.shutdown()
 
@@ -83,7 +83,7 @@ async def test_worker_dispatch_retries_on_error(client):
         queue=queue,
     )
 
-    client.start([(queue, 2)])
+    await client.start([(queue, 2)])
     await asyncio.sleep(0.5)
     await client.shutdown()
 
@@ -116,7 +116,7 @@ async def test_worker_dispatch_handles_cancel(client):
         queue=queue,
     )
 
-    client.start([(queue, 2)])
+    await client.start([(queue, 2)])
     await asyncio.sleep(0.5)
     await client.shutdown()
 
@@ -138,7 +138,7 @@ async def test_worker_dispatch_shutdown_is_clean(client):
     async def handle(job):
         return None
 
-    client.start([(queue, 2)])
+    await client.start([(queue, 2)])
     await asyncio.sleep(0.1)
     await client.shutdown()  # Should not raise
 
@@ -149,7 +149,7 @@ async def test_worker_dispatch_requires_registered_workers(client):
     with pytest.raises(
         awa.AwaError, match="register at least one worker before starting the runtime"
     ):
-        client.start([("dispatch_missing_worker", 1)])
+        await client.start([("dispatch_missing_worker", 1)])
 
 
 @pytest.mark.asyncio
@@ -172,7 +172,7 @@ async def test_worker_dispatch_shutdown_signals_cancellation(client):
         queue=queue,
     )
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.wait_for(started.wait(), timeout=1.0)
     await client.shutdown(timeout_ms=500)
     await asyncio.wait_for(observed.wait(), timeout=1.0)
@@ -188,7 +188,7 @@ async def test_worker_dispatch_health_check(client):
         await asyncio.sleep(0.05)
         return None
 
-    client.start([(queue, 2)])
+    await client.start([(queue, 2)])
     health = await client.health_check()
     await client.shutdown()
 
@@ -208,7 +208,7 @@ async def test_worker_dispatch_validates_registered_queue(client):
         return None
 
     with pytest.raises(ValueError):
-        client.start([("different_queue", 1)])
+        await client.start([("different_queue", 1)])
 
 
 @pytest.mark.asyncio

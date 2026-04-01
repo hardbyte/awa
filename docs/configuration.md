@@ -66,10 +66,10 @@ Tuple form for simple cases, dict form for full control:
 
 ```python
 # Hard-reserved — just (name, max_workers)
-client.start([("email", 10), ("reports", 5)])
+await client.start([("email", 10), ("reports", 5)])
 
 # Dict form — rate limiting, weighted mode, retention
-client.start([
+await client.start([
     {"name": "email", "max_workers": 10, "rate_limit": (50.0, 50)},
     {"name": "reports", "max_workers": 5},
 ])
@@ -78,7 +78,7 @@ client.start([
 Weighted mode requires dict form and `global_max_workers`:
 
 ```python
-client.start(
+await client.start(
     [{"name": "email", "min_workers": 5, "weight": 2},
      {"name": "reports", "min_workers": 2, "weight": 1}],
     global_max_workers=20,

@@ -37,7 +37,7 @@ async def main() -> None:
             )
             return None
 
-        client.start(
+        await client.start(
             [(queue, 1)],
             leader_election_interval_ms=100,
             heartbeat_interval_ms=50,
@@ -66,7 +66,7 @@ async def main() -> None:
             )
             return None
 
-        client.start(
+        await client.start(
             [(queue, 1)],
             leader_election_interval_ms=leader_election_interval_ms,
             heartbeat_interval_ms=50,

@@ -49,7 +49,7 @@ class AsyncClient:
         async def handle(job):
             print(f"Sending to {job.args.to}")
 
-        client.start([("email", 2)])
+        await client.start([("email", 2)])
         ...
         await client.shutdown()
         await client.close()
@@ -328,7 +328,7 @@ class AsyncClient:
             metadata=metadata,
         )
 
-    def start(
+    async def start(
         self,
         queues: list[tuple[str, int]] | list[dict[str, Any]] | None = None,
         *,
@@ -346,7 +346,7 @@ class AsyncClient:
         callback_rescue_interval_ms: int | None = None,
     ) -> None:
         """Start the worker runtime."""
-        return self._raw.start(
+        return await self._raw.start(
             queues,
             poll_interval_ms=poll_interval_ms,
             global_max_workers=global_max_workers,
