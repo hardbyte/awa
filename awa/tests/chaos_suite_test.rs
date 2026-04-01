@@ -743,15 +743,6 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
         )
         .await;
 
-    client_a
-        .start()
-        .await
-        .expect("Failed to start mixed chaos client A");
-    client_b
-        .start()
-        .await
-        .expect("Failed to start mixed chaos client B");
-
     async fn insert_wave(pool: &sqlx::PgPool, queue: &str, seq: &mut i64) {
         for _ in 0..2 {
             insert_with(
@@ -790,29 +781,14 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     let total_waves = 4_i64;
     let mut seq = 1_i64;
 
+    // Insert waves BEFORE starting Rust clients. Python is the only worker
+    // running so it exclusively claims simple_chaos_jobs (400ms each). This
+    // eliminates the race with Rust's instant CompleteWorker and guarantees
+    // Python has in-flight jobs when we kill it.
     insert_wave(&pool, &queue, &mut seq).await;
     insert_wave(&pool, &queue, &mut seq).await;
 
-    // Insert simple jobs and wait for the Python helper to print a START
-    // line, which proves it claimed a job and is mid-execution (sleeping
-    // 400ms). Rust workers also handle this kind but complete instantly,
-    // so we can't rely on DB state — Python's stdout is the definitive
-    // signal that it owns an in-flight job.
-    for i in 0..10 {
-        insert_with(
-            &pool,
-            &SimpleChaosJob { seq: seq + i },
-            InsertOpts {
-                queue: queue.clone(),
-                max_attempts: 3,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("Failed to insert pre-kill simple chaos job");
-    }
-    seq += 10;
-
+    // Confirm Python is mid-execution on at least one simple job.
     python_worker
         .wait_for_line(
             "START mode=worker_simple_chaos_job",
@@ -820,8 +796,18 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
         )
         .await;
 
-    // Python is now mid-execution on a simple job. Kill it immediately
-    // so the job stays in 'running' state with a stale heartbeat.
+    // Now start Rust clients. They handle chaos_jobs from the waves and
+    // will also pick up simple_chaos_jobs — but Python already owns several.
+    client_a
+        .start()
+        .await
+        .expect("Failed to start mixed chaos client A");
+    client_b
+        .start()
+        .await
+        .expect("Failed to start mixed chaos client B");
+
+    // Kill Python while it has in-flight simple jobs.
     python_worker.stop().await;
 
     let _ = wait_for_single_leader(&[&client_a, &client_b], Duration::from_secs(5)).await;
@@ -912,8 +898,8 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     .await
     .expect("Failed to backdate run_at for retryable chaos jobs");
 
-    // 1 sentinel + 5 per wave (2 simple + 2 complete + 1 retry_once_manual) + 10 pre-kill simple
-    let expected_completed = 1 + (total_waves * 5) + 10;
+    // 1 sentinel + 5 per wave (2 simple + 2 complete + 1 retry_once_manual)
+    let expected_completed = 1 + (total_waves * 5);
     let expected_failed = total_waves;
 
     let counts = wait_for_counts(

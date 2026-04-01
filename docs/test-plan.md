@@ -62,9 +62,17 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | T27 | Admin ops under load | ✓ | |
 | T72 | Runtime recovers after terminating Postgres backends | ✓ | |
 | T71 | Mixed Rust/Python workers share queue | Both | Both |
-| T73 | Sustained mixed workload survives node failure | Both | Both |
+| T73 | Sustained mixed workload survives node failure (see below) | Both | Both |
 | T74 | Hot-standby promotion | ✓ | |
 | HA1 | Postgres failover smoke | ✓ | |
+
+**T73 ordering invariant:** Jobs are inserted *before* Rust clients start so that
+the Python worker exclusively claims `simple_chaos_job` rows. This avoids a race
+where Rust's instant `CompleteWorker` steals all simple jobs before the slower
+Python worker (400 ms/job) can claim any. The test confirms Python is mid-execution
+via its `START` stdout line, then kills it. Heartbeat backdating triggers rescue,
+and the `max_simple_attempt >= 2` assertion verifies re-processing by a surviving
+Rust worker.
 
 ### External Callbacks
 
@@ -290,6 +298,8 @@ cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test 
 ./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
 ./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
 ./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimNew.cfg
+./correctness/run-tlc.sh races/AwaViewTrigger.tla
+./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
 
 # Concurrent multi-queue lifecycle benchmarks
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --release --package awa --test concurrent_lifecycle_test -- --ignored --nocapture
