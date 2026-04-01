@@ -56,7 +56,7 @@ async def _setup_waiting_job(client, queue: str, order_id: int, **insert_kwargs)
         ExternalTask(order_id=order_id), queue=queue, **insert_kwargs
     )
 
-    client.start(
+    await client.start(
         [(queue, 1)],
         poll_interval_ms=50,
         heartbeat_interval_ms=50,
@@ -293,7 +293,7 @@ async def test_stale_callback_rejected_after_rescue(client):
     )
 
     # Run first attempt → parks in waiting_external
-    client.start([(queue, 1)], poll_interval_ms=50, leader_election_interval_ms=100)
+    await client.start([(queue, 1)], poll_interval_ms=50, leader_election_interval_ms=100)
     deadline = asyncio.get_event_loop().time() + 5
     while not callback_ids and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.1)
@@ -306,7 +306,7 @@ async def test_stale_callback_rejected_after_rescue(client):
     await client.retry(job.id)
 
     # Run second attempt → completes normally
-    client.start(
+    await client.start(
         [(queue, 1)],
         poll_interval_ms=50,
         promote_interval_ms=100,
@@ -352,7 +352,7 @@ async def test_callback_timeout_rescued_by_runtime(client):
         ExternalTask(order_id=109), queue=queue, max_attempts=3
     )
 
-    client.start(
+    await client.start(
         [(queue, 1)],
         poll_interval_ms=50,
         heartbeat_interval_ms=50,

@@ -41,7 +41,7 @@ async def test_tuple_form_backward_compat(client):
         return None
 
     # Should not raise
-    client.start([(queue, 10)])
+    await client.start([(queue, 10)])
     await client.shutdown()
 
 
@@ -57,7 +57,7 @@ async def test_dict_config_with_rate_limit(client):
     async def handle(job):
         return None
 
-    client.start(
+    await client.start(
         [{"name": queue, "max_workers": 10, "rate_limit": (100.0, 100)}]
     )
     await client.shutdown()
@@ -75,7 +75,7 @@ async def test_global_max_workers(client):
     async def handle(job):
         return None
 
-    client.start(
+    await client.start(
         [{"name": queue, "min_workers": 5, "weight": 2}],
         global_max_workers=20,
     )
@@ -95,7 +95,7 @@ async def test_tuple_plus_global_max_workers_raises(client):
         return None
 
     with pytest.raises(ValueError, match="tuple queue config is not supported"):
-        client.start([(queue, 10)], global_max_workers=20)
+        await client.start([(queue, 10)], global_max_workers=20)
 
 
 # -- Test 16: Invalid: both max_workers and min_workers --
@@ -111,7 +111,7 @@ async def test_both_max_and_min_workers_raises(client):
         return None
 
     with pytest.raises(ValueError, match="max_workers.*min_workers"):
-        client.start(
+        await client.start(
             [{"name": queue, "max_workers": 10, "min_workers": 5}]
         )
 
@@ -129,7 +129,7 @@ async def test_zero_weight_raises(client):
         return None
 
     with pytest.raises(ValueError, match="weight must be > 0"):
-        client.start(
+        await client.start(
             [{"name": queue, "max_workers": 10, "weight": 0}]
         )
 
@@ -147,7 +147,7 @@ async def test_global_max_workers_requires_explicit_queues(client):
         return None
 
     with pytest.raises(ValueError, match="weighted mode requires explicit queue configs"):
-        client.start(global_max_workers=20)
+        await client.start(global_max_workers=20)
 
 
 # -- Additional validation: dict missing name --
@@ -163,7 +163,7 @@ async def test_dict_missing_name_raises(client):
         return None
 
     with pytest.raises(ValueError, match="name"):
-        client.start([{"max_workers": 10}])
+        await client.start([{"max_workers": 10}])
 
 
 # -- Additional validation: rate_limit wrong type --
@@ -179,7 +179,7 @@ async def test_rate_limit_wrong_type_raises(client):
         return None
 
     with pytest.raises(TypeError, match="rate_limit must be a"):
-        client.start(
+        await client.start(
             [{"name": queue, "max_workers": 10, "rate_limit": "fast"}]
         )
 
@@ -196,7 +196,7 @@ async def test_retention_kwargs_accepted(client):
     async def handle(job):
         return None
 
-    client.start(
+    await client.start(
         [(queue, 10)],
         completed_retention_hours=1.0,
         failed_retention_hours=168.0,
@@ -214,7 +214,7 @@ async def test_maintenance_interval_kwargs_accepted(client):
     async def handle(job):
         return None
 
-    client.start(
+    await client.start(
         [(queue, 4)],
         heartbeat_interval_ms=100,
         heartbeat_staleness_ms=5_000,
@@ -236,7 +236,7 @@ async def test_per_queue_retention_in_dict_config(client):
     async def handle(job):
         return None
 
-    client.start(
+    await client.start(
         [
             {
                 "name": queue,

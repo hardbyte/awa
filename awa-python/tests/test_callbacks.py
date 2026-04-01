@@ -49,7 +49,7 @@ async def test_register_callback_and_wait(client):
 
     await client.insert(ExternalTask(order_id=1), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -78,7 +78,7 @@ async def test_complete_external(client):
 
     await client.insert(ExternalTask(order_id=2), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -101,7 +101,7 @@ async def test_complete_external_without_payload(client):
 
     await client.insert(ExternalTask(order_id=3), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -126,7 +126,7 @@ async def test_fail_external(client):
 
     await client.insert(ExternalTask(order_id=4), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -151,7 +151,7 @@ async def test_retry_external(client):
 
     await client.insert(ExternalTask(order_id=5), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -176,7 +176,7 @@ async def test_resolve_callback_default_complete(client):
 
     await client.insert(ExternalTask(order_id=6), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -202,7 +202,7 @@ async def test_resolve_callback_default_ignore(client):
 
     job = await client.insert(ExternalTask(order_id=7), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -231,7 +231,7 @@ async def test_resolve_callback_default_fail(client):
 
     await client.insert(ExternalTask(order_id=8), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -260,7 +260,7 @@ async def test_complete_external_sync(client):
 
     await client.insert(ExternalTask(order_id=9), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -282,7 +282,7 @@ async def test_fail_external_sync(client):
 
     await client.insert(ExternalTask(order_id=10), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -304,7 +304,7 @@ async def test_retry_external_sync(client):
 
     await client.insert(ExternalTask(order_id=11), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -326,7 +326,7 @@ async def test_resolve_callback_sync(client):
 
     await client.insert(ExternalTask(order_id=12), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 

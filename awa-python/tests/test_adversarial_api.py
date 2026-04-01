@@ -84,7 +84,7 @@ async def test_task_decorator_registers_handler():
         return None
 
     await client.insert(AdvJob(value="task_test"), queue="adv_task_reg")
-    client.start([("adv_task_reg", 2)])
+    await client.start([("adv_task_reg", 2)])
     for _ in range(20):
         await asyncio.sleep(0.1)
         if results:
@@ -215,7 +215,7 @@ async def test_handler_exception_preserves_type():
         queue="adv_error_type",
         max_attempts=1,
     )
-    client.start([("adv_error_type", 1)])
+    await client.start([("adv_error_type", 1)])
     await asyncio.sleep(2)
     await client.shutdown()
 
@@ -250,7 +250,7 @@ async def test_terminal_error_in_handler():
         queue="adv_terminal",
         max_attempts=5,
     )
-    client.start([("adv_terminal", 1)])
+    await client.start([("adv_terminal", 1)])
     await asyncio.sleep(2)
     await client.shutdown()
 
@@ -300,7 +300,7 @@ async def test_no_duplicate_processing_with_task_decorator():
     for i in range(30):
         await client.insert(AdvJob(value=f"job_{i}"), queue="adv_dedup")
 
-    client.start(
+    await client.start(
         [{"name": "adv_dedup", "max_workers": 10}],
         poll_interval_ms=50,
         leader_election_interval_ms=500,

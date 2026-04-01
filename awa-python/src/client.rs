@@ -12,9 +12,8 @@ use pyo3::types::PyDict;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-use tokio::sync::RwLock;
 
 fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     if !timeout_seconds.is_finite() || timeout_seconds.is_sign_negative() {
@@ -264,20 +263,23 @@ pub struct PyClient {
 impl PyClient {
     #[new]
     #[pyo3(signature = (database_url, max_connections=10))]
-    fn new(_py: Python<'_>, database_url: String, max_connections: u32) -> PyResult<Self> {
-        let pool = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async {
-                tokio::time::timeout(
-                    Duration::from_secs(30),
-                    PgPoolOptions::new()
-                        .max_connections(max_connections)
-                        .acquire_timeout(Duration::from_secs(30))
-                        .connect(&database_url),
-                )
-                .await
-                .map_err(|_| {
-                    sqlx::Error::PoolTimedOut
-                })?
+    fn new(py: Python<'_>, database_url: String, max_connections: u32) -> PyResult<Self> {
+        // Release the GIL during pool connect so other Python threads can
+        // make progress. The block_on is unavoidable here (__init__ must be
+        // sync) but is bounded by the 30s timeout.
+        let pool = py
+            .detach(|| {
+                pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        PgPoolOptions::new()
+                            .max_connections(max_connections)
+                            .acquire_timeout(Duration::from_secs(30))
+                            .connect(&database_url),
+                    )
+                    .await
+                    .map_err(|_| sqlx::Error::PoolTimedOut)?
+                })
             })
             .map_err(map_connect_error)?;
 
@@ -375,15 +377,20 @@ impl PyClient {
 
     fn migrate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
-        // Run synchronously via block_on then return an already-resolved future
-        // for backward compatibility with `await client.migrate()`.
-        // migrations::run is not Send-safe (holds PoolConnection across awaits),
-        // so we cannot use future_into_py.
-        let result = pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(async { awa_model::migrations::run(&pool).await })
-            .map_err(map_awa_error);
+        // migrations::run() is !Send (holds PoolConnection across awaits).
+        // We bridge it via spawn_blocking + a current_thread runtime so the
+        // asyncio event loop stays free and asyncio.wait_for() can cancel.
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            result?;
+            tokio::task::spawn_blocking(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("failed to build current_thread runtime for migrate");
+                rt.block_on(awa_model::migrations::run(&pool))
+            })
+            .await
+            .map_err(|e| map_awa_error(awa_model::AwaError::Database(sqlx::Error::Protocol(e.to_string()))))?
+            .map_err(map_awa_error)?;
             Ok(())
         })
     }
@@ -434,10 +441,10 @@ impl PyClient {
 
                 let workers = workers.clone();
                 let kind = kind_str.clone();
-                pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                    let mut guard = workers.write().await;
-                    guard.insert(kind, entry);
-                });
+                workers
+                    .write()
+                    .expect("workers lock poisoned")
+                    .insert(kind, entry);
 
                 Ok(handler_py)
             },
@@ -754,9 +761,9 @@ impl PyClient {
 
     #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
     #[allow(clippy::too_many_arguments)]
-    fn start(
+    fn start<'py>(
         &self,
-        py: Python<'_>,
+        py: Python<'py>,
         queues: Option<Py<PyAny>>,
         poll_interval_ms: u64,
         global_max_workers: Option<u32>,
@@ -770,7 +777,7 @@ impl PyClient {
         heartbeat_staleness_ms: Option<u64>,
         deadline_rescue_interval_ms: Option<u64>,
         callback_rescue_interval_ms: Option<u64>,
-    ) -> PyResult<()> {
+    ) -> PyResult<Bound<'py, PyAny>> {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
             if guard.is_some() {
@@ -778,14 +785,13 @@ impl PyClient {
             }
         }
 
-        let entries = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-            self.workers
-                .read()
-                .await
-                .values()
-                .cloned()
-                .collect::<Vec<_>>()
-        });
+        let entries: Vec<_> = self
+            .workers
+            .read()
+            .expect("workers lock poisoned")
+            .values()
+            .cloned()
+            .collect();
         if entries.is_empty() {
             return Err(state_error(
                 "register at least one worker before starting the runtime",
@@ -880,11 +886,13 @@ impl PyClient {
         }
 
         let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
-        pyo3_async_runtimes::tokio::get_runtime()
-            .block_on(runtime.start())
-            .map_err(map_awa_error)?;
-        *self.runtime.lock().expect("runtime mutex poisoned") = Some(runtime);
-        Ok(())
+        let runtime_clone = runtime.clone();
+        let runtime_store = self.runtime.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            runtime_clone.start().await.map_err(map_awa_error)?;
+            *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
+            Ok(())
+        })
     }
 
     #[pyo3(signature = (timeout_ms=2000))]

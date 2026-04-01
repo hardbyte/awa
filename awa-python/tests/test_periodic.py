@@ -56,7 +56,7 @@ async def test_periodic_registration(client):
     )
 
     # Start briefly to trigger cron sync
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(2.0)
     await client.shutdown()
 
@@ -96,7 +96,7 @@ async def test_periodic_with_metadata_and_tags(client):
         metadata={"team": "platform"},
     )
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(2.0)
     await client.shutdown()
 
@@ -183,7 +183,7 @@ async def test_periodic_fires_and_executes(client):
 
     # Use fast leader election so the cron job fires promptly.
     # Default 10s election interval makes this test timing-dependent.
-    client.start([(queue, 1)], leader_election_interval_ms=100, heartbeat_interval_ms=100)
+    await client.start([(queue, 1)], leader_election_interval_ms=100, heartbeat_interval_ms=100)
 
     # Poll until the job fires or timeout.
     for _ in range(60):

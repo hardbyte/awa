@@ -116,7 +116,7 @@ async def test_deadline_set_during_execution(client):
 
     await client.insert(PropsJob(value="dl"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -149,7 +149,7 @@ async def test_progress_readable_on_retrying_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -173,7 +173,7 @@ async def test_progress_cleared_on_completed_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -194,7 +194,7 @@ async def test_progress_preserved_on_failed_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -216,7 +216,7 @@ async def test_progress_preserved_on_cancelled_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -256,7 +256,7 @@ async def test_progress_readable_during_execution(client):
 
     await client.insert(PropsJob(value="live"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -280,7 +280,7 @@ async def test_progress_clamped_to_100(client):
 
     await client.insert(PropsJob(value="clamp"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -306,7 +306,7 @@ async def test_update_metadata_shallow_merge(client):
 
     await client.insert(PropsJob(value="merge"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -330,7 +330,7 @@ async def test_update_metadata_rejects_non_dict(client):
 
     await client.insert(PropsJob(value="bad"), queue=queue)
 
-    client.start([(queue, 1)])
+    await client.start([(queue, 1)])
     await asyncio.sleep(1.0)
     await client.shutdown()
 
