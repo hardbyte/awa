@@ -888,9 +888,14 @@ impl PyClient {
         let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
         let runtime_clone = runtime.clone();
         let runtime_store = self.runtime.clone();
+        // Store the runtime BEFORE starting so shutdown() can find it
+        // even if called concurrently. If start() fails, remove it.
+        *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            runtime_clone.start().await.map_err(map_awa_error)?;
-            *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
+            if let Err(e) = runtime_clone.start().await {
+                runtime_store.lock().expect("runtime mutex poisoned").take();
+                return Err(map_awa_error(e));
+            }
             Ok(())
         })
     }
