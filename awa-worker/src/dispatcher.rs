@@ -12,7 +12,6 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
 const CLAIM_BATCH_LIMIT: usize = 128;
-const CLAIM_CANDIDATES_PER_PRIORITY_MULTIPLIER: usize = 4;
 
 /// Rate limit configuration for a queue.
 #[derive(Debug, Clone)]
@@ -435,8 +434,6 @@ impl Dispatcher {
             .map(|rl| rl.available() as usize)
             .unwrap_or(usize::MAX);
         let batch_size = permits.len().min(rate_available).min(CLAIM_BATCH_LIMIT);
-        let candidate_limit_per_priority =
-            (batch_size * CLAIM_CANDIDATES_PER_PRIORITY_MULTIPLIER).max(batch_size);
         if batch_size == 0 {
             // Drop all permits — rate limited
             return false;
@@ -446,91 +443,35 @@ impl Dispatcher {
             permits.pop(); // Drop releases the permit
         }
 
-        // Phase 3: Claim from DB
+        // Phase 3: Claim jobs from DB.
+        //
+        // Uses a CTE (not a FROM-subquery) so the LIMIT is enforced as a
+        // materialization barrier. PostgreSQL's planner can merge a
+        // FROM-subquery with the UPDATE target when both reference the same
+        // table, which under concurrent load causes the LIMIT to be ignored.
+        //
+        // Single index scan on idx_awa_jobs_hot_dequeue with FOR UPDATE SKIP LOCKED
+        // acquires row locks during the scan. Priority ordering is strict
+        // (priority ASC, run_at ASC, id ASC); cross-priority fairness is handled
+        // by the maintenance leader's age_waiting_priorities task (ADR-005).
         let deadline_secs = self.config.deadline_duration.as_secs_f64();
-        let aging_secs = self.config.priority_aging_interval.as_secs_f64();
         let claim_start = Instant::now();
 
         let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
             r#"
-            WITH candidates AS (
-                (
-                    SELECT id, priority, run_at
-                    FROM awa.jobs_hot
-                    WHERE state = 'available'
-                      AND queue = $1
-                      AND priority = 1
-                      AND run_at <= now()
-                      AND NOT EXISTS (
-                          SELECT 1 FROM awa.queue_meta
-                          WHERE queue = $1 AND paused = TRUE
-                      )
-                    ORDER BY run_at ASC, id ASC
-                    LIMIT $5
-                )
-
-                UNION ALL
-
-                (
-                    SELECT id, priority, run_at
-                    FROM awa.jobs_hot
-                    WHERE state = 'available'
-                      AND queue = $1
-                      AND priority = 2
-                      AND run_at <= now()
-                      AND NOT EXISTS (
-                          SELECT 1 FROM awa.queue_meta
-                          WHERE queue = $1 AND paused = TRUE
-                      )
-                    ORDER BY run_at ASC, id ASC
-                    LIMIT $5
-                )
-
-                UNION ALL
-
-                (
-                    SELECT id, priority, run_at
-                    FROM awa.jobs_hot
-                    WHERE state = 'available'
-                      AND queue = $1
-                      AND priority = 3
-                      AND run_at <= now()
-                      AND NOT EXISTS (
-                          SELECT 1 FROM awa.queue_meta
-                          WHERE queue = $1 AND paused = TRUE
-                      )
-                    ORDER BY run_at ASC, id ASC
-                    LIMIT $5
-                )
-
-                UNION ALL
-
-                (
-                    SELECT id, priority, run_at
-                    FROM awa.jobs_hot
-                    WHERE state = 'available'
-                      AND queue = $1
-                      AND priority = 4
-                      AND run_at <= now()
-                      AND NOT EXISTS (
-                          SELECT 1 FROM awa.queue_meta
-                          WHERE queue = $1 AND paused = TRUE
-                      )
-                    ORDER BY run_at ASC, id ASC
-                    LIMIT $5
-                )
-            ),
-            claimed AS (
-                SELECT jobs.id
-                FROM awa.jobs_hot AS jobs
-                JOIN candidates ON candidates.id = jobs.id
-                WHERE jobs.state = 'available'
-                ORDER BY
-                  GREATEST(1, candidates.priority - FLOOR(EXTRACT(EPOCH FROM (now() - candidates.run_at)) / $4)::int) ASC,
-                  candidates.run_at ASC,
-                  candidates.id ASC
+            WITH claimed AS (
+                SELECT id
+                FROM awa.jobs_hot
+                WHERE state = 'available'
+                  AND queue = $1
+                  AND run_at <= now()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM awa.queue_meta
+                      WHERE queue = $1 AND paused = TRUE
+                  )
+                ORDER BY priority ASC, run_at ASC, id ASC
                 LIMIT $2
-                FOR UPDATE OF jobs SKIP LOCKED
+                FOR UPDATE SKIP LOCKED
             )
             UPDATE awa.jobs_hot
             SET state = 'running',
@@ -548,8 +489,6 @@ impl Dispatcher {
         .bind(&self.queue)
         .bind(batch_size as i32)
         .bind(deadline_secs)
-        .bind(aging_secs)
-        .bind(candidate_limit_per_priority as i32)
         .fetch_all(&self.pool)
         .await
         {

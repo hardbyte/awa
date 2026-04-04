@@ -39,6 +39,11 @@ What is intentionally not modeled:
   state graph
 - full advisory-lock mechanics; leadership is an abstract exclusive token
 - exact permit identity per task attempt; the model is job-centric and approximates task-held capacity closely enough to check the protocol invariants
+- **priority ordering and starvation.** No model includes a `priority` variable.
+  Priority is a scheduling heuristic, not a safety invariant — all formal
+  invariants (NoDuplicateClaim, TaskLeaseBounded, RunningHasPermit, etc.)
+  are independent of dispatch order. Cross-priority fairness is enforced by
+  the maintenance leader's priority aging task (see ADR-005)
 
 ## Files
 
@@ -57,11 +62,12 @@ What is intentionally not modeled:
   resolution model for the three-way race between complete/fail, timeout rescue,
   and heartbeat rescue with Postgres row-lock semantics
 - `AwaDispatchClaim.tla` / `AwaDispatchClaimOld.cfg` /
-  `AwaDispatchClaimNew.cfg`: focused dispatcher-claim model for the stale
-  candidate race from issue #134; includes retry cycles so `attempt > 1` is
-  exercised as a legitimate path; the old config intentionally fails the
-  `NoDuplicateClaim` invariant and the new config re-checks availability at
-  claim time
+  `AwaDispatchClaimNew.cfg`: focused dispatcher-claim model; includes retry
+  cycles so `attempt > 1` is exercised as a legitimate path; the old config
+  intentionally fails the `NoDuplicateClaim` invariant and the new config
+  re-checks availability at claim time — matching the production dispatch
+  query's `WHERE state = 'available'` guard in both the subquery and the
+  UPDATE
 - `AwaViewTrigger.tla` / `AwaViewTrigger.cfg` / `AwaViewTriggerOld.cfg`:
   INSTEAD OF UPDATE trigger concurrency model for the `awa.jobs` UNION ALL
   view; the trigger implements UPDATE as DELETE + INSERT for cross-table
@@ -161,7 +167,7 @@ maintenance can rescue the job and a new worker can re-claim it.
 
 | TLA+ action | Rust code |
 |-------------|-----------|
-| `Claim` | `dispatcher.claim_jobs()` — `UPDATE SET state='running', run_lease=run_lease+1` |
+| `Claim` | `dispatcher.poll_once()` — `UPDATE ... FROM (SELECT ... FOR UPDATE SKIP LOCKED) ... SET state='running', run_lease=run_lease+1` |
 | `HandlerComplete` | `completion_batcher.complete(job.id, job.run_lease)` (`executor.rs:364`) |
 | `BatcherFlushSuccess` | Flush SQL: `UPDATE ... WHERE run_lease=$2 AND state='running'` (`completion.rs:150`) |
 | `BatcherFlushStale` | Same SQL, `RETURNING` returns 0 rows (job rescued between enqueue and flush) |
@@ -330,9 +336,9 @@ was re-dispatched as attempt 2 and completed, and the test got stuck at
    the model's reserve/claim split was permissive enough to allow the same bad
    shape, but the checked invariants did not explicitly forbid it.
 
-**Fix:** The dispatcher SQL now re-checks `jobs.state = 'available'` both in the
-locked `claimed` CTE and in the final `UPDATE ... WHERE` clause. This restores
-the claim semantics that `AwaExtended` was already intending to model.
+**Fix:** The dispatcher SQL re-checks `state = 'available'` both in the
+`FOR UPDATE SKIP LOCKED` subquery and in the outer `UPDATE ... WHERE` clause,
+preventing a stale candidate from claiming a row that has already transitioned.
 
 ### Concurrent UPDATE race on the `awa.jobs` view (v0.5.1, #132)
 

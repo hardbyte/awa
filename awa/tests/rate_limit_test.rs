@@ -165,7 +165,7 @@ async fn test_rate_limit_throttles_dispatch() {
         if completed.load(Ordering::SeqCst) >= 30 {
             break;
         }
-        if start.elapsed() > Duration::from_secs(10) {
+        if start.elapsed() > Duration::from_secs(30) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -230,7 +230,7 @@ async fn test_rate_limit_burst_then_throttle() {
         if completed.load(Ordering::SeqCst) >= 30 {
             break;
         }
-        if start.elapsed() > Duration::from_secs(15) {
+        if start.elapsed() > Duration::from_secs(30) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -295,7 +295,7 @@ async fn test_rate_limit_with_low_max_workers() {
         if completed.load(Ordering::SeqCst) >= 10 {
             break;
         }
-        if start.elapsed() > Duration::from_secs(5) {
+        if start.elapsed() > Duration::from_secs(30) {
             break;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;

@@ -26,6 +26,9 @@ export interface JobRow {
   callback_on_complete: string | null;
   callback_on_fail: string | null;
   callback_transform: string | null;
+  // Computed by the API — the priority assigned at enqueue time,
+  // before maintenance-based aging.
+  original_priority: number;
 }
 
 export interface QueueStats {

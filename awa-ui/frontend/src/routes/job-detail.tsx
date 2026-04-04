@@ -144,7 +144,12 @@ export function JobDetailPage() {
         </DescriptionDetails>
 
         <DescriptionTerm>Priority</DescriptionTerm>
-        <DescriptionDetails>{job.priority}</DescriptionDetails>
+        <DescriptionDetails>
+          {job.priority}
+          {job.original_priority !== job.priority && (
+            <span className="ml-1 text-zinc-500">(enqueued as {job.original_priority})</span>
+          )}
+        </DescriptionDetails>
 
         <DescriptionTerm>Attempt</DescriptionTerm>
         <DescriptionDetails>

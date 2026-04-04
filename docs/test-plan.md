@@ -32,6 +32,7 @@ See [the full test plan](../prd.md) for detailed descriptions of each test case.
 | B4 | Heartbeat alive during shutdown drain | ✓ | |
 | B5 | Deadline rescue signals ctx.is_cancelled() | ✓ | |
 | B6 | UniqueConflict.constraint field | ✓ | |
+| T75 | Priority aging maintenance task promotes long-waiting low-priority jobs | ✓ | |
 
 ### Uniqueness (Python)
 
@@ -213,6 +214,9 @@ Rust worker.
 | SP1-SP2 | Scheduled promotion at scale | ✓ | |
 | FB1-FB7 | Failure modes: terminal, retryable, callback, deadline, mixed | ✓ | |
 | FB8 | Failure modes (Python) | | ✓ |
+| PB1 | Portable cross-system enqueue throughput (Awa vs River vs Oban, 10k and 50k jobs) | | |
+| PB2 | Portable cross-system worker throughput (50/100/200 workers, no-op jobs) | | |
+| PB3 | Portable cross-system pickup latency (single job to idle queue) | | |
 
 ### Dirty-key trigger overhead (measured v0.5.1, debug build, Docker PG 17)
 
@@ -233,6 +237,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA3 | AwaCbk | At-most-once callback resolution, sequential resume |
 | TLA4 | AwaCron | No duplicate fire under leader failover |
 | TLA5 | AwaBatcher | At-most-once completion, DirectCompleteFail recovery |
+| TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
 
 ## Running Tests
 

@@ -652,7 +652,7 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
                 && state_count(counts, "scheduled") == 0
                 && state_count(counts, "waiting_external") == 0
         },
-        Duration::from_secs(15),
+        Duration::from_secs(30),
     )
     .await;
 

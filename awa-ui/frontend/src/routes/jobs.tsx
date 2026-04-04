@@ -411,12 +411,12 @@ export function JobsPage() {
                     <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
                   </span>
                   <StateBadge state={job.state} />
-                  {job.priority !== 2 && (
+                  {(job.priority !== 2 || job.original_priority !== job.priority) && (
                     <Badge
                       intent={job.priority === 1 ? "danger" : "secondary"}
                       className="text-[10px]"
                     >
-                      P{job.priority}
+                      P{job.priority}{job.original_priority !== job.priority ? ` (was ${job.original_priority})` : ""}
                     </Badge>
                   )}
                 </div>
@@ -504,8 +504,12 @@ export function JobsPage() {
               <TableCell>
                 {job.priority !== 2 ? (
                   <Badge intent={job.priority === 1 ? "danger" : "secondary"} className="text-[10px]">
-                    {job.priority}
+                    {job.original_priority !== job.priority
+                      ? `${job.priority} (was ${job.original_priority})`
+                      : String(job.priority)}
                   </Badge>
+                ) : job.original_priority !== 2 ? (
+                  <span className="text-muted-fg">2 <span className="text-[10px]">(was {job.original_priority})</span></span>
                 ) : (
                   <span className="text-muted-fg/40">2</span>
                 )}
