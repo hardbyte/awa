@@ -597,13 +597,10 @@ impl MaintenanceService {
 
     /// Age priorities for jobs that have been waiting longer than `priority_aging_interval`.
     ///
-    /// For each elapsed aging interval, a job's priority improves by one level
-    /// (lower number = higher priority, minimum 1). A priority-4 job waiting
-    /// 3× the interval is promoted to priority-1, matching a fresh high-priority job.
-    ///
-    /// Only affects `available` jobs in `jobs_hot`. The original `priority` column
-    /// is modified in place — this is intentional so the dispatch query's simple
-    /// `ORDER BY priority ASC` ordering naturally picks up aged jobs.
+    /// Decrements `priority` by 1 per pass for available jobs waiting longer than
+    /// the aging interval (minimum priority 1). On the first age, stores the
+    /// original priority in `metadata._awa_original_priority` so the API can
+    /// report it accurately.
     #[tracing::instrument(skip(self), name = "maintenance.priority_aging")]
     async fn age_waiting_priorities(&self) {
         let aging_secs = self.priority_aging_interval.as_secs() as f64;
@@ -612,22 +609,22 @@ impl MaintenanceService {
         }
         match sqlx::query_scalar::<_, i64>(
             r#"
-            WITH aged AS (
-                SELECT id,
-                       GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $1)::int)::smallint AS new_priority
-                FROM awa.jobs_hot
+            UPDATE awa.jobs_hot
+            SET priority = priority - 1,
+                metadata = CASE
+                    WHEN NOT (metadata ? '_awa_original_priority')
+                    THEN metadata || jsonb_build_object('_awa_original_priority', priority)
+                    ELSE metadata
+                END
+            WHERE id IN (
+                SELECT id FROM awa.jobs_hot
                 WHERE state = 'available'
                   AND priority > 1
                   AND run_at <= now() - make_interval(secs => $1)
                 LIMIT 1000
+                FOR UPDATE SKIP LOCKED
             )
-            UPDATE awa.jobs_hot
-            SET priority = aged.new_priority
-            FROM aged
-            WHERE awa.jobs_hot.id = aged.id
-              AND awa.jobs_hot.state = 'available'
-              AND awa.jobs_hot.priority > aged.new_priority
-            RETURNING awa.jobs_hot.id
+            RETURNING id
             "#,
         )
         .bind(aging_secs)

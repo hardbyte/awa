@@ -303,40 +303,44 @@ async fn test_priority_aging_reorders_jobs() {
     .await
     .unwrap();
 
-    // Run the maintenance aging query scoped to our queue.
-    // The production maintenance task runs globally; this test scopes
-    // to avoid interference from other tests sharing the database.
+    // Run the maintenance aging query multiple times (simulating multiple ticks).
+    // Each pass decrements priority by 1 for eligible jobs. Scoped to our queue.
     let aging_interval_secs: f64 = 60.0;
-    let aged_ids: Vec<i64> = sqlx::query_scalar(
-        r#"
-        WITH aged AS (
-            SELECT id,
-                   GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $1)::int)::smallint AS new_priority
-            FROM awa.jobs_hot
+    let aging_sql = r#"
+        UPDATE awa.jobs_hot
+        SET priority = priority - 1,
+            metadata = CASE
+                WHEN NOT (metadata ? '_awa_original_priority')
+                THEN metadata || jsonb_build_object('_awa_original_priority', priority)
+                ELSE metadata
+            END
+        WHERE id IN (
+            SELECT id FROM awa.jobs_hot
             WHERE state = 'available'
               AND queue = $2
               AND priority > 1
               AND run_at <= now() - make_interval(secs => $1)
             LIMIT 1000
+            FOR UPDATE SKIP LOCKED
         )
-        UPDATE awa.jobs_hot
-        SET priority = aged.new_priority
-        FROM aged
-        WHERE awa.jobs_hot.id = aged.id
-          AND awa.jobs_hot.state = 'available'
-          AND awa.jobs_hot.priority > aged.new_priority
-        RETURNING awa.jobs_hot.id
-        "#,
-    )
-    .bind(aging_interval_secs)
-    .bind(queue)
-    .fetch_all(&pool)
-    .await
-    .unwrap();
+        RETURNING id
+    "#;
 
-    // Two jobs should have been aged (index 1 and index 2).
-    // Index 3 (priority-1) was not eligible.
-    assert_eq!(aged_ids.len(), 2, "Two jobs should have been aged");
+    // Run 5 aging passes (enough for priority-4 → 1 at 300s wait)
+    let mut total_aged = 0;
+    for _ in 0..5 {
+        let aged: Vec<i64> = sqlx::query_scalar(aging_sql)
+            .bind(aging_interval_secs)
+            .bind(queue)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        total_aged += aged.len();
+        if aged.is_empty() {
+            break;
+        }
+    }
+    assert!(total_aged > 0, "At least some jobs should have been aged");
 
     // Verify the priority column was updated correctly
     let jobs: Vec<(i16, serde_json::Value)> = sqlx::query_as(
@@ -348,12 +352,26 @@ async fn test_priority_aging_reorders_jobs() {
     .unwrap();
 
     assert_eq!(jobs.len(), 3);
-    // Index 1: priority 4, waited 300s / 60s = 5 levels → clamped to 1
+    // Index 1: priority 4, waited 300s, ages 4→3→2→1 over passes → 1
     assert_eq!(jobs[0].0, 1, "Priority-4 job waited 300s should age to 1");
-    // Index 2: priority 3, waited 90s / 60s = 1 level → 2
-    assert_eq!(jobs[1].0, 2, "Priority-3 job waited 90s should age to 2");
+    // Index 2: priority 3, waited 90s, ages 3→2→1 over passes → 1
+    assert_eq!(jobs[1].0, 1, "Priority-3 job waited 90s should age to 1");
     // Index 3: priority 1, fresh — unchanged
     assert_eq!(jobs[2].0, 1, "Priority-1 job should remain at 1");
+
+    // Verify original priority stored in metadata
+    let orig: Option<serde_json::Value> = sqlx::query_scalar(
+        "SELECT metadata->'_awa_original_priority' FROM awa.jobs_hot WHERE queue = $1 AND args->>'index' = '1'",
+    )
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        orig,
+        Some(serde_json::json!(4)),
+        "Original priority should be preserved in metadata"
+    );
 
     // Verify that the dispatch query (strict priority ordering) now picks
     // the aged-up old job first (it has priority 1 and earlier run_at)
@@ -384,17 +402,15 @@ async fn test_priority_aging_reorders_jobs() {
         "Aged priority-4 job (now priority-1) should be claimed first"
     );
 
-    // Verify original priority is reconstructable: priority + levels_aged
-    // For the claimed job: priority=1, waited 300s, interval=60s
-    // original = min(4, 1 + floor(300/60)) = min(4, 6) = 4
-    let wait_secs = (chrono::Utc::now() - claimed[0].run_at)
-        .num_seconds()
-        .max(0) as f64;
-    let levels_aged = (wait_secs / aging_interval_secs).floor() as i16;
-    let reconstructed_original = (claimed[0].priority + levels_aged).min(4);
+    // Verify original priority is readable from metadata (set by aging task)
+    let original: Option<i64> = claimed[0]
+        .metadata
+        .get("_awa_original_priority")
+        .and_then(|v| v.as_i64());
     assert_eq!(
-        reconstructed_original, 4,
-        "Original priority should be reconstructable from priority + wait time"
+        original,
+        Some(4),
+        "Original priority should be readable from metadata"
     );
 }
 
