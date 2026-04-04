@@ -169,7 +169,7 @@ def start_river_worker() -> subprocess.Popen:
             "-e", "SCENARIO=worker_only",
             "-e", "WORKER_COUNT=10",
             "-e", "JOB_DURATION_MS=30000",
-            "-e", "RESCUE_AFTER_SECS=30",
+            "-e", "RESCUE_AFTER_SECS=15",
             "river-bench",
         ],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -582,7 +582,7 @@ def start_second_worker(system: str) -> subprocess.Popen:
              "--network", "host",
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=10",
-             "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_AFTER_SECS=30",
+             "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_AFTER_SECS=15",
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -705,7 +705,7 @@ def start_worker_fast(system: str) -> subprocess.Popen:
              "--network", "host",
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
-             "-e", "JOB_DURATION_MS=100", "-e", "RESCUE_AFTER_SECS=30",
+             "-e", "JOB_DURATION_MS=100", "-e", "RESCUE_AFTER_SECS=15",
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -756,7 +756,7 @@ def scenario_pool_exhaustion(system: str, job_count: int = 20) -> dict:
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
              "-e", "MAX_CONNECTIONS=5", "-e", "JOB_DURATION_MS=5000",
-             "-e", "RESCUE_AFTER_SECS=30",
+             "-e", "RESCUE_AFTER_SECS=15",
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -862,7 +862,7 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
              "--network", "host",
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=3",
-             "-e", "JOB_DURATION_MS=2000", "-e", "RESCUE_AFTER_SECS=30"],
+             "-e", "JOB_DURATION_MS=2000", "-e", "RESCUE_AFTER_SECS=15"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     else:
         worker = subprocess.Popen(

@@ -372,7 +372,7 @@ func scenarioWorkerThroughput(ctx context.Context, pool *pgxpool.Pool, jobCount 
 		Workers:           workers,
 		JobTimeout:        -1,
 		FetchCooldown:     50 * time.Millisecond,
-		FetchPollInterval: 200 * time.Millisecond,
+		FetchPollInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create worker client: %v", err)
@@ -420,7 +420,7 @@ func scenarioPickupLatency(ctx context.Context, pool *pgxpool.Pool, iterations i
 		Workers:           workers,
 		JobTimeout:        -1,
 		FetchCooldown:     50 * time.Millisecond,
-		FetchPollInterval: 200 * time.Millisecond,
+		FetchPollInterval: 50 * time.Millisecond,
 	})
 	if err != nil {
 		log.Fatalf("Failed to create client: %v", err)
