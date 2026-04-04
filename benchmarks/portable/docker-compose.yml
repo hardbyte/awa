@@ -1,0 +1,30 @@
+version: "3.8"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_PASSWORD: bench
+      POSTGRES_USER: bench
+    ports:
+      - "15555:5432"
+    volumes:
+      - ./init-databases.sql:/docker-entrypoint-initdb.d/01-init.sql
+    shm_size: 256mb
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "max_connections=200"
+      - "-c"
+      - "synchronous_commit=on"
+      - "-c"
+      - "wal_level=replica"
+      - "-c"
+      - "log_min_duration_statement=5000"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bench"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
