@@ -609,14 +609,7 @@ impl MaintenanceService {
         }
         match sqlx::query_scalar::<_, i64>(
             r#"
-            UPDATE awa.jobs_hot
-            SET priority = priority - 1,
-                metadata = CASE
-                    WHEN NOT (metadata ? '_awa_original_priority')
-                    THEN metadata || jsonb_build_object('_awa_original_priority', priority)
-                    ELSE metadata
-                END
-            WHERE id IN (
+            WITH eligible AS (
                 SELECT id FROM awa.jobs_hot
                 WHERE state = 'available'
                   AND priority > 1
@@ -624,7 +617,16 @@ impl MaintenanceService {
                 LIMIT 1000
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING id
+            UPDATE awa.jobs_hot
+            SET priority = priority - 1,
+                metadata = CASE
+                    WHEN NOT (metadata ? '_awa_original_priority')
+                    THEN metadata || jsonb_build_object('_awa_original_priority', priority)
+                    ELSE metadata
+                END
+            FROM eligible
+            WHERE awa.jobs_hot.id = eligible.id
+            RETURNING awa.jobs_hot.id
             "#,
         )
         .bind(aging_secs)

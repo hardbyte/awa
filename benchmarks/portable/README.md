@@ -98,6 +98,14 @@ the shared Postgres.
 - Same job count, batch size, and worker concurrency
 - Same result schema (JSON with jobs_per_sec, duration_ms, latency percentiles)
 - Each system uses its own database to avoid schema conflicts
+- Aligned poll intervals: all systems use 50ms poll/fetch interval
+- Aligned rescue intervals: all systems use 15s rescue-after for chaos tests
+- Chaos enqueue via direct SQL INSERT — all three systems have INSERT triggers
+  that fire NOTIFY, so workers discover jobs at the same speed
+- River's schema is hand-crafted (no `rivermigrate` module). It includes the
+  core tables, indexes, and `river_job_state_in_bitmask` function but may lack
+  some features from later River migrations. This does not affect core dispatch
+  or rescue, but could affect unique job deduplication
 
 ## Chaos / Correctness Scenarios
 
