@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -451,6 +451,7 @@ impl ClientBuilder {
             service_cancel: CancellationToken::new(),
             dispatcher_handles: RwLock::new(Vec::new()),
             service_handles: RwLock::new(Vec::new()),
+            job_set: Arc::new(Mutex::new(JoinSet::new())),
             in_flight: Arc::new(InFlightRegistry::default()),
             queue_in_flight,
             dispatcher_alive,
@@ -528,9 +529,11 @@ pub struct Client {
     /// Cancellation token for heartbeat + maintenance — kept alive during drain.
     service_cancel: CancellationToken,
     /// Handles for dispatcher tasks.
-    dispatcher_handles: RwLock<Vec<tokio::task::JoinHandle<JoinSet<()>>>>,
+    dispatcher_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
     /// Handles for service tasks (heartbeat + maintenance).
     service_handles: RwLock<Vec<tokio::task::JoinHandle<()>>>,
+    /// JoinSet tracking in-flight job tasks for graceful drain.
+    job_set: Arc<Mutex<JoinSet<()>>>,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
@@ -733,6 +736,7 @@ impl Client {
                     self.in_flight.clone(),
                     alive,
                     self.dispatch_cancel.clone(),
+                    self.job_set.clone(),
                     concurrency,
                 )
             } else {
@@ -746,9 +750,12 @@ impl Client {
                     self.in_flight.clone(),
                     alive,
                     self.dispatch_cancel.clone(),
+                    self.job_set.clone(),
                 )
             };
-            dispatcher_handles.push(tokio::spawn(dispatcher.run()));
+            dispatcher_handles.push(tokio::spawn(async move {
+                dispatcher.run().await;
+            }));
         }
 
         self.publish_runtime_snapshot().await;
@@ -767,8 +774,8 @@ impl Client {
     /// Phased lifecycle:
     /// 1. Stop dispatchers (no new jobs claimed)
     /// 2. Signal in-flight jobs to cancel
-    /// 3. Wait for dispatchers to exit (each returns its in-flight JoinSet)
-    /// 4. Drain all in-flight jobs with timeout (heartbeat + maintenance still alive!)
+    /// 3. Wait for dispatchers to exit
+    /// 4. Drain in-flight jobs (heartbeat + maintenance still alive!)
     /// 5. Stop heartbeat + maintenance
     pub async fn shutdown(&self, timeout: Duration) {
         info!("Initiating graceful shutdown");
@@ -783,24 +790,19 @@ impl Client {
             flag.store(true, Ordering::SeqCst);
         }
 
-        // Phase 3: Wait for dispatchers to exit their poll loops.
-        // Each dispatcher returns its local JoinSet of in-flight jobs.
+        // Phase 3: Wait for dispatchers to exit their poll loops
         let dispatcher_handles: Vec<_> = {
             let mut guard = self.dispatcher_handles.write().await;
             std::mem::take(&mut *guard)
         };
-        let mut job_sets: Vec<JoinSet<()>> = Vec::new();
         for handle in dispatcher_handles {
-            if let Ok(set) = handle.await {
-                job_sets.push(set);
-            }
+            let _ = handle.await;
         }
 
-        // Phase 4: Drain all in-flight jobs with timeout (heartbeat + maintenance still alive)
+        // Phase 4: Drain in-flight jobs (heartbeat + maintenance still alive)
         let drain = async {
-            for set in &mut job_sets {
-                while set.join_next().await.is_some() {}
-            }
+            let mut set = self.job_set.lock().await;
+            while set.join_next().await.is_some() {}
         };
         if tokio::time::timeout(timeout, drain).await.is_err() {
             warn!(

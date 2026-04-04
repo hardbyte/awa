@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Semaphore;
+use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -229,8 +229,7 @@ pub struct Dispatcher {
     concurrency: ConcurrencyMode,
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
-    /// In-flight job tasks. Returned to the client on shutdown for drain.
-    job_set: JoinSet<()>,
+    job_set: Arc<Mutex<JoinSet<()>>>,
     rate_limiter: Option<TokenBucket>,
 }
 
@@ -245,6 +244,7 @@ impl Dispatcher {
         in_flight: InFlightMap,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
+        job_set: Arc<Mutex<JoinSet<()>>>,
     ) -> Self {
         let concurrency = ConcurrencyMode::HardReserved {
             semaphore: Arc::new(Semaphore::new(config.max_workers as usize)),
@@ -260,7 +260,7 @@ impl Dispatcher {
             concurrency,
             alive,
             cancel,
-            job_set: JoinSet::new(),
+            job_set,
             rate_limiter,
         }
     }
@@ -276,6 +276,7 @@ impl Dispatcher {
         in_flight: InFlightMap,
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
+        job_set: Arc<Mutex<JoinSet<()>>>,
         concurrency: ConcurrencyMode,
     ) -> Self {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
@@ -289,14 +290,14 @@ impl Dispatcher {
             concurrency,
             alive,
             cancel,
-            job_set: JoinSet::new(),
+            job_set,
             rate_limiter,
         }
     }
 
-    /// Run the poll loop. Returns the in-flight JoinSet when cancelled.
+    /// Run the poll loop. Returns when cancelled.
     #[tracing::instrument(skip(self), fields(queue = %self.queue))]
-    pub async fn run(mut self) -> JoinSet<()> {
+    pub async fn run(mut self) {
         self.alive.store(true, Ordering::SeqCst);
         info!(
             queue = %self.queue,
@@ -313,7 +314,7 @@ impl Dispatcher {
                 // Fall back to poll-only mode
                 self.poll_loop_only().await;
                 self.alive.store(false, Ordering::SeqCst);
-                return self.job_set;
+                return;
             }
         };
 
@@ -321,45 +322,37 @@ impl Dispatcher {
             warn!(error = %err, channel = %notify_channel, "Failed to LISTEN, falling back to polling");
             self.poll_loop_only().await;
             self.alive.store(false, Ordering::SeqCst);
-            return self.job_set;
+            return;
         }
 
         debug!(channel = %notify_channel, "Listening for job notifications");
 
-        let mut listener_backoff = Duration::from_millis(0);
         loop {
-            let poll_delay = if listener_backoff > Duration::ZERO {
-                listener_backoff
-            } else {
-                self.config.poll_interval
-            };
             tokio::select! {
                 _ = self.cancel.cancelled() => {
                     debug!(queue = %self.queue, "Dispatcher shutting down");
                     break;
                 }
                 // Wait for either a notification or the poll interval
-                notification = listener.recv(), if listener_backoff == Duration::ZERO => {
+                notification = listener.recv() => {
                     match notification {
                         Ok(_) => {
                             debug!(queue = %self.queue, "Woken by NOTIFY");
                             self.drain_ready().await;
                         }
                         Err(err) => {
-                            warn!(error = %err, "PG listener error, backing off");
-                            listener_backoff = Duration::from_secs(1);
+                            warn!(error = %err, "PG listener error, will retry");
+                            tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
-                _ = tokio::time::sleep(poll_delay) => {
-                    listener_backoff = Duration::ZERO;
+                _ = tokio::time::sleep(self.config.poll_interval) => {
                     self.drain_ready().await;
                 }
             }
         }
 
         self.alive.store(false, Ordering::SeqCst);
-        self.job_set
     }
 
     /// Poll-only fallback (no LISTEN/NOTIFY).
@@ -428,10 +421,6 @@ impl Dispatcher {
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
     #[tracing::instrument(skip(self), fields(queue = %self.queue))]
     async fn poll_once(&mut self) -> bool {
-        // Phase 0: Reap completed tasks from the local JoinSet (non-blocking).
-        // This reclaims memory and ensures permits are returned promptly.
-        while self.job_set.try_join_next().is_some() {}
-
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
@@ -456,6 +445,11 @@ impl Dispatcher {
 
         // Phase 3: Claim jobs from DB.
         //
+        // Uses a CTE (not a FROM-subquery) so the LIMIT is enforced as a
+        // materialization barrier. PostgreSQL's planner can merge a
+        // FROM-subquery with the UPDATE target when both reference the same
+        // table, which under concurrent load causes the LIMIT to be ignored.
+        //
         // Single index scan on idx_awa_jobs_hot_dequeue with FOR UPDATE SKIP LOCKED
         // acquires row locks during the scan. Priority ordering is strict
         // (priority ASC, run_at ASC, id ASC); cross-priority fairness is handled
@@ -465,14 +459,7 @@ impl Dispatcher {
 
         let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
             r#"
-            UPDATE awa.jobs_hot
-            SET state = 'running',
-                attempt = attempt + 1,
-                run_lease = run_lease + 1,
-                attempted_at = now(),
-                heartbeat_at = now(),
-                deadline_at = now() + make_interval(secs => $3)
-            FROM (
+            WITH claimed AS (
                 SELECT id
                 FROM awa.jobs_hot
                 WHERE state = 'available'
@@ -485,7 +472,15 @@ impl Dispatcher {
                 ORDER BY priority ASC, run_at ASC, id ASC
                 LIMIT $2
                 FOR UPDATE SKIP LOCKED
-            ) AS claimed
+            )
+            UPDATE awa.jobs_hot
+            SET state = 'running',
+                attempt = attempt + 1,
+                run_lease = run_lease + 1,
+                attempted_at = now(),
+                heartbeat_at = now(),
+                deadline_at = now() + make_interval(secs => $3)
+            FROM claimed
             WHERE awa.jobs_hot.id = claimed.id
               AND awa.jobs_hot.state = 'available'
             RETURNING awa.jobs_hot.*
@@ -545,10 +540,11 @@ impl Dispatcher {
         }
 
         // Phase 7: Dispatch (each job takes one pre-acquired permit)
+        let mut set = self.job_set.lock().await;
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let task = self.executor.execute_task(job, cancel_flag);
-            self.job_set.spawn(async move {
+            set.spawn(async move {
                 task.await;
                 drop(permit);
             });

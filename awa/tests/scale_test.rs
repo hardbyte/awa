@@ -377,15 +377,16 @@ async fn test_priority_aging_reorders_jobs() {
     // the aged-up old job first (it has priority 1 and earlier run_at)
     let claimed: Vec<JobRow> = sqlx::query_as(
         r#"
-        UPDATE awa.jobs_hot
-        SET state = 'running', attempt = attempt + 1
-        FROM (
+        WITH claimed AS (
             SELECT id FROM awa.jobs_hot
             WHERE state = 'available' AND queue = $1 AND run_at <= now()
             ORDER BY priority ASC, run_at ASC, id ASC
             LIMIT 1
             FOR UPDATE SKIP LOCKED
-        ) AS claimed
+        )
+        UPDATE awa.jobs_hot
+        SET state = 'running', attempt = attempt + 1
+        FROM claimed
         WHERE awa.jobs_hot.id = claimed.id AND awa.jobs_hot.state = 'available'
         RETURNING awa.jobs_hot.*
         "#,

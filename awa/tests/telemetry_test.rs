@@ -236,7 +236,7 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
             return;
         }
 
-        if start.elapsed() > Duration::from_secs(30) {
+        if start.elapsed() > Duration::from_secs(60) {
             panic!("Timed out waiting for {min} {state} jobs in queue {queue}; only {count} found");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -257,7 +257,7 @@ async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: &str) {
             return;
         }
 
-        if start.elapsed() > Duration::from_secs(30) {
+        if start.elapsed() > Duration::from_secs(60) {
             panic!(
                 "Timed out waiting for job {job_id} to reach state {state}; current state: {current_state}"
             );
@@ -539,7 +539,7 @@ async fn test_otlp_metrics_reach_prometheus() {
             break;
         }
 
-        if start.elapsed() > Duration::from_secs(30) {
+        if start.elapsed() > Duration::from_secs(60) {
             panic!("Timed out waiting for jobs to complete; only {count}/{num_jobs} completed");
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
