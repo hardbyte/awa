@@ -445,3 +445,69 @@ PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_tes
 - Ignored benchmark tests are not part of the normal unit/integration test pass.
 - The current focus is relative behavior and architectural validation, not
   cross-machine leaderboard comparisons.
+
+## Cross-System Comparison (Portable Benchmarks)
+
+The `benchmarks/portable/` harness runs comparable scenarios against Awa, River (Go), and Oban (Elixir) sharing the same Postgres instance. See `benchmarks/portable/README.md` for setup and usage.
+
+### Reference Results (Postgres 17-alpine, shared_buffers=256MB)
+
+#### Enqueue Throughput (jobs/sec)
+
+| Scale | Awa (COPY) | River (COPY) | Oban (Ecto) |
+|-------|------------|--------------|-------------|
+| 10k   | ~27,500    | ~31,000      | ~9,900      |
+| 50k   | ~23,000    | ~29,000      | ~10,400     |
+
+#### Worker Throughput — no-op jobs (jobs/sec)
+
+| Workers | Awa    | River  | Oban   |
+|---------|--------|--------|--------|
+| 50      | ~830   | ~960   | ~1,470 |
+| 100     | ~1,240 | ~1,950 | ~1,700 |
+| 200     | ~3,900 | ~3,800 | ~820   |
+
+#### Pickup Latency — single job to idle queue (p50)
+
+| Awa   | River* | Oban  |
+|-------|--------|-------|
+| ~56ms | ~264ms | ~56ms |
+
+*River's latency is likely inflated due to incomplete NOTIFY setup in the hand-crafted migration schema.
+
+### Comparability Notes
+
+- No-op workload measures pure queue overhead; real jobs with actual work narrow all gaps.
+- River uses `InsertManyFast` (COPY protocol) for enqueue. Awa uses `insert_many_copy_from_pool`.
+- Oban uses the open-source Basic engine; Oban Pro's SmartEngine would likely differ.
+- Single-node only; no multi-process or cluster testing.
+
+### Correctness Under Adverse Conditions
+
+The chaos runner (`benchmarks/portable/chaos.py`) tests failure recovery
+across all three systems using 30-second sleep jobs and tuned rescue intervals.
+
+#### SIGKILL Recovery (10 jobs, tuned rescue intervals)
+
+| System | Rescue time | Jobs lost |
+|--------|-------------|-----------|
+| Awa    | ~46s        | 0         |
+| River  | ~75s        | 0         |
+| Oban   | ~93s        | 0         |
+
+Awa uses active heartbeats for crash detection (ADR-003); River and Oban use
+wall-clock age since `attempted_at`. Rescue intervals were configured to
+comparable values (Awa 15s staleness, River 30s stuck-after, Oban 15s rescue-after).
+
+#### Repeated Kills (15 jobs, 3 kill cycles)
+
+| System | Total time | Jobs lost |
+|--------|-----------|-----------|
+| Awa    | ~83s      | 0         |
+| River  | ~113s     | 0         |
+| Oban   | ~141s     | 0         |
+
+#### Postgres Restart (5 jobs in flight)
+
+All three systems reconnect and complete all jobs with zero loss after a
+Postgres restart (~1.5s downtime).

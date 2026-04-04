@@ -1,11 +1,22 @@
--- Dequeue jobs using SKIP LOCKED with priority aging.
+-- Dequeue jobs using FOR UPDATE SKIP LOCKED with strict priority ordering.
+--
 -- $1: queue name
 -- $2: batch limit
--- $3: deadline interval (e.g., '5 minutes')
--- $4: priority aging interval in seconds
-WITH claimed AS (
+-- $3: deadline interval in seconds
+--
+-- Uses idx_awa_jobs_hot_dequeue (queue, priority, run_at, id) WHERE state = 'available'.
+-- Cross-priority fairness is handled by the maintenance leader's priority aging
+-- task, which periodically promotes the priority column for long-waiting jobs.
+UPDATE awa.jobs_hot
+SET state = 'running',
+    attempt = attempt + 1,
+    run_lease = run_lease + 1,
+    attempted_at = now(),
+    heartbeat_at = now(),
+    deadline_at = now() + make_interval(secs => $3)
+FROM (
     SELECT id
-    FROM awa.jobs
+    FROM awa.jobs_hot
     WHERE state = 'available'
       AND queue = $1
       AND run_at <= now()
@@ -13,20 +24,10 @@ WITH claimed AS (
           SELECT 1 FROM awa.queue_meta
           WHERE queue = $1 AND paused = TRUE
       )
-    ORDER BY
-      -- Priority aging: boost by 1 level per aging_interval of wait time
-      GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $4)::int) ASC,
-      run_at ASC,
-      id ASC
+    ORDER BY priority ASC, run_at ASC, id ASC
     LIMIT $2
     FOR UPDATE SKIP LOCKED
-)
-UPDATE awa.jobs
-SET state = 'running',
-    attempt = attempt + 1,
-    attempted_at = now(),
-    heartbeat_at = now(),
-    deadline_at = now() + $3::interval
-FROM claimed
-WHERE awa.jobs.id = claimed.id
-RETURNING awa.jobs.*;
+) AS claimed
+WHERE awa.jobs_hot.id = claimed.id
+  AND awa.jobs_hot.state = 'available'
+RETURNING awa.jobs_hot.*;

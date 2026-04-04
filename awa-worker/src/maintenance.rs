@@ -61,6 +61,9 @@ pub struct MaintenanceService {
     queue_stats_interval: Duration,
     dirty_key_recompute_interval: Duration,
     metadata_reconciliation_interval: Duration,
+    /// Interval for priority aging — jobs waiting longer than this have their
+    /// priority improved by one level per interval elapsed (default: 60s).
+    priority_aging_interval: Duration,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -101,7 +104,17 @@ impl MaintenanceService {
             queue_stats_interval: Duration::from_secs(30),
             dirty_key_recompute_interval: Duration::from_secs(2),
             metadata_reconciliation_interval: Duration::from_secs(60),
+            priority_aging_interval: Duration::from_secs(60),
         }
+    }
+
+    /// Set the priority aging interval (default: 60s).
+    ///
+    /// Jobs waiting longer than this per priority level are promoted:
+    /// a priority-4 job waiting 180s is treated as priority-1.
+    pub fn priority_aging_interval(mut self, interval: Duration) -> Self {
+        self.priority_aging_interval = interval;
+        self
     }
 
     /// Set the leader election retry interval (default: 10s).
@@ -244,6 +257,7 @@ impl MaintenanceService {
             let mut dirty_key_timer = tokio::time::interval(self.dirty_key_recompute_interval);
             let mut metadata_reconciliation_timer =
                 tokio::time::interval(self.metadata_reconciliation_interval);
+            let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -257,6 +271,7 @@ impl MaintenanceService {
             queue_stats_timer.tick().await;
             dirty_key_timer.tick().await;
             metadata_reconciliation_timer.tick().await;
+            priority_aging_timer.tick().await;
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
@@ -301,6 +316,9 @@ impl MaintenanceService {
                     }
                     _ = metadata_reconciliation_timer.tick() => {
                         self.refresh_admin_metadata().await;
+                    }
+                    _ = priority_aging_timer.tick() => {
+                        self.age_waiting_priorities().await;
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -572,6 +590,55 @@ impl MaintenanceService {
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
+            }
+            _ => {}
+        }
+    }
+
+    /// Age priorities for jobs that have been waiting longer than `priority_aging_interval`.
+    ///
+    /// For each elapsed aging interval, a job's priority improves by one level
+    /// (lower number = higher priority, minimum 1). A priority-4 job waiting
+    /// 3× the interval is promoted to priority-1, matching a fresh high-priority job.
+    ///
+    /// Only affects `available` jobs in `jobs_hot`. The original `priority` column
+    /// is modified in place — this is intentional so the dispatch query's simple
+    /// `ORDER BY priority ASC` ordering naturally picks up aged jobs.
+    #[tracing::instrument(skip(self), name = "maintenance.priority_aging")]
+    async fn age_waiting_priorities(&self) {
+        let aging_secs = self.priority_aging_interval.as_secs() as f64;
+        if aging_secs <= 0.0 {
+            return;
+        }
+        match sqlx::query_scalar::<_, i64>(
+            r#"
+            WITH aged AS (
+                SELECT id,
+                       GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $1)::int)::smallint AS new_priority
+                FROM awa.jobs_hot
+                WHERE state = 'available'
+                  AND priority > 1
+                  AND run_at <= now() - make_interval(secs => $1)
+                LIMIT 1000
+            )
+            UPDATE awa.jobs_hot
+            SET priority = aged.new_priority
+            FROM aged
+            WHERE awa.jobs_hot.id = aged.id
+              AND awa.jobs_hot.state = 'available'
+              AND awa.jobs_hot.priority > aged.new_priority
+            RETURNING awa.jobs_hot.id
+            "#,
+        )
+        .bind(aging_secs)
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(ids) if !ids.is_empty() => {
+                debug!(count = ids.len(), "Aged job priorities");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to age job priorities");
             }
             _ => {}
         }

@@ -254,7 +254,7 @@ async fn test_stale_candidate_cannot_reclaim_running_row() {
     assert_eq!(final_row, ("running".to_string(), 1, 1));
 }
 
-// ── Priority aging reordering ─────────────────────────────────────────
+// ── Priority aging via maintenance task ──────────────────────────────
 
 #[tokio::test]
 async fn test_priority_aging_reorders_jobs() {
@@ -262,7 +262,8 @@ async fn test_priority_aging_reorders_jobs() {
     let queue = "scale_aging";
     clean_queue(&pool, queue).await;
 
-    // Insert a low-priority job with old run_at (should age up)
+    // Insert a priority-4 job that has been waiting 300 seconds.
+    // With aging_interval=60s, it should age from 4 → 1.
     let old_time = chrono::Utc::now() - chrono::Duration::seconds(300);
     sqlx::query(
         r#"
@@ -276,11 +277,25 @@ async fn test_priority_aging_reorders_jobs() {
     .await
     .unwrap();
 
-    // Insert a high-priority job with recent run_at
+    // Insert a priority-3 job waiting 90 seconds → should age from 3 → 2.
+    let medium_time = chrono::Utc::now() - chrono::Duration::seconds(90);
     sqlx::query(
         r#"
         INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, run_at)
-        VALUES ('scale_job', $1, '{"index": 2}', 'available', 1, now())
+        VALUES ('scale_job', $1, '{"index": 2}', 'available', 3, $2)
+        "#,
+    )
+    .bind(queue)
+    .bind(medium_time)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // Insert a fresh priority-1 job — should not be aged.
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, run_at)
+        VALUES ('scale_job', $1, '{"index": 3}', 'available', 1, now())
         "#,
     )
     .bind(queue)
@@ -288,25 +303,72 @@ async fn test_priority_aging_reorders_jobs() {
     .await
     .unwrap();
 
-    // Claim with priority aging (60s interval)
-    // Old job: effective priority = max(1, 4 - floor(300/60)) = max(1, -1) = 1
-    // New job: effective priority = max(1, 1 - 0) = 1
-    // Tie-break by run_at ASC → old job wins
-    let jobs: Vec<JobRow> = sqlx::query_as(
+    // Run the maintenance aging query scoped to our queue.
+    // The production maintenance task runs globally; this test scopes
+    // to avoid interference from other tests sharing the database.
+    let aging_interval_secs: f64 = 60.0;
+    let aged_ids: Vec<i64> = sqlx::query_scalar(
         r#"
-        WITH claimed AS (
-            SELECT id FROM awa.jobs_hot
-            WHERE state = 'available' AND queue = $1
-            ORDER BY
-              GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / 60)::int) ASC,
-              run_at ASC, id ASC
-            LIMIT 1
-            FOR UPDATE SKIP LOCKED
+        WITH aged AS (
+            SELECT id,
+                   GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $1)::int)::smallint AS new_priority
+            FROM awa.jobs_hot
+            WHERE state = 'available'
+              AND queue = $2
+              AND priority > 1
+              AND run_at <= now() - make_interval(secs => $1)
+            LIMIT 1000
         )
         UPDATE awa.jobs_hot
+        SET priority = aged.new_priority
+        FROM aged
+        WHERE awa.jobs_hot.id = aged.id
+          AND awa.jobs_hot.state = 'available'
+          AND awa.jobs_hot.priority > aged.new_priority
+        RETURNING awa.jobs_hot.id
+        "#,
+    )
+    .bind(aging_interval_secs)
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    // Two jobs should have been aged (index 1 and index 2).
+    // Index 3 (priority-1) was not eligible.
+    assert_eq!(aged_ids.len(), 2, "Two jobs should have been aged");
+
+    // Verify the priority column was updated correctly
+    let jobs: Vec<(i16, serde_json::Value)> = sqlx::query_as(
+        "SELECT priority, args FROM awa.jobs_hot WHERE queue = $1 ORDER BY args->>'index'",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(jobs.len(), 3);
+    // Index 1: priority 4, waited 300s / 60s = 5 levels → clamped to 1
+    assert_eq!(jobs[0].0, 1, "Priority-4 job waited 300s should age to 1");
+    // Index 2: priority 3, waited 90s / 60s = 1 level → 2
+    assert_eq!(jobs[1].0, 2, "Priority-3 job waited 90s should age to 2");
+    // Index 3: priority 1, fresh — unchanged
+    assert_eq!(jobs[2].0, 1, "Priority-1 job should remain at 1");
+
+    // Verify that the dispatch query (strict priority ordering) now picks
+    // the aged-up old job first (it has priority 1 and earlier run_at)
+    let claimed: Vec<JobRow> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
         SET state = 'running', attempt = attempt + 1
-        FROM claimed
-        WHERE awa.jobs_hot.id = claimed.id
+        FROM (
+            SELECT id FROM awa.jobs_hot
+            WHERE state = 'available' AND queue = $1 AND run_at <= now()
+            ORDER BY priority ASC, run_at ASC, id ASC
+            LIMIT 1
+            FOR UPDATE SKIP LOCKED
+        ) AS claimed
+        WHERE awa.jobs_hot.id = claimed.id AND awa.jobs_hot.state = 'available'
         RETURNING awa.jobs_hot.*
         "#,
     )
@@ -315,11 +377,24 @@ async fn test_priority_aging_reorders_jobs() {
     .await
     .unwrap();
 
-    assert_eq!(jobs.len(), 1);
-    let args: serde_json::Value = jobs[0].args.clone();
+    assert_eq!(claimed.len(), 1);
+    let args: serde_json::Value = claimed[0].args.clone();
     assert_eq!(
         args["index"], 1,
-        "Priority aging should boost old low-priority job"
+        "Aged priority-4 job (now priority-1) should be claimed first"
+    );
+
+    // Verify original priority is reconstructable: priority + levels_aged
+    // For the claimed job: priority=1, waited 300s, interval=60s
+    // original = min(4, 1 + floor(300/60)) = min(4, 6) = 4
+    let wait_secs = (chrono::Utc::now() - claimed[0].run_at)
+        .num_seconds()
+        .max(0) as f64;
+    let levels_aged = (wait_secs / aging_interval_secs).floor() as i16;
+    let reconstructed_original = (claimed[0].priority + levels_aged).min(4);
+    assert_eq!(
+        reconstructed_original, 4,
+        "Original priority should be reconstructable from priority + wait time"
     );
 }
 

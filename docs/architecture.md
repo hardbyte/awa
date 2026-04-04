@@ -123,23 +123,19 @@ Dispatcher::run()
             ├── Apply rate limit (truncate if throttled)
             │
             ▼
-            CTE claim query:
-              WITH candidates AS (
-                (SELECT id, priority, run_at FROM awa.jobs_hot
-                 WHERE state='available' AND queue=$1 AND priority=1 AND run_at<=now()
-                 ORDER BY run_at, id LIMIT ... )
-                UNION ALL ...
-              ),
-              claimed AS (
-                SELECT jobs.id
-                FROM awa.jobs_hot AS jobs
-                JOIN candidates ON candidates.id = jobs.id
-                ORDER BY GREATEST(1, candidates.priority - FLOOR(...)) ASC,
-                         candidates.run_at, candidates.id
+            Claim query:
+              UPDATE awa.jobs_hot
+              SET state='running', attempt=attempt+1, run_lease=run_lease+1, ...
+              FROM (
+                SELECT id FROM awa.jobs_hot
+                WHERE state='available' AND queue=$1 AND run_at<=now()
+                  AND NOT EXISTS (SELECT 1 FROM awa.queue_meta WHERE queue=$1 AND paused=TRUE)
+                ORDER BY priority ASC, run_at ASC, id ASC
                 LIMIT $2
-                FOR UPDATE OF jobs SKIP LOCKED   ◄── concurrent-safe dispatch
-              )
-              UPDATE awa.jobs_hot SET state='running', attempt=attempt+1, run_lease=run_lease+1, ...
+                FOR UPDATE SKIP LOCKED             ◄── concurrent-safe dispatch
+              ) AS claimed
+              WHERE awa.jobs_hot.id = claimed.id
+              RETURNING awa.jobs_hot.*
             │
             ├── Release excess permits (if DB returned fewer jobs)
             ├── Consume rate limit tokens
@@ -147,12 +143,9 @@ Dispatcher::run()
             For each claimed job + permit → executor.execute(job)
 ```
 
-Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job.
+Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job. The subquery uses the `idx_awa_jobs_hot_dequeue` partial index on `(queue, priority, run_at, id) WHERE state = 'available'`, keeping the claim query planner-friendly even under large hot backlogs.
 
-The dispatcher intentionally applies priority aging only over a bounded
-candidate window rather than over the full available backlog. That keeps the
-claim query planner-friendly under large hot backlogs while preserving the
-fairness effect of aging.
+The dispatch query uses strict priority ordering (`priority ASC, run_at ASC, id ASC`). Cross-priority fairness is handled separately by the maintenance leader's `age_waiting_priorities` task, which periodically decrements the `priority` column for long-waiting available jobs. This keeps the claim query simple while ensuring lower-priority jobs are gradually promoted.
 
 ### Execute (Executor)
 
@@ -325,13 +318,13 @@ An optional token bucket rate limiter can be configured per queue. See [ADR-010]
 
 ## Graceful Shutdown
 
-Shutdown uses a phased lifecycle with separate cancellation domains:
+Shutdown uses a phased lifecycle with two cancellation domains (`dispatch_cancel` and `service_cancel`):
 
-1. **Stop dispatchers** (`dispatch_cancel`) — no new jobs are claimed
-2. **Signal in-flight cancellation** — handlers see `ctx.is_cancelled() == true`
-3. **Wait for dispatchers** to exit their poll loops
-4. **Drain in-flight jobs** via `JoinSet` — heartbeat and maintenance remain alive during drain to prevent false rescue
-5. **Stop services** (`service_cancel`) — heartbeat and maintenance shut down
+1. **Cancel dispatchers** (`dispatch_cancel`) — stop claiming new jobs
+2. **Signal in-flight cancellation flags** — handlers see `ctx.is_cancelled() == true`
+3. **Wait for dispatchers to exit** — each dispatcher returns its in-flight `JoinSet`
+4. **Drain all returned JoinSets with timeout** — heartbeat and maintenance remain alive during drain to prevent false rescue
+5. **Stop background services** (`service_cancel`) — heartbeat and maintenance shut down
 
 This ensures in-flight jobs complete (or timeout) with heartbeats still running, preventing other workers from rescuing jobs that are still actively executing.
 
@@ -435,7 +428,7 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 
 ### Leader Election
 
-Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup, cron evaluation) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds. The leader verifies its connection is still alive every 30 seconds; if the ping fails, it re-enters the election loop.
+Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup, cron evaluation, priority aging) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds. The leader verifies its connection is still alive every 30 seconds; if the ping fails, it re-enters the election loop.
 
 Scheduled and retryable promotion runs every 250ms by default, in bounded
 batches, and emits queue notifications after promotion. Cron evaluation remains

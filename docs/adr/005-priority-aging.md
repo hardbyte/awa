@@ -1,4 +1,4 @@
-# ADR-005: Priority Aging Algorithm
+# ADR-005: Priority Ordering and Aging
 
 ## Status
 
@@ -6,7 +6,10 @@ Accepted
 
 ## Context
 
-Awa supports four priority levels (1 = highest, 4 = lowest) per job (PRD section 6.2). Priority determines the order in which jobs are claimed from a queue. Without any aging mechanism, low-priority jobs can be starved indefinitely if higher-priority jobs are continuously enqueued.
+Awa supports four priority levels (1 = highest, 4 = lowest) per job. Priority
+determines the order in which jobs are claimed from a queue. Without any aging
+mechanism, low-priority jobs can be starved indefinitely if higher-priority jobs
+are continuously enqueued.
 
 Starvation is a real operational problem:
 
@@ -14,73 +17,98 @@ Starvation is a real operational problem:
 - A misconfigured producer enqueues high-priority jobs in a tight loop. All other priorities effectively halt.
 - During peak load, the queue never drains completely. Priority-4 analytics jobs accumulate without bound.
 
-Job queues with fixed priority ordering (no aging) require operators to manually intervene -- pausing high-priority producers, re-prioritizing jobs, or provisioning dedicated queues. Aging provides an automatic, tunable solution.
-
 ## Decision
 
-Use the formula `GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / aging_interval)::int)` to compute an effective priority at claim time.
+### Dispatch ordering
 
-This is implemented in the claim CTE (`awa-worker/src/dispatcher.rs` and `awa-model/queries/claim.sql`), where `$4` is the aging interval in seconds:
+The dispatch query claims jobs in strict `priority ASC, run_at ASC, id ASC`
+order using a single `FOR UPDATE SKIP LOCKED` index scan on
+`idx_awa_jobs_hot_dequeue (queue, priority, run_at, id) WHERE state = 'available'`.
 
-```sql
-ORDER BY
-  GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / $4)::int) ASC,
-  run_at ASC,
-  id ASC
-```
+This keeps the dispatch query simple and fast — a single index scan with no
+expression evaluation, which scales linearly with worker count.
 
-### How It Works
+### Starvation prevention via maintenance-based aging
 
-The effective priority decreases (improves) by 1 level for each `aging_interval` that a job has been waiting in the queue. The `GREATEST(1, ...)` clamp prevents the effective priority from going below 1 (the highest level).
+The maintenance leader runs a periodic `age_waiting_priorities` task at
+`priority_aging_interval` (default: 60 seconds). This task finds `available`
+jobs with `priority > 1` that have been waiting longer than their aging
+threshold and decrements their `priority` column.
 
-With the default `priority_aging_interval` of 60 seconds:
+The effective priority improves by one level for each `priority_aging_interval`
+that a job has waited:
 
-| Original Priority | Wait Time | Effective Priority |
-|---|---|---|
-| 4 (lowest) | 0s | 4 |
-| 4 | 60s | 3 |
-| 4 | 120s | 2 |
-| 4 | 180s+ | 1 (clamped) |
-| 3 | 0s | 3 |
-| 3 | 60s | 2 |
-| 3 | 120s+ | 1 (clamped) |
-| 2 | 0s | 2 |
-| 2 | 60s+ | 1 (clamped) |
-| 1 (highest) | any | 1 (already highest) |
+| Original Priority | Wait Time  | Effective Priority |
+|-------------------|------------|--------------------|
+| 4 (lowest)        | 0s         | 4                  |
+| 4                 | 60s        | 3                  |
+| 4                 | 120s       | 2                  |
+| 4                 | 180s+      | 1 (clamped)        |
+| 3                 | 0s         | 3                  |
+| 3                 | 60s        | 2                  |
+| 3                 | 120s+      | 1 (clamped)        |
+| 2                 | 0s         | 2                  |
+| 2                 | 60s+       | 1 (clamped)        |
+| 1 (highest)       | any        | 1 (already highest) |
 
-A priority-4 job waiting 3 minutes is treated as priority-1, equal to a freshly enqueued high-priority job. When effective priorities tie, `run_at ASC, id ASC` breaks the tie -- older jobs go first.
+A priority-4 job waiting 3 minutes is promoted to priority-1, equal to a freshly
+enqueued high-priority job. When priorities tie, `run_at ASC, id ASC` breaks the
+tie — older jobs go first.
 
 ### Configuration
 
-The aging interval is configurable per queue via `QueueConfig::priority_aging_interval` (default: 60 seconds). A shorter interval ages jobs faster (stronger starvation prevention, weaker priority enforcement). A longer interval ages jobs slower (stricter priority ordering, weaker starvation prevention).
+The aging interval is configurable:
 
-Setting the interval to a very large value (e.g., `Duration::from_secs(86400)`) effectively disables aging, reverting to strict priority ordering.
+- **Per maintenance service:** `MaintenanceService::priority_aging_interval()` (default: 60s)
+- **Per queue (dispatch config):** `QueueConfig::priority_aging_interval` (default: 60s, retained for per-queue overrides in future)
 
-### Why This Formula
+A shorter interval ages jobs faster (stronger starvation prevention, weaker
+priority enforcement). A longer interval ages jobs slower (stricter priority
+ordering, weaker starvation prevention). Setting the interval to a very large
+value effectively disables aging.
 
-The formula is evaluated entirely in SQL, in the `ORDER BY` clause of the claim CTE. This means:
+### Why maintenance-based rather than query-time aging
 
-1. **No materialized column:** Effective priority is computed at query time, not stored. There is no column to update, no background job to recalculate priorities.
-2. **Exact, not approximate:** The aging is based on the actual wall-clock time the job has been waiting, not a periodic "bump" operation.
-3. **Index-compatible:** The base index `idx_awa_jobs_hot_dequeue` on `(queue, priority, run_at, id)` is still used for the initial scan. The `GREATEST(...)` expression reorders within the candidate set, which is bounded by the `LIMIT` clause.
+The original implementation computed aging at query time using a SQL expression:
 
-Alternative approaches considered:
+```sql
+ORDER BY GREATEST(1, priority - FLOOR(EXTRACT(EPOCH FROM (now() - run_at)) / aging_interval)::int) ASC
+```
 
-- **Periodic priority bump (River-style):** A maintenance task periodically decrements priority for old jobs. This requires write I/O proportional to the number of waiting jobs and introduces lag (jobs are only aged at the bump interval).
-- **Weight-based fair queueing:** Complex to implement in SQL. Over-engineered for 4 priority levels.
-- **Separate queues per priority:** Requires the dispatcher to implement a scheduling policy across queues. Increases configuration surface area.
+This was moved to the maintenance task because:
+
+1. **Dispatch scalability.** The dispatch query is the hottest path in the
+   system. Under high concurrency (200+ workers), keeping it as a simple index
+   scan reduces `SKIP LOCKED` contention and avoids CTE materialization fences
+   that amplify lock collisions.
+2. **Index compatibility.** The strict `ORDER BY priority, run_at, id` matches
+   the dequeue index exactly, allowing Postgres to satisfy both the ORDER BY
+   and the range predicate from a single index scan with no sort step.
+3. **Write amplification is bounded.** The maintenance task only updates jobs
+   whose effective priority has actually changed, and limits each pass to 1,000
+   rows. At the default 60s interval, this is negligible compared to the
+   insert/complete write volume.
 
 ## Consequences
 
 ### Positive
 
-- **No starvation:** Every job eventually reaches effective priority 1, guaranteeing it will be claimed ahead of any newly enqueued lower-effective-priority job.
-- **Zero write amplification:** Aging is computed at read time in the claim query. No background updates, no additional writes.
-- **Tunable per queue:** Different queues can have different aging intervals based on their workload characteristics.
-- **Transparent:** The effective priority is a function of the original priority and wait time -- both visible in the job row. Operators can predict when a low-priority job will be promoted.
+- **No starvation.** Every waiting job eventually reaches priority 1.
+- **Simple dispatch query.** The claim SQL is a single index scan with no
+  expression evaluation — maximizes throughput under contention.
+- **Tunable.** Operators can adjust aging per queue based on workload.
+- **Observable.** The `priority` column reflects the current effective priority
+  at all times, making queue state inspectable without formula knowledge.
 
 ### Negative
 
-- **Non-obvious ordering:** The effective priority at claim time may differ from the stored `priority` column. Operators inspecting the queue may be surprised that a priority-4 job was claimed before a priority-2 job. The `run_at` column and the aging interval explain the behavior, but it requires understanding the formula.
-- **Index efficiency:** The `ORDER BY GREATEST(...)` expression cannot use a simple btree index scan. Postgres must evaluate the expression for all candidate rows (those matching `state = 'available' AND queue = $1 AND run_at <= now()`). This is acceptable because the claim query already uses `LIMIT` (default: 10 per poll) and `SKIP LOCKED`, so the evaluated set is small.
-- **Aggressive aging at small intervals:** If `priority_aging_interval` is set very low (e.g., 5 seconds), all priorities collapse to 1 almost immediately, making the priority system meaningless. The default of 60 seconds is a reasonable balance.
+- **Aging granularity is bounded by the maintenance interval.** A job's priority
+  updates at most once per aging tick, unlike the continuous query-time formula.
+  At the default 60s interval this is invisible in practice.
+- **Mutates the priority column.** Operators inspecting the queue see the aged
+  priority, not the original enqueue priority. The original priority is not
+  separately preserved (it could be reconstructed from `run_at` and the aging
+  interval if needed).
+- **Leader dependency.** Aging only runs on the maintenance leader. If leader
+  election stalls, aging stops. This is the same dependency as rescue and
+  promotion — acceptable given the advisory-lock-based leader model.
