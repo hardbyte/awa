@@ -59,7 +59,7 @@ fn database_url() -> String {
 
 async fn create_pool(max_connections: u32) -> PgPool {
     PgPoolOptions::new()
-        .max_connections(max_connections.max(40))
+        .max_connections(max_connections)
         .connect(&database_url())
         .await
         .expect("Failed to connect to database")

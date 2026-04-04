@@ -940,32 +940,35 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
 # ── Migration helpers ─────────────────────────────────────────────
 
 def migrate_system(system: str):
-    """Run migrations for the given system."""
-    if system == "awa":
-        subprocess.run(
+    """Run migrations for the given system. Raises on failure."""
+    cmds = {
+        "awa": (
             [str(SCRIPT_DIR / "awa-bench" / "target" / "release" / "awa-bench")],
-            env={
-                **os.environ,
-                "DATABASE_URL": pg_url("awa_bench"),
-                "SCENARIO": "migrate_only",
-            },
-            capture_output=True, timeout=30,
-        )
-    elif system == "river":
-        subprocess.run(
+            {"DATABASE_URL": pg_url("awa_bench"), "SCENARIO": "migrate_only"},
+        ),
+        "river": (
             ["docker", "run", "--rm", "--network", "host",
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
              "-e", "SCENARIO=migrate_only",
              "river-bench"],
-            capture_output=True, timeout=30,
-        )
-    elif system == "oban":
-        subprocess.run(
+            {},
+        ),
+        "oban": (
             ["docker", "run", "--rm", "--network", "host",
              "-e", f"DATABASE_URL={pg_url('oban_bench')}",
              "-e", "SCENARIO=migrate_only",
              "oban-bench"],
-            capture_output=True, timeout=30,
+            {},
+        ),
+    }
+    cmd, extra_env = cmds[system]
+    result = subprocess.run(
+        cmd, env={**os.environ, **extra_env},
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Migration failed for {system} (exit {result.returncode}):\n{result.stderr}"
         )
 
 # ── Comparison table ──────────────────────────────────────────────
