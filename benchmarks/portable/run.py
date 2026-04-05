@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Portable benchmark orchestrator for Awa, River, and Oban.
+Portable benchmark orchestrator for Awa, Awa-Python, Procrastinate, River, and Oban.
 
 Usage:
     python run.py [--scenario SCENARIO] [--job-count N] [--worker-count N]
-                  [--systems awa,river,oban] [--skip-build]
+                  [--systems awa,awa-docker,awa-python,procrastinate,river,oban] [--skip-build]
 
 Requires: Docker, cargo (for Awa adapter).
 """
@@ -41,6 +41,11 @@ def run_cmd(cmd: list[str], cwd: str | None = None, env: dict | None = None,
     )
 
 
+def with_system_name(results: list[dict], system: str) -> list[dict]:
+    """Override adapter-reported system names when the harness is comparing variants."""
+    return [{**result, "system": system} for result in results]
+
+
 def start_postgres():
     """Start the shared Postgres via docker compose."""
     print("\n=== Starting Postgres ===", file=sys.stderr)
@@ -75,6 +80,22 @@ def build_awa():
         raise RuntimeError("Failed to build awa-bench")
 
 
+def build_awa_docker():
+    """Build the Dockerized Awa benchmark image."""
+    print("\n=== Building Awa (Docker) benchmark ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "build",
+            "-f", str(SCRIPT_DIR / "awa-bench" / "Dockerfile"),
+            "-t", "awa-bench-docker",
+            ".",
+        ],
+        cwd=str(REPO_ROOT),
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Failed to build awa-bench-docker image")
+
+
 def run_awa(scenario: str, job_count: int, worker_count: int,
             latency_iterations: int) -> list[dict]:
     """Run Awa benchmark natively."""
@@ -93,6 +114,112 @@ def run_awa(scenario: str, job_count: int, worker_count: int,
     if result.returncode != 0:
         print(f"Awa stderr: {result.stderr}", file=sys.stderr)
         raise RuntimeError(f"awa-bench failed: {result.stderr}")
+    print(result.stderr, file=sys.stderr, end="")
+    return with_system_name(json.loads(result.stdout), "awa")
+
+
+def run_awa_docker(scenario: str, job_count: int, worker_count: int,
+                   latency_iterations: int) -> list[dict]:
+    """Run Awa benchmark in Docker."""
+    print("\n=== Running Awa (Docker) benchmarks ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "run", "--rm",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
+            "-e", f"SCENARIO={scenario}",
+            "-e", f"JOB_COUNT={job_count}",
+            "-e", f"WORKER_COUNT={worker_count}",
+            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "awa-bench-docker",
+        ],
+        capture=True, timeout=300,
+    )
+    if result.returncode != 0:
+        print(f"Awa (Docker) stderr: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"awa-bench-docker failed: {result.stderr}")
+    print(result.stderr, file=sys.stderr, end="")
+    return with_system_name(json.loads(result.stdout), "awa-docker")
+
+
+def build_awa_python():
+    """Build the Awa-Python Docker image."""
+    print("\n=== Building Awa-Python benchmark ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "build",
+            "-f", str(SCRIPT_DIR / "awa-python-bench" / "Dockerfile"),
+            "-t", "awa-python-bench",
+            ".",
+        ],
+        cwd=str(REPO_ROOT),
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Failed to build awa-python-bench image")
+
+
+def build_procrastinate():
+    """Build the Procrastinate Docker image."""
+    print("\n=== Building Procrastinate benchmark ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "build",
+            "-f", str(SCRIPT_DIR / "procrastinate-bench" / "Dockerfile"),
+            "-t", "procrastinate-bench",
+            ".",
+        ],
+        cwd=str(REPO_ROOT),
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Failed to build procrastinate-bench image")
+
+
+def run_awa_python(scenario: str, job_count: int, worker_count: int,
+                   latency_iterations: int) -> list[dict]:
+    """Run Awa-Python benchmark in Docker."""
+    print("\n=== Running Awa-Python benchmarks ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "run", "--rm",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
+            "-e", f"SCENARIO={scenario}",
+            "-e", f"JOB_COUNT={job_count}",
+            "-e", f"WORKER_COUNT={worker_count}",
+            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "awa-python-bench",
+        ],
+        capture=True, timeout=600,
+    )
+    if result.returncode != 0:
+        print(f"Awa-Python stderr: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"awa-python-bench failed: {result.stderr}")
+    print(result.stderr, file=sys.stderr, end="")
+    return with_system_name(json.loads(result.stdout), "awa-python")
+
+
+def run_procrastinate(scenario: str, job_count: int, worker_count: int,
+                      latency_iterations: int) -> list[dict]:
+    """Run Procrastinate benchmark in Docker."""
+    print("\n=== Running Procrastinate benchmarks ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "run", "--rm",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+            "-e", f"SCENARIO={scenario}",
+            "-e", f"JOB_COUNT={job_count}",
+            "-e", f"WORKER_COUNT={worker_count}",
+            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "procrastinate-bench",
+        ],
+        capture=True, timeout=1800,
+    )
+    if result.returncode != 0:
+        print(f"Procrastinate stderr: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"procrastinate-bench failed: {result.stderr}")
     print(result.stderr, file=sys.stderr, end="")
     return json.loads(result.stdout)
 
@@ -179,22 +306,23 @@ def print_comparison(all_results: list[dict]):
         by_scenario.setdefault(r["scenario"], []).append(r)
 
     for scenario, results in by_scenario.items():
+        system_width = max(10, max(len(r["system"]) for r in results))
         print(f"\n--- {scenario} ---")
         if scenario in ("enqueue_throughput", "worker_throughput"):
             # Sort by jobs_per_sec descending
             results.sort(key=lambda r: r["results"]["jobs_per_sec"], reverse=True)
-            print(f"  {'System':<10} {'Jobs/sec':>12} {'Duration (ms)':>15}")
-            print(f"  {'-'*10} {'-'*12} {'-'*15}")
+            print(f"  {'System':<{system_width}} {'Jobs/sec':>12} {'Duration (ms)':>15}")
+            print(f"  {'-'*system_width} {'-'*12} {'-'*15}")
             for r in results:
                 res = r["results"]
-                print(f"  {r['system']:<10} {res['jobs_per_sec']:>12,.0f} {res['duration_ms']:>15,}")
+                print(f"  {r['system']:<{system_width}} {res['jobs_per_sec']:>12,.0f} {res['duration_ms']:>15,}")
         elif scenario == "pickup_latency":
             results.sort(key=lambda r: r["results"]["p50_us"])
-            print(f"  {'System':<10} {'p50 (us)':>10} {'p95 (us)':>10} {'p99 (us)':>10} {'mean (us)':>10}")
-            print(f"  {'-'*10} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+            print(f"  {'System':<{system_width}} {'p50 (us)':>10} {'p95 (us)':>10} {'p99 (us)':>10} {'mean (us)':>10}")
+            print(f"  {'-'*system_width} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
             for r in results:
                 res = r["results"]
-                print(f"  {r['system']:<10} {res['p50_us']:>10,.0f} {res['p95_us']:>10,.0f} {res['p99_us']:>10,.0f} {res['mean_us']:>10,.0f}")
+                print(f"  {r['system']:<{system_width}} {res['p50_us']:>10,.0f} {res['p95_us']:>10,.0f} {res['p99_us']:>10,.0f} {res['mean_us']:>10,.0f}")
     print()
 
 
@@ -205,7 +333,7 @@ def main():
     parser.add_argument("--job-count", type=int, default=10000)
     parser.add_argument("--worker-count", type=int, default=50)
     parser.add_argument("--latency-iterations", type=int, default=100)
-    parser.add_argument("--systems", default="awa,river,oban",
+    parser.add_argument("--systems", default="awa,awa-docker,awa-python,procrastinate,river,oban",
                         help="Comma-separated list of systems to benchmark")
     parser.add_argument("--skip-build", action="store_true",
                         help="Skip building, use cached images/binaries")
@@ -216,8 +344,22 @@ def main():
     systems = [s.strip() for s in args.systems.split(",")]
     RESULTS_DIR.mkdir(exist_ok=True)
 
-    builders = {"awa": build_awa, "river": build_river, "oban": build_oban}
-    runners = {"awa": run_awa, "river": run_river, "oban": run_oban}
+    builders = {
+        "awa": build_awa,
+        "awa-docker": build_awa_docker,
+        "awa-python": build_awa_python,
+        "procrastinate": build_procrastinate,
+        "river": build_river,
+        "oban": build_oban,
+    }
+    runners = {
+        "awa": run_awa,
+        "awa-docker": run_awa_docker,
+        "awa-python": run_awa_python,
+        "procrastinate": run_procrastinate,
+        "river": run_river,
+        "oban": run_oban,
+    }
 
     try:
         start_postgres()

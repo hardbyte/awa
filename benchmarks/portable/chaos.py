@@ -124,6 +124,23 @@ SYSTEMS = {
             ORDER BY attempted_at DESC LIMIT 1
         """,
     },
+    "procrastinate": {
+        "db": "procrastinate_bench",
+        "job_table": "procrastinate_jobs",
+        "state_col": "status",
+        "enqueue_sql": """
+            INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, attempts)
+            SELECT 'main.chaos_job', 'chaos', jsonb_build_object('seq', g),
+                   'todo', 0
+            FROM generate_series(1, {count}) g
+        """,
+        "count_sql": """
+            SELECT status::text, count(*)::int FROM procrastinate_jobs WHERE queue_name = 'chaos' GROUP BY status
+        """,
+        "rescue_time_sql": """
+            SELECT 0.0
+        """,
+    },
 }
 
 def enqueue_jobs(system: str, count: int):
@@ -191,6 +208,21 @@ def start_oban_worker() -> subprocess.Popen:
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
+def start_procrastinate_worker() -> subprocess.Popen:
+    """Start Procrastinate worker container with short rescue interval."""
+    return subprocess.Popen(
+        [
+            "docker", "run", "--rm", "--name", "procrastinate-chaos-worker",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+            "-e", "SCENARIO=worker_only",
+            "-e", "WORKER_COUNT=10",
+            "-e", "JOB_DURATION_MS=30000",
+            "procrastinate-bench",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
 def kill_worker(proc: subprocess.Popen, system: str):
     """SIGKILL the worker process."""
     if system == "awa":
@@ -208,7 +240,18 @@ WORKER_STARTERS = {
     "awa": start_awa_worker,
     "river": start_river_worker,
     "oban": start_oban_worker,
+    "procrastinate": start_procrastinate_worker,
 }
+
+# ── State name mapping (each system uses different terminology) ────
+
+def running_state(system: str) -> str:
+    return {"awa": "running", "river": "running", "oban": "executing",
+            "procrastinate": "doing"}[system]
+
+def completed_state(system: str) -> str:
+    return {"awa": "completed", "river": "completed", "oban": "completed",
+            "procrastinate": "succeeded"}[system]
 
 # ── Scenarios ─────────────────────────────────────────────────────
 
@@ -254,9 +297,9 @@ def scenario_crash_recovery(system: str, job_count: int = 10) -> dict:
     time.sleep(2)  # Let worker start up
 
     # Wait for jobs to start running
-    running_state = "running" if system != "oban" else "executing"
+    rs = running_state(system)
     try:
-        wait_for_state(system, running_state, min_count=job_count, timeout=30)
+        wait_for_state(system, rs, min_count=job_count, timeout=30)
     except TimeoutError:
         counts = get_state_counts(system)
         print(f"  [{system}] Only some jobs running: {counts}", file=sys.stderr)
@@ -278,9 +321,9 @@ def scenario_crash_recovery(system: str, job_count: int = 10) -> dict:
     worker2 = WORKER_STARTERS[system]()
 
     # Wait for rescue (jobs go from running → retryable/available)
-    completed_state = "completed"
+    cs = completed_state(system)
     try:
-        rescue_wait = wait_for_state(system, completed_state,
+        rescue_wait = wait_for_state(system, cs,
                                      min_count=job_count, timeout=300)
     except TimeoutError:
         rescue_wait = 300.0
@@ -295,7 +338,7 @@ def scenario_crash_recovery(system: str, job_count: int = 10) -> dict:
     except Exception:
         pass
 
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
     lost = job_count - completed
 
     print(f"  [{system}] Rescue complete in {total_time:.1f}s: {final_counts}",
@@ -328,9 +371,9 @@ def scenario_postgres_restart(system: str, job_count: int = 10) -> dict:
     worker = WORKER_STARTERS[system]()
     time.sleep(2)
 
-    running_state = "running" if system != "oban" else "executing"
+    rs = running_state(system)
     try:
-        wait_for_state(system, running_state, min_count=1, timeout=30)
+        wait_for_state(system, rs, min_count=1, timeout=30)
     except TimeoutError:
         pass
 
@@ -347,7 +390,7 @@ def scenario_postgres_restart(system: str, job_count: int = 10) -> dict:
 
     # Wait for all jobs to complete
     try:
-        completion_wait = wait_for_state(system, "completed",
+        completion_wait = wait_for_state(system, completed_state(system),
                                          min_count=job_count, timeout=300)
     except TimeoutError:
         completion_wait = 300.0
@@ -361,7 +404,7 @@ def scenario_postgres_restart(system: str, job_count: int = 10) -> dict:
     except Exception:
         pass
 
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
 
     return {
         "system": system,
@@ -397,7 +440,7 @@ def scenario_repeated_kills(system: str, job_count: int = 20,
         time.sleep(1)
 
         counts = get_state_counts(system)
-        completed = counts.get("completed", 0)
+        completed = counts.get(completed_state(system), 0)
         print(f"  [{system}] After kill {i+1}: {counts}", file=sys.stderr)
 
     # Final worker — let it finish
@@ -405,7 +448,7 @@ def scenario_repeated_kills(system: str, job_count: int = 20,
     worker = WORKER_STARTERS[system]()
 
     try:
-        wait_for_state(system, "completed", min_count=job_count, timeout=300)
+        wait_for_state(system, completed_state(system), min_count=job_count, timeout=300)
     except TimeoutError:
         print(f"  [{system}] TIMEOUT on final drain", file=sys.stderr)
 
@@ -417,7 +460,7 @@ def scenario_repeated_kills(system: str, job_count: int = 20,
     except Exception:
         pass
 
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
 
     return {
         "system": system,
@@ -448,9 +491,9 @@ def scenario_pg_backend_kill(system: str, job_count: int = 10) -> dict:
     worker = WORKER_STARTERS[system]()
     time.sleep(3)
 
-    running_state = "running" if system != "oban" else "executing"
+    rs = running_state(system)
     try:
-        wait_for_state(system, running_state, min_count=1, timeout=30)
+        wait_for_state(system, rs, min_count=1, timeout=30)
     except TimeoutError:
         pass
 
@@ -466,7 +509,7 @@ def scenario_pg_backend_kill(system: str, job_count: int = 10) -> dict:
 
     # Worker should reconnect via pool. Wait for completion.
     try:
-        completion_wait = wait_for_state(system, "completed",
+        completion_wait = wait_for_state(system, completed_state(system),
                                          min_count=job_count, timeout=180)
     except TimeoutError:
         completion_wait = 180.0
@@ -480,7 +523,7 @@ def scenario_pg_backend_kill(system: str, job_count: int = 10) -> dict:
     except Exception:
         pass
 
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
 
     return {
         "system": system,
@@ -516,9 +559,9 @@ def scenario_leader_failover(system: str, job_count: int = 10) -> dict:
     worker_b = start_second_worker(system)
     time.sleep(3)
 
-    running_state = "running" if system != "oban" else "executing"
+    rs = running_state(system)
     try:
-        wait_for_state(system, running_state, min_count=1, timeout=30)
+        wait_for_state(system, rs, min_count=1, timeout=30)
     except TimeoutError:
         pass
 
@@ -529,7 +572,7 @@ def scenario_leader_failover(system: str, job_count: int = 10) -> dict:
 
     # Worker B should take over and complete all jobs
     try:
-        completion_wait = wait_for_state(system, "completed",
+        completion_wait = wait_for_state(system, completed_state(system),
                                          min_count=job_count, timeout=180)
     except TimeoutError:
         completion_wait = 180.0
@@ -538,7 +581,7 @@ def scenario_leader_failover(system: str, job_count: int = 10) -> dict:
     final_counts = get_state_counts(system)
 
     # Check for duplicates: completed count should equal job_count exactly
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
     duplicates = max(0, completed - job_count)
 
     try:
@@ -586,7 +629,7 @@ def start_second_worker(system: str) -> subprocess.Popen:
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-    else:  # oban
+    elif system == "oban":
         return subprocess.Popen(
             ["docker", "run", "--rm", "--name", "oban-chaos-worker-b",
              "--network", "host",
@@ -594,6 +637,16 @@ def start_second_worker(system: str) -> subprocess.Popen:
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=10",
              "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_AFTER_SECS=15",
              "oban-bench"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    else:  # procrastinate
+        return subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "procrastinate-chaos-worker-b",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=10",
+             "-e", "JOB_DURATION_MS=30000",
+             "procrastinate-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
 
@@ -620,12 +673,6 @@ def scenario_retry_storm(system: str, job_count: int = 500) -> dict:
 
     # Insert jobs directly as retryable (Awa) or scheduled (River/Oban)
     # to simulate mass failure without needing a failing worker.
-    retry_state = {
-        "awa": "retryable",
-        "river": "retryable",
-        "oban": "retryable",
-    }[system]
-
     retry_enqueue = {
         "awa": """
             INSERT INTO awa.scheduled_jobs (kind, queue, args, state, priority, run_at, attempt, max_attempts)
@@ -645,6 +692,12 @@ def scenario_retry_storm(system: str, job_count: int = 500) -> dict:
                    'retryable', 5, now(), now(), 1
             FROM generate_series(1, {count}) g
         """,
+        "procrastinate": """
+            INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, attempts)
+            SELECT 'main.chaos_job', 'chaos', jsonb_build_object('seq', g),
+                   'todo', 1
+            FROM generate_series(1, {count}) g
+        """,
     }[system]
 
     print(f"  [{system}] Inserting {job_count} retryable jobs...", file=sys.stderr)
@@ -657,7 +710,7 @@ def scenario_retry_storm(system: str, job_count: int = 500) -> dict:
     worker = start_worker_fast(system)
 
     try:
-        wait_for_state(system, "completed", min_count=job_count, timeout=300)
+        wait_for_state(system, completed_state(system), min_count=job_count, timeout=300)
     except TimeoutError:
         print(f"  [{system}] TIMEOUT", file=sys.stderr)
 
@@ -669,7 +722,7 @@ def scenario_retry_storm(system: str, job_count: int = 500) -> dict:
     except Exception:
         pass
 
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
 
     return {
         "system": system,
@@ -709,7 +762,7 @@ def start_worker_fast(system: str) -> subprocess.Popen:
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-    else:
+    elif system == "oban":
         return subprocess.Popen(
             ["docker", "run", "--rm", "--name", "oban-chaos-worker",
              "--network", "host",
@@ -717,6 +770,16 @@ def start_worker_fast(system: str) -> subprocess.Popen:
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
              "-e", "JOB_DURATION_MS=100", "-e", "RESCUE_AFTER_SECS=15",
              "oban-bench"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    else:  # procrastinate
+        return subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "procrastinate-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
+             "-e", "JOB_DURATION_MS=100",
+             "procrastinate-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
 
@@ -775,7 +838,7 @@ def scenario_pool_exhaustion(system: str, job_count: int = 20) -> dict:
     start_time = time.time()
 
     try:
-        wait_for_state(system, "completed", min_count=job_count, timeout=120)
+        wait_for_state(system, completed_state(system), min_count=job_count, timeout=120)
     except TimeoutError:
         print(f"  [{system}] TIMEOUT", file=sys.stderr)
 
@@ -787,7 +850,7 @@ def scenario_pool_exhaustion(system: str, job_count: int = 20) -> dict:
     except Exception:
         pass
 
-    completed = final_counts.get("completed", 0)
+    completed = final_counts.get(completed_state(system), 0)
 
     return {
         "system": system,
@@ -840,6 +903,12 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
                    'available', 5, now(), now(), 4
             FROM generate_series(1, {count}) g
         """,
+        "procrastinate": """
+            INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, priority)
+            SELECT 'main.chaos_job', 'chaos', jsonb_build_object('seq', g, 'prio', 'low'),
+                   'todo', 0
+            FROM generate_series(1, {count}) g
+        """,
     }[system]
 
     print(f"  [{system}] Inserting {low_count} low-priority (4) jobs...",
@@ -864,13 +933,21 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=3",
              "-e", "JOB_DURATION_MS=2000", "-e", "RESCUE_AFTER_SECS=15"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-    else:
+    elif system == "oban":
         worker = subprocess.Popen(
             ["docker", "run", "--rm", "--name", "oban-chaos-worker",
              "--network", "host",
              "-e", f"DATABASE_URL={pg_url('oban_bench')}",
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=3",
              "-e", "JOB_DURATION_MS=2000", "-e", "RESCUE_AFTER_SECS=15"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    else:  # procrastinate
+        worker = subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "procrastinate-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=3",
+             "-e", "JOB_DURATION_MS=2000"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     time.sleep(3)
 
@@ -879,6 +956,7 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
         "awa": "INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, run_at) SELECT 'chaos_job', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'available', 1, now() FROM generate_series(1, {batch}) g",
         "river": "INSERT INTO river_job (kind, queue, args, state, max_attempts, scheduled_at, priority) SELECT 'chaos_job', 'default', jsonb_build_object('prio', 'high', 'seq', g), 'available', 5, now(), 1 FROM generate_series(1, {batch}) g",
         "oban": "INSERT INTO oban_jobs (worker, queue, args, state, max_attempts, scheduled_at, inserted_at, priority) SELECT 'ObanBench.ChaosWorker', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'available', 5, now(), now(), 0 FROM generate_series(1, {batch}) g",
+        "procrastinate": "INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, priority) SELECT 'main.chaos_job', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'todo', 10 FROM generate_series(1, {batch}) g",
     }[system]
 
     start_time = time.time()
@@ -903,6 +981,7 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
         "awa": "SELECT count(*) FROM awa.jobs WHERE args->>'prio' = 'low' AND state = 'completed'",
         "river": "SELECT count(*) FROM river_job WHERE args->>'prio' = 'low' AND state = 'completed'",
         "oban": "SELECT count(*) FROM oban_jobs WHERE args->>'prio' = 'low' AND state = 'completed'",
+        "procrastinate": "SELECT count(*) FROM procrastinate_jobs WHERE args->>'prio' = 'low' AND status = 'succeeded'",
     }[system]
 
     deadline = time.time() + 120  # 2 more minutes max
@@ -958,6 +1037,13 @@ def migrate_system(system: str):
              "-e", f"DATABASE_URL={pg_url('oban_bench')}",
              "-e", "SCENARIO=migrate_only",
              "oban-bench"],
+            {},
+        ),
+        "procrastinate": (
+            ["docker", "run", "--rm", "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+             "-e", "SCENARIO=migrate_only",
+             "procrastinate-bench"],
             {},
         ),
     }

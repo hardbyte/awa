@@ -1,7 +1,8 @@
 # Portable Cross-System Benchmarks
 
-Comparable benchmark scenarios for Awa, River (Go), and Oban (Elixir) running
-against a shared Postgres instance.
+Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
+Procrastinate (Python), River (Go), and Oban (Elixir) running against a shared
+Postgres instance.
 
 ## Prerequisites
 
@@ -13,19 +14,22 @@ against a shared Postgres instance.
 
 ```bash
 # Start Postgres, build all adapters, run all scenarios, stop Postgres
-python benchmarks/portable/run.py
+uv run python benchmarks/portable/run.py
 
 # Run specific systems
-python benchmarks/portable/run.py --systems awa,river
+uv run python benchmarks/portable/run.py --systems awa,awa-docker,awa-python,procrastinate,river
 
 # Run a single scenario
-python benchmarks/portable/run.py --scenario worker_throughput --job-count 50000 --worker-count 200
+uv run python benchmarks/portable/run.py --scenario worker_throughput --job-count 50000 --worker-count 200
 
 # Skip rebuild (use cached images/binaries)
-python benchmarks/portable/run.py --skip-build
+uv run python benchmarks/portable/run.py --skip-build
 
 # Keep Postgres running after benchmarks (for debugging)
-python benchmarks/portable/run.py --keep-pg
+uv run python benchmarks/portable/run.py --keep-pg
+
+# Run isolated 3x repetitions at the higher-throughput scale point
+uv run python benchmarks/portable/isolated.py --skip-build
 ```
 
 ## Scenarios
@@ -54,11 +58,20 @@ and dispatch poll interval.
 ```
 benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
-├── docker-compose.yml     # Shared Postgres 17 with three databases
-├── init-databases.sql     # Creates awa_bench, river_bench, oban_bench
-├── awa-bench/             # Rust binary (built locally from workspace)
+├── isolated.py            # Repeats one-system-per-run isolated benchmarks
+├── docker-compose.yml     # Shared Postgres 17 with per-system databases
+├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench
+├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
+│   ├── Dockerfile
 │   └── src/main.rs
+├── awa-python-bench/      # Python runtime variant (Docker)
+│   ├── Dockerfile
+│   └── main.py
+├── procrastinate-bench/   # Python Procrastinate adapter (Docker)
+│   ├── Dockerfile
+│   ├── main.py
+│   └── pyproject.toml
 ├── river-bench/           # Go binary (built in Docker)
 │   ├── Dockerfile
 │   ├── go.mod
@@ -78,9 +91,9 @@ Each adapter:
 - Outputs JSON results to stdout, logs to stderr
 - Manages its own schema migration and cleanup
 
-The Awa adapter runs natively (using workspace crates via path dependency).
-River and Oban run in Docker containers with `--network host` to connect to
-the shared Postgres.
+`awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
+`procrastinate`, River, and Oban run in Docker containers with `--network host`
+to connect to the shared Postgres.
 
 ## Configuration
 
@@ -90,7 +103,7 @@ the shared Postgres.
 | `--job-count` | `10000` | Number of jobs per scenario |
 | `--worker-count` | `50` | Concurrent workers |
 | `--latency-iterations` | `100` | Iterations for pickup latency test |
-| `--systems` | `awa,river,oban` | Comma-separated list of systems to run |
+| `--systems` | `awa,awa-docker,awa-python,procrastinate,river,oban` | Comma-separated list of systems to run |
 
 ## Fairness Constraints
 
@@ -98,29 +111,33 @@ the shared Postgres.
 - Same job count, batch size, and worker concurrency
 - Same result schema (JSON with jobs_per_sec, duration_ms, latency percentiles)
 - Each system uses its own database to avoid schema conflicts
+- `awa`, `awa-docker`, `awa-python`, and `procrastinate` use separate databases
+  so variant comparisons do not inherit warmed tables or queue metadata from the prior run
 - Aligned poll intervals: all systems use 50ms poll/fetch interval
 - Aligned rescue intervals: all systems use 15s rescue-after for chaos tests
+- Awa reuses one DB session across COPY batches so its temp-table reuse
+  optimization is exercised in the portable harness
+- Pickup latency uses each system's normal single-job insert API rather than a
+  batch insert helper
 - Chaos enqueue via direct SQL INSERT — all three systems have INSERT triggers
   that fire NOTIFY, so workers discover jobs at the same speed
-- River's schema is hand-crafted (no `rivermigrate` module). It includes the
-  core tables, indexes, and `river_job_state_in_bitmask` function but may lack
-  some features from later River migrations. This does not affect core dispatch
-  or rescue, but could affect unique job deduplication
+- River uses the upstream `rivermigrate` package so its benchmark schema tracks
+  the real River release instead of a local approximation
 
 ## Chaos / Correctness Scenarios
 
 ```bash
 # SIGKILL recovery: kill worker mid-flight, measure rescue time
-python benchmarks/portable/chaos.py --scenario crash_recovery
+uv run python benchmarks/portable/chaos.py --scenario crash_recovery
 
 # Postgres restart: restart PG with jobs in flight
-python benchmarks/portable/chaos.py --scenario postgres_restart
+uv run python benchmarks/portable/chaos.py --scenario postgres_restart
 
 # Repeated kills: 3 kill cycles, verify all jobs eventually complete
-python benchmarks/portable/chaos.py --scenario repeated_kills --job-count 20
+uv run python benchmarks/portable/chaos.py --scenario repeated_kills --job-count 20
 
 # All chaos scenarios
-python benchmarks/portable/chaos.py --scenario all
+uv run python benchmarks/portable/chaos.py --scenario all
 ```
 
 ### pg_backend_kill
@@ -165,7 +182,7 @@ completed, and verifies zero job loss.
 
 Each system is configured with short rescue intervals:
 - Awa: heartbeat staleness 15s, rescue poll 5s
-- River: `RescueStuckJobsAfter` 30s
+- River: `RescueStuckJobsAfter` 15s
 - Oban: Lifeline `rescue_after` 15s
 
 ### postgres_restart
