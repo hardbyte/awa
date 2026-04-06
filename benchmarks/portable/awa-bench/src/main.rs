@@ -7,11 +7,11 @@
 
 use async_trait::async_trait;
 use awa_macros::JobArgs;
-use awa_model::{insert_many, insert_many_copy_from_pool, migrations, InsertOpts};
+use awa_model::{insert_many, insert_many_copy, insert_with, migrations, InsertOpts};
 use awa_worker::{Client, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::{Acquire, PgPool};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -114,23 +114,44 @@ async fn wait_for_completion(pool: &PgPool, queue_name: &str, expected: i64, tim
 
 async fn enqueue_batch(pool: &PgPool, queue_name: &str, count: i64, use_copy: bool) {
     let batch_size = 500;
-    for batch_start in (0..count).step_by(batch_size as usize) {
-        let batch_end = (batch_start + batch_size).min(count);
-        let params: Vec<_> = (batch_start..batch_end)
-            .map(|i| {
-                awa_model::insert::params_with(
-                    &BenchJob { seq: i },
-                    InsertOpts {
-                        queue: queue_name.into(),
-                        ..Default::default()
-                    },
-                )
-                .unwrap()
-            })
-            .collect();
-        if use_copy {
-            insert_many_copy_from_pool(pool, &params).await.unwrap();
-        } else {
+    if use_copy {
+        // Reuse one DB session across COPY batches so the temp staging table is
+        // reused as intended by the COPY design, instead of reacquiring an
+        // arbitrary pooled session on every chunk.
+        let mut conn = pool.acquire().await.unwrap();
+        for batch_start in (0..count).step_by(batch_size as usize) {
+            let batch_end = (batch_start + batch_size).min(count);
+            let params: Vec<_> = (batch_start..batch_end)
+                .map(|i| {
+                    awa_model::insert::params_with(
+                        &BenchJob { seq: i },
+                        InsertOpts {
+                            queue: queue_name.into(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect();
+            let mut tx = conn.begin().await.unwrap();
+            insert_many_copy(&mut tx, &params).await.unwrap();
+            tx.commit().await.unwrap();
+        }
+    } else {
+        for batch_start in (0..count).step_by(batch_size as usize) {
+            let batch_end = (batch_start + batch_size).min(count);
+            let params: Vec<_> = (batch_start..batch_end)
+                .map(|i| {
+                    awa_model::insert::params_with(
+                        &BenchJob { seq: i },
+                        InsertOpts {
+                            queue: queue_name.into(),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap()
+                })
+                .collect();
             insert_many(pool, &params).await.unwrap();
         }
     }
@@ -240,15 +261,16 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
 
     for i in 0..iterations {
         let insert_time = Instant::now();
-        let params = awa_model::insert::params_with(
+        insert_with(
+            &pool,
             &BenchJob { seq: i },
             InsertOpts {
                 queue: queue.into(),
                 ..Default::default()
             },
         )
+        .await
         .unwrap();
-        insert_many(&pool, &[params]).await.unwrap();
 
         // Wait for completion
         wait_for_completion(&pool, queue, i + 1, Duration::from_secs(10)).await;
@@ -332,7 +354,7 @@ async fn scenario_worker_only() {
             "chaos",
             QueueConfig {
                 max_workers: worker_count,
-                poll_interval: Duration::from_millis(100),
+                poll_interval: Duration::from_millis(50),
                 ..QueueConfig::default()
             },
         )
@@ -362,6 +384,7 @@ async fn scenario_worker_only() {
 async fn main() {
     tracing_subscriber::fmt()
         .with_env_filter("warn")
+        .with_writer(std::io::stderr)
         .init();
 
     let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "all".into());

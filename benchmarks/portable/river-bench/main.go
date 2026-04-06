@@ -17,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/riverqueue/river"
 	"github.com/riverqueue/river/riverdriver/riverpgxv5"
+	"github.com/riverqueue/river/rivermigrate"
 )
 
 // ── Job type ──────────────────────────────────────────────────────
@@ -92,123 +93,14 @@ func mustPool(ctx context.Context) *pgxpool.Pool {
 }
 
 func migrate(ctx context.Context, pool *pgxpool.Pool) {
-	// Inline River schema creation — avoids rivermigrate module dependency issues.
-	// Based on River's documented schema (v0.32).
-	migrationSQL := `
-	DO $$ BEGIN
-		CREATE TYPE river_job_state AS ENUM(
-			'available', 'cancelled', 'completed', 'discarded',
-			'pending', 'retryable', 'running', 'scheduled'
-		);
-	EXCEPTION WHEN duplicate_object THEN NULL;
-	END $$;
-
-	CREATE TABLE IF NOT EXISTS river_migration (
-		line SMALLINT NOT NULL DEFAULT 0,
-		version BIGINT NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		CONSTRAINT river_migration_pkey PRIMARY KEY (line, version)
-	);
-
-	CREATE TABLE IF NOT EXISTS river_job (
-		id BIGSERIAL PRIMARY KEY,
-		state river_job_state NOT NULL DEFAULT 'available',
-		attempt SMALLINT NOT NULL DEFAULT 0,
-		max_attempts SMALLINT NOT NULL,
-		attempted_at TIMESTAMPTZ,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		finalized_at TIMESTAMPTZ,
-		scheduled_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		priority SMALLINT NOT NULL DEFAULT 1,
-		args JSONB NOT NULL,
-		attempted_by TEXT[],
-		errors JSONB[],
-		kind TEXT NOT NULL,
-		metadata JSONB NOT NULL DEFAULT '{}',
-		queue TEXT NOT NULL DEFAULT 'default',
-		tags VARCHAR(255)[] NOT NULL DEFAULT '{}',
-		unique_key BYTEA,
-		unique_states BIT(8)
-	);
-
-	CREATE OR REPLACE FUNCTION river_job_state_in_bitmask(bitmask BIT(8), state river_job_state)
-	RETURNS BOOLEAN
-	LANGUAGE SQL IMMUTABLE AS $$
-		SELECT CASE state
-			WHEN 'available' THEN get_bit(bitmask, 7)
-			WHEN 'cancelled' THEN get_bit(bitmask, 6)
-			WHEN 'completed' THEN get_bit(bitmask, 5)
-			WHEN 'discarded' THEN get_bit(bitmask, 4)
-			WHEN 'pending'   THEN get_bit(bitmask, 3)
-			WHEN 'retryable' THEN get_bit(bitmask, 2)
-			WHEN 'running'   THEN get_bit(bitmask, 1)
-			WHEN 'scheduled' THEN get_bit(bitmask, 0)
-			ELSE 0
-		END = 1
-	$$;
-
-	CREATE INDEX IF NOT EXISTS river_job_prioritized_fetching_index
-		ON river_job (state, queue, priority, scheduled_at, id);
-	CREATE INDEX IF NOT EXISTS river_job_kind ON river_job (kind);
-	CREATE INDEX IF NOT EXISTS river_job_state_and_finalized_at_index
-		ON river_job (state, finalized_at) WHERE finalized_at IS NOT NULL;
-	CREATE UNIQUE INDEX IF NOT EXISTS river_job_unique_idx
-		ON river_job (unique_key)
-		WHERE unique_key IS NOT NULL
-		AND unique_states IS NOT NULL
-		AND river_job_state_in_bitmask(unique_states, state);
-
-	-- Notification function for fast job pickup (LISTEN/NOTIFY)
-	CREATE OR REPLACE FUNCTION river_job_notify() RETURNS TRIGGER
-	LANGUAGE plpgsql AS $$
-	BEGIN
-		PERFORM pg_notify('river_insert', NEW.queue);
-		RETURN NEW;
-	END;
-	$$;
-	DROP TRIGGER IF EXISTS river_job_notify_trigger ON river_job;
-	CREATE TRIGGER river_job_notify_trigger
-		AFTER INSERT ON river_job
-		FOR EACH ROW EXECUTE FUNCTION river_job_notify();
-
-	CREATE UNLOGGED TABLE IF NOT EXISTS river_leader (
-		elected_at TIMESTAMPTZ NOT NULL,
-		expires_at TIMESTAMPTZ NOT NULL,
-		leader_id TEXT NOT NULL,
-		name TEXT PRIMARY KEY NOT NULL DEFAULT 'default'
-	);
-
-	CREATE TABLE IF NOT EXISTS river_queue (
-		name TEXT PRIMARY KEY NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		metadata JSONB NOT NULL DEFAULT '{}',
-		paused_at TIMESTAMPTZ,
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-	);
-
-	CREATE UNLOGGED TABLE IF NOT EXISTS river_client (
-		id TEXT PRIMARY KEY NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		metadata JSONB NOT NULL DEFAULT '{}',
-		paused_at TIMESTAMPTZ,
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-	);
-
-	CREATE UNLOGGED TABLE IF NOT EXISTS river_client_queue (
-		river_client_id TEXT NOT NULL,
-		name TEXT NOT NULL,
-		created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		max_workers BIGINT NOT NULL DEFAULT 0,
-		metadata JSONB NOT NULL DEFAULT '{}',
-		num_available BIGINT NOT NULL DEFAULT 0,
-		num_running BIGINT NOT NULL DEFAULT 0,
-		updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-		PRIMARY KEY (river_client_id, name)
-	);
-	`
-	_, err := pool.Exec(ctx, migrationSQL)
+	migrator, err := rivermigrate.New(riverpgxv5.New(pool), nil)
 	if err != nil {
-		log.Fatalf("Failed to run River migration SQL: %v", err)
+		log.Fatalf("Failed to create River migrator: %v", err)
+	}
+
+	_, err = migrator.Migrate(ctx, rivermigrate.DirectionUp, nil)
+	if err != nil {
+		log.Fatalf("Failed to run River migrations: %v", err)
 	}
 }
 
@@ -512,7 +404,7 @@ func main() {
 
 	if scenario == "worker_only" {
 		jobDurationMs := envInt("JOB_DURATION_MS", 30000)
-		rescueAfterSecs := envInt("RESCUE_AFTER_SECS", 30)
+		rescueAfterSecs := envInt("RESCUE_AFTER_SECS", 15)
 
 		workers := river.NewWorkers()
 		river.AddWorker(workers, &ChaosWorker{JobDurationMs: jobDurationMs})
@@ -523,8 +415,8 @@ func main() {
 			},
 			Workers:              workers,
 			RescueStuckJobsAfter: time.Duration(rescueAfterSecs) * time.Second,
-			FetchCooldown:        100 * time.Millisecond,
-			FetchPollInterval:    200 * time.Millisecond,
+			FetchCooldown:        50 * time.Millisecond,
+			FetchPollInterval:    50 * time.Millisecond,
 			JobTimeout:           -1,
 		})
 		if err != nil {
