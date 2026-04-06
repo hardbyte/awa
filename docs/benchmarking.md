@@ -448,66 +448,118 @@ PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_tes
 
 ## Cross-System Comparison (Portable Benchmarks)
 
-The `benchmarks/portable/` harness runs comparable scenarios against Awa, River (Go), and Oban (Elixir) sharing the same Postgres instance. See `benchmarks/portable/README.md` for setup and usage.
+The `benchmarks/portable/` harness runs comparable scenarios against Awa
+(native Rust), `awa-docker`, `awa-python`, River (Go), and Oban (Elixir)
+sharing the same Postgres instance. See `benchmarks/portable/README.md` for
+setup and usage.
 
-### Reference Results (Postgres 17-alpine, shared_buffers=256MB)
+The current reference run is the isolated 5-repetition fair suite in:
+
+- `benchmarks/portable/results/full_suite_20260406_011911.json`
+- `benchmarks/portable/results/benchmark_summary_20260406_011911.md`
+- `benchmarks/portable/results/chaos_summary_20260406_011911.md`
+
+Configuration for that run:
+
+- 5 isolated repetitions per system
+- 10,000 benchmark jobs
+- 50 workers
+- 50 pickup-latency iterations
+- portable chaos suite with 10 long-running jobs
+- systems included: `awa`, `awa-docker`, `awa-python`, `river`, `oban`
+
+`procrastinate` was excluded from the fair 5x comparison because its portable
+chaos adapter/schema path was not yet trustworthy enough to compare fairly.
+
+### Benchmark Summary (5 isolated repetitions)
 
 #### Enqueue Throughput (jobs/sec)
 
-| Scale | Awa (COPY) | River (COPY) | Oban (Ecto) |
-|-------|------------|--------------|-------------|
-| 10k   | ~27,500    | ~31,000      | ~9,900      |
-| 50k   | ~23,000    | ~29,000      | ~10,400     |
+| System | Mean | Stdev | Min | Max |
+|--------|-----:|------:|----:|----:|
+| `awa` | 30,798 | 8,293 | 20,599 | 43,522 |
+| `awa-docker` | 28,777 | 2,676 | 24,328 | 30,822 |
+| `awa-python` | 24,357 | 2,276 | 21,012 | 26,823 |
+| `river` | 39,792 | 15,912 | 31,461 | 68,195 |
+| `oban` | 12,129 | 452 | 11,641 | 12,739 |
 
 #### Worker Throughput — no-op jobs (jobs/sec)
 
-| Workers | Awa    | River  | Oban   |
-|---------|--------|--------|--------|
-| 50      | ~830   | ~960   | ~1,470 |
-| 100     | ~1,240 | ~1,950 | ~1,700 |
-| 200     | ~3,900 | ~3,800 | ~820   |
+| System | Mean | Stdev | Min | Max |
+|--------|-----:|------:|----:|----:|
+| `awa` | 851 | 15 | 843 | 879 |
+| `awa-docker` | 847 | 3 | 843 | 849 |
+| `awa-python` | 818 | 3 | 816 | 823 |
+| `river` | 968 | 1 | 967 | 969 |
+| `oban` | 2,243 | 1,211 | 1,641 | 4,407 |
 
 #### Pickup Latency — single job to idle queue (p50)
 
-| Awa   | River* | Oban  |
-|-------|--------|-------|
-| ~56ms | ~264ms | ~56ms |
+| System | Mean p50 | Min p50 | Max p50 |
+|--------|---------:|--------:|--------:|
+| `awa` | 56,023 us | 55,738 us | 56,697 us |
+| `awa-docker` | 55,768 us | 55,511 us | 56,041 us |
+| `awa-python` | 56,933 us | 56,662 us | 57,193 us |
+| `river` | 263,434 us | 262,101 us | 264,067 us |
+| `oban` | 55,430 us | 53,145 us | 56,045 us |
 
-*River's latency is likely inflated due to incomplete NOTIFY setup in the hand-crafted migration schema.
+### Benchmark Takeaways
+
+- The three Awa variants were tightly clustered and stable. Native Awa had the
+  fastest mean enqueue throughput, while `awa-docker` and `awa-python` stayed
+  close on pickup latency and worker throughput.
+- River had strong worker throughput and the fastest mean enqueue throughput in
+  this run set, but its enqueue numbers were much more variable than the Awa
+  family.
+- River remained a clear outlier on pickup latency at roughly `263 ms` p50,
+  versus roughly `55-57 ms` for the other systems.
+- Oban had the lowest enqueue throughput in this suite, but the highest mean
+  worker throughput. That mean is noisy: the 5-run range was `1.6k/s` to
+  `4.4k/s`, so the mean should not be treated as a stable single-number result.
 
 ### Comparability Notes
 
-- No-op workload measures pure queue overhead; real jobs with actual work narrow all gaps.
-- River uses `InsertManyFast` (COPY protocol) for enqueue. Awa uses `insert_many_copy_from_pool`.
-- Oban uses the open-source Basic engine; Oban Pro's SmartEngine would likely differ.
-- Single-node only; no multi-process or cluster testing.
+- These are still local engineering numbers on one machine, not published
+  vendor-style claims.
+- No-op workload measures queue/runtime overhead. Real jobs with meaningful work
+  would narrow many of these gaps.
+- River uses `InsertManyFast` (COPY protocol) for enqueue. Awa uses
+  `insert_many_copy_from_pool`.
+- Oban uses the open-source Basic engine; Oban Pro's SmartEngine would likely
+  differ.
+- Single-node only; no multi-process cluster benchmark is implied by these
+  results.
 
 ### Correctness Under Adverse Conditions
 
-The chaos runner (`benchmarks/portable/chaos.py`) tests failure recovery
-across all three systems using 30-second sleep jobs and tuned rescue intervals.
+The portable chaos runner (`benchmarks/portable/chaos.py`) exercises crash
+recovery, Postgres restart, repeated worker kills, backend termination, leader
+failover, and connection-pool exhaustion.
 
-#### SIGKILL Recovery (10 jobs, tuned rescue intervals)
+Important: the generated chaos summary records `5/5` completed harness runs for
+every system/scenario, but correctness should be judged by `jobs_lost` and
+duplicate completion counts, not by harness completion alone.
 
-| System | Rescue time | Jobs lost |
-|--------|-------------|-----------|
-| Awa    | ~46s        | 0         |
-| River  | ~75s        | 0         |
-| Oban   | ~93s        | 0         |
+#### Chaos Summary (5 isolated repetitions)
 
-Awa uses active heartbeats for crash detection (ADR-003); River and Oban use
-wall-clock age since `attempted_at`. Rescue intervals were configured to
-comparable values (Awa 15s staleness, River 30s stuck-after, Oban 15s rescue-after).
+| System | Crash Recovery | Repeated Kills | Leader Failover | Postgres Restart |
+|--------|----------------|----------------|-----------------|------------------|
+| `awa` | mean `41.7s`, lost `0` | mean `53.4s`, lost `0` | mean `47.5s`, lost `0`, dupes `0` | mean `28.3s`, lost `0` |
+| `awa-docker` | mean `41.8s`, lost `0` | mean `54.3s`, lost `0` | mean `47.7s`, lost `0`, dupes `0` | mean `28.5s`, lost `0` |
+| `awa-python` | mean `42.2s`, lost `0` | mean `54.4s`, lost `0` | mean `47.9s`, lost `0`, dupes `0` | mean `28.9s`, lost `0` |
+| `river` | mean `255.5s`, max lost `1` | mean `244.7s`, max lost `1` | mean `180.4s`, max lost `2`, dupes `0` | mean `28.6s`, lost `0` |
+| `oban` | mean `93.1s`, lost `0` | mean `110.4s`, lost `0` | mean `89.0s`, lost `0`, dupes `0` | mean `29.8s`, lost `0` |
 
-#### Repeated Kills (15 jobs, 3 kill cycles)
+#### Chaos Takeaways
 
-| System | Total time | Jobs lost |
-|--------|-----------|-----------|
-| Awa    | ~83s      | 0         |
-| River  | ~113s     | 0         |
-| Oban   | ~141s     | 0         |
-
-#### Postgres Restart (5 jobs in flight)
-
-All three systems reconnect and complete all jobs with zero loss after a
-Postgres restart (~1.5s downtime).
+- The Awa family was the most consistent result in the suite: all five runs of
+  all portable chaos scenarios completed with zero loss and zero duplicates.
+- Oban was also correct in this run set, but materially slower to rescue and
+  fail over than the Awa variants.
+- River was not just slower on recovery; it was the only system in this fair
+  5x run set to leave jobs incomplete in crash-related scenarios:
+  - crash recovery: up to `1` job lost
+  - repeated kills: up to `1` job lost
+  - leader failover: up to `2` jobs lost
+- All systems handled Postgres restart and backend-kill scenarios without job
+  loss in this suite.

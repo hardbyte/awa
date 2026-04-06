@@ -117,6 +117,15 @@ async def enqueue_batch(queue: str, count: int) -> None:
         )
 
 
+async def enqueue_chaos_jobs(count: int, *, low_priority: bool = False) -> None:
+    deferrer = chaos_job.configure(queue="chaos")
+    for seq in range(1, count + 1):
+        payload = {"seq": seq}
+        if low_priority:
+            payload["prio"] = "low"
+        await deferrer.defer_async(**payload)
+
+
 def build_worker(queue: str, worker_count: int, *, wait: bool):
     return app._worker(
         queues=[queue],

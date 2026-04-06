@@ -30,6 +30,9 @@ uv run python benchmarks/portable/run.py --keep-pg
 
 # Run isolated 3x repetitions at the higher-throughput scale point
 uv run python benchmarks/portable/isolated.py --skip-build
+
+# Run the benchmark suite plus the portable chaos suite per system in isolation
+uv run python benchmarks/portable/full_suite.py --skip-build
 ```
 
 ## Scenarios
@@ -114,7 +117,9 @@ to connect to the shared Postgres.
 - `awa`, `awa-docker`, `awa-python`, and `procrastinate` use separate databases
   so variant comparisons do not inherit warmed tables or queue metadata from the prior run
 - Aligned poll intervals: all systems use 50ms poll/fetch interval
-- Aligned rescue intervals: all systems use 15s rescue-after for chaos tests
+- Aligned rescue intent: Awa uses 15s heartbeat staleness, Oban uses 15s
+  rescue-after, and River uses a rescue timeout above the 30s chaos job
+  duration so healthy jobs are not falsely rescued
 - Awa reuses one DB session across COPY batches so its temp-table reuse
   optimization is exercised in the portable harness
 - Pickup latency uses each system's normal single-job insert API rather than a
@@ -123,6 +128,9 @@ to connect to the shared Postgres.
   that fire NOTIFY, so workers discover jobs at the same speed
 - River uses the upstream `rivermigrate` package so its benchmark schema tracks
   the real River release instead of a local approximation
+- The comparable chaos subset excludes feature-specific probes like priority
+  aging and synthetic retry-promotion shortcuts; those remain available via the
+  `extended` suite for diagnostics rather than apples-to-apples comparisons
 
 ## Chaos / Correctness Scenarios
 
@@ -138,6 +146,15 @@ uv run python benchmarks/portable/chaos.py --scenario repeated_kills --job-count
 
 # All chaos scenarios
 uv run python benchmarks/portable/chaos.py --scenario all
+
+# Comparable cross-system chaos subset
+uv run python benchmarks/portable/chaos.py --suite portable
+
+# Benchmark suite + portable chaos suite, one isolated run per system
+uv run python benchmarks/portable/full_suite.py --skip-build
+
+# Same, but repeated 5x and with CSV/Markdown summaries emitted beside the JSON
+uv run python benchmarks/portable/full_suite.py --repetitions 5 --skip-build
 ```
 
 ### pg_backend_kill
@@ -182,7 +199,8 @@ completed, and verifies zero job loss.
 
 Each system is configured with short rescue intervals:
 - Awa: heartbeat staleness 15s, rescue poll 5s
-- River: `RescueStuckJobsAfter` 15s
+- River: `RescueStuckJobsAfter` 60s for the 30s chaos jobs, so crash recovery
+  is measured without false-rescuing healthy long-running work
 - Oban: Lifeline `rescue_after` 15s
 
 ### postgres_restart
@@ -209,3 +227,14 @@ repeated crashes.
 
 Results are saved to `results/results_<timestamp>.json` with full configuration
 metadata.
+
+`full_suite.py` also writes:
+- `benchmark_summary_<timestamp>.md`
+- `benchmark_summary_<timestamp>.csv`
+- `chaos_summary_<timestamp>.md`
+- `chaos_summary_<timestamp>.csv`
+- `full_suite_<timestamp>.log`
+- `full_suite_<timestamp>.status.json`
+
+The status file is updated during execution so long runs can be inspected even
+if the terminal session is interrupted.

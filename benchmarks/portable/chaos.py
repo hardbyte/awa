@@ -3,11 +3,11 @@
 Chaos comparison: correctness under adverse conditions.
 
 Tests SIGKILL recovery, Postgres restart, and no-job-loss guarantees
-across Awa, River, and Oban.
+across the portable systems under test.
 
 Usage:
     python chaos.py [--scenario crash_recovery|postgres_restart|repeated_kills]
-                    [--systems awa,river,oban]
+                    [--systems awa,awa-docker,awa-python,procrastinate,river,oban]
 """
 
 import argparse
@@ -25,6 +25,29 @@ PG_PORT = 15555
 PG_USER = "bench"
 PG_PASS = "bench"
 DB_URL_TPL = f"postgres://{PG_USER}:{PG_PASS}@localhost:{PG_PORT}/{{}}"
+
+PORTABLE_SYSTEMS = [
+    "awa",
+    "awa-docker",
+    "awa-python",
+    "procrastinate",
+    "river",
+    "oban",
+]
+
+PORTABLE_SCENARIOS = [
+    "crash_recovery",
+    "postgres_restart",
+    "repeated_kills",
+    "pg_backend_kill",
+    "leader_failover",
+    "pool_exhaustion",
+]
+
+EXTENDED_SCENARIOS = PORTABLE_SCENARIOS + [
+    "retry_storm",
+    "priority_starvation",
+]
 
 # ── Postgres helpers ──────────────────────────────────────────────
 
@@ -68,9 +91,9 @@ def reset_db(db: str):
 
 # ── Per-system SQL: enqueue, state counts, rescue times ───────────
 
-SYSTEMS = {
-    "awa": {
-        "db": "awa_bench",
+def awa_like_system(db: str) -> dict[str, str]:
+    return {
+        "db": db,
         "job_table": "awa.jobs_hot",
         "state_col": "state",
         "enqueue_sql": """
@@ -86,7 +109,13 @@ SYSTEMS = {
             FROM awa.jobs WHERE queue = 'chaos' AND state = 'retryable'
             ORDER BY finalized_at DESC LIMIT 1
         """,
-    },
+    }
+
+
+SYSTEMS = {
+    "awa": awa_like_system("awa_bench"),
+    "awa-docker": awa_like_system("awa_docker_bench"),
+    "awa-python": awa_like_system("awa_python_bench"),
     "river": {
         "db": "river_bench",
         "job_table": "river_job",
@@ -144,9 +173,44 @@ SYSTEMS = {
 }
 
 def enqueue_jobs(system: str, count: int):
+    if system == "procrastinate":
+        enqueue_procrastinate_jobs(count)
+        return
     cfg = SYSTEMS[system]
     sql = cfg["enqueue_sql"].format(count=count)
     psql(cfg["db"], sql)
+
+
+def run_procrastinate_python(code: str) -> None:
+    result = subprocess.run(
+        [
+            "docker", "run", "--rm", "--entrypoint", "sh",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+            "procrastinate-bench",
+            "-lc",
+            (
+                "cd /app/benchmarks/portable/procrastinate-bench && "
+                f"uv run python -c '{code}'"
+            ),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(f"Procrastinate helper failed:\n{result.stderr}")
+
+
+def enqueue_procrastinate_jobs(count: int):
+    code = (
+        "import asyncio, main\n"
+        "async def run():\n"
+        "    async with main.app.open_async():\n"
+        f"        await main.enqueue_chaos_jobs({count})\n"
+        "asyncio.run(run())"
+    )
+    run_procrastinate_python(code)
 
 def get_state_counts(system: str) -> dict[str, int]:
     cfg = SYSTEMS[system]
@@ -176,8 +240,42 @@ def start_awa_worker() -> subprocess.Popen:
         env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
     )
 
+
+def start_awa_docker_worker() -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            "docker", "run", "--rm", "--name", "awa-docker-chaos-worker",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
+            "-e", "SCENARIO=worker_only",
+            "-e", "WORKER_COUNT=10",
+            "-e", "JOB_DURATION_MS=30000",
+            "-e", "RESCUE_INTERVAL_SECS=5",
+            "-e", "HEARTBEAT_STALENESS_SECS=15",
+            "awa-bench-docker",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
+
+def start_awa_python_worker() -> subprocess.Popen:
+    return subprocess.Popen(
+        [
+            "docker", "run", "--rm", "--name", "awa-python-chaos-worker",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
+            "-e", "SCENARIO=worker_only",
+            "-e", "WORKER_COUNT=10",
+            "-e", "JOB_DURATION_MS=30000",
+            "-e", "RESCUE_INTERVAL_SECS=5",
+            "-e", "HEARTBEAT_STALENESS_SECS=15",
+            "awa-python-bench",
+        ],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+
 def start_river_worker() -> subprocess.Popen:
-    """Start River worker container with short rescue interval."""
+    """Start River worker container with rescue timeout above job duration."""
     return subprocess.Popen(
         [
             "docker", "run", "--rm", "--name", "river-chaos-worker",
@@ -186,7 +284,7 @@ def start_river_worker() -> subprocess.Popen:
             "-e", "SCENARIO=worker_only",
             "-e", "WORKER_COUNT=10",
             "-e", "JOB_DURATION_MS=30000",
-            "-e", "RESCUE_AFTER_SECS=15",
+            "-e", "RESCUE_AFTER_SECS=60",
             "river-bench",
         ],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -238,6 +336,8 @@ def kill_worker(proc: subprocess.Popen, system: str):
 
 WORKER_STARTERS = {
     "awa": start_awa_worker,
+    "awa-docker": start_awa_docker_worker,
+    "awa-python": start_awa_python_worker,
     "river": start_river_worker,
     "oban": start_oban_worker,
     "procrastinate": start_procrastinate_worker,
@@ -246,12 +346,24 @@ WORKER_STARTERS = {
 # ── State name mapping (each system uses different terminology) ────
 
 def running_state(system: str) -> str:
-    return {"awa": "running", "river": "running", "oban": "executing",
-            "procrastinate": "doing"}[system]
+    return {
+        "awa": "running",
+        "awa-docker": "running",
+        "awa-python": "running",
+        "river": "running",
+        "oban": "executing",
+        "procrastinate": "doing",
+    }[system]
 
 def completed_state(system: str) -> str:
-    return {"awa": "completed", "river": "completed", "oban": "completed",
-            "procrastinate": "succeeded"}[system]
+    return {
+        "awa": "completed",
+        "awa-docker": "completed",
+        "awa-python": "completed",
+        "river": "completed",
+        "oban": "completed",
+        "procrastinate": "succeeded",
+    }[system]
 
 # ── Scenarios ─────────────────────────────────────────────────────
 
@@ -619,13 +731,35 @@ def start_second_worker(system: str) -> subprocess.Popen:
             },
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+    elif system == "awa-docker":
+        return subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "awa-docker-chaos-worker-b",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=10",
+             "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_INTERVAL_SECS=5",
+             "-e", "HEARTBEAT_STALENESS_SECS=15",
+             "awa-bench-docker"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    elif system == "awa-python":
+        return subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "awa-python-chaos-worker-b",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=10",
+             "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_INTERVAL_SECS=5",
+             "-e", "HEARTBEAT_STALENESS_SECS=15",
+             "awa-python-bench"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
     elif system == "river":
         return subprocess.Popen(
             ["docker", "run", "--rm", "--name", "river-chaos-worker-b",
              "--network", "host",
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
              "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=10",
-             "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_AFTER_SECS=15",
+             "-e", "JOB_DURATION_MS=30000", "-e", "RESCUE_AFTER_SECS=60",
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
@@ -752,6 +886,28 @@ def start_worker_fast(system: str) -> subprocess.Popen:
             },
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+    elif system == "awa-docker":
+        return subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "awa-docker-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
+             "-e", "JOB_DURATION_MS=100", "-e", "RESCUE_INTERVAL_SECS=5",
+             "-e", "HEARTBEAT_STALENESS_SECS=15",
+             "awa-bench-docker"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    elif system == "awa-python":
+        return subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "awa-python-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
+             "-e", "JOB_DURATION_MS=100", "-e", "RESCUE_INTERVAL_SECS=5",
+             "-e", "HEARTBEAT_STALENESS_SECS=15",
+             "awa-python-bench"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
     elif system == "river":
         return subprocess.Popen(
             ["docker", "run", "--rm", "--name", "river-chaos-worker",
@@ -812,6 +968,28 @@ def scenario_pool_exhaustion(system: str, job_count: int = 20) -> dict:
             },
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+    elif system == "awa-docker":
+        worker = subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "awa-docker-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
+             "-e", "MAX_CONNECTIONS=5", "-e", "JOB_DURATION_MS=5000",
+             "-e", "RESCUE_INTERVAL_SECS=5", "-e", "HEARTBEAT_STALENESS_SECS=15",
+             "awa-bench-docker"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    elif system == "awa-python":
+        worker = subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "awa-python-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
+             "-e", "MAX_CONNECTIONS=5", "-e", "JOB_DURATION_MS=5000",
+             "-e", "RESCUE_INTERVAL_SECS=5", "-e", "HEARTBEAT_STALENESS_SECS=15",
+             "awa-python-bench"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
     elif system == "river":
         worker = subprocess.Popen(
             ["docker", "run", "--rm", "--name", "river-chaos-worker",
@@ -823,7 +1001,7 @@ def scenario_pool_exhaustion(system: str, job_count: int = 20) -> dict:
              "river-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
-    else:
+    elif system == "oban":
         worker = subprocess.Popen(
             ["docker", "run", "--rm", "--name", "oban-chaos-worker",
              "--network", "host",
@@ -834,6 +1012,18 @@ def scenario_pool_exhaustion(system: str, job_count: int = 20) -> dict:
              "oban-bench"],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         )
+    elif system == "procrastinate":
+        worker = subprocess.Popen(
+            ["docker", "run", "--rm", "--name", "procrastinate-chaos-worker",
+             "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
+             "-e", "SCENARIO=worker_only", "-e", "WORKER_COUNT=50",
+             "-e", "MAX_CONNECTIONS=5", "-e", "JOB_DURATION_MS=5000",
+             "procrastinate-bench"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+    else:
+        raise ValueError(f"Unsupported pool_exhaustion system: {system}")
 
     start_time = time.time()
 
@@ -1025,6 +1215,20 @@ def migrate_system(system: str):
             [str(SCRIPT_DIR / "awa-bench" / "target" / "release" / "awa-bench")],
             {"DATABASE_URL": pg_url("awa_bench"), "SCENARIO": "migrate_only"},
         ),
+        "awa-docker": (
+            ["docker", "run", "--rm", "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
+             "-e", "SCENARIO=migrate_only",
+             "awa-bench-docker"],
+            {},
+        ),
+        "awa-python": (
+            ["docker", "run", "--rm", "--network", "host",
+             "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
+             "-e", "SCENARIO=migrate_only",
+             "awa-python-bench"],
+            {},
+        ),
         "river": (
             ["docker", "run", "--rm", "--network", "host",
              "-e", f"DATABASE_URL={pg_url('river_bench')}",
@@ -1074,6 +1278,9 @@ def print_comparison(results: list[dict]):
             print(f"  {'System':<10} {'Rescue (s)':>12} {'Completed':>12} {'Lost':>8}")
             print(f"  {'-'*10} {'-'*12} {'-'*12} {'-'*8}")
             for r in items:
+                if "error" in r:
+                    print(f"  {r['system']:<10} {'ERROR':>12}")
+                    continue
                 res = r["results"]
                 print(f"  {r['system']:<10} {res['rescue_time_secs']:>12.1f} "
                       f"{res['jobs_completed']:>12} {res['jobs_lost']:>8}")
@@ -1081,6 +1288,9 @@ def print_comparison(results: list[dict]):
             print(f"  {'System':<10} {'PG down (s)':>12} {'Total (s)':>12} {'Lost':>8}")
             print(f"  {'-'*10} {'-'*12} {'-'*12} {'-'*8}")
             for r in items:
+                if "error" in r:
+                    print(f"  {r['system']:<10} {'ERROR':>12}")
+                    continue
                 res = r["results"]
                 print(f"  {r['system']:<10} {res['pg_downtime_secs']:>12.1f} "
                       f"{res['total_time_secs']:>12.1f} {res['jobs_lost']:>8}")
@@ -1088,6 +1298,9 @@ def print_comparison(results: list[dict]):
             print(f"  {'System':<10} {'Total (s)':>12} {'Completed':>12} {'Lost':>8} {'Dupes':>8}")
             print(f"  {'-'*10} {'-'*12} {'-'*12} {'-'*8} {'-'*8}")
             for r in items:
+                if "error" in r:
+                    print(f"  {r['system']:<10} {'ERROR':>12}")
+                    continue
                 res = r.get("results", {})
                 print(f"  {r['system']:<10} {res.get('total_time_secs',0):>12.1f} "
                       f"{res.get('jobs_completed',0):>12} {res.get('jobs_lost',0):>8} "
@@ -1113,17 +1326,33 @@ def print_comparison(results: list[dict]):
                           f"{res.get('jobs_completed',0):>12} {res.get('jobs_lost',0):>8}")
     print()
 
+
+def resolve_scenarios(selected_scenario: str | None, suite: str | None) -> list[str]:
+    if selected_scenario and suite:
+        raise ValueError("Use either --scenario or --suite, not both")
+    if selected_scenario:
+        if selected_scenario == "all":
+            return list(EXTENDED_SCENARIOS)
+        return [selected_scenario]
+    if suite == "portable":
+        return list(PORTABLE_SCENARIOS)
+    if suite == "extended":
+        return list(EXTENDED_SCENARIOS)
+    return ["crash_recovery"]
+
 # ── Main ──────────────────────────────────────────────────────────
 
 def main():
     parser = argparse.ArgumentParser(description="Chaos comparison runner")
-    parser.add_argument("--scenario", default="crash_recovery",
+    parser.add_argument("--scenario",
                         choices=["crash_recovery", "postgres_restart",
-                                 "repeated_kills", "pg_backend_kill",
-                                 "leader_failover", "retry_storm",
-                                 "pool_exhaustion", "priority_starvation",
-                                 "all"])
-    parser.add_argument("--systems", default="awa,river,oban")
+                                  "repeated_kills", "pg_backend_kill",
+                                  "leader_failover", "retry_storm",
+                                  "pool_exhaustion", "priority_starvation",
+                                  "all"])
+    parser.add_argument("--suite", choices=["portable", "extended"],
+                        help="Named scenario set for isolated cross-system runs")
+    parser.add_argument("--systems", default=",".join(PORTABLE_SYSTEMS))
     parser.add_argument("--job-count", type=int, default=10)
     parser.add_argument("--keep-pg", action="store_true")
     args = parser.parse_args()
@@ -1144,7 +1373,7 @@ def main():
         start_postgres()
         all_results = []
 
-        to_run = list(scenarios.keys()) if args.scenario == "all" else [args.scenario]
+        to_run = resolve_scenarios(args.scenario, args.suite)
         for scenario_name in to_run:
             scenario_fn = scenarios[scenario_name]
             for system in systems:
