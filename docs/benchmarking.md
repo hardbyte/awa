@@ -453,13 +453,7 @@ The `benchmarks/portable/` harness runs comparable scenarios against Awa
 sharing the same Postgres instance. See `benchmarks/portable/README.md` for
 setup and usage.
 
-The current reference run is the isolated 5-repetition fair suite in:
-
-- `benchmarks/portable/results/full_suite_20260406_011911.json`
-- `benchmarks/portable/results/benchmark_summary_20260406_011911.md`
-- `benchmarks/portable/results/chaos_summary_20260406_011911.md`
-
-Configuration for that run:
+A recent fair comparison used:
 
 - 5 isolated repetitions per system
 - 10,000 benchmark jobs
@@ -536,18 +530,19 @@ The portable chaos runner (`benchmarks/portable/chaos.py`) exercises crash
 recovery, Postgres restart, repeated worker kills, backend termination, leader
 failover, and connection-pool exhaustion.
 
-Important: the generated chaos summary records `5/5` completed harness runs for
-every system/scenario, but correctness should be judged by `jobs_lost` and
-duplicate completion counts, not by harness completion alone.
+An early River configuration used a stuck-job timeout shorter than the 30s
+chaos job duration, which could falsely rescue healthy work. After correcting
+River to use a rescue timeout above the job duration, a focused rerun completed
+the portable chaos scenarios with zero lost jobs.
 
-#### Chaos Summary (5 isolated repetitions)
+#### Chaos Summary
 
 | System | Crash Recovery | Repeated Kills | Leader Failover | Postgres Restart |
 |--------|----------------|----------------|-----------------|------------------|
 | `awa` | mean `41.7s`, lost `0` | mean `53.4s`, lost `0` | mean `47.5s`, lost `0`, dupes `0` | mean `28.3s`, lost `0` |
 | `awa-docker` | mean `41.8s`, lost `0` | mean `54.3s`, lost `0` | mean `47.7s`, lost `0`, dupes `0` | mean `28.5s`, lost `0` |
 | `awa-python` | mean `42.2s`, lost `0` | mean `54.4s`, lost `0` | mean `47.9s`, lost `0`, dupes `0` | mean `28.9s`, lost `0` |
-| `river` | mean `255.5s`, max lost `1` | mean `244.7s`, max lost `1` | mean `180.4s`, max lost `2`, dupes `0` | mean `28.6s`, lost `0` |
+| `river` | corrected rerun `103.6s`, lost `0` | corrected rerun `114.6s`, lost `0` | corrected rerun `110.6s`, lost `0`, dupes `0` | corrected rerun `28.4s`, lost `0` |
 | `oban` | mean `93.1s`, lost `0` | mean `110.4s`, lost `0` | mean `89.0s`, lost `0`, dupes `0` | mean `29.8s`, lost `0` |
 
 #### Chaos Takeaways
@@ -556,10 +551,10 @@ duplicate completion counts, not by harness completion alone.
   all portable chaos scenarios completed with zero loss and zero duplicates.
 - Oban was also correct in this run set, but materially slower to rescue and
   fail over than the Awa variants.
-- River was not just slower on recovery; it was the only system in this fair
-  5x run set to leave jobs incomplete in crash-related scenarios:
-  - crash recovery: up to `1` job lost
-  - repeated kills: up to `1` job lost
-  - leader failover: up to `2` jobs lost
+- River's first run highlighted an important fairness issue in the harness:
+  stuck-job detection has to be configured relative to each system's recovery
+  semantics and the test job duration, not just matched numerically.
+- With the corrected River rescue timeout, the focused rerun completed the
+  portable chaos scenarios without job loss or duplicate completions.
 - All systems handled Postgres restart and backend-kill scenarios without job
   loss in this suite.
