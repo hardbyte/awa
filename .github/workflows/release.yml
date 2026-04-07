@@ -230,9 +230,11 @@ jobs:
           - os: ubuntu-latest
             target: x86_64
             manylinux: auto
+            maturin-interpreter: python3.10
           - os: ubuntu-24.04-arm
             target: aarch64
             manylinux: auto
+            maturin-interpreter: python3.10
           - os: macos-latest
             target: x86_64
           - os: macos-latest
@@ -249,7 +251,7 @@ jobs:
         with:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
-          args: --release --out dist --manifest-path awa-python/Cargo.toml
+          args: --release --out dist --manifest-path awa-python/Cargo.toml ${{ matrix.maturin-interpreter && format('-i {0}', matrix.maturin-interpreter) || '' }}
           before-script-linux: |
             # Install Postgres dev headers for sqlx compilation
             apt-get update && apt-get install -y libpq-dev || true
