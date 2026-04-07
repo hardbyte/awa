@@ -31,7 +31,7 @@ Documentation = "https://github.com/hardbyte/awa#readme"
 Changelog = "https://github.com/hardbyte/awa/releases"
 
 [tool.maturin]
-features = ["pyo3/extension-module"]
+features = ["pyo3/extension-module", "pyo3/abi3-py310"]
 python-source = "python"
 module-name = "awa._awa"
 
