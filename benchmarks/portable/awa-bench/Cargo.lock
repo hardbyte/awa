@@ -89,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -99,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "async-trait",
  "awa-macros",
