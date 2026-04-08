@@ -2,6 +2,17 @@
 
 This guide takes you from `cargo add` to a job reaching `completed`.
 
+## Mental Model
+
+Before writing code, it helps to know what Awa is doing for you:
+
+- enqueueing inserts a durable row into Postgres; if your transaction rolls back, the job disappears too
+- workers claim runnable rows, increment the attempt, and keep the claim alive with heartbeats
+- retries, callback waits, and progress updates all land back on that same job row
+- inspection is row-centric: when something looks wrong, dump the job and inspect its current state, progress, callback config, and recorded errors
+
+The important habit is to treat Postgres as the system of record for job execution, not worker memory.
+
 ## Prerequisites
 
 - PostgreSQL running locally or remotely
@@ -123,9 +134,13 @@ Then inspect what happened:
 
 ```bash
 awa --database-url "$DATABASE_URL" job list --queue email
+awa --database-url "$DATABASE_URL" job dump 1
+awa --database-url "$DATABASE_URL" job dump-run 1
 awa --database-url "$DATABASE_URL" queue stats
 awa --database-url "$DATABASE_URL" serve
 ```
+
+`job dump` prints the full job snapshot as JSON. `job dump-run` prints one attempt-oriented view: the current attempt comes from the live job row, while older attempts are reconstructed from the recorded error history.
 
 The UI starts on `http://127.0.0.1:3000` by default.
 

@@ -93,6 +93,15 @@ fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
 
 #[derive(Subcommand)]
 enum JobCommands {
+    /// Dump a single job as a detailed JSON inspection snapshot
+    Dump { id: i64 },
+    /// Dump one attempt as a detailed JSON inspection snapshot
+    DumpRun {
+        id: i64,
+        /// Attempt number to inspect. Defaults to the current attempt.
+        #[arg(long)]
+        attempt: Option<i16>,
+    },
     /// Retry a failed or cancelled job
     Retry { id: i64 },
     /// Cancel a job
@@ -282,6 +291,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Commands::Migrate { .. } | Commands::Serve { .. } => unreachable!(),
 
                 Commands::Job { command } => match command {
+                    JobCommands::Dump { id } => {
+                        let dump = awa_model::admin::dump_job(&pool, id).await?;
+                        println!("{}", serde_json::to_string_pretty(&dump)?);
+                    }
+
+                    JobCommands::DumpRun { id, attempt } => {
+                        let dump = awa_model::admin::dump_run(&pool, id, attempt).await?;
+                        println!("{}", serde_json::to_string_pretty(&dump)?);
+                    }
+
                     JobCommands::Retry { id } => {
                         awa_model::admin::retry(&pool, id).await?;
                         println!("Retried job {id}");

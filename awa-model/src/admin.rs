@@ -9,6 +9,235 @@ use std::cmp::max;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobTimelineEvent {
+    pub timestamp: DateTime<Utc>,
+    pub label: String,
+    pub state: Option<JobState>,
+    pub detail: Option<String>,
+    pub is_error: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobDumpSummary {
+    pub original_priority: i16,
+    pub can_retry: bool,
+    pub can_cancel: bool,
+    pub error_count: usize,
+    pub latest_error: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobDump {
+    pub job: JobRow,
+    pub summary: JobDumpSummary,
+    pub timeline: Vec<JobTimelineEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunDumpSource {
+    CurrentJobRow,
+    ErrorHistory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CallbackDump {
+    pub callback_id: Option<Uuid>,
+    pub callback_timeout_at: Option<DateTime<Utc>>,
+    pub callback_filter: Option<String>,
+    pub callback_on_complete: Option<String>,
+    pub callback_on_fail: Option<String>,
+    pub callback_transform: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct RunDump {
+    pub job_id: i64,
+    pub kind: String,
+    pub queue: String,
+    pub selected_attempt: i16,
+    pub current_attempt: i16,
+    pub current_run_lease: i64,
+    pub selected_run_lease: Option<i64>,
+    pub source: RunDumpSource,
+    pub state: JobState,
+    pub started_at: Option<DateTime<Utc>>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub error: Option<String>,
+    pub terminal: Option<bool>,
+    pub progress: Option<serde_json::Value>,
+    pub metadata: Option<serde_json::Value>,
+    pub callback: Option<CallbackDump>,
+    pub raw_error_entry: Option<serde_json::Value>,
+    pub notes: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ErrorEntry {
+    attempt: Option<i16>,
+    error: Option<String>,
+    at: Option<DateTime<Utc>>,
+    terminal: bool,
+    raw: serde_json::Value,
+}
+
+fn parse_error_entry(value: &serde_json::Value) -> Option<ErrorEntry> {
+    let obj = value.as_object()?;
+    let attempt = obj
+        .get("attempt")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i16::try_from(v).ok());
+    let error = obj
+        .get("error")
+        .and_then(|v| v.as_str())
+        .map(ToOwned::to_owned);
+    let at = obj
+        .get("at")
+        .and_then(|v| v.as_str())
+        .and_then(|v| chrono::DateTime::parse_from_rfc3339(v).ok())
+        .map(|v| v.with_timezone(&Utc));
+    let terminal = obj
+        .get("terminal")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    Some(ErrorEntry {
+        attempt,
+        error,
+        at,
+        terminal,
+        raw: value.clone(),
+    })
+}
+
+fn original_priority(job: &JobRow) -> i16 {
+    job.metadata
+        .get("_awa_original_priority")
+        .and_then(|v| v.as_i64())
+        .and_then(|v| i16::try_from(v).ok())
+        .unwrap_or(job.priority)
+}
+
+fn build_job_timeline(job: &JobRow) -> Vec<JobTimelineEvent> {
+    let mut events = Vec::new();
+    events.push(JobTimelineEvent {
+        timestamp: job.created_at,
+        label: "Created".to_string(),
+        state: None,
+        detail: None,
+        is_error: false,
+    });
+
+    if let Some(errors) = &job.errors {
+        for entry in errors.iter().filter_map(parse_error_entry) {
+            if let Some(timestamp) = entry.at {
+                let label = match entry.attempt {
+                    Some(attempt) => format!("Attempt {attempt} failed"),
+                    None => "Error".to_string(),
+                };
+                events.push(JobTimelineEvent {
+                    timestamp,
+                    label,
+                    state: Some(JobState::Failed),
+                    detail: entry.error,
+                    is_error: true,
+                });
+            }
+        }
+    }
+
+    if let Some(attempted_at) = job.attempted_at {
+        let label = if job.state == JobState::WaitingExternal {
+            format!("Attempt {} — waiting for callback", job.attempt)
+        } else if job.state.is_terminal() {
+            format!("Attempt {} started", job.attempt)
+        } else {
+            format!("Attempt {} running", job.attempt)
+        };
+        let state = if job.state.is_terminal() {
+            Some(JobState::Running)
+        } else {
+            Some(job.state)
+        };
+        events.push(JobTimelineEvent {
+            timestamp: attempted_at,
+            label,
+            state,
+            detail: None,
+            is_error: false,
+        });
+    }
+
+    if let Some(finalized_at) = job.finalized_at {
+        let label = match job.state {
+            JobState::Completed => format!("Completed (attempt {})", job.attempt),
+            JobState::Failed => format!(
+                "Failed after {} attempt{}",
+                job.attempt,
+                if job.attempt == 1 { "" } else { "s" }
+            ),
+            JobState::Cancelled => "Cancelled".to_string(),
+            _ => "Finalized".to_string(),
+        };
+        events.push(JobTimelineEvent {
+            timestamp: finalized_at,
+            label,
+            state: Some(job.state),
+            detail: None,
+            is_error: false,
+        });
+    }
+
+    events.sort_by_key(|event| event.timestamp);
+    events
+}
+
+fn build_job_dump(job: JobRow) -> JobDump {
+    let latest_error = job
+        .errors
+        .as_ref()
+        .and_then(|errors| errors.last())
+        .cloned();
+    let summary = JobDumpSummary {
+        original_priority: original_priority(&job),
+        can_retry: matches!(
+            job.state,
+            JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
+        ),
+        can_cancel: !job.state.is_terminal(),
+        error_count: job.errors.as_ref().map(|errors| errors.len()).unwrap_or(0),
+        latest_error,
+    };
+    let timeline = build_job_timeline(&job);
+    JobDump {
+        job,
+        summary,
+        timeline,
+    }
+}
+
+fn callback_dump(job: &JobRow) -> Option<CallbackDump> {
+    let callback = CallbackDump {
+        callback_id: job.callback_id,
+        callback_timeout_at: job.callback_timeout_at,
+        callback_filter: job.callback_filter.clone(),
+        callback_on_complete: job.callback_on_complete.clone(),
+        callback_on_fail: job.callback_on_fail.clone(),
+        callback_transform: job.callback_transform.clone(),
+    };
+    if callback.callback_id.is_none()
+        && callback.callback_timeout_at.is_none()
+        && callback.callback_filter.is_none()
+        && callback.callback_on_complete.is_none()
+        && callback.callback_on_fail.is_none()
+        && callback.callback_transform.is_none()
+    {
+        None
+    } else {
+        Some(callback)
+    }
+}
+
 /// Retry a single failed, cancelled, or waiting_external job.
 pub async fn retry<'e, E>(executor: E, job_id: i64) -> Result<Option<JobRow>, AwaError>
 where
@@ -804,6 +1033,146 @@ where
         .await?;
 
     row.ok_or(AwaError::JobNotFound { id: job_id })
+}
+
+/// Build a read-only inspection snapshot for one job.
+pub async fn dump_job<'e, E>(executor: E, job_id: i64) -> Result<JobDump, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let job = get_job(executor, job_id).await?;
+    Ok(build_job_dump(job))
+}
+
+/// Build a read-only inspection snapshot for one attempt.
+///
+/// Awa does not currently persist a standalone runs table. The current attempt
+/// is inspected from the live job row. Historical attempts are reconstructed
+/// from the structured `errors[]` history.
+pub async fn dump_run<'e, E>(
+    executor: E,
+    job_id: i64,
+    attempt: Option<i16>,
+) -> Result<RunDump, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let job = get_job(executor, job_id).await?;
+    let selected_attempt = attempt.unwrap_or(job.attempt);
+
+    if selected_attempt < 0 {
+        return Err(AwaError::Validation("attempt must be >= 0".to_string()));
+    }
+
+    if job.attempt == 0 {
+        if selected_attempt != 0 {
+            return Err(AwaError::Validation(format!(
+                "job {job_id} has not started yet; only attempt 0 is available"
+            )));
+        }
+        return Ok(RunDump {
+            job_id: job.id,
+            kind: job.kind.clone(),
+            queue: job.queue.clone(),
+            selected_attempt,
+            current_attempt: job.attempt,
+            current_run_lease: job.run_lease,
+            selected_run_lease: Some(job.run_lease),
+            source: RunDumpSource::CurrentJobRow,
+            state: job.state,
+            started_at: job.attempted_at,
+            finished_at: job.finalized_at,
+            error: None,
+            terminal: None,
+            progress: job.progress.clone(),
+            metadata: Some(job.metadata.clone()),
+            callback: callback_dump(&job),
+            raw_error_entry: None,
+            notes: vec!["Job has not been claimed yet; attempt 0 is the pre-run snapshot.".into()],
+        });
+    }
+
+    if selected_attempt == job.attempt {
+        let latest_error = job
+            .errors
+            .as_ref()
+            .into_iter()
+            .flatten()
+            .filter_map(parse_error_entry)
+            .find(|entry| entry.attempt == Some(selected_attempt));
+        return Ok(RunDump {
+            job_id: job.id,
+            kind: job.kind.clone(),
+            queue: job.queue.clone(),
+            selected_attempt,
+            current_attempt: job.attempt,
+            current_run_lease: job.run_lease,
+            selected_run_lease: Some(job.run_lease),
+            source: RunDumpSource::CurrentJobRow,
+            state: job.state,
+            started_at: job.attempted_at,
+            finished_at: if job.state.is_terminal() {
+                job.finalized_at
+            } else {
+                None
+            },
+            error: latest_error.as_ref().and_then(|entry| entry.error.clone()),
+            terminal: latest_error.as_ref().map(|entry| entry.terminal),
+            progress: job.progress.clone(),
+            metadata: Some(job.metadata.clone()),
+            callback: callback_dump(&job),
+            raw_error_entry: latest_error.map(|entry| entry.raw),
+            notes: vec![],
+        });
+    }
+
+    if selected_attempt == 0 || selected_attempt > job.attempt {
+        return Err(AwaError::Validation(format!(
+            "attempt {selected_attempt} is not available for job {job_id}; current attempt is {}",
+            job.attempt
+        )));
+    }
+
+    let historical = job
+        .errors
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(parse_error_entry)
+        .find(|entry| entry.attempt == Some(selected_attempt))
+        .ok_or_else(|| {
+            AwaError::Validation(format!(
+                "attempt {selected_attempt} is not present in the recorded error history for job {job_id}"
+            ))
+        })?;
+
+    Ok(RunDump {
+        job_id: job.id,
+        kind: job.kind.clone(),
+        queue: job.queue.clone(),
+        selected_attempt,
+        current_attempt: job.attempt,
+        current_run_lease: job.run_lease,
+        selected_run_lease: None,
+        source: RunDumpSource::ErrorHistory,
+        state: if historical.terminal {
+            JobState::Failed
+        } else {
+            JobState::Retryable
+        },
+        started_at: None,
+        finished_at: historical.at,
+        error: historical.error,
+        terminal: Some(historical.terminal),
+        progress: None,
+        metadata: None,
+        callback: None,
+        raw_error_entry: Some(historical.raw),
+        notes: vec![
+            "Historical attempts are reconstructed from errors[] because Awa does not persist a standalone runs table.".into(),
+            "Only the current attempt has live progress, callback, and metadata fields.".into(),
+        ],
+    })
 }
 
 /// Count jobs grouped by state.
