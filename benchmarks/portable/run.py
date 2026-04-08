@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Portable benchmark orchestrator for Awa, Awa-Python, Procrastinate, River, and Oban.
+Portable benchmark orchestrator for Awa, Absurd, Procrastinate, River, and Oban.
 
 Usage:
     python run.py [--scenario SCENARIO] [--job-count N] [--worker-count N]
-                  [--systems awa,awa-docker,awa-python,procrastinate,river,oban] [--skip-build]
+                  [--systems awa,awa-docker,awa-python,absurd,procrastinate,river,oban] [--skip-build]
 
 Requires: Docker, cargo (for Awa adapter).
 """
@@ -176,6 +176,23 @@ def build_procrastinate():
         raise RuntimeError("Failed to build procrastinate-bench image")
 
 
+def build_absurd():
+    """Build the Absurd benchmark Docker image."""
+    print("\n=== Building Absurd benchmark ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "build",
+            "-f", str(SCRIPT_DIR / "absurd-bench" / "Dockerfile"),
+            "-t", "absurd-bench",
+            ".",
+        ],
+        cwd=str(SCRIPT_DIR),
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Failed to build absurd-bench image")
+
+
 def run_awa_python(scenario: str, job_count: int, worker_count: int,
                    latency_iterations: int) -> list[dict]:
     """Run Awa-Python benchmark in Docker."""
@@ -198,6 +215,30 @@ def run_awa_python(scenario: str, job_count: int, worker_count: int,
         raise RuntimeError(f"awa-python-bench failed: {result.stderr}")
     print(result.stderr, file=sys.stderr, end="")
     return with_system_name(json.loads(result.stdout), "awa-python")
+
+
+def run_absurd(scenario: str, job_count: int, worker_count: int,
+               latency_iterations: int) -> list[dict]:
+    """Run Absurd benchmark in Docker."""
+    print("\n=== Running Absurd benchmarks ===", file=sys.stderr)
+    result = run_cmd(
+        [
+            "docker", "run", "--rm",
+            "--network", "host",
+            "-e", f"DATABASE_URL={pg_url('absurd_bench')}",
+            "-e", f"SCENARIO={scenario}",
+            "-e", f"JOB_COUNT={job_count}",
+            "-e", f"WORKER_COUNT={worker_count}",
+            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "absurd-bench",
+        ],
+        capture=True, timeout=1800,
+    )
+    if result.returncode != 0:
+        print(f"Absurd stderr: {result.stderr}", file=sys.stderr)
+        raise RuntimeError(f"absurd-bench failed: {result.stderr}")
+    print(result.stderr, file=sys.stderr, end="")
+    return json.loads(result.stdout)
 
 
 def run_procrastinate(scenario: str, job_count: int, worker_count: int,
@@ -333,7 +374,7 @@ def main():
     parser.add_argument("--job-count", type=int, default=10000)
     parser.add_argument("--worker-count", type=int, default=50)
     parser.add_argument("--latency-iterations", type=int, default=100)
-    parser.add_argument("--systems", default="awa,awa-docker,awa-python,procrastinate,river,oban",
+    parser.add_argument("--systems", default="awa,awa-docker,awa-python,absurd,procrastinate,river,oban",
                         help="Comma-separated list of systems to benchmark")
     parser.add_argument("--skip-build", action="store_true",
                         help="Skip building, use cached images/binaries")
@@ -348,6 +389,7 @@ def main():
         "awa": build_awa,
         "awa-docker": build_awa_docker,
         "awa-python": build_awa_python,
+        "absurd": build_absurd,
         "procrastinate": build_procrastinate,
         "river": build_river,
         "oban": build_oban,
@@ -356,6 +398,7 @@ def main():
         "awa": run_awa,
         "awa-docker": run_awa_docker,
         "awa-python": run_awa_python,
+        "absurd": run_absurd,
         "procrastinate": run_procrastinate,
         "river": run_river,
         "oban": run_oban,

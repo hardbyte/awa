@@ -157,7 +157,7 @@ def main() -> None:
     parser.add_argument("--job-count", type=int, default=50000)
     parser.add_argument("--worker-count", type=int, default=200)
     parser.add_argument("--latency-iterations", type=int, default=100)
-    parser.add_argument("--systems", default="awa,awa-docker,awa-python,procrastinate,river,oban")
+    parser.add_argument("--systems", default="awa,awa-docker,awa-python,absurd,procrastinate,river,oban")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--skip-build", action="store_true")
     args = parser.parse_args()

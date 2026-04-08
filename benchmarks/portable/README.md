@@ -1,8 +1,8 @@
 # Portable Cross-System Benchmarks
 
 Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
-Procrastinate (Python), River (Go), and Oban (Elixir) running against a shared
-Postgres instance.
+Absurd (Python SDK plus SQL schema), Procrastinate (Python), River (Go), and
+Oban (Elixir) running against a shared Postgres instance.
 
 ## Prerequisites
 
@@ -17,7 +17,7 @@ Postgres instance.
 uv run python benchmarks/portable/run.py
 
 # Run specific systems
-uv run python benchmarks/portable/run.py --systems awa,awa-docker,awa-python,procrastinate,river
+uv run python benchmarks/portable/run.py --systems awa,awa-docker,awa-python,absurd,procrastinate,river
 
 # Run a single scenario
 uv run python benchmarks/portable/run.py --scenario worker_throughput --job-count 50000 --worker-count 200
@@ -63,7 +63,7 @@ benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
 ├── isolated.py            # Repeats one-system-per-run isolated benchmarks
 ├── docker-compose.yml     # Shared Postgres 17 with per-system databases
-├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench
+├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, absurd_bench, procrastinate_bench, river_bench, oban_bench
 ├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
 │   ├── Dockerfile
@@ -71,6 +71,10 @@ benchmarks/portable/
 ├── awa-python-bench/      # Python runtime variant (Docker)
 │   ├── Dockerfile
 │   └── main.py
+├── absurd-bench/          # Python Absurd adapter (Docker)
+│   ├── Dockerfile
+│   ├── main.py
+│   └── pyproject.toml
 ├── procrastinate-bench/   # Python Procrastinate adapter (Docker)
 │   ├── Dockerfile
 │   ├── main.py
@@ -95,8 +99,8 @@ Each adapter:
 - Manages its own schema migration and cleanup
 
 `awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
-`procrastinate`, River, and Oban run in Docker containers with `--network host`
-to connect to the shared Postgres.
+`absurd`, `procrastinate`, River, and Oban run in Docker containers with
+`--network host` to connect to the shared Postgres.
 
 ## Configuration
 
@@ -106,7 +110,7 @@ to connect to the shared Postgres.
 | `--job-count` | `10000` | Number of jobs per scenario |
 | `--worker-count` | `50` | Concurrent workers |
 | `--latency-iterations` | `100` | Iterations for pickup latency test |
-| `--systems` | `awa,awa-docker,awa-python,procrastinate,river,oban` | Comma-separated list of systems to run |
+| `--systems` | `awa,awa-docker,awa-python,absurd,procrastinate,river,oban` | Comma-separated list of systems to run |
 
 ## Fairness Constraints
 
@@ -122,6 +126,9 @@ to connect to the shared Postgres.
   duration so healthy jobs are not falsely rescued
 - Awa reuses one DB session across COPY batches so its temp-table reuse
   optimization is exercised in the portable harness
+- Absurd bulk enqueue uses batched `absurd.spawn_task(...)` calls because the
+  current Python SDK exposes single-task `spawn()` but no bulk helper; pickup
+  latency still uses the normal single-task SDK path
 - Pickup latency uses each system's normal single-job insert API rather than a
   batch insert helper
 - Chaos enqueue via direct SQL INSERT — all three systems have INSERT triggers
