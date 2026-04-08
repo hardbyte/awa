@@ -203,6 +203,31 @@ async fn dump_run_reconstructs_historical_attempt_from_errors() {
 }
 
 #[tokio::test]
+async fn dump_run_preserves_historical_attempts_after_retry_reset() {
+    let pool = setup_pool().await;
+    let queue = unique_queue("cli_dump_run_retry_reset");
+    let (job_id, _callback_id) = seed_inspection_job(&pool, &queue).await;
+
+    awa_model::admin::retry(&pool, job_id)
+        .await
+        .expect("retry should succeed");
+
+    let assert = run_cli(&["job", "dump-run", &job_id.to_string(), "--attempt", "2"])
+        .assert()
+        .success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).expect("stdout utf8");
+    let payload: Value = serde_json::from_str(&stdout).expect("dump output should be json");
+
+    assert_eq!(payload["source"].as_str(), Some("error_history"));
+    assert_eq!(payload["selected_attempt"].as_i64(), Some(2));
+    assert_eq!(payload["current_attempt"].as_i64(), Some(0));
+    assert_eq!(payload["state"].as_str(), Some("retryable"));
+    assert_eq!(payload["error"].as_str(), Some("second failure"));
+
+    awa_testing::setup::clean_queue(&pool, &queue).await;
+}
+
+#[tokio::test]
 async fn dump_run_rejects_unknown_attempt() {
     let pool = setup_pool().await;
     let queue = unique_queue("cli_dump_run_invalid");

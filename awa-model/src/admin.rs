@@ -1064,12 +1064,7 @@ where
         return Err(AwaError::Validation("attempt must be >= 0".to_string()));
     }
 
-    if job.attempt == 0 {
-        if selected_attempt != 0 {
-            return Err(AwaError::Validation(format!(
-                "job {job_id} has not started yet; only attempt 0 is available"
-            )));
-        }
+    if job.attempt == 0 && selected_attempt == 0 {
         return Ok(RunDump {
             job_id: job.id,
             kind: job.kind.clone(),
@@ -1126,7 +1121,14 @@ where
         });
     }
 
-    if selected_attempt == 0 || selected_attempt > job.attempt {
+    if selected_attempt == 0 {
+        return Err(AwaError::Validation(format!(
+            "attempt {selected_attempt} is not available for job {job_id}; current attempt is {}",
+            job.attempt
+        )));
+    }
+
+    if job.attempt > 0 && selected_attempt > job.attempt {
         return Err(AwaError::Validation(format!(
             "attempt {selected_attempt} is not available for job {job_id}; current attempt is {}",
             job.attempt
