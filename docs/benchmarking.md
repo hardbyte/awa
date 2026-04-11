@@ -9,6 +9,8 @@ reference results from local runs and dedicated-server enqueue comparisons.
 - Local runtime: PostgreSQL 17 in Docker (OrbStack)
 - Local database URL used for the example commands:
   `postgres://postgres:test@localhost:15432/awa_test`
+- The portable harness in `benchmarks/portable/` defaults to PostgreSQL 17 but
+  accepts `--pg-image postgres:18-alpine` for PG18 runs.
 - Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
   a separate Linux host. Those numbers are used only for shape comparison and
   should not be treated as published throughput claims.
@@ -43,6 +45,56 @@ Two benchmark shapes are used:
 - **Steady/sustained benchmarks**: warm up, then measure a fixed time window
 
 Steady numbers are the better indicator of sustained runtime behavior.
+
+## MVCC Horizon Benchmark
+
+`awa/tests/scheduling_benchmark_test.rs` also includes an ignored
+`test_mvcc_horizon_overlap_benchmark` scenario for the failure mode described in
+PlanetScale's "Keeping a Postgres queue healthy" post: overlapping long-lived
+transactions pin the MVCC horizon while queue churn continues.
+
+The benchmark:
+
+- runs a steady producer feeding `awa.jobs_hot`
+- enables aggressive completed-job cleanup to generate update/delete churn
+- starts overlapping `REPEATABLE READ` reader transactions on separate
+  connections to hold old snapshots open
+- samples per-second throughput, queue depth, and `pg_stat_user_tables`
+  (`n_dead_tup`, vacuum counters) for `awa.jobs_hot`
+
+Example:
+
+```bash
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test \
+  cargo test --release --package awa --test scheduling_benchmark_test \
+  test_mvcc_horizon_overlap_benchmark -- --ignored --exact --nocapture
+```
+
+This scenario is also wired into `.github/workflows/nightly-chaos.yml` and runs
+on PostgreSQL 18 in the Rust nightly benchmark lane.
+
+The nightly lane uses a shorter CI profile so the benchmark stays cheap on
+shared runners while still exercising overlap readers and cleanup pressure:
+
+- `AWA_MVCC_JOB_RATE=400`
+- `AWA_MVCC_BASELINE_SECS=5`
+- `AWA_MVCC_OVERLAP_SECS=12`
+- `AWA_MVCC_COOLDOWN_SECS=5`
+- `AWA_MVCC_OVERLAP_READERS=2`
+- `AWA_MVCC_OVERLAP_HOLD_SECS=12`
+- `AWA_MVCC_OVERLAP_STAGGER_SECS=4`
+
+Nightly regression checks use per-run ratios (`overlap_handler_per_s` and
+`cooldown_handler_per_s` relative to the same run's baseline window) plus
+guardrails on `dead_tup_delta` and `max_available`.
+
+Useful knobs:
+
+- `AWA_MVCC_JOB_RATE` — steady producer rate in jobs/sec
+- `AWA_MVCC_BASELINE_SECS` / `AWA_MVCC_OVERLAP_SECS` / `AWA_MVCC_COOLDOWN_SECS`
+- `AWA_MVCC_OVERLAP_READERS` / `AWA_MVCC_OVERLAP_HOLD_SECS` /
+  `AWA_MVCC_OVERLAP_STAGGER_SECS`
+- `AWA_MVCC_CLEANUP_INTERVAL_MS` / `AWA_MVCC_CLEANUP_BATCH_SIZE`
 
 ## Python Runtime Benchmarks
 

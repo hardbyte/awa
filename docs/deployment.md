@@ -51,6 +51,27 @@ Examples:
 
 The Python client defaults to `max_connections=10`. `awa serve` defaults to a pool of `10` connections (configurable via `--pool-max` / `AWA_POOL_MAX`). Other CLI subcommands use a single connection.
 
+## PostgreSQL Workload Discipline
+
+Awa is tolerant of large deferred frontiers because it separates
+`awa.jobs_hot` from `awa.scheduled_jobs`, but it is still a high-churn Postgres
+workload. Operationally, the main pitfall is long-lived read transactions on
+the primary: a `REPEATABLE READ` or otherwise old snapshot can pin the MVCC
+horizon while workers continue to update and delete hot rows.
+
+Recommended practice:
+
+- keep analytical reads and admin transactions short on the primary
+- run long-lived reporting queries against a replica when possible
+- avoid leaving sessions `idle in transaction`
+- monitor `pg_stat_activity` and `pg_stat_user_tables` for long transactions
+  and rising `n_dead_tup` on `awa.jobs_hot`
+- tune autovacuum for the database if the queue is expected to churn heavily
+
+The nightly MVCC benchmark exists to catch changes that make this failure mode
+worse, but it is not a substitute for keeping the primary free of stale
+snapshots.
+
 ## Docker
 
 ### CLI / UI Container

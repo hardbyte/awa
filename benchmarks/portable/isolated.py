@@ -24,6 +24,7 @@ def run_once(
     worker_count: int,
     latency_iterations: int,
     skip_build: bool,
+    pg_image: str,
 ) -> dict:
     cmd = [
         "uv",
@@ -40,6 +41,8 @@ def run_once(
         str(worker_count),
         "--latency-iterations",
         str(latency_iterations),
+        "--pg-image",
+        pg_image,
     ]
     if skip_build:
         cmd.append("--skip-build")
@@ -160,6 +163,7 @@ def main() -> None:
     parser.add_argument("--systems", default="awa,awa-docker,awa-python,procrastinate,river,oban")
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--pg-image", default="postgres:17-alpine")
     args = parser.parse_args()
 
     systems = [s.strip() for s in args.systems.split(",") if s.strip()]
@@ -174,6 +178,7 @@ def main() -> None:
                 worker_count=args.worker_count,
                 latency_iterations=args.latency_iterations,
                 skip_build=args.skip_build,
+                pg_image=args.pg_image,
             )
             for result in payload["results"]:
                 all_runs.append(
@@ -202,6 +207,7 @@ def main() -> None:
                     "systems": systems,
                     "repetitions": args.repetitions,
                     "skip_build": args.skip_build,
+                    "pg_image": args.pg_image,
                 },
                 "runs": all_runs,
                 "summary": summary,

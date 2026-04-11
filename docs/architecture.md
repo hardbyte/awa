@@ -147,6 +147,14 @@ Permits are pre-acquired before the DB claim to guarantee every `running` job ha
 
 The dispatch query uses strict priority ordering (`priority ASC, run_at ASC, id ASC`). Cross-priority fairness is handled separately by the maintenance leader's `age_waiting_priorities` task, which periodically decrements the `priority` column for long-waiting available jobs. This keeps the claim query simple while ensuring lower-priority jobs are gradually promoted.
 
+The hot/deferred split keeps deferred frontiers out of the hot dispatch heap,
+but it does not eliminate MVCC pressure on `awa.jobs_hot`. Long-lived snapshots
+on the same primary can still pin the MVCC horizon while handlers and cleanup
+continue to churn rows. In practice that means Awa benefits from the same
+Postgres discipline as any high-churn queue table: keep analytical reads short,
+prefer replicas for long-running read-only work, and watch `pg_stat_user_tables`
+for dead-tuple growth if cleanup falls behind.
+
 ### Execute (Executor)
 
 ```

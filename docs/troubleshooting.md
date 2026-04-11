@@ -148,6 +148,82 @@ If long-running jobs are expected, remember:
 
 If a job really needs `20m`, set a longer deadline for that queue.
 
+## Dead Tuples Growing On `awa.jobs_hot`
+
+### What It Usually Means
+
+If queue throughput starts to sag while `awa.jobs_hot` keeps accumulating dead
+tuples, the usual cause is not duplicate dispatch or a broken worker. The more
+common pattern is:
+
+- workers are still claiming and completing jobs
+- the maintenance leader is still running cleanup
+- one or more long-lived transactions on the primary are holding an old
+  snapshot open
+- vacuum cannot reclaim dead rows aggressively enough because the MVCC horizon
+  is pinned
+
+This is the same general failure mode described in PlanetScale's "Keeping a
+Postgres queue healthy" post.
+
+### Inspect Table Churn
+
+```sql
+SELECT
+    relname,
+    n_live_tup,
+    n_dead_tup,
+    vacuum_count,
+    autovacuum_count,
+    last_vacuum,
+    last_autovacuum
+FROM pg_stat_user_tables
+WHERE schemaname = 'awa'
+  AND relname IN ('jobs_hot', 'scheduled_jobs')
+ORDER BY relname;
+```
+
+Interpretation:
+
+- rising `n_dead_tup` on `jobs_hot` with steady worker activity means churn is happening
+- `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up
+- `scheduled_jobs` is usually not the problem here; `jobs_hot` is the churn table
+
+### Inspect Long Transactions
+
+```sql
+SELECT
+    pid,
+    usename,
+    application_name,
+    client_addr,
+    state,
+    now() - xact_start AS xact_age,
+    wait_event_type,
+    query
+FROM pg_stat_activity
+WHERE datname = current_database()
+  AND xact_start IS NOT NULL
+ORDER BY xact_start ASC;
+```
+
+Pay particular attention to:
+
+- sessions with large `xact_age`
+- sessions in `idle in transaction`
+- read-only / reporting tools that keep a snapshot open for a long time
+
+### Recovery Options
+
+- terminate or fix the long-lived transaction that is pinning the horizon
+- move analytical reads to a replica
+- shorten transaction scope in admin or reporting code
+- reduce terminal-row retention if the table is much larger than needed
+- review autovacuum settings if high churn is expected continuously
+
+If you want to reproduce the behavior locally before changing settings, run the
+MVCC benchmark documented in `docs/benchmarking.md`.
+
 ## Common Error Cases
 
 ### `SchemaNotMigrated`

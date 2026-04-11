@@ -25,6 +25,7 @@ PG_PORT = 15555
 PG_USER = "bench"
 PG_PASS = "bench"
 DB_URL_TPL = f"postgres://{PG_USER}:{PG_PASS}@localhost:{PG_PORT}/{{}}"
+DEFAULT_PG_IMAGE = "postgres:17-alpine"
 
 PORTABLE_SYSTEMS = [
     "awa",
@@ -72,17 +73,27 @@ def wait_pg_ready(timeout: int = 30):
             time.sleep(0.5)
     raise RuntimeError("Postgres not ready")
 
+def compose_env(pg_image: str) -> dict[str, str]:
+    return {**os.environ, "POSTGRES_IMAGE": pg_image}
+
 def start_postgres():
+    pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
     subprocess.run(
         ["docker", "compose", "up", "-d", "--wait"],
-        cwd=str(SCRIPT_DIR), capture_output=True, timeout=60,
+        cwd=str(SCRIPT_DIR),
+        capture_output=True,
+        timeout=60,
+        env=compose_env(pg_image),
     )
     wait_pg_ready()
 
 def stop_postgres():
+    pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
     subprocess.run(
         ["docker", "compose", "down", "-v"],
-        cwd=str(SCRIPT_DIR), capture_output=True,
+        cwd=str(SCRIPT_DIR),
+        capture_output=True,
+        env=compose_env(pg_image),
     )
 
 def reset_db(db: str):
@@ -494,7 +505,10 @@ def scenario_postgres_restart(system: str, job_count: int = 10) -> dict:
     print(f"  [{system}] Restarting Postgres...", file=sys.stderr)
     subprocess.run(
         ["docker", "compose", "restart", "postgres"],
-        cwd=str(SCRIPT_DIR), capture_output=True, timeout=30,
+        cwd=str(SCRIPT_DIR),
+        capture_output=True,
+        timeout=30,
+        env=compose_env(os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)),
     )
     wait_pg_ready(timeout=30)
     pg_downtime = time.time() - restart_time
@@ -1355,7 +1369,9 @@ def main():
     parser.add_argument("--systems", default=",".join(PORTABLE_SYSTEMS))
     parser.add_argument("--job-count", type=int, default=10)
     parser.add_argument("--keep-pg", action="store_true")
+    parser.add_argument("--pg-image", default=DEFAULT_PG_IMAGE)
     args = parser.parse_args()
+    os.environ["POSTGRES_IMAGE"] = args.pg_image
 
     systems = [s.strip() for s in args.systems.split(",")]
     scenarios = {
@@ -1394,7 +1410,21 @@ def main():
         result_file = SCRIPT_DIR / "results" / f"chaos_{ts}.json"
         result_file.parent.mkdir(exist_ok=True)
         with open(result_file, "w") as f:
-            json.dump(all_results, f, indent=2)
+            json.dump(
+                {
+                    "timestamp": ts,
+                    "config": {
+                        "systems": systems,
+                        "job_count": args.job_count,
+                        "scenario": args.scenario,
+                        "suite": args.suite,
+                        "pg_image": args.pg_image,
+                    },
+                    "results": all_results,
+                },
+                f,
+                indent=2,
+            )
         print(f"\nResults saved to {result_file}", file=sys.stderr)
 
         if all_results:

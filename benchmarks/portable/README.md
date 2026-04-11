@@ -33,6 +33,9 @@ uv run python benchmarks/portable/isolated.py --skip-build
 
 # Run the benchmark suite plus the portable chaos suite per system in isolation
 uv run python benchmarks/portable/full_suite.py --skip-build
+
+# Run the same harness against Postgres 18
+uv run python benchmarks/portable/run.py --pg-image postgres:18-alpine
 ```
 
 ## Scenarios
@@ -62,7 +65,7 @@ and dispatch poll interval.
 benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
 ├── isolated.py            # Repeats one-system-per-run isolated benchmarks
-├── docker-compose.yml     # Shared Postgres 17 with per-system databases
+├── docker-compose.yml     # Shared Postgres service (PG17 by default, PG18 via --pg-image)
 ├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench
 ├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
@@ -107,6 +110,7 @@ to connect to the shared Postgres.
 | `--worker-count` | `50` | Concurrent workers |
 | `--latency-iterations` | `100` | Iterations for pickup latency test |
 | `--systems` | `awa,awa-docker,awa-python,procrastinate,river,oban` | Comma-separated list of systems to run |
+| `--pg-image` | `postgres:17-alpine` | Docker image for the shared Postgres service, e.g. `postgres:18-alpine` |
 
 ## Fairness Constraints
 

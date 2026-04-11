@@ -3,16 +3,21 @@
 //! Run with:
 //! `DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test scheduling_benchmark_test -- --ignored --nocapture`
 
+mod bench_output;
+
 use awa::model::{insert_many, migrations};
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, PeriodicJob, QueueConfig, Worker,
 };
+use bench_output::{BenchMetrics, BenchmarkResult, SCHEMA_VERSION};
 use chrono::{DateTime, Utc};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
 use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 fn database_url() -> String {
@@ -69,6 +74,15 @@ async fn clean_cron_names(pool: &sqlx::PgPool, names: &[String]) {
             .await
             .expect("Failed to clean cron job");
     }
+}
+
+async fn refresh_pg_stats(pool: &sqlx::PgPool) {
+    let _ = sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(pool)
+        .await;
 }
 
 async fn wait_for_leader(client: &Client, timeout: Duration) {
@@ -208,6 +222,20 @@ fn print_runtime_metrics(resource_metrics: &[opentelemetry_sdk::metrics::data::R
     print_histogram_metric_f64(resource_metrics, "awa.maintenance.promote_duration");
 }
 
+fn env_u32(name: &str, default: u32) -> u32 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u32>().ok())
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
     assert!(!sorted.is_empty());
     let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
@@ -292,6 +320,213 @@ impl Worker for TimingWorker {
             cron_fire_time,
         });
         Ok(JobResult::Completed)
+    }
+}
+
+struct MvccBenchWorker {
+    completed: Arc<AtomicU64>,
+}
+
+#[async_trait::async_trait]
+impl Worker for MvccBenchWorker {
+    fn kind(&self) -> &'static str {
+        "mvcc_bench_job"
+    }
+
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(JobResult::Completed)
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MvccSample {
+    second: u64,
+    seeded_total: u64,
+    handler_total: u64,
+    handler_delta: u64,
+    available: i64,
+    running: i64,
+    completed: i64,
+    live_tup: i64,
+    dead_tup: i64,
+    vacuum_count: i64,
+    autovacuum_count: i64,
+}
+
+#[derive(Debug, Clone)]
+struct HotTableSnapshot {
+    available: i64,
+    running: i64,
+    completed: i64,
+    live_tup: i64,
+    dead_tup: i64,
+    vacuum_count: i64,
+    autovacuum_count: i64,
+}
+
+async fn sample_hot_table_snapshot(pool: &sqlx::PgPool, queue: &str) -> HotTableSnapshot {
+    refresh_pg_stats(pool).await;
+
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            count(*) FILTER (WHERE state = 'available')::bigint AS available,
+            count(*) FILTER (WHERE state = 'running')::bigint AS running,
+            count(*) FILTER (WHERE state = 'completed')::bigint AS completed
+        FROM awa.jobs_hot
+        WHERE queue = $1
+        "#,
+    )
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to sample jobs_hot state counts");
+
+    let stats: Option<(i64, i64, i64, i64)> = sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE(n_live_tup, 0),
+            COALESCE(n_dead_tup, 0),
+            COALESCE(vacuum_count, 0),
+            COALESCE(autovacuum_count, 0)
+        FROM pg_stat_user_tables
+        WHERE schemaname = 'awa' AND relname = 'jobs_hot'
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .expect("Failed to sample pg_stat_user_tables for jobs_hot");
+
+    let (live_tup, dead_tup, vacuum_count, autovacuum_count) = stats.unwrap_or((0, 0, 0, 0));
+
+    HotTableSnapshot {
+        available: counts.0,
+        running: counts.1,
+        completed: counts.2,
+        live_tup,
+        dead_tup,
+        vacuum_count,
+        autovacuum_count,
+    }
+}
+
+async fn wait_or_stop(duration: Duration, stop: &mut tokio::sync::watch::Receiver<bool>) -> bool {
+    if *stop.borrow() {
+        return true;
+    }
+    tokio::select! {
+        _ = tokio::time::sleep(duration) => false,
+        changed = stop.changed() => {
+            changed.is_err() || *stop.borrow()
+        }
+    }
+}
+
+async fn mvcc_producer_loop(
+    pool: sqlx::PgPool,
+    queue: String,
+    jobs_per_sec: u64,
+    tick: Duration,
+    seeded: Arc<AtomicU64>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut interval = tokio::time::interval(tick);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut carry = 0.0_f64;
+
+    loop {
+        tokio::select! {
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                carry += jobs_per_sec as f64 * tick.as_secs_f64();
+                let batch = carry.floor() as i64;
+                carry -= batch as f64;
+                if batch <= 0 {
+                    continue;
+                }
+
+                let start_seq = seeded.fetch_add(batch as u64, Ordering::Relaxed) as i64;
+                sqlx::query(
+                    r#"
+                    INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
+                    SELECT
+                        'mvcc_bench_job',
+                        $1,
+                        jsonb_build_object('seq', $2 + g),
+                        'available'::awa.job_state,
+                        2,
+                        25,
+                        now(),
+                        '{}'::jsonb,
+                        '{}'::text[]
+                    FROM generate_series(1, $3) AS g
+                    "#,
+                )
+                .bind(&queue)
+                .bind(start_seq)
+                .bind(batch)
+                .execute(&pool)
+                .await
+                .expect("MVCC benchmark producer insert failed");
+            }
+        }
+    }
+}
+
+async fn mvcc_overlap_reader(
+    pool: sqlx::PgPool,
+    queue: String,
+    initial_delay: Duration,
+    hold_time: Duration,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    if wait_or_stop(initial_delay, &mut stop).await {
+        return;
+    }
+
+    loop {
+        if *stop.borrow() {
+            break;
+        }
+
+        let mut conn = pool.acquire().await.expect("Failed to acquire MVCC reader connection");
+        sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            .execute(conn.as_mut())
+            .await
+            .expect("Failed to start MVCC reader transaction");
+        let _: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_hot WHERE queue = $1")
+                .bind(&queue)
+                .fetch_one(conn.as_mut())
+                .await
+                .expect("Failed to pin MVCC reader snapshot");
+
+        let should_stop = wait_or_stop(hold_time, &mut stop).await;
+        sqlx::query("COMMIT")
+            .execute(conn.as_mut())
+            .await
+            .expect("Failed to commit MVCC reader transaction");
+
+        if should_stop {
+            break;
+        }
+    }
+}
+
+fn average_handler_rate(samples: &[MvccSample]) -> f64 {
+    if samples.is_empty() {
+        0.0
+    } else {
+        samples
+            .iter()
+            .map(|sample| sample.handler_delta as f64)
+            .sum::<f64>()
+            / samples.len() as f64
     }
 }
 
@@ -503,6 +738,217 @@ async fn test_runtime_sustained_hot_path() {
 #[ignore]
 async fn test_runtime_sustained_hot_path_pool_100() {
     run_runtime_sustained_hot_path(100).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore]
+async fn test_mvcc_horizon_overlap_benchmark() {
+    let max_conns = env_u32("AWA_MVCC_POOL_MAX", 40);
+    let pool = setup(max_conns).await;
+    let analytics_pool = pool_with(env_u32("AWA_MVCC_ANALYTICS_POOL_MAX", 6)).await;
+    let queue = "bench_mvcc_horizon";
+    reset_runtime_state(&pool).await;
+    clean_queue(&pool, queue).await;
+
+    let producer_rate = env_u64("AWA_MVCC_JOB_RATE", 800);
+    let producer_tick_ms = env_u64("AWA_MVCC_PRODUCER_TICK_MS", 100);
+    let baseline_secs = env_u64("AWA_MVCC_BASELINE_SECS", 10);
+    let overlap_secs = env_u64("AWA_MVCC_OVERLAP_SECS", 30);
+    let cooldown_secs = env_u64("AWA_MVCC_COOLDOWN_SECS", 10);
+    let overlap_readers = env_u32("AWA_MVCC_OVERLAP_READERS", 3);
+    let overlap_hold_secs = env_u64("AWA_MVCC_OVERLAP_HOLD_SECS", 40);
+    let overlap_stagger_secs = env_u64("AWA_MVCC_OVERLAP_STAGGER_SECS", 10);
+    let cleanup_interval_ms = env_u64("AWA_MVCC_CLEANUP_INTERVAL_MS", 1_000);
+    let cleanup_batch_size = env_u64("AWA_MVCC_CLEANUP_BATCH_SIZE", 10_000) as i64;
+    let worker_count = env_u32("AWA_MVCC_WORKERS", 64);
+    let total_secs = baseline_secs + overlap_secs + cooldown_secs;
+
+    let completed = Arc::new(AtomicU64::new(0));
+    let seeded = Arc::new(AtomicU64::new(0));
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: worker_count,
+                poll_interval: Duration::from_millis(50),
+                ..QueueConfig::default()
+            },
+        )
+        .leader_election_interval(Duration::from_millis(200))
+        .cleanup_interval(Duration::from_millis(cleanup_interval_ms))
+        .cleanup_batch_size(cleanup_batch_size)
+        .completed_retention(Duration::from_secs(0))
+        .failed_retention(Duration::from_secs(0))
+        .register_worker(MvccBenchWorker {
+            completed: completed.clone(),
+        })
+        .build()
+        .expect("Failed to build MVCC horizon benchmark client");
+
+    client.start().await.expect("Failed to start MVCC benchmark client");
+    wait_for_dispatch(&client, Duration::from_secs(5)).await;
+    // Runtime snapshot publication can lag slightly behind dispatcher startup.
+    // Give maintenance a brief window to acquire leadership before the churn
+    // workload begins so cleanup has a chance to run during the benchmark.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let (producer_tx, producer_rx) = tokio::sync::watch::channel(false);
+    let producer_handle = tokio::spawn(mvcc_producer_loop(
+        pool.clone(),
+        queue.to_string(),
+        producer_rate,
+        Duration::from_millis(producer_tick_ms),
+        seeded.clone(),
+        producer_rx,
+    ));
+
+    let initial = sample_hot_table_snapshot(&pool, queue).await;
+    let mut samples = Vec::with_capacity(total_secs as usize);
+    let mut analytics_started = false;
+    let mut overlap_handles = Vec::new();
+    let (overlap_tx, overlap_rx) = tokio::sync::watch::channel(false);
+    let benchmark_started = Instant::now();
+    let mut previous_completed = 0_u64;
+
+    for second in 1..=total_secs {
+        if !analytics_started && second == baseline_secs + 1 {
+            analytics_started = true;
+            for index in 0..overlap_readers {
+                overlap_handles.push(tokio::spawn(mvcc_overlap_reader(
+                    analytics_pool.clone(),
+                    queue.to_string(),
+                    Duration::from_secs(overlap_stagger_secs * index as u64),
+                    Duration::from_secs(overlap_hold_secs),
+                    overlap_rx.clone(),
+                )));
+            }
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let snapshot = sample_hot_table_snapshot(&pool, queue).await;
+        let completed_total = completed.load(Ordering::Relaxed);
+        let handler_delta = completed_total.saturating_sub(previous_completed);
+        previous_completed = completed_total;
+
+        let sample = MvccSample {
+            second,
+            seeded_total: seeded.load(Ordering::Relaxed),
+            handler_total: completed_total,
+            handler_delta,
+            available: snapshot.available,
+            running: snapshot.running,
+            completed: snapshot.completed,
+            live_tup: snapshot.live_tup,
+            dead_tup: snapshot.dead_tup,
+            vacuum_count: snapshot.vacuum_count,
+            autovacuum_count: snapshot.autovacuum_count,
+        };
+        println!(
+            "[mvcc] second={:>2} seeded={} handled={} (+{}) available={} running={} dead_tup={} live_tup={} autovacuum_count={}",
+            sample.second,
+            sample.seeded_total,
+            sample.handler_total,
+            sample.handler_delta,
+            sample.available,
+            sample.running,
+            sample.dead_tup,
+            sample.live_tup,
+            sample.autovacuum_count,
+        );
+        samples.push(sample);
+    }
+
+    let _ = producer_tx.send(true);
+    producer_handle.await.expect("MVCC producer task failed");
+    let _ = overlap_tx.send(true);
+    for handle in overlap_handles {
+        handle.await.expect("MVCC overlap reader task failed");
+    }
+
+    let final_snapshot = sample_hot_table_snapshot(&pool, queue).await;
+    let elapsed = benchmark_started.elapsed();
+    let baseline_window = &samples[..baseline_secs as usize];
+    let overlap_end = (baseline_secs + overlap_secs) as usize;
+    let overlap_window = &samples[baseline_secs as usize..overlap_end];
+    let cooldown_window = &samples[overlap_end..];
+
+    let baseline_rate = average_handler_rate(baseline_window);
+    let overlap_rate = average_handler_rate(overlap_window);
+    let cooldown_rate = average_handler_rate(cooldown_window);
+    let max_available = samples.iter().map(|sample| sample.available).max().unwrap_or(0);
+    let max_dead_tup = samples.iter().map(|sample| sample.dead_tup).max().unwrap_or(0);
+    let dead_tup_delta = max_dead_tup - initial.dead_tup;
+    let autovacuum_delta = final_snapshot.autovacuum_count - initial.autovacuum_count;
+    let vacuum_delta = final_snapshot.vacuum_count - initial.vacuum_count;
+
+    println!(
+        "[mvcc] baseline={baseline_rate:.0}/s overlap={overlap_rate:.0}/s cooldown={cooldown_rate:.0}/s max_available={max_available} dead_tup_start={} dead_tup_max={} dead_tup_final={}",
+        initial.dead_tup,
+        max_dead_tup,
+        final_snapshot.dead_tup,
+    );
+    println!(
+        "[mvcc] autovacuum_delta={} vacuum_delta={} total_seeded={} total_handled={} elapsed={:.1}s",
+        autovacuum_delta,
+        vacuum_delta,
+        seeded.load(Ordering::Relaxed),
+        completed.load(Ordering::Relaxed),
+        elapsed.as_secs_f64(),
+    );
+
+    let outcomes: HashMap<String, u64> = sqlx::query_as(
+        "SELECT state::text, count(*)::bigint FROM awa.jobs WHERE queue = $1 GROUP BY state",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to fetch MVCC benchmark outcomes")
+    .into_iter()
+    .map(|(state, count): (String, i64)| (state, count as u64))
+    .collect();
+
+    BenchmarkResult {
+        schema_version: SCHEMA_VERSION,
+        scenario: "mvcc_horizon_overlap".to_string(),
+        language: "rust".to_string(),
+        seeded: seeded.load(Ordering::Relaxed),
+        metrics: BenchMetrics {
+            throughput: None,
+            enqueue_per_s: None,
+            drain_time_s: Some(elapsed.as_secs_f64()),
+            latency_ms: None,
+            rescue: None,
+        },
+        outcomes,
+        metadata: Some(serde_json::json!({
+            "producer_rate_per_s": producer_rate,
+            "worker_count": worker_count,
+            "baseline_secs": baseline_secs,
+            "overlap_secs": overlap_secs,
+            "cooldown_secs": cooldown_secs,
+            "overlap_readers": overlap_readers,
+            "overlap_hold_secs": overlap_hold_secs,
+            "overlap_stagger_secs": overlap_stagger_secs,
+            "cleanup_interval_ms": cleanup_interval_ms,
+            "cleanup_batch_size": cleanup_batch_size,
+            "baseline_handler_per_s": baseline_rate,
+            "overlap_handler_per_s": overlap_rate,
+            "cooldown_handler_per_s": cooldown_rate,
+            "max_available": max_available,
+            "initial_dead_tup": initial.dead_tup,
+            "max_dead_tup": max_dead_tup,
+            "final_dead_tup": final_snapshot.dead_tup,
+            "dead_tup_delta": dead_tup_delta,
+            "autovacuum_delta": autovacuum_delta,
+            "vacuum_delta": vacuum_delta,
+            "samples": samples,
+        })),
+    }
+    .emit();
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 async fn run_runtime_sustained_hot_path(max_conns: u32) {
