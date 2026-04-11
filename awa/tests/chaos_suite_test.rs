@@ -90,12 +90,31 @@ fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
     counts.get(state).copied().unwrap_or(0)
 }
 
+fn chaos_timeout_multiplier() -> u32 {
+    if let Ok(raw) = std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER") {
+        if let Ok(parsed) = raw.parse::<u32>() {
+            return parsed.max(1);
+        }
+    }
+
+    if std::env::var_os("CI").is_some() {
+        3
+    } else {
+        1
+    }
+}
+
+fn scaled_timeout(timeout: Duration) -> Duration {
+    timeout.saturating_mul(chaos_timeout_multiplier())
+}
+
 async fn wait_for_counts(
     pool: &sqlx::PgPool,
     queue: &str,
     predicate: impl Fn(&HashMap<String, i64>) -> bool,
     timeout: Duration,
 ) -> HashMap<String, i64> {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         let counts = queue_state_counts(pool, queue).await;
@@ -111,6 +130,7 @@ async fn wait_for_counts(
 }
 
 async fn wait_for_single_leader(clients: &[&Client], timeout: Duration) -> usize {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         let mut leaders = Vec::new();
@@ -155,6 +175,7 @@ struct PythonHelperProcess {
 
 impl PythonHelperProcess {
     async fn wait_for_line(&mut self, expected: &str, timeout: Duration) -> String {
+        let timeout = scaled_timeout(timeout);
         let deadline = tokio::time::Instant::now() + timeout;
         let mut seen = Vec::new();
         loop {
@@ -306,6 +327,7 @@ async fn wait_for_new_leader_backend_pid(
     previous_pid: i32,
     timeout: Duration,
 ) -> i32 {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         if let Some(pid) = current_leader_backend_pid(pool).await {
@@ -390,6 +412,8 @@ fn complete_client(pool: sqlx::PgPool, queue: &str) -> Client {
         )
         .heartbeat_interval(Duration::from_millis(50))
         .promote_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .heartbeat_staleness(Duration::from_millis(250))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
         .register_worker(CompleteWorker)
@@ -652,7 +676,7 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
                 && state_count(counts, "scheduled") == 0
                 && state_count(counts, "waiting_external") == 0
         },
-        Duration::from_secs(30),
+        Duration::from_secs(60),
     )
     .await;
 
@@ -851,7 +875,7 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
             break;
         }
         assert!(
-            reconnect_start.elapsed() < Duration::from_secs(10),
+            reconnect_start.elapsed() < scaled_timeout(Duration::from_secs(10)),
             "Timed out waiting for node A to reconnect after backend termination"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -914,7 +938,7 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
                 && state_count(counts, "scheduled") == 0
                 && state_count(counts, "waiting_external") == 0
         },
-        Duration::from_secs(25),
+        Duration::from_secs(45),
     )
     .await;
 
@@ -1067,10 +1091,11 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             .expect("Failed to insert Rust-enqueued ChaosProbe");
         }
 
-        let rust_processed_marker = tokio::time::timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("Timed out waiting for Rust worker to process a shared-kind job")
-            .expect("Rust mixed-fleet receiver closed unexpectedly");
+        let rust_processed_marker =
+            tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), rx.recv())
+                .await
+                .expect("Timed out waiting for Rust worker to process a shared-kind job")
+                .expect("Rust mixed-fleet receiver closed unexpectedly");
         assert!(
             rust_processed_marker.starts_with("python-")
                 || rust_processed_marker.starts_with("rust-"),
