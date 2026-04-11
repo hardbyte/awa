@@ -3,6 +3,7 @@ name: Nightly Chaos And Benchmarks
 on:
   schedule:
     - cron: "0 6 * * *"
+    - cron: "0 8 * * 0"
   workflow_dispatch:
 
 env:
@@ -137,12 +138,23 @@ jobs:
           AWA_MVCC_OVERLAP_READERS: "2"
           AWA_MVCC_OVERLAP_HOLD_SECS: "12"
           AWA_MVCC_OVERLAP_STAGGER_SECS: "4"
+          AWA_MVCC_READER_MODE: "active_scan"
+          AWA_MVCC_ANALYTICS_TICK_MS: "500"
           AWA_MVCC_WORKERS: "32"
         run: |
           set -o pipefail
           cargo test --release --package awa --test scheduling_benchmark_test \
             test_mvcc_horizon_overlap_benchmark -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-mvcc-horizon.txt
+      - name: Run MVCC horizon soak benchmark
+        if: always() && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 0')
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --release --package awa --test scheduling_benchmark_test \
+            test_mvcc_horizon_planetscale_soak -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-mvcc-soak.txt
       - name: Check for regressions
         if: always()
         run: python .github/scripts/check-bench-regression.py artifacts/nightly benchmarks/baseline.json

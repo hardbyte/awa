@@ -236,6 +236,77 @@ fn env_u64(name: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_string(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+#[derive(Clone, Copy)]
+struct MvccBenchmarkDefaults {
+    scenario_name: &'static str,
+    queue: &'static str,
+    max_conns: u32,
+    analytics_pool_max: u32,
+    producer_rate: u64,
+    producer_tick_ms: u64,
+    baseline_secs: u64,
+    overlap_secs: u64,
+    cooldown_secs: u64,
+    overlap_readers: u32,
+    overlap_hold_secs: u64,
+    overlap_stagger_secs: u64,
+    cleanup_interval_ms: u64,
+    cleanup_batch_size: u64,
+    worker_count: u32,
+    reader_mode: &'static str,
+    analytics_tick_ms: u64,
+}
+
+impl MvccBenchmarkDefaults {
+    const fn nightly_overlap() -> Self {
+        Self {
+            scenario_name: "mvcc_horizon_overlap",
+            queue: "bench_mvcc_horizon",
+            max_conns: 40,
+            analytics_pool_max: 6,
+            producer_rate: 800,
+            producer_tick_ms: 100,
+            baseline_secs: 10,
+            overlap_secs: 30,
+            cooldown_secs: 10,
+            overlap_readers: 3,
+            overlap_hold_secs: 40,
+            overlap_stagger_secs: 10,
+            cleanup_interval_ms: 1_000,
+            cleanup_batch_size: 10_000,
+            worker_count: 64,
+            reader_mode: "idle_snapshot",
+            analytics_tick_ms: 1_000,
+        }
+    }
+
+    const fn planetscale_soak() -> Self {
+        Self {
+            scenario_name: "mvcc_horizon_planetscale_soak",
+            queue: "bench_mvcc_horizon_soak",
+            max_conns: 40,
+            analytics_pool_max: 6,
+            producer_rate: 800,
+            producer_tick_ms: 100,
+            baseline_secs: 45,
+            overlap_secs: 900,
+            cooldown_secs: 45,
+            overlap_readers: 3,
+            overlap_hold_secs: 120,
+            overlap_stagger_secs: 20,
+            cleanup_interval_ms: 1_000,
+            cleanup_batch_size: 10_000,
+            worker_count: 64,
+            reader_mode: "active_scan",
+            analytics_tick_ms: 1_000,
+        }
+    }
+}
+
 fn percentile(sorted: &[Duration], p: f64) -> Duration {
     assert!(!sorted.is_empty());
     let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
@@ -483,6 +554,8 @@ async fn mvcc_overlap_reader(
     queue: String,
     initial_delay: Duration,
     hold_time: Duration,
+    reader_mode: String,
+    analytics_tick: Duration,
     mut stop: tokio::sync::watch::Receiver<bool>,
 ) {
     if wait_or_stop(initial_delay, &mut stop).await {
@@ -494,25 +567,64 @@ async fn mvcc_overlap_reader(
             break;
         }
 
-        let mut conn = pool.acquire().await.expect("Failed to acquire MVCC reader connection");
+        let mut conn = pool
+            .acquire()
+            .await
+            .expect("Failed to acquire MVCC reader connection");
         sqlx::query("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")
             .execute(conn.as_mut())
             .await
             .expect("Failed to start MVCC reader transaction");
-        let _: i64 =
-            sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_hot WHERE queue = $1")
+
+        match reader_mode.as_str() {
+            "active_scan" => {
+                let tick = analytics_tick.max(Duration::from_millis(50));
+                let steps = ((hold_time.as_secs_f64() / tick.as_secs_f64()).ceil() as i32).max(1);
+                let sleep_secs = tick.as_secs_f64();
+                let _: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT max(snapshot.visible)::bigint
+                    FROM generate_series(1, $2::int) AS step(n)
+                    CROSS JOIN LATERAL (
+                        SELECT count(*)::bigint AS visible
+                        FROM awa.jobs_hot
+                        WHERE queue = $1
+                    ) AS snapshot
+                    CROSS JOIN LATERAL pg_sleep($3)
+                    "#,
+                )
+                .bind(&queue)
+                .bind(steps)
+                .bind(sleep_secs)
+                .fetch_one(conn.as_mut())
+                .await
+                .expect("Failed to run active MVCC analytics query");
+            }
+            _ => {
+                let _: i64 = sqlx::query_scalar(
+                    "SELECT count(*)::bigint FROM awa.jobs_hot WHERE queue = $1",
+                )
                 .bind(&queue)
                 .fetch_one(conn.as_mut())
                 .await
                 .expect("Failed to pin MVCC reader snapshot");
 
-        let should_stop = wait_or_stop(hold_time, &mut stop).await;
+                if wait_or_stop(hold_time, &mut stop).await {
+                    sqlx::query("COMMIT")
+                        .execute(conn.as_mut())
+                        .await
+                        .expect("Failed to commit MVCC reader transaction");
+                    break;
+                }
+            }
+        }
+
         sqlx::query("COMMIT")
             .execute(conn.as_mut())
             .await
             .expect("Failed to commit MVCC reader transaction");
 
-        if should_stop {
+        if *stop.borrow() {
             break;
         }
     }
@@ -743,24 +855,44 @@ async fn test_runtime_sustained_hot_path_pool_100() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore]
 async fn test_mvcc_horizon_overlap_benchmark() {
-    let max_conns = env_u32("AWA_MVCC_POOL_MAX", 40);
+    run_mvcc_horizon_benchmark(MvccBenchmarkDefaults::nightly_overlap()).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore]
+async fn test_mvcc_horizon_planetscale_soak() {
+    run_mvcc_horizon_benchmark(MvccBenchmarkDefaults::planetscale_soak()).await;
+}
+
+async fn run_mvcc_horizon_benchmark(defaults: MvccBenchmarkDefaults) {
+    let max_conns = env_u32("AWA_MVCC_POOL_MAX", defaults.max_conns);
     let pool = setup(max_conns).await;
-    let analytics_pool = pool_with(env_u32("AWA_MVCC_ANALYTICS_POOL_MAX", 6)).await;
-    let queue = "bench_mvcc_horizon";
+    let analytics_pool = pool_with(env_u32(
+        "AWA_MVCC_ANALYTICS_POOL_MAX",
+        defaults.analytics_pool_max,
+    ))
+    .await;
+    let queue = defaults.queue;
     reset_runtime_state(&pool).await;
     clean_queue(&pool, queue).await;
 
-    let producer_rate = env_u64("AWA_MVCC_JOB_RATE", 800);
-    let producer_tick_ms = env_u64("AWA_MVCC_PRODUCER_TICK_MS", 100);
-    let baseline_secs = env_u64("AWA_MVCC_BASELINE_SECS", 10);
-    let overlap_secs = env_u64("AWA_MVCC_OVERLAP_SECS", 30);
-    let cooldown_secs = env_u64("AWA_MVCC_COOLDOWN_SECS", 10);
-    let overlap_readers = env_u32("AWA_MVCC_OVERLAP_READERS", 3);
-    let overlap_hold_secs = env_u64("AWA_MVCC_OVERLAP_HOLD_SECS", 40);
-    let overlap_stagger_secs = env_u64("AWA_MVCC_OVERLAP_STAGGER_SECS", 10);
-    let cleanup_interval_ms = env_u64("AWA_MVCC_CLEANUP_INTERVAL_MS", 1_000);
-    let cleanup_batch_size = env_u64("AWA_MVCC_CLEANUP_BATCH_SIZE", 10_000) as i64;
-    let worker_count = env_u32("AWA_MVCC_WORKERS", 64);
+    let producer_rate = env_u64("AWA_MVCC_JOB_RATE", defaults.producer_rate);
+    let producer_tick_ms = env_u64("AWA_MVCC_PRODUCER_TICK_MS", defaults.producer_tick_ms);
+    let baseline_secs = env_u64("AWA_MVCC_BASELINE_SECS", defaults.baseline_secs);
+    let overlap_secs = env_u64("AWA_MVCC_OVERLAP_SECS", defaults.overlap_secs);
+    let cooldown_secs = env_u64("AWA_MVCC_COOLDOWN_SECS", defaults.cooldown_secs);
+    let overlap_readers = env_u32("AWA_MVCC_OVERLAP_READERS", defaults.overlap_readers);
+    let overlap_hold_secs = env_u64("AWA_MVCC_OVERLAP_HOLD_SECS", defaults.overlap_hold_secs);
+    let overlap_stagger_secs = env_u64(
+        "AWA_MVCC_OVERLAP_STAGGER_SECS",
+        defaults.overlap_stagger_secs,
+    );
+    let cleanup_interval_ms = env_u64("AWA_MVCC_CLEANUP_INTERVAL_MS", defaults.cleanup_interval_ms);
+    let cleanup_batch_size =
+        env_u64("AWA_MVCC_CLEANUP_BATCH_SIZE", defaults.cleanup_batch_size) as i64;
+    let worker_count = env_u32("AWA_MVCC_WORKERS", defaults.worker_count);
+    let reader_mode = env_string("AWA_MVCC_READER_MODE", defaults.reader_mode);
+    let analytics_tick_ms = env_u64("AWA_MVCC_ANALYTICS_TICK_MS", defaults.analytics_tick_ms);
     let total_secs = baseline_secs + overlap_secs + cooldown_secs;
 
     let completed = Arc::new(AtomicU64::new(0));
@@ -786,7 +918,10 @@ async fn test_mvcc_horizon_overlap_benchmark() {
         .build()
         .expect("Failed to build MVCC horizon benchmark client");
 
-    client.start().await.expect("Failed to start MVCC benchmark client");
+    client
+        .start()
+        .await
+        .expect("Failed to start MVCC benchmark client");
     wait_for_dispatch(&client, Duration::from_secs(5)).await;
     // Runtime snapshot publication can lag slightly behind dispatcher startup.
     // Give maintenance a brief window to acquire leadership before the churn
@@ -820,6 +955,8 @@ async fn test_mvcc_horizon_overlap_benchmark() {
                     queue.to_string(),
                     Duration::from_secs(overlap_stagger_secs * index as u64),
                     Duration::from_secs(overlap_hold_secs),
+                    reader_mode.clone(),
+                    Duration::from_millis(analytics_tick_ms),
                     overlap_rx.clone(),
                 )));
             }
@@ -877,8 +1014,16 @@ async fn test_mvcc_horizon_overlap_benchmark() {
     let baseline_rate = average_handler_rate(baseline_window);
     let overlap_rate = average_handler_rate(overlap_window);
     let cooldown_rate = average_handler_rate(cooldown_window);
-    let max_available = samples.iter().map(|sample| sample.available).max().unwrap_or(0);
-    let max_dead_tup = samples.iter().map(|sample| sample.dead_tup).max().unwrap_or(0);
+    let max_available = samples
+        .iter()
+        .map(|sample| sample.available)
+        .max()
+        .unwrap_or(0);
+    let max_dead_tup = samples
+        .iter()
+        .map(|sample| sample.dead_tup)
+        .max()
+        .unwrap_or(0);
     let dead_tup_delta = max_dead_tup - initial.dead_tup;
     let autovacuum_delta = final_snapshot.autovacuum_count - initial.autovacuum_count;
     let vacuum_delta = final_snapshot.vacuum_count - initial.vacuum_count;
@@ -911,7 +1056,7 @@ async fn test_mvcc_horizon_overlap_benchmark() {
 
     BenchmarkResult {
         schema_version: SCHEMA_VERSION,
-        scenario: "mvcc_horizon_overlap".to_string(),
+        scenario: defaults.scenario_name.to_string(),
         language: "rust".to_string(),
         seeded: seeded.load(Ordering::Relaxed),
         metrics: BenchMetrics {
@@ -923,6 +1068,7 @@ async fn test_mvcc_horizon_overlap_benchmark() {
         },
         outcomes,
         metadata: Some(serde_json::json!({
+            "profile": defaults.scenario_name,
             "producer_rate_per_s": producer_rate,
             "worker_count": worker_count,
             "baseline_secs": baseline_secs,
@@ -931,6 +1077,8 @@ async fn test_mvcc_horizon_overlap_benchmark() {
             "overlap_readers": overlap_readers,
             "overlap_hold_secs": overlap_hold_secs,
             "overlap_stagger_secs": overlap_stagger_secs,
+            "reader_mode": reader_mode,
+            "analytics_tick_ms": analytics_tick_ms,
             "cleanup_interval_ms": cleanup_interval_ms,
             "cleanup_batch_size": cleanup_batch_size,
             "baseline_handler_per_s": baseline_rate,

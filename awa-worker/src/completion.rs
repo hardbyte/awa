@@ -142,7 +142,8 @@ impl CompletionWorker {
             return;
         }
 
-        let batch: Vec<_> = std::mem::take(pending);
+        let mut batch: Vec<_> = std::mem::take(pending);
+        batch.sort_unstable_by_key(|request| (request.job_id, request.run_lease));
         let job_ids: Vec<i64> = batch.iter().map(|request| request.job_id).collect();
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
@@ -151,16 +152,24 @@ impl CompletionWorker {
             r#"
             WITH completed (id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            ),
+            locked AS (
+                SELECT jobs.ctid, jobs.id
+                FROM awa.jobs_hot AS jobs
+                JOIN completed
+                  ON jobs.id = completed.id
+                 AND jobs.run_lease = completed.run_lease
+                WHERE jobs.state = 'running'
+                ORDER BY jobs.id
+                FOR UPDATE OF jobs
             )
             UPDATE awa.jobs_hot AS jobs
             SET state = 'completed',
                 finalized_at = now(),
                 progress = NULL
-            FROM completed
-            WHERE jobs.id = completed.id
-              AND jobs.run_lease = completed.run_lease
-              AND jobs.state = 'running'
-            RETURNING jobs.id
+            FROM locked
+            WHERE jobs.ctid = locked.ctid
+            RETURNING locked.id
             "#,
         )
         .bind(&job_ids)

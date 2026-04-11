@@ -62,6 +62,13 @@ The benchmark:
 - samples per-second throughput, queue depth, and `pg_stat_user_tables`
   (`n_dead_tup`, vacuum counters) for `awa.jobs_hot`
 
+Reader modes:
+
+- `idle_snapshot`: pins a snapshot and waits inside the transaction; useful for
+  the pure MVCC-horizon case
+- `active_scan`: runs repeated queue scans inside the open transaction so the
+  reader behaves more like overlapping analytics work on the primary
+
 Example:
 
 ```bash
@@ -83,10 +90,32 @@ shared runners while still exercising overlap readers and cleanup pressure:
 - `AWA_MVCC_OVERLAP_READERS=2`
 - `AWA_MVCC_OVERLAP_HOLD_SECS=12`
 - `AWA_MVCC_OVERLAP_STAGGER_SECS=4`
+- `AWA_MVCC_READER_MODE=active_scan`
+- `AWA_MVCC_ANALYTICS_TICK_MS=500`
 
 Nightly regression checks use per-run ratios (`overlap_handler_per_s` and
 `cooldown_handler_per_s` relative to the same run's baseline window) plus
 guardrails on `dead_tup_delta` and `max_available`.
+
+That nightly profile is intentionally short. It checks that Awa still behaves
+reasonably under overlapping analytical readers, but it is not the same thing
+as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a
+closer local reproduction, increase duration and reader hold times and keep the
+readers in `active_scan` mode so queries overlap continuously rather than
+simulating only `idle in transaction`.
+
+A second ignored benchmark target now exists for that longer profile:
+`test_mvcc_horizon_planetscale_soak`. Its default shape is closer to the blog's
+mixed-workload setup:
+
+- `800` jobs/sec producer rate
+- `3` overlapping analytics readers
+- `120s` reader hold time
+- `20s` stagger between readers
+- `15m` overlap window with `active_scan`
+
+That soak benchmark is wired into CI as a weekly/manual run, while the shorter
+`test_mvcc_horizon_overlap_benchmark` remains the daily nightly smoke.
 
 Useful knobs:
 
@@ -94,6 +123,9 @@ Useful knobs:
 - `AWA_MVCC_BASELINE_SECS` / `AWA_MVCC_OVERLAP_SECS` / `AWA_MVCC_COOLDOWN_SECS`
 - `AWA_MVCC_OVERLAP_READERS` / `AWA_MVCC_OVERLAP_HOLD_SECS` /
   `AWA_MVCC_OVERLAP_STAGGER_SECS`
+- `AWA_MVCC_READER_MODE` — `idle_snapshot` or `active_scan`
+- `AWA_MVCC_ANALYTICS_TICK_MS` — cadence for repeated analytics scans in
+  `active_scan` mode
 - `AWA_MVCC_CLEANUP_INTERVAL_MS` / `AWA_MVCC_CLEANUP_BATCH_SIZE`
 
 ## Python Runtime Benchmarks
