@@ -42,6 +42,8 @@ async def main() -> None:
             leader_election_interval_ms=100,
             heartbeat_interval_ms=50,
             promote_interval_ms=50,
+            heartbeat_rescue_interval_ms=100,
+            heartbeat_staleness_ms=250,
         )
         print(f"READY mode={mode} pid={os.getpid()}", flush=True)
         await asyncio.Event().wait()
