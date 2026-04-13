@@ -2,6 +2,17 @@
 
 This guide takes you from `pip install` to a job reaching `completed`.
 
+## Mental Model
+
+Before the code, here is the operational model Awa is built around:
+
+- inserting a job writes a durable row to Postgres, so enqueueing can live inside the same transaction as your application write
+- workers claim that row when it becomes runnable, heartbeat while it is executing, and rescue it if the worker dies
+- retries, callback waits, and progress checkpoints are persisted back onto the job row instead of being held only in memory
+- when you debug or operate the system, inspect the row first; the CLI and UI are designed around that read-only inspection path
+
+That means “what happened?” is usually a database inspection question, not a worker-log archaeology exercise.
+
 ## Prerequisites
 
 - PostgreSQL running locally or remotely
@@ -91,9 +102,13 @@ job 1 state = JobState.Completed
 
 ```bash
 awa --database-url "$DATABASE_URL" job list --queue email
+awa --database-url "$DATABASE_URL" job dump 1
+awa --database-url "$DATABASE_URL" job dump-run 1
 awa --database-url "$DATABASE_URL" queue stats
 awa --database-url "$DATABASE_URL" serve
 ```
+
+`job dump` gives you the whole job snapshot as JSON. `job dump-run` focuses on one attempt: the current attempt uses live row data, while historical attempts are reconstructed from the stored `errors[]` history.
 
 The UI starts on `http://127.0.0.1:3000` by default.
 

@@ -32,6 +32,15 @@ Core concurrency invariants (no duplicate processing after rescue, stale complet
 
 ## Getting Started
 
+The quickest way to reason about Awa is:
+
+- your app inserts a durable job row inside Postgres, often in the same transaction as business data
+- workers claim runnable rows, heartbeat while they are executing, and safely rescue stale work after crashes
+- the job row itself is the source of truth for state, progress, callbacks, and retry history
+- operators inspect and control that state through the CLI or the built-in UI
+
+If you keep that model in mind, the APIs make more sense: enqueue work, run workers, then inspect the resulting row rather than guessing what happened in memory.
+
 ```bash
 # 1. Install
 pip install awa-pg awa-cli     # Python
@@ -44,6 +53,8 @@ awa --database-url $DATABASE_URL migrate
 
 # 4. Monitor
 awa --database-url $DATABASE_URL serve   # → http://127.0.0.1:3000
+awa --database-url $DATABASE_URL job dump 123
+awa --database-url $DATABASE_URL job dump-run 123
 ```
 
 Language-specific guides:
@@ -218,6 +229,8 @@ awa --database-url $DATABASE_URL migrate
 awa --database-url $DATABASE_URL serve
 awa --database-url $DATABASE_URL queue stats
 awa --database-url $DATABASE_URL job list --state failed
+awa --database-url $DATABASE_URL job dump 123
+awa --database-url $DATABASE_URL job dump-run 123
 ```
 
 ## Architecture

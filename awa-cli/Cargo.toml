@@ -23,3 +23,9 @@ tracing-subscriber.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 hex.workspace = true
+
+[dev-dependencies]
+awa-testing = { path = "../awa-testing", version = "0.5.3" }
+assert_cmd = "2"
+serde.workspace = true
+uuid.workspace = true

@@ -16,3 +16,9 @@ awa-python/python/awa/lib_awa.dylib.dSYM/
 /awa-ui/frontend/node_modules
 /awa-ui/static/assets
 /awa-ui/static/index.html
+
+# Local worktrees and generated artifacts
+/.claude/
+/artifacts/
+/awa-cli/dist/
+/corectness/

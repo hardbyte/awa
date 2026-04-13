@@ -13,6 +13,8 @@ awa --database-url $DATABASE_URL migrate
 # Admin
 awa --database-url $DATABASE_URL queue stats
 awa --database-url $DATABASE_URL job list --state failed
+awa --database-url $DATABASE_URL job dump 12345
+awa --database-url $DATABASE_URL job dump-run 12345
 awa --database-url $DATABASE_URL job retry 12345
 
 # Web UI
@@ -26,6 +28,8 @@ awa --database-url $DATABASE_URL serve
 |---------|-------------|
 | `migrate` | Run database migrations (or extract SQL) |
 | `job list` | List jobs with state/kind/queue filters |
+| `job dump` | Dump one job as a detailed JSON inspection snapshot |
+| `job dump-run` | Dump one attempt-oriented inspection snapshot |
 | `job retry` | Retry a failed/cancelled job |
 | `job cancel` | Cancel a job |
 | `job retry-failed` | Retry all failed jobs by kind |
