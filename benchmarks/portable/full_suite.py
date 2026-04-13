@@ -22,6 +22,7 @@ DEFAULT_SYSTEMS = [
     "awa",
     "awa-docker",
     "awa-python",
+    "absurd",
     "procrastinate",
     "river",
     "oban",
