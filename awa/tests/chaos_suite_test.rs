@@ -338,15 +338,25 @@ async fn run_python_helper(mode: &str, queue: &str, extra_env: &[(&str, String)]
 }
 
 async fn current_leader_backend_pid(pool: &sqlx::PgPool) -> Option<i32> {
+    // Keep this in sync with awa-worker/src/maintenance.rs::LOCK_KEY.
+    const LEADER_LOCK_KEY: i64 = 0x_4157_415f_4d41_494e;
+    const LEADER_LOCK_CLASSID: i32 = ((LEADER_LOCK_KEY >> 32) & 0xffff_ffff) as i32;
+    const LEADER_LOCK_OBJID: i32 = (LEADER_LOCK_KEY & 0xffff_ffff) as i32;
+
     let rows: Vec<(i32,)> = sqlx::query_as(
         r#"
-        SELECT pid
+        SELECT DISTINCT pid
         FROM pg_locks
         WHERE locktype = 'advisory'
           AND granted
+          AND classid = $1
+          AND objid = $2
+          AND objsubid = 1
         ORDER BY pid
         "#,
     )
+    .bind(LEADER_LOCK_CLASSID)
+    .bind(LEADER_LOCK_OBJID)
     .fetch_all(pool)
     .await
     .expect("Failed to query advisory lock holders");

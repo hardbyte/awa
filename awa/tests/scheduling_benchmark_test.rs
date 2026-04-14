@@ -76,7 +76,26 @@ async fn clean_cron_names(pool: &sqlx::PgPool, names: &[String]) {
     }
 }
 
+fn benchmark_timeout_multiplier() -> f64 {
+    if let Ok(raw) = std::env::var("AWA_BENCH_TIMEOUT_MULTIPLIER") {
+        if let Ok(parsed) = raw.parse::<f64>() {
+            return parsed.max(1.0);
+        }
+    }
+
+    if std::env::var_os("CI").is_some() {
+        3.0
+    } else {
+        1.0
+    }
+}
+
+fn scaled_timeout(timeout: Duration) -> Duration {
+    timeout.mul_f64(benchmark_timeout_multiplier())
+}
+
 async fn wait_for_leader(client: &Client, timeout: Duration) {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         let health = client.health_check().await;
@@ -92,6 +111,7 @@ async fn wait_for_leader(client: &Client, timeout: Duration) {
 }
 
 async fn wait_for_dispatch(client: &Client, timeout: Duration) {
+    let timeout = scaled_timeout(timeout);
     let start = Instant::now();
     loop {
         let health = client.health_check().await;

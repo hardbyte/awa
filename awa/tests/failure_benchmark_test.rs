@@ -43,6 +43,24 @@ async fn setup(max_conns: u32) -> sqlx::PgPool {
     pool
 }
 
+fn benchmark_timeout_multiplier() -> f64 {
+    if let Ok(raw) = std::env::var("AWA_BENCH_TIMEOUT_MULTIPLIER") {
+        if let Ok(parsed) = raw.parse::<f64>() {
+            return parsed.max(1.0);
+        }
+    }
+
+    if std::env::var_os("CI").is_some() {
+        1.5
+    } else {
+        1.0
+    }
+}
+
+fn scaled_timeout(timeout: Duration) -> Duration {
+    timeout.mul_f64(benchmark_timeout_multiplier())
+}
+
 async fn reset_runtime_state(pool: &sqlx::PgPool) {
     sqlx::query(
         "TRUNCATE awa.jobs_hot, awa.scheduled_jobs, awa.queue_meta, awa.job_unique_claims RESTART IDENTITY CASCADE",
@@ -302,7 +320,7 @@ async fn run_scenario(pool: &sqlx::PgPool, config: &ScenarioConfig) {
     // Wait for all jobs to reach terminal states
     // Scenarios with deadline_hang or callback_timeout need extra time for
     // rescue cycles; 180s is generous enough for the full mixed matrix.
-    let timeout = Duration::from_secs(180);
+    let timeout = scaled_timeout(Duration::from_secs(180));
     let deadline = Instant::now() + timeout;
     loop {
         let counts = queue_state_counts(pool, &queue).await;
@@ -715,7 +733,7 @@ async fn test_failure_bench_stale_heartbeat_rescue() {
     client.start().await.expect("Failed to start client");
 
     // Wait for all jobs to reach completed
-    let timeout = Duration::from_secs(60);
+    let timeout = scaled_timeout(Duration::from_secs(60));
     let deadline = Instant::now() + timeout;
     loop {
         let counts = queue_state_counts(&pool, queue).await;

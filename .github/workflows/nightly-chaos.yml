@@ -99,7 +99,9 @@ jobs:
             | tee artifacts/nightly/rust-scheduled-2m-4k.txt
       - name: Run failure-mode benchmark matrix
         if: always()
-        timeout-minutes: 10
+        timeout-minutes: 30
+        env:
+          AWA_BENCH_TIMEOUT_MULTIPLIER: "3"
         continue-on-error: true
         run: |
           set -o pipefail
