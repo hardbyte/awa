@@ -102,7 +102,10 @@ def start_postgres():
 
 def stop_postgres():
     pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
-    run_compose(["down", "-v"], pg_image=pg_image)
+    try:
+        run_compose(["down", "-v"], pg_image=pg_image, timeout=30)
+    except Exception as exc:
+        print(f"WARNING: docker compose down failed during teardown: {exc}", file=sys.stderr)
 
 def reset_db(db: str):
     # Drop both public and awa schemas (Awa uses awa.*, River/Oban use public.*)
@@ -1377,7 +1380,8 @@ def main():
     parser.add_argument("--keep-pg", action="store_true")
     parser.add_argument("--pg-image", default=DEFAULT_PG_IMAGE)
     args = parser.parse_args()
-    os.environ["POSTGRES_IMAGE"] = args.pg_image
+    pg_image = os.environ.get("POSTGRES_IMAGE") or args.pg_image
+    os.environ["POSTGRES_IMAGE"] = pg_image
 
     systems = [s.strip() for s in args.systems.split(",")]
     scenarios = {
@@ -1424,7 +1428,7 @@ def main():
                         "job_count": args.job_count,
                         "scenario": args.scenario,
                         "suite": args.suite,
-                        "pg_image": args.pg_image,
+                        "pg_image": pg_image,
                     },
                     "results": all_results,
                 },

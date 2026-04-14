@@ -90,22 +90,22 @@ fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
     counts.get(state).copied().unwrap_or(0)
 }
 
-fn chaos_timeout_multiplier() -> u32 {
+fn chaos_timeout_multiplier() -> f64 {
     if let Ok(raw) = std::env::var("AWA_CHAOS_TIMEOUT_MULTIPLIER") {
-        if let Ok(parsed) = raw.parse::<u32>() {
-            return parsed.max(1);
+        if let Ok(parsed) = raw.parse::<f64>() {
+            return parsed.max(1.0);
         }
     }
 
     if std::env::var_os("CI").is_some() {
-        3
+        3.0
     } else {
-        1
+        1.0
     }
 }
 
 fn scaled_timeout(timeout: Duration) -> Duration {
-    timeout.saturating_mul(chaos_timeout_multiplier())
+    timeout.mul_f64(chaos_timeout_multiplier())
 }
 
 async fn wait_for_counts(
