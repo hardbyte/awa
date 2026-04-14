@@ -76,25 +76,33 @@ def wait_pg_ready(timeout: int = 30):
 def compose_env(pg_image: str) -> dict[str, str]:
     return {**os.environ, "POSTGRES_IMAGE": pg_image}
 
-def start_postgres():
-    pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
-    subprocess.run(
-        ["docker", "compose", "up", "-d", "--wait"],
+def run_compose(
+    args: list[str], *, pg_image: str, timeout: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["docker", "compose", *args],
         cwd=str(SCRIPT_DIR),
         capture_output=True,
-        timeout=60,
+        text=True,
+        timeout=timeout,
         env=compose_env(pg_image),
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"docker compose {' '.join(args)} failed with exit {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
+
+def start_postgres():
+    pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
+    run_compose(["up", "-d", "--wait"], pg_image=pg_image, timeout=60)
     wait_pg_ready()
 
 def stop_postgres():
     pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=str(SCRIPT_DIR),
-        capture_output=True,
-        env=compose_env(pg_image),
-    )
+    run_compose(["down", "-v"], pg_image=pg_image)
 
 def reset_db(db: str):
     # Drop both public and awa schemas (Awa uses awa.*, River/Oban use public.*)
@@ -503,12 +511,10 @@ def scenario_postgres_restart(system: str, job_count: int = 10) -> dict:
     # Restart Postgres
     restart_time = time.time()
     print(f"  [{system}] Restarting Postgres...", file=sys.stderr)
-    subprocess.run(
-        ["docker", "compose", "restart", "postgres"],
-        cwd=str(SCRIPT_DIR),
-        capture_output=True,
+    run_compose(
+        ["restart", "postgres"],
+        pg_image=os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE),
         timeout=30,
-        env=compose_env(os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)),
     )
     wait_pg_ready(timeout=30)
     pg_downtime = time.time() - restart_time

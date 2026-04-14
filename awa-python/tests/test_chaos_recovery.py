@@ -20,6 +20,21 @@ class ChaosProbe:
     marker: str
 
 
+def chaos_timeout_multiplier() -> float:
+    raw = os.environ.get("AWA_CHAOS_TIMEOUT_MULTIPLIER")
+    if raw is not None:
+        try:
+            return max(float(raw), 1.0)
+        except ValueError:
+            pass
+
+    return 3.0 if os.environ.get("CI") else 1.0
+
+
+def scaled_timeout(timeout: float) -> float:
+    return timeout * chaos_timeout_multiplier()
+
+
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
@@ -211,7 +226,7 @@ async def _wait_for_line(
                 return text
 
     try:
-        return await asyncio.wait_for(read_until_match(), timeout=timeout)
+        return await asyncio.wait_for(read_until_match(), timeout=scaled_timeout(timeout))
     except TimeoutError as exc:
         raise AssertionError(
             f"timed out waiting for worker output: {expected}\n" + "\n".join(seen)
@@ -221,7 +236,7 @@ async def _wait_for_line(
 async def _wait_for_job_state(
     client: awa.AsyncClient, job_id: int, expected_state: str, timeout: float
 ):
-    deadline = asyncio.get_running_loop().time() + timeout
+    deadline = asyncio.get_running_loop().time() + scaled_timeout(timeout)
 
     while True:
         tx = await client.transaction()
@@ -255,7 +270,7 @@ async def _stop_process(process: asyncio.subprocess.Process | None) -> None:
 
     process.terminate()
     try:
-        await asyncio.wait_for(process.wait(), timeout=5)
+        await asyncio.wait_for(process.wait(), timeout=scaled_timeout(5))
     except TimeoutError:
         process.kill()
-        await asyncio.wait_for(process.wait(), timeout=5)
+        await asyncio.wait_for(process.wait(), timeout=scaled_timeout(5))

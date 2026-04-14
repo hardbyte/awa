@@ -224,6 +224,7 @@ mod tests {
     use super::*;
     use awa_model::migrations;
     use sqlx::postgres::PgPoolOptions;
+    use std::sync::Arc;
     use std::time::Instant;
 
     fn database_url() -> String {
@@ -293,6 +294,172 @@ mod tests {
         .fetch_all(pool)
         .await
         .expect("Failed to load seeded rows")
+    }
+
+    async fn reset_running_jobs(pool: &PgPool, queue: &str) {
+        sqlx::query(
+            r#"
+            UPDATE awa.jobs_hot
+            SET state = 'running',
+                finalized_at = NULL,
+                heartbeat_at = now(),
+                progress = NULL
+            WHERE queue = $1
+            "#,
+        )
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to reset running jobs");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completion_and_heartbeat_batches_do_not_deadlock_with_reversed_input_order() {
+        let pool = setup(10).await;
+        let queue = "test_completion_heartbeat_lock_order";
+        clean_queue(&pool, queue).await;
+
+        let jobs = seed_running_jobs(&pool, queue, 2).await;
+        let (first_id, first_lease) = jobs[0];
+        let (second_id, second_lease) = jobs[1];
+
+        for iteration in 0..20 {
+            if iteration > 0 {
+                reset_running_jobs(&pool, queue).await;
+            }
+
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+            let completion_pool = pool.clone();
+            let completion_barrier = barrier.clone();
+            let completion_task = tokio::spawn(async move {
+                completion_barrier.wait().await;
+                sqlx::query_scalar::<_, i64>(
+                    r#"
+                    WITH completed (id, run_lease) AS (
+                        SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                    ),
+                    locked AS (
+                        SELECT jobs.ctid, jobs.id
+                        FROM awa.jobs_hot AS jobs
+                        JOIN completed
+                          ON jobs.id = completed.id
+                         AND jobs.run_lease = completed.run_lease
+                        WHERE jobs.state = 'running'
+                        ORDER BY jobs.id
+                        FOR UPDATE OF jobs
+                    )
+                    UPDATE awa.jobs_hot AS jobs
+                    SET state = 'completed',
+                        finalized_at = now(),
+                        progress = NULL
+                    FROM locked
+                    WHERE jobs.ctid = locked.ctid
+                    RETURNING locked.id
+                    "#,
+                )
+                .bind(vec![second_id, first_id])
+                .bind(vec![second_lease, first_lease])
+                .fetch_all(&completion_pool)
+                .await
+            });
+
+            let heartbeat_pool = pool.clone();
+            let heartbeat_barrier = barrier.clone();
+            let heartbeat_task = tokio::spawn(async move {
+                heartbeat_barrier.wait().await;
+                sqlx::query(
+                    r#"
+                    WITH inflight AS (
+                        SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[]) AS v(id, run_lease, progress)
+                    ),
+                    locked AS (
+                        SELECT jobs.ctid, inflight.progress
+                        FROM awa.jobs_hot AS jobs
+                        JOIN inflight
+                          ON jobs.id = inflight.id
+                         AND jobs.run_lease = inflight.run_lease
+                        WHERE jobs.state = 'running'
+                        ORDER BY jobs.id
+                        FOR UPDATE OF jobs
+                    )
+                    UPDATE awa.jobs_hot AS jobs
+                    SET heartbeat_at = now(),
+                        progress = locked.progress
+                    FROM locked
+                    WHERE jobs.ctid = locked.ctid
+                    "#,
+                )
+                .bind(vec![first_id, second_id])
+                .bind(vec![first_lease, second_lease])
+                .bind(vec![
+                    serde_json::json!({ "iteration": iteration, "job": 1 }),
+                    serde_json::json!({ "iteration": iteration, "job": 2 }),
+                ])
+                .execute(&heartbeat_pool)
+                .await
+            });
+
+            barrier.wait().await;
+
+            let (completed_ids, heartbeat_result) =
+                tokio::time::timeout(Duration::from_secs(5), async move {
+                    let completed_ids = completion_task.await.expect("completion task panicked");
+                    let heartbeat_result = heartbeat_task.await.expect("heartbeat task panicked");
+                    (completed_ids, heartbeat_result)
+                })
+                .await
+                .expect("concurrent completion/heartbeat batches timed out");
+
+            let completed_ids = completed_ids.expect("completion batch query failed");
+            heartbeat_result.expect("heartbeat batch query failed");
+            assert!(
+                completed_ids.len() <= 2,
+                "completion batch returned too many rows in iteration {iteration}"
+            );
+
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                WITH completed (id, run_lease) AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                ),
+                locked AS (
+                    SELECT jobs.ctid, jobs.id
+                    FROM awa.jobs_hot AS jobs
+                    JOIN completed
+                      ON jobs.id = completed.id
+                     AND jobs.run_lease = completed.run_lease
+                    WHERE jobs.state = 'running'
+                    ORDER BY jobs.id
+                    FOR UPDATE OF jobs
+                )
+                UPDATE awa.jobs_hot AS jobs
+                SET state = 'completed',
+                    finalized_at = now(),
+                    progress = NULL
+                FROM locked
+                WHERE jobs.ctid = locked.ctid
+                RETURNING locked.id
+                "#,
+            )
+            .bind(vec![second_id, first_id])
+            .bind(vec![second_lease, first_lease])
+            .fetch_all(&pool)
+            .await
+            .expect("serial completion sweep failed");
+
+            let completed: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM awa.jobs_hot WHERE queue = $1 AND state = 'completed'",
+            )
+            .bind(queue)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to count completed rows");
+            assert_eq!(
+                completed, 2,
+                "expected both rows completed after concurrent batch iteration {iteration}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

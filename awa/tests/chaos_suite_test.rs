@@ -1160,15 +1160,15 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             &pool,
             &queue,
             |counts| {
-                state_count(counts, "completed") >= 2 && state_count(counts, "failed") == 0
+                state_count(counts, "completed") == batch_size * 2
+                    && state_count(counts, "failed") == 0
+                    && state_count(counts, "running") == 0
+                    && state_count(counts, "available") == 0
             },
-            Duration::from_secs(5),
+            Duration::from_secs(20),
         )
         .await;
-        assert!(
-            state_count(&counts, "completed") >= 2,
-            "Expected both runtimes to finalize shared-kind jobs, got counts: {counts:?}"
-        );
+        assert_eq!(state_count(&counts, "completed"), batch_size * 2);
 
         python_worker.stop().await;
     }

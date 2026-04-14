@@ -76,15 +76,6 @@ async fn clean_cron_names(pool: &sqlx::PgPool, names: &[String]) {
     }
 }
 
-async fn refresh_pg_stats(pool: &sqlx::PgPool) {
-    let _ = sqlx::query("SELECT pg_stat_force_next_flush()")
-        .execute(pool)
-        .await;
-    let _ = sqlx::query("SELECT pg_stat_clear_snapshot()")
-        .execute(pool)
-        .await;
-}
-
 async fn wait_for_leader(client: &Client, timeout: Duration) {
     let start = Instant::now();
     loop {
@@ -437,7 +428,17 @@ struct HotTableSnapshot {
 }
 
 async fn sample_hot_table_snapshot(pool: &sqlx::PgPool, queue: &str) -> HotTableSnapshot {
-    refresh_pg_stats(pool).await;
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("Failed to acquire stats sampling connection");
+
+    let _ = sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(conn.as_mut())
+        .await;
+    let _ = sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(conn.as_mut())
+        .await;
 
     let counts: (i64, i64, i64) = sqlx::query_as(
         r#"
@@ -450,7 +451,7 @@ async fn sample_hot_table_snapshot(pool: &sqlx::PgPool, queue: &str) -> HotTable
         "#,
     )
     .bind(queue)
-    .fetch_one(pool)
+    .fetch_one(conn.as_mut())
     .await
     .expect("Failed to sample jobs_hot state counts");
 
@@ -465,7 +466,7 @@ async fn sample_hot_table_snapshot(pool: &sqlx::PgPool, queue: &str) -> HotTable
         WHERE schemaname = 'awa' AND relname = 'jobs_hot'
         "#,
     )
-    .fetch_optional(pool)
+    .fetch_optional(conn.as_mut())
     .await
     .expect("Failed to sample pg_stat_user_tables for jobs_hot");
 
