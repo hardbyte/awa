@@ -65,7 +65,8 @@ impl HeartbeatService {
 
     #[tracing::instrument(skip(self))]
     async fn heartbeat_once(&self) {
-        let all_keys: Vec<(i64, RunLease)> = self.in_flight.keys();
+        let mut all_keys: Vec<(i64, RunLease)> = self.in_flight.keys();
+        all_keys.sort_unstable();
 
         if all_keys.is_empty() {
             return;
@@ -73,7 +74,8 @@ impl HeartbeatService {
 
         // Snapshot pending progress updates from the in-flight registry.
         // This locks each ProgressState briefly and sets in_flight snapshots.
-        let pending_progress = self.in_flight.snapshot_pending_progress();
+        let mut pending_progress = self.in_flight.snapshot_pending_progress();
+        pending_progress.sort_unstable_by_key(|(job_id, run_lease, _, _)| (*job_id, *run_lease));
         let progress_keys: std::collections::HashSet<(i64, i64)> = pending_progress
             .iter()
             .map(|(id, lease, _, _)| (*id, *lease))
@@ -92,12 +94,23 @@ impl HeartbeatService {
             let run_leases: Vec<i64> = chunk.iter().map(|(_, run_lease)| *run_lease).collect();
             match sqlx::query(
                 r#"
+                WITH inflight AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[]) AS v(id, run_lease)
+                ),
+                locked AS (
+                    SELECT jobs.ctid
+                    FROM awa.jobs_hot AS jobs
+                    JOIN inflight
+                      ON jobs.id = inflight.id
+                     AND jobs.run_lease = inflight.run_lease
+                    WHERE jobs.state = 'running'
+                    ORDER BY jobs.id
+                    FOR UPDATE OF jobs
+                )
                 UPDATE awa.jobs_hot AS jobs
                 SET heartbeat_at = now()
-                FROM unnest($1::bigint[], $2::bigint[]) AS inflight(id, run_lease)
-                WHERE jobs.id = inflight.id
-                  AND jobs.run_lease = inflight.run_lease
-                  AND jobs.state = 'running'
+                FROM locked
+                WHERE jobs.ctid = locked.ctid
                 "#,
             )
             .bind(&job_ids)
@@ -129,13 +142,24 @@ impl HeartbeatService {
 
                 match sqlx::query(
                     r#"
+                    WITH inflight AS (
+                        SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[]) AS v(id, run_lease, progress)
+                    ),
+                    locked AS (
+                        SELECT jobs.ctid, inflight.progress
+                        FROM awa.jobs_hot AS jobs
+                        JOIN inflight
+                          ON jobs.id = inflight.id
+                         AND jobs.run_lease = inflight.run_lease
+                        WHERE jobs.state = 'running'
+                        ORDER BY jobs.id
+                        FOR UPDATE OF jobs
+                    )
                     UPDATE awa.jobs_hot AS jobs
                     SET heartbeat_at = now(),
-                        progress = v.progress
-                    FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[]) AS v(id, run_lease, progress)
-                    WHERE jobs.id = v.id
-                      AND jobs.run_lease = v.run_lease
-                      AND jobs.state = 'running'
+                        progress = locked.progress
+                    FROM locked
+                    WHERE jobs.ctid = locked.ctid
                     "#,
                 )
                 .bind(&job_ids)

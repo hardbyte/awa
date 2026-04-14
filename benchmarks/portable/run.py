@@ -25,6 +25,7 @@ REPO_ROOT = SCRIPT_DIR.parent.parent
 PG_PORT = 15555
 PG_USER = "bench"
 PG_PASS = "bench"
+DEFAULT_PG_IMAGE = "postgres:17-alpine"
 
 
 def pg_url(dbname: str, host: str = "localhost") -> str:
@@ -46,16 +47,24 @@ def with_system_name(results: list[dict], system: str) -> list[dict]:
     return [{**result, "system": system} for result in results]
 
 
-def start_postgres():
+def postgres_env(pg_image: str) -> dict[str, str]:
+    return {"POSTGRES_IMAGE": pg_image}
+
+
+def start_postgres(pg_image: str):
     """Start the shared Postgres via docker compose."""
-    print("\n=== Starting Postgres ===", file=sys.stderr)
-    run_cmd(["docker", "compose", "up", "-d", "--wait"], cwd=str(SCRIPT_DIR))
+    print(f"\n=== Starting Postgres ({pg_image}) ===", file=sys.stderr)
+    run_cmd(
+        ["docker", "compose", "up", "-d", "--wait"],
+        cwd=str(SCRIPT_DIR),
+        env=postgres_env(pg_image),
+    )
     # Wait for readiness
     for _ in range(30):
         result = run_cmd(
             ["docker", "compose", "exec", "-T", "postgres",
              "pg_isready", "-U", PG_USER],
-            cwd=str(SCRIPT_DIR), capture=True,
+            cwd=str(SCRIPT_DIR), capture=True, env=postgres_env(pg_image),
         )
         if result.returncode == 0:
             return
@@ -63,9 +72,13 @@ def start_postgres():
     raise RuntimeError("Postgres did not become ready in time")
 
 
-def stop_postgres():
+def stop_postgres(pg_image: str):
     print("\n=== Stopping Postgres ===", file=sys.stderr)
-    run_cmd(["docker", "compose", "down", "-v"], cwd=str(SCRIPT_DIR))
+    run_cmd(
+        ["docker", "compose", "down", "-v"],
+        cwd=str(SCRIPT_DIR),
+        env=postgres_env(pg_image),
+    )
 
 
 def build_awa():
@@ -339,6 +352,11 @@ def main():
                         help="Skip building, use cached images/binaries")
     parser.add_argument("--keep-pg", action="store_true",
                         help="Don't stop Postgres after benchmarks")
+    parser.add_argument(
+        "--pg-image",
+        default=DEFAULT_PG_IMAGE,
+        help="Docker image to use for the shared Postgres service",
+    )
     args = parser.parse_args()
 
     systems = [s.strip() for s in args.systems.split(",")]
@@ -362,7 +380,7 @@ def main():
     }
 
     try:
-        start_postgres()
+        start_postgres(args.pg_image)
 
         # Build phase
         if not args.skip_build:
@@ -393,6 +411,7 @@ def main():
                     "worker_count": args.worker_count,
                     "latency_iterations": args.latency_iterations,
                     "systems": systems,
+                    "pg_image": args.pg_image,
                 },
                 "results": all_results,
             }, f, indent=2)
@@ -404,7 +423,7 @@ def main():
 
     finally:
         if not args.keep_pg:
-            stop_postgres()
+            stop_postgres(args.pg_image)
 
 
 if __name__ == "__main__":

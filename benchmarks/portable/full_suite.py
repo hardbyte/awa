@@ -87,6 +87,8 @@ def run_benchmarks(system: str, args: argparse.Namespace, *, log_path: Path) -> 
         str(args.benchmark_worker_count),
         "--latency-iterations",
         str(args.latency_iterations),
+        "--pg-image",
+        args.pg_image,
     ]
     if args.skip_build:
         cmd.append("--skip-build")
@@ -109,11 +111,13 @@ def run_chaos(system: str, args: argparse.Namespace, *, log_path: Path) -> list[
         args.chaos_suite,
         "--job-count",
         str(args.chaos_job_count),
+        "--pg-image",
+        args.pg_image,
     ]
     completed = run_command(cmd, log_path=log_path, phase_label=f"chaos:{system}")
     result_path = extract_result_path(completed.stderr)
     with result_path.open() as handle:
-        return json.load(handle)
+        return json.load(handle)["results"]
 
 
 def summarize_system(benchmark_payload: dict, chaos_payload: list[dict]) -> dict:
@@ -337,6 +341,7 @@ def main() -> None:
     parser.add_argument("--chaos-suite", choices=["portable", "extended"], default="portable")
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--skip-build", action="store_true")
+    parser.add_argument("--pg-image", default="postgres:17-alpine")
     args = parser.parse_args()
 
     run_timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -361,6 +366,7 @@ def main() -> None:
             "chaos_suite": args.chaos_suite,
             "repetitions": args.repetitions,
             "skip_build": args.skip_build,
+            "pg_image": args.pg_image,
         },
         "current": None,
         "completed": [],
@@ -442,6 +448,7 @@ def main() -> None:
                     "chaos_suite": args.chaos_suite,
                     "repetitions": args.repetitions,
                     "skip_build": args.skip_build,
+                    "pg_image": args.pg_image,
                 },
                 "systems": combined_results,
                 "summary": summary,

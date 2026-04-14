@@ -72,6 +72,8 @@ boundary intact across both physical tables.
   the physical tables directly, not the `awa.jobs` view — `FOR UPDATE` is not
   reliably supported on UNION ALL views, and the view's INSTEAD OF trigger
   uses DELETE+INSERT which does not provide true row-level update atomicity
+- Reduces queue-local heap churn, but does not protect the primary from
+  unrelated long-lived snapshots pinning MVCC cleanup on `awa.jobs_hot`
 
 ## Notes
 

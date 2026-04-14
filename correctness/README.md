@@ -44,6 +44,10 @@ What is intentionally not modeled:
   invariants (NoDuplicateClaim, TaskLeaseBounded, RunningHasPermit, etc.)
   are independent of dispatch order. Cross-priority fairness is enforced by
   the maintenance leader's priority aging task (see ADR-005)
+- **MVCC, vacuum, and storage reclamation.** The models do not attempt to
+  represent Postgres heap cleanup, autovacuum timing, or horizon pinning from
+  long-lived snapshots. Those are operational/performance concerns rather than
+  protocol-safety invariants, and are covered by runtime benchmarks instead
 
 ## Files
 

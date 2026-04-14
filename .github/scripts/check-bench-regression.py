@@ -21,6 +21,28 @@ JSONL_PREFIX = "@@BENCH_JSON@@"
 DEFAULT_TOLERANCE = 0.50  # 50%
 
 
+def add_row(
+    rows: list[dict],
+    failures: list[dict],
+    *,
+    scenario: str,
+    metric: str,
+    baseline: str,
+    actual: str,
+    passed: bool,
+):
+    row = {
+        "scenario": scenario,
+        "metric": metric,
+        "baseline": baseline,
+        "actual": actual,
+        "status": "Pass" if passed else "**REGRESSION**",
+    }
+    rows.append(row)
+    if not passed:
+        failures.append(row)
+
+
 def load_baseline(path: Path) -> dict:
     if not path.exists():
         print(f"No baseline file at {path}, skipping regression check")
@@ -62,6 +84,7 @@ def check_regressions(
             continue
 
         metrics = result.get("metrics", {})
+        metadata = result.get("metadata") or {}
 
         # Check throughput (handler_per_s)
         tp = metrics.get("throughput")
@@ -70,16 +93,15 @@ def check_regressions(
             actual = tp["handler_per_s"]
             threshold = bl_tp * (1 - tolerance)
             passed = actual >= threshold
-            row = {
-                "scenario": scenario,
-                "metric": "handler_per_s",
-                "baseline": f"{bl_tp:.0f}",
-                "actual": f"{actual:.0f}",
-                "status": "Pass" if passed else "**REGRESSION**",
-            }
-            rows.append(row)
-            if not passed:
-                failures.append(row)
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="handler_per_s",
+                baseline=f"{bl_tp:.0f}",
+                actual=f"{actual:.0f}",
+                passed=passed,
+            )
 
         # Check enqueue throughput
         enq = metrics.get("enqueue_per_s")
@@ -87,16 +109,15 @@ def check_regressions(
         if enq and bl_enq:
             threshold = bl_enq * (1 - tolerance)
             passed = enq >= threshold
-            row = {
-                "scenario": scenario,
-                "metric": "enqueue_per_s",
-                "baseline": f"{bl_enq:.0f}",
-                "actual": f"{enq:.0f}",
-                "status": "Pass" if passed else "**REGRESSION**",
-            }
-            rows.append(row)
-            if not passed:
-                failures.append(row)
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="enqueue_per_s",
+                baseline=f"{bl_enq:.0f}",
+                actual=f"{enq:.0f}",
+                passed=passed,
+            )
 
         # Check p99 latency (higher is worse)
         lat = metrics.get("latency_ms")
@@ -105,16 +126,85 @@ def check_regressions(
             actual = lat["p99"]
             threshold = bl_p99 * (1 + tolerance)
             passed = actual <= threshold
-            row = {
-                "scenario": scenario,
-                "metric": "p99_ms",
-                "baseline": f"{bl_p99:.1f}",
-                "actual": f"{actual:.1f}",
-                "status": "Pass" if passed else "**REGRESSION**",
-            }
-            rows.append(row)
-            if not passed:
-                failures.append(row)
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="p99_ms",
+                baseline=f"{bl_p99:.1f}",
+                actual=f"{actual:.1f}",
+                passed=passed,
+            )
+
+        # Check MVCC overlap throughput as a ratio against the same run's
+        # baseline window. This is more stable than comparing absolute numbers
+        # across shared CI runners.
+        min_overlap_ratio = bl.get("min_overlap_vs_baseline")
+        baseline_handler = metadata.get("baseline_handler_per_s")
+        overlap_handler = metadata.get("overlap_handler_per_s")
+        if (
+            min_overlap_ratio is not None
+            and baseline_handler
+            and overlap_handler is not None
+        ):
+            actual_ratio = overlap_handler / baseline_handler
+            passed = actual_ratio >= min_overlap_ratio
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="overlap_vs_baseline",
+                baseline=f">={min_overlap_ratio:.2f}",
+                actual=f"{actual_ratio:.2f}",
+                passed=passed,
+            )
+
+        min_cooldown_ratio = bl.get("min_cooldown_vs_baseline")
+        cooldown_handler = metadata.get("cooldown_handler_per_s")
+        if (
+            min_cooldown_ratio is not None
+            and baseline_handler
+            and cooldown_handler is not None
+        ):
+            actual_ratio = cooldown_handler / baseline_handler
+            passed = actual_ratio >= min_cooldown_ratio
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="cooldown_vs_baseline",
+                baseline=f">={min_cooldown_ratio:.2f}",
+                actual=f"{actual_ratio:.2f}",
+                passed=passed,
+            )
+
+        max_dead_tup_delta = bl.get("max_dead_tup_delta")
+        dead_tup_delta = metadata.get("dead_tup_delta")
+        if max_dead_tup_delta is not None and dead_tup_delta is not None:
+            passed = dead_tup_delta <= max_dead_tup_delta
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="dead_tup_delta",
+                baseline=f"<={max_dead_tup_delta:.0f}",
+                actual=f"{dead_tup_delta:.0f}",
+                passed=passed,
+            )
+
+        max_available = bl.get("max_available")
+        actual_max_available = metadata.get("max_available")
+        if max_available is not None and actual_max_available is not None:
+            passed = actual_max_available <= max_available
+            add_row(
+                rows,
+                failures,
+                scenario=scenario,
+                metric="max_available",
+                baseline=f"<={max_available:.0f}",
+                actual=f"{actual_max_available:.0f}",
+                passed=passed,
+            )
 
     return rows, failures
 

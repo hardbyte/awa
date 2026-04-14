@@ -443,7 +443,7 @@ impl MaintenanceService {
     /// Rescue jobs with stale heartbeats (crash detection).
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
-        let staleness_str = format!("{} seconds", self.heartbeat_staleness.as_secs());
+        let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
         match sqlx::query_as::<_, JobRow>(
             r#"
             UPDATE awa.jobs
@@ -465,14 +465,14 @@ impl MaintenanceService {
             WHERE id IN (
                 SELECT id FROM awa.jobs_hot
                 WHERE state = 'running'
-                  AND heartbeat_at < now() - $1::interval
+                  AND heartbeat_at < now() - ($1 * interval '1 millisecond')
                 LIMIT 500
                 FOR UPDATE SKIP LOCKED
             )
             RETURNING *
             "#,
         )
-        .bind(&staleness_str)
+        .bind(staleness_ms)
         .fetch_all(&self.pool)
         .await
         {

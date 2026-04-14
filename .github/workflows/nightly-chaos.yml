@@ -3,6 +3,7 @@ name: Nightly Chaos And Benchmarks
 on:
   schedule:
     - cron: "0 6 * * *"
+    - cron: "0 8 * * 0"
   workflow_dispatch:
 
 env:
@@ -40,7 +41,7 @@ jobs:
         shell: bash
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test
@@ -123,6 +124,37 @@ jobs:
           cargo test --release --package awa --test concurrent_lifecycle_test \
             test_concurrent_queue_sweep -- --exact --ignored --nocapture \
             | tee artifacts/nightly/rust-queue-sweep.txt
+      - name: Run MVCC horizon overlap benchmark
+        if: always()
+        timeout-minutes: 10
+        continue-on-error: true
+        env:
+          AWA_MVCC_POOL_MAX: "24"
+          AWA_MVCC_ANALYTICS_POOL_MAX: "4"
+          AWA_MVCC_JOB_RATE: "400"
+          AWA_MVCC_BASELINE_SECS: "5"
+          AWA_MVCC_OVERLAP_SECS: "12"
+          AWA_MVCC_COOLDOWN_SECS: "5"
+          AWA_MVCC_OVERLAP_READERS: "2"
+          AWA_MVCC_OVERLAP_HOLD_SECS: "12"
+          AWA_MVCC_OVERLAP_STAGGER_SECS: "4"
+          AWA_MVCC_READER_MODE: "active_scan"
+          AWA_MVCC_ANALYTICS_TICK_MS: "500"
+          AWA_MVCC_WORKERS: "32"
+        run: |
+          set -o pipefail
+          cargo test --release --package awa --test scheduling_benchmark_test \
+            test_mvcc_horizon_overlap_benchmark -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-mvcc-horizon.txt
+      - name: Run MVCC horizon soak benchmark
+        if: always() && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 0')
+        timeout-minutes: 30
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          cargo test --release --package awa --test scheduling_benchmark_test \
+            test_mvcc_horizon_planetscale_soak -- --exact --ignored --nocapture \
+            | tee artifacts/nightly/rust-mvcc-soak.txt
       - name: Check for regressions
         if: always()
         run: python .github/scripts/check-bench-regression.py artifacts/nightly benchmarks/baseline.json
@@ -139,7 +171,7 @@ jobs:
     timeout-minutes: 45
     services:
       postgres:
-        image: postgres:17-alpine
+        image: postgres:18-alpine
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: awa_test

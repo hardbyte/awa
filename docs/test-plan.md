@@ -243,7 +243,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 
 ```bash
 # Start Postgres
-docker run -d --name awa-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test -p 15432:5432 postgres:17-alpine
+docker run -d --name awa-pg -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test -p 15432:5432 postgres:18-alpine
 
 # Rust tests (unit + integration + scale + validation)
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --workspace
@@ -283,6 +283,9 @@ DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --pack
 
 # Stale-heartbeat rescue benchmark
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test failure_benchmark_test test_failure_bench_stale_heartbeat_rescue -- --exact --ignored --nocapture
+
+# MVCC horizon overlap benchmark
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --release --package awa --test scheduling_benchmark_test test_mvcc_horizon_overlap_benchmark -- --exact --ignored --nocapture
 
 # Python failure-mode benchmarks
 cd awa-python && PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test uv run python scripts/benchmark_runtime.py --scenario failures

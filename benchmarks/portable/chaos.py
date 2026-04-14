@@ -25,6 +25,7 @@ PG_PORT = 15555
 PG_USER = "bench"
 PG_PASS = "bench"
 DB_URL_TPL = f"postgres://{PG_USER}:{PG_PASS}@localhost:{PG_PORT}/{{}}"
+DEFAULT_PG_IMAGE = "postgres:17-alpine"
 
 PORTABLE_SYSTEMS = [
     "awa",
@@ -72,18 +73,39 @@ def wait_pg_ready(timeout: int = 30):
             time.sleep(0.5)
     raise RuntimeError("Postgres not ready")
 
-def start_postgres():
-    subprocess.run(
-        ["docker", "compose", "up", "-d", "--wait"],
-        cwd=str(SCRIPT_DIR), capture_output=True, timeout=60,
+def compose_env(pg_image: str) -> dict[str, str]:
+    return {**os.environ, "POSTGRES_IMAGE": pg_image}
+
+def run_compose(
+    args: list[str], *, pg_image: str, timeout: int | None = None
+) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(
+        ["docker", "compose", *args],
+        cwd=str(SCRIPT_DIR),
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        env=compose_env(pg_image),
     )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"docker compose {' '.join(args)} failed with exit {result.returncode}\n"
+            f"stdout:\n{result.stdout}\n"
+            f"stderr:\n{result.stderr}"
+        )
+    return result
+
+def start_postgres():
+    pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
+    run_compose(["up", "-d", "--wait"], pg_image=pg_image, timeout=60)
     wait_pg_ready()
 
 def stop_postgres():
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=str(SCRIPT_DIR), capture_output=True,
-    )
+    pg_image = os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE)
+    try:
+        run_compose(["down", "-v"], pg_image=pg_image, timeout=30)
+    except Exception as exc:
+        print(f"WARNING: docker compose down failed during teardown: {exc}", file=sys.stderr)
 
 def reset_db(db: str):
     # Drop both public and awa schemas (Awa uses awa.*, River/Oban use public.*)
@@ -492,9 +514,10 @@ def scenario_postgres_restart(system: str, job_count: int = 10) -> dict:
     # Restart Postgres
     restart_time = time.time()
     print(f"  [{system}] Restarting Postgres...", file=sys.stderr)
-    subprocess.run(
-        ["docker", "compose", "restart", "postgres"],
-        cwd=str(SCRIPT_DIR), capture_output=True, timeout=30,
+    run_compose(
+        ["restart", "postgres"],
+        pg_image=os.environ.get("POSTGRES_IMAGE", DEFAULT_PG_IMAGE),
+        timeout=30,
     )
     wait_pg_ready(timeout=30)
     pg_downtime = time.time() - restart_time
@@ -1355,7 +1378,10 @@ def main():
     parser.add_argument("--systems", default=",".join(PORTABLE_SYSTEMS))
     parser.add_argument("--job-count", type=int, default=10)
     parser.add_argument("--keep-pg", action="store_true")
+    parser.add_argument("--pg-image", default=DEFAULT_PG_IMAGE)
     args = parser.parse_args()
+    pg_image = os.environ.get("POSTGRES_IMAGE") or args.pg_image
+    os.environ["POSTGRES_IMAGE"] = pg_image
 
     systems = [s.strip() for s in args.systems.split(",")]
     scenarios = {
@@ -1394,7 +1420,21 @@ def main():
         result_file = SCRIPT_DIR / "results" / f"chaos_{ts}.json"
         result_file.parent.mkdir(exist_ok=True)
         with open(result_file, "w") as f:
-            json.dump(all_results, f, indent=2)
+            json.dump(
+                {
+                    "timestamp": ts,
+                    "config": {
+                        "systems": systems,
+                        "job_count": args.job_count,
+                        "scenario": args.scenario,
+                        "suite": args.suite,
+                        "pg_image": pg_image,
+                    },
+                    "results": all_results,
+                },
+                f,
+                indent=2,
+            )
         print(f"\nResults saved to {result_file}", file=sys.stderr)
 
         if all_results:

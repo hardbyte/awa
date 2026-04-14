@@ -32,6 +32,12 @@
   "rust/stale_heartbeat_rescue": {
     "handler_per_s": 160.3
   },
+  "rust/mvcc_horizon_overlap": {
+    "min_overlap_vs_baseline": 0.75,
+    "min_cooldown_vs_baseline": 0.75,
+    "max_dead_tup_delta": 60000,
+    "max_available": 2000
+  },
   "python/copy": {
     "enqueue_per_s": 17804.8
   },
