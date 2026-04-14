@@ -135,8 +135,10 @@ $$ LANGUAGE sql IMMUTABLE;
 CREATE FUNCTION awa.backoff_duration(attempt SMALLINT, max_attempts SMALLINT)
 RETURNS interval AS $$
     SELECT LEAST(
-        (power(2, attempt)::int || ' seconds')::interval
-            + (random() * power(2, attempt) * 0.25 || ' seconds')::interval,
+        make_interval(secs => power(2::double precision, attempt::double precision))
+            + make_interval(
+                secs => random() * power(2::double precision, attempt::double precision) * 0.25
+            ),
         interval '24 hours'
     );
 $$ LANGUAGE sql VOLATILE;

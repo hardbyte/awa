@@ -724,6 +724,28 @@ async fn t18_backoff_timing() {
     assert_eq!(errors.len(), 5, "Should have 5 error entries");
 }
 
+#[tokio::test]
+async fn t18b_backoff_duration_handles_subsecond_jitter() {
+    let pool = setup().await;
+
+    // The previous implementation built intervals by string-casting floats,
+    // which intermittently produced scientific notation and failed to parse.
+    sqlx::raw_sql(
+        r#"
+        DO $$
+        BEGIN
+            FOR i IN 1..50000 LOOP
+                PERFORM awa.backoff_duration(1::smallint, 5::smallint);
+            END LOOP;
+        END;
+        $$;
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("backoff_duration should handle sub-second jitter without parse errors");
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // T19: Snooze Semantics
 // ═══════════════════════════════════════════════════════════════════════

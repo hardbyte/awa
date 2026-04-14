@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 6;
+pub const CURRENT_VERSION: i32 = 7;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -29,6 +29,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Dirty-key statement triggers for deadlock-free admin metadata",
         &[V6_UP],
     ),
+    (
+        7,
+        "Backoff interval creation avoids scientific-notation parse failures",
+        &[V7_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -37,6 +42,7 @@ const V3_UP: &str = include_str!("../migrations/v003_maintenance_health.sql");
 const V4_UP: &str = include_str!("../migrations/v004_admin_metadata.sql");
 const V5_UP: &str = include_str!("../migrations/v005_admin_metadata_stmt_triggers.sql");
 const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.sql");
+const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
