@@ -77,11 +77,15 @@ CREATE INDEX IF NOT EXISTS idx_awa_jobs_dlq_tags
 --
 -- Runs in a single statement so the DELETE and INSERT commit together.
 -- Returns the new jobs_dlq row on success, NULL otherwise.
+--
+-- `p_progress` lets the caller preserve the handler's final progress snapshot
+-- (otherwise checkpoint visibility would be lost when a poison job is DLQ'd).
 CREATE OR REPLACE FUNCTION awa.move_to_dlq_guarded(
     p_job_id     BIGINT,
     p_run_lease  BIGINT,
     p_reason     TEXT,
-    p_error      JSONB
+    p_error      JSONB,
+    p_progress   JSONB
 ) RETURNS SETOF awa.jobs_dlq AS $$
     WITH moved AS (
         DELETE FROM awa.jobs_hot
@@ -125,7 +129,7 @@ CREATE OR REPLACE FUNCTION awa.move_to_dlq_guarded(
         NULL,
         NULL,
         0,
-        NULL,
+        p_progress,
         p_reason,
         now(),
         p_run_lease

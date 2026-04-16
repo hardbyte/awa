@@ -821,12 +821,13 @@ async fn apply_terminal_failure(
         // guard that the in-place UPDATE below uses, so concurrent rescue
         // wins the same way.
         let moved: Option<awa_model::dlq::DlqRow> = sqlx::query_as(
-            "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4)",
+            "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4, $5)",
         )
         .bind(job.id)
         .bind(job.run_lease)
         .bind(dlq_reason)
         .bind(&error_json)
+        .bind(progress_snapshot)
         .fetch_optional(pool)
         .await?;
 
@@ -841,13 +842,39 @@ async fn apply_terminal_failure(
         metrics.record_dlq_moved(&job.kind, &job.queue, dlq_reason);
 
         if needs_event {
-            // Convert the DLQ row back into a JobRow for the lifecycle event.
-            // The DLQ row carries identical job-level fields plus DLQ metadata.
-            let mut updated_job = job.clone();
-            updated_job.state = dlq_row.state;
-            updated_job.finalized_at = dlq_row.finalized_at;
-            updated_job.errors = dlq_row.errors;
-            updated_job.progress = progress_snapshot.cloned();
+            // Reconstruct a JobRow from the DLQ row so lifecycle handlers see
+            // the post-finalisation state (run_lease=0, NULL heartbeat/deadline/
+            // callbacks, updated errors + preserved progress) rather than the
+            // pre-claim snapshot.
+            let updated_job = JobRow {
+                id: dlq_row.id,
+                kind: dlq_row.kind,
+                queue: dlq_row.queue,
+                args: dlq_row.args,
+                state: dlq_row.state,
+                priority: dlq_row.priority,
+                attempt: dlq_row.attempt,
+                run_lease: dlq_row.run_lease,
+                max_attempts: dlq_row.max_attempts,
+                run_at: dlq_row.run_at,
+                heartbeat_at: dlq_row.heartbeat_at,
+                deadline_at: dlq_row.deadline_at,
+                attempted_at: dlq_row.attempted_at,
+                finalized_at: dlq_row.finalized_at,
+                created_at: dlq_row.created_at,
+                errors: dlq_row.errors,
+                metadata: dlq_row.metadata,
+                tags: dlq_row.tags,
+                unique_key: dlq_row.unique_key,
+                unique_states: dlq_row.unique_states,
+                callback_id: dlq_row.callback_id,
+                callback_timeout_at: dlq_row.callback_timeout_at,
+                callback_filter: dlq_row.callback_filter,
+                callback_on_complete: dlq_row.callback_on_complete,
+                callback_on_fail: dlq_row.callback_on_fail,
+                callback_transform: dlq_row.callback_transform,
+                progress: dlq_row.progress,
+            };
             return Ok(CompletionOutcome::Applied {
                 event: Some(UntypedJobEvent::Exhausted {
                     job: updated_job,

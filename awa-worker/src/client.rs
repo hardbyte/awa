@@ -418,6 +418,12 @@ impl ClientBuilder {
     /// are atomically moved into `awa.jobs_dlq` instead of staying in
     /// `jobs_hot`. Use `queue_dlq_enabled` to override per-queue.
     ///
+    /// Note: the rescue paths (stale-heartbeat, deadline, callback-timeout)
+    /// still transition through `jobs_hot` first — callback-timeout can reach
+    /// `failed` in `jobs_hot` when attempts are exhausted. Operators can move
+    /// those rows into the DLQ on demand via `bulk_move_failed_to_dlq` or the
+    /// `awa dlq move` CLI. A future maintenance task may automate this.
+    ///
     /// Defaults to `false` — existing deployments observe no behavior change
     /// on upgrade until they opt in. See issue #109 for rollout notes.
     pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {

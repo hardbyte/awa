@@ -97,12 +97,13 @@ async fn test_move_to_dlq_guarded_happy_path() {
     .unwrap();
 
     let dlq_row: Option<awa::DlqRow> = sqlx::query_as(
-        "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb)",
+        "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb, $5::jsonb)",
     )
     .bind(job.id)
     .bind(42_i64)
     .bind("terminal_error")
     .bind(serde_json::json!({"error": "boom", "attempt": 1, "terminal": true}))
+    .bind(serde_json::json!({"checkpoint": "step3"}))
     .fetch_optional(pool)
     .await
     .unwrap();
@@ -111,6 +112,11 @@ async fn test_move_to_dlq_guarded_happy_path() {
     assert_eq!(dlq_row.id, job.id);
     assert_eq!(dlq_row.dlq_reason, "terminal_error");
     assert_eq!(dlq_row.original_run_lease, 42);
+    assert_eq!(
+        dlq_row.progress,
+        Some(serde_json::json!({"checkpoint": "step3"})),
+        "final handler progress should be preserved in the DLQ row"
+    );
 
     let remaining: i64 =
         sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_hot WHERE id = $1")
@@ -153,12 +159,13 @@ async fn test_move_to_dlq_guarded_rejects_stale_lease() {
 
     // Call with the wrong lease (simulating a rescue that bumped it in the meantime)
     let dlq_row: Option<awa::DlqRow> = sqlx::query_as(
-        "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb)",
+        "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb, $5::jsonb)",
     )
     .bind(job.id)
     .bind(99_i64) // wrong
     .bind("should_not_move")
     .bind(serde_json::json!({}))
+    .bind::<Option<serde_json::Value>>(None)
     .fetch_optional(pool)
     .await
     .unwrap();
