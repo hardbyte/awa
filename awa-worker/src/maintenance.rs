@@ -1,3 +1,4 @@
+use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
 use awa_model::cron::{atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow};
 use awa_model::{JobRow, PeriodicJob};
@@ -68,6 +69,9 @@ pub struct MaintenanceService {
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
     descriptor_retention: Duration,
+    dlq_retention: Duration,
+    dlq_cleanup_batch_size: i64,
+    dlq_policy: DlqPolicy,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -110,7 +114,30 @@ impl MaintenanceService {
             metadata_reconciliation_interval: Duration::from_secs(60),
             priority_aging_interval: Duration::from_secs(60),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
+            dlq_retention: Duration::from_secs(60 * 60 * 24 * 30), // 30 days
+            dlq_cleanup_batch_size: 1000,
+            dlq_policy: DlqPolicy::default(),
         }
+    }
+
+    /// Per-queue DLQ policy used to decide whether callback-timeout rescues on
+    /// exhausted attempts should be routed into `jobs_dlq` instead of leaving
+    /// the row in `jobs_hot` as `failed`.
+    pub(crate) fn dlq_policy(mut self, policy: DlqPolicy) -> Self {
+        self.dlq_policy = policy;
+        self
+    }
+
+    /// Set retention for DLQ rows (default: 30 days).
+    pub fn dlq_retention(mut self, retention: Duration) -> Self {
+        self.dlq_retention = retention;
+        self
+    }
+
+    /// Set the maximum number of DLQ rows deleted per cleanup pass (default: 1000).
+    pub fn dlq_cleanup_batch_size(mut self, batch_size: i64) -> Self {
+        self.dlq_cleanup_batch_size = batch_size;
+        self
     }
 
     /// Set the priority aging interval (default: 60s).
@@ -320,6 +347,7 @@ impl MaintenanceService {
                         self.cleanup_completed().await;
                         self.cleanup_stale_runtime_snapshots().await;
                         self.cleanup_stale_descriptors().await;
+                        self.cleanup_dlq_rows().await;
                     }
                     _ = cron_sync_timer.tick() => {
                         self.sync_periodic_jobs_to_db().await;
@@ -1086,6 +1114,43 @@ impl MaintenanceService {
             if let Some(lag_seconds) = queue_stat.lag_seconds {
                 self.metrics.record_queue_lag(queue, lag_seconds);
             }
+        }
+
+        // DLQ depth — separate query because DLQ lives outside queue_stats.
+        match awa_model::dlq::dlq_depth_by_queue(&self.pool).await {
+            Ok(depths) => {
+                for (queue, count) in depths {
+                    self.metrics.record_dlq_depth(&queue, count);
+                }
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to query DLQ depth for metrics");
+            }
+        }
+    }
+
+    /// Delete DLQ rows older than `dlq_retention`.
+    ///
+    /// DLQ rows live in a separate table (`awa.jobs_dlq`) that the hot-path
+    /// claim loop never touches, so DLQ retention is independent of the
+    /// `failed_retention` policy and typically runs much longer (default 30d).
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup_dlq")]
+    async fn cleanup_dlq_rows(&self) {
+        match awa_model::dlq::cleanup_dlq(
+            &self.pool,
+            self.dlq_retention,
+            self.dlq_cleanup_batch_size,
+        )
+        .await
+        {
+            Ok(count) if count > 0 => {
+                self.metrics.record_dlq_purged(None, count);
+                tracing::debug!(count, "Cleaned up expired DLQ rows");
+            }
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to clean up DLQ rows");
+            }
+            _ => {}
         }
     }
 }

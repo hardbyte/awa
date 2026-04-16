@@ -1,7 +1,7 @@
 use crate::completion::CompletionBatcher;
 use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
 use crate::events::{BoxedUntypedEventHandler, JobEvent, UntypedJobEvent};
-use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
+use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
@@ -104,6 +104,10 @@ pub struct ClientBuilder {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
+    dlq_enabled_by_default: bool,
+    dlq_retention: Option<Duration>,
+    dlq_cleanup_batch_size: Option<i64>,
+    dlq_overrides: HashMap<String, bool>,
 }
 
 impl ClientBuilder {
@@ -134,6 +138,10 @@ impl ClientBuilder {
             queue_retention_overrides: HashMap::new(),
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
+            dlq_enabled_by_default: false,
+            dlq_retention: None,
+            dlq_cleanup_batch_size: None,
+            dlq_overrides: HashMap::new(),
         }
     }
 
@@ -404,6 +412,40 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable or disable Dead Letter Queue routing by default for every queue.
+    ///
+    /// When enabled, jobs that exhaust `max_attempts` or hit a terminal error
+    /// are atomically moved into `awa.jobs_dlq` instead of staying in
+    /// `jobs_hot`. Use `queue_dlq_enabled` to override per-queue.
+    ///
+    /// Defaults to `false` — existing deployments observe no behavior change
+    /// on upgrade until they opt in. See issue #109 for rollout notes.
+    pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {
+        self.dlq_enabled_by_default = enabled;
+        self
+    }
+
+    /// Enable or disable DLQ routing for a single queue, overriding the default.
+    pub fn queue_dlq_enabled(mut self, queue: impl Into<String>, enabled: bool) -> Self {
+        self.dlq_overrides.insert(queue.into(), enabled);
+        self
+    }
+
+    /// Retention for DLQ rows before the cleanup task deletes them.
+    ///
+    /// Defaults to 30 days, which intentionally outlasts the standard failed
+    /// retention (72h) so operators have time to investigate poison jobs.
+    pub fn dlq_retention(mut self, retention: Duration) -> Self {
+        self.dlq_retention = Some(retention);
+        self
+    }
+
+    /// Maximum number of DLQ rows deleted per cleanup pass (default: 1000).
+    pub fn dlq_cleanup_batch_size(mut self, batch_size: i64) -> Self {
+        self.dlq_cleanup_batch_size = Some(batch_size);
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -496,6 +538,11 @@ impl ClientBuilder {
                 .collect(),
         );
 
+        let dlq_policy = DlqPolicy {
+            enabled_default: self.dlq_enabled_by_default,
+            overrides: Arc::new(self.dlq_overrides),
+        };
+
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
@@ -540,6 +587,9 @@ impl ClientBuilder {
             runtime_hostname: std::env::var("HOSTNAME").ok(),
             runtime_pid: std::process::id() as i32,
             runtime_version: env!("CARGO_PKG_VERSION"),
+            dlq_policy,
+            dlq_retention: self.dlq_retention,
+            dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
         })
     }
 }
@@ -626,6 +676,9 @@ pub struct Client {
     runtime_hostname: Option<String>,
     runtime_pid: i32,
     runtime_version: &'static str,
+    dlq_policy: DlqPolicy,
+    dlq_retention: Option<Duration>,
+    dlq_cleanup_batch_size: Option<i64>,
 }
 
 #[derive(Clone)]
@@ -763,6 +816,7 @@ impl Client {
             self.state.clone(),
             self.metrics.clone(),
             completion_handle,
+            self.dlq_policy.clone(),
         ));
 
         let mut service_handles = self.service_handles.write().await;
@@ -833,6 +887,13 @@ impl Client {
         if let Some(interval) = self.queue_stats_interval {
             maintenance = maintenance.queue_stats_interval(interval);
         }
+        if let Some(retention) = self.dlq_retention {
+            maintenance = maintenance.dlq_retention(retention);
+        }
+        if let Some(batch_size) = self.dlq_cleanup_batch_size {
+            maintenance = maintenance.dlq_cleanup_batch_size(batch_size);
+        }
+        maintenance = maintenance.dlq_policy(self.dlq_policy.clone());
         service_handles.push(tokio::spawn(async move {
             maintenance.run().await;
         }));

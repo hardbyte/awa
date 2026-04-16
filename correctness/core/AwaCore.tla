@@ -7,7 +7,7 @@ Queues == {"q1"}
 QueueOf == [j \in Jobs |-> "q1"]
 WorkerQueue == [w \in Workers |-> "q1"]
 
-JobStates == {"available", "running", "retryable", "completed", "failed", "cancelled"}
+JobStates == {"available", "running", "retryable", "completed", "failed", "cancelled", "dlq"}
 FinalStates == {"retryable", "completed", "failed", "cancelled"}
 NoOwner == "no_owner"
 MaxLease == 2
@@ -50,6 +50,31 @@ FinalizeAccepted(w, j, toState) ==
     /\ owner' = [owner EXCEPT ![j] = NoOwner]
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ UNCHANGED <<lease, cancelFlag, shutdownPhase>>
+
+\* Atomic, lease-guarded move to DLQ. Mirrors the SQL helper
+\* `awa.move_to_dlq_guarded` in migration v008: succeeds only when the task's
+\* snapshot lease still matches the row's lease and the state is still running.
+\* Unlike FinalizeAccepted this transitions directly to the absorbing "dlq"
+\* state, bypassing the normal "failed" retention. Rescue/AdminCancel racing
+\* against this move continue to win because this transition requires the same
+\* lease guard.
+MoveToDlqAccepted(w, j) ==
+    /\ jobState[j] = "running"
+    /\ owner[j] = w
+    /\ taskLease[w][j] = lease[j]
+    /\ jobState' = [jobState EXCEPT ![j] = "dlq"]
+    /\ owner' = [owner EXCEPT ![j] = NoOwner]
+    /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
+    /\ UNCHANGED <<lease, cancelFlag, shutdownPhase>>
+
+\* Retry from DLQ — revives the job back to available with a fresh lease epoch.
+\* Modeled as an atomic admin action; in the implementation this is the atomic
+\* DELETE-from-jobs_dlq + INSERT-into-jobs_hot CTE in awa_model::dlq.
+RetryFromDlq(j) ==
+    /\ jobState[j] = "dlq"
+    /\ lease[j] < MaxLease
+    /\ jobState' = [jobState EXCEPT ![j] = "available"]
+    /\ UNCHANGED <<owner, lease, taskLease, cancelFlag, shutdownPhase>>
 
 FinalizeRejected(w, j, toState) ==
     /\ toState \in FinalStates
@@ -112,9 +137,11 @@ Next ==
     \/ \E w \in Workers, j \in Jobs : StartTask(w, j)
     \/ \E w \in Workers, j \in Jobs, s \in FinalStates : FinalizeAccepted(w, j, s)
     \/ \E w \in Workers, j \in Jobs, s \in FinalStates : FinalizeRejected(w, j, s)
+    \/ \E w \in Workers, j \in Jobs : MoveToDlqAccepted(w, j)
     \/ \E j \in Jobs : Rescue(j)
     \/ \E j \in Jobs : Promote(j)
     \/ \E j \in Jobs : AdminCancel(j)
+    \/ \E j \in Jobs : RetryFromDlq(j)
     \/ ShutdownBegin
     \/ EnterDraining
     \/ FinishShutdown

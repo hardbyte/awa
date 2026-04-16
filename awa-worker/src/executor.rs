@@ -141,6 +141,28 @@ enum CompletionOutcome {
     IgnoredStale,
 }
 
+/// Per-queue DLQ policy resolved at `Client::start`.
+///
+/// `enabled_default` controls the fallback for queues without an explicit
+/// override, and `overrides` holds per-queue decisions. When enabled for a
+/// queue, the executor routes terminal failures (Terminal errors + exhausted
+/// retries) through `awa.move_to_dlq_guarded` instead of updating the
+/// failed state in `jobs_hot`.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct DlqPolicy {
+    pub enabled_default: bool,
+    pub overrides: Arc<HashMap<String, bool>>,
+}
+
+impl DlqPolicy {
+    pub fn enabled_for(&self, queue: &str) -> bool {
+        self.overrides
+            .get(queue)
+            .copied()
+            .unwrap_or(self.enabled_default)
+    }
+}
+
 /// Manages job execution — spawns worker futures and tracks in-flight jobs.
 pub struct JobExecutor {
     pool: PgPool,
@@ -151,6 +173,7 @@ pub struct JobExecutor {
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
     metrics: crate::metrics::AwaMetrics,
     completion_batcher: CompletionBatcherHandle,
+    dlq_policy: DlqPolicy,
 }
 
 impl JobExecutor {
@@ -164,6 +187,7 @@ impl JobExecutor {
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         metrics: crate::metrics::AwaMetrics,
         completion_batcher: CompletionBatcherHandle,
+        dlq_policy: DlqPolicy,
     ) -> Self {
         Self {
             pool,
@@ -174,6 +198,7 @@ impl JobExecutor {
             state,
             metrics,
             completion_batcher,
+            dlq_policy,
         }
     }
 
@@ -193,6 +218,7 @@ impl JobExecutor {
         let state = self.state.clone();
         let metrics = self.metrics.clone();
         let completion_batcher = self.completion_batcher.clone();
+        let dlq_policy = self.dlq_policy.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -256,6 +282,7 @@ impl JobExecutor {
             // Complete the job based on the result, then record metrics
             // only if the state transition actually happened (not stale).
             let has_lifecycle_handlers = lifecycle_handlers.contains_key(&job_kind);
+            let dlq_enabled = dlq_policy.enabled_for(&job_queue);
             let outcome = complete_job(
                 &pool,
                 &job,
@@ -264,6 +291,8 @@ impl JobExecutor {
                 progress_snapshot,
                 duration,
                 has_lifecycle_handlers,
+                dlq_enabled,
+                &metrics,
             )
             .await;
 
@@ -348,6 +377,7 @@ impl JobExecutor {
 ///
 /// Returns a `CompletionOutcome` indicating whether the state transition was
 /// applied (with an optional lifecycle event) or ignored as stale.
+#[allow(clippy::too_many_arguments)]
 async fn complete_job(
     pool: &PgPool,
     job: &JobRow,
@@ -356,6 +386,8 @@ async fn complete_job(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
+    dlq_enabled: bool,
+    metrics: &crate::metrics::AwaMetrics,
 ) -> Result<CompletionOutcome, AwaError> {
     match result {
         Ok(JobResult::Completed) => {
@@ -624,49 +656,24 @@ async fn complete_job(
                 error = %msg,
                 "Job failed terminally"
             );
-            let result = sqlx::query(
-                r#"
-                UPDATE awa.jobs
-                SET state = 'failed',
-                    finalized_at = now(),
-                    errors = errors || $2::jsonb,
-                    progress = $4
-                WHERE id = $1 AND state = 'running' AND run_lease = $3
-                "#,
-            )
-            .bind(job.id)
-            .bind(serde_json::json!({
+            let error_json = serde_json::json!({
                 "error": msg.to_string(),
                 "attempt": job.attempt,
                 "at": chrono::Utc::now().to_rfc3339(),
                 "terminal": true
-            }))
-            .bind(job.run_lease)
-            .bind(&progress_snapshot)
-            .execute(pool)
-            .await?;
-            if result.rows_affected() == 0 {
-                warn!(
-                    job_id = job.id,
-                    "Job already rescued/cancelled, terminal failure ignored"
-                );
-                return Ok(CompletionOutcome::IgnoredStale);
-            }
-            if needs_event {
-                let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                    .bind(job.id)
-                    .fetch_one(pool)
-                    .await?;
-                Ok(CompletionOutcome::Applied {
-                    event: Some(UntypedJobEvent::Exhausted {
-                        job: updated_job,
-                        error: msg.clone(),
-                        attempt: job.attempt,
-                    }),
-                })
-            } else {
-                Ok(CompletionOutcome::Applied { event: None })
-            }
+            });
+            apply_terminal_failure(
+                pool,
+                job,
+                error_json,
+                progress_snapshot.as_ref(),
+                dlq_enabled,
+                "terminal_error",
+                msg,
+                needs_event,
+                metrics,
+            )
+            .await
         }
 
         Err(JobError::Retryable(err)) => {
@@ -681,49 +688,23 @@ async fn complete_job(
                     error = %error_msg,
                     "Job failed (max attempts exhausted)"
                 );
-                let result = sqlx::query(
-                    r#"
-                    UPDATE awa.jobs
-                    SET state = 'failed',
-                        finalized_at = now(),
-                        errors = errors || $2::jsonb,
-                        progress = $4
-                    WHERE id = $1 AND state = 'running' AND run_lease = $3
-                    "#,
-                )
-                .bind(job.id)
-                .bind(serde_json::json!({
+                let error_json = serde_json::json!({
                     "error": error_msg,
                     "attempt": job.attempt,
                     "at": chrono::Utc::now().to_rfc3339()
-                }))
-                .bind(job.run_lease)
-                .bind(&progress_snapshot)
-                .execute(pool)
-                .await?;
-                if result.rows_affected() == 0 {
-                    warn!(
-                        job_id = job.id,
-                        "Job already rescued/cancelled, failure ignored"
-                    );
-                    return Ok(CompletionOutcome::IgnoredStale);
-                }
-                if needs_event {
-                    let updated_job: JobRow =
-                        sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-                            .bind(job.id)
-                            .fetch_one(pool)
-                            .await?;
-                    Ok(CompletionOutcome::Applied {
-                        event: Some(UntypedJobEvent::Exhausted {
-                            job: updated_job,
-                            error: error_msg,
-                            attempt: job.attempt,
-                        }),
-                    })
-                } else {
-                    Ok(CompletionOutcome::Applied { event: None })
-                }
+                });
+                apply_terminal_failure(
+                    pool,
+                    job,
+                    error_json,
+                    progress_snapshot.as_ref(),
+                    dlq_enabled,
+                    "max_attempts_exhausted",
+                    &error_msg,
+                    needs_event,
+                    metrics,
+                )
+                .await
             } else {
                 warn!(
                     job_id = job.id,
@@ -814,6 +795,107 @@ async fn dispatch_lifecycle_event(
             }
         }
     }
+}
+
+/// Apply a terminal failure — either route the job into the DLQ (when enabled
+/// for this queue) or mark it `failed` in place. Both paths are lease-guarded.
+///
+/// Stale outcomes (another rescue or cancel won the race) return
+/// `CompletionOutcome::IgnoredStale` so dispatchers skip lifecycle events and
+/// duplicate metrics.
+#[allow(clippy::too_many_arguments)]
+async fn apply_terminal_failure(
+    pool: &PgPool,
+    job: &JobRow,
+    error_json: serde_json::Value,
+    progress_snapshot: Option<&serde_json::Value>,
+    dlq_enabled: bool,
+    dlq_reason: &str,
+    error_msg: &str,
+    needs_event: bool,
+    metrics: &crate::metrics::AwaMetrics,
+) -> Result<CompletionOutcome, AwaError> {
+    if dlq_enabled {
+        // Atomic, lease-guarded move from jobs_hot to jobs_dlq. The SQL
+        // function uses the same (state='running' AND run_lease=lease)
+        // guard that the in-place UPDATE below uses, so concurrent rescue
+        // wins the same way.
+        let moved: Option<awa_model::dlq::DlqRow> = sqlx::query_as(
+            "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4)",
+        )
+        .bind(job.id)
+        .bind(job.run_lease)
+        .bind(dlq_reason)
+        .bind(&error_json)
+        .fetch_optional(pool)
+        .await?;
+
+        let Some(dlq_row) = moved else {
+            warn!(
+                job_id = job.id,
+                "Job already rescued/cancelled, DLQ move ignored"
+            );
+            return Ok(CompletionOutcome::IgnoredStale);
+        };
+
+        metrics.record_dlq_moved(&job.kind, &job.queue, dlq_reason);
+
+        if needs_event {
+            // Convert the DLQ row back into a JobRow for the lifecycle event.
+            // The DLQ row carries identical job-level fields plus DLQ metadata.
+            let mut updated_job = job.clone();
+            updated_job.state = dlq_row.state;
+            updated_job.finalized_at = dlq_row.finalized_at;
+            updated_job.errors = dlq_row.errors;
+            updated_job.progress = progress_snapshot.cloned();
+            return Ok(CompletionOutcome::Applied {
+                event: Some(UntypedJobEvent::Exhausted {
+                    job: updated_job,
+                    error: error_msg.to_string(),
+                    attempt: job.attempt,
+                }),
+            });
+        }
+        return Ok(CompletionOutcome::Applied { event: None });
+    }
+
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET state = 'failed',
+            finalized_at = now(),
+            errors = errors || $2::jsonb,
+            progress = $4
+        WHERE id = $1 AND state = 'running' AND run_lease = $3
+        "#,
+    )
+    .bind(job.id)
+    .bind(&error_json)
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .execute(pool)
+    .await?;
+    if result.rows_affected() == 0 {
+        warn!(
+            job_id = job.id,
+            "Job already rescued/cancelled, terminal failure ignored"
+        );
+        return Ok(CompletionOutcome::IgnoredStale);
+    }
+    if needs_event {
+        let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await?;
+        return Ok(CompletionOutcome::Applied {
+            event: Some(UntypedJobEvent::Exhausted {
+                job: updated_job,
+                error: error_msg.to_string(),
+                attempt: job.attempt,
+            }),
+        });
+    }
+    Ok(CompletionOutcome::Applied { event: None })
 }
 
 async fn direct_complete_job(pool: &PgPool, job: &JobRow) -> Result<bool, AwaError> {

@@ -34,8 +34,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Backoff interval creation avoids scientific-notation parse failures",
         &[V7_UP],
     ),
-    // v008 is reserved for the dead-letter-queue migration on a parallel
-    // branch; leave the slot open so both PRs can land without renumbering.
+    (8, "First-class Dead Letter Queue (awa.jobs_dlq)", &[V8_UP]),
     (9, "Queue and job-kind descriptor catalogs", &[V9_UP]),
 ];
 
@@ -46,6 +45,7 @@ const V4_UP: &str = include_str!("../migrations/v004_admin_metadata.sql");
 const V5_UP: &str = include_str!("../migrations/v005_admin_metadata_stmt_triggers.sql");
 const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.sql");
 const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
+const V8_UP: &str = include_str!("../migrations/v008_dead_letter_queue.sql");
 const V9_UP: &str = include_str!("../migrations/v009_descriptors.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
@@ -100,9 +100,26 @@ async fn run_inner(conn: &mut PgConnection) -> Result<(), AwaError> {
         0
     };
 
-    if !(has_schema && current == CURRENT_VERSION) {
+    // Collect the full set of applied versions so the loop can fill gaps,
+    // not just versions above the high-water mark. Example: migration tests
+    // that exercise legacy normalisation can leave schema_version with a
+    // hole (e.g. {1..7, 9}). Under the old "version <= current" skip, v8
+    // would stay unapplied forever once v9 was present; now we re-apply
+    // anything missing. Migration SQL is idempotent (CREATE IF NOT EXISTS
+    // + ON CONFLICT DO NOTHING) so re-applying from gap-fill is safe.
+    let applied: std::collections::HashSet<i32> = if has_schema {
+        let rows: Vec<(i32,)> = sqlx::query_as("SELECT version FROM awa.schema_version")
+            .fetch_all(&mut *conn)
+            .await
+            .unwrap_or_default();
+        rows.into_iter().map(|(v,)| v).collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+
+    if !(has_schema && current == CURRENT_VERSION && applied.len() == MIGRATIONS.len()) {
         for &(version, description, steps) in MIGRATIONS {
-            if version <= current {
+            if version <= current && applied.contains(&version) {
                 continue;
             }
             info!(version, description, "Applying migration");

@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod bridge;
 pub mod cron;
+pub mod dlq;
 pub mod error;
 pub mod insert;
 pub mod job;
@@ -23,6 +24,7 @@ pub use admin::{
 #[deprecated(since = "0.5.4", note = "use `QueueOverview` instead")]
 pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, PeriodicJob, PeriodicJobBuilder};
+pub use dlq::{DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::AwaError;
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};

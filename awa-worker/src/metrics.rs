@@ -72,6 +72,14 @@ pub struct AwaMetrics {
     /// Info gauge for declared job-kind descriptors. Same pattern as
     /// [`queue_info`][Self::queue_info].
     pub job_kind_info: Gauge<i64>,
+    /// Total jobs moved into the Dead Letter Queue.
+    pub dlq_moved: Counter<u64>,
+    /// Total jobs retried out of the Dead Letter Queue.
+    pub dlq_retried: Counter<u64>,
+    /// Total DLQ rows purged (either admin-initiated or retention cleanup).
+    pub dlq_purged: Counter<u64>,
+    /// Current DLQ depth per queue.
+    pub dlq_depth: Gauge<i64>,
 }
 
 impl AwaMetrics {
@@ -206,6 +214,26 @@ impl AwaMetrics {
                     "Declared job-kind descriptors (always 1; use as a label-join target)",
                 )
                 .with_unit("{kind}")
+                .build(),
+            dlq_moved: meter
+                .u64_counter("awa.job.dlq_moved")
+                .with_description("Number of jobs moved into the Dead Letter Queue")
+                .with_unit("{job}")
+                .build(),
+            dlq_retried: meter
+                .u64_counter("awa.job.dlq_retried")
+                .with_description("Number of jobs retried out of the Dead Letter Queue")
+                .with_unit("{job}")
+                .build(),
+            dlq_purged: meter
+                .u64_counter("awa.job.dlq_purged")
+                .with_description("Number of DLQ rows deleted")
+                .with_unit("{job}")
+                .build(),
+            dlq_depth: meter
+                .i64_gauge("awa.job.dlq_depth")
+                .with_description("Current Dead Letter Queue depth per queue")
+                .with_unit("{job}")
                 .build(),
         }
     }
@@ -423,6 +451,76 @@ impl AwaMetrics {
             ));
         }
         self.job_kind_info.record(1, &attrs);
+    }
+
+    /// Record a job moved into the DLQ.
+    pub fn record_dlq_moved(&self, kind: &str, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dlq.reason", reason.to_string()),
+        ];
+        self.dlq_moved.add(1, &attrs);
+    }
+
+    /// Record a bulk admin move into the DLQ. Emits a single counter
+    /// increment with the row count, matching the per-row `record_dlq_moved`
+    /// label set where filters supply the value. Kind and queue are both
+    /// optional because `awa dlq move` accepts either (or both) as the
+    /// filter, and a bulk move that spans a dimension has no single value
+    /// to attach for it.
+    pub fn record_dlq_moved_bulk(
+        &self,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        reason: &str,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let mut attrs = vec![opentelemetry::KeyValue::new(
+            "awa.dlq.reason",
+            reason.to_string(),
+        )];
+        if let Some(kind) = kind {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.kind",
+                kind.to_string(),
+            ));
+        }
+        if let Some(queue) = queue {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.queue",
+                queue.to_string(),
+            ));
+        }
+        self.dlq_moved.add(count, &attrs);
+    }
+
+    /// Record jobs retried out of the DLQ.
+    pub fn record_dlq_retried(&self, queue: Option<&str>, count: u64) {
+        let attrs: Vec<opentelemetry::KeyValue> = queue
+            .map(|q| vec![opentelemetry::KeyValue::new("awa.job.queue", q.to_string())])
+            .unwrap_or_default();
+        self.dlq_retried.add(count, &attrs);
+    }
+
+    /// Record DLQ rows purged.
+    pub fn record_dlq_purged(&self, queue: Option<&str>, count: u64) {
+        let attrs: Vec<opentelemetry::KeyValue> = queue
+            .map(|q| vec![opentelemetry::KeyValue::new("awa.job.queue", q.to_string())])
+            .unwrap_or_default();
+        self.dlq_purged.add(count, &attrs);
+    }
+
+    /// Record current DLQ depth for a queue.
+    pub fn record_dlq_depth(&self, queue: &str, count: i64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.dlq_depth.record(count, &attrs);
     }
 }
 
