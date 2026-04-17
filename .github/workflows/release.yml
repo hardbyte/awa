@@ -170,10 +170,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Single trap covers every failure path — serve may not be started
+          # yet when we exit (migrate failure, pg startup timeout), so guard
+          # the kill with :-.
+          serve_pid=
+          cleanup() {
+            [ -n "${serve_pid}" ] && kill "${serve_pid}" 2>/dev/null || true
+            docker rm -f awa-smoke-pg >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
           docker run -d --name awa-smoke-pg \
             -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test \
             -p 15432:5432 postgres:17-alpine
-          trap 'docker rm -f awa-smoke-pg >/dev/null' EXIT
           for _ in $(seq 1 30); do
             if docker exec awa-smoke-pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
             sleep 1
@@ -184,7 +193,6 @@ jobs:
           "${bin}" --database-url "${DATABASE_URL}" migrate
           "${bin}" --database-url "${DATABASE_URL}" serve --host 127.0.0.1 --port 3000 &
           serve_pid=$!
-          trap 'kill ${serve_pid} 2>/dev/null || true; docker rm -f awa-smoke-pg >/dev/null' EXIT
 
           for _ in $(seq 1 30); do
             if curl -sf http://127.0.0.1:3000/api/capabilities >/dev/null; then break; fi
