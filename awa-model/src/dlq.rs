@@ -57,6 +57,62 @@ pub struct DlqRow {
     pub original_run_lease: i64,
 }
 
+/// DLQ-specific metadata attached to a job when surfaced through admin APIs.
+///
+/// Separates the columns unique to `jobs_dlq` (reason, dlq_at, original_run_lease)
+/// from the job row fields so admin views can present a DLQ'd job alongside a
+/// live one without introducing a union type at every callsite.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DlqMetadata {
+    pub reason: String,
+    pub dlq_at: DateTime<Utc>,
+    pub original_run_lease: i64,
+}
+
+impl DlqRow {
+    /// Split a DLQ row into its underlying JobRow and DLQ-specific metadata.
+    ///
+    /// Used by admin tools that want to present DLQ'd jobs through the same
+    /// interfaces as live jobs while still exposing the DLQ metadata.
+    pub fn into_parts(self) -> (JobRow, DlqMetadata) {
+        let meta = DlqMetadata {
+            reason: self.dlq_reason,
+            dlq_at: self.dlq_at,
+            original_run_lease: self.original_run_lease,
+        };
+        let job = JobRow {
+            id: self.id,
+            kind: self.kind,
+            queue: self.queue,
+            args: self.args,
+            state: self.state,
+            priority: self.priority,
+            attempt: self.attempt,
+            run_lease: self.run_lease,
+            max_attempts: self.max_attempts,
+            run_at: self.run_at,
+            heartbeat_at: self.heartbeat_at,
+            deadline_at: self.deadline_at,
+            attempted_at: self.attempted_at,
+            finalized_at: self.finalized_at,
+            created_at: self.created_at,
+            errors: self.errors,
+            metadata: self.metadata,
+            tags: self.tags,
+            unique_key: self.unique_key,
+            unique_states: self.unique_states,
+            callback_id: self.callback_id,
+            callback_timeout_at: self.callback_timeout_at,
+            callback_filter: self.callback_filter,
+            callback_on_complete: self.callback_on_complete,
+            callback_on_fail: self.callback_on_fail,
+            callback_transform: self.callback_transform,
+            progress: self.progress,
+        };
+        (job, meta)
+    }
+}
+
 /// Filter for listing DLQ rows.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ListDlqFilter {

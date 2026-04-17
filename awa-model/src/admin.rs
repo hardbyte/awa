@@ -1,3 +1,4 @@
+use crate::dlq::{DlqMetadata, DlqRow};
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
 use chrono::{DateTime, Duration, Utc};
@@ -32,6 +33,11 @@ pub struct JobDump {
     pub job: JobRow,
     pub summary: JobDumpSummary,
     pub timeline: Vec<JobTimelineEvent>,
+    /// Populated when the job has been moved to the Dead Letter Queue.
+    /// Callers rendering `JobDump` should route retry/cancel actions through
+    /// the DLQ endpoints instead of the live-job ones when this is `Some`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq: Option<DlqMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -192,7 +198,7 @@ fn build_job_timeline(job: &JobRow) -> Vec<JobTimelineEvent> {
     events
 }
 
-fn build_job_dump(job: JobRow) -> JobDump {
+fn build_job_dump(job: JobRow, dlq: Option<DlqMetadata>) -> JobDump {
     let latest_error = job
         .errors
         .as_ref()
@@ -200,11 +206,15 @@ fn build_job_dump(job: JobRow) -> JobDump {
         .cloned();
     let summary = JobDumpSummary {
         original_priority: original_priority(&job),
-        can_retry: matches!(
-            job.state,
-            JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
-        ),
-        can_cancel: !job.state.is_terminal(),
+        // DLQ'd jobs can be retried only via the DLQ endpoint; `can_retry` on
+        // the live-job interface would point at the wrong route, so report
+        // false here and let the caller consult `dlq.is_some()` instead.
+        can_retry: dlq.is_none()
+            && matches!(
+                job.state,
+                JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
+            ),
+        can_cancel: dlq.is_none() && !job.state.is_terminal(),
         error_count: job.errors.as_ref().map(|errors| errors.len()).unwrap_or(0),
         latest_error,
     };
@@ -213,6 +223,7 @@ fn build_job_dump(job: JobRow) -> JobDump {
         job,
         summary,
         timeline,
+        dlq,
     }
 }
 
@@ -1572,13 +1583,47 @@ where
     row.ok_or(AwaError::JobNotFound { id: job_id })
 }
 
+/// Get a job by ID, falling back to the Dead Letter Queue.
+///
+/// Returns the `JobRow` plus `Some(DlqMetadata)` when the row was found in
+/// `jobs_dlq` (i.e., the job has been permanently moved to the DLQ) and
+/// `None` when it lives in the live `awa.jobs` view. Callers that need to
+/// distinguish between "retryable via the live interface" and "retryable via
+/// the DLQ interface" should branch on whether the metadata is present.
+///
+/// Takes `&PgPool` (rather than a generic executor) because two queries may
+/// be issued — a transactional executor would be consumed by the first call.
+pub async fn get_job_with_source(
+    pool: &PgPool,
+    job_id: i64,
+) -> Result<(JobRow, Option<DlqMetadata>), AwaError> {
+    if let Some(row) = sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?
+    {
+        return Ok((row, None));
+    }
+    let dlq_row: Option<DlqRow> = sqlx::query_as("SELECT * FROM awa.jobs_dlq WHERE id = $1")
+        .bind(job_id)
+        .fetch_optional(pool)
+        .await?;
+    if let Some(dlq_row) = dlq_row {
+        let (job, meta) = dlq_row.into_parts();
+        return Ok((job, Some(meta)));
+    }
+    Err(AwaError::JobNotFound { id: job_id })
+}
+
 /// Build a read-only inspection snapshot for one job.
-pub async fn dump_job<'e, E>(executor: E, job_id: i64) -> Result<JobDump, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let job = get_job(executor, job_id).await?;
-    Ok(build_job_dump(job))
+///
+/// Falls back to the DLQ when the job is not in the live view; in that case
+/// the returned `JobDump.dlq` is populated with the DLQ metadata and
+/// `summary.can_retry` / `can_cancel` are reported as `false` so UI
+/// consumers don't send retry/cancel through the wrong route.
+pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
+    let (job, dlq) = get_job_with_source(pool, job_id).await?;
+    Ok(build_job_dump(job, dlq))
 }
 
 /// Build a read-only inspection snapshot for one attempt.

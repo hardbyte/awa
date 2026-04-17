@@ -149,12 +149,20 @@ enum CompletionOutcome {
 /// retries) through `awa.move_to_dlq_guarded` instead of updating the
 /// failed state in `jobs_hot`.
 #[derive(Debug, Clone, Default)]
-pub(crate) struct DlqPolicy {
+pub struct DlqPolicy {
     pub enabled_default: bool,
     pub overrides: Arc<HashMap<String, bool>>,
 }
 
 impl DlqPolicy {
+    /// Build a policy with a default flag and explicit per-queue overrides.
+    pub fn new(enabled_default: bool, overrides: HashMap<String, bool>) -> Self {
+        Self {
+            enabled_default,
+            overrides: Arc::new(overrides),
+        }
+    }
+
     pub fn enabled_for(&self, queue: &str) -> bool {
         self.overrides
             .get(queue)

@@ -17,8 +17,8 @@ pub use client::{BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, 
 pub use context::{CallbackGuard, CallbackToken, JobContext};
 pub use dispatcher::{QueueConfig, RateLimit};
 pub use events::{JobEvent, UntypedJobEvent};
-pub use executor::{JobError, JobResult, Worker};
-pub use maintenance::RetentionPolicy;
+pub use executor::{DlqPolicy, JobError, JobResult, Worker};
+pub use maintenance::{rescue_expired_callbacks_once, RetentionPolicy};
 pub use metrics::AwaMetrics;
 
 #[cfg(feature = "http-worker")]

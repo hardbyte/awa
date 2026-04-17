@@ -1,7 +1,7 @@
 use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
 use awa_model::cron::{atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow};
-use awa_model::{JobRow, PeriodicJob};
+use awa_model::{JobRow, JobState, PeriodicJob};
 use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
@@ -593,53 +593,7 @@ impl MaintenanceService {
     /// Rescue jobs whose callback timeout has expired.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
     async fn rescue_expired_callbacks(&self) {
-        match sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE awa.jobs
-            SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
-                finalized_at = now(),
-                callback_id = NULL,
-                callback_timeout_at = NULL,
-                callback_filter = NULL,
-                callback_on_complete = NULL,
-                callback_on_fail = NULL,
-                callback_transform = NULL,
-                run_at = CASE WHEN attempt >= max_attempts THEN run_at
-                         ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
-                errors = errors || jsonb_build_object(
-                    'error', 'callback timed out',
-                    'attempt', attempt,
-                    'at', now()
-                )::jsonb
-            WHERE id IN (
-                SELECT id FROM awa.jobs_hot
-                WHERE state = 'waiting_external'
-                  AND callback_timeout_at IS NOT NULL
-                  AND callback_timeout_at < now()
-                LIMIT 500
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING *
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(rescued) if !rescued.is_empty() => {
-                self.metrics.maintenance_rescues.add(
-                    rescued.len() as u64,
-                    &[opentelemetry::KeyValue::new(
-                        "awa.rescue.kind",
-                        "callback_timeout",
-                    )],
-                );
-                warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
-            }
-            Err(err) => {
-                error!(error = %err, "Failed to rescue callback-timed-out jobs");
-            }
-            _ => {}
-        }
+        rescue_expired_callbacks_once(&self.pool, &self.dlq_policy, &self.metrics).await;
     }
 
     /// Age priorities for jobs that have been waiting longer than `priority_aging_interval`.
@@ -954,6 +908,98 @@ impl MaintenanceService {
         if total_deleted > 0 {
             info!(count = total_deleted, "Cleaned up old jobs");
         }
+    }
+}
+
+/// Run a single callback-timeout rescue pass followed by the DLQ sweep,
+/// bypassing leader election.
+///
+/// Exposed (doc-hidden) so integration tests can drive the rescue directly
+/// without contending with other tests for the maintenance advisory lock.
+/// Production code paths go through [`MaintenanceService::run`] which owns
+/// the lock and handles scheduling.
+#[doc(hidden)]
+pub async fn rescue_expired_callbacks_once(
+    pool: &PgPool,
+    dlq_policy: &DlqPolicy,
+    metrics: &crate::metrics::AwaMetrics,
+) {
+    match sqlx::query_as::<_, JobRow>(
+        r#"
+        UPDATE awa.jobs
+        SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
+            finalized_at = now(),
+            callback_id = NULL,
+            callback_timeout_at = NULL,
+            callback_filter = NULL,
+            callback_on_complete = NULL,
+            callback_on_fail = NULL,
+            callback_transform = NULL,
+            run_at = CASE WHEN attempt >= max_attempts THEN run_at
+                     ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
+            errors = errors || jsonb_build_object(
+                'error', 'callback timed out',
+                'attempt', attempt,
+                'at', now()
+            )::jsonb
+        WHERE id IN (
+            SELECT id FROM awa.jobs_hot
+            WHERE state = 'waiting_external'
+              AND callback_timeout_at IS NOT NULL
+              AND callback_timeout_at < now()
+            LIMIT 500
+            FOR UPDATE SKIP LOCKED
+        )
+        RETURNING *
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rescued) if !rescued.is_empty() => {
+            metrics.maintenance_rescues.add(
+                rescued.len() as u64,
+                &[opentelemetry::KeyValue::new(
+                    "awa.rescue.kind",
+                    "callback_timeout",
+                )],
+            );
+            warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
+            // Single-invariant: permanent failures land in DLQ. Callback-timeout
+            // is the only rescue path that can transition directly to `failed`
+            // (on exhausted attempts) without passing through the executor's
+            // apply_terminal_failure. Sweep those rows into the DLQ now,
+            // guarded by `state='failed'` so concurrent admin actions or
+            // operator retries win naturally.
+            for job in &rescued {
+                if job.state != JobState::Failed || !dlq_policy.enabled_for(&job.queue) {
+                    continue;
+                }
+                match awa_model::dlq::move_failed_to_dlq(pool, job.id, "callback_timeout").await {
+                    Ok(Some(_)) => {
+                        metrics.record_dlq_moved(&job.kind, &job.queue, "callback_timeout");
+                        debug!(job_id = job.id, "Routed rescue failure into DLQ");
+                    }
+                    Ok(None) => {
+                        debug!(
+                            job_id = job.id,
+                            "Rescue-failure row no longer in failed state; DLQ move skipped"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            job_id = job.id,
+                            error = %err,
+                            "Failed to route rescue failure into DLQ"
+                        );
+                    }
+                }
+            }
+        }
+        Err(err) => {
+            error!(error = %err, "Failed to rescue callback-timed-out jobs");
+        }
+        _ => {}
     }
 }
 
