@@ -431,6 +431,7 @@ jobs:
   # ─── Python wheels (maturin) ─────────────────────────────────────────
   python-wheels:
     name: Python wheels — ${{ matrix.target }}
+    needs: [version-check]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
