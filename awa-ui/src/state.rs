@@ -50,6 +50,39 @@ pub async fn detect_read_only(pool: &PgPool) -> Result<bool, sqlx::Error> {
     Ok(read_only)
 }
 
+/// How the API server decides whether to accept mutation requests.
+///
+/// `Auto` (the default) probes the Postgres connection — useful for running
+/// the UI against a read replica or a read-only role without extra config.
+/// Forcing `ReadOnly` is the operator escape hatch when the DB is writable
+/// but mutations should still be disabled (e.g. an incident read-out, a
+/// shared debugging instance, a less-trusted public UI session).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ReadOnlyMode {
+    /// Probe the DB connection — read-only if Postgres reports
+    /// `transaction_read_only = on`, writable otherwise.
+    #[default]
+    Auto,
+    /// Force read-only regardless of DB privilege. Mutation endpoints return
+    /// 503 (the same status the auto-detect path uses) and
+    /// `/api/capabilities` reports `read_only: true`.
+    ReadOnly,
+    /// Force writable. Mutations are always permitted at the HTTP layer; the
+    /// DB still has the final say at query time.
+    Writable,
+}
+
+impl ReadOnlyMode {
+    /// Resolve to a concrete boolean, probing the pool only when `Auto`.
+    pub async fn resolve(self, pool: &PgPool) -> Result<bool, sqlx::Error> {
+        match self {
+            Self::Auto => detect_read_only(pool).await,
+            Self::ReadOnly => Ok(true),
+            Self::Writable => Ok(false),
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 pub struct Capabilities {
     pub read_only: bool,

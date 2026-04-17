@@ -85,6 +85,16 @@ enum Commands {
         /// Hex-encoded 32-byte key used to verify callback signatures.
         #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET")]
         callback_hmac_secret: Option<String>,
+        /// Force the server into read-only mode regardless of DB privilege.
+        ///
+        /// By default the server probes the Postgres connection and enables
+        /// read-only mode only when the DB reports `transaction_read_only =
+        /// on` (e.g. a read replica). Setting this flag forces read-only —
+        /// mutation endpoints return 503 and `/api/capabilities` reports
+        /// `read_only: true`. Useful for incident read-outs, shared debug
+        /// instances, or public UI sessions against a writable DB.
+        #[arg(long, env = "AWA_READ_ONLY")]
+        read_only: bool,
     },
 }
 
@@ -256,6 +266,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             pool_acquire_timeout,
             cache_ttl,
             callback_hmac_secret,
+            read_only,
         } => {
             let db_url = require_pool(&cli.database_url)?;
             let pool = PgPoolOptions::new()
@@ -273,12 +284,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map(parse_callback_hmac_secret)
                 .transpose()
                 .map_err(|err| format!("invalid callback HMAC secret: {err}"))?;
+            let read_only_mode = if read_only {
+                awa_ui::state::ReadOnlyMode::ReadOnly
+            } else {
+                awa_ui::state::ReadOnlyMode::Auto
+            };
             let app =
-                awa_ui::router_with_callback_secret(pool, cache_duration, callback_hmac_secret)
+                awa_ui::router_with(pool, cache_duration, callback_hmac_secret, read_only_mode)
                     .await?;
             let addr = format!("{host}:{port}");
             let listener = tokio::net::TcpListener::bind(&addr).await?;
-            tracing::info!("AWA UI listening on http://{addr}");
+            if read_only {
+                tracing::info!("AWA UI listening on http://{addr} (forced read-only)");
+            } else {
+                tracing::info!("AWA UI listening on http://{addr}");
+            }
             axum::serve(listener, app).await?;
         }
 

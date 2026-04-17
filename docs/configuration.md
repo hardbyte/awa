@@ -128,7 +128,27 @@ If you're connecting to a read replica, increase `--cache-ttl` to reduce load. T
 
 ### Read-only mode
 
-`awa serve` auto-detects read-only databases (replicas, read-only transactions) and disables mutation endpoints (retry, cancel, pause, drain). The frontend hides the corresponding buttons. No configuration needed.
+`awa serve` disables mutation endpoints (retry, cancel, pause, drain) whenever the server is running in read-only mode. `/api/capabilities` reports `read_only: true` and the frontend hides the corresponding buttons. Mutation requests against a read-only server return `503 Service Unavailable` with a clear error body.
+
+There are two ways to opt in:
+
+| Mode | Trigger | When to use |
+|---|---|---|
+| Auto-detect (default) | Server probes `current_setting('transaction_read_only')` on startup | Pointed at a read replica or a Postgres role without write grants |
+| Forced | `--read-only` flag or `AWA_READ_ONLY=1` env var | Writable DB but you want mutations off — incident read-outs, shared debugging instances, less-trusted public UI sessions |
+
+```bash
+# Auto-detect (current behaviour)
+awa --database-url "$DATABASE_URL" serve
+
+# Explicit — force read-only regardless of DB privileges
+awa --database-url "$DATABASE_URL" serve --read-only
+
+# Same via env var
+AWA_READ_ONLY=1 awa --database-url "$DATABASE_URL" serve
+```
+
+Once forced, there is no way for a frontend user to flip back to writable without restarting the server — that's the whole point.
 
 ## Next
 
