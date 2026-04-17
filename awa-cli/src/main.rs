@@ -4,7 +4,11 @@ use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
 #[derive(Parser)]
-#[command(name = "awa", about = "Awa — Postgres-native background job queue")]
+#[command(
+    name = "awa",
+    version,
+    about = "Awa — Postgres-native background job queue"
+)]
 struct Cli {
     /// Database URL (not required for migrate --sql without --pending)
     #[arg(long, env = "DATABASE_URL")]
