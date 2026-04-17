@@ -88,7 +88,9 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
             timeout=5,
         )
 
-        row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        row = await _wait_for_job_state(
+            client, job.id, "completed", timeout=10, worker=worker_b
+        )
         assert row["attempt"] == 2
         assert row["finalized_at"] is not None
     finally:
@@ -135,7 +137,9 @@ async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
             timeout=5,
         )
 
-        row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        row = await _wait_for_job_state(
+            client, job.id, "completed", timeout=10, worker=worker
+        )
         assert row["attempt"] == 2
         assert row["finalized_at"] is not None
     finally:
@@ -177,7 +181,9 @@ async def test_callback_timeout_is_rescued_and_retried(client):
             timeout=5,
         )
 
-        final_row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        final_row = await _wait_for_job_state(
+            client, job.id, "completed", timeout=10, worker=worker
+        )
         assert final_row["attempt"] == 2
         assert final_row["finalized_at"] is not None
     finally:
@@ -308,7 +314,11 @@ async def _wait_for_line(worker: ChaosWorker, expected: str, timeout: float) -> 
 
 
 async def _wait_for_job_state(
-    client: awa.AsyncClient, job_id: int, expected_state: str, timeout: float
+    client: awa.AsyncClient,
+    job_id: int,
+    expected_state: str,
+    timeout: float,
+    worker: "ChaosWorker | None" = None,
 ):
     deadline = asyncio.get_running_loop().time() + scaled_timeout(timeout)
 
@@ -319,7 +329,11 @@ async def _wait_for_job_state(
             SELECT id,
                    state::text AS state,
                    attempt,
-                   finalized_at::text AS finalized_at
+                   run_lease,
+                   heartbeat_at::text AS heartbeat_at,
+                   deadline_at::text AS deadline_at,
+                   finalized_at::text AS finalized_at,
+                   EXTRACT(EPOCH FROM (now() - heartbeat_at))::float AS heartbeat_age_s
             FROM awa.jobs
             WHERE id = $1
             """,
@@ -331,9 +345,15 @@ async def _wait_for_job_state(
             return row
 
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(
-                f"job {job_id} did not reach state {expected_state!r}: {row!r}"
-            )
+            diag = f"job {job_id} did not reach state {expected_state!r}: {row!r}"
+            if worker is not None:
+                tail = worker.lines[-40:]
+                diag += (
+                    f"\nworker pid={worker.pid} returncode={worker.returncode}"
+                    f" stdout_lines={len(worker.lines)}\n"
+                    "-- last 40 stdout lines --\n" + "\n".join(tail)
+                )
+            raise AssertionError(diag)
 
         await asyncio.sleep(0.2)
 
