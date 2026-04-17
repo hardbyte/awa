@@ -16,9 +16,68 @@ permissions:
   attestations: write
 
 jobs:
+  # ─── Version-consistency gate ────────────────────────────────────────
+  # Runs first and gates everything else. A mismatch between the git tag
+  # and the workspace Cargo.toml version means the published crates/wheels
+  # will disagree with the GitHub release / Docker tag — fail early.
+  version-check:
+    name: Verify version consistency
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml versions
+        shell: bash
+        # Real TOML parse via stdlib `tomllib` (Python 3.11+). Ubuntu runners
+        # ship Python ≥3.12, so no install step needed. `grep` worked for the
+        # current layout but is brittle against future drift (multi-line
+        # strings, commented lines, a stray `version = ...` in a sibling
+        # table).
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os, sys, tomllib
+
+          expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          print(f"Git tag:          {os.environ['GITHUB_REF_NAME']}")
+          print(f"Expected version: {expected}")
+
+          def cargo_version(path: str) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              return (
+                  data.get("package", {}).get("version")
+                  or data.get("workspace", {}).get("package", {}).get("version")
+              )
+
+          def pyproject_version(path: str) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              return data.get("project", {}).get("version")
+
+          checks = [
+              ("Cargo.toml", cargo_version("Cargo.toml")),
+              ("awa-python/Cargo.toml", cargo_version("awa-python/Cargo.toml")),
+              ("awa-python/pyproject.toml", pyproject_version("awa-python/pyproject.toml")),
+          ]
+
+          fail = 0
+          for file, value in checks:
+              if value is None:
+                  print(f"::error file={file}::could not read version from {file}")
+                  fail = 1
+              elif value != expected:
+                  print(f"::error file={file}::version mismatch: {file} says '{value}', tag says '{expected}'")
+                  fail = 1
+              else:
+                  print(f"ok: {file} = {value}")
+
+          sys.exit(fail)
+          PY
+
   # ─── Cross-compile CLI binaries ──────────────────────────────────────
   build-binaries:
     name: Build — ${{ matrix.target }}
+    needs: [version-check]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -62,6 +121,38 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cargo install cross --git https://github.com/cross-rs/cross --tag v0.2.5 --locked
 
+      # Frontend must be built before cargo so rust-embed in awa-ui picks it up.
+      # Without this the binary ships the "Frontend not built" placeholder (#162).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: awa-ui/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: awa-ui/frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: awa-ui/frontend
+        run: npm run build
+
+      - name: Verify frontend was embedded
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f awa-ui/static/index.html
+          # Vite emits hashed asset references; their absence means the build
+          # produced a degenerate index (or didn't run).
+          if ! grep -q '/assets/' awa-ui/static/index.html; then
+            echo "::error::awa-ui/static/index.html does not reference /assets/* — Vite build produced no frontend bundle"
+            cat awa-ui/static/index.html
+            exit 1
+          fi
+          test -d awa-ui/static/assets
+          ls awa-ui/static/assets/ | grep -q '\.js$'
+          ls awa-ui/static/assets/ | grep -q '\.css$'
+
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
         run: cargo build --release --package awa-cli --target ${{ matrix.target }}
@@ -69,6 +160,66 @@ jobs:
       - name: Build (cross)
         if: matrix.target == 'aarch64-unknown-linux-musl'
         run: cross build --release --package awa-cli --target ${{ matrix.target }}
+
+      # Smoke-test the binary: start `awa serve` against an ephemeral Postgres
+      # and verify GET / returns the built frontend, not the placeholder page.
+      # Runs only on the x86_64 Linux job — the binary from aarch64-musl cross
+      # cannot execute on the runner, and macOS runners don't have Docker.
+      - name: Smoke-test embedded frontend
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Single trap covers every failure path — serve may not be started
+          # yet when we exit (migrate failure, pg startup timeout), so guard
+          # the kill with :-.
+          serve_pid=
+          cleanup() {
+            [ -n "${serve_pid}" ] && kill "${serve_pid}" 2>/dev/null || true
+            docker rm -f awa-smoke-pg >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker run -d --name awa-smoke-pg \
+            -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test \
+            -p 15432:5432 postgres:17-alpine
+          for _ in $(seq 1 30); do
+            if docker exec awa-smoke-pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          DATABASE_URL="postgres://postgres:test@localhost:15432/awa_test"
+          bin="target/${{ matrix.target }}/release/awa"
+          "${bin}" --database-url "${DATABASE_URL}" migrate
+          "${bin}" --database-url "${DATABASE_URL}" serve --host 127.0.0.1 --port 3000 &
+          serve_pid=$!
+
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/capabilities >/dev/null; then break; fi
+            sleep 1
+          done
+
+          body=$(curl -sf http://127.0.0.1:3000/)
+          if echo "${body}" | grep -qi "Frontend not built"; then
+            echo "::error::awa serve is returning the placeholder page — the frontend was not embedded"
+            echo "${body}"
+            exit 1
+          fi
+          if ! echo "${body}" | grep -q "/assets/"; then
+            echo "::error::awa serve / did not reference any /assets/* paths — the embedded frontend looks wrong"
+            echo "${body}"
+            exit 1
+          fi
+          echo "ok: embedded frontend reachable via GET /"
+
+          # And while we're here, sanity-check `awa --version` reports the tag.
+          awa_version=$("${bin}" --version | awk '{print $NF}')
+          expected="${GITHUB_REF_NAME#v}"
+          if [ "${awa_version}" != "${expected}" ]; then
+            echo "::error::awa --version '${awa_version}' does not match tag '${expected}'"
+            exit 1
+          fi
+          echo "ok: awa --version = ${awa_version}"
 
       - name: Package binary
         if: matrix.release_asset
@@ -146,7 +297,73 @@ jobs:
       - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
 
-      - name: Build and push
+      # Smoke-test BEFORE pushing so a broken image never lands in the registry.
+      # We build a local single-platform (amd64) image, boot it against an
+      # ephemeral Postgres, and verify GET / returns the embedded frontend,
+      # not the "Frontend not built" placeholder (#162). We also check
+      # `awa --version` matches the git tag.
+      - name: Build local image for smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile.runtime
+          push: false
+          load: true
+          platforms: linux/amd64
+          tags: awa:smoke
+
+      - name: Smoke-test local image
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${GITHUB_REF_NAME#v}"
+          image="awa:smoke"
+
+          docker network create awa-smoke >/dev/null
+          trap 'docker rm -f awa-smoke-pg awa-smoke-app >/dev/null 2>&1 || true; docker network rm awa-smoke >/dev/null 2>&1 || true' EXIT
+
+          docker run -d --name awa-smoke-pg --network awa-smoke \
+            -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test \
+            postgres:17-alpine >/dev/null
+          for _ in $(seq 1 30); do
+            if docker exec awa-smoke-pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+
+          DATABASE_URL="postgres://postgres:test@awa-smoke-pg:5432/awa_test"
+          docker run --rm --network awa-smoke \
+            "${image}" --database-url "${DATABASE_URL}" migrate
+
+          docker run -d --name awa-smoke-app --network awa-smoke \
+            -p 3000:3000 \
+            "${image}" --database-url "${DATABASE_URL}" serve --host 0.0.0.0 --port 3000 >/dev/null
+
+          for _ in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:3000/api/capabilities >/dev/null; then break; fi
+            sleep 1
+          done
+
+          body=$(curl -sf http://127.0.0.1:3000/)
+          if echo "${body}" | grep -qi "Frontend not built"; then
+            echo "::error::Docker image serves the placeholder page — the frontend was not embedded"
+            echo "${body}"
+            docker logs awa-smoke-app || true
+            exit 1
+          fi
+          if ! echo "${body}" | grep -q "/assets/"; then
+            echo "::error::Docker image GET / did not reference /assets/* — embedded frontend looks wrong"
+            echo "${body}"
+            exit 1
+          fi
+
+          awa_version=$(docker run --rm "${image}" --version | awk '{print $NF}')
+          if [ "${awa_version}" != "${expected}" ]; then
+            echo "::error::Docker awa --version '${awa_version}' does not match tag '${expected}'"
+            exit 1
+          fi
+          echo "ok: ${image} serves built frontend and reports version ${awa_version}"
+
+      - name: Build and push (multi-arch)
         id: build-and-push
         uses: docker/build-push-action@v6
         with:
@@ -222,6 +439,7 @@ jobs:
   # ─── Python wheels (maturin) ─────────────────────────────────────────
   python-wheels:
     name: Python wheels — ${{ matrix.target }}
+    needs: [version-check]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -265,6 +483,7 @@ jobs:
   # ─── CLI wheels (maturin, bindings=bin) ──────────────────────────────
   cli-wheels:
     name: CLI wheels — ${{ matrix.target }}
+    needs: [version-check]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -286,6 +505,39 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      # Frontend must be built before maturin invokes cargo so rust-embed in
+      # awa-ui picks it up — the CLI wheel otherwise ships the "Frontend not
+      # built" placeholder (#162).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: awa-ui/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: awa-ui/frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: awa-ui/frontend
+        run: npm run build
+
+      - name: Verify frontend was embedded
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f awa-ui/static/index.html
+          # Vite emits hashed asset references; their absence means the build
+          # produced a degenerate index (or didn't run).
+          if ! grep -q '/assets/' awa-ui/static/index.html; then
+            echo "::error::awa-ui/static/index.html does not reference /assets/* — Vite build produced no frontend bundle"
+            cat awa-ui/static/index.html
+            exit 1
+          fi
+          test -d awa-ui/static/assets
+          ls awa-ui/static/assets/ | grep -q '\.js$'
+          ls awa-ui/static/assets/ | grep -q '\.css$'
 
       - name: Build CLI wheels
         uses: PyO3/maturin-action@v1
@@ -343,10 +595,45 @@ jobs:
   # ─── Publish Rust crates ─────────────────────────────────────────────
   publish-crates:
     name: Publish to crates.io
+    needs: [version-check]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+
+      # awa-ui embeds `awa-ui/static/` via rust-embed; without building the
+      # frontend first, the crate published to crates.io carries no assets and
+      # every downstream `cargo install awa-cli` bakes in the placeholder HTML
+      # (#162).
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: awa-ui/frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: awa-ui/frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: awa-ui/frontend
+        run: npm run build
+
+      - name: Verify frontend was embedded
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f awa-ui/static/index.html
+          # Vite emits hashed asset references; their absence means the build
+          # produced a degenerate index (or didn't run).
+          if ! grep -q '/assets/' awa-ui/static/index.html; then
+            echo "::error::awa-ui/static/index.html does not reference /assets/* — Vite build produced no frontend bundle"
+            cat awa-ui/static/index.html
+            exit 1
+          fi
+          test -d awa-ui/static/assets
+          ls awa-ui/static/assets/ | grep -q '\.js$'
+          ls awa-ui/static/assets/ | grep -q '\.css$'
 
       - name: Publish awa-macros
         run: cargo publish --package awa-macros --no-verify
@@ -380,8 +667,16 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
+      # `npm run build` earlier in this job empties `awa-ui/static/` and
+      # removes the tracked `.gitkeep` (Vite's `emptyOutDir: true`), and
+      # re-populates it with the real bundle. That leaves the working tree
+      # dirty at publish time — which is exactly what we want, since the
+      # built bundle IS what we're shipping. `--allow-dirty` is how cargo
+      # consents to that; the `include` list in `awa-ui/Cargo.toml` is what
+      # actually gets the bundle into the .crate file (gitignored paths are
+      # otherwise skipped for git-backed packages).
       - name: Publish awa-ui
-        run: cargo publish --package awa-ui --no-verify
+        run: cargo publish --package awa-ui --no-verify --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 

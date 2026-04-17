@@ -695,6 +695,14 @@ async fn test_failure_path_metrics_reach_prometheus() {
     wait_for_job_count(&pool, queue, "waiting_external", 2).await;
     wait_for_job_count(&pool, queue, "retryable", 2).await;
 
+    // Backdate callback_timeout_at so the next callback-rescue tick
+    // transitions these jobs into retryable. The rescue itself sets
+    // run_at = now() + backoff_duration(attempt, max_attempts) — which can
+    // be several seconds — so we can't backdate run_at before the rescue
+    // fires (the new retryable rows would inherit future run_at). Wait for
+    // waiting_external to drain first, then backdate run_at for every
+    // retryable row (both the original retry_once jobs and the callback
+    // rescues).
     sqlx::query(
         "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
          WHERE queue = $1 AND state = 'waiting_external'",
@@ -703,6 +711,12 @@ async fn test_failure_path_metrics_reach_prometheus() {
     .execute(&pool)
     .await
     .expect("Failed to backdate callback_timeout_at");
+
+    // Retryable jumps from 2 to 4 once both callback rescues land. No row
+    // leaves retryable until run_at is backdated (below), so the count is
+    // monotonic and waiting for >= 4 is the right signal that the rescue
+    // pass is done.
+    wait_for_job_count(&pool, queue, "retryable", 4).await;
 
     sqlx::query(
         "UPDATE awa.jobs SET run_at = now() - interval '1 second' \
@@ -1104,11 +1118,26 @@ async fn dashboard_panels_have_observed_data() {
     .await
     .expect("Failed to backdate callback timeouts");
 
-    sqlx::query("UPDATE awa.jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)")
-        .bind(&retry_job_ids)
-        .execute(&pool)
-        .await
-        .expect("Failed to backdate retryable jobs");
+    // Wait for the callback rescue to land — waiting_external drains and
+    // retryable count jumps from 2 to 4. Then backdate run_at for ALL
+    // retryable rows (both the original retry_once jobs and the freshly
+    // rescued callback_timeout jobs). Doing this before the rescue lets
+    // the newly-rescued rows inherit `run_at = now() + backoff_duration`
+    // and stall the test (see maintenance.rs:560-561).
+    wait_for_job_count(&pool, queue, "retryable", 4).await;
+
+    sqlx::query(
+        "UPDATE awa.jobs SET run_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'retryable'",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate retryable jobs");
+    // Silence the unused-binding warning — IDs are only needed for the
+    // callback backdate above; the run_at backdate intentionally targets
+    // the queue-wide set so it covers the rescued rows.
+    let _ = &retry_job_ids;
 
     sqlx::query("UPDATE awa.jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)")
         .bind(&scheduled_job_ids)

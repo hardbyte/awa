@@ -19,6 +19,23 @@ import pytest
 
 import awa
 
+
+def _timeout_multiplier() -> float:
+    """CI runners are slower and loaded — scale generously so timeouts
+    reflect the real budget for the work, not the runner's throughput.
+    Matches the pattern used in test_chaos_recovery.py."""
+    raw = os.environ.get("AWA_CHAOS_TIMEOUT_MULTIPLIER")
+    if raw is not None:
+        try:
+            return max(float(raw), 1.0)
+        except ValueError:
+            pass
+    return 3.0 if os.environ.get("CI") else 1.0
+
+
+def _scaled(timeout: float) -> float:
+    return timeout * _timeout_multiplier()
+
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
@@ -63,7 +80,7 @@ async def _setup_waiting_job(client, queue: str, order_id: int, **insert_kwargs)
         leader_election_interval_ms=100,
     )
     # Wait for handler to register callback
-    deadline = asyncio.get_event_loop().time() + 5
+    deadline = asyncio.get_event_loop().time() + _scaled(5)
     while not callback_ids and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.1)
     await client.shutdown()
@@ -294,7 +311,7 @@ async def test_stale_callback_rejected_after_rescue(client):
 
     # Run first attempt → parks in waiting_external
     await client.start([(queue, 1)], poll_interval_ms=50, leader_election_interval_ms=100)
-    deadline = asyncio.get_event_loop().time() + 5
+    deadline = asyncio.get_event_loop().time() + _scaled(5)
     while not callback_ids and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.1)
     await client.shutdown()
@@ -312,7 +329,7 @@ async def test_stale_callback_rejected_after_rescue(client):
         promote_interval_ms=100,
         leader_election_interval_ms=100,
     )
-    deadline = asyncio.get_event_loop().time() + 5
+    deadline = asyncio.get_event_loop().time() + _scaled(5)
     while len(attempts) < 2 and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.1)
     await client.shutdown()
@@ -362,7 +379,7 @@ async def test_callback_timeout_rescued_by_runtime(client):
     )
 
     # Wait for the job to go through: attempt 1 → timeout → rescue → attempt 2 → complete
-    deadline = asyncio.get_event_loop().time() + 10
+    deadline = asyncio.get_event_loop().time() + _scaled(10)
     while len(attempts) < 2 and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.2)
     await client.shutdown()

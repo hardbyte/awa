@@ -6,6 +6,18 @@ license.workspace = true
 description = "Web UI and JSON API for the Awa job queue"
 repository.workspace = true
 readme = "README.md"
+# The built React bundle (`static/index.html`, `static/assets/*`) is
+# .gitignored for dev ergonomics, so cargo publish would skip it by default
+# and ship an awa-ui crate with no embedded frontend. Explicitly include the
+# built output here — release.yml runs `npm run build` before this crate is
+# packaged (see #162 / PR #163).
+include = [
+    "/src/**/*",
+    "/static/**/*",
+    "/build.rs",
+    "/Cargo.toml",
+    "/README.md",
+]
 
 [dependencies]
 awa-model.workspace = true

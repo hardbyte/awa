@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import sys
 import uuid
@@ -87,7 +88,9 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
             timeout=5,
         )
 
-        row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        row = await _wait_for_job_state(
+            client, job.id, "completed", timeout=10, worker=worker_b
+        )
         assert row["attempt"] == 2
         assert row["finalized_at"] is not None
     finally:
@@ -134,7 +137,9 @@ async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
             timeout=5,
         )
 
-        row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        row = await _wait_for_job_state(
+            client, job.id, "completed", timeout=10, worker=worker
+        )
         assert row["attempt"] == 2
         assert row["finalized_at"] is not None
     finally:
@@ -176,16 +181,115 @@ async def test_callback_timeout_is_rescued_and_retried(client):
             timeout=5,
         )
 
-        final_row = await _wait_for_job_state(client, job.id, "completed", timeout=10)
+        final_row = await _wait_for_job_state(
+            client, job.id, "completed", timeout=10, worker=worker
+        )
         assert final_row["attempt"] == 2
         assert final_row["finalized_at"] is not None
     finally:
         await _stop_process(worker)
 
 
-async def _start_worker(
-    queue: str, role: str
-) -> asyncio.subprocess.Process:
+class ChaosWorker:
+    """Wraps a subprocess and continuously drains its stdout into an
+    in-memory list, so the test can match lines at its own pace without
+    the pipe backing up.
+
+    Why this exists: the worker prints heartbeat/maintenance/tracing
+    output at ~50+ lines/sec. Linux's default pipe capacity is 64 KiB —
+    roughly nine seconds of output. If the test matches an expected line
+    and then stops reading while it does a DB poll, the pipe fills, the
+    worker's next write blocks on stdout, and any tokio worker thread
+    holding the write-blocked logger stalls. With the completion batcher
+    on a blocked thread, a `running → completed` transition never gets
+    committed and the test times out. Draining in the background keeps
+    the pipe empty so writes never block.
+    """
+
+    def __init__(self, process: asyncio.subprocess.Process) -> None:
+        self.process = process
+        self.lines: list[str] = []
+        self._new_line = asyncio.Event()
+        self._closed = asyncio.Event()
+        self._drainer = asyncio.create_task(self._drain())
+
+    @property
+    def pid(self) -> int | None:
+        return self.process.pid
+
+    @property
+    def returncode(self) -> int | None:
+        return self.process.returncode
+
+    async def _drain(self) -> None:
+        assert self.process.stdout is not None
+        try:
+            while True:
+                line = await self.process.stdout.readline()
+                if not line:
+                    break
+                self.lines.append(line.decode().rstrip("\n"))
+                self._new_line.set()
+        finally:
+            self._closed.set()
+            self._new_line.set()
+
+    async def wait_for_line(self, expected: str, timeout: float) -> str:
+        """Return the first line (past or future) containing `expected`.
+
+        Keeps position by scanning from index 0 every call — acceptable
+        because `expected` markers embed PIDs / job IDs / attempt numbers
+        that are unique per test call.
+        """
+        async def scan() -> str:
+            cursor = 0
+            while True:
+                while cursor < len(self.lines):
+                    line = self.lines[cursor]
+                    cursor += 1
+                    if expected in line:
+                        return line
+                if self._closed.is_set() and cursor >= len(self.lines):
+                    raise AssertionError(
+                        "worker exited before emitting expected output.\n"
+                        + "\n".join(self.lines)
+                    )
+                self._new_line.clear()
+                await self._new_line.wait()
+
+        try:
+            return await asyncio.wait_for(scan(), timeout=scaled_timeout(timeout))
+        except TimeoutError as exc:
+            raise AssertionError(
+                f"timed out waiting for worker output: {expected}\n"
+                + "\n".join(self.lines)
+            ) from exc
+
+    def terminate(self) -> None:
+        if self.process.returncode is None:
+            self.process.terminate()
+
+    def kill(self) -> None:
+        if self.process.returncode is None:
+            self.process.kill()
+
+    async def wait(self) -> int:
+        return await self.process.wait()
+
+    async def shutdown(self) -> None:
+        if self.process.returncode is None:
+            self.terminate()
+            try:
+                await asyncio.wait_for(self.process.wait(), timeout=scaled_timeout(5))
+            except TimeoutError:
+                self.kill()
+                await asyncio.wait_for(self.process.wait(), timeout=scaled_timeout(5))
+        self._drainer.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await self._drainer
+
+
+async def _start_worker(queue: str, role: str) -> ChaosWorker:
     env = os.environ.copy()
     env.update(
         {
@@ -195,46 +299,26 @@ async def _start_worker(
             "PYTHONUNBUFFERED": "1",
         }
     )
-    return await asyncio.create_subprocess_exec(
+    process = await asyncio.create_subprocess_exec(
         sys.executable,
         str(WORKER_SCRIPT),
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=env,
     )
+    return ChaosWorker(process)
 
 
-async def _wait_for_line(
-    process: asyncio.subprocess.Process, expected: str, timeout: float
-) -> str:
-    if process.stdout is None:
-        raise AssertionError("worker process stdout was not captured")
-
-    seen: list[str] = []
-
-    async def read_until_match() -> str:
-        while True:
-            line = await process.stdout.readline()
-            if not line:
-                raise AssertionError(
-                    "worker exited before emitting expected output.\n"
-                    + "\n".join(seen)
-                )
-            text = line.decode().strip()
-            seen.append(text)
-            if expected in text:
-                return text
-
-    try:
-        return await asyncio.wait_for(read_until_match(), timeout=scaled_timeout(timeout))
-    except TimeoutError as exc:
-        raise AssertionError(
-            f"timed out waiting for worker output: {expected}\n" + "\n".join(seen)
-        ) from exc
+async def _wait_for_line(worker: ChaosWorker, expected: str, timeout: float) -> str:
+    return await worker.wait_for_line(expected, timeout)
 
 
 async def _wait_for_job_state(
-    client: awa.AsyncClient, job_id: int, expected_state: str, timeout: float
+    client: awa.AsyncClient,
+    job_id: int,
+    expected_state: str,
+    timeout: float,
+    worker: "ChaosWorker | None" = None,
 ):
     deadline = asyncio.get_running_loop().time() + scaled_timeout(timeout)
 
@@ -245,7 +329,11 @@ async def _wait_for_job_state(
             SELECT id,
                    state::text AS state,
                    attempt,
-                   finalized_at::text AS finalized_at
+                   run_lease,
+                   heartbeat_at::text AS heartbeat_at,
+                   deadline_at::text AS deadline_at,
+                   finalized_at::text AS finalized_at,
+                   EXTRACT(EPOCH FROM (now() - heartbeat_at))::float AS heartbeat_age_s
             FROM awa.jobs
             WHERE id = $1
             """,
@@ -257,20 +345,20 @@ async def _wait_for_job_state(
             return row
 
         if asyncio.get_running_loop().time() >= deadline:
-            raise AssertionError(
-                f"job {job_id} did not reach state {expected_state!r}: {row!r}"
-            )
+            diag = f"job {job_id} did not reach state {expected_state!r}: {row!r}"
+            if worker is not None:
+                tail = worker.lines[-40:]
+                diag += (
+                    f"\nworker pid={worker.pid} returncode={worker.returncode}"
+                    f" stdout_lines={len(worker.lines)}\n"
+                    "-- last 40 stdout lines --\n" + "\n".join(tail)
+                )
+            raise AssertionError(diag)
 
         await asyncio.sleep(0.2)
 
 
-async def _stop_process(process: asyncio.subprocess.Process | None) -> None:
-    if process is None or process.returncode is not None:
+async def _stop_process(worker: ChaosWorker | None) -> None:
+    if worker is None:
         return
-
-    process.terminate()
-    try:
-        await asyncio.wait_for(process.wait(), timeout=scaled_timeout(5))
-    except TimeoutError:
-        process.kill()
-        await asyncio.wait_for(process.wait(), timeout=scaled_timeout(5))
+    await worker.shutdown()
