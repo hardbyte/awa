@@ -14,6 +14,8 @@ import { KindsPage } from "./routes/kinds";
 import { QueuesPage } from "./routes/queues";
 import { QueueDetailPage } from "./routes/queue-detail";
 import { CronPage } from "./routes/cron";
+import { DlqPage } from "./routes/dlq";
+import { DlqDetailPage } from "./routes/dlq-detail";
 import { RuntimePage } from "./routes/runtime";
 import { RuntimeInstancePage } from "./routes/runtime-detail";
 import { NotFoundPage } from "./routes/not-found";
@@ -65,6 +67,18 @@ const cronRoute = createRoute({
   component: CronPage,
 });
 
+const dlqRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/dlq",
+  component: DlqPage,
+});
+
+const dlqDetailRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/dlq/$id",
+  component: DlqDetailPage,
+});
+
 const runtimeRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/runtime",
@@ -87,6 +101,8 @@ const routeTree = rootRoute.addChildren([
   runtimeRoute,
   runtimeInstanceRoute,
   cronRoute,
+  dlqRoute,
+  dlqDetailRoute,
 ]);
 
 const router = createRouter({ routeTree });

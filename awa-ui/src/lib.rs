@@ -99,6 +99,7 @@ pub async fn router_with(
         .route("/dlq/{id}/retry", post(handlers::dlq::retry_dlq_job))
         .route("/dlq/bulk-retry", post(handlers::dlq::bulk_retry_dlq))
         .route("/dlq/bulk-purge", post(handlers::dlq::bulk_purge_dlq))
+        .route("/dlq/bulk-move", post(handlers::dlq::bulk_move_failed))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime))
         // Callbacks (for HTTP workers and external systems)

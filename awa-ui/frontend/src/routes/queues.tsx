@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import {
+  fetchDlqDepth,
   fetchQueues,
   fetchQueueRuntime,
   pauseQueue,
@@ -40,6 +41,13 @@ export function QueuesPage() {
     queryKey: ["queues"],
     queryFn: fetchQueues,
     refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
+  const dlqDepthQuery = useQuery({
+    queryKey: ["dlq-depth"],
+    queryFn: fetchDlqDepth,
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
@@ -122,9 +130,30 @@ export function QueuesPage() {
       : `Descriptor seen ${timeAgo(q.descriptor_last_seen_at)}`;
   }
 
+  const dlqByQueue = new Map<string, number>(
+    (dlqDepthQuery.data?.by_queue ?? []).map(({ queue, count }) => [queue, count]),
+  );
+
   return (
     <div className="space-y-4">
       <Heading level={2}>Queues</Heading>
+
+      {dlqDepthQuery.data && dlqDepthQuery.data.total > 0 && (
+        <Link
+          to="/dlq"
+          className="flex items-center justify-between rounded-lg border border-danger/30 bg-danger/5 p-3 no-underline hover:bg-danger/10"
+        >
+          <div className="flex items-center gap-2">
+            <Badge intent="danger">DLQ</Badge>
+            <span className="text-sm">
+              {dlqDepthQuery.data.total.toLocaleString()} permanently failed job(s)
+              {dlqDepthQuery.data.by_queue.length > 0 &&
+                ` across ${dlqDepthQuery.data.by_queue.length} queue(s)`}
+            </span>
+          </div>
+          <span className="text-sm text-muted-fg">Inspect →</span>
+        </Link>
+      )}
 
       {/* Mobile card layout */}
       {queues.length > 0 && (
@@ -293,6 +322,16 @@ export function QueuesPage() {
                     <span className={q.failed > 0 ? "text-danger" : ""}>
                       {q.failed.toLocaleString()}
                     </span>
+                    {dlqByQueue.get(q.queue) ? (
+                      <Link
+                        to="/dlq"
+                        search={{ q: `queue:${q.queue}` }}
+                        className="ml-2 text-xs text-danger underline"
+                        title="DLQ depth"
+                      >
+                        (+{dlqByQueue.get(q.queue)!.toLocaleString()} DLQ)
+                      </Link>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     {q.waiting_external > 0 ? q.waiting_external.toLocaleString() : "-"}

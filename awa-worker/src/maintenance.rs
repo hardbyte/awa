@@ -20,6 +20,11 @@ pub struct RetentionPolicy {
     pub completed: Duration,
     /// How long to keep failed/cancelled jobs before cleanup.
     pub failed: Duration,
+    /// Optional override for DLQ retention on this queue. When `None`, the
+    /// queue follows the global DLQ retention configured on `ClientBuilder`.
+    /// DLQ rows are persisted much longer than failed rows (default 30d vs
+    /// 72h) so operators have time to investigate poison jobs.
+    pub dlq: Option<Duration>,
 }
 
 impl Default for RetentionPolicy {
@@ -27,6 +32,7 @@ impl Default for RetentionPolicy {
         Self {
             completed: Duration::from_secs(86400), // 24h
             failed: Duration::from_secs(259200),   // 72h
+            dlq: None,
         }
     }
 }
@@ -1175,28 +1181,107 @@ impl MaintenanceService {
         }
     }
 
-    /// Delete DLQ rows older than `dlq_retention`.
+    /// Delete DLQ rows older than their applicable retention.
     ///
-    /// DLQ rows live in a separate table (`awa.jobs_dlq`) that the hot-path
-    /// claim loop never touches, so DLQ retention is independent of the
-    /// `failed_retention` policy and typically runs much longer (default 30d).
+    /// Runs a global pass for queues that follow the default retention, then
+    /// per-queue passes for queues with explicit `RetentionPolicy.dlq`
+    /// overrides. The global pass excludes override queues so they don't
+    /// inherit the default retention alongside their own policy.
+    ///
+    /// DLQ rows live in `awa.jobs_dlq`, which the hot-path claim loop never
+    /// touches, so DLQ retention is independent of `failed_retention`.
     #[tracing::instrument(skip(self), name = "maintenance.cleanup_dlq")]
     async fn cleanup_dlq_rows(&self) {
-        match awa_model::dlq::cleanup_dlq(
-            &self.pool,
-            self.dlq_retention,
-            self.dlq_cleanup_batch_size,
-        )
-        .await
-        {
-            Ok(count) if count > 0 => {
-                self.metrics.record_dlq_purged(None, count);
-                tracing::debug!(count, "Cleaned up expired DLQ rows");
+        let override_queues: Vec<&str> = self
+            .queue_retention_overrides
+            .iter()
+            .filter(|(_, policy)| policy.dlq.is_some())
+            .map(|(queue, _)| queue.as_str())
+            .collect();
+
+        // Global pass: everything except override queues.
+        let retention_secs = format!("{} seconds", self.dlq_retention.as_secs());
+        let global_result = if override_queues.is_empty() {
+            sqlx::query(
+                r#"
+                DELETE FROM awa.jobs_dlq
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_dlq
+                    WHERE dlq_at < now() - $1::interval
+                    LIMIT $2
+                )
+                "#,
+            )
+            .bind(&retention_secs)
+            .bind(self.dlq_cleanup_batch_size)
+            .execute(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r#"
+                DELETE FROM awa.jobs_dlq
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_dlq
+                    WHERE dlq_at < now() - $1::interval
+                      AND queue != ALL($3::text[])
+                    LIMIT $2
+                )
+                "#,
+            )
+            .bind(&retention_secs)
+            .bind(self.dlq_cleanup_batch_size)
+            .bind(&override_queues)
+            .execute(&self.pool)
+            .await
+        };
+
+        let mut total_purged: u64 = 0;
+        match global_result {
+            Ok(result) if result.rows_affected() > 0 => {
+                total_purged += result.rows_affected();
+                self.metrics.record_dlq_purged(None, result.rows_affected());
             }
             Err(err) => {
-                tracing::warn!(error = %err, "Failed to clean up DLQ rows");
+                tracing::warn!(error = %err, "Failed to clean up DLQ rows (global pass)");
             }
             _ => {}
+        }
+
+        // Per-queue override passes.
+        for (queue, policy) in &self.queue_retention_overrides {
+            let Some(retention) = policy.dlq else {
+                continue;
+            };
+            match awa_model::dlq::cleanup_dlq(
+                &self.pool,
+                retention,
+                self.dlq_cleanup_batch_size,
+                Some(queue),
+            )
+            .await
+            {
+                Ok(count) if count > 0 => {
+                    total_purged += count;
+                    self.metrics.record_dlq_purged(Some(queue), count);
+                    tracing::debug!(
+                        %queue,
+                        count,
+                        "Cleaned up expired DLQ rows (queue override)"
+                    );
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        %queue,
+                        error = %err,
+                        "Failed to clean up DLQ rows (queue override)"
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        if total_purged > 0 {
+            tracing::debug!(total_purged, "DLQ cleanup pass complete");
         }
     }
 }

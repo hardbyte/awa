@@ -7,6 +7,7 @@ use crate::transaction::{
 use crate::worker::PythonWorker;
 use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
 use awa_model::{InsertOpts, InsertParams, JobState, PeriodicJob};
+use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sqlx::postgres::PgPoolOptions;
@@ -905,6 +906,206 @@ impl PyClient {
         })
     }
 
+    /// List DLQ entries, optionally filtered by kind/queue/tag. `before_id`
+    /// enables cursor pagination (pass the smallest id from the previous
+    /// page). Rows are ordered by `dlq_at DESC, id DESC`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, limit=100))]
+    fn list_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let filter = crate::dlq::build_filter(kind, queue, tag, before_id, Some(limit));
+            let rows = awa_model::dlq::list_dlq(&pool, &filter)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                let list = pyo3::types::PyList::empty(py);
+                for row in rows {
+                    let entry = crate::dlq::dlq_row_to_entry(py, row)?;
+                    list.append(Py::new(py, entry)?)?;
+                }
+                Ok(list.unbind())
+            })
+        })
+    }
+
+    /// Fetch a single DLQ entry by id. Returns `None` if the row isn't in the DLQ.
+    fn get_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let row = awa_model::dlq::get_dlq_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                Ok(match row {
+                    Some(row) => crate::dlq::dlq_row_to_entry(py, row)?
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Count DLQ rows, optionally filtered by queue.
+    #[pyo3(signature = (*, queue=None))]
+    fn dlq_depth<'py>(
+        &self,
+        py: Python<'py>,
+        queue: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let count = awa_model::dlq::dlq_depth(&pool, queue.as_deref())
+                .await
+                .map_err(map_awa_error)?;
+            Ok(count)
+        })
+    }
+
+    /// DLQ row counts grouped by queue (descending).
+    fn dlq_depth_by_queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = awa_model::dlq::dlq_depth_by_queue(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(rows)
+        })
+    }
+
+    /// Retry a single DLQ'd job. Returns the revived PyJob or `None` if the
+    /// DLQ row no longer exists.
+    #[pyo3(signature = (job_id, *, run_at=None, priority=None, queue=None))]
+    fn retry_from_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: i64,
+        run_at: Option<DateTime<Utc>>,
+        priority: Option<i16>,
+        queue: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let opts = crate::dlq::build_retry_opts(run_at, priority, queue);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                Ok(match job {
+                    Some(job) => PyJob::from(job).into_pyobject(py)?.into_any().unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    fn bulk_retry_from_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(count)
+        })
+    }
+
+    /// Move an already-failed job (in `jobs_hot`) into the DLQ. Returns the
+    /// resulting DlqEntry, or `None` if the row wasn't in `failed` state.
+    fn move_failed_to_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: i64,
+        reason: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                Ok(match row {
+                    Some(row) => crate::dlq::dlq_row_to_entry(py, row)?
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Bulk-move all failed jobs matching the filter into the DLQ. At least
+    /// one of `kind` or `queue` must be provided.
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string()))]
+    fn bulk_move_failed_to_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        reason: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                &pool,
+                kind.as_deref(),
+                queue.as_deref(),
+                &reason,
+            )
+            .await
+            .map_err(map_awa_error)?;
+            Ok(count)
+        })
+    }
+
+    /// Purge a single DLQ row. Returns `True` if the row was deleted.
+    fn purge_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let deleted = awa_model::dlq::purge_dlq_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(deleted)
+        })
+    }
+
+    /// Bulk-purge DLQ rows matching the filter.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    fn purge_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+            let count = awa_model::dlq::purge_dlq(&pool, &filter)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(count)
+        })
+    }
+
     fn health_check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
@@ -1755,6 +1956,183 @@ impl PyClient {
         })
     }
 
+    // --- DLQ sync versions -------------------------------------------------
+
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, limit=100))]
+    fn list_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
+        limit: i64,
+    ) -> PyResult<Vec<crate::dlq::PyDlqEntry>> {
+        let pool = self.pool.clone();
+        let filter = crate::dlq::build_filter(kind, queue, tag, before_id, Some(limit));
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let rows = awa_model::dlq::list_dlq(&pool, &filter)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| {
+                    rows.into_iter()
+                        .map(|row| crate::dlq::dlq_row_to_entry(py, row))
+                        .collect()
+                })
+            })
+        })
+    }
+
+    fn get_dlq_job_sync(
+        &self,
+        py: Python<'_>,
+        job_id: i64,
+    ) -> PyResult<Option<crate::dlq::PyDlqEntry>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::dlq::get_dlq_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| row.map(|r| crate::dlq::dlq_row_to_entry(py, r)).transpose())
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, queue=None))]
+    fn dlq_depth_sync(&self, py: Python<'_>, queue: Option<String>) -> PyResult<i64> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::dlq_depth(&pool, queue.as_deref())
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
+    fn dlq_depth_by_queue_sync(&self, py: Python<'_>) -> PyResult<Vec<(String, i64)>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::dlq_depth_by_queue(&pool)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
+    #[pyo3(signature = (job_id, *, run_at=None, priority=None, queue=None))]
+    fn retry_from_dlq_sync(
+        &self,
+        py: Python<'_>,
+        job_id: i64,
+        run_at: Option<DateTime<Utc>>,
+        priority: Option<i16>,
+        queue: Option<String>,
+    ) -> PyResult<Option<PyJob>> {
+        let pool = self.pool.clone();
+        let opts = crate::dlq::build_retry_opts(run_at, priority, queue);
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
+                    .await
+                    .map_err(map_awa_error)?;
+                Ok(job.map(PyJob::from))
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    fn bulk_retry_from_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
+    fn move_failed_to_dlq_sync(
+        &self,
+        py: Python<'_>,
+        job_id: i64,
+        reason: String,
+    ) -> PyResult<Option<crate::dlq::PyDlqEntry>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| row.map(|r| crate::dlq::dlq_row_to_entry(py, r)).transpose())
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string()))]
+    fn bulk_move_failed_to_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        reason: String,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::bulk_move_failed_to_dlq(
+                    &pool,
+                    kind.as_deref(),
+                    queue.as_deref(),
+                    &reason,
+                )
+                .await
+                .map_err(map_awa_error)
+            })
+        })
+    }
+
+    fn purge_dlq_job_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::purge_dlq_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    fn purge_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::purge_dlq(&pool, &filter)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
     fn health_check_sync(&self, py: Python<'_>) -> PyResult<PyHealthCheck> {
         let pool = self.pool.clone();
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
@@ -2160,6 +2538,7 @@ fn parse_queue_retention_overrides(
             awa_worker::RetentionPolicy {
                 completed: Duration::from_secs_f64(completed_hours * 3600.0),
                 failed: Duration::from_secs_f64(failed_hours * 3600.0),
+                dlq: None,
             },
         ));
     }

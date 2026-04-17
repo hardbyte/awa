@@ -46,6 +46,22 @@ class CallbackToken:
     @property
     def id(self) -> str: ...
 
+class DlqEntry:
+    """An entry in the Dead Letter Queue.
+
+    Combines the original `Job` snapshot with DLQ-specific metadata (reason
+    for moving, timestamp, and the run_lease of the final attempt).
+    """
+
+    @property
+    def job(self) -> Job[dict[str, Any]]: ...
+    @property
+    def reason(self) -> str: ...
+    @property
+    def dlq_at(self) -> Any: ...  # datetime.datetime
+    @property
+    def original_run_lease(self) -> int: ...
+
 class Job(Generic[T]):
     @property
     def id(self) -> int: ...
@@ -290,6 +306,49 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     async def get_job(self, job_id: int) -> Job[dict[str, Any]]: ...
+    async def list_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list[DlqEntry]: ...
+    async def get_dlq_job(self, job_id: int) -> DlqEntry | None: ...
+    async def dlq_depth(self, *, queue: str | None = None) -> int: ...
+    async def dlq_depth_by_queue(self) -> list[tuple[str, int]]: ...
+    async def retry_from_dlq(
+        self,
+        job_id: int,
+        *,
+        run_at: Any | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job[dict[str, Any]] | None: ...
+    async def bulk_retry_from_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+    ) -> int: ...
+    async def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None: ...
+    async def bulk_move_failed_to_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+    ) -> int: ...
+    async def purge_dlq_job(self, job_id: int) -> bool: ...
+    async def purge_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+    ) -> int: ...
     async def health_check(self) -> HealthCheck: ...
     async def insert_many_copy(
         self,

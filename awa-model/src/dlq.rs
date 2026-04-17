@@ -453,11 +453,14 @@ where
 /// Delete DLQ rows older than the given retention duration.
 ///
 /// Limited per-call via `batch_size` to avoid long-running transactions.
-/// Returns the number of rows deleted.
+/// Returns the number of rows deleted. When `queue` is `Some`, only rows for
+/// that queue are considered — used to apply per-queue retention overrides
+/// without leaking global retention to queues with explicit policies.
 pub async fn cleanup_dlq<'e, E>(
     executor: E,
     retention: std::time::Duration,
     batch_size: i64,
+    queue: Option<&str>,
 ) -> Result<u64, AwaError>
 where
     E: PgExecutor<'e>,
@@ -469,12 +472,14 @@ where
         WHERE id IN (
             SELECT id FROM awa.jobs_dlq
             WHERE dlq_at < now() - $1::interval
+              AND ($3::text IS NULL OR queue = $3)
             LIMIT $2
         )
         "#,
     )
     .bind(&retention_secs)
     .bind(batch_size)
+    .bind(queue)
     .execute(executor)
     .await?;
     Ok(res.rows_affected())

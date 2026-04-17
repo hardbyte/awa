@@ -532,6 +532,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &reason,
                         )
                         .await?;
+                        // Emit the same `awa.job.dlq_moved` counter the
+                        // executor uses for automatic routing, so dashboards
+                        // and alerting see admin bulk moves too.
+                        awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                            queue.as_deref(),
+                            &reason,
+                            count,
+                        );
                         println!("Moved {count} failed jobs into the DLQ.");
                     }
                     DlqCommands::Purge { kind, queue, tag } => {

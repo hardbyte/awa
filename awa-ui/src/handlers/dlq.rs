@@ -144,3 +144,59 @@ pub async fn bulk_purge_dlq(
     let count = dlq::purge_dlq(&state.pool, &filter).await?;
     Ok(Json(CountResponse { count }))
 }
+
+#[derive(Debug, Deserialize)]
+pub struct BulkMovePayload {
+    #[serde(default)]
+    pub kind: Option<String>,
+    #[serde(default)]
+    pub queue: Option<String>,
+    #[serde(default = "default_move_reason")]
+    pub reason: String,
+}
+
+fn default_move_reason() -> String {
+    "ui_bulk_move".to_string()
+}
+
+/// Bulk-move failed jobs from `jobs_hot` into the DLQ. Requires at least one
+/// of `kind` or `queue` to avoid accidentally archiving every failed row in
+/// the system.
+pub async fn bulk_move_failed(
+    State(state): State<AppState>,
+    Json(payload): Json<BulkMovePayload>,
+) -> Result<Json<CountResponse>, ApiError> {
+    state.require_writable()?;
+    let count = dlq::bulk_move_failed_to_dlq(
+        &state.pool,
+        payload.kind.as_deref(),
+        payload.queue.as_deref(),
+        &payload.reason,
+    )
+    .await?;
+    // Mirror the worker: emit the `awa.job.dlq_moved` counter so operator
+    // dashboards reflect admin bulk moves alongside automatic routing.
+    // Done inline against the global OTel meter rather than through an
+    // awa-worker dependency, which would pull in the dispatcher/runtime
+    // crate graph for a single counter increment.
+    if count > 0 {
+        let meter = opentelemetry::global::meter("awa");
+        let counter = meter
+            .u64_counter("awa.job.dlq_moved")
+            .with_description("Number of jobs moved into the Dead Letter Queue")
+            .with_unit("{job}")
+            .build();
+        let mut attrs = vec![opentelemetry::KeyValue::new(
+            "awa.dlq.reason",
+            payload.reason.clone(),
+        )];
+        if let Some(queue) = payload.queue.as_deref() {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.queue",
+                queue.to_string(),
+            ));
+        }
+        counter.add(count, &attrs);
+    }
+    Ok(Json(CountResponse { count }))
+}

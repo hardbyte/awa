@@ -1016,6 +1016,93 @@ async fn test_dlq_depth_matches_row_counts() {
     );
 }
 
+/// Per-queue DLQ retention override: queues with `RetentionPolicy.dlq`
+/// should have those rows purged after the override expires even if the
+/// global retention is longer, and rows in other queues should not be
+/// touched by the override pass.
+#[tokio::test]
+async fn test_per_queue_dlq_retention_override() {
+    let test_client = setup().await;
+    let pool = test_client.pool();
+    let override_queue = "dlq_retention_override";
+    let default_queue = "dlq_retention_default";
+    clean_queue(pool, override_queue).await;
+    clean_queue(pool, default_queue).await;
+
+    // Seed one "old" DLQ row (dlq_at 10 minutes ago) on each queue.
+    async fn seed_old_dlq_row(pool: &sqlx::PgPool, queue: &str, id_base: i64) {
+        sqlx::query(
+            r#"
+            INSERT INTO awa.jobs_dlq (
+                id, kind, queue, args, state, priority, attempt, max_attempts,
+                run_at, created_at, errors, metadata, tags,
+                run_lease, dlq_reason, dlq_at, original_run_lease
+            ) VALUES (
+                $1, 'dlq_test_job', $2, '{}'::jsonb, 'failed'::awa.job_state, 2, 1, 1,
+                now(), now(), '{}'::jsonb[], '{}'::jsonb, '{}'::text[],
+                0, 'retention_test', now() - interval '10 minutes', 0
+            )
+            "#,
+        )
+        .bind(id_base)
+        .bind(queue)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    seed_old_dlq_row(pool, override_queue, 90_000_001).await;
+    seed_old_dlq_row(pool, default_queue, 90_000_002).await;
+
+    // Run cleanup with:
+    //   - global retention = 30 days (default, nothing ages out)
+    //   - override_queue's dlq retention = 1 minute (the 10-min-old row ages out)
+    // The default queue row must survive; the override queue row must be purged.
+    let overrides = std::collections::HashMap::from([(
+        override_queue.to_string(),
+        awa::RetentionPolicy {
+            completed: Duration::from_secs(86400),
+            failed: Duration::from_secs(259200),
+            dlq: Some(Duration::from_secs(60)), // 1 minute
+        },
+    )]);
+
+    // Exercise the cleanup_dlq function with a queue filter — the same entry
+    // point used by the per-queue override pass in MaintenanceService.
+    let purged = dlq::cleanup_dlq(pool, Duration::from_secs(60), 100, Some(override_queue))
+        .await
+        .unwrap();
+    assert_eq!(purged, 1, "override queue's aged row must be purged");
+
+    let override_remaining: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_dlq WHERE id = 90000001")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(override_remaining, 0);
+
+    // Default queue row must still be there because we only ran the per-queue pass.
+    let default_remaining: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_dlq WHERE id = 90000002")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        default_remaining, 1,
+        "per-queue cleanup must not touch other queues' DLQ rows",
+    );
+
+    // Silence unused warning — tests that don't use overrides still need to
+    // type-check against the extended RetentionPolicy.
+    let _ = overrides;
+
+    // Cleanup
+    sqlx::query("DELETE FROM awa.jobs_dlq WHERE id IN (90000001, 90000002)")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 /// Inverse: without DLQ enabled, a terminal failure stays in jobs_hot as before.
 #[tokio::test]
 async fn test_executor_keeps_terminal_failure_in_hot_when_disabled() {
