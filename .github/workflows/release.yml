@@ -183,8 +183,15 @@ jobs:
           docker run -d --name awa-smoke-pg \
             -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test \
             -p 15432:5432 postgres:17-alpine
-          for _ in $(seq 1 30); do
-            if docker exec awa-smoke-pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
+          # `pg_isready` checks the socket, which can return true while
+          # initdb is still creating the `awa_test` database on first boot —
+          # the next client connection then gets "Connection reset by peer".
+          # Poll with an actual query against the target DB instead.
+          for _ in $(seq 1 60); do
+            if docker exec -e PGPASSWORD=test awa-smoke-pg \
+                 psql -U postgres -d awa_test -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
             sleep 1
           done
 
@@ -325,8 +332,14 @@ jobs:
           docker run -d --name awa-smoke-pg --network awa-smoke \
             -e POSTGRES_PASSWORD=test -e POSTGRES_DB=awa_test \
             postgres:17-alpine >/dev/null
-          for _ in $(seq 1 30); do
-            if docker exec awa-smoke-pg pg_isready -U postgres >/dev/null 2>&1; then break; fi
+          # pg_isready can pass while initdb is still setting up the
+          # `awa_test` database; next client connection resets. Query the
+          # target DB directly until it responds.
+          for _ in $(seq 1 60); do
+            if docker exec -e PGPASSWORD=test awa-smoke-pg \
+                 psql -U postgres -d awa_test -tAc 'SELECT 1' >/dev/null 2>&1; then
+              break
+            fi
             sleep 1
           done
 
