@@ -492,8 +492,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     DlqCommands::Depth { queue } => {
                         if let Some(queue_name) = queue {
-                            let depth =
-                                awa_model::dlq::dlq_depth(&pool, Some(&queue_name)).await?;
+                            let depth = awa_model::dlq::dlq_depth(&pool, Some(&queue_name)).await?;
                             println!("{queue_name}: {depth}");
                         } else {
                             let total = awa_model::dlq::dlq_depth(&pool, None).await?;
@@ -518,8 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             tag,
                             ..Default::default()
                         };
-                        let count =
-                            awa_model::dlq::bulk_retry_from_dlq(&pool, &filter).await?;
+                        let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter).await?;
                         println!("Retried {count} DLQ rows.");
                     }
                     DlqCommands::Move {

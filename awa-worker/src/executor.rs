@@ -820,16 +820,15 @@ async fn apply_terminal_failure(
         // function uses the same (state='running' AND run_lease=lease)
         // guard that the in-place UPDATE below uses, so concurrent rescue
         // wins the same way.
-        let moved: Option<awa_model::dlq::DlqRow> = sqlx::query_as(
-            "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4, $5)",
-        )
-        .bind(job.id)
-        .bind(job.run_lease)
-        .bind(dlq_reason)
-        .bind(&error_json)
-        .bind(progress_snapshot)
-        .fetch_optional(pool)
-        .await?;
+        let moved: Option<awa_model::dlq::DlqRow> =
+            sqlx::query_as("SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4, $5)")
+                .bind(job.id)
+                .bind(job.run_lease)
+                .bind(dlq_reason)
+                .bind(&error_json)
+                .bind(progress_snapshot)
+                .fetch_optional(pool)
+                .await?;
 
         let Some(dlq_row) = moved else {
             warn!(

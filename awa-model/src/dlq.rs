@@ -82,13 +82,11 @@ pub async fn move_failed_to_dlq<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let row = sqlx::query_as::<_, DlqRow>(
-        "SELECT * FROM awa.move_failed_to_dlq($1, $2)",
-    )
-    .bind(job_id)
-    .bind(reason)
-    .fetch_optional(executor)
-    .await?;
+    let row = sqlx::query_as::<_, DlqRow>("SELECT * FROM awa.move_failed_to_dlq($1, $2)")
+        .bind(job_id)
+        .bind(reason)
+        .fetch_optional(executor)
+        .await?;
     Ok(row)
 }
 
@@ -96,6 +94,9 @@ where
 ///
 /// Returns the number of rows moved. Either `kind` or `queue` must be
 /// specified.
+///
+/// Preserves the source row's `progress` column so operator-initiated moves
+/// don't silently drop handler checkpoints.
 pub async fn bulk_move_failed_to_dlq<'e, E>(
     executor: E,
     kind: Option<&str>,
@@ -131,7 +132,7 @@ where
             id, kind, queue, args, 'failed'::awa.job_state, priority, attempt,
             max_attempts, run_at, NULL, NULL, attempted_at, COALESCE(finalized_at, now()),
             created_at, errors, metadata, tags, unique_key, unique_states,
-            NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, 0, progress,
             $3, now(), run_lease
         FROM moved
         "#,
@@ -179,9 +180,9 @@ where
     E: PgExecutor<'e>,
 {
     let row = sqlx::query_as::<_, DlqRow>("SELECT * FROM awa.jobs_dlq WHERE id = $1")
-    .bind(job_id)
-    .fetch_optional(executor)
-    .await?;
+        .bind(job_id)
+        .fetch_optional(executor)
+        .await?;
     Ok(row)
 }
 
@@ -248,10 +249,7 @@ pub async fn retry_from_dlq<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let scheduled = opts
-        .run_at
-        .map(|t| t > Utc::now())
-        .unwrap_or(false);
+    let scheduled = opts.run_at.map(|t| t > Utc::now()).unwrap_or(false);
 
     if scheduled {
         let row = sqlx::query_as::<_, JobRow>(

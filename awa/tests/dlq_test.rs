@@ -96,17 +96,16 @@ async fn test_move_to_dlq_guarded_happy_path() {
     .await
     .unwrap();
 
-    let dlq_row: Option<awa::DlqRow> = sqlx::query_as(
-        "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb, $5::jsonb)",
-    )
-    .bind(job.id)
-    .bind(42_i64)
-    .bind("terminal_error")
-    .bind(serde_json::json!({"error": "boom", "attempt": 1, "terminal": true}))
-    .bind(serde_json::json!({"checkpoint": "step3"}))
-    .fetch_optional(pool)
-    .await
-    .unwrap();
+    let dlq_row: Option<awa::DlqRow> =
+        sqlx::query_as("SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb, $5::jsonb)")
+            .bind(job.id)
+            .bind(42_i64)
+            .bind("terminal_error")
+            .bind(serde_json::json!({"error": "boom", "attempt": 1, "terminal": true}))
+            .bind(serde_json::json!({"checkpoint": "step3"}))
+            .fetch_optional(pool)
+            .await
+            .unwrap();
 
     let dlq_row = dlq_row.expect("DLQ move should have succeeded");
     assert_eq!(dlq_row.id, job.id);
@@ -149,26 +148,23 @@ async fn test_move_to_dlq_guarded_rejects_stale_lease() {
     .await
     .unwrap();
 
-    sqlx::query(
-        r#"UPDATE awa.jobs_hot SET state='running', run_lease=7 WHERE id=$1"#,
-    )
-    .bind(job.id)
-    .execute(pool)
-    .await
-    .unwrap();
+    sqlx::query(r#"UPDATE awa.jobs_hot SET state='running', run_lease=7 WHERE id=$1"#)
+        .bind(job.id)
+        .execute(pool)
+        .await
+        .unwrap();
 
     // Call with the wrong lease (simulating a rescue that bumped it in the meantime)
-    let dlq_row: Option<awa::DlqRow> = sqlx::query_as(
-        "SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb, $5::jsonb)",
-    )
-    .bind(job.id)
-    .bind(99_i64) // wrong
-    .bind("should_not_move")
-    .bind(serde_json::json!({}))
-    .bind::<Option<serde_json::Value>>(None)
-    .fetch_optional(pool)
-    .await
-    .unwrap();
+    let dlq_row: Option<awa::DlqRow> =
+        sqlx::query_as("SELECT * FROM awa.move_to_dlq_guarded($1, $2, $3, $4::jsonb, $5::jsonb)")
+            .bind(job.id)
+            .bind(99_i64) // wrong
+            .bind("should_not_move")
+            .bind(serde_json::json!({}))
+            .bind::<Option<serde_json::Value>>(None)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
 
     assert!(dlq_row.is_none(), "stale lease should reject the move");
 
@@ -212,10 +208,9 @@ async fn test_bulk_move_failed_to_dlq() {
             .unwrap();
     }
 
-    let moved =
-        dlq::bulk_move_failed_to_dlq(pool, None, Some(queue), "ops_archived")
-            .await
-            .unwrap();
+    let moved = dlq::bulk_move_failed_to_dlq(pool, None, Some(queue), "ops_archived")
+        .await
+        .unwrap();
     assert_eq!(moved, 3);
 
     let depth = dlq::dlq_depth(pool, Some(queue)).await.unwrap();
@@ -251,12 +246,16 @@ async fn test_retry_from_dlq_revives_job() {
     )
     .await
     .unwrap();
-    sqlx::query("UPDATE awa.jobs_hot SET state='failed', attempt=5, finalized_at=now() WHERE id=$1")
-        .bind(job.id)
-        .execute(pool)
+    sqlx::query(
+        "UPDATE awa.jobs_hot SET state='failed', attempt=5, finalized_at=now() WHERE id=$1",
+    )
+    .bind(job.id)
+    .execute(pool)
+    .await
+    .unwrap();
+    dlq::move_failed_to_dlq(pool, job.id, "reason")
         .await
         .unwrap();
-    dlq::move_failed_to_dlq(pool, job.id, "reason").await.unwrap();
 
     let opts = RetryFromDlqOpts::default();
     let revived = dlq::retry_from_dlq(pool, job.id, &opts)
@@ -297,7 +296,9 @@ async fn test_retry_from_dlq_with_future_run_at_schedules() {
         .execute(pool)
         .await
         .unwrap();
-    dlq::move_failed_to_dlq(pool, job.id, "will_retry").await.unwrap();
+    dlq::move_failed_to_dlq(pool, job.id, "will_retry")
+        .await
+        .unwrap();
 
     let opts = RetryFromDlqOpts {
         run_at: Some(chrono::Utc::now() + chrono::Duration::minutes(10)),
@@ -308,6 +309,142 @@ async fn test_retry_from_dlq_with_future_run_at_schedules() {
         .unwrap()
         .expect("retry should return the revived row");
     assert_eq!(revived.state.to_string(), "scheduled");
+}
+
+/// `move_failed_to_dlq` and `bulk_move_failed_to_dlq` must carry the source
+/// row's `progress` checkpoint into the DLQ. Terminal-failure handlers write
+/// their final progress snapshot to `jobs_hot.progress`; dropping it during
+/// an operator-initiated move loses the last-known state of the job.
+#[tokio::test]
+async fn test_bulk_move_preserves_progress_snapshot() {
+    let test_client = setup().await;
+    let pool = test_client.pool();
+    let queue = "dlq_progress_preserve";
+    clean_queue(pool, queue).await;
+
+    // Single-job admin move path.
+    let single = awa::model::insert_with(
+        pool,
+        &DlqTestJob {
+            value: "single".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE awa.jobs_hot
+           SET state='failed', finalized_at=now(),
+               progress='{"checkpoint":"single_row"}'::jsonb
+           WHERE id=$1"#,
+    )
+    .bind(single.id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let moved_single = dlq::move_failed_to_dlq(pool, single.id, "single_move")
+        .await
+        .unwrap()
+        .expect("single move should return a DLQ row");
+    assert_eq!(
+        moved_single.progress,
+        Some(serde_json::json!({"checkpoint": "single_row"})),
+        "move_failed_to_dlq must preserve the source progress checkpoint",
+    );
+
+    // Bulk admin move path.
+    let bulk = awa::model::insert_with(
+        pool,
+        &DlqTestJob {
+            value: "bulk".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query(
+        r#"UPDATE awa.jobs_hot
+           SET state='failed', finalized_at=now(),
+               progress='{"checkpoint":"bulk_row","step":7}'::jsonb
+           WHERE id=$1"#,
+    )
+    .bind(bulk.id)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let moved = dlq::bulk_move_failed_to_dlq(pool, None, Some(queue), "bulk_move")
+        .await
+        .unwrap();
+    assert_eq!(moved, 1, "bulk move should have picked up the failed row");
+
+    let bulk_row = dlq::get_dlq_job(pool, bulk.id)
+        .await
+        .unwrap()
+        .expect("bulk-moved row should land in the DLQ");
+    assert_eq!(
+        bulk_row.progress,
+        Some(serde_json::json!({"checkpoint": "bulk_row", "step": 7})),
+        "bulk_move_failed_to_dlq must preserve the source progress checkpoint",
+    );
+}
+
+/// Guards against schema drift between `jobs_hot` and `jobs_dlq`. The DLQ
+/// table redefines every column explicitly, so a new column added to
+/// `jobs_hot` in a future migration must also be added to `jobs_dlq` — else
+/// the `SELECT *`-free move CTE will break. This test fails loudly if the
+/// two tables diverge.
+#[tokio::test]
+async fn test_jobs_hot_and_dlq_schema_parity() {
+    let test_client = setup().await;
+    let pool = test_client.pool();
+
+    let drift: Vec<(String, String, String)> = sqlx::query_as(
+        r#"
+        SELECT h.column_name, h.data_type::text, COALESCE(d.data_type::text, '<missing>')
+        FROM information_schema.columns h
+        LEFT JOIN information_schema.columns d
+            ON d.table_schema = h.table_schema
+           AND d.table_name = 'jobs_dlq'
+           AND d.column_name = h.column_name
+        WHERE h.table_schema = 'awa'
+          AND h.table_name = 'jobs_hot'
+          AND (d.column_name IS NULL OR d.data_type <> h.data_type)
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap();
+
+    assert!(
+        drift.is_empty(),
+        "jobs_hot columns missing or mismatched in jobs_dlq: {drift:?}",
+    );
+
+    // DLQ-specific columns must exist.
+    let dlq_specific: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*)::bigint
+        FROM information_schema.columns
+        WHERE table_schema = 'awa'
+          AND table_name = 'jobs_dlq'
+          AND column_name IN ('dlq_reason', 'dlq_at', 'original_run_lease')
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        dlq_specific, 3,
+        "jobs_dlq must define dlq_reason, dlq_at, original_run_lease",
+    );
 }
 
 /// Purge DLQ removes matching rows.
@@ -407,7 +544,11 @@ async fn test_executor_routes_terminal_failure_to_dlq_when_enabled() {
     );
     let dlq_row = dlq_row.unwrap();
     assert_eq!(dlq_row.dlq_reason, "terminal_error");
-    assert!(dlq_row.errors.as_ref().map(|e| !e.is_empty()).unwrap_or(false));
+    assert!(dlq_row
+        .errors
+        .as_ref()
+        .map(|e| !e.is_empty())
+        .unwrap_or(false));
 }
 
 /// Inverse: without DLQ enabled, a terminal failure stays in jobs_hot as before.
@@ -444,12 +585,11 @@ async fn test_executor_keeps_terminal_failure_in_hot_when_disabled() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     client.shutdown(Duration::from_secs(3)).await;
 
-    let row: Option<(String,)> =
-        sqlx::query_as("SELECT state::text FROM awa.jobs_hot WHERE id=$1")
-            .bind(job.id)
-            .fetch_optional(pool)
-            .await
-            .unwrap();
+    let row: Option<(String,)> = sqlx::query_as("SELECT state::text FROM awa.jobs_hot WHERE id=$1")
+        .bind(job.id)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
     assert_eq!(row.map(|r| r.0), Some("failed".to_string()));
     assert!(dlq::get_dlq_job(pool, job.id).await.unwrap().is_none());
 }

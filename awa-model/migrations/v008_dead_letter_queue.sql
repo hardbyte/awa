@@ -140,6 +140,10 @@ $$ LANGUAGE sql;
 -- Move an already-failed job (currently in jobs_hot) to the DLQ.
 -- Used by bulk admin moves where the caller doesn't own a run_lease.
 -- Guarded by state = 'failed' rather than run_lease.
+--
+-- Preserves the source row's `progress` column — terminal-failure handlers
+-- write their final checkpoint there, and operators manually promoting
+-- failed rows into the DLQ expect to see it in the DLQ view.
 CREATE OR REPLACE FUNCTION awa.move_failed_to_dlq(
     p_job_id     BIGINT,
     p_reason     TEXT
@@ -161,7 +165,7 @@ CREATE OR REPLACE FUNCTION awa.move_failed_to_dlq(
         id, kind, queue, args, 'failed'::awa.job_state, priority, attempt,
         max_attempts, run_at, NULL, NULL, attempted_at, COALESCE(finalized_at, now()),
         created_at, errors, metadata, tags, unique_key, unique_states,
-        NULL, NULL, NULL, NULL, NULL, NULL, 0, NULL,
+        NULL, NULL, NULL, NULL, NULL, NULL, 0, progress,
         p_reason, now(), run_lease
     FROM moved
     RETURNING *;
