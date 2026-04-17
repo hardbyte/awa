@@ -27,29 +27,52 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tag matches Cargo.toml versions
         shell: bash
+        # Real TOML parse via stdlib `tomllib` (Python 3.11+). Ubuntu runners
+        # ship Python ≥3.12, so no install step needed. `grep` worked for the
+        # current layout but is brittle against future drift (multi-line
+        # strings, commented lines, a stray `version = ...` in a sibling
+        # table).
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
-          # Strip leading "v" — Cargo versions don't carry the prefix.
-          expected="${tag#v}"
-          echo "Git tag:          ${tag}"
-          echo "Expected version: ${expected}"
+          python3 - <<'PY'
+          import os, sys, tomllib
 
-          ws=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
-          py=$(grep -m1 '^version' awa-python/Cargo.toml | cut -d'"' -f2)
-          pyproj=$(grep -m1 '^version' awa-python/pyproject.toml | cut -d'"' -f2)
+          expected = os.environ["GITHUB_REF_NAME"].removeprefix("v")
+          print(f"Git tag:          {os.environ['GITHUB_REF_NAME']}")
+          print(f"Expected version: {expected}")
 
-          fail=0
-          for pair in "Cargo.toml=${ws}" "awa-python/Cargo.toml=${py}" "awa-python/pyproject.toml=${pyproj}"; do
-            file="${pair%%=*}"; value="${pair#*=}"
-            if [ "${value}" != "${expected}" ]; then
-              echo "::error file=${file}::version mismatch: ${file} says '${value}', tag says '${expected}'"
-              fail=1
-            else
-              echo "ok: ${file} = ${value}"
-            fi
-          done
-          exit ${fail}
+          def cargo_version(path: str) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              return (
+                  data.get("package", {}).get("version")
+                  or data.get("workspace", {}).get("package", {}).get("version")
+              )
+
+          def pyproject_version(path: str) -> str | None:
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              return data.get("project", {}).get("version")
+
+          checks = [
+              ("Cargo.toml", cargo_version("Cargo.toml")),
+              ("awa-python/Cargo.toml", cargo_version("awa-python/Cargo.toml")),
+              ("awa-python/pyproject.toml", pyproject_version("awa-python/pyproject.toml")),
+          ]
+
+          fail = 0
+          for file, value in checks:
+              if value is None:
+                  print(f"::error file={file}::could not read version from {file}")
+                  fail = 1
+              elif value != expected:
+                  print(f"::error file={file}::version mismatch: {file} says '{value}', tag says '{expected}'")
+                  fail = 1
+              else:
+                  print(f"ok: {file} = {value}")
+
+          sys.exit(fail)
+          PY
 
   # ─── Cross-compile CLI binaries ──────────────────────────────────────
   build-binaries:
@@ -119,9 +142,16 @@ jobs:
         run: |
           set -euo pipefail
           test -f awa-ui/static/index.html
-          # Fail early if the built index is empty or shorter than our placeholder,
-          # which would silently ship a broken UI.
-          [ "$(wc -c < awa-ui/static/index.html)" -gt 200 ]
+          # Vite emits hashed asset references; their absence means the build
+          # produced a degenerate index (or didn't run).
+          if ! grep -q '/assets/' awa-ui/static/index.html; then
+            echo "::error::awa-ui/static/index.html does not reference /assets/* — Vite build produced no frontend bundle"
+            cat awa-ui/static/index.html
+            exit 1
+          fi
+          test -d awa-ui/static/assets
+          ls awa-ui/static/assets/ | grep -q '\.js$'
+          ls awa-ui/static/assets/ | grep -q '\.css$'
 
       - name: Build (native)
         if: matrix.target != 'aarch64-unknown-linux-musl'
