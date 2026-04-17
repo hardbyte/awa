@@ -156,6 +156,77 @@ Both surfaces must be called before `start()` / `build()`. Declaring a descripto
 
 All intervals have `_ms` suffixed kwargs in Python (e.g. `heartbeat_interval_ms=15000`).
 
+## Dead Letter Queue
+
+Permanently-failed jobs can optionally be routed into `awa.jobs_dlq` instead of staying in `jobs_hot` with `state = 'failed'`. This keeps the hot path clean and lets DLQ forensics happen on a much longer retention window than `failed_retention` allows. See [ADR-019](adr/019-dead-letter-queue.md) for the design; this section covers the knobs.
+
+**Default is off.** Migration v008 creates the `jobs_dlq` table but `dlq_enabled_by_default = false` — existing deployments see zero behavior change on upgrade until they opt in. Opt in globally, per queue, or both.
+
+### Rust
+
+```rust
+use std::time::Duration;
+
+let client = Client::builder()
+    // Global default: all queues route terminal failures through the DLQ.
+    .dlq_enabled_by_default(true)
+    // Opt a specific queue back out.
+    .queue_dlq_enabled("metrics_flush", false)
+    // Retention for DLQ rows (default: 30 days).
+    .dlq_retention(Duration::from_secs(60 * 60 * 24 * 14)) // 14 days
+    // Max rows deleted per cleanup pass (default: 1000).
+    .dlq_cleanup_batch_size(5000)
+    .queue("email", QueueConfig::default())
+    .build(&pool)
+    .await?;
+```
+
+Per-queue retention overrides live on `RetentionPolicy`:
+
+```rust
+use awa::RetentionPolicy;
+use std::collections::HashMap;
+use std::time::Duration;
+
+let mut overrides = HashMap::new();
+overrides.insert(
+    "payments".to_string(),
+    RetentionPolicy {
+        completed: Duration::from_secs(24 * 60 * 60),
+        failed:    Duration::from_secs(72 * 60 * 60),
+        dlq: Some(Duration::from_secs(90 * 24 * 60 * 60)), // 90-day DLQ for audits
+    },
+);
+
+let client = Client::builder()
+    .dlq_enabled_by_default(true)
+    .queue_retention_overrides(overrides)
+    .build(&pool)
+    .await?;
+```
+
+The global DLQ cleanup pass excludes override queues — each queue follows only its own policy, not both.
+
+### Key fields
+
+| Field | Default | Notes |
+|---|---|---|
+| `dlq_enabled_by_default` | `false` | Preserves upgrade path — existing deployments are unaffected until opted in |
+| `queue_dlq_enabled(q, bool)` | — | Per-queue override of the default |
+| `dlq_retention` | `30d` | Intentionally longer than `failed_retention` (72h) — the point is forensics |
+| `dlq_cleanup_batch_size` | `1000` | Raise for high-volume DLQ inflows |
+| `RetentionPolicy.dlq` | `None` | Per-queue retention; `None` falls back to `dlq_retention` |
+
+### What "enabled" actually does
+
+When a queue has DLQ enabled, the executor's terminal path (`JobError::Terminal` or `Retryable` at `attempt >= max_attempts`) calls `awa.move_to_dlq_guarded` instead of `UPDATE ... SET state = 'failed'`. Both are lease-guarded, so concurrency semantics are identical — see [architecture.md#dead-letter-queue](architecture.md#dead-letter-queue).
+
+Heartbeat/deadline rescue always transitions to `retryable` regardless of DLQ policy; the next claim re-enters the terminal path and routes accordingly.
+
+### Pre-existing `failed` rows
+
+Opting in does **not** migrate existing `failed` rows — they age out via `failed_retention`. To force a migration, use `awa dlq move --kind <k>` (CLI), `bulk_move_failed_to_dlq` (Rust/Python), or the "Move to DLQ" bulk action in the Web UI.
+
 ## CLI and `awa serve`
 
 The CLI reads `DATABASE_URL` from the environment or `--database-url`. All subcommands except `serve` use a single database connection.

@@ -143,3 +143,6 @@ async def test_async_dlq_flow():
     assert revived is not None
     assert revived.id == job.id
     assert str(revived.state) == "available"
+
+    # DLQ should be empty for this queue after the retry moves the row back.
+    assert await c.dlq_depth(queue="pydlq_async") == 0

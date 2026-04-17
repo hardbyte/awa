@@ -189,7 +189,7 @@ export function DlqPage() {
         <TableBody>
           {rows.length === 0 && !dlqQuery.isLoading && (
             <TableRow>
-              <TableCell>
+              <TableCell colSpan={6}>
                 <div className="text-muted-fg py-6">
                   DLQ is empty{hasActiveFilter ? " (matching this filter)" : ""}.
                 </div>

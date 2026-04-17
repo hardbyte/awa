@@ -1054,10 +1054,13 @@ async fn test_per_queue_dlq_retention_override() {
     seed_old_dlq_row(pool, override_queue, 90_000_001).await;
     seed_old_dlq_row(pool, default_queue, 90_000_002).await;
 
-    // Run cleanup with:
-    //   - global retention = 30 days (default, nothing ages out)
-    //   - override_queue's dlq retention = 1 minute (the 10-min-old row ages out)
-    // The default queue row must survive; the override queue row must be purged.
+    // Exercise the full MaintenanceService cleanup path (global exclusion +
+    // per-queue override) rather than the model helper in isolation. With:
+    //   - global dlq retention = 30 days (nothing in default queue ages out)
+    //   - override_queue dlq retention = 1 minute (the 10-min-old row ages out)
+    // we expect exactly one row purged — from the override queue — and the
+    // global pass must *not* touch the override queue even though its row is
+    // older than the global retention.
     let overrides = std::collections::HashMap::from([(
         override_queue.to_string(),
         awa::RetentionPolicy {
@@ -1067,12 +1070,28 @@ async fn test_per_queue_dlq_retention_override() {
         },
     )]);
 
-    // Exercise the cleanup_dlq function with a queue filter — the same entry
-    // point used by the per-queue override pass in MaintenanceService.
-    let purged = dlq::cleanup_dlq(pool, Duration::from_secs(60), 100, Some(override_queue))
-        .await
-        .unwrap();
-    assert_eq!(purged, 1, "override queue's aged row must be purged");
+    let mut global_purged: u64 = 0;
+    let mut per_queue_purged: Vec<(String, u64)> = Vec::new();
+    awa_worker::maintenance::run_dlq_cleanup_pass(
+        pool,
+        Duration::from_secs(60 * 60 * 24 * 30), // 30-day global retention
+        100,
+        &overrides,
+        &mut global_purged,
+        &mut per_queue_purged,
+    )
+    .await
+    .expect("cleanup pass should not error");
+
+    assert_eq!(
+        global_purged, 0,
+        "global pass must not touch override queue, and default queue row is not old enough",
+    );
+    assert_eq!(
+        per_queue_purged,
+        vec![(override_queue.to_string(), 1u64)],
+        "override queue's aged row must be purged by the per-queue pass",
+    );
 
     let override_remaining: i64 =
         sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_dlq WHERE id = 90000001")
@@ -1081,7 +1100,8 @@ async fn test_per_queue_dlq_retention_override() {
             .unwrap();
     assert_eq!(override_remaining, 0);
 
-    // Default queue row must still be there because we only ran the per-queue pass.
+    // Default queue row must still be there — global pass didn't age it out,
+    // per-queue pass has no entry for this queue.
     let default_remaining: i64 =
         sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_dlq WHERE id = 90000002")
             .fetch_one(pool)
@@ -1089,12 +1109,8 @@ async fn test_per_queue_dlq_retention_override() {
             .unwrap();
     assert_eq!(
         default_remaining, 1,
-        "per-queue cleanup must not touch other queues' DLQ rows",
+        "default queue row must survive when its dlq_at is within global retention",
     );
-
-    // Silence unused warning — tests that don't use overrides still need to
-    // type-check against the extended RetentionPolicy.
-    let _ = overrides;
 
     // Cleanup
     sqlx::query("DELETE FROM awa.jobs_dlq WHERE id IN (90000001, 90000002)")

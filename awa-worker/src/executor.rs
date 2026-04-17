@@ -136,7 +136,15 @@ pub(crate) type BoxedWorker = Box<dyn Worker>;
 #[allow(clippy::large_enum_variant)]
 enum CompletionOutcome {
     /// The DB update was applied; optionally carries a lifecycle event to dispatch.
-    Applied { event: Option<UntypedJobEvent> },
+    Applied {
+        event: Option<UntypedJobEvent>,
+        /// True when the transition took the job to a terminal state — either
+        /// `failed` in `jobs_hot` or moved into `jobs_dlq`. The caller uses
+        /// this to pick between retry vs. terminal-failure metrics for paths
+        /// where the raw `JobResult`/`JobError` alone is ambiguous (notably
+        /// `JobError::Retryable` when `attempt >= max_attempts`).
+        terminal: bool,
+    },
     /// The job was already rescued/cancelled — stale completion, no event.
     IgnoredStale,
 }
@@ -305,8 +313,17 @@ impl JobExecutor {
             .await;
 
             match &outcome {
-                Ok(CompletionOutcome::Applied { .. }) => {
-                    // State transition succeeded — record metrics
+                Ok(CompletionOutcome::Applied { terminal, .. }) => {
+                    // State transition succeeded — record metrics. `terminal`
+                    // is the source of truth for retry-vs-failure because
+                    // `JobError::Retryable` can resolve to either a retry
+                    // (attempts remain) or a terminal failure (exhausted →
+                    // `failed`/DLQ). Outcome flows:
+                    //   JobError::Retryable + !terminal  → record_job_retried
+                    //   JobError::Retryable +  terminal  → record_job_failed
+                    //   JobError::Terminal               → record_job_failed
+                    // DLQ counters are emitted inside `apply_terminal_failure`
+                    // so they are not duplicated here.
                     match &result {
                         Ok(JobResult::Completed) => {
                             metrics.record_job_completed(&job_kind, &job_queue, duration);
@@ -328,22 +345,36 @@ impl JobExecutor {
                         }
                         Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
                         Ok(JobResult::WaitForCallback(_)) => {
-                            metrics.jobs_waiting_external.add(
-                                1,
-                                &[
-                                    opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
-                                    opentelemetry::KeyValue::new(
-                                        "awa.job.queue",
-                                        job_queue.clone(),
-                                    ),
-                                ],
-                            );
+                            if *terminal {
+                                // Handler returned WaitForCallback without
+                                // registering one — we forced the job to
+                                // `failed`.
+                                metrics.record_job_failed(&job_kind, &job_queue, true);
+                            } else {
+                                metrics.jobs_waiting_external.add(
+                                    1,
+                                    &[
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.kind",
+                                            job_kind.clone(),
+                                        ),
+                                        opentelemetry::KeyValue::new(
+                                            "awa.job.queue",
+                                            job_queue.clone(),
+                                        ),
+                                    ],
+                                );
+                            }
                         }
                         Err(JobError::Terminal(_)) => {
                             metrics.record_job_failed(&job_kind, &job_queue, true);
                         }
                         Err(JobError::Retryable(_)) => {
-                            metrics.record_job_retried(&job_kind, &job_queue);
+                            if *terminal {
+                                metrics.record_job_failed(&job_kind, &job_queue, true);
+                            } else {
+                                metrics.record_job_retried(&job_kind, &job_queue);
+                            }
                         }
                     }
                 }
@@ -429,9 +460,13 @@ async fn complete_job(
                         job: updated_job,
                         duration,
                     }),
+                    terminal: false,
                 })
             } else {
-                Ok(CompletionOutcome::Applied { event: None })
+                Ok(CompletionOutcome::Applied {
+                    event: None,
+                    terminal: false,
+                })
             }
         }
 
@@ -478,9 +513,13 @@ async fn complete_job(
                         attempt: updated_job.attempt,
                         next_run_at: updated_job.run_at,
                     }),
+                    terminal: false,
                 })
             } else {
-                Ok(CompletionOutcome::Applied { event: None })
+                Ok(CompletionOutcome::Applied {
+                    event: None,
+                    terminal: false,
+                })
             }
         }
 
@@ -520,7 +559,10 @@ async fn complete_job(
                 return Ok(CompletionOutcome::IgnoredStale);
             }
             // Snooze is not a terminal event — no lifecycle event
-            Ok(CompletionOutcome::Applied { event: None })
+            Ok(CompletionOutcome::Applied {
+                event: None,
+                terminal: false,
+            })
         }
 
         Ok(JobResult::Cancel(reason)) => {
@@ -567,9 +609,13 @@ async fn complete_job(
                         job: updated_job,
                         reason: reason.clone(),
                     }),
+                    terminal: false,
                 })
             } else {
-                Ok(CompletionOutcome::Applied { event: None })
+                Ok(CompletionOutcome::Applied {
+                    event: None,
+                    terminal: false,
+                })
             }
         }
 
@@ -613,7 +659,10 @@ async fn complete_job(
                             "Job already completed by racing callback"
                         );
                         // No lifecycle event for wait-for-callback
-                        return Ok(CompletionOutcome::Applied { event: None });
+                        return Ok(CompletionOutcome::Applied {
+                            event: None,
+                            terminal: false,
+                        });
                     }
                     Some((_, None)) => {
                         // Still running but no callback_id — programming error
@@ -640,8 +689,12 @@ async fn complete_job(
                         .bind(job.run_lease)
                         .execute(pool)
                         .await?;
-                        // No lifecycle event for wait-for-callback
-                        return Ok(CompletionOutcome::Applied { event: None });
+                        // Terminal: the handler returned WaitForCallback without
+                        // registering one, so we forced the job to `failed` above.
+                        return Ok(CompletionOutcome::Applied {
+                            event: None,
+                            terminal: true,
+                        });
                     }
                     _ => {
                         warn!(
@@ -653,7 +706,10 @@ async fn complete_job(
                 }
             }
             // No lifecycle event for wait-for-callback
-            Ok(CompletionOutcome::Applied { event: None })
+            Ok(CompletionOutcome::Applied {
+                event: None,
+                terminal: false,
+            })
         }
 
         Err(JobError::Terminal(msg)) => {
@@ -767,9 +823,13 @@ async fn complete_job(
                             attempt: job.attempt,
                             next_run_at: updated_job.run_at,
                         }),
+                        terminal: false,
                     })
                 } else {
-                    Ok(CompletionOutcome::Applied { event: None })
+                    Ok(CompletionOutcome::Applied {
+                        event: None,
+                        terminal: false,
+                    })
                 }
             }
         }
@@ -888,9 +948,13 @@ async fn apply_terminal_failure(
                     error: error_msg.to_string(),
                     attempt: job.attempt,
                 }),
+                terminal: true,
             });
         }
-        return Ok(CompletionOutcome::Applied { event: None });
+        return Ok(CompletionOutcome::Applied {
+            event: None,
+            terminal: true,
+        });
     }
 
     let result = sqlx::query(
@@ -927,9 +991,13 @@ async fn apply_terminal_failure(
                 error: error_msg.to_string(),
                 attempt: job.attempt,
             }),
+            terminal: true,
         });
     }
-    Ok(CompletionOutcome::Applied { event: None })
+    Ok(CompletionOutcome::Applied {
+        event: None,
+        terminal: true,
+    })
 }
 
 async fn direct_complete_job(pool: &PgPool, job: &JobRow) -> Result<bool, AwaError> {

@@ -86,6 +86,7 @@ Relevant behavior:
 - pre-0.4 legacy version rows are normalized automatically during upgrade
 - schema versions increase monotonically as new migrations are added; use `awa migrate` rather than depending on a specific numeric version in application code
 - `v005` switches admin metadata maintenance from row-level to statement-level triggers
+- `v008` adds `awa.jobs_dlq` and two SQL helpers (`move_to_dlq_guarded`, `move_failed_to_dlq`) — fully additive, zero behavior change until a queue opts in. No data is moved at migration time, no index on `jobs_hot` is altered. See [ADR-019](adr/019-dead-letter-queue.md) and [configuration.md](configuration.md#dead-letter-queue) for the opt-in surface
 - `SchemaNotMigrated` means your application expects a newer schema than the database currently has
 - there are no bundled down migrations
 

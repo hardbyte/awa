@@ -69,12 +69,16 @@ MoveToDlqAccepted(w, j) ==
 
 \* Retry from DLQ — revives the job back to available with a fresh lease epoch.
 \* Modeled as an atomic admin action; in the implementation this is the atomic
-\* DELETE-from-jobs_dlq + INSERT-into-jobs_hot CTE in awa_model::dlq.
+\* DELETE-from-jobs_dlq + INSERT-into-jobs_hot CTE in awa_model::dlq, which
+\* inserts the revived row with run_lease = 0. Resetting lease here matches
+\* that behaviour; without the reset a job that burned its lease budget before
+\* landing in the DLQ could never be re-claimed after retry (Claim requires
+\* lease < MaxLease).
 RetryFromDlq(j) ==
     /\ jobState[j] = "dlq"
-    /\ lease[j] < MaxLease
     /\ jobState' = [jobState EXCEPT ![j] = "available"]
-    /\ UNCHANGED <<owner, lease, taskLease, cancelFlag, shutdownPhase>>
+    /\ lease' = [lease EXCEPT ![j] = 0]
+    /\ UNCHANGED <<owner, taskLease, cancelFlag, shutdownPhase>>
 
 FinalizeRejected(w, j, toState) ==
     /\ toState \in FinalStates

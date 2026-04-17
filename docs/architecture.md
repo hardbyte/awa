@@ -75,6 +75,8 @@ INSERT ──► scheduled ──► available ──► running ──► compl
                │              │           │         (external callback / sequential wait)
                │              │           │
                │              │           ├──► failed (max attempts exhausted or terminal error)
+               │              │           │       │
+               │              │           │       └──► dlq (if queue has DLQ enabled, or via admin move)
                │              │           │
                │              │           └──► cancelled (by handler or admin)
                │              │
@@ -95,8 +97,9 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 | `failed` | Exhausted max attempts or terminal error (terminal) |
 | `cancelled` | Cancelled by handler or admin (terminal) |
 | `waiting_external` | Parked for external callback completion or sequential resume |
+| `dlq` | Terminal, lives in `awa.jobs_dlq` — see [Dead Letter Queue](#dead-letter-queue) and [ADR-019](adr/019-dead-letter-queue.md) |
 
-Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled).
+Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled). DLQ rows live in their own table (`awa.jobs_dlq`) with an independent retention (default 30 days) — see [Dead Letter Queue](#dead-letter-queue).
 
 Jobs carry an optional `progress` JSONB column that handlers can write during execution. Progress is cleared to NULL on completion but preserved across all other transitions (retry, snooze, cancel, fail, rescue), enabling checkpoint-based resumption on retry.
 
@@ -215,8 +218,12 @@ tokio::spawn(async {
     ├── Ok(RetryAfter)   → state = 'retryable', run_at = now() + duration
     ├── Ok(Snooze)       → state = 'scheduled', attempt -= 1
     ├── Ok(Cancel)       → state = 'cancelled'
-    ├── Err(Terminal)    → state = 'failed'
-    └── Err(Retryable)   → state = 'retryable' (with backoff) or 'failed' (if max attempts)
+    ├── Err(Terminal)    → terminal failure (see below)
+    └── Err(Retryable)   → state = 'retryable' (with backoff) or terminal failure (if max attempts)
+
+        Terminal failure routes depending on queue DLQ policy:
+          DLQ enabled  → atomic move to `awa.jobs_dlq` via `move_to_dlq_guarded`
+          DLQ disabled → state = 'failed' in place (legacy behavior)
     │
     ▼
     in_flight.remove(job_id)
@@ -342,6 +349,45 @@ FROM due
 Jobs can declare uniqueness constraints via `UniqueOpts`. The unique key is a BLAKE3 hash of the job kind plus optional queue, args, and time-period components. A separate `awa.job_unique_claims` table holds one row per active claim, enforced by a unique index. Triggers on both `jobs_hot` and `scheduled_jobs` insert/remove claims as jobs transition between states.
 
 Each job carries a `unique_states` bitmask (BIT(8)) specifying which states count as "active" for uniqueness purposes (default: scheduled, available, running, completed, retryable). A job only holds a uniqueness claim while its current state is set in its bitmask. This allows the hot and deferred tables to share one uniqueness boundary without keeping all jobs in a single heap.
+
+## Dead Letter Queue
+
+Permanently-failed jobs can be routed into `awa.jobs_dlq` — a separate table off the hot claim path — instead of staying in `jobs_hot` with `state = 'failed'`. See [ADR-019](adr/019-dead-letter-queue.md) for the design rationale.
+
+### Why a separate table
+
+- Hot-path claim indexes and MVCC horizon are unaffected by DLQ row accumulation
+- DLQ retention (default 30 days, for forensics) is decoupled from `failed_retention` (default 72h, for `jobs_hot` housekeeping)
+- `awa.jobs_dlq` has no dequeue index — dispatchers never claim DLQ rows
+- The always-on plan guard test verifies the claim query never references `jobs_dlq`
+
+### Population path
+
+Only two entry points populate the DLQ at runtime:
+
+1. **Executor terminal** — `apply_terminal_failure()` on either `JobError::Terminal(_)` or `JobError::Retryable(_)` with `attempt >= max_attempts`
+2. **Callback-timeout rescue on exhausted attempts** — maintenance loop when the external callback deadline expires and no attempts remain
+
+Heartbeat and deadline rescue always transition to `retryable`; the next claim re-enters `apply_terminal_failure` and routes through the same choke point. This "single invariant, covered transitively" pattern means every runtime DLQ move goes through one tested path.
+
+Operators can also move rows manually via `bulk_move_failed_to_dlq()` or `awa dlq move` (CLI) — used to migrate pre-existing `failed` rows after opting in.
+
+### Atomic, lease-guarded move
+
+The executor uses `awa.move_to_dlq_guarded(id, run_lease, reason, error_json, progress)`, a SQL function that runs `DELETE FROM jobs_hot ... RETURNING *` inside a CTE feeding `INSERT INTO jobs_dlq` in a single statement. The guard is `state = 'running' AND run_lease = $lease` — identical to the in-place `UPDATE ... SET state = 'failed'` guard. That means:
+
+- A concurrent rescue (stale heartbeat, deadline, cancel) wins the same way it does against `failed` finalization — no new race surface
+- A stale lease fails the guard → zero rows affected → runtime treats it as `CompletionOutcome::IgnoredStale`, no DLQ row created, no double-completion
+
+Admin bulk moves (`awa.move_failed_to_dlq`) guard on `state = 'failed'` instead since there is no running lease; `failed` is absorbing in `jobs_hot`, so the state check is sufficient.
+
+### Retry and purge
+
+Retry runs a `DELETE FROM jobs_dlq ... RETURNING *` into either `jobs_hot` (immediate) or `scheduled_jobs` (if `run_at` in the future), setting `run_lease = 0` and `attempt = 0` on the revived row. Retention cleanup is a separate maintenance pass (`run_dlq_cleanup_pass`) that handles a global retention window plus per-queue `RetentionPolicy.dlq` overrides; the global pass excludes override queues so their policy is authoritative.
+
+### Opt-in default
+
+`dlq_enabled_by_default = false` preserves the upgrade path — existing deployments pick up migration v008 without behavior change, and opt in per queue via `queue_dlq_enabled(queue, true)` on the client builder. See [configuration.md](configuration.md#dead-letter-queue) for the operator-facing knobs.
 
 ## Queue Concurrency Modes
 
@@ -543,8 +589,12 @@ The `AwaMetrics` struct (in `awa-worker/src/metrics.rs`) publishes OTel metrics 
 | `awa.maintenance.promote_duration` | Histogram | `s` | Promotion batch duration |
 | `awa.heartbeat.batches` | Counter | `{batch}` | Number of heartbeat batch updates |
 | `awa.maintenance.rescues` | Counter | `{job}` | Number of jobs rescued by maintenance |
+| `awa.job.dlq_moved` | Counter | `{job}` | Jobs moved to DLQ at terminal failure (runtime path) |
+| `awa.job.dlq_retried` | Counter | `{job}` | Jobs retrieved from DLQ by operator action |
+| `awa.job.dlq_purged` | Counter | `{job}` | DLQ rows purged by retention sweep |
+| `awa.job.dlq_depth` | Gauge | `{job}` | Current DLQ row count, per queue |
 
-Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch metrics carry `awa.job.queue`. Completion metrics carry `awa.completion.shard`. Promotion metrics carry `awa.job.state`.
+Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch metrics carry `awa.job.queue`. Completion metrics carry `awa.completion.shard`. Promotion metrics carry `awa.job.state`. DLQ counters also carry `awa.dlq.reason` — e.g. `terminal_error`, `max_attempts_exhausted`, `callback_timeout`, or an operator-supplied string for manual moves.
 
 ### Queue Statistics (SQL)
 

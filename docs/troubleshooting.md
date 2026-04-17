@@ -224,6 +224,101 @@ Pay particular attention to:
 If you want to reproduce the behavior locally before changing settings, run the
 MVCC benchmark documented in `docs/benchmarking.md`.
 
+## Something's In The DLQ
+
+The Dead Letter Queue (`awa.jobs_dlq`) is where terminal failures land when a queue has DLQ enabled. These rows are never claimed — they sit there until an operator retries them, purges them, or retention ages them out (default 30 days).
+
+See [ADR-019](adr/019-dead-letter-queue.md) for the full design and [configuration.md](configuration.md#dead-letter-queue) for the opt-in surface.
+
+### Quick triage
+
+```bash
+# Total DLQ depth, grouped by queue
+awa --database-url "$DATABASE_URL" dlq depth
+
+# Recent entries (newest first)
+awa --database-url "$DATABASE_URL" dlq list --limit 20
+
+# Filter by kind, queue, or tag
+awa --database-url "$DATABASE_URL" dlq list --kind send_email --queue email
+```
+
+The Web UI mirrors this at `/dlq` (filterable list + bulk actions) and `/dlq/$id` (detail + single-row retry/purge). The queues page shows a `+N DLQ` badge next to any queue with non-zero depth.
+
+### Inspect a DLQ row
+
+```sql
+SELECT
+    id,
+    kind,
+    queue,
+    dlq_reason,
+    dlq_at,
+    attempt,
+    max_attempts,
+    errors -> (array_length(errors, 1) - 1) AS last_error,
+    progress
+FROM awa.jobs_dlq
+WHERE id = <job-id>;
+```
+
+`dlq_reason` values:
+
+- `terminal_error` — handler returned `JobError::Terminal`
+- `max_attempts_exhausted` — handler returned `JobError::Retryable` at the last attempt
+- `callback_timeout` — maintenance loop declared the external callback expired with no attempts remaining
+- `manual` (or an operator-supplied string) — `awa dlq move` / `bulk_move_failed_to_dlq`
+
+### Retry a row
+
+Revive back to `available` in `jobs_hot` with a fresh lease (`run_lease = 0`, `attempt = 0`):
+
+```bash
+awa --database-url "$DATABASE_URL" dlq retry <job-id>
+
+# Schedule for the future instead of immediately:
+awa --database-url "$DATABASE_URL" dlq retry <job-id> --run-at "2026-04-20T09:00:00Z"
+
+# Bulk retry by filter (applies atomically per row, returns count)
+awa --database-url "$DATABASE_URL" dlq retry-bulk --kind send_email --queue email
+```
+
+Retries are idempotent — if the row is gone (already retried, purged, or cleaned up), the operation returns `None`/0 without erroring.
+
+### Purge a row
+
+```bash
+awa --database-url "$DATABASE_URL" dlq purge <job-id>
+
+# Bulk purge (for manual forensics cleanup)
+awa --database-url "$DATABASE_URL" dlq purge --kind flaky_kind
+```
+
+Purge is destructive — the row is gone. Prefer retry or wait for retention unless you have a specific reason.
+
+### Move pre-existing failed rows into DLQ
+
+If a queue was previously in "failed-in-place" mode and you've just opted into DLQ, use `awa dlq move` to migrate the surviving `failed` rows (anything still within `failed_retention`):
+
+```bash
+awa --database-url "$DATABASE_URL" dlq move --kind important_work --reason backfill_to_dlq
+```
+
+Admin bulk moves are guarded by `state = 'failed'` (not `run_lease`) since failed rows have no active lease.
+
+### DLQ keeps filling
+
+If `dlq_depth` is growing faster than you can inspect:
+
+1. Check `awa.dlq.reason` attribute on the `awa.job.dlq_moved` counter — one reason may dominate (e.g. a new external API failure all failing with `terminal_error`)
+2. Check the underlying `errors` column on a sample row — `awa job dump <id>` prints the full errors + progress chain
+3. Consider pausing the upstream producer or disabling DLQ for that queue while you investigate:
+   ```rust
+   client.queue_dlq_enabled("offending_queue", false)
+   ```
+   Pre-existing DLQ rows for that queue stay put — only new terminal failures route elsewhere.
+4. Tune `dlq_retention` or `RetentionPolicy.dlq` for the affected queue to keep the DLQ table a reasonable size while you work
+
 ## Common Error Cases
 
 ### `SchemaNotMigrated`

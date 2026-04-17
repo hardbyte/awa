@@ -289,6 +289,7 @@ export function QueuesPage() {
           <TableBody>
             {queues.map((q) => {
               const runtime = runtimeByQueue.get(q.queue);
+              const dlqCount = dlqByQueue.get(q.queue);
               return (
                 <TableRow key={q.queue} id={q.queue}>
                   <TableCell className="font-medium">
@@ -322,14 +323,14 @@ export function QueuesPage() {
                     <span className={q.failed > 0 ? "text-danger" : ""}>
                       {q.failed.toLocaleString()}
                     </span>
-                    {dlqByQueue.get(q.queue) ? (
+                    {dlqCount ? (
                       <Link
                         to="/dlq"
                         search={{ q: `queue:${q.queue}` }}
                         className="ml-2 text-xs text-danger underline"
                         title="DLQ depth"
                       >
-                        (+{dlqByQueue.get(q.queue)!.toLocaleString()} DLQ)
+                        (+{dlqCount.toLocaleString()} DLQ)
                       </Link>
                     ) : null}
                   </TableCell>

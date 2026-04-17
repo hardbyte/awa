@@ -56,6 +56,15 @@ GET  /api/runtime/:instance_id
 GET  /api/cron
 POST /api/cron/:name/trigger
 
+GET  /api/dlq?kind=&queue=&tag=&limit=&before_id=
+GET  /api/dlq/:id
+GET  /api/dlq/depth
+POST /api/dlq/:id/retry
+POST /api/dlq/:id/purge
+POST /api/dlq/bulk-retry                { kind?, queue?, tag? }
+POST /api/dlq/bulk-purge                { kind?, queue?, tag? }
+POST /api/dlq/bulk-move                 { kind?, queue?, reason? }
+
 GET  /api/capabilities                  Feature flags / read-only detection
 ```
 
@@ -96,6 +105,17 @@ Cluster overview: instance count, liveness, leader status, and an attention pane
 ### Cron (`/cron`)
 
 Accordion list of registered periodic job schedules. Each entry shows the cron expression, job kind, target queue, priority, next fire time (countdown), and last run. Expandable to see full details including arguments and tags. "Trigger now" fires the job immediately without affecting the next scheduled run.
+
+### Dead Letter Queue (`/dlq`, `/dlq/:id`)
+
+Operator surface for `awa.jobs_dlq`. See [ADR-019](adr/019-dead-letter-queue.md) for the design and [troubleshooting.md](troubleshooting.md#somethings-in-the-dlq) for diagnostic recipes.
+
+- **List (`/dlq`)** — filterable table (ID, kind, queue, DLQ reason, attempts, age). Same `kind:`/`queue:`/`tag:` prefix-search DSL as `/jobs`. Empty-state cell spans all six columns so the "DLQ is empty" message reads cleanly.
+- **Bulk actions** — checkbox-based selection enables bulk retry, bulk purge, and bulk move-from-failed. All are filter-driven (everything matching the current filter), with confirmation dialogs on destructive operations.
+- **Detail (`/dlq/:id`)** — mirrors the `/jobs/:id` layout: state badge (always `dlq`), queue link, DLQ reason, `dlq_at`, original run lease, attempts, syntax-highlighted args, timeline reconstructed from `errors` + `progress`. Retry and Purge actions are first-class — DLQ rows surface these instead of the `/jobs` Retry/Cancel pair.
+- **Queue depth banner** — the `/queues` page shows a `+N DLQ` link next to any queue with non-zero DLQ depth. The link navigates to `/dlq?q=queue:<name>` so operators jump directly from the queue overview into the relevant slice.
+
+The shared job detail surface (`GET /api/jobs/:id`) transparently falls back to `jobs_dlq` so a direct link (e.g. from an alert) keeps working after a terminal failure has moved the row into DLQ. `can_retry` and `can_cancel` report `false` on DLQ rows so the frontend routes actions through the DLQ endpoints rather than the non-applicable `/jobs` ones.
 
 ## Interaction Patterns
 
