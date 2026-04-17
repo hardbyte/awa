@@ -628,8 +628,16 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
+      # `npm run build` earlier in this job empties `awa-ui/static/` and
+      # removes the tracked `.gitkeep` (Vite's `emptyOutDir: true`), and
+      # re-populates it with the real bundle. That leaves the working tree
+      # dirty at publish time — which is exactly what we want, since the
+      # built bundle IS what we're shipping. `--allow-dirty` is how cargo
+      # consents to that; the `include` list in `awa-ui/Cargo.toml` is what
+      # actually gets the bundle into the .crate file (gitignored paths are
+      # otherwise skipped for git-backed packages).
       - name: Publish awa-ui
-        run: cargo publish --package awa-ui --no-verify
+        run: cargo publish --package awa-ui --no-verify --allow-dirty
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
