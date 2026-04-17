@@ -5,6 +5,8 @@
 //!
 //! Env: DATABASE_URL (required)
 
+mod long_horizon;
+
 use async_trait::async_trait;
 use awa_macros::JobArgs;
 use awa_model::{insert_many, insert_many_copy, insert_with, migrations, InsertOpts};
@@ -92,12 +94,13 @@ async fn count_by_state(pool: &PgPool, queue_name: &str) -> HashMap<String, i64>
 async fn wait_for_completion(pool: &PgPool, queue_name: &str, expected: i64, timeout: Duration) {
     let start = Instant::now();
     loop {
-        let completed: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'completed'")
-                .bind(queue_name)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let completed: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'completed'",
+        )
+        .bind(queue_name)
+        .fetch_one(pool)
+        .await
+        .unwrap();
         if completed >= expected {
             return;
         }
@@ -423,6 +426,11 @@ async fn main() {
 
     if scenario == "worker_only" {
         scenario_worker_only().await;
+        return;
+    }
+
+    if scenario == "long_horizon" {
+        long_horizon::run().await;
         return;
     }
 

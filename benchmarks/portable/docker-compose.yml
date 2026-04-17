@@ -1,8 +1,9 @@
-version: "3.8"
-
 services:
   postgres:
-    image: ${POSTGRES_IMAGE:-postgres:17-alpine}
+    # Pinned to a specific minor version. Do not track `:17-alpine` — autovacuum
+    # behaviour can change across minors, and the long-horizon bench needs
+    # run-over-run comparability.
+    image: ${POSTGRES_IMAGE:-postgres:17.2-alpine}
     environment:
       POSTGRES_PASSWORD: bench
       POSTGRES_USER: bench
@@ -10,19 +11,17 @@ services:
       - "15555:5432"
     volumes:
       - ./init-databases.sql:/docker-entrypoint-initdb.d/01-init.sql
+      - ./postgres.conf:/etc/postgresql/postgresql.conf:ro
     shm_size: 256mb
     command:
       - "postgres"
       - "-c"
-      - "shared_buffers=256MB"
-      - "-c"
-      - "max_connections=200"
-      - "-c"
-      - "synchronous_commit=on"
-      - "-c"
-      - "wal_level=replica"
-      - "-c"
-      - "log_min_duration_statement=5000"
+      - "config_file=/etc/postgresql/postgresql.conf"
+    deploy:
+      resources:
+        limits:
+          cpus: "4"
+          memory: 8G
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U bench"]
       interval: 2s

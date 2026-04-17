@@ -242,6 +242,201 @@ async def scenario_worker_only() -> None:
     print("[awa-python] worker_only: received signal, exiting.", file=sys.stderr)
 
 
+async def scenario_long_horizon() -> None:
+    """Fixed-rate producer + steady consumer, emits JSONL samples every
+    SAMPLE_EVERY_S. Contract: benchmarks/portable/CONTRIBUTING_ADAPTERS.md"""
+    import collections
+    import datetime
+    import math
+    import time
+
+    sample_every_s = env_int("SAMPLE_EVERY_S", 10)
+    producer_rate = env_int("PRODUCER_RATE", 800)
+    worker_count = env_int("WORKER_COUNT", 32)
+    payload_bytes = env_int("JOB_PAYLOAD_BYTES", 256)
+    work_ms = env_int("JOB_WORK_MS", 1)
+
+    c = client()
+    await c.migrate()
+    queue = "awa_python_longhorizon_bench"
+    db_name = database_url().rsplit("/", 1)[-1]
+
+    _emit({
+        "kind": "descriptor",
+        "system": "awa-python",
+        "event_tables": [
+            "awa.jobs_hot", "awa.scheduled_jobs",
+            "awa.jobs_dlq", "awa.job_unique_claims",
+        ],
+        "extensions": [],
+        "version": "0.1.0",
+        "schema_version": os.environ.get("AWA_SCHEMA_VERSION", "current"),
+        "db_name": db_name,
+        "started_at": _now_iso(),
+    })
+
+    # Bounded ring for claim latency (30s @ producer_rate = ~24k, capped to 32k)
+    latencies_ms: collections.deque[tuple[float, float]] = collections.deque(maxlen=32_768)
+    enqueued = 0
+    completed = 0
+    queue_depth = 0
+
+    @c.task(BenchJob, queue=queue)
+    async def handle(job: awa.Job[BenchJob]) -> None:
+        nonlocal completed
+        now = time.monotonic()
+        # `job.created_at` is a UTC datetime in the awa-python bridge.
+        try:
+            created = job.created_at
+            now_wall = datetime.datetime.now(datetime.timezone.utc)
+            latency_ms = max(0.0, (now_wall - created).total_seconds() * 1000.0)
+        except Exception:
+            latency_ms = 0.0
+        latencies_ms.append((now, latency_ms))
+        if work_ms:
+            await asyncio.sleep(work_ms / 1000.0)
+        completed += 1
+
+    await c.start([(queue, worker_count)], poll_interval_ms=50)
+
+    shutdown = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except NotImplementedError:
+            signal.signal(sig, lambda *_a: shutdown.set())
+
+    padding = "x" * max(0, payload_bytes - 32)
+
+    async def producer() -> None:
+        nonlocal enqueued
+        if producer_rate <= 0:
+            return
+        period = 1.0 / producer_rate
+        seq = 0
+        next_t = loop.time()
+        while not shutdown.is_set():
+            next_t += period
+            # Fire-and-forget insert; avoid blocking the producer loop on DB stalls.
+            try:
+                await c.insert(BenchJob(seq=seq), queue=queue)
+                enqueued += 1
+                seq += 1
+            except Exception as exc:
+                print(f"[awa-python] producer insert failed: {exc}", file=sys.stderr)
+            sleep_for = next_t - loop.time()
+            if sleep_for > 0:
+                await asyncio.sleep(sleep_for)
+
+    async def depth_poller() -> None:
+        nonlocal queue_depth
+        while not shutdown.is_set():
+            try:
+                tx = await c.transaction()
+                try:
+                    row = await tx.fetch_one(
+                        "SELECT count(*)::bigint AS cnt FROM awa.jobs_hot "
+                        "WHERE queue = $1 AND state = 'available'",
+                        queue,
+                    )
+                finally:
+                    await tx.rollback()
+                queue_depth = int(row["cnt"])
+            except Exception:
+                pass
+            await asyncio.sleep(1.0)
+
+    async def sampler() -> None:
+        # Align to wall-clock boundary so cross-system timebases match.
+        now_epoch = int(time.time())
+        sleep_for = sample_every_s - (now_epoch % sample_every_s)
+        await asyncio.sleep(sleep_for)
+        last_enqueued = enqueued
+        last_completed = completed
+        last_tick = loop.time()
+        while not shutdown.is_set():
+            tick_deadline = loop.time() + sample_every_s
+            while not shutdown.is_set() and loop.time() < tick_deadline:
+                await asyncio.sleep(min(0.5, tick_deadline - loop.time()))
+            if shutdown.is_set():
+                break
+            dt = max(0.001, loop.time() - last_tick)
+            last_tick = loop.time()
+            enq_rate = (enqueued - last_enqueued) / dt
+            cmp_rate = (completed - last_completed) / dt
+            last_enqueued = enqueued
+            last_completed = completed
+            p50, p95, p99 = _percentiles(latencies_ms, window_s=30.0, now=loop.time())
+            ts = _now_iso()
+            for metric, value, window_s in [
+                ("claim_p50_ms", p50, 30.0),
+                ("claim_p95_ms", p95, 30.0),
+                ("claim_p99_ms", p99, 30.0),
+                ("enqueue_rate", enq_rate, float(sample_every_s)),
+                ("completion_rate", cmp_rate, float(sample_every_s)),
+                ("queue_depth", float(queue_depth), 0.0),
+            ]:
+                _emit({
+                    "t": ts,
+                    "system": "awa-python",
+                    "kind": "adapter",
+                    "subject_kind": "adapter",
+                    "subject": "",
+                    "metric": metric,
+                    "value": value,
+                    "window_s": window_s,
+                })
+
+    try:
+        tasks = [
+            asyncio.create_task(producer(), name="producer"),
+            asyncio.create_task(depth_poller(), name="depth"),
+            asyncio.create_task(sampler(), name="sampler"),
+        ]
+        await shutdown.wait()
+    finally:
+        shutdown.set()
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await c.shutdown(timeout_ms=5000)
+        await c.close()
+
+
+def _emit(record: dict) -> None:
+    print(json.dumps(record), flush=True)
+
+
+def _now_iso() -> str:
+    import datetime as _dt
+    return (
+        _dt.datetime.now(_dt.timezone.utc)
+        .isoformat(timespec="milliseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _percentiles(
+    events: "collections.deque[tuple[float, float]]",
+    *,
+    window_s: float,
+    now: float,
+) -> tuple[float, float, float]:
+    import collections as _c
+    # Filter to the window; keep the deque untouched (it's append-only elsewhere).
+    cutoff = now - window_s
+    values = [v for t, v in events if t >= cutoff]
+    if not values:
+        return 0.0, 0.0, 0.0
+    values.sort()
+    n = len(values)
+    def q(p: float) -> float:
+        idx = min(n - 1, max(0, int(round(p * (n - 1)))))
+        return values[idx]
+    return q(0.50), q(0.95), q(0.99)
+
+
 async def main() -> None:
     scenario = os.environ.get("SCENARIO", "all")
     job_count = env_int("JOB_COUNT", 10000)
@@ -253,6 +448,9 @@ async def main() -> None:
         return
     if scenario == "worker_only":
         await scenario_worker_only()
+        return
+    if scenario == "long_horizon":
+        await scenario_long_horizon()
         return
 
     results: list[dict] = []
