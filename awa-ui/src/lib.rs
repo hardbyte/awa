@@ -13,24 +13,48 @@ use rust_embed::Embed;
 use sqlx::PgPool;
 use tower_http::cors::CorsLayer;
 
-use crate::state::{detect_read_only, AppState};
+use crate::state::{AppState, ReadOnlyMode};
 
 #[derive(Embed)]
 #[folder = "static/"]
 struct StaticAssets;
 
 /// Create the awa-ui router with all API routes and static file serving.
+///
+/// Read-only mode is auto-detected by probing the database connection — see
+/// [`router_with`] to force it explicitly.
 pub async fn router(pool: PgPool, cache_ttl: Duration) -> Result<Router, sqlx::Error> {
-    router_with_callback_secret(pool, cache_ttl, None).await
+    router_with(pool, cache_ttl, None, ReadOnlyMode::Auto).await
 }
 
 /// Create the awa-ui router with optional callback signature verification.
+///
+/// Read-only mode is auto-detected. Prefer [`router_with`] when you need to
+/// force read-only or writable behaviour regardless of DB privilege.
 pub async fn router_with_callback_secret(
     pool: PgPool,
     cache_ttl: Duration,
     callback_hmac_secret: Option<[u8; 32]>,
 ) -> Result<Router, sqlx::Error> {
-    let read_only = detect_read_only(&pool).await?;
+    router_with(pool, cache_ttl, callback_hmac_secret, ReadOnlyMode::Auto).await
+}
+
+/// Create the awa-ui router with full control over callback signing and
+/// read-only behaviour.
+///
+/// `read_only_mode`:
+/// - [`ReadOnlyMode::Auto`] — probe the DB (matches legacy behaviour)
+/// - [`ReadOnlyMode::ReadOnly`] — force mutation endpoints off even if the
+///   DB can write
+/// - [`ReadOnlyMode::Writable`] — force mutation endpoints on; the DB still
+///   has the final say at query time
+pub async fn router_with(
+    pool: PgPool,
+    cache_ttl: Duration,
+    callback_hmac_secret: Option<[u8; 32]>,
+    read_only_mode: ReadOnlyMode,
+) -> Result<Router, sqlx::Error> {
+    let read_only = read_only_mode.resolve(&pool).await?;
     let state = AppState::new(pool, read_only, cache_ttl, callback_hmac_secret);
     let api = Router::new()
         // Jobs

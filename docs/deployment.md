@@ -208,6 +208,14 @@ awa --database-url "$DATABASE_URL" serve --host 0.0.0.0 --port 3000
 
 The UI is read/write admin surface. Put it behind your normal authentication, network policy, and ingress controls.
 
+For a UI pinned to a less-trusted network or shared with stakeholders who shouldn't trigger retries, cancels, or pauses, run with `--read-only` (or set `AWA_READ_ONLY=1`):
+
+```bash
+awa --database-url "$DATABASE_URL" serve --read-only
+```
+
+This forces read-only even when the Postgres connection is fully writable — the UI hides mutation buttons and every mutation endpoint returns 503. See [configuration.md#read-only-mode](configuration.md#read-only-mode) for the tradeoff versus pointing at a read replica.
+
 If you expose the callback receiver endpoints for `HttpWorker`, also configure
 `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) so `awa-ui` verifies
 `X-Awa-Signature` on callback requests.
