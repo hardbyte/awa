@@ -6,8 +6,9 @@ use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
 use awa_model::admin::{
-    self, NamedQueueDescriptor, QueueDescriptor, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
-    QueueRuntimeSnapshot, RateLimitSnapshot, RuntimeSnapshotInput,
+    self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
+    QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
+    RuntimeSnapshotInput,
 };
 use awa_model::{JobArgs, PeriodicJob};
 use chrono::{DateTime, Utc};
@@ -81,6 +82,7 @@ pub struct ClientBuilder {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
+    job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
@@ -109,6 +111,7 @@ impl ClientBuilder {
             pool,
             queues: Vec::new(),
             queue_descriptors: HashMap::new(),
+            job_kind_descriptors: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
             state: HashMap::new(),
@@ -145,6 +148,23 @@ impl ClientBuilder {
         descriptor: QueueDescriptor,
     ) -> Self {
         self.queue_descriptors.insert(name.into(), descriptor);
+        self
+    }
+
+    /// Attach a control-plane descriptor to a typed job kind.
+    pub fn job_kind_descriptor<T: JobArgs>(mut self, descriptor: JobKindDescriptor) -> Self {
+        self.job_kind_descriptors
+            .insert(T::kind().to_string(), descriptor);
+        self
+    }
+
+    /// Attach a control-plane descriptor to a job kind by name.
+    pub fn job_kind_descriptor_kind(
+        mut self,
+        kind: impl Into<String>,
+        descriptor: JobKindDescriptor,
+    ) -> Self {
+        self.job_kind_descriptors.insert(kind.into(), descriptor);
         self
     }
 
@@ -460,6 +480,7 @@ impl ClientBuilder {
             pool: self.pool,
             queues: self.queues,
             queue_descriptors: self.queue_descriptors,
+            job_kind_descriptors: self.job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             state: Arc::new(self.state),
@@ -538,6 +559,7 @@ pub struct Client {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
     queue_descriptors: HashMap<String, QueueDescriptor>,
+    job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
@@ -624,6 +646,28 @@ impl Client {
             .collect()
     }
 
+    fn declared_job_kind_descriptors(&self) -> Vec<NamedJobKindDescriptor> {
+        let mut kinds: Vec<String> = self.workers.keys().cloned().collect();
+        for kind in self.job_kind_descriptors.keys() {
+            if !kinds.iter().any(|existing| existing == kind) {
+                kinds.push(kind.clone());
+            }
+        }
+        kinds.sort();
+
+        kinds
+            .into_iter()
+            .map(|kind| NamedJobKindDescriptor {
+                descriptor: self
+                    .job_kind_descriptors
+                    .get(&kind)
+                    .cloned()
+                    .unwrap_or_default(),
+                kind,
+            })
+            .collect()
+    }
+
     fn runtime_reporter_state(&self) -> RuntimeReporterState {
         RuntimeReporterState {
             pool: self.pool.clone(),
@@ -659,6 +703,7 @@ impl Client {
         );
 
         admin::sync_queue_descriptors(&self.pool, &self.declared_queue_descriptors()).await?;
+        admin::sync_job_kind_descriptors(&self.pool, &self.declared_job_kind_descriptors()).await?;
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -973,6 +1018,23 @@ mod tests {
             .build();
 
         assert!(result.is_ok(), "descriptor for declared queue should build");
+    }
+
+    #[tokio::test]
+    async fn job_kind_descriptor_allows_registered_kind() {
+        #[derive(serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
+        struct TestJob;
+
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .register::<TestJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+            .job_kind_descriptor::<TestJob>(JobKindDescriptor::new().display_name("Test job"))
+            .build();
+
+        assert!(
+            result.is_ok(),
+            "descriptor for registered kind should build"
+        );
     }
 }
 
