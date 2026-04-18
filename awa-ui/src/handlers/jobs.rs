@@ -111,6 +111,9 @@ pub async fn retry_job(
 ) -> Result<Json<Option<JobResponse>>, ApiError> {
     state.require_writable()?;
     let job = admin::retry(&state.pool, job_id).await?;
+    if job.is_some() {
+        state.invalidate_dashboard_caches();
+    }
     match job {
         Some(job) => {
             let mut rows = JobResponse::from_rows(&state.pool, vec![job]).await?;
@@ -126,6 +129,9 @@ pub async fn cancel_job(
 ) -> Result<Json<Option<JobResponse>>, ApiError> {
     state.require_writable()?;
     let job = admin::cancel(&state.pool, job_id).await?;
+    if job.is_some() {
+        state.invalidate_dashboard_caches();
+    }
     match job {
         Some(job) => {
             let mut rows = JobResponse::from_rows(&state.pool, vec![job]).await?;
@@ -146,6 +152,9 @@ pub async fn bulk_retry(
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
     let jobs = admin::bulk_retry(&state.pool, &payload.ids).await?;
+    if !jobs.is_empty() {
+        state.invalidate_dashboard_caches();
+    }
     Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
 }
 
@@ -155,5 +164,8 @@ pub async fn bulk_cancel(
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
     let jobs = admin::bulk_cancel(&state.pool, &payload.ids).await?;
+    if !jobs.is_empty() {
+        state.invalidate_dashboard_caches();
+    }
     Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
 }

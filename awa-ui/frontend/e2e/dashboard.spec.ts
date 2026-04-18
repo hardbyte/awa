@@ -1,4 +1,9 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Response } from "@playwright/test";
+
+function isQueuesListResponse(response: Response): boolean {
+  const url = new URL(response.url());
+  return response.ok() && response.request().method() === "GET" && url.pathname === "/api/queues";
+}
 
 test.describe("Dashboard page", () => {
   test("page loads and shows Dashboard heading", async ({ page }) => {
@@ -22,7 +27,7 @@ test.describe("Dashboard page", () => {
 
   test("queues card renders", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.goto("/"),
     ]);
 
@@ -94,7 +99,7 @@ test.describe("Dashboard page", () => {
 
   test("queue row click navigates to /jobs with queue filter", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.goto("/"),
     ]);
 

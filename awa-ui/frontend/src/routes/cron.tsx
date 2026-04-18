@@ -49,6 +49,9 @@ export function CronPage() {
         <div className="space-y-3">
           {cronJobs.map((cj) => {
             const isExpanded = expandedName === cj.name;
+            const domId = cj.name.replace(/[^a-zA-Z0-9_-]/g, "-");
+            const summaryId = `cron-summary-${domId}`;
+            const panelId = `cron-panel-${domId}`;
             const hasArgs =
               cj.args != null &&
               typeof cj.args === "object" &&
@@ -64,71 +67,75 @@ export function CronPage() {
                 key={cj.name}
                 className="rounded-lg border transition-colors"
               >
-                {/* Summary row */}
-                <div
-                  className="flex flex-wrap items-center gap-3 px-4 py-3 cursor-pointer hover:bg-secondary/30"
-                  onClick={() =>
-                    setExpandedName(isExpanded ? null : cj.name)
-                  }
-                >
-                  {/* Expand indicator */}
-                  <svg
-                    className={`size-4 shrink-0 text-muted-fg transition-transform ${
-                      isExpanded ? "rotate-90" : ""
-                    }`}
-                    viewBox="0 0 20 20"
-                    fill="currentColor"
+                <div className="flex items-start gap-2 px-4 py-3">
+                  <button
+                    id={summaryId}
+                    type="button"
+                    aria-expanded={isExpanded}
+                    aria-controls={panelId}
+                    className="flex min-w-0 flex-1 flex-wrap items-center gap-3 rounded-md px-2 py-1 -mx-2 -my-1 text-left hover:bg-secondary/30 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-ring"
+                    onClick={() =>
+                      setExpandedName(isExpanded ? null : cj.name)
+                    }
                   >
-                    <path
-                      fillRule="evenodd"
-                      d="M7.21 14.77a.75.75 0 0 1 .02-1.06L11.168 10 7.23 6.29a.75.75 0 1 1 1.04-1.08l4.5 4.25a.75.75 0 0 1 0 1.08l-4.5 4.25a.75.75 0 0 1-1.06-.02Z"
-                      clipRule="evenodd"
-                    />
-                  </svg>
-
-                  <span className="font-medium">{cj.name}</span>
-                  <CronExpr expr={cj.cron_expr} />
-                  {cj.timezone !== "UTC" && (
-                    <span className="text-xs text-muted-fg">
-                      {cj.timezone}
-                    </span>
-                  )}
-
-                  <span className="text-sm text-muted-fg">{cj.kind}</span>
-                  <span className="text-sm text-muted-fg">&rarr; {cj.queue}</span>
-
-                  {cj.priority !== 2 && (
-                    <Badge
-                      intent={cj.priority === 1 ? "danger" : "secondary"}
-                      className="text-[10px]"
+                    <svg
+                      className={`size-4 shrink-0 text-muted-fg transition-transform ${
+                        isExpanded ? "rotate-90" : ""
+                      }`}
+                      viewBox="0 0 20 20"
+                      fill="currentColor"
+                      aria-hidden="true"
                     >
-                      P{cj.priority}
-                    </Badge>
-                  )}
+                      <path
+                        fillRule="evenodd"
+                        d="M7.21 14.77a.75.75 0 0 1 .02-1.06L11.168 10 7.23 6.29a.75.75 0 1 1 1.04-1.08l4.5 4.25a.75.75 0 0 1 0 1.08l-4.5 4.25a.75.75 0 0 1-1.06-.02Z"
+                        clipRule="evenodd"
+                      />
+                    </svg>
 
-                  <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
-                    {cj.next_fire_at && (
-                      <span
-                        className="text-success"
-                        title={formatInTimezone(cj.next_fire_at, cj.timezone)}
+                    <span className="font-medium">{cj.name}</span>
+                    <CronExpr expr={cj.cron_expr} />
+                    {cj.timezone !== "UTC" && (
+                      <span className="text-xs text-muted-fg">
+                        {cj.timezone}
+                      </span>
+                    )}
+
+                    <span className="text-sm text-muted-fg">{cj.kind}</span>
+                    <span className="text-sm text-muted-fg">&rarr; {cj.queue}</span>
+
+                    {cj.priority !== 2 && (
+                      <Badge
+                        intent={cj.priority === 1 ? "danger" : "secondary"}
+                        className="text-[10px]"
                       >
-                        {timeUntil(cj.next_fire_at)}
-                      </span>
+                        P{cj.priority}
+                      </Badge>
                     )}
-                    {cj.last_enqueued_at ? (
-                      <span title={new Date(cj.last_enqueued_at).toLocaleString()}>
-                        {timeAgo(cj.last_enqueued_at)}
-                      </span>
-                    ) : (
-                      "Never run"
-                    )}
-                  </span>
+
+                    <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
+                      {cj.next_fire_at && (
+                        <span
+                          className="text-success"
+                          title={formatInTimezone(cj.next_fire_at, cj.timezone)}
+                        >
+                          {timeUntil(cj.next_fire_at)}
+                        </span>
+                      )}
+                      {cj.last_enqueued_at ? (
+                        <span title={new Date(cj.last_enqueued_at).toLocaleString()}>
+                          {timeAgo(cj.last_enqueued_at)}
+                        </span>
+                      ) : (
+                        "Never run"
+                      )}
+                    </span>
+                  </button>
 
                   <Button
                     intent="outline"
                     size="xs"
-                    onPress={(e) => {
-                      e.continuePropagation(); // Don't toggle expand
+                    onPress={() => {
                       triggerMutation.mutate(cj.name);
                     }}
                     isDisabled={readOnly || triggerMutation.isPending}
@@ -139,7 +146,11 @@ export function CronPage() {
 
                 {/* Expanded detail */}
                 {isExpanded && (
-                  <div className="border-t px-4 py-3 space-y-3">
+                  <div
+                    id={panelId}
+                    aria-labelledby={summaryId}
+                    className="border-t px-4 py-3 space-y-3"
+                  >
                     <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm sm:grid-cols-4">
                       <div>
                         <dt className="text-muted-fg">Kind</dt>
