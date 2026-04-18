@@ -8,6 +8,7 @@ dependencies = [
   "matplotlib>=3.9",
   "pandas>=2.2",
   "numpy>=2.0",
+  "pydantic>=2",
 ]
 
 [project.optional-dependencies]

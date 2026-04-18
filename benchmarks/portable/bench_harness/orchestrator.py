@@ -729,39 +729,39 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from pydantic import ValidationError
+
+    from .config import CliConfig, format_validation_error
+
     parser = build_parser()
     args = parser.parse_args(argv)
-    # Reject invalid cadence up front. A 0/negative value would otherwise
-    # reach _next_aligned_tick (integer division) and the adapter-side
-    # alignment math, turning a trivial CLI mistake into an opaque crash
-    # mid-run.
-    if args.sample_every <= 0:
-        parser.error(
-            f"--sample-every must be > 0, got {args.sample_every}"
-        )
-    if args.producer_rate < 0:
-        parser.error(
-            f"--producer-rate must be >= 0, got {args.producer_rate}"
-        )
-    if args.worker_count <= 0:
-        parser.error(
-            f"--worker-count must be > 0, got {args.worker_count}"
-        )
-    phases = resolve_scenario(args.scenario, args.phase)
-    systems = [s.strip() for s in args.systems.split(",") if s.strip()]
+    # All validation flows through one pydantic model so rules stay in
+    # one place and bad combinations produce structured, readable CLI
+    # errors. See bench_harness/config.py.
+    try:
+        config = CliConfig.from_namespace(args)
+        phases = config.resolve_phases()
+    except ValidationError as exc:
+        parser.error(format_validation_error(exc))
+    except ValueError as exc:
+        # resolve_scenario (and anything else that raises ValueError
+        # downstream) is already CLI-friendly; route it through the same
+        # parser.error so the user sees consistent framing.
+        parser.error(str(exc))
+
     drive(
-        systems=systems,
-        scenario=args.scenario,
+        systems=config.systems,
+        scenario=config.scenario,
         phases=phases,
-        pg_image=args.pg_image,
-        fast=args.fast,
-        skip_build=args.skip_build,
-        sample_every_s=args.sample_every,
-        producer_rate=args.producer_rate,
-        producer_mode=args.producer_mode,
-        target_depth=args.target_depth,
-        worker_count=args.worker_count,
-        high_load_multiplier=args.high_load_multiplier,
+        pg_image=config.pg_image,
+        fast=config.fast,
+        skip_build=config.skip_build,
+        sample_every_s=config.sample_every,
+        producer_rate=config.producer_rate,
+        producer_mode=config.producer_mode,
+        target_depth=config.target_depth,
+        worker_count=config.worker_count,
+        high_load_multiplier=config.high_load_multiplier,
         cli_args=list(sys.argv) if argv is None else list(argv),
     )
     return 0

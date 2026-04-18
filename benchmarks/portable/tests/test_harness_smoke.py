@@ -147,3 +147,99 @@ def test_run_readme_written(tmp_path: Path):
     body = (tmp_path / "README.md").read_text()
     assert "warmup" in body
     assert "raw.csv" in body
+
+
+# ─── CliConfig validation ───────────────────────────────────────────
+
+from bench_harness.config import CliConfig, format_validation_error
+from pydantic import ValidationError
+
+
+def _config_kwargs(**overrides):
+    base = dict(
+        scenario="long_horizon",
+        phase_specs=[],
+        systems=["awa"],
+        pg_image="postgres:17.2-alpine",
+        fast=False,
+        skip_build=False,
+        sample_every=10,
+        producer_rate=800,
+        producer_mode="fixed",
+        target_depth=1000,
+        worker_count=32,
+        high_load_multiplier=1.5,
+    )
+    base.update(overrides)
+    return base
+
+
+def test_config_happy_path():
+    config = CliConfig(**_config_kwargs())
+    phases = config.resolve_phases()
+    assert phases[0].type.value == "warmup"
+    assert config.systems == ["awa"]
+
+
+def test_config_rejects_non_positive_sample_every():
+    with pytest.raises(ValidationError) as exc:
+        CliConfig(**_config_kwargs(sample_every=0))
+    assert "sample_every" in format_validation_error(exc.value)
+
+
+def test_config_rejects_unknown_system():
+    with pytest.raises(ValidationError) as exc:
+        CliConfig(**_config_kwargs(systems=["awa", "bogus"]))
+    assert "bogus" in format_validation_error(exc.value)
+
+
+def test_config_rejects_empty_systems():
+    with pytest.raises(ValidationError):
+        CliConfig(**_config_kwargs(systems=[]))
+
+
+def test_config_rejects_unknown_scenario():
+    with pytest.raises(ValidationError) as exc:
+        CliConfig(**_config_kwargs(scenario="nope"))
+    assert "nope" in format_validation_error(exc.value)
+
+
+def test_config_requires_scenario_or_phase():
+    with pytest.raises(ValidationError) as exc:
+        CliConfig(**_config_kwargs(scenario=None, phase_specs=[]))
+    assert "--scenario" in format_validation_error(exc.value)
+
+
+def test_config_accepts_phase_specs_without_scenario():
+    config = CliConfig(**_config_kwargs(
+        scenario=None,
+        phase_specs=["warmup=warmup:10s", "clean_1=clean:30s"],
+    ))
+    phases = config.resolve_phases()
+    assert [p.label for p in phases] == ["warmup", "clean_1"]
+
+
+def test_config_rejects_negative_producer_rate():
+    with pytest.raises(ValidationError):
+        CliConfig(**_config_kwargs(producer_rate=-1))
+
+
+def test_config_rejects_zero_worker_count():
+    with pytest.raises(ValidationError):
+        CliConfig(**_config_kwargs(worker_count=0))
+
+
+def test_config_producer_mode_literal():
+    with pytest.raises(ValidationError):
+        CliConfig(**_config_kwargs(producer_mode="nope"))
+
+
+def test_format_validation_error_is_readable():
+    try:
+        CliConfig(**_config_kwargs(sample_every=0, systems=["bogus"]))
+    except ValidationError as exc:
+        formatted = format_validation_error(exc)
+        # Multi-error: starts with "invalid configuration" prefix
+        # and one bullet per error.
+        assert "invalid configuration" in formatted
+        assert formatted.count("\n  - ") >= 2
