@@ -607,14 +607,23 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 		}
 	}()
 
-	// Sampler — clock-aligned to sample_every_s boundary.
+	// Sampler: clock-aligned to the sample_every_s boundary.
 	var samplerWG sync.WaitGroup
 	samplerWG.Add(1)
 	go func() {
 		defer samplerWG.Done()
 		nowEpoch := time.Now().Unix()
 		next := time.Unix(((nowEpoch/int64(sampleEveryS))+1)*int64(sampleEveryS), 0)
-		time.Sleep(time.Until(next))
+		// Sleepable wait: a SIGTERM during startup would otherwise block
+		// here for up to SAMPLE_EVERY_S seconds. The select below makes
+		// the initial alignment cancellable.
+		alignTimer := time.NewTimer(time.Until(next))
+		select {
+		case <-shutdown:
+			alignTimer.Stop()
+			return
+		case <-alignTimer.C:
+		}
 		lastEnq := state.enqueued.Load()
 		lastCmp := state.completed.Load()
 		lastTick := time.Now()

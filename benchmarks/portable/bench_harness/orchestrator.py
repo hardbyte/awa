@@ -297,26 +297,44 @@ def launch_adapter(
         daemon=True,
     )
     tailer.start()
+
+    def _abort(message: str) -> "RuntimeError":
+        # Tear down the child before raising so we don't leak a subprocess
+        # when descriptor handshake fails for any reason.
+        stop_event.set()
+        if proc.poll() is None:
+            proc.send_signal(signal.SIGTERM)
+            try:
+                proc.wait(timeout=5.0)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        tailer.join(timeout=2.0)
+        return RuntimeError(message)
+
     # Wait up to 60s for descriptor to arrive so we can cross-check against
     # the static manifest. Adapters are expected to emit it promptly.
     deadline = time.time() + 60
     while "descriptor" not in descriptor_holder and time.time() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(
+            raise _abort(
                 f"{system} exited during startup (rc={proc.returncode}) "
                 f"before emitting a descriptor record."
             )
         time.sleep(0.1)
     descriptor = descriptor_holder.get("descriptor")
-    if descriptor:
-        _check_descriptor_drift(manifest, descriptor)
-    else:
-        print(
-            f"[{system}] WARNING: no startup descriptor emitted within 60s; "
-            "continuing without drift check.",
-            file=sys.stderr,
+    if not descriptor:
+        raise _abort(
+            f"{system} did not emit a startup descriptor within 60s. "
+            "The harness requires a descriptor record to cross-check the "
+            "adapter against its static manifest; running blind would let "
+            "drift slip through unnoticed."
         )
-    return RunningAdapter(process=proc, tailer=tailer, descriptor=descriptor or {})
+    try:
+        _check_descriptor_drift(manifest, descriptor)
+    except RuntimeError as exc:
+        raise _abort(str(exc)) from exc
+    return RunningAdapter(process=proc, tailer=tailer, descriptor=descriptor)
 
 
 def _check_descriptor_drift(manifest: AdapterManifest, descriptor: dict) -> None:
@@ -451,6 +469,9 @@ def run_one_system(
         "producer_rate_control_file": str(control_file),
         "base_producer_rate": float(producer_rate),
         "high_load_multiplier": float(high_load_multiplier),
+        # Exposed so the active-readers hook can scan this system's hot
+        # table instead of the catalog. See hooks.enter_active_readers.
+        "event_tables": list(manifest.event_tables),
     }
     try:
         for phase in phases:

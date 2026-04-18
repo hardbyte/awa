@@ -8,6 +8,7 @@ import signal
 import sys
 from collections import deque
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 import awa
 
@@ -315,7 +316,9 @@ async def scenario_long_horizon() -> None:
     c = client()
     await migrate_with_retry(c)
     queue = "awa_python_longhorizon_bench"
-    db_name = database_url().rsplit("/", 1)[-1]
+    # rsplit would capture query params for URLs like postgres://.../db?sslmode=disable.
+    # urlparse handles that cleanly and is robust against user:pass@host:port forms.
+    db_name = (urlparse(database_url()).path or "/").lstrip("/") or "awa_python_bench"
 
     _emit(
         {

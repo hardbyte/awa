@@ -412,20 +412,13 @@ def render_faceted_dead_tuples(
     meta = system_meta or {}
     for idx, system in enumerate(systems):
         ax = axes[idx // cols][idx % cols]
+        # One call per panel: the earlier two-pass version double-drew
+        # phase bands and overwrote display titles with raw system names.
         _, panel_title = meta.get(system, (system, system))
         _setup_axes(
             ax,
             phases=phases,
             title=panel_title,
-            y_label="n_dead_tup",
-            log_scale=False,
-        )
-    for idx, system in enumerate(systems):
-        ax = axes[idx // cols][idx % cols]
-        _setup_axes(
-            ax,
-            phases=phases,
-            title=system,
             y_label="n_dead_tup",
             log_scale=False,
         )

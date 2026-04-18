@@ -11,6 +11,7 @@ regardless of when each system's run started within that second.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 from dataclasses import dataclass
@@ -58,6 +59,11 @@ _CLUSTER_SQL = """
 WITH snap AS (
   SELECT pg_snapshot_xmin(pg_current_snapshot()) AS snapshot_xmin
 )
+-- snapshot_xmin is emitted as an identity for plot annotations, not for
+-- arithmetic. xid8 is 64-bit; routing it through text -> double will lose
+-- precision above 2^53. Fine for sampled values and for "did xmin advance?"
+-- checks over the lifetime of a bench run. Anyone extending this to compute
+-- age-in-xids should switch to a proper int representation.
 SELECT
   snap.snapshot_xmin::text::double precision AS snapshot_xmin,
   COALESCE(
@@ -129,7 +135,21 @@ class MetricsDaemon(threading.Thread):
 
     # ── one-shot boundary snapshots ─────────────────────────────────────
     def phase_boundary_snapshot(self) -> None:
-        """Run pgstattuple / pgstatindex once, emit rows."""
+        """Run pgstattuple / pgstatindex once, emit rows.
+
+        Like _poll_once, capture one elapsed_s/sampled_at for every _emit
+        in this snapshot so per-snapshot rows coalesce on a single
+        elapsed_s in downstream aggregations.
+        """
+        self._tick_elapsed_s = round(time.time() - self.bench_start, 3)
+        self._tick_sampled_at = now_iso()
+        try:
+            self._phase_boundary_snapshot_body()
+        finally:
+            self._tick_elapsed_s = None
+            self._tick_sampled_at = None
+
+    def _phase_boundary_snapshot_body(self) -> None:
         try:
             with psycopg.connect(self.database_url, autocommit=True) as conn:
                 with conn.cursor() as cur:
@@ -195,7 +215,17 @@ class MetricsDaemon(threading.Thread):
     def run(self) -> None:
         try:
             conn = psycopg.connect(self.database_url, autocommit=True)
-        except psycopg.Error:
+        except psycopg.Error as exc:
+            # Surface the failure instead of exiting silently: a daemon that
+            # dies here leaves the run looking healthy with zero DB
+            # telemetry, which is the worst possible failure mode for a
+            # measurement harness.
+            print(
+                f"[{self.system}] metrics daemon failed to connect to "
+                f"{self.database_url!r}: {exc}",
+                file=sys.stderr,
+            )
+            self._emit_connect_error(exc)
             return
         try:
             self._poll_loop(conn)
@@ -204,6 +234,21 @@ class MetricsDaemon(threading.Thread):
                 conn.close()
             except Exception:
                 pass
+
+    def _emit_connect_error(self, exc: Exception) -> None:
+        # Best-effort error marker written into raw.csv so the
+        # absence-of-telemetry is itself observable post-run.
+        try:
+            self._tick_elapsed_s = round(time.time() - self.bench_start, 3)
+            self._tick_sampled_at = now_iso()
+            self._emit_adapter_error(
+                subject="",
+                metric="metrics_daemon_connect_error",
+                detail=str(exc)[:120],
+            )
+        finally:
+            self._tick_elapsed_s = None
+            self._tick_sampled_at = None
 
     def _poll_loop(self, conn: "psycopg.Connection") -> None:
         period = self.period_s
@@ -216,7 +261,11 @@ class MetricsDaemon(threading.Thread):
                 self.stop_event.wait(timeout=min(0.5, next_tick - now))
                 continue
             self._poll_once(conn)
-            next_tick += period
+            # Skip past any missed ticks after a slow poll so we resume on
+            # the next wall-clock boundary instead of replaying a burst of
+            # back-to-back polls to "catch up" (which would pile on the
+            # same DB we just stalled against).
+            next_tick = max(next_tick + period, _next_aligned_tick(time.time(), period))
 
     def _poll_once(self, conn: "psycopg.Connection") -> None:
         # Capture one timestamp for every _emit in this tick so per-tick
@@ -426,7 +475,13 @@ def parse_adapter_record(
     system = expected_system
     subject = rec.get("subject", "")
     subject_kind = rec.get("subject_kind", "adapter")
-    window_s = float(rec.get("window_s", 0.0))
+    # Guard window_s the same way value is guarded: one malformed line
+    # from a buggy adapter should drop the sample, not crash the tailer
+    # and end ingestion for the rest of the run.
+    try:
+        window_s = float(rec.get("window_s", 0.0))
+    except (TypeError, ValueError):
+        return None
     sampled_at = rec.get("t") or now_iso()
     # Prefer harness clock for elapsed_s even if adapter supplies its own.
     elapsed_s = round(time.time() - bench_start, 3)

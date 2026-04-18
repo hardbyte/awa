@@ -30,23 +30,46 @@ from .phases import PhaseRuntime
 
 def enter_idle_in_tx(runtime: PhaseRuntime) -> None:
     stop = threading.Event()
-    holder: dict[str, Any] = {"stop": stop}
+    ready = threading.Event()
+    holder: dict[str, Any] = {"stop": stop, "ready": ready}
 
     def _hold() -> None:
-        # autocommit off: the transaction stays open until close().
-        with psycopg.connect(runtime.database_url, autocommit=False) as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT txid_current()")
-                xid = cur.fetchone()[0]
-                holder["xid"] = xid
-            # Block until the exit hook signals us. Don't commit/rollback
-            # until then — autoexit via `with` rollback fires on stop.
-            stop.wait()
+        try:
+            # autocommit off: the transaction stays open until close().
+            with psycopg.connect(runtime.database_url, autocommit=False) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT txid_current()")
+                    xid = cur.fetchone()[0]
+                    holder["xid"] = xid
+                # Signal success only after xid is captured: if BEGIN/SELECT
+                # raised, the ready event is still set below with an error
+                # so the caller can surface it instead of silently running a
+                # no-op idle-in-tx phase.
+                ready.set()
+                # Block until the exit hook signals us. Don't commit/rollback
+                # until then: autoexit via `with` rollback fires on stop.
+                stop.wait()
+        except Exception as exc:
+            holder["error"] = exc
+            ready.set()
 
     thread = threading.Thread(target=_hold, name="idle-in-tx-holder", daemon=True)
     thread.start()
     holder["thread"] = thread
     runtime.state["idle-in-tx"] = holder
+
+    # Wait until the holder either opens its transaction or errors out. The
+    # phase is measuring "what happens when the MVCC horizon is pinned," so
+    # silently running without a held transaction would make the measurement
+    # meaningless.
+    if not ready.wait(timeout=5.0):
+        raise RuntimeError(
+            "idle-in-tx holder thread did not open a transaction within 5s"
+        )
+    if "error" in holder:
+        raise RuntimeError(
+            f"idle-in-tx holder thread failed to open transaction: {holder['error']}"
+        ) from holder["error"]
 
 
 def exit_idle_in_tx(runtime: PhaseRuntime) -> None:
@@ -83,12 +106,20 @@ def _reader_loop(
 
 
 def enter_active_readers(runtime: PhaseRuntime) -> None:
-    # A portable scan that hits each adapter's event tables lightly. The
-    # adapter can override this via env.
-    scan_sql = os.environ.get(
-        "ACTIVE_READER_SQL",
-        "SELECT count(*) FROM pg_stat_user_tables",
-    )
+    # The PlanetScale failure mode is about analytics readers hitting the
+    # queue's hot tables while the primary churns them. Default to scanning
+    # the first event table from the adapter's manifest so the reader
+    # actually exercises that path; fall back to a catalog scan only if
+    # the manifest didn't declare any event tables. Callers can still
+    # override via env for bespoke analytics shapes.
+    event_tables = runtime.state.get("event_tables") or []
+    default_sql: str
+    if event_tables:
+        first = str(event_tables[0])
+        default_sql = f"SELECT count(*) FROM {first}"
+    else:
+        default_sql = "SELECT count(*) FROM pg_stat_user_tables"
+    scan_sql = os.environ.get("ACTIVE_READER_SQL", default_sql)
     reader_count = int(os.environ.get("ACTIVE_READER_COUNT", "4"))
     stop = threading.Event()
     threads: list[threading.Thread] = []

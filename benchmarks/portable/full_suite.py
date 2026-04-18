@@ -421,7 +421,11 @@ def _svg_bar_chart(
     row_gap = 12
     bar_height = 32
     chart_height = len(items) * (bar_height + row_gap) - row_gap if items else 1
-    scale = chart_width / max((value for _, value in items), default=1.0)
+    # When every item is 0 (e.g. chaos_failures when all systems pass),
+    # max() returns 0 and chart_width / 0 would crash. Treat as unit scale:
+    # every bar collapses to the minimum 2px width rendered below.
+    max_value = max((value for _, value in items), default=1.0)
+    scale = chart_width / max_value if max_value > 0 else 0.0
     svg_height = max(height, margin_top + margin_bottom + chart_height)
     rows: list[str] = [
         f"<text x='24' y='34' font-size='24' font-weight='700' fill='#0f172a'>{html.escape(title)}</text>",
@@ -735,7 +739,7 @@ tr.row-fail td:first-child { border-left: 4px solid #dc2626; }
                             f"{values.get('mean_p50_us', 0) / 1000:,.2f}",
                             f"{values.get('mean_p95_us', 0) / 1000:,.2f}",
                             f"{values.get('mean_p99_us', 0) / 1000:,.2f}",
-                            f"{values.get('min_p50_us', 0) / 1000:,.2f} – {values.get('max_p50_us', 0) / 1000:,.2f}",
+                            f"{values.get('min_p50_us', 0) / 1000:,.2f} to {values.get('max_p50_us', 0) / 1000:,.2f}",
                         ],
                     )
                 )

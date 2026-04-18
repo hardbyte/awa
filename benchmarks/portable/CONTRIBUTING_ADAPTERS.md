@@ -10,7 +10,7 @@ in the existing adapters (Rust, Python, Go, Elixir).
 
 Create a self-contained subdirectory:
 
-```
+```text
 benchmarks/portable/<system>-bench/
     adapter.json                # static manifest (authoritative for preflight)
     Dockerfile                  # unless the adapter runs natively on the host
