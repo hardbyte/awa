@@ -142,31 +142,27 @@
     },
     {
       "id": 110,
-      "type": "timeseries",
+      "type": "table",
       "title": "Queue Depth by State",
-      "description": "Current jobs by queue, stacked by state. Queue column carries the declared display name when available. Click a data point → drill into awa-ui for that queue.",
+      "description": "Current jobs by queue, one row per queue with per-state counts. Eventually consistent (~2s lag against the jobs table). The queue name column is a direct link into awa-ui's queue detail page.",
       "gridPos": { "h": 8, "w": 16, "x": 0, "y": 4 },
       "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 20, "stacking": { "mode": "normal" } },
-          "links": [
-            { "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__field.labels.queue}", "targetBlank": true }
-          ]
-        },
+        "defaults": { "unit": "short", "custom": { "align": "right" } },
         "overrides": [
-          { "matcher": { "id": "byRegexp", "options": "available" },         "properties": [{ "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "running" },           "properties": [{ "id": "color", "value": { "fixedColor": "blue",   "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "failed" },            "properties": [{ "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "retryable" },         "properties": [{ "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "scheduled" },         "properties": [{ "id": "color", "value": { "fixedColor": "purple", "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": "waiting_external" },  "properties": [{ "id": "color", "value": { "fixedColor": "yellow", "mode": "fixed" } }] }
+          { "matcher": { "id": "byName", "options": "queue" },        "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 170 }, { "id": "links", "value": [{ "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__value.text}", "targetBlank": true }]}] },
+          { "matcher": { "id": "byName", "options": "display_name" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "owner" },        "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 160 }] },
+          { "matcher": { "id": "byName", "options": "available" },    "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "running" },      "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "blue",   "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "failed" },       "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "retryable" },    "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
         ]
       },
+      "options": { "sortBy": [{ "displayName": "available", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT $__time(now()) AS time, (COALESCE(qd.display_name, qs.queue) || ' · ' || s.state) AS metric, s.value::bigint AS value FROM awa.queue_state_counts qs LEFT JOIN awa.queue_descriptors qd ON qd.queue = qs.queue CROSS JOIN LATERAL (VALUES ('available', qs.available), ('running', qs.running), ('failed', qs.failed), ('retryable', qs.retryable), ('scheduled', qs.scheduled), ('waiting_external', qs.waiting_external)) s(state, value) WHERE s.value > 0 ORDER BY 1, 2",
-          "format": "time_series",
+          "rawSql": "WITH q AS (SELECT queue FROM awa.queue_state_counts UNION SELECT queue FROM awa.queue_descriptors) SELECT q.queue, qd.display_name, qd.owner, COALESCE(qs.available, 0) AS available, COALESCE(qs.running, 0) AS running, COALESCE(qs.completed, 0) AS completed, COALESCE(qs.failed, 0) AS failed, COALESCE(qs.scheduled, 0) AS scheduled, COALESCE(qs.retryable, 0) AS retryable, COALESCE(qs.waiting_external, 0) AS waiting_ext FROM q LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue ORDER BY COALESCE(qs.available, 0) DESC, q.queue",
+          "format": "table",
           "refId": "A"
         }
       ],
@@ -174,28 +170,28 @@
     },
     {
       "id": 111,
-      "type": "timeseries",
+      "type": "table",
       "title": "Queue Lag (oldest available job)",
-      "description": "Age of the oldest 'available' job per queue. The #1 alerting signal — jumps sharply when workers can't keep up.",
+      "description": "Age of the oldest 'available' job per queue — the #1 alerting signal. Empty table = every queue is caught up. Queue name links to awa-ui for pause/drain.",
       "gridPos": { "h": 8, "w": 8, "x": 16, "y": 4 },
       "fieldConfig": {
-        "defaults": {
-          "unit": "s",
-          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 },
-          "thresholds": { "mode": "absolute", "steps": [
-            { "color": "green", "value": null },
-            { "color": "yellow", "value": 60 },
-            { "color": "red", "value": 300 }
+        "defaults": { "custom": { "align": "right" }, "noValue": "\u2713 all queues caught up" },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "queue" },        "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 160 }, { "id": "links", "value": [{ "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__value.text}", "targetBlank": true }]}] },
+          { "matcher": { "id": "byName", "options": "display_name" }, "properties": [{ "id": "custom.align", "value": "left" }] },
+          { "matcher": { "id": "byName", "options": "lag_s" }, "properties": [
+            { "id": "unit", "value": "s" },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }]}},
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } }
           ]},
-          "links": [
-            { "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__field.labels.queue}", "targetBlank": true }
-          ]
-        }
+          { "matcher": { "id": "byName", "options": "pending" }, "properties": [{ "id": "unit", "value": "short" }] }
+        ]
       },
+      "options": { "sortBy": [{ "displayName": "lag_s", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT $__time(now()) AS time, COALESCE(qd.display_name, j.queue) AS metric, EXTRACT(EPOCH FROM (now() - min(j.run_at)))::float8 AS value FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state = 'available' GROUP BY j.queue, qd.display_name ORDER BY metric",
-          "format": "time_series",
+          "rawSql": "SELECT j.queue, qd.display_name, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(j.run_at)))::float8 AS lag_s FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state = 'available' GROUP BY j.queue, qd.display_name ORDER BY lag_s DESC NULLS LAST LIMIT 20",
+          "format": "table",
           "refId": "A"
         }
       ],
