@@ -337,7 +337,7 @@ async fn test_insert_many_updates_admin_metadata_for_direct_paths() {
     admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    let stats = admin::queue_stats(client.pool()).await.unwrap();
+    let stats = admin::queue_overviews(client.pool()).await.unwrap();
     let hot_stats = stats.iter().find(|stat| stat.queue == hot_queue).unwrap();
     assert_eq!(hot_stats.available, 2);
     assert_eq!(hot_stats.total_queued, 2);
@@ -945,7 +945,7 @@ async fn test_admin_queue_stats() {
     admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    let stats = admin::queue_stats(client.pool()).await.unwrap();
+    let stats = admin::queue_overviews(client.pool()).await.unwrap();
     let stat = stats.iter().find(|s| s.queue == queue).unwrap();
     assert_eq!(stat.available, 3);
     assert_eq!(stat.scheduled, 1);
@@ -1020,7 +1020,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
         "expected at least 1 more waiting_external job"
     );
 
-    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queues = admin::queue_overviews(client.pool()).await.unwrap();
     let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
     assert_eq!(queue_a_stats.total_queued, 2);
     assert_eq!(queue_a_stats.available, 1);
@@ -1049,7 +1049,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queues = admin::queue_overviews(client.pool()).await.unwrap();
     let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
     assert_eq!(queue_a_stats.available, 2, "kind_b should now be available");
     assert_eq!(
@@ -1066,7 +1066,7 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    let queues = admin::queue_stats(client.pool()).await.unwrap();
+    let queues = admin::queue_overviews(client.pool()).await.unwrap();
     assert!(!queues.iter().any(|stat| stat.queue == queue_b));
 
     let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
@@ -1102,7 +1102,7 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    let before = admin::queue_stats(client.pool()).await.unwrap();
+    let before = admin::queue_overviews(client.pool()).await.unwrap();
     let before = before.iter().find(|stat| stat.queue == queue).unwrap();
     assert_eq!(before.scheduled, 1);
     assert_eq!(before.available, 0);
@@ -1175,7 +1175,7 @@ async fn test_admin_metadata_tracks_scheduled_promotion_path() {
     admin::flush_dirty_admin_metadata(client.pool())
         .await
         .unwrap();
-    let after = admin::queue_stats(client.pool()).await.unwrap();
+    let after = admin::queue_overviews(client.pool()).await.unwrap();
     let after = after.iter().find(|stat| stat.queue == queue).unwrap();
     assert_eq!(after.scheduled, 0);
     assert_eq!(after.available, 1);
@@ -1304,7 +1304,7 @@ async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
     assert_eq!(dirty_after, 0, "all dirty queues should be drained");
 
     // Verify the cache is accurate for a sample queue
-    let stats = admin::queue_stats(client.pool()).await.unwrap();
+    let stats = admin::queue_overviews(client.pool()).await.unwrap();
     let stat = stats
         .iter()
         .find(|s| s.queue == "integ_flush_backlog_000")
@@ -1480,6 +1480,8 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         leader: false,
         global_max_workers: None,
         queues: vec![],
+        queue_descriptor_hashes: std::collections::HashMap::new(),
+        job_kind_descriptor_hashes: std::collections::HashMap::new(),
     };
     admin::upsert_runtime_snapshot(client.pool(), &fresh_snapshot)
         .await

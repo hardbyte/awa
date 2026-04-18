@@ -1055,6 +1055,20 @@ mod tests {
 }
 
 impl RuntimeReporterState {
+    fn queue_descriptor_hashes(&self) -> HashMap<String, String> {
+        self.declared_queue_descriptors()
+            .into_iter()
+            .map(|named| (named.queue, named.descriptor.descriptor_hash()))
+            .collect()
+    }
+
+    fn job_kind_descriptor_hashes(&self) -> HashMap<String, String> {
+        self.declared_job_kind_descriptors()
+            .into_iter()
+            .map(|named| (named.kind, named.descriptor.descriptor_hash()))
+            .collect()
+    }
+
     fn declared_queue_descriptors(&self) -> Vec<NamedQueueDescriptor> {
         self.queues
             .iter()
@@ -1176,6 +1190,8 @@ impl RuntimeReporterState {
             leader,
             global_max_workers: self.global_max_workers,
             queues,
+            queue_descriptor_hashes: self.queue_descriptor_hashes(),
+            job_kind_descriptor_hashes: self.job_kind_descriptor_hashes(),
         }
     }
 

@@ -20,6 +20,7 @@ function kindLabel(kind: JobKindOverview): string {
 }
 
 function descriptorSyncLabel(kind: JobKindOverview): string {
+  if (kind.descriptor_mismatch) return "Descriptor drift across live runtimes";
   if (!kind.descriptor_last_seen_at) return "Descriptor not declared";
   return kind.descriptor_stale
     ? `Descriptor stale · seen ${timeAgo(kind.descriptor_last_seen_at)}`
@@ -61,9 +62,14 @@ export function KindsPage() {
                     {descriptorSyncLabel(kind)}
                   </div>
                 </div>
-                {kind.descriptor_stale && (
-                  <Badge intent="warning">Descriptor stale</Badge>
-                )}
+                <div className="flex flex-wrap gap-1">
+                  {kind.descriptor_stale && (
+                    <Badge intent="warning">Descriptor stale</Badge>
+                  )}
+                  {kind.descriptor_mismatch && (
+                    <Badge intent="danger">Descriptor drift</Badge>
+                  )}
+                </div>
               </div>
 
               {kind.description && (
@@ -139,11 +145,16 @@ export function KindsPage() {
                 <TableCell>{kind.completed_last_hour.toLocaleString()}</TableCell>
                 <TableCell>{kind.owner ?? "—"}</TableCell>
                 <TableCell>
-                  {kind.descriptor_stale ? (
-                    <Badge intent="warning">Descriptor stale</Badge>
-                  ) : (
-                    <Badge intent="success">Live</Badge>
-                  )}
+                  <div className="flex flex-wrap gap-1">
+                    {kind.descriptor_stale ? (
+                      <Badge intent="warning">Descriptor stale</Badge>
+                    ) : (
+                      <Badge intent="success">Live</Badge>
+                    )}
+                    {kind.descriptor_mismatch && (
+                      <Badge intent="danger">Descriptor drift</Badge>
+                    )}
+                  </div>
                 </TableCell>
               </TableRow>
             ))}

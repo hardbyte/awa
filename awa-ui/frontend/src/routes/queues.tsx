@@ -113,6 +113,7 @@ export function QueuesPage() {
   }
 
   function descriptorSyncLabel(q: QueueStats): string {
+    if (q.descriptor_mismatch) return "Descriptor drift across live runtimes";
     if (!q.descriptor_last_seen_at) return "Descriptor not declared";
     return q.descriptor_stale
       ? `Descriptor stale · seen ${timeAgo(q.descriptor_last_seen_at)}`
@@ -154,6 +155,9 @@ export function QueuesPage() {
                   )}
                   {q.descriptor_stale && (
                     <Badge intent="warning">Descriptor stale</Badge>
+                  )}
+                  {q.descriptor_mismatch && (
+                    <Badge intent="danger">Descriptor drift</Badge>
                   )}
                 </div>
               </div>
@@ -339,6 +343,9 @@ export function QueuesPage() {
                       )}
                       {q.descriptor_stale && (
                         <Badge intent="warning">Descriptor stale</Badge>
+                      )}
+                      {q.descriptor_mismatch && (
+                        <Badge intent="danger">Descriptor drift</Badge>
                       )}
                     </div>
                   </TableCell>
