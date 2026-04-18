@@ -47,6 +47,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "percentunit",
+          "noValue": "0%",
           "thresholds": { "mode": "absolute", "steps": [
             { "color": "green",  "value": null },
             { "color": "orange", "value": 0.01 },
@@ -106,6 +107,7 @@
       "fieldConfig": {
         "defaults": {
           "unit": "short",
+          "noValue": "0",
           "thresholds": { "mode": "absolute", "steps": [
             { "color": "green",  "value": null },
             { "color": "orange", "value": 1 },
