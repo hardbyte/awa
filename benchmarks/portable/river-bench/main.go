@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"sort"
@@ -488,12 +489,17 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 	producerMode := envOrDefault("PRODUCER_MODE", "fixed")
 	targetDepth := envInt("TARGET_DEPTH", 1000)
 	sampleEveryS := envInt("SAMPLE_EVERY_S", 10)
+	if sampleEveryS <= 0 {
+		log.Fatalf("SAMPLE_EVERY_S must be > 0; got %d", sampleEveryS)
+	}
 	payloadBytes := envInt("JOB_PAYLOAD_BYTES", 256)
 	workMs := envInt("JOB_WORK_MS", 1)
 
 	dbName := "river_bench"
-	if i := strings.LastIndex(databaseURL(), "/"); i >= 0 {
-		dbName = databaseURL()[i+1:]
+	if parsed, err := url.Parse(databaseURL()); err == nil {
+		if name := strings.TrimPrefix(parsed.Path, "/"); name != "" {
+			dbName = name
+		}
 	}
 
 	emitJSONL(map[string]interface{}{

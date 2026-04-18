@@ -11,11 +11,11 @@ from .phases import (
 )
 
 __all__ = [
+    "PHASE_TINTS",
     "Phase",
     "PhaseType",
-    "PHASE_TINTS",
-    "parse_phase_spec",
-    "parse_duration",
     "SCENARIOS",
+    "parse_duration",
+    "parse_phase_spec",
     "resolve_scenario",
 ]

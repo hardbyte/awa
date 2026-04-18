@@ -20,7 +20,7 @@ on:
   workflow_dispatch:
     inputs:
       scenario:
-        description: "Scenario (idle_in_tx_saturation | long_horizon | custom)"
+        description: "Scenario gate: set to 'long_horizon' to also run the full long-horizon job. Any other value (incl. 'idle_in_tx_saturation', 'custom') only runs the smoke job."
         default: "idle_in_tx_saturation"
         required: false
       systems:
@@ -88,7 +88,7 @@ jobs:
     name: Full long_horizon run (all default systems)
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.scenario == 'long_horizon'
     runs-on: ubuntu-latest
-    timeout-minutes: 720   # up to 12h for a full 5.5h+ scenario
+    timeout-minutes: 720   # up to 12h for a full ≈6h10m scenario
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

@@ -145,7 +145,7 @@ failure modes (idle-in-tx bloat, sustained high load, soak drift) that the
 short-horizon suite above cannot see.
 
 ```bash
-# Named scenario (idle_in_tx_saturation ≈ 2.5h; long_horizon ≈ 5.5h+):
+# Named scenario (idle_in_tx_saturation ≈ 2h40m; long_horizon ≈ 6h10m):
 uv run python benchmarks/portable/long_horizon.py --scenario idle_in_tx_saturation
 
 # Custom phases (label=type:duration):

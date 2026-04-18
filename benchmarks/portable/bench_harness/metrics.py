@@ -121,6 +121,11 @@ class MetricsDaemon(threading.Thread):
         self.get_phase = get_phase
         self.period_s = period_s
         self.stop_event = threading.Event()
+        # Per-tick timestamps captured once in _poll_once so all _emit calls
+        # in the same tick share the same elapsed_s/sampled_at — downstream
+        # aggregations key on exact elapsed_s equality.
+        self._tick_elapsed_s: float | None = None
+        self._tick_sampled_at: str | None = None
 
     # ── one-shot boundary snapshots ─────────────────────────────────────
     def phase_boundary_snapshot(self) -> None:
@@ -214,6 +219,17 @@ class MetricsDaemon(threading.Thread):
             next_tick += period
 
     def _poll_once(self, conn: "psycopg.Connection") -> None:
+        # Capture one timestamp for every _emit in this tick so per-tick
+        # samples coalesce on elapsed_s in downstream aggregations.
+        self._tick_elapsed_s = round(time.time() - self.bench_start, 3)
+        self._tick_sampled_at = now_iso()
+        try:
+            self._poll_once_body(conn)
+        finally:
+            self._tick_elapsed_s = None
+            self._tick_sampled_at = None
+
+    def _poll_once_body(self, conn: "psycopg.Connection") -> None:
         with conn.cursor() as cur:
             for fq_table in self.targets.event_tables:
                 schema, _, relname = fq_table.partition(".")
@@ -342,11 +358,15 @@ class MetricsDaemon(threading.Thread):
         window_s: float = 0.0,
     ) -> None:
         label, phase_type = self.get_phase()
+        elapsed_s = self._tick_elapsed_s
+        if elapsed_s is None:
+            elapsed_s = round(time.time() - self.bench_start, 3)
+        sampled_at = self._tick_sampled_at or now_iso()
         s = Sample(
             run_id=self.run_id,
             system=self.system,
-            elapsed_s=round(time.time() - self.bench_start, 3),
-            sampled_at=now_iso(),
+            elapsed_s=elapsed_s,
+            sampled_at=sampled_at,
             phase_label=label,
             phase_type=phase_type,
             subject_kind=subject_kind,
@@ -400,7 +420,10 @@ def parse_adapter_record(
     except (TypeError, ValueError):
         return None
     label, phase_type = get_phase()
-    system = rec.get("system") or expected_system
+    # Trust the harness-supplied system label, not the adapter's self-report.
+    # Different adapter binaries (e.g. awa-docker vs native awa) can both emit
+    # system="awa", which would collapse their metrics together.
+    system = expected_system
     subject = rec.get("subject", "")
     subject_kind = rec.get("subject_kind", "adapter")
     window_s = float(rec.get("window_s", 0.0))

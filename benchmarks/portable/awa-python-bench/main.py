@@ -6,6 +6,7 @@ import json
 import os
 import signal
 import sys
+from collections import deque
 from dataclasses import dataclass
 
 import awa
@@ -265,7 +266,6 @@ async def scenario_worker_only() -> None:
 async def scenario_long_horizon() -> None:
     """Fixed-rate producer + steady consumer, emits JSONL samples every
     SAMPLE_EVERY_S. Contract: benchmarks/portable/CONTRIBUTING_ADAPTERS.md"""
-    import collections
     import datetime
     import math
     import time
@@ -275,7 +275,9 @@ async def scenario_long_horizon() -> None:
     producer_mode = env_str("PRODUCER_MODE", "fixed")
     target_depth = env_int("TARGET_DEPTH", 1000)
     worker_count = env_int("WORKER_COUNT", 32)
-    payload_bytes = env_int("JOB_PAYLOAD_BYTES", 256)
+    # JOB_PAYLOAD_BYTES is part of the adapter contract but BenchJob has no
+    # payload field today; intentionally unread until we plumb it through.
+    _payload_bytes = env_int("JOB_PAYLOAD_BYTES", 256)
     work_ms = env_int("JOB_WORK_MS", 1)
 
     c = client()
@@ -302,9 +304,7 @@ async def scenario_long_horizon() -> None:
     )
 
     # Bounded ring for claim latency (30s @ producer_rate = ~24k, capped to 32k)
-    latencies_ms: collections.deque[tuple[float, float]] = collections.deque(
-        maxlen=32_768
-    )
+    latencies_ms: deque[tuple[float, float]] = deque(maxlen=32_768)
     enqueued = 0
     completed = 0
     queue_depth = 0
@@ -335,8 +335,6 @@ async def scenario_long_horizon() -> None:
             loop.add_signal_handler(sig, shutdown.set)
         except NotImplementedError:
             signal.signal(sig, lambda *_a: shutdown.set())
-
-    padding = "x" * max(0, payload_bytes - 32)
 
     async def producer() -> None:
         nonlocal enqueued, current_producer_target_rate
@@ -474,13 +472,11 @@ def _now_iso() -> str:
 
 
 def _percentiles(
-    events: "collections.deque[tuple[float, float]]",
+    events: "deque[tuple[float, float]]",
     *,
     window_s: float,
     now: float,
 ) -> tuple[float, float, float]:
-    import collections as _c
-
     # Filter to the window; keep the deque untouched (it's append-only elsewhere).
     cutoff = now - window_s
     values = [v for t, v in events if t >= cutoff]
