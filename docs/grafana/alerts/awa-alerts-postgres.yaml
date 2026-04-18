@@ -1,16 +1,16 @@
 # Grafana unified-alerting rules for an awa fleet whose only observability
 # source is the Postgres schema (no OTel collector deployed). Rules
 # correspond to the panels on awa-dashboard-postgres.json — import via
-# Grafana provisioning just like the Prometheus variant, but with
-# DS_POSTGRES pointing at your Awa Postgres datasource.
+# Grafana provisioning just like the Prometheus variant, substituting
+# DS_POSTGRES with the uid of your Awa Postgres datasource.
 #
 # Same thresholds and annotations as the Prometheus variant where the
 # metric is available. The "throughput collapse" rule is omitted because
-# it needs a trailing 1-hour baseline that the raw SQL queries are too
-# heavy to run every minute — users running Postgres-only observability
-# should plug in their own rate-over-rate query or rely on "queue lag
-# high" and "error rate elevated" together, which cover the same signal
-# at steady state.
+# it needs a trailing 1-hour baseline that the raw SQL would re-compute
+# every minute — users running Postgres-only observability should plug
+# in their own rate-over-rate query or rely on "queue lag high" and
+# "error rate elevated" together, which cover the same signal at steady
+# state.
 
 apiVersion: 1
 groups:
@@ -22,7 +22,7 @@ groups:
 
       - uid: awa_pg_queue_lag_high
         title: "awa queue lag > 5 minutes (Postgres)"
-        condition: "B"
+        condition: "C"
         for: 2m
         noDataState: OK
         execErrState: Error
@@ -38,8 +38,11 @@ groups:
             in awa-ui for per-job detail and pause/drain controls.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_POSTGRES
             model:
+              refId: A
+              datasource: { type: grafana-postgresql-datasource, uid: DS_POSTGRES }
               rawSql: |
                 SELECT
                   now() AS time,
@@ -49,22 +52,36 @@ groups:
                 WHERE state = 'available'
                 GROUP BY queue
               format: time_series
-              refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [300] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [300] }
 
       - uid: awa_pg_error_rate_elevated
         title: "awa error rate > 5% for 5m (Postgres)"
-        condition: "B"
+        condition: "C"
         for: 5m
         noDataState: OK
         execErrState: Error
@@ -79,8 +96,11 @@ groups:
             awa-ui.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_POSTGRES
             model:
+              refId: A
+              datasource: { type: grafana-postgresql-datasource, uid: DS_POSTGRES }
               rawSql: |
                 SELECT
                   now() AS time,
@@ -96,22 +116,36 @@ groups:
                     0
                   ) AS value
               format: time_series
-              refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [0.05] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0.05] }
 
       - uid: awa_pg_no_active_runtime
         title: "awa fleet has no live runtime (Postgres)"
-        condition: "B"
+        condition: "C"
         for: 5m
         noDataState: Alerting
         execErrState: Error
@@ -126,8 +160,11 @@ groups:
             lost DB connectivity. Page the on-call.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_POSTGRES
             model:
+              refId: A
+              datasource: { type: grafana-postgresql-datasource, uid: DS_POSTGRES }
               rawSql: |
                 SELECT
                   now() AS time,
@@ -137,22 +174,36 @@ groups:
                   secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
                 ) >= now()
               format: time_series
-              refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: lt, params: [1] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: replaceNN, replaceWithValue: 0 }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: lt, params: [1] }
 
       - uid: awa_pg_descriptor_drift_persistent
         title: "awa descriptor drift > 15 minutes (Postgres)"
-        condition: "B"
+        condition: "C"
         for: 15m
         noDataState: OK
         execErrState: Error
@@ -169,8 +220,11 @@ groups:
             Postgres dashboard.
         data:
           - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
             datasourceUid: DS_POSTGRES
             model:
+              refId: A
+              datasource: { type: grafana-postgresql-datasource, uid: DS_POSTGRES }
               rawSql: |
                 WITH live AS (
                   SELECT * FROM awa.runtime_instances
@@ -197,15 +251,29 @@ groups:
                   SELECT target FROM kv WHERE n > 1
                 ) drifts
               format: time_series
-              refId: A
-            relativeTimeRange:
-              from: 900
-              to: 0
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [0] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0] }
