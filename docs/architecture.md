@@ -6,6 +6,26 @@ Awa (Maori: river) is a Postgres-native background job queue providing durable, 
 
 The Rust runtime owns all queue machinery -- polling, heartbeating, crash recovery, and dispatch. Python workers are callbacks invoked by this runtime via PyO3, inheriting Rust-grade reliability without reimplementing queue internals.
 
+## Control-Plane Descriptors
+
+Awa has two operator-facing descriptor catalogs:
+
+- `awa.queue_descriptors` for queue labels and ownership metadata
+- `awa.job_kind_descriptors` for job-kind labels and ownership metadata
+
+These are code-declared descriptors, not per-job payload metadata. They are synced by the Rust worker runtime on startup and on each runtime snapshot interval. The admin API and UI use them to render friendly queue and kind names, descriptions, tags, docs links, and owner fields.
+
+Descriptor health is derived from the runtime snapshot stream:
+
+- **stale** means no live runtime has refreshed the descriptor within the expected snapshot window
+- **drift** means multiple live runtimes are reporting different descriptor hashes for the same queue or kind
+
+The source-of-truth split is intentional:
+
+- descriptor payloads live in dedicated catalog tables
+- descriptor liveness and drift come from per-runtime hash snapshots in `awa.runtime_instances`
+- mutable queue control state like pause/resume still lives in `awa.queue_meta`
+
 ## Crate Structure
 
 ```

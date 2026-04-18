@@ -25,6 +25,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Hot/cold storage** — runnable work in a hot table, deferred work in a cold table.
 - **Rate limiting** — per-queue token bucket.
 - **Weighted concurrency** — global worker pool with per-queue guarantees.
+- **Operator descriptors** — code-declared queue and job-kind names/descriptions with stale/drift visibility in the UI.
 
 Local benchmarks show ~5.6k jobs/sec sustained throughput (Rust workers, with OTel metrics enabled), ~3.1k jobs/sec (Python workers), and sub-10ms p50 pickup latency. Enqueue throughput reaches ~30k/s single-producer, ~100k/s multi-producer. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) for methodology and caveats.
 
