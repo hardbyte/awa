@@ -16,13 +16,15 @@
   "panels": [
     {
       "title": "Queue Depth by State",
-      "description": "Current job counts per queue, pivoted by state. Eventually consistent (~2s). Sortable — click column headers.",
+      "description": "Current job counts per queue, pivoted by state. Eventually consistent (~2s). Declared-but-idle queues appear too (descriptor catalog is authoritative). Sortable — click column headers.",
       "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
       "fieldConfig": {
         "defaults": { "unit": "short", "custom": { "align": "right" } },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 160 }] },
+          { "matcher": { "id": "byName", "options": "display_name" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "owner" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 140 }] },
           { "matcher": { "id": "byName", "options": "available" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
           { "matcher": { "id": "byName", "options": "running" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
           { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
@@ -31,7 +33,7 @@
       "options": { "sortBy": [{ "displayName": "available", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, available, running, completed, failed, scheduled, retryable, waiting_external AS waiting_ext, cancelled FROM awa.queue_state_counts ORDER BY available DESC",
+          "rawSql": "WITH all_queues AS (SELECT queue FROM awa.queue_state_counts UNION SELECT queue FROM awa.queue_descriptors) SELECT q.queue, qd.display_name, qd.owner, COALESCE(qs.available, 0) AS available, COALESCE(qs.running, 0) AS running, COALESCE(qs.completed, 0) AS completed, COALESCE(qs.failed, 0) AS failed, COALESCE(qs.scheduled, 0) AS scheduled, COALESCE(qs.retryable, 0) AS retryable, COALESCE(qs.waiting_external, 0) AS waiting_ext, COALESCE(qs.cancelled, 0) AS cancelled FROM all_queues q LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue ORDER BY COALESCE(qs.available, 0) DESC, q.queue",
           "format": "table",
           "refId": "A"
         }
@@ -40,13 +42,14 @@
     },
     {
       "title": "Queue Lag (oldest pending job)",
-      "description": "Age of the oldest available job per queue — sorted by lag descending",
+      "description": "Age of the oldest available job per queue — sorted by lag descending. Shows declared display name when available.",
       "type": "table",
       "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
       "fieldConfig": {
         "defaults": { "custom": { "align": "right" } },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 200 }] },
+          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "display_name" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
           { "matcher": { "id": "byName", "options": "lag" }, "properties": [
             { "id": "unit", "value": "s" },
             { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }] } },
@@ -58,7 +61,39 @@
       "options": { "sortBy": [{ "displayName": "lag", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(run_at)))::float AS lag FROM awa.jobs_hot WHERE state = 'available' GROUP BY queue ORDER BY lag DESC LIMIT 20",
+          "rawSql": "SELECT j.queue, qd.display_name, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(j.run_at)))::float AS lag FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state = 'available' GROUP BY j.queue, qd.display_name ORDER BY lag DESC LIMIT 20",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "title": "Descriptor Health",
+      "description": "Stale or drifted queue / job-kind descriptors. Empty table = healthy fleet. Stale = no live runtime has refreshed the descriptor recently. Drift = two or more live runtimes report different descriptor hashes for the same target (normal briefly during a rolling deploy; persistent drift means two code revisions disagree).",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "status" }, "properties": [
+            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+            { "id": "mappings", "value": [
+              { "type": "value", "options": {
+                "stale": { "text": "stale", "color": "orange" },
+                "drift": { "text": "drift", "color": "red" },
+                "stale+drift": { "text": "stale+drift", "color": "red" }
+              } }
+            ]}
+          ]},
+          { "matcher": { "id": "byName", "options": "last_seen_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
+          { "matcher": { "id": "byName", "options": "live_variants" }, "properties": [{ "id": "custom.align", "value": "right" }, { "id": "custom.width", "value": 120 }] }
+        ]
+      },
+      "options": { "sortBy": [{ "displayName": "status", "desc": true }] },
+      "targets": [
+        {
+          "rawSql": "WITH live_runtimes AS (SELECT * FROM awa.runtime_instances WHERE last_seen_at + make_interval(secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)) >= now()), queue_variants AS (SELECT descriptor.key AS queue, count(DISTINCT descriptor.value) AS n FROM live_runtimes r CROSS JOIN LATERAL jsonb_each_text(r.queue_descriptor_hashes) AS descriptor(key, value) GROUP BY descriptor.key), kind_variants AS (SELECT descriptor.key AS kind, count(DISTINCT descriptor.value) AS n FROM live_runtimes r CROSS JOIN LATERAL jsonb_each_text(r.job_kind_descriptor_hashes) AS descriptor(key, value) GROUP BY descriptor.key) SELECT 'queue' AS target_type, qd.queue AS target, qd.display_name, qd.owner, qd.last_seen_at, COALESCE(qv.n, 0) AS live_variants, (CASE WHEN qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN 'stale' ELSE '' END || CASE WHEN COALESCE(qv.n, 0) > 1 THEN CASE WHEN qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN '+drift' ELSE 'drift' END ELSE '' END) AS status FROM awa.queue_descriptors qd LEFT JOIN queue_variants qv ON qv.queue = qd.queue WHERE qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() OR COALESCE(qv.n, 0) > 1 UNION ALL SELECT 'kind' AS target_type, kd.kind AS target, kd.display_name, kd.owner, kd.last_seen_at, COALESCE(kv.n, 0) AS live_variants, (CASE WHEN kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN 'stale' ELSE '' END || CASE WHEN COALESCE(kv.n, 0) > 1 THEN CASE WHEN kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN '+drift' ELSE 'drift' END ELSE '' END) AS status FROM awa.job_kind_descriptors kd LEFT JOIN kind_variants kv ON kv.kind = kd.kind WHERE kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() OR COALESCE(kv.n, 0) > 1 ORDER BY status DESC, target_type, target",
           "format": "table",
           "refId": "A"
         }
@@ -69,7 +104,7 @@
       "title": "Completed / Failed (last hour)",
       "description": "Jobs finalized in the last hour, by queue",
       "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
       "fieldConfig": {
         "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 80, "stacking": { "mode": "normal" } } },
         "overrides": [
@@ -90,7 +125,7 @@
       "title": "Failed Jobs (recent)",
       "description": "Most recent failed jobs with error details",
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
       "fieldConfig": {
         "overrides": [
           { "matcher": { "id": "byName", "options": "finalized_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
@@ -111,7 +146,7 @@
       "title": "Cron Schedules",
       "description": "Registered cron schedules with last enqueue time",
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 32 },
       "fieldConfig": {
         "overrides": [
           { "matcher": { "id": "byName", "options": "last_enqueued_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
@@ -129,9 +164,9 @@
     },
     {
       "title": "Runtime Instances",
-      "description": "Connected worker instances and their health",
+      "description": "Connected worker instances and their health, including the number of queue/kind descriptors each is publishing",
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 32 },
       "fieldConfig": {
         "overrides": [
           { "matcher": { "id": "byName", "options": "last_seen_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
@@ -145,7 +180,7 @@
       },
       "targets": [
         {
-          "rawSql": "SELECT hostname, version, healthy, leader, poll_loop_alive, heartbeat_alive, maintenance_alive, shutting_down, last_seen_at, jsonb_array_length(queues) AS queue_count FROM awa.runtime_instances WHERE last_seen_at > now() - interval '5 minutes' ORDER BY hostname",
+          "rawSql": "SELECT hostname, version, healthy, leader, poll_loop_alive, heartbeat_alive, maintenance_alive, shutting_down, last_seen_at, jsonb_array_length(queues) AS queue_count, (SELECT count(*) FROM jsonb_object_keys(queue_descriptor_hashes))::int AS queue_descs, (SELECT count(*) FROM jsonb_object_keys(job_kind_descriptor_hashes))::int AS kind_descs FROM awa.runtime_instances WHERE last_seen_at > now() - interval '5 minutes' ORDER BY hostname",
           "format": "table",
           "refId": "A"
         }
@@ -156,7 +191,7 @@
       "title": "Total Available",
       "description": "Eventually consistent (~2s)",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 24 },
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -169,7 +204,7 @@
     {
       "title": "Total Running",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 24 },
+      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -182,7 +217,7 @@
     {
       "title": "Total Failed",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 24 },
+      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -195,7 +230,7 @@
     {
       "title": "Total Scheduled",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 24 },
+      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",
@@ -208,7 +243,7 @@
     {
       "title": "Paused Queues",
       "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 24 },
+      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 32 },
       "fieldConfig": {
         "defaults": {
           "unit": "short",

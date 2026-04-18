@@ -3,7 +3,9 @@
 Two dashboards are provided:
 
 - **`awa-dashboard.json`** — Prometheus / OTel metrics dashboard. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows time-series metrics: throughput, latency, queue depth, rescues, completion flush performance.
-- **`awa-dashboard-postgres.json`** — SQL dashboard querying Postgres directly. No collector needed. Shows queue depth, lag, recent failures, cron schedules, runtime instances. Queue depth and stat panels read from `queue_state_counts` (cache table, eventually consistent within the ~2s dirty-key recompute window). Lag and recent failure panels use targeted queries on `jobs_hot` with appropriate indexes.
+- **`awa-dashboard-postgres.json`** — SQL dashboard querying Postgres directly. No collector needed. Shows queue depth, lag, descriptor health, recent failures, cron schedules, and runtime instances. Queue depth and stat panels read from `queue_state_counts` (cache table, eventually consistent within the ~2s dirty-key recompute window). Lag and recent failure panels use targeted queries on `jobs_hot` with appropriate indexes. Queue-related tables LEFT JOIN `queue_descriptors` so declared display names and owners appear alongside raw queue names, and declared-but-idle queues stay visible. The **Descriptor Health** panel surfaces stale and drifted descriptors (see `docs/architecture.md#control-plane-descriptors` for the model); an empty table = healthy fleet.
+
+The Prometheus / OTel dashboard (`awa-dashboard.json`) is not descriptor-aware — descriptor state is only surfaced via the Postgres dashboard until the runtime emits dedicated descriptor metrics.
 
 ## Prometheus / OTel Dashboard
 
