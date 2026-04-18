@@ -89,6 +89,43 @@ await client.start(
 
 Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Each queue's `min_workers` is guaranteed; remaining capacity is distributed by `weight`. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.
 
+## Queue and job-kind descriptors
+
+Queues and job kinds can carry operator-facing descriptors: display names, descriptions, owners, docs links, tags, and arbitrary JSON `extra`. These are separate from runtime scheduling config.
+
+Rust workers declare descriptors in code:
+
+```rust
+use awa::{Client, JobArgs, JobKindDescriptor, QueueConfig, QueueDescriptor};
+
+let client = Client::builder(pool)
+    .queue("email", QueueConfig::default())
+    .queue_descriptor(
+        "email",
+        QueueDescriptor::new()
+            .display_name("Email")
+            .description("Transactional outbound email")
+            .owner("messaging")
+            .tag("customer-facing"),
+    )
+    .job_kind_descriptor::<SendEmail>(
+        JobKindDescriptor::new()
+            .display_name("Send email")
+            .description("Deliver a single transactional email"),
+    )
+    .register::<SendEmail, _, _>(handle_email)
+    .build()?;
+```
+
+Descriptor sync semantics:
+
+- Descriptors are synced on worker startup and on each runtime snapshot heartbeat.
+- The UI/API shows declared-but-empty queues and job kinds even when they currently have zero jobs.
+- If no live runtime has refreshed a descriptor recently, the UI marks it as stale.
+- If live runtimes disagree on the descriptor payload for the same queue or kind, the UI marks it as descriptor drift.
+
+Today the declaration API is Rust-runtime owned. Python workers can still process queues and kinds normally, but they do not yet declare descriptors directly.
+
 ## Runtime tuning
 
 `ClientBuilder` (Rust) and `client.start()` kwargs (Python) control maintenance loop intervals. The defaults are sensible for most workloads — you'd typically only touch these for:
