@@ -321,7 +321,7 @@ async fn test_copy_updates_admin_metadata_for_direct_paths() {
         .unwrap();
 
     admin::flush_dirty_admin_metadata(&pool).await.unwrap();
-    let stats = admin::queue_stats(&pool).await.unwrap();
+    let stats = admin::queue_overviews(&pool).await.unwrap();
     let hot_stats = stats.iter().find(|stat| stat.queue == hot_queue).unwrap();
     assert_eq!(hot_stats.available, 2);
     assert_eq!(hot_stats.total_queued, 2);

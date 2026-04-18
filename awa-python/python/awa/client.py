@@ -328,6 +328,89 @@ class AsyncClient:
             metadata=metadata,
         )
 
+    def queue_descriptor(
+        self,
+        queue: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        owner: str | None = None,
+        docs_url: str | None = None,
+        tags: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach descriptive metadata to a queue.
+
+        The display name, description, owner, docs URL, tags, and any extra
+        JSON you provide show up on the admin UI's queue views and in the
+        admin API. This is how operators understand what a queue is for
+        without reading the worker source.
+
+        Call before :py:meth:`start`. The queue must also appear in the
+        ``queues=`` argument of :py:meth:`start` — you can't describe a
+        queue this client doesn't run.
+
+        Example::
+
+            client.queue_descriptor(
+                "email",
+                display_name="Outbound email",
+                owner="growth@company.com",
+                docs_url="https://runbook/email",
+                tags=["user-facing"],
+            )
+        """
+        return self._raw.queue_descriptor(
+            queue,
+            display_name=display_name,
+            description=description,
+            owner=owner,
+            docs_url=docs_url,
+            tags=tags,
+            extra=extra,
+        )
+
+    def job_kind_descriptor(
+        self,
+        kind: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        owner: str | None = None,
+        docs_url: str | None = None,
+        tags: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach descriptive metadata to a job kind.
+
+        Same shape as :py:meth:`queue_descriptor`, but for a job kind (the
+        string ``@client.task(...)`` publishes — by default the snake_cased
+        class name of the args type).
+
+        Call before :py:meth:`start`. The kind must be registered with
+        :py:meth:`task` or referenced from a periodic schedule.
+
+        Example::
+
+            @client.task(SendEmail, queue="email")
+            async def send(job): ...
+
+            client.job_kind_descriptor(
+                "send_email",
+                display_name="Send user email",
+                description="Renders a template and hands off to SES.",
+            )
+        """
+        return self._raw.job_kind_descriptor(
+            kind,
+            display_name=display_name,
+            description=description,
+            owner=owner,
+            docs_url=docs_url,
+            tags=tags,
+            extra=extra,
+        )
+
     async def start(
         self,
         queues: list[tuple[str, int]] | list[dict[str, Any]] | None = None,

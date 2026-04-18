@@ -216,7 +216,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     for _ in 0..60 {
         tokio::time::sleep(Duration::from_secs(1)).await;
-        let stats = awa::model::admin::queue_stats(&pool).await?;
+        let stats = awa::model::admin::queue_overviews(&pool).await?;
         if let Some(etl) = stats.iter().find(|s| s.queue == "etl_example") {
             if etl.available == 0 && etl.running == 0 {
                 tracing::info!("All ETL jobs completed");
