@@ -1,7 +1,7 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Shell navigation", () => {
-  test("all nav links work: Dashboard, Jobs, Queues, Runtime, Cron", async ({
+  test("all nav links work: Dashboard, Jobs, Kinds, Queues, Runtime, Cron", async ({
     page,
   }) => {
     await page.goto("/");
@@ -13,6 +13,11 @@ test.describe("Shell navigation", () => {
     await nav.getByRole("link", { name: "Jobs" }).click();
     await expect(page).toHaveURL(/\/jobs/);
     await expect(page.getByRole("heading", { name: "Jobs" })).toBeVisible();
+
+    // Click Kinds nav link
+    await nav.getByRole("link", { name: "Kinds" }).click();
+    await expect(page).toHaveURL(/\/kinds/);
+    await expect(page.getByRole("heading", { name: "Job Kinds" })).toBeVisible();
 
     // Click Queues nav link
     await nav.getByRole("link", { name: "Queues" }).click();
