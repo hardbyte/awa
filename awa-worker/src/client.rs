@@ -636,6 +636,7 @@ struct RuntimeReporterState {
     pid: i32,
     version: &'static str,
     snapshot_interval: Duration,
+    metrics: crate::metrics::AwaMetrics,
 }
 
 impl Client {
@@ -701,6 +702,7 @@ impl Client {
             pid: self.runtime_pid,
             version: self.runtime_version,
             snapshot_interval: self.runtime_snapshot_interval,
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -1153,23 +1155,45 @@ impl RuntimeReporterState {
     }
 
     async fn publish_snapshot(&self) {
-        if let Err(err) = admin::sync_queue_descriptors(
-            &self.pool,
-            &self.declared_queue_descriptors(),
-            self.snapshot_interval,
-        )
-        .await
+        let queue_descriptors = self.declared_queue_descriptors();
+        let kind_descriptors = self.declared_job_kind_descriptors();
+
+        if let Err(err) =
+            admin::sync_queue_descriptors(&self.pool, &queue_descriptors, self.snapshot_interval)
+                .await
         {
             warn!(error = %err, "Failed to sync queue descriptors");
         }
-        if let Err(err) = admin::sync_job_kind_descriptors(
-            &self.pool,
-            &self.declared_job_kind_descriptors(),
-            self.snapshot_interval,
-        )
-        .await
+        if let Err(err) =
+            admin::sync_job_kind_descriptors(&self.pool, &kind_descriptors, self.snapshot_interval)
+                .await
         {
             warn!(error = %err, "Failed to sync job kind descriptors");
+        }
+
+        // Emit OTel info gauges for every declared descriptor. One series per
+        // descriptor, value=1, with all descriptor fields as attributes. Panels
+        // lift descriptor fields into existing metrics via a Prometheus label
+        // join: `awa_job_completed_total * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info`.
+        for named in &queue_descriptors {
+            self.metrics.record_queue_info(
+                &named.queue,
+                named.descriptor.display_name.as_deref(),
+                named.descriptor.description.as_deref(),
+                named.descriptor.owner.as_deref(),
+                named.descriptor.docs_url.as_deref(),
+                &named.descriptor.tags,
+            );
+        }
+        for named in &kind_descriptors {
+            self.metrics.record_job_kind_info(
+                &named.kind,
+                named.descriptor.display_name.as_deref(),
+                named.descriptor.description.as_deref(),
+                named.descriptor.owner.as_deref(),
+                named.descriptor.docs_url.as_deref(),
+                &named.descriptor.tags,
+            );
         }
 
         let snapshot = self.snapshot_input().await;

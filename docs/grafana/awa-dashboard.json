@@ -860,6 +860,91 @@
       "datasource": {
         "uid": "${DS_PROMETHEUS}"
       }
+    },
+    {
+      "title": "Queue Descriptor Catalog",
+      "description": "Declared queue descriptors. awa.queue.info is an info-style gauge that is always 1 \u2014 its value is unused; all the signal is in the labels (display name, owner, tags, docs URL). Use it as a join target to enrich other panels: e.g. `sum by (awa_queue_display_name) (rate(awa_job_completed_total[$__rate_interval]) * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info)`.",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 48 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "awa_job_queue" },        "properties": [{ "id": "displayName", "value": "queue" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "awa_queue_display_name" }, "properties": [{ "id": "displayName", "value": "display name" }, { "id": "custom.width", "value": 200 }] },
+          { "matcher": { "id": "byName", "options": "awa_queue_owner" },       "properties": [{ "id": "displayName", "value": "owner" }, { "id": "custom.width", "value": 160 }] },
+          { "matcher": { "id": "byName", "options": "awa_queue_tags" },        "properties": [{ "id": "displayName", "value": "tags" }] },
+          { "matcher": { "id": "byName", "options": "awa_queue_docs_url" },    "properties": [{ "id": "displayName", "value": "docs" }, { "id": "custom.cellOptions", "value": { "type": "auto" } }] },
+          { "matcher": { "id": "byName", "options": "Value" },                  "properties": [{ "id": "custom.hidden", "value": true } ] }
+        ]
+      },
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true, "awa_queue_description": true }, "indexByName": {} } }
+      ],
+      "targets": [
+        {
+          "expr": "awa_queue_info",
+          "instant": true,
+          "format": "table",
+          "legendFormat": ""
+        }
+      ],
+      "datasource": {
+        "uid": "${DS_PROMETHEUS}"
+      }
+    },
+    {
+      "title": "Job Kind Descriptor Catalog",
+      "description": "Declared job-kind descriptors. Join target for kind-level panels \u2014 e.g. `rate(awa_job_duration_seconds_count[$__rate_interval]) * on(awa_job_kind) group_left(awa_job_kind_display_name, awa_job_kind_owner) awa_job_kind_info`.",
+      "type": "table",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 48 },
+      "fieldConfig": {
+        "defaults": { "custom": { "align": "left" } },
+        "overrides": [
+          { "matcher": { "id": "byName", "options": "awa_job_kind" },              "properties": [{ "id": "displayName", "value": "kind" }, { "id": "custom.width", "value": 200 }] },
+          { "matcher": { "id": "byName", "options": "awa_job_kind_display_name" }, "properties": [{ "id": "displayName", "value": "display name" }, { "id": "custom.width", "value": 200 }] },
+          { "matcher": { "id": "byName", "options": "awa_job_kind_owner" },        "properties": [{ "id": "displayName", "value": "owner" }, { "id": "custom.width", "value": 160 }] },
+          { "matcher": { "id": "byName", "options": "awa_job_kind_tags" },         "properties": [{ "id": "displayName", "value": "tags" }] },
+          { "matcher": { "id": "byName", "options": "awa_job_kind_docs_url" },     "properties": [{ "id": "displayName", "value": "docs" }] },
+          { "matcher": { "id": "byName", "options": "Value" },                     "properties": [{ "id": "custom.hidden", "value": true } ] }
+        ]
+      },
+      "transformations": [
+        { "id": "labelsToFields", "options": { "mode": "columns" } },
+        { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true, "awa_job_kind_description": true }, "indexByName": {} } }
+      ],
+      "targets": [
+        {
+          "expr": "awa_job_kind_info",
+          "instant": true,
+          "format": "table",
+          "legendFormat": ""
+        }
+      ],
+      "datasource": {
+        "uid": "${DS_PROMETHEUS}"
+      }
+    },
+    {
+      "title": "Throughput by Queue (with display names)",
+      "description": "Completed jobs per second per queue, with the declared display name lifted in via `awa_queue_info`. If a queue has no declared display_name, the legend falls back to the raw queue name. This is the recommended pattern for label-joining descriptors into any existing Prometheus metric.",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 56 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 10 }
+        }
+      },
+      "targets": [
+        {
+          "expr": "sum by (awa_job_queue, awa_queue_display_name) (\n  rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])\n  * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info\n) or sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
+          "legendFormat": "{{awa_queue_display_name}}{{awa_job_queue}}"
+        }
+      ],
+      "datasource": {
+        "uid": "${DS_PROMETHEUS}"
+      }
     }
   ],
   "schemaVersion": 39,

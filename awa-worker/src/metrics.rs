@@ -62,6 +62,16 @@ pub struct AwaMetrics {
     pub queue_lag_seconds: Gauge<f64>,
     /// Time from job creation to claim — the user-visible queuing latency.
     pub wait_duration_seconds: Histogram<f64>,
+    /// Info gauge for declared queue descriptors — value is always 1, the
+    /// useful payload is the attribute set (display_name, owner, tags).
+    /// Dashboards join it into throughput / latency panels with a
+    /// `* on(awa_job_queue) group_left(awa_queue_display_name, awa_queue_owner)`
+    /// Prometheus expression, which keeps descriptor fields out of the
+    /// high-cardinality per-metric label set.
+    pub queue_info: Gauge<i64>,
+    /// Info gauge for declared job-kind descriptors. Same pattern as
+    /// [`queue_info`][Self::queue_info].
+    pub job_kind_info: Gauge<i64>,
 }
 
 impl AwaMetrics {
@@ -183,6 +193,20 @@ impl AwaMetrics {
                 .with_description("Time from job creation to claim")
                 .with_unit("s")
                 .build(),
+            queue_info: meter
+                .i64_gauge("awa.queue.info")
+                .with_description(
+                    "Declared queue descriptors (always 1; use as a label-join target)",
+                )
+                .with_unit("{queue}")
+                .build(),
+            job_kind_info: meter
+                .i64_gauge("awa.job_kind.info")
+                .with_description(
+                    "Declared job-kind descriptors (always 1; use as a label-join target)",
+                )
+                .with_unit("{kind}")
+                .build(),
         }
     }
 
@@ -302,11 +326,147 @@ impl AwaMetrics {
         )];
         self.wait_duration_seconds.record(seconds, &attrs);
     }
+
+    /// Emit the info gauge for a declared queue descriptor. Called once per
+    /// descriptor on every runtime snapshot tick — constant value of 1 with
+    /// the descriptor fields as attributes. Optional fields that are `None`
+    /// are elided so we don't produce `display_name=""` series.
+    pub fn record_queue_info(
+        &self,
+        queue: &str,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        owner: Option<&str>,
+        docs_url: Option<&str>,
+        tags: &[String],
+    ) {
+        let mut attrs = vec![opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        if let Some(v) = display_name {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.queue.display_name",
+                v.to_string(),
+            ));
+        }
+        if let Some(v) = description {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.queue.description",
+                v.to_string(),
+            ));
+        }
+        if let Some(v) = owner {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.queue.owner",
+                v.to_string(),
+            ));
+        }
+        if let Some(v) = docs_url {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.queue.docs_url",
+                v.to_string(),
+            ));
+        }
+        if !tags.is_empty() {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.queue.tags",
+                tags.join(","),
+            ));
+        }
+        self.queue_info.record(1, &attrs);
+    }
+
+    /// Emit the info gauge for a declared job-kind descriptor. Same shape
+    /// as [`record_queue_info`][Self::record_queue_info].
+    pub fn record_job_kind_info(
+        &self,
+        kind: &str,
+        display_name: Option<&str>,
+        description: Option<&str>,
+        owner: Option<&str>,
+        docs_url: Option<&str>,
+        tags: &[String],
+    ) {
+        let mut attrs = vec![opentelemetry::KeyValue::new(
+            "awa.job.kind",
+            kind.to_string(),
+        )];
+        if let Some(v) = display_name {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job_kind.display_name",
+                v.to_string(),
+            ));
+        }
+        if let Some(v) = description {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job_kind.description",
+                v.to_string(),
+            ));
+        }
+        if let Some(v) = owner {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job_kind.owner",
+                v.to_string(),
+            ));
+        }
+        if let Some(v) = docs_url {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job_kind.docs_url",
+                v.to_string(),
+            ));
+        }
+        if !tags.is_empty() {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job_kind.tags",
+                tags.join(","),
+            ));
+        }
+        self.job_kind_info.record(1, &attrs);
+    }
 }
 
 /// No-op metrics for when OTel is not configured.
 impl Default for AwaMetrics {
     fn default() -> Self {
         Self::from_global()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The info gauges are no-op under a default (global) meter provider —
+    /// this just confirms the method signatures build and don't panic when
+    /// called with a realistic attribute mix. End-to-end OTLP export is
+    /// covered by the telemetry integration test.
+    #[test]
+    fn record_queue_info_does_not_panic_on_mixed_attrs() {
+        let metrics = AwaMetrics::from_global();
+        metrics.record_queue_info(
+            "emails",
+            Some("Outbound email"),
+            Some("Transactional mail"),
+            Some("growth@example.com"),
+            Some("https://runbook/emails"),
+            &["user-facing".to_string(), "critical".to_string()],
+        );
+        // With every optional field absent only the queue label is emitted.
+        metrics.record_queue_info("minimal", None, None, None, None, &[]);
+    }
+
+    #[test]
+    fn record_job_kind_info_does_not_panic_on_mixed_attrs() {
+        let metrics = AwaMetrics::from_global();
+        metrics.record_job_kind_info(
+            "send_email",
+            Some("Send user email"),
+            None,
+            Some("growth@example.com"),
+            None,
+            &["outbound".to_string()],
+        );
+        metrics.record_job_kind_info("minimal", None, None, None, None, &[]);
     }
 }
