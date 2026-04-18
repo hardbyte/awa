@@ -750,7 +750,7 @@ Operators get day-one tools through CLI, Python, Rust, and documented SQL.
 | Resume queue | `awa queue resume X` | `await client.resume_queue("X")` | `awa_model::admin::resume_queue(...)` |
 | Drain queue | `awa queue drain X` | `await client.drain_queue("X")` | `awa_model::admin::drain_queue(...)` |
 | List jobs | `awa job list --state running` | `await client.list_jobs(state=...)` | `awa_model::admin::list_jobs(...)` |
-| Queue stats / lag | `awa queue stats` | `await client.queue_stats()` | `awa_model::admin::queue_stats(...)` |
+| Queue stats / lag | `awa queue stats` | `await client.queue_stats()` | `awa_model::admin::queue_overviews(...)` |
 
 **Pause/resume** is stored in `awa.queue_meta`. Pausing immediately stops new claims across all workers. In-flight jobs continue to completion.
 

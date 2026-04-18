@@ -264,6 +264,25 @@ await client.start(
 )
 ```
 
+### Queue or job-kind shows "stale descriptor" in the UI
+
+The descriptor catalog is refreshed by live workers on every runtime snapshot tick. A descriptor is flagged **stale** when no live runtime has touched `last_seen_at` within the snapshot window — typically because the code that declared it has been retired or no workers are currently running.
+
+- If the queue/kind is genuinely retired, delete the row:
+  ```sql
+  DELETE FROM awa.queue_descriptors WHERE queue = 'retired-queue';
+  DELETE FROM awa.job_kind_descriptors WHERE kind = 'retired_kind';
+  ```
+- If workers *should* be running, check `/runtime` for missing instances.
+- If the declaration moved to a different worker role that isn't deployed yet, the stale status will clear once that rollout completes.
+
+### Queue or job-kind shows "descriptor drift" in the UI
+
+Two or more live runtimes are reporting different BLAKE3 hashes for the same descriptor — i.e. they disagree on its fields.
+
+- During a rolling deploy this is normal and clears when the old revision finishes draining.
+- If it persists, two branches of your worker code are running simultaneously (e.g. a partial rollback or a split between the Rust and Python runtimes with different descriptor declarations). Reconcile the declaring code and re-deploy.
+
 ## When To Escalate
 
 Escalate beyond normal operator actions when:

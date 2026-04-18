@@ -48,6 +48,8 @@ POST /api/queues/:name/pause
 POST /api/queues/:name/resume
 POST /api/queues/:name/drain
 
+GET  /api/kinds                         Job kinds with descriptor metadata
+
 GET  /api/runtime                       Worker instances and health
 GET  /api/runtime/:instance_id
 
@@ -65,21 +67,27 @@ At-a-glance health check. Shows state counter cards (available, running, failed,
 
 ### Jobs (`/jobs`)
 
-Filterable, paginated job list with state filter pills (showing counts), a search bar supporting `kind:`, `queue:`, and `tag:` prefix filters, and checkbox-based bulk selection for retry/cancel operations.
+Filterable, paginated job list with state filter pills (showing counts), a search bar supporting `kind:`, `queue:`, and `tag:` prefix filters, and checkbox-based bulk selection for retry/cancel operations. Queue and kind cells show declared display names when a descriptor is present; raw names otherwise.
 
 Desktop uses a table layout; mobile switches to a card layout. Both show the job kind with an inline `#ID` suffix for easy reference. Cursor-based pagination using `before_id` on the primary key.
 
 ### Job Detail (`/jobs/:id`)
 
-Full inspection of a single job: state badge, queue (linked), priority, attempt count, creation time, a timeline reconstructed from timestamps and error history, syntax-highlighted JSON arguments, and retry/cancel actions.
+Full inspection of a single job: state badge, queue (linked), priority, attempt count, creation time, a timeline reconstructed from timestamps and error history, syntax-highlighted JSON arguments, and retry/cancel actions. Declared queue and job-kind descriptors render alongside the raw fields so operators can jump from a job instance to its owning team or runbook without leaving the page.
 
 ### Queues (`/queues`)
 
-Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons.
+Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative — before descriptors shipped, listings were driven by `queue_state_counts` so idle declared queues would silently disappear.
+
+Descriptor display name, owner, tags, and docs URL (when declared) appear inline; a stale or drifted descriptor shows a subdued status badge so operators can tell when the catalog diverged from any live runtime.
 
 ### Queue Detail (`/queues/:name`)
 
-Reuses the Jobs list with a pre-applied queue filter, plus a summary bar showing the queue's status and counts with Pause/Resume/Drain controls.
+Reuses the Jobs list with a pre-applied queue filter, plus a summary bar showing the queue's status and counts with Pause/Resume/Drain controls. The declared descriptor (display name, description, owner, docs URL, tags, extra JSON) renders above the filter; stale/drift status is surfaced the same way as on the Queues listing.
+
+### Job Kinds (`/kinds`)
+
+Catalog of every declared job kind. Shows display name, owner, tags, descriptor last-seen time, and job count. Declared-but-never-enqueued kinds still appear here because the descriptor catalog is authoritative, which lets operators see the full vocabulary of jobs the fleet could emit even during a quiet period. Each row links to the jobs view pre-filtered by `kind:<kind>`. Stale/drift status is surfaced the same way as on queue surfaces.
 
 ### Runtime (`/runtime`)
 
