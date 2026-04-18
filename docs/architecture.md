@@ -6,25 +6,27 @@ Awa (Maori: river) is a Postgres-native background job queue providing durable, 
 
 The Rust runtime owns all queue machinery -- polling, heartbeating, crash recovery, and dispatch. Python workers are callbacks invoked by this runtime via PyO3, inheriting Rust-grade reliability without reimplementing queue internals.
 
-## Control-Plane Descriptors
+## Control-plane descriptors
 
-Awa has two operator-facing descriptor catalogs:
+Awa keeps two operator-facing descriptor catalogs, distinct from per-job payload metadata:
 
-- `awa.queue_descriptors` for queue labels and ownership metadata
-- `awa.job_kind_descriptors` for job-kind labels and ownership metadata
+- `awa.queue_descriptors` — labels and ownership for queues
+- `awa.job_kind_descriptors` — labels and ownership for job kinds
 
-These are code-declared descriptors, not per-job payload metadata. They are synced by the Rust worker runtime on startup and on each runtime snapshot interval. The admin API and UI use them to render friendly queue and kind names, descriptions, tags, docs links, and owner fields.
+Descriptors are **code-declared by whichever runtime is hosting the workers** — either the Rust `ClientBuilder` or the Python `AsyncClient`. Both use the same catalog tables and the same hashing, so a mixed Rust + Python fleet produces consistent descriptors. See [Configuration → Queue and job-kind descriptors](configuration.md#queue-and-job-kind-descriptors) for the declaration surface in each language.
 
-Descriptor health is derived from the runtime snapshot stream:
+At startup and on every runtime snapshot tick, each worker upserts the descriptors it declares and refreshes a `last_seen_at` plus a BLAKE3 `descriptor_hash` over canonicalised (sorted-key) JSON of the descriptor fields. The admin API and UI render friendly names, descriptions, tags, docs links, and owner fields from the catalog, and derive two health signals from the snapshot stream:
 
-- **stale** means no live runtime has refreshed the descriptor within the expected snapshot window
-- **drift** means multiple live runtimes are reporting different descriptor hashes for the same queue or kind
+- **stale** — no live runtime has refreshed the descriptor within its expected snapshot window, so whatever is in the catalog is out-of-date with production
+- **drift** — two or more live runtimes are reporting different descriptor hashes for the same queue or kind (typical during a rolling deploy where old and new code disagree on ownership or docs URL)
 
-The source-of-truth split is intentional:
+The source-of-truth split matters because the three concerns have different lifecycles and writers:
 
-- descriptor payloads live in dedicated catalog tables
-- descriptor liveness and drift come from per-runtime hash snapshots in `awa.runtime_instances`
-- mutable queue control state like pause/resume still lives in `awa.queue_meta`
+- **descriptor payloads** — owned by application code; live in the dedicated catalog tables
+- **descriptor liveness and drift** — derived at read time from per-runtime hash snapshots in `awa.runtime_instances`, so they don't need their own writer path
+- **mutable queue control state** (pause/resume, paused_by, …) — owned by operators; stays in `awa.queue_meta`, which is also on the dispatcher hot path and therefore kept narrow
+
+Declared-but-empty queues and kinds still appear in the admin surfaces because the catalog is authoritative; before descriptors existed, listings were driven by `queue_state_counts`, so an idle-but-declared queue would disappear from the UI.
 
 ## Crate Structure
 

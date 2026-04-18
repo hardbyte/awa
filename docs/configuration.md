@@ -91,9 +91,11 @@ Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Ea
 
 ## Queue and job-kind descriptors
 
-Queues and job kinds can carry operator-facing descriptors: display names, descriptions, owners, docs links, tags, and arbitrary JSON `extra`. These are separate from runtime scheduling config.
+Queues and job kinds can carry operator-facing metadata: display names, descriptions, owners, docs links, tags, and arbitrary JSON `extra`. This is separate from runtime scheduling config and drives the labels the admin UI / API surface.
 
-Rust workers declare descriptors in code:
+The runtime catalogs and propagates these — see [Architecture → Control-plane descriptors](architecture.md#control-plane-descriptors) for how sync, staleness, and drift detection work.
+
+### Rust
 
 ```rust
 use awa::{Client, JobArgs, JobKindDescriptor, QueueConfig, QueueDescriptor};
@@ -117,14 +119,32 @@ let client = Client::builder(pool)
     .build()?;
 ```
 
-Descriptor sync semantics:
+### Python
 
-- Descriptors are synced on worker startup and on each runtime snapshot heartbeat.
-- The UI/API shows declared-but-empty queues and job kinds even when they currently have zero jobs.
-- If no live runtime has refreshed a descriptor recently, the UI marks it as stale.
-- If live runtimes disagree on the descriptor payload for the same queue or kind, the UI marks it as descriptor drift.
+```python
+client = awa.AsyncClient(database_url)
 
-Today the declaration API is Rust-runtime owned. Python workers can still process queues and kinds normally, but they do not yet declare descriptors directly.
+@client.task(SendEmail, queue="email")
+async def handle(job):
+    ...
+
+client.queue_descriptor(
+    "email",
+    display_name="Email",
+    description="Transactional outbound email",
+    owner="messaging",
+    tags=["customer-facing"],
+)
+client.job_kind_descriptor(
+    "send_email",
+    display_name="Send email",
+    description="Deliver a single transactional email",
+)
+
+await client.start([("email", 8)])
+```
+
+Both surfaces must be called before `start()` / `build()`. Declaring a descriptor for a queue the client doesn't run is an error, so dead references show up at startup instead of silently producing stale rows.
 
 ## Runtime tuning
 
