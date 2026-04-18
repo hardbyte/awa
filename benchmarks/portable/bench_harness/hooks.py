@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 import psycopg
@@ -25,6 +26,7 @@ from .phases import PhaseRuntime
 # Open a connection, BEGIN, SELECT txid_current(), sleep until the exit hook
 # closes the connection. The transaction pins the cluster xmin horizon for
 # the whole phase.
+
 
 def enter_idle_in_tx(runtime: PhaseRuntime) -> None:
     stop = threading.Event()
@@ -60,6 +62,7 @@ def exit_idle_in_tx(runtime: PhaseRuntime) -> None:
 #
 # Open N overlapping REPEATABLE READ connections running a repeating scan
 # query. Parity with awa's Rust MVCC bench `active_scan` mode.
+
 
 def _reader_loop(
     database_url: str,
@@ -118,20 +121,21 @@ def exit_active_readers(runtime: PhaseRuntime) -> None:
 # dynamic rate changes simply ignore the file — the phase still runs the
 # clean workload, which is strictly worse data but not a failure.
 
+
 def enter_high_load(runtime: PhaseRuntime) -> None:
-    multiplier = float(os.environ.get("HIGH_LOAD_MULTIPLIER", "1.5"))
-    base = float(os.environ.get("PRODUCER_RATE", "800"))
-    control_file = os.environ.get("PRODUCER_RATE_CONTROL_FILE")
+    multiplier = float(runtime.state.get("high_load_multiplier", 1.5))
+    base = float(runtime.state.get("base_producer_rate", 800.0))
+    control_file = runtime.state.get("producer_rate_control_file")
     if not control_file:
         return
-    with open(control_file, "w") as fh:
+    with Path(control_file).open("w") as fh:
         fh.write(str(base * multiplier))
 
 
 def exit_high_load(runtime: PhaseRuntime) -> None:
-    base = os.environ.get("PRODUCER_RATE", "800")
-    control_file = os.environ.get("PRODUCER_RATE_CONTROL_FILE")
+    base = str(runtime.state.get("base_producer_rate", 800))
+    control_file = runtime.state.get("producer_rate_control_file")
     if not control_file:
         return
-    with open(control_file, "w") as fh:
+    with Path(control_file).open("w") as fh:
         fh.write(base)

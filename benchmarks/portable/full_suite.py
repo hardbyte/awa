@@ -3,8 +3,10 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import re
+import shutil
 import statistics
 import subprocess
 import sys
@@ -41,7 +43,9 @@ def write_status(status_path: Path, payload: dict) -> None:
     status_path.write_text(json.dumps(payload, indent=2) + "\n")
 
 
-def run_command(cmd: list[str], *, log_path: Path, phase_label: str) -> subprocess.CompletedProcess[str]:
+def run_command(
+    cmd: list[str], *, log_path: Path, phase_label: str
+) -> subprocess.CompletedProcess[str]:
     command_text = f"$ {' '.join(cmd)}"
     print(command_text, file=sys.stderr)
     append_log(log_path, f"\n[{utc_now()}] {phase_label}\n{command_text}\n")
@@ -60,7 +64,9 @@ def run_command(cmd: list[str], *, log_path: Path, phase_label: str) -> subproce
         append_log(log_path, f"[stderr]\n{completed.stderr}\n")
     append_log(log_path, f"[exit] {completed.returncode}\n")
     if completed.returncode != 0:
-        raise RuntimeError(f"command failed with exit code {completed.returncode}: {' '.join(cmd)}")
+        raise RuntimeError(
+            f"command failed with exit code {completed.returncode}: {' '.join(cmd)}"
+        )
     return completed
 
 
@@ -121,7 +127,9 @@ def run_chaos(system: str, args: argparse.Namespace, *, log_path: Path) -> list[
 
 
 def summarize_system(benchmark_payload: dict, chaos_payload: list[dict]) -> dict:
-    benchmark_results = {item["scenario"]: item["results"] for item in benchmark_payload["results"]}
+    benchmark_results = {
+        item["scenario"]: item["results"] for item in benchmark_payload["results"]
+    }
     chaos_results = {}
     for item in chaos_payload:
         if "results" in item:
@@ -152,7 +160,9 @@ def summarize_repetitions(repetitions: list[dict]) -> dict:
                 "mean_jobs_per_sec": statistics.mean(values),
                 "min_jobs_per_sec": min(values),
                 "max_jobs_per_sec": max(values),
-                "stdev_jobs_per_sec": statistics.stdev(values) if len(values) > 1 else 0.0,
+                "stdev_jobs_per_sec": statistics.stdev(values)
+                if len(values) > 1
+                else 0.0,
             }
         else:
             p50_values = [run["p50_us"] for run in runs]
@@ -274,10 +284,18 @@ def write_benchmark_exports(summary: dict[str, dict], timestamp: str) -> None:
         row = {"system": system}
         for scenario, values in data["benchmarks"].items():
             if "mean_jobs_per_sec" in values:
-                row[f"{scenario}_mean_jobs_per_sec"] = round(values["mean_jobs_per_sec"], 3)
-                row[f"{scenario}_stdev_jobs_per_sec"] = round(values["stdev_jobs_per_sec"], 3)
-                row[f"{scenario}_min_jobs_per_sec"] = round(values["min_jobs_per_sec"], 3)
-                row[f"{scenario}_max_jobs_per_sec"] = round(values["max_jobs_per_sec"], 3)
+                row[f"{scenario}_mean_jobs_per_sec"] = round(
+                    values["mean_jobs_per_sec"], 3
+                )
+                row[f"{scenario}_stdev_jobs_per_sec"] = round(
+                    values["stdev_jobs_per_sec"], 3
+                )
+                row[f"{scenario}_min_jobs_per_sec"] = round(
+                    values["min_jobs_per_sec"], 3
+                )
+                row[f"{scenario}_max_jobs_per_sec"] = round(
+                    values["max_jobs_per_sec"], 3
+                )
             else:
                 row[f"{scenario}_mean_p50_us"] = round(values["mean_p50_us"], 3)
                 row[f"{scenario}_mean_p95_us"] = round(values["mean_p95_us"], 3)
@@ -286,13 +304,21 @@ def write_benchmark_exports(summary: dict[str, dict], timestamp: str) -> None:
                 row[f"{scenario}_max_p50_us"] = round(values["max_p50_us"], 3)
         benchmark_rows.append(row)
 
-    fieldnames = sorted({key for row in benchmark_rows for key in row.keys()}, key=lambda key: (key != "system", key))
+    fieldnames = sorted(
+        {key for row in benchmark_rows for key in row.keys()},
+        key=lambda key: (key != "system", key),
+    )
     with csv_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(benchmark_rows)
 
-    lines = ["# Benchmark Summary", "", "| System | Worker Throughput Mean | Worker Throughput Stdev | Pickup p50 Mean |", "|---|---:|---:|---:|"]
+    lines = [
+        "# Benchmark Summary",
+        "",
+        "| System | Worker Throughput Mean | Worker Throughput Stdev | Pickup p50 Mean |",
+        "|---|---:|---:|---:|",
+    ]
     for system, data in summary.items():
         worker = data["benchmarks"].get("worker_throughput", {})
         latency = data["benchmarks"].get("pickup_latency", {})
@@ -316,13 +342,21 @@ def write_chaos_exports(summary: dict[str, dict], timestamp: str) -> None:
             row.update(values)
             chaos_rows.append(row)
 
-    fieldnames = sorted({key for row in chaos_rows for key in row.keys()}, key=lambda key: (key not in {"system", "scenario"}, key))
+    fieldnames = sorted(
+        {key for row in chaos_rows for key in row.keys()},
+        key=lambda key: (key not in {"system", "scenario"}, key),
+    )
     with csv_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(chaos_rows)
 
-    lines = ["# Chaos Summary", "", "| System | Scenario | Successes | Max Lost | Mean Total (s) |", "|---|---|---:|---:|---:|"]
+    lines = [
+        "# Chaos Summary",
+        "",
+        "| System | Scenario | Successes | Max Lost | Mean Total (s) |",
+        "|---|---|---:|---:|---:|",
+    ]
     for system, data in summary.items():
         for scenario, values in data["chaos"].items():
             lines.append(
@@ -331,14 +365,163 @@ def write_chaos_exports(summary: dict[str, dict], timestamp: str) -> None:
     markdown_path.write_text("\n".join(lines) + "\n")
 
 
+def write_html_report(
+    *,
+    summary: dict[str, dict],
+    timestamp: str,
+    config: dict,
+    output_path: Path,
+    log_path: Path,
+    status_path: Path,
+) -> Path:
+    report_dir = RESULTS_DIR / f"full_suite_report_{timestamp}"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    styles = """
+body { font-family: Inter, Arial, sans-serif; margin: 32px; color: #1f2937; background: #f8fafc; }
+h1, h2, h3 { color: #0f172a; }
+.meta { background: white; border: 1px solid #dbe4ee; border-radius: 8px; padding: 16px; margin-bottom: 24px; }
+.section { margin-bottom: 28px; }
+table { border-collapse: collapse; width: 100%; background: white; margin: 12px 0 24px 0; }
+th, td { border: 1px solid #dbe4ee; padding: 8px 10px; text-align: left; }
+th { background: #eff6ff; }
+tr:nth-child(even) td { background: #f8fbff; }
+.muted { color: #475569; }
+.mono { font-family: ui-monospace, SFMono-Regular, monospace; }
+""".strip()
+    (report_dir / "styles.css").write_text(styles)
+
+    def table(headers: list[str], rows: list[list[str]]) -> str:
+        head = "".join(f"<th>{html.escape(h)}</th>" for h in headers)
+        body = "".join(
+            "<tr>" + "".join(f"<td>{html.escape(cell)}</td>" for cell in row) + "</tr>"
+            for row in rows
+        )
+        return f"<table><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table>"
+
+    benchmark_rows: list[list[str]] = []
+    chaos_rows: list[list[str]] = []
+    system_sections: list[str] = []
+
+    for system, data in summary.items():
+        worker = data["benchmarks"].get("worker_throughput", {})
+        latency = data["benchmarks"].get("pickup_latency", {})
+        benchmark_rows.append(
+            [
+                system,
+                f"{worker.get('mean_jobs_per_sec', 0):,.0f}",
+                f"{worker.get('stdev_jobs_per_sec', 0):,.0f}",
+                f"{latency.get('mean_p50_us', 0):,.0f}",
+                f"{latency.get('mean_p95_us', 0):,.0f}",
+                f"{latency.get('mean_p99_us', 0):,.0f}",
+            ]
+        )
+
+        system_benchmark_rows: list[list[str]] = []
+        for scenario, values in sorted(data["benchmarks"].items()):
+            if "mean_jobs_per_sec" in values:
+                system_benchmark_rows.append(
+                    [
+                        scenario,
+                        f"{values.get('mean_jobs_per_sec', 0):,.0f}",
+                        f"{values.get('stdev_jobs_per_sec', 0):,.0f}",
+                        f"{values.get('min_jobs_per_sec', 0):,.0f}",
+                        f"{values.get('max_jobs_per_sec', 0):,.0f}",
+                    ]
+                )
+            else:
+                system_benchmark_rows.append(
+                    [
+                        scenario,
+                        f"{values.get('mean_p50_us', 0):,.0f}",
+                        f"{values.get('mean_p95_us', 0):,.0f}",
+                        f"{values.get('mean_p99_us', 0):,.0f}",
+                        f"{values.get('min_p50_us', 0):,.0f}..{values.get('max_p50_us', 0):,.0f}",
+                    ]
+                )
+
+        system_chaos_rows: list[list[str]] = []
+        for scenario, values in sorted(data["chaos"].items()):
+            if "errors" in values:
+                errors = "; ".join(values["errors"])
+                chaos_rows.append([system, scenario, "0/0", "-", errors])
+                system_chaos_rows.append([scenario, "0/0", "-", errors])
+                continue
+            successes = f"{values.get('successes', 0)}/{values.get('runs', 0)}"
+            max_lost = str(values.get("max_jobs_lost", 0))
+            mean_total = f"{values.get('mean_total_time_secs', 0):.1f}s"
+            chaos_rows.append([system, scenario, successes, max_lost, mean_total])
+            system_chaos_rows.append([scenario, successes, max_lost, mean_total])
+
+        system_sections.append(
+            f"<div class='section'><h2>{html.escape(system)}</h2>"
+            f"<h3>Benchmark Summary</h3>"
+            f"{table(['Scenario', 'Metric 1', 'Metric 2', 'Metric 3', 'Range'], system_benchmark_rows or [['-', '-', '-', '-', '-']])}"
+            f"<h3>Chaos Summary</h3>"
+            f"{table(['Scenario', 'Successes', 'Max Lost', 'Mean Total / Errors'], system_chaos_rows or [['-', '-', '-', '-']])}"
+            f"</div>"
+        )
+
+    index_html = f"""
+<!doctype html>
+<html lang='en'>
+  <head>
+    <meta charset='utf-8'>
+    <title>Portable Full Suite Report {html.escape(timestamp)}</title>
+    <link rel='stylesheet' href='styles.css'>
+  </head>
+  <body>
+    <h1>Portable Full Suite Report</h1>
+    <div class='meta'>
+      <div><strong>Timestamp:</strong> <span class='mono'>{html.escape(timestamp)}</span></div>
+      <div><strong>Systems:</strong> {html.escape(", ".join(config["systems"]))}</div>
+      <div><strong>Benchmark job count:</strong> {config["benchmark_job_count"]}</div>
+      <div><strong>Chaos suite:</strong> {html.escape(config["chaos_suite"])}</div>
+      <div><strong>PG image:</strong> <span class='mono'>{html.escape(config["pg_image"])}</span></div>
+      <div class='muted'>This bundle includes the HTML summary plus the source JSON, CSV, Markdown, log, and status files from the run.</div>
+    </div>
+    <div class='section'>
+      <h2>Cross-System Benchmarks</h2>
+      {table(["System", "Worker Throughput Mean", "Worker Throughput Stdev", "Pickup p50 Mean", "Pickup p95 Mean", "Pickup p99 Mean"], benchmark_rows)}
+    </div>
+    <div class='section'>
+      <h2>Cross-System Chaos</h2>
+      {table(["System", "Scenario", "Successes", "Max Lost", "Mean Total / Errors"], chaos_rows)}
+    </div>
+    {"".join(system_sections)}
+  </body>
+</html>
+""".strip()
+    (report_dir / "index.html").write_text(index_html)
+
+    for path in [
+        output_path,
+        log_path,
+        status_path,
+        RESULTS_DIR / f"benchmark_summary_{timestamp}.csv",
+        RESULTS_DIR / f"benchmark_summary_{timestamp}.md",
+        RESULTS_DIR / f"chaos_summary_{timestamp}.csv",
+        RESULTS_DIR / f"chaos_summary_{timestamp}.md",
+    ]:
+        if path.exists():
+            shutil.copy2(path, report_dir / path.name)
+
+    archive_path = shutil.make_archive(str(report_dir), "zip", root_dir=report_dir)
+    return Path(archive_path)
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run benchmark and chaos suites per system")
+    parser = argparse.ArgumentParser(
+        description="Run benchmark and chaos suites per system"
+    )
     parser.add_argument("--systems", default=",".join(DEFAULT_SYSTEMS))
     parser.add_argument("--benchmark-job-count", type=int, default=10000)
     parser.add_argument("--benchmark-worker-count", type=int, default=50)
     parser.add_argument("--latency-iterations", type=int, default=100)
     parser.add_argument("--chaos-job-count", type=int, default=10)
-    parser.add_argument("--chaos-suite", choices=["portable", "extended"], default="portable")
+    parser.add_argument(
+        "--chaos-suite", choices=["portable", "extended"], default="portable"
+    )
     parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--skip-build", action="store_true")
     parser.add_argument("--pg-image", default="postgres:17-alpine")
@@ -387,7 +570,10 @@ def main() -> None:
                 }
                 run_status["updated_at"] = utc_now()
                 write_status(status_path, run_status)
-                print(f"\n=== repetition {repetition}/{args.repetitions}: {system} benchmarks ===", file=sys.stderr)
+                print(
+                    f"\n=== repetition {repetition}/{args.repetitions}: {system} benchmarks ===",
+                    file=sys.stderr,
+                )
                 benchmark_payload = run_benchmarks(system, args, log_path=log_path)
                 built_systems.add(system)
 
@@ -399,7 +585,10 @@ def main() -> None:
                 }
                 run_status["updated_at"] = utc_now()
                 write_status(status_path, run_status)
-                print(f"\n=== repetition {repetition}/{args.repetitions}: {system} chaos ({args.chaos_suite}) ===", file=sys.stderr)
+                print(
+                    f"\n=== repetition {repetition}/{args.repetitions}: {system} chaos ({args.chaos_suite}) ===",
+                    file=sys.stderr,
+                )
                 chaos_payload = run_chaos(system, args, log_path=log_path)
 
                 combined_entry = {
@@ -458,16 +647,28 @@ def main() -> None:
         )
     write_benchmark_exports(summary, timestamp)
     write_chaos_exports(summary, timestamp)
+    report_zip = write_html_report(
+        summary=summary,
+        timestamp=timestamp,
+        config=run_status["config"],
+        output_path=output_path,
+        log_path=log_path,
+        status_path=status_path,
+    )
     run_status["state"] = "completed"
     run_status["updated_at"] = utc_now()
     run_status["finished_at"] = utc_now()
     run_status["result_file"] = str(output_path)
+    run_status["html_report_zip"] = str(report_zip)
     run_status["current"] = None
     write_status(status_path, run_status)
     append_log(log_path, f"[{utc_now()}] full_suite completed\n")
     print(f"\nResults saved to {output_path}", file=sys.stderr)
+    print(f"HTML report bundle saved to {report_zip}", file=sys.stderr)
     if args.repetitions == 1:
-        print_summary({system: runs[0]["summary"] for system, runs in combined_results.items()})
+        print_summary(
+            {system: runs[0]["summary"] for system, runs in combined_results.items()}
+        )
     else:
         print_repetition_summary(summary)
 

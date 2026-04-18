@@ -12,10 +12,12 @@ import json
 import os
 import queue
 import signal
+import shutil
 import subprocess
 import sys
 import threading
 import time
+import tempfile
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -62,6 +64,7 @@ COMPOSE_FILE = SCRIPT_DIR / "docker-compose.yml"
 # Phase tracker: shared between metrics daemon and stdout tailer
 # ────────────────────────────────────────────────────────────────────────
 
+
 class PhaseTracker:
     def __init__(self) -> None:
         self._label = "pre-run"
@@ -82,8 +85,14 @@ class PhaseTracker:
 # Postgres lifecycle
 # ────────────────────────────────────────────────────────────────────────
 
-def _run_cmd(argv: list[str], *, cwd: Path | None = None, env: dict | None = None,
-             check: bool = True) -> subprocess.CompletedProcess:
+
+def _run_cmd(
+    argv: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict | None = None,
+    check: bool = True,
+) -> subprocess.CompletedProcess:
     print(f"[harness] $ {' '.join(argv)}", file=sys.stderr)
     return subprocess.run(
         argv,
@@ -106,15 +115,40 @@ def start_postgres(pg_image: str) -> None:
     # Readiness probe
     for _ in range(30):
         r = subprocess.run(
-            ["docker", "compose", "exec", "-T", "postgres", "pg_isready", "-U", "bench"],
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "postgres",
+                "pg_isready",
+                "-U",
+                "bench",
+            ],
             cwd=str(SCRIPT_DIR),
             env={**os.environ, **_compose_env(pg_image)},
             capture_output=True,
         )
         if r.returncode == 0:
-            return
+            break
         time.sleep(1)
-    raise RuntimeError("Postgres did not become ready in time")
+    else:
+        raise RuntimeError("Postgres did not become ready in time")
+
+    last_error: Exception | None = None
+    for _ in range(30):
+        try:
+            with psycopg.connect(pg_url("postgres"), autocommit=True) as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT 1")
+                    cur.fetchone()
+            return
+        except psycopg.Error as exc:
+            last_error = exc
+            time.sleep(1)
+    raise RuntimeError(
+        f"Postgres passed health checks but never became query-ready: {last_error}"
+    )
 
 
 def stop_postgres(pg_image: str) -> None:
@@ -126,20 +160,32 @@ def stop_postgres(pg_image: str) -> None:
     )
 
 
-def preflight_database(manifest: AdapterManifest) -> None:
+def preflight_database(manifest: AdapterManifest, *, recreate: bool = False) -> None:
     """Create the per-system database if missing, install declared extensions,
     plus pgstattuple (required by the harness). Fail fast on errors."""
     admin_url = pg_url("postgres")
     with psycopg.connect(admin_url, autocommit=True) as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM pg_database WHERE datname = %s",
-                (manifest.db_name,),
-            )
-            if cur.fetchone() is None:
-                # Database identifier can't be parameterised; this comes from
-                # the adapter manifest file (trusted) and matches [a-z_]+.
+            if recreate:
+                cur.execute(
+                    """
+                    SELECT pg_terminate_backend(pid)
+                    FROM pg_stat_activity
+                    WHERE datname = %s AND pid <> pg_backend_pid()
+                    """,
+                    (manifest.db_name,),
+                )
+                cur.execute(f'DROP DATABASE IF EXISTS "{manifest.db_name}"')
                 cur.execute(f'CREATE DATABASE "{manifest.db_name}"')
+            else:
+                cur.execute(
+                    "SELECT 1 FROM pg_database WHERE datname = %s",
+                    (manifest.db_name,),
+                )
+                if cur.fetchone() is None:
+                    # Database identifier can't be parameterised; this comes from
+                    # the adapter manifest file (trusted) and matches [a-z_]+.
+                    cur.execute(f'CREATE DATABASE "{manifest.db_name}"')
 
     target_url = pg_url(manifest.db_name)
     required_exts = list(manifest.extensions) + ["pgstattuple"]
@@ -159,6 +205,7 @@ def preflight_database(manifest: AdapterManifest) -> None:
 # ────────────────────────────────────────────────────────────────────────
 # Adapter process management
 # ────────────────────────────────────────────────────────────────────────
+
 
 @dataclass
 class RunningAdapter:
@@ -197,8 +244,11 @@ def _tail_stdout(
         if rec.get("kind") != "adapter":
             continue
         s = parse_adapter_record(
-            line, run_id=run_id, expected_system=system,
-            bench_start=bench_start, get_phase=get_phase,
+            line,
+            run_id=run_id,
+            expected_system=system,
+            bench_start=bench_start,
+            get_phase=get_phase,
         )
         if s:
             out_queue.put(s)
@@ -217,8 +267,9 @@ def launch_adapter(
 ) -> RunningAdapter:
     spec = entry.launcher(manifest, overrides)
     env = {**os.environ, **spec.env}
-    print(f"[harness] launching {system}: {' '.join(spec.argv[:2])}...",
-          file=sys.stderr)
+    print(
+        f"[harness] launching {system}: {' '.join(spec.argv[:2])}...", file=sys.stderr
+    )
     proc = subprocess.Popen(
         spec.argv,
         cwd=spec.cwd,
@@ -287,15 +338,18 @@ def _check_descriptor_drift(manifest: AdapterManifest, descriptor: dict) -> None
         )
 
 
-def terminate_adapter(running: RunningAdapter, system: str, timeout_s: float = 10.0) -> None:
+def terminate_adapter(
+    running: RunningAdapter, system: str, timeout_s: float = 10.0
+) -> None:
     proc = running.process
     if proc.poll() is None:
         proc.send_signal(signal.SIGTERM)
         try:
             proc.wait(timeout=timeout_s)
         except subprocess.TimeoutExpired:
-            print(f"[{system}] did not exit within {timeout_s}s, killing",
-                  file=sys.stderr)
+            print(
+                f"[{system}] did not exit within {timeout_s}s, killing", file=sys.stderr
+            )
             proc.kill()
             proc.wait()
     running.tailer.join(timeout=2.0)
@@ -305,8 +359,10 @@ def terminate_adapter(running: RunningAdapter, system: str, timeout_s: float = 1
 # Drain thread: pulls samples off the queue, writes to raw.csv
 # ────────────────────────────────────────────────────────────────────────
 
-def _drain_loop(out_queue: "queue.Queue[Sample]", writer: RawCsvWriter,
-                stop_event: threading.Event) -> None:
+
+def _drain_loop(
+    out_queue: "queue.Queue[Sample]", writer: RawCsvWriter, stop_event: threading.Event
+) -> None:
     while not stop_event.is_set() or not out_queue.empty():
         try:
             s = out_queue.get(timeout=0.5)
@@ -320,6 +376,7 @@ def _drain_loop(out_queue: "queue.Queue[Sample]", writer: RawCsvWriter,
 # Running a single system through the full phase list
 # ────────────────────────────────────────────────────────────────────────
 
+
 def run_one_system(
     system: str,
     *,
@@ -331,7 +388,10 @@ def run_one_system(
     tracker: PhaseTracker,
     sample_every_s: int,
     producer_rate: int,
+    producer_mode: str,
+    target_depth: int,
     worker_count: int,
+    high_load_multiplier: float,
 ) -> dict:
     entry = ADAPTERS[system]
     manifest = AdapterManifest.load(entry.bench_dir)
@@ -342,17 +402,28 @@ def run_one_system(
         stop_postgres(pg_image)
         start_postgres(pg_image)
 
-    preflight_database(manifest)
+    preflight_database(manifest, recreate=fast)
 
     overrides: dict[str, str] = {
         "SAMPLE_EVERY_S": str(sample_every_s),
         "PRODUCER_RATE": str(producer_rate),
+        "PRODUCER_MODE": producer_mode,
+        "TARGET_DEPTH": str(target_depth),
         "WORKER_COUNT": str(worker_count),
     }
+    control_dir = Path(tempfile.mkdtemp(prefix=f"bench-control-{system}-"))
+    control_file = control_dir / "producer_rate.txt"
+    control_file.write_text(str(producer_rate))
+    overrides["PRODUCER_RATE_CONTROL_FILE"] = str(control_file)
+    overrides["PRODUCER_RATE_CONTROL_FILE_HOST"] = str(control_file)
+    overrides["PRODUCER_RATE_CONTROL_FILE_CONTAINER"] = "/control/producer_rate.txt"
 
     bench_start = time.time()
     adapter = launch_adapter(
-        system, entry, manifest, overrides,
+        system,
+        entry,
+        manifest,
+        overrides,
         run_id=run_id,
         bench_start=bench_start,
         tracker=tracker,
@@ -376,12 +447,19 @@ def run_one_system(
     daemon.start()
 
     registry = default_registry()
-    phase_state: dict[str, object] = {}
+    phase_state: dict[str, object] = {
+        "producer_rate_control_file": str(control_file),
+        "base_producer_rate": float(producer_rate),
+        "high_load_multiplier": float(high_load_multiplier),
+    }
     try:
         for phase in phases:
             tracker.set(phase.label, phase.type.value)
-            print(f"[{system}] phase {phase.label} ({phase.type.value}) "
-                  f"for {phase.duration_s}s", file=sys.stderr)
+            print(
+                f"[{system}] phase {phase.label} ({phase.type.value}) "
+                f"for {phase.duration_s}s",
+                file=sys.stderr,
+            )
             runtime = PhaseRuntime(
                 database_url=pg_url(manifest.db_name),
                 phase=phase,
@@ -398,6 +476,7 @@ def run_one_system(
         daemon.stop()
         daemon.join(timeout=5.0)
         terminate_adapter(adapter, system)
+        shutil.rmtree(control_dir, ignore_errors=True)
 
     return adapter.descriptor
 
@@ -418,6 +497,7 @@ def _sleep_or_abort(seconds: float, adapter: RunningAdapter) -> None:
 # Top-level driver
 # ────────────────────────────────────────────────────────────────────────
 
+
 def _new_run_dir(scenario: str | None) -> Path:
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     short_id = uuid.uuid4().hex[:6]
@@ -437,13 +517,15 @@ def drive(
     skip_build: bool,
     sample_every_s: int,
     producer_rate: int,
+    producer_mode: str,
+    target_depth: int,
     worker_count: int,
+    high_load_multiplier: float,
     cli_args: list[str],
 ) -> Path:
     unknown = [s for s in systems if s not in ADAPTERS]
     if unknown:
-        raise SystemExit(f"Unknown systems: {unknown}. "
-                         f"Known: {sorted(ADAPTERS)}")
+        raise SystemExit(f"Unknown systems: {unknown}. Known: {sorted(ADAPTERS)}")
 
     run_dir = _new_run_dir(scenario)
     run_id = run_dir.name
@@ -455,8 +537,10 @@ def drive(
 
     drain_stop = threading.Event()
     drain_thread = threading.Thread(
-        target=_drain_loop, args=(out_queue, writer, drain_stop),
-        name="raw-csv-drain", daemon=True,
+        target=_drain_loop,
+        args=(out_queue, writer, drain_stop),
+        name="raw-csv-drain",
+        daemon=True,
     )
     drain_thread.start()
 
@@ -490,7 +574,10 @@ def drive(
                 tracker=tracker,
                 sample_every_s=sample_every_s,
                 producer_rate=producer_rate,
+                producer_mode=producer_mode,
+                target_depth=target_depth,
                 worker_count=worker_count,
+                high_load_multiplier=high_load_multiplier,
             )
             adapter_descriptors[system] = descriptor or {}
     finally:
@@ -513,12 +600,10 @@ def drive(
     if pg_env_snapshot:
         manifest["postgres"] = pg_env_snapshot
     write_manifest(manifest, run_dir / "manifest.json")
-    summary = compute_summary(raw_csv, run_id=run_id, scenario=scenario,
-                              phases=phases)
+    summary = compute_summary(raw_csv, run_id=run_id, scenario=scenario, phases=phases)
     write_summary(summary, run_dir / "summary.json")
     write_run_readme(run_dir / "README.md", scenario=scenario, phases=phases)
-    render_all(raw_csv, systems=systems, phases=phases,
-               out_dir=run_dir / "plots")
+    render_all(raw_csv, systems=systems, phases=phases, out_dir=run_dir / "plots")
 
     print(f"\n[harness] results at: {run_dir}", file=sys.stderr)
     return run_dir
@@ -528,6 +613,7 @@ def drive(
 # CLI
 # ────────────────────────────────────────────────────────────────────────
 
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Long-horizon benchmark runner for the portable queue suite",
@@ -536,20 +622,20 @@ def build_parser() -> argparse.ArgumentParser:
         "--scenario",
         default=None,
         help="Named scenario, e.g. idle_in_tx_saturation, long_horizon. "
-             "Combine with --phase to append extra phases.",
+        "Combine with --phase to append extra phases.",
     )
     parser.add_argument(
         "--phase",
         action="append",
         default=[],
         help="Phase spec: label=type:duration (e.g. idle_1=idle-in-tx:60m). "
-             "Repeatable. Can be used with or without --scenario.",
+        "Repeatable. Can be used with or without --scenario.",
     )
     parser.add_argument(
         "--systems",
         default=",".join(DEFAULT_SYSTEMS),
         help="Comma-separated adapters to run. awa-docker is opt-in only "
-             "because it duplicates the awa-native line in cross-system plots.",
+        "because it duplicates the awa-native line in cross-system plots.",
     )
     parser.add_argument(
         "--pg-image",
@@ -560,19 +646,49 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast",
         action="store_true",
         help="Developer fast path: keep one PG instance across systems "
-             "(DB-only recreation). Non-canonical — use for iteration only.",
+        "(DB-only recreation). Non-canonical — use for iteration only.",
     )
     parser.add_argument(
         "--skip-build",
         action="store_true",
         help="Skip adapter build step; use cached binaries/images.",
     )
-    parser.add_argument("--sample-every", type=int, default=10,
-                        help="Sample cadence in seconds (default 10).")
-    parser.add_argument("--producer-rate", type=int, default=800,
-                        help="Fixed-rate producer target jobs/s (default 800).")
-    parser.add_argument("--worker-count", type=int, default=32,
-                        help="Consumer concurrency (default 32).")
+    parser.add_argument(
+        "--sample-every",
+        type=int,
+        default=10,
+        help="Sample cadence in seconds (default 10).",
+    )
+    parser.add_argument(
+        "--producer-rate",
+        type=int,
+        default=800,
+        help="Fixed-rate producer target jobs/s (default 800).",
+    )
+    parser.add_argument(
+        "--producer-mode",
+        choices=["fixed", "depth-target"],
+        default="fixed",
+        help="Producer mode: fixed-rate offered load or depth-target diagnostic mode.",
+    )
+    parser.add_argument(
+        "--target-depth",
+        type=int,
+        default=1000,
+        help="Target queue depth when --producer-mode=depth-target (default 1000).",
+    )
+    parser.add_argument(
+        "--worker-count",
+        type=int,
+        default=32,
+        help="Consumer concurrency (default 32).",
+    )
+    parser.add_argument(
+        "--high-load-multiplier",
+        type=float,
+        default=1.5,
+        help="Producer-rate multiplier applied during high-load phases (default 1.5).",
+    )
     return parser
 
 
@@ -590,7 +706,10 @@ def main(argv: list[str] | None = None) -> int:
         skip_build=args.skip_build,
         sample_every_s=args.sample_every,
         producer_rate=args.producer_rate,
+        producer_mode=args.producer_mode,
+        target_depth=args.target_depth,
         worker_count=args.worker_count,
+        high_load_multiplier=args.high_load_multiplier,
         cli_args=list(sys.argv) if argv is None else list(argv),
     )
     return 0

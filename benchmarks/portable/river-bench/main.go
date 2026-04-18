@@ -84,6 +84,25 @@ func envInt(key string, def int) int {
 	return v
 }
 
+func readProducerRate(def int) int {
+	path := os.Getenv("PRODUCER_RATE_CONTROL_FILE")
+	if path == "" {
+		return def
+	}
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return def
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(string(buf)), 64)
+	if err != nil {
+		return def
+	}
+	if value < 0 {
+		return 0
+	}
+	return int(value)
+}
+
 func mustPool(ctx context.Context) *pgxpool.Pool {
 	poolConfig, err := pgxpool.ParseConfig(databaseURL())
 	if err != nil {
@@ -466,6 +485,8 @@ func percentiles(state *longHorizonState, windowS float64) (p50, p95, p99 float6
 
 func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 	producerRate := envInt("PRODUCER_RATE", 800)
+	producerMode := envOrDefault("PRODUCER_MODE", "fixed")
+	targetDepth := envInt("TARGET_DEPTH", 1000)
 	sampleEveryS := envInt("SAMPLE_EVERY_S", 10)
 	payloadBytes := envInt("JOB_PAYLOAD_BYTES", 256)
 	workMs := envInt("JOB_WORK_MS", 1)
@@ -490,6 +511,8 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 		workMs:       workMs,
 		maxLatencies: 32768,
 	}
+	var producerTargetRate atomic.Int64
+	producerTargetRate.Store(int64(producerRate))
 
 	workers := river.NewWorkers()
 	river.AddWorker(workers, &LongHorizonWorker{state: state})
@@ -521,26 +544,37 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 	producerWG.Add(1)
 	go func() {
 		defer producerWG.Done()
-		if producerRate <= 0 {
-			return
-		}
-		period := time.Second / time.Duration(producerRate)
-		ticker := time.NewTicker(period)
-		defer ticker.Stop()
 		var seq int64
 		for {
 			select {
 			case <-shutdown:
 				return
-			case <-ticker.C:
-				_, err := client.Insert(ctx, LongHorizonArgs{Seq: seq, Padding: padding}, nil)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "[river] producer insert failed: %v\n", err)
+			default:
+			}
+
+			if producerMode == "depth-target" {
+				producerTargetRate.Store(0)
+				if state.queueDepth.Load() >= int64(targetDepth) {
+					time.Sleep(50 * time.Millisecond)
 					continue
 				}
-				state.enqueued.Add(1)
-				seq++
+			} else {
+				currentRate := readProducerRate(producerRate)
+				producerTargetRate.Store(int64(currentRate))
+				if currentRate <= 0 {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				time.Sleep(time.Second / time.Duration(currentRate))
 			}
+
+			_, err := client.Insert(ctx, LongHorizonArgs{Seq: seq, Padding: padding}, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[river] producer insert failed: %v\n", err)
+				continue
+			}
+			state.enqueued.Add(1)
+			seq++
 		}
 	}()
 
@@ -599,6 +633,7 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 				lastCmp = cmp
 				p50, p95, p99 := percentiles(state, 30.0)
 				depth := float64(state.queueDepth.Load())
+				targetRate := float64(producerTargetRate.Load())
 				ts := nowISO()
 
 				type metric struct {
@@ -613,6 +648,7 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 					{"enqueue_rate", enqRate, float64(sampleEveryS)},
 					{"completion_rate", cmpRate, float64(sampleEveryS)},
 					{"queue_depth", depth, 0},
+					{"producer_target_rate", targetRate, 0},
 				} {
 					emitJSONL(map[string]interface{}{
 						"t":            ts,

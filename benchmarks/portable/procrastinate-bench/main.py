@@ -36,6 +36,22 @@ def env_int(key: str, default: int) -> int:
     return int(value) if value is not None else default
 
 
+def env_str(key: str, default: str) -> str:
+    value = os.environ.get(key)
+    return value if value is not None else default
+
+
+def read_producer_rate(default: int) -> int:
+    control_file = os.environ.get("PRODUCER_RATE_CONTROL_FILE")
+    if not control_file:
+        return default
+    try:
+        with open(control_file) as fh:
+            return int(float(fh.read().strip()))
+    except Exception:
+        return default
+
+
 app = procrastinate.App(
     connector=procrastinate.PsycopgConnector(conninfo=database_url()),
 )
@@ -59,7 +75,9 @@ async def connect() -> AsyncConnection:
 
 async def clean_queue(queue: str) -> None:
     async with await connect() as conn:
-        await conn.execute("DELETE FROM procrastinate_jobs WHERE queue_name = %s", (queue,))
+        await conn.execute(
+            "DELETE FROM procrastinate_jobs WHERE queue_name = %s", (queue,)
+        )
 
 
 async def count_completed(queue: str) -> int:
@@ -255,27 +273,37 @@ async def scenario_long_horizon() -> None:
 
     sample_every_s = env_int("SAMPLE_EVERY_S", 10)
     producer_rate = env_int("PRODUCER_RATE", 800)
+    producer_mode = env_str("PRODUCER_MODE", "fixed")
+    target_depth = env_int("TARGET_DEPTH", 1000)
     worker_count = env_int("WORKER_COUNT", 32)
     work_ms = env_int("JOB_WORK_MS", 1)
 
     queue = "procrastinate_longhorizon_bench"
     db_name = database_url().rsplit("/", 1)[-1]
 
-    _emit({
-        "kind": "descriptor",
-        "system": "procrastinate",
-        "event_tables": ["public.procrastinate_jobs", "public.procrastinate_events"],
-        "extensions": [],
-        "version": "0.1.0",
-        "schema_version": os.environ.get("PROCRASTINATE_SCHEMA_VERSION", "current"),
-        "db_name": db_name,
-        "started_at": _now_iso(),
-    })
+    _emit(
+        {
+            "kind": "descriptor",
+            "system": "procrastinate",
+            "event_tables": [
+                "public.procrastinate_jobs",
+                "public.procrastinate_events",
+            ],
+            "extensions": [],
+            "version": "0.1.0",
+            "schema_version": os.environ.get("PROCRASTINATE_SCHEMA_VERSION", "current"),
+            "db_name": db_name,
+            "started_at": _now_iso(),
+        }
+    )
 
-    latencies_ms: collections.deque[tuple[float, float]] = collections.deque(maxlen=32768)
+    latencies_ms: collections.deque[tuple[float, float]] = collections.deque(
+        maxlen=32768
+    )
     enqueued = 0
     completed = 0
     queue_depth = 0
+    current_producer_target_rate = float(producer_rate)
 
     # Redefine the task so the handler captures `latencies_ms`/`completed`.
     # procrastinate discovers tasks by name, so we can shadow the module-level
@@ -286,7 +314,9 @@ async def scenario_long_horizon() -> None:
     )
 
     @lh_app.task(queue=queue, name="long_horizon_job", pass_context=True)
-    async def long_horizon_task(context, seq: int, created_at_iso: str, padding: str = "") -> None:
+    async def long_horizon_task(
+        context, seq: int, created_at_iso: str, padding: str = ""
+    ) -> None:
         nonlocal completed
         try:
             created = _dt.datetime.fromisoformat(created_at_iso)
@@ -323,15 +353,28 @@ async def scenario_long_horizon() -> None:
                 signal.signal(sig, lambda *_a: shutdown.set())
 
         async def producer() -> None:
-            nonlocal enqueued
-            if producer_rate <= 0:
-                return
-            period = 1.0 / producer_rate
+            nonlocal enqueued, current_producer_target_rate
             seq = 0
             deferrer = long_horizon_task.configure(queue=queue)
             next_t = loop.time()
             while not shutdown.is_set():
-                next_t += period
+                if producer_mode == "depth-target":
+                    current_producer_target_rate = 0.0
+                    if queue_depth >= target_depth:
+                        await asyncio.sleep(0.05)
+                        continue
+                    next_t = loop.time()
+                else:
+                    effective_rate = read_producer_rate(producer_rate)
+                    current_producer_target_rate = float(effective_rate)
+                    if effective_rate <= 0:
+                        next_t = loop.time()
+                        await asyncio.sleep(0.1)
+                        continue
+                    next_t = max(next_t + (1.0 / effective_rate), loop.time())
+                    sleep_for = next_t - loop.time()
+                    if sleep_for > 0:
+                        await asyncio.sleep(sleep_for)
                 try:
                     await deferrer.defer_async(
                         seq=seq,
@@ -340,11 +383,10 @@ async def scenario_long_horizon() -> None:
                     enqueued += 1
                     seq += 1
                 except Exception as exc:
-                    print(f"[procrastinate] producer insert failed: {exc}",
-                          file=sys.stderr)
-                sleep_for = next_t - loop.time()
-                if sleep_for > 0:
-                    await asyncio.sleep(sleep_for)
+                    print(
+                        f"[procrastinate] producer insert failed: {exc}",
+                        file=sys.stderr,
+                    )
 
         async def depth_poller() -> None:
             nonlocal queue_depth
@@ -381,8 +423,9 @@ async def scenario_long_horizon() -> None:
                 enq_rate = (enqueued - last_enq) / dt
                 cmp_rate = (completed - last_cmp) / dt
                 last_enq, last_cmp = enqueued, completed
-                p50, p95, p99 = _percentiles(latencies_ms, window_s=30.0,
-                                             now=loop.time())
+                p50, p95, p99 = _percentiles(
+                    latencies_ms, window_s=30.0, now=loop.time()
+                )
                 ts = _now_iso()
                 for metric, value, window_s in [
                     ("claim_p50_ms", p50, 30.0),
@@ -391,28 +434,45 @@ async def scenario_long_horizon() -> None:
                     ("enqueue_rate", enq_rate, float(sample_every_s)),
                     ("completion_rate", cmp_rate, float(sample_every_s)),
                     ("queue_depth", float(queue_depth), 0.0),
+                    ("producer_target_rate", current_producer_target_rate, 0.0),
                 ]:
-                    _emit({
-                        "t": ts,
-                        "system": "procrastinate",
-                        "kind": "adapter",
-                        "subject_kind": "adapter",
-                        "subject": "",
-                        "metric": metric,
-                        "value": value,
-                        "window_s": window_s,
-                    })
+                    _emit(
+                        {
+                            "t": ts,
+                            "system": "procrastinate",
+                            "kind": "adapter",
+                            "subject_kind": "adapter",
+                            "subject": "",
+                            "metric": metric,
+                            "value": value,
+                            "window_s": window_s,
+                        }
+                    )
 
-        tasks = [
+        tasks: list[asyncio.Task[None]] = [
             asyncio.create_task(producer(), name="producer"),
             asyncio.create_task(depth_poller(), name="depth"),
             asyncio.create_task(sampler(), name="sampler"),
         ]
-        await shutdown.wait()
-        for t in tasks:
-            t.cancel()
-        worker.stop()
-        await asyncio.gather(worker_task, *tasks, return_exceptions=True)
+        try:
+            await shutdown.wait()
+        finally:
+            shutdown.set()
+            for t in tasks:
+                t.cancel()
+            worker.stop()
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(worker_task, *tasks, return_exceptions=True),
+                    timeout=5.0,
+                )
+            except asyncio.TimeoutError:
+                worker_task.cancel()
+                await asyncio.gather(worker_task, *tasks, return_exceptions=True)
+            print(
+                "[procrastinate] long_horizon: shutdown signal received",
+                file=sys.stderr,
+            )
 
 
 def _emit(record: dict) -> None:
@@ -421,6 +481,7 @@ def _emit(record: dict) -> None:
 
 def _now_iso() -> str:
     import datetime as _dt
+
     return (
         _dt.datetime.now(_dt.timezone.utc)
         .isoformat(timespec="milliseconds")
@@ -435,9 +496,11 @@ def _percentiles(events, *, window_s: float, now: float):
         return 0.0, 0.0, 0.0
     values.sort()
     n = len(values)
+
     def q(p):
         idx = min(n - 1, max(0, int(round(p * (n - 1)))))
         return values[idx]
+
     return q(0.50), q(0.95), q(0.99)
 
 
@@ -468,7 +531,9 @@ async def main() -> None:
             results.append(await scenario_worker_throughput(job_count, worker_count))
         if scenario in ("all", "pickup_latency"):
             print("[procrastinate] Running pickup_latency...", file=sys.stderr)
-            results.append(await scenario_pickup_latency(latency_iterations, worker_count))
+            results.append(
+                await scenario_pickup_latency(latency_iterations, worker_count)
+            )
 
         print(json.dumps(results, indent=2))
 

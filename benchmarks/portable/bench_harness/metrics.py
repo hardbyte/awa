@@ -24,8 +24,9 @@ from .sample import Sample, now_iso
 @dataclass
 class PollTargets:
     """Set of subjects the daemon polls every tick for one system."""
-    event_tables: list[str]     # schema.table
-    event_indexes: list[str]    # schema.indexname
+
+    event_tables: list[str]  # schema.table
+    event_indexes: list[str]  # schema.indexname
 
 
 def _next_aligned_tick(now: float, period_s: int) -> float:
@@ -54,19 +55,30 @@ SELECT pg_relation_size(%s)::double precision / (1024 * 1024)
 """
 
 _CLUSTER_SQL = """
+WITH snap AS (
+  SELECT pg_snapshot_xmin(pg_current_snapshot()) AS snapshot_xmin
+)
 SELECT
-  -- xmin age: clamp snapshot xmin to a bigint age via pg_current_xact_id_if_assigned.
-  -- In 14+, age is against the current TransactionId.
+  snap.snapshot_xmin::text::double precision AS snapshot_xmin,
+  COALESCE(
+    EXTRACT(EPOCH FROM (now() - MIN(pg_stat_activity.xact_start) FILTER (
+      WHERE pg_stat_activity.backend_xmin::text = snap.snapshot_xmin::text
+    ))),
+    0
+  )::double precision AS xmin_age_s,
   COALESCE(EXTRACT(EPOCH FROM (now() - MIN(xact_start))), 0)::double precision
       AS oldest_xact_age_s,
   (SELECT count(*) FROM pg_stat_activity
-     WHERE state = 'idle in transaction')::double precision
+      WHERE state = 'idle in transaction')::double precision
       AS idle_in_tx_count,
   COALESCE(
-    EXTRACT(EPOCH FROM (now() - MIN(xact_start)))
-      FILTER (WHERE state = 'idle in transaction'), 0
+    EXTRACT(EPOCH FROM (now() - MIN(xact_start) FILTER (
+      WHERE state = 'idle in transaction'
+    ))), 0
   )::double precision AS oldest_idle_in_tx_age_s
-FROM pg_stat_activity
+FROM snap
+CROSS JOIN pg_stat_activity
+GROUP BY snap.snapshot_xmin
 """
 
 _PGSTATTUPLE_SQL = """
@@ -78,6 +90,10 @@ _PGSTATINDEX_SQL = """
 SELECT avg_leaf_density, leaf_fragmentation
 FROM pgstatindex(%s)
 """
+
+
+def _is_missing_relation(exc: psycopg.Error) -> bool:
+    return exc.sqlstate in {"42P01", "42704"}
 
 
 class MetricsDaemon(threading.Thread):
@@ -117,6 +133,8 @@ class MetricsDaemon(threading.Thread):
                             cur.execute(_PGSTATTUPLE_SQL, (fq_table,))
                             row = cur.fetchone()
                         except psycopg.Error as exc:
+                            if _is_missing_relation(exc):
+                                continue
                             self._emit_adapter_error(
                                 subject=fq_table,
                                 metric="pgstattuple_error",
@@ -142,7 +160,9 @@ class MetricsDaemon(threading.Thread):
                         try:
                             cur.execute(_PGSTATINDEX_SQL, (fq_index,))
                             row = cur.fetchone()
-                        except psycopg.Error:
+                        except psycopg.Error as exc:
+                            if _is_missing_relation(exc):
+                                continue
                             continue
                         if row is None:
                             continue
@@ -207,23 +227,51 @@ class MetricsDaemon(threading.Thread):
                 if row is None:
                     # Not yet created by the adapter — skip this tick.
                     continue
-                (n_dead, n_live, autovac_count,
-                 last_autovac_age, total_mb, table_mb) = row
-                self._emit(subject_kind="table", subject=fq_table,
-                           metric="n_dead_tup", value=float(n_dead))
-                self._emit(subject_kind="table", subject=fq_table,
-                           metric="n_live_tup", value=float(n_live))
-                self._emit(subject_kind="table", subject=fq_table,
-                           metric="autovacuum_count", value=float(autovac_count))
+                (
+                    n_dead,
+                    n_live,
+                    autovac_count,
+                    last_autovac_age,
+                    total_mb,
+                    table_mb,
+                ) = row
+                self._emit(
+                    subject_kind="table",
+                    subject=fq_table,
+                    metric="n_dead_tup",
+                    value=float(n_dead),
+                )
+                self._emit(
+                    subject_kind="table",
+                    subject=fq_table,
+                    metric="n_live_tup",
+                    value=float(n_live),
+                )
+                self._emit(
+                    subject_kind="table",
+                    subject=fq_table,
+                    metric="autovacuum_count",
+                    value=float(autovac_count),
+                )
                 if last_autovac_age is not None:
-                    self._emit(subject_kind="table", subject=fq_table,
-                               metric="last_autovacuum_age_s",
-                               value=float(last_autovac_age))
-                self._emit(subject_kind="table", subject=fq_table,
-                           metric="total_relation_size_mb",
-                           value=float(total_mb))
-                self._emit(subject_kind="table", subject=fq_table,
-                           metric="table_size_mb", value=float(table_mb))
+                    self._emit(
+                        subject_kind="table",
+                        subject=fq_table,
+                        metric="last_autovacuum_age_s",
+                        value=float(last_autovac_age),
+                    )
+                self._emit(
+                    subject_kind="table",
+                    subject=fq_table,
+                    metric="total_relation_size_mb",
+                    value=float(total_mb),
+                )
+                self._emit(
+                    subject_kind="table",
+                    subject=fq_table,
+                    metric="table_size_mb",
+                    value=float(table_mb),
+                )
             for fq_index in self.targets.event_indexes:
                 try:
                     cur.execute(_INDEX_SIZE_SQL, (fq_index,))
@@ -232,8 +280,12 @@ class MetricsDaemon(threading.Thread):
                     continue
                 if row is None:
                     continue
-                self._emit(subject_kind="index", subject=fq_index,
-                           metric="index_size_mb", value=float(row[0]))
+                self._emit(
+                    subject_kind="index",
+                    subject=fq_index,
+                    metric="index_size_mb",
+                    value=float(row[0]),
+                )
 
             try:
                 cur.execute(_CLUSTER_SQL)
@@ -241,16 +293,43 @@ class MetricsDaemon(threading.Thread):
             except psycopg.Error:
                 row = None
             if row is not None:
-                oldest_xact_age, idle_count, oldest_idle_age = row
-                self._emit(subject_kind="cluster", subject="",
-                           metric="oldest_xact_age_s",
-                           value=float(oldest_xact_age))
-                self._emit(subject_kind="cluster", subject="",
-                           metric="idle_in_tx_count",
-                           value=float(idle_count))
-                self._emit(subject_kind="cluster", subject="",
-                           metric="oldest_idle_in_tx_age_s",
-                           value=float(oldest_idle_age))
+                (
+                    snapshot_xmin,
+                    xmin_age_s,
+                    oldest_xact_age,
+                    idle_count,
+                    oldest_idle_age,
+                ) = row
+                self._emit(
+                    subject_kind="cluster",
+                    subject="",
+                    metric="snapshot_xmin",
+                    value=float(snapshot_xmin),
+                )
+                self._emit(
+                    subject_kind="cluster",
+                    subject="",
+                    metric="xmin_age_s",
+                    value=float(xmin_age_s),
+                )
+                self._emit(
+                    subject_kind="cluster",
+                    subject="",
+                    metric="oldest_xact_age_s",
+                    value=float(oldest_xact_age),
+                )
+                self._emit(
+                    subject_kind="cluster",
+                    subject="",
+                    metric="idle_in_tx_count",
+                    value=float(idle_count),
+                )
+                self._emit(
+                    subject_kind="cluster",
+                    subject="",
+                    metric="oldest_idle_in_tx_age_s",
+                    value=float(oldest_idle_age),
+                )
 
     # ── emission helpers ───────────────────────────────────────────────
     def _emit(
@@ -282,10 +361,9 @@ class MetricsDaemon(threading.Thread):
         # Carry the detail via a separate metric+value=-1; the string goes into
         # stderr via the writer so we don't try to stuff text into float cells.
         import sys
-        print(f"[metrics] {self.system} {subject} {metric}: {detail}",
-              file=sys.stderr)
-        self._emit(subject_kind="adapter", subject=subject,
-                   metric=metric, value=-1.0)
+
+        print(f"[metrics] {self.system} {subject} {metric}: {detail}", file=sys.stderr)
+        self._emit(subject_kind="adapter", subject=subject, metric=metric, value=-1.0)
 
     def stop(self) -> None:
         self.stop_event.set()
@@ -294,6 +372,7 @@ class MetricsDaemon(threading.Thread):
 # ────────────────────────────────────────────────────────────────────────
 # Adapter stdout tailer: consumes JSONL, pushes Sample records.
 # ────────────────────────────────────────────────────────────────────────
+
 
 def parse_adapter_record(
     line: str,
@@ -306,6 +385,7 @@ def parse_adapter_record(
     """Turn one adapter JSONL line into a Sample. Returns None for non-sample
     records (descriptor, log)."""
     import json
+
     try:
         rec = json.loads(line)
     except (ValueError, TypeError):

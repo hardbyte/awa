@@ -20,6 +20,9 @@ defmodule ObanBench.LongHorizon do
   def run do
     sample_every_s = env_int("SAMPLE_EVERY_S", 10)
     producer_rate = env_int("PRODUCER_RATE", 800)
+    producer_mode = System.get_env("PRODUCER_MODE", "fixed")
+    target_depth = env_int("TARGET_DEPTH", 1000)
+    producer_rate_control_file = System.get_env("PRODUCER_RATE_CONTROL_FILE")
     worker_count = env_int("WORKER_COUNT", 32)
     work_ms = env_int("JOB_WORK_MS", 1)
     payload_bytes = env_int("JOB_PAYLOAD_BYTES", 256)
@@ -50,54 +53,109 @@ defmodule ObanBench.LongHorizon do
     :ets.insert(:long_horizon_state, {:completed, 0})
     :ets.insert(:long_horizon_state, {:work_ms, work_ms})
     :ets.insert(:long_horizon_state, {:queue_depth, 0})
+    :ets.insert(:long_horizon_state, {:producer_target_rate, producer_rate * 1.0})
     :ets.new(:long_horizon_lat, [:public, :named_table, :duplicate_bag])
 
     Oban.scale_queue(queue: @queue, limit: worker_count)
 
     padding = String.duplicate("x", max(0, payload_bytes - 32))
 
-    _producer = spawn_link(fn -> producer_loop(producer_rate, padding) end)
-    _sampler = spawn_link(fn -> sampler_loop(sample_every_s) end)
-    _depth = spawn_link(fn -> depth_loop() end)
+    _producer =
+      spawn(fn ->
+        producer_loop(producer_mode, producer_rate, target_depth, padding, producer_rate_control_file)
+      end)
+    _sampler = spawn(fn -> sampler_loop(sample_every_s) end)
+    _depth = spawn(fn -> depth_loop() end)
 
     # Block forever — the harness SIGTERMs the container.
     Process.sleep(:infinity)
   end
 
-  defp producer_loop(rate, _padding) when rate <= 0, do: :ok
+  defp producer_loop("fixed", rate, _target_depth, _padding, _control_file) when rate <= 0, do: :ok
 
-  defp producer_loop(rate, padding) do
-    period_ms = max(1, div(1000, rate))
-    producer_step(0, period_ms, padding)
+  defp producer_loop(mode, rate, target_depth, padding, control_file) do
+    producer_step(0, mode, rate, target_depth, padding, control_file)
   end
 
-  defp producer_step(seq, period_ms, padding) do
-    Process.sleep(period_ms)
+  defp producer_step(seq, mode, base_rate, target_depth, padding, control_file) do
+    should_insert =
+      case mode do
+        "depth-target" ->
+          :ets.insert(:long_horizon_state, {:producer_target_rate, 0.0})
 
-    case Oban.insert(LongHorizonWorker.new(%{seq: seq, padding: padding})) do
-      {:ok, _} -> :ets.update_counter(:long_horizon_state, :enqueued, 1)
-      _ -> :ok
+          case :ets.lookup(:long_horizon_state, :queue_depth) do
+            [{:queue_depth, depth}] when depth >= target_depth ->
+              Process.sleep(50)
+              false
+
+            _ ->
+              true
+          end
+
+        _ ->
+          current_rate = read_producer_rate(base_rate, control_file)
+          :ets.insert(:long_horizon_state, {:producer_target_rate, current_rate * 1.0})
+
+          if current_rate <= 0 do
+            Process.sleep(100)
+            false
+          else
+            Process.sleep(max(1, div(1000, current_rate)))
+            true
+          end
+      end
+
+    if not should_insert do
+      producer_step(seq, mode, base_rate, target_depth, padding, control_file)
+    else
+      result =
+        try do
+          Oban.insert(LongHorizonWorker.new(%{seq: seq, padding: padding}))
+        rescue
+          ArgumentError -> :stopping
+          RuntimeError -> :stopping
+        catch
+          :exit, _reason -> :stopping
+        end
+
+      case result do
+        {:ok, _} ->
+          :ets.update_counter(:long_horizon_state, :enqueued, 1)
+          producer_step(seq + 1, mode, base_rate, target_depth, padding, control_file)
+
+        :stopping ->
+          :ok
+
+        _ ->
+          producer_step(seq + 1, mode, base_rate, target_depth, padding, control_file)
+      end
     end
-
-    producer_step(seq + 1, period_ms, padding)
   end
 
   defp depth_loop do
     Process.sleep(1000)
 
     depth =
-      case Repo.one(
-             from(j in "oban_jobs",
-               where: j.state == "available" and j.queue == "long_horizon_bench",
-               select: count(j.id)
-             )
-           ) do
-        n when is_integer(n) -> n
-        _ -> 0
+      try do
+        case Repo.one(
+               from(j in "oban_jobs",
+                 where: j.state == "available" and j.queue == "long_horizon_bench",
+                 select: count(j.id)
+               )
+             ) do
+          n when is_integer(n) -> n
+          _ -> 0
+        end
+      catch
+        :exit, _reason -> :stopping
       end
 
-    :ets.insert(:long_horizon_state, {:queue_depth, depth})
-    depth_loop()
+    case depth do
+      :stopping -> :ok
+      value ->
+        :ets.insert(:long_horizon_state, {:queue_depth, value})
+        depth_loop()
+    end
   end
 
   defp sampler_loop(sample_every_s) do
@@ -114,6 +172,9 @@ defmodule ObanBench.LongHorizon do
     [{:enqueued, enq}] = :ets.lookup(:long_horizon_state, :enqueued)
     [{:completed, cmp}] = :ets.lookup(:long_horizon_state, :completed)
     [{:queue_depth, depth}] = :ets.lookup(:long_horizon_state, :queue_depth)
+    [{:producer_target_rate, producer_target_rate}] =
+      :ets.lookup(:long_horizon_state, :producer_target_rate)
+
     now_ms = System.monotonic_time(:millisecond)
     dt_s = max(0.001, (now_ms - last_tick_ms) / 1000.0)
     enq_rate = (enq - last_enq) / dt_s
@@ -129,7 +190,8 @@ defmodule ObanBench.LongHorizon do
         {"claim_p99_ms", p99, 30},
         {"enqueue_rate", enq_rate, sample_every_s},
         {"completion_rate", cmp_rate, sample_every_s},
-        {"queue_depth", depth * 1.0, 0}
+        {"queue_depth", depth * 1.0, 0},
+        {"producer_target_rate", producer_target_rate, 0}
       ],
       fn {name, value, window_s} ->
         emit(%{
@@ -188,6 +250,21 @@ defmodule ObanBench.LongHorizon do
     case System.get_env(key) do
       nil -> default
       val -> String.to_integer(val)
+    end
+  end
+
+  defp read_producer_rate(default, nil), do: default
+
+  defp read_producer_rate(default, path) do
+    case File.read(path) do
+      {:ok, contents} ->
+        case Float.parse(String.trim(contents)) do
+          {value, _} when value >= 0 -> trunc(value)
+          _ -> default
+        end
+
+      _ ->
+        default
     end
   end
 end

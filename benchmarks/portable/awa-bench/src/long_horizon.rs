@@ -120,6 +120,17 @@ fn env_string(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
 }
 
+fn read_producer_rate(default: u64) -> u64 {
+    let Some(path) = std::env::var("PRODUCER_RATE_CONTROL_FILE").ok() else {
+        return default;
+    };
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<f64>().ok())
+        .map(|value| value.max(0.0) as u64)
+        .unwrap_or(default)
+}
+
 fn now_iso_ms() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -157,6 +168,8 @@ fn emit_descriptor(db_name: &str) {
 pub async fn run() {
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
     let producer_rate = env_u64("PRODUCER_RATE", 800);
+    let producer_mode = env_string("PRODUCER_MODE", "fixed");
+    let target_depth = env_u64("TARGET_DEPTH", 1000);
     let worker_count = env_u32("WORKER_COUNT", 32);
     let payload_bytes = env_u64("JOB_PAYLOAD_BYTES", 256);
     let work_ms = env_u64("JOB_WORK_MS", 1);
@@ -187,6 +200,7 @@ pub async fn run() {
     let completed = Arc::new(AtomicU64::new(0));
     let enqueued = Arc::new(AtomicU64::new(0));
     let queue_depth = Arc::new(AtomicU64::new(0));
+    let producer_target_rate = Arc::new(AtomicU64::new(producer_rate));
 
     let worker = LongHorizonWorker {
         work_ms,
@@ -214,20 +228,32 @@ pub async fn run() {
     let producer_pool = pool.clone();
     let producer_shutdown = Arc::clone(&shutdown);
     let producer_enqueued = Arc::clone(&enqueued);
+    let producer_queue_depth = Arc::clone(&queue_depth);
+    let producer_target_rate_metric = Arc::clone(&producer_target_rate);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_handle = tokio::spawn(async move {
-        // Convert rate to a uniform tick. Bursty patterns skew tail latency
-        // measurement; prefer a smooth drip.
-        let period_ns = if producer_rate > 0 {
-            1_000_000_000 / producer_rate
-        } else {
-            return;
-        };
-        let mut ticker = interval_at(tokio::time::Instant::now(), Duration::from_nanos(period_ns));
-        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut seq: i64 = 0;
+        let mut next_tick = tokio::time::Instant::now();
         while !producer_shutdown.load(Ordering::Relaxed) {
-            ticker.tick().await;
+            if producer_mode == "depth-target" {
+                producer_target_rate_metric.store(0, Ordering::Relaxed);
+                if producer_queue_depth.load(Ordering::Relaxed) >= target_depth {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    continue;
+                }
+                next_tick = tokio::time::Instant::now();
+            } else {
+                let current_rate = read_producer_rate(producer_rate);
+                producer_target_rate_metric.store(current_rate, Ordering::Relaxed);
+                if current_rate == 0 {
+                    next_tick = tokio::time::Instant::now();
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                let period = Duration::from_secs_f64(1.0 / current_rate as f64);
+                next_tick = std::cmp::max(next_tick + period, tokio::time::Instant::now());
+                tokio::time::sleep_until(next_tick).await;
+            }
             let args = LongHorizonJob {
                 seq,
                 padding: padding.clone(),
@@ -281,6 +307,7 @@ pub async fn run() {
     let sample_completed = Arc::clone(&completed);
     let sample_depth = Arc::clone(&queue_depth);
     let sample_latencies = Arc::clone(&latencies);
+    let sample_target_rate = Arc::clone(&producer_target_rate);
     let sample_handle = tokio::spawn(async move {
         // Align first tick to the next wall-clock `sample_every_s` boundary.
         let now_epoch = SystemTime::now()
@@ -322,6 +349,7 @@ pub async fn run() {
                     .unwrap_or((0.0, 0.0, 0.0))
             };
             let depth = sample_depth.load(Ordering::Relaxed) as f64;
+            let target_rate = sample_target_rate.load(Ordering::Relaxed) as f64;
             let ts = now_iso_ms();
 
             for (metric, value, window_s) in [
@@ -331,6 +359,7 @@ pub async fn run() {
                 ("enqueue_rate", enq_rate, sample_every_s as f64),
                 ("completion_rate", cmp_rate, sample_every_s as f64),
                 ("queue_depth", depth, 0.0),
+                ("producer_target_rate", target_rate, 0.0),
             ] {
                 emit(json!({
                     "t": ts,
@@ -383,5 +412,5 @@ pub async fn run() {
         let _ = sample_handle.await;
     })
     .await;
-    client.shutdown(Duration::from_secs(5)).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), client.shutdown(Duration::from_secs(3))).await;
 }

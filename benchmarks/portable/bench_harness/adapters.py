@@ -16,7 +16,7 @@ import json
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
@@ -60,13 +60,34 @@ class LaunchSpec:
     argv: list[str]
     env: dict[str, str]
     cwd: str | None = None
+    mounts: list[tuple[str, str]] = field(default_factory=list)
 
 
 Builder = Callable[[bool], None]
 Launcher = Callable[[AdapterManifest, dict[str, str]], LaunchSpec]
 
 
+def _cargo_target_dir(manifest_path: Path) -> Path:
+    proc = subprocess.run(
+        [
+            "cargo",
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            str(manifest_path),
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    data = json.loads(proc.stdout)
+    return Path(data["target_directory"])
+
+
 # ─── Build functions ─────────────────────────────────────────────────────
+
 
 def build_awa(skip: bool) -> None:
     if skip:
@@ -138,24 +159,33 @@ def build_oban(skip: bool) -> None:
 
 # ─── Launch specs ────────────────────────────────────────────────────────
 
+
 def _base_env(manifest: AdapterManifest, overrides: dict[str, str]) -> dict[str, str]:
     env = {
         "DATABASE_URL": pg_url(manifest.db_name),
         "SCENARIO": "long_horizon",
         "PRODUCER_MODE": "fixed",
         "PRODUCER_RATE": "800",
+        "TARGET_DEPTH": "1000",
         "WORKER_COUNT": "32",
         "JOB_PAYLOAD_BYTES": "256",
         "JOB_WORK_MS": "1",
         "SAMPLE_EVERY_S": "10",
     }
-    env.update(overrides)
+    env.update(
+        {
+            key: value
+            for key, value in overrides.items()
+            if not key.endswith("_HOST") and not key.endswith("_CONTAINER")
+        }
+    )
     return env
 
 
 def launch_awa(manifest: AdapterManifest, overrides: dict[str, str]) -> LaunchSpec:
+    target_dir = _cargo_target_dir(SCRIPT_DIR / "awa-bench" / "Cargo.toml")
     return LaunchSpec(
-        argv=[str(SCRIPT_DIR / "awa-bench" / "target" / "release" / "awa-bench")],
+        argv=[str(target_dir / "release" / "awa-bench")],
         env=_base_env(manifest, overrides),
     )
 
@@ -166,12 +196,22 @@ def _docker_launch(
     overrides: dict[str, str],
 ) -> LaunchSpec:
     env = _base_env(manifest, overrides)
+    mounts: list[tuple[str, str]] = []
+    host_control = overrides.get("PRODUCER_RATE_CONTROL_FILE_HOST")
+    container_control = overrides.get("PRODUCER_RATE_CONTROL_FILE_CONTAINER")
+    if host_control and container_control:
+        host_dir = str(Path(host_control).parent)
+        container_dir = str(Path(container_control).parent)
+        mounts.append((host_dir, container_dir))
+        env["PRODUCER_RATE_CONTROL_FILE"] = container_control
     # Docker containers reach PG via host networking.
     argv = ["docker", "run", "--rm", "--network", "host"]
+    for host_path, container_path in mounts:
+        argv.extend(["-v", f"{host_path}:{container_path}"])
     for k, v in env.items():
         argv.extend(["-e", f"{k}={v}"])
     argv.append(image)
-    return LaunchSpec(argv=argv, env={})
+    return LaunchSpec(argv=argv, env={}, mounts=mounts)
 
 
 def launch_awa_docker(manifest, overrides):
@@ -195,6 +235,7 @@ def launch_oban(manifest, overrides):
 
 
 # ─── Registry ────────────────────────────────────────────────────────────
+
 
 @dataclass
 class AdapterEntry:

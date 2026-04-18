@@ -29,6 +29,7 @@ from .sample import RAW_CSV_HEADER, Sample
 # raw.csv
 # ────────────────────────────────────────────────────────────────────────
 
+
 class RawCsvWriter:
     """Append-only writer for raw.csv. Safe to call from the orchestrator
     consumer thread — not thread-safe on its own."""
@@ -60,6 +61,7 @@ class RawCsvWriter:
 # ────────────────────────────────────────────────────────────────────────
 # summary.json
 # ────────────────────────────────────────────────────────────────────────
+
 
 def _median(values: list[float]) -> float | None:
     if not values:
@@ -110,10 +112,13 @@ def compute_summary(
         if phase is None or not PHASE_INCLUDED_IN_SUMMARY.get(phase.type, True):
             continue
         sys_block = out_systems.setdefault(system, {"phases": {}})
-        phase_block = sys_block["phases"].setdefault(label, {
-            "phase_type": phase.type.value,
-            "metrics": {},
-        })
+        phase_block = sys_block["phases"].setdefault(
+            label,
+            {
+                "phase_type": phase.type.value,
+                "metrics": {},
+            },
+        )
         key = metric if not subject else f"{metric}@{subject}"
         phase_block["metrics"][key] = {
             "median": _median(values),
@@ -148,11 +153,47 @@ def compute_summary(
                 clean_label=prev_clean.label if prev_clean else None,
             )
             if rec:
-                target = out_systems[system]["phases"].setdefault(phase.label, {
-                    "phase_type": phase.type.value,
-                    "metrics": {},
-                })
+                target = out_systems[system]["phases"].setdefault(
+                    phase.label,
+                    {
+                        "phase_type": phase.type.value,
+                        "metrics": {},
+                    },
+                )
                 target.update(rec)
+
+    for system, system_block in out_systems.items():
+        for phase_label, phase_block in system_block["phases"].items():
+            dead_tup = _phase_summed_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="n_dead_tup",
+                subject_kind="table",
+            )
+            claim_p99 = _phase_metric_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="claim_p99_ms",
+                subject_kind="adapter",
+            )
+            throughput = _phase_metric_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="completion_rate",
+                subject_kind="adapter",
+            )
+            phase_block["peak_dead_tup"] = _peak(dead_tup)
+            phase_block["median_dead_tup"] = _median(dead_tup)
+            phase_block["median_claim_p99_ms"] = _median(claim_p99)
+            phase_block["median_throughput_per_s"] = _median(throughput)
+            phase_block["autovacuum_count_delta"] = _autovacuum_count_delta(
+                rows,
+                system=system,
+                phase_label=phase_label,
+            )
 
     return {
         "run_id": run_id,
@@ -175,12 +216,16 @@ def _recovery_stats(
 ) -> dict | None:
     """recovery_halflife_s = time until n_dead_tup <= 0.1 * peak_idle.
     recovery_to_baseline_s = time until within 10% of median_clean."""
+
     def sum_by_elapsed(phase: str) -> list[tuple[float, float]]:
         per_elapsed: dict[float, float] = {}
         for r in rows:
-            if (r["system"] == system and r["phase_label"] == phase
-                    and r["metric"] == "n_dead_tup"
-                    and r["subject_kind"] == "table"):
+            if (
+                r["system"] == system
+                and r["phase_label"] == phase
+                and r["metric"] == "n_dead_tup"
+                and r["subject_kind"] == "table"
+            ):
                 try:
                     t = float(r["elapsed_s"])
                     v = float(r["value"])
@@ -223,6 +268,82 @@ def _recovery_stats(
     }
 
 
+def _phase_metric_values(
+    rows: list[dict],
+    *,
+    system: str,
+    phase_label: str,
+    metric: str,
+    subject_kind: str | None = None,
+) -> list[float]:
+    values: list[float] = []
+    for row in rows:
+        if (
+            row["system"] != system
+            or row["phase_label"] != phase_label
+            or row["metric"] != metric
+        ):
+            continue
+        if subject_kind and row["subject_kind"] != subject_kind:
+            continue
+        try:
+            values.append(float(row["value"]))
+        except (TypeError, ValueError):
+            continue
+    return values
+
+
+def _phase_summed_values(
+    rows: list[dict],
+    *,
+    system: str,
+    phase_label: str,
+    metric: str,
+    subject_kind: str,
+) -> list[float]:
+    per_elapsed: dict[float, float] = {}
+    for row in rows:
+        if (
+            row["system"] != system
+            or row["phase_label"] != phase_label
+            or row["metric"] != metric
+        ):
+            continue
+        if row["subject_kind"] != subject_kind:
+            continue
+        try:
+            elapsed_s = float(row["elapsed_s"])
+            value = float(row["value"])
+        except (TypeError, ValueError):
+            continue
+        per_elapsed[elapsed_s] = per_elapsed.get(elapsed_s, 0.0) + value
+    return list(per_elapsed.values())
+
+
+def _autovacuum_count_delta(
+    rows: list[dict], *, system: str, phase_label: str
+) -> float | None:
+    per_subject: dict[str, list[float]] = {}
+    for row in rows:
+        if (
+            row["system"] != system
+            or row["phase_label"] != phase_label
+            or row["metric"] != "autovacuum_count"
+        ):
+            continue
+        if row["subject_kind"] != "table":
+            continue
+        try:
+            value = float(row["value"])
+        except (TypeError, ValueError):
+            continue
+        per_subject.setdefault(row["subject"], []).append(value)
+    deltas = [
+        values[-1] - values[0] for values in per_subject.values() if len(values) >= 2
+    ]
+    return float(sum(deltas)) if deltas else None
+
+
 def write_summary(summary: dict, path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
@@ -233,10 +354,15 @@ def write_summary(summary: dict, path: Path) -> None:
 # manifest.json
 # ────────────────────────────────────────────────────────────────────────
 
+
 def _safe_cmd(cmd: list[str]) -> str | None:
     try:
         out = subprocess.run(
-            cmd, capture_output=True, text=True, timeout=10, check=False,
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
         )
         return out.stdout.strip() or None
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
@@ -246,12 +372,20 @@ def _safe_cmd(cmd: list[str]) -> str | None:
 def capture_pg_env(database_url: str) -> dict:
     """Connect to PG and pull version + relevant config settings."""
     import psycopg
+
     settings_of_interest = [
-        "shared_buffers", "work_mem", "maintenance_work_mem",
-        "autovacuum", "autovacuum_naptime", "autovacuum_vacuum_cost_delay",
-        "autovacuum_vacuum_cost_limit", "autovacuum_vacuum_scale_factor",
-        "autovacuum_analyze_scale_factor", "max_connections",
-        "synchronous_commit", "wal_level",
+        "shared_buffers",
+        "work_mem",
+        "maintenance_work_mem",
+        "autovacuum",
+        "autovacuum_naptime",
+        "autovacuum_vacuum_cost_delay",
+        "autovacuum_vacuum_cost_limit",
+        "autovacuum_vacuum_scale_factor",
+        "autovacuum_analyze_scale_factor",
+        "max_connections",
+        "synchronous_commit",
+        "wal_level",
     ]
     try:
         with psycopg.connect(database_url, autocommit=True) as conn:
@@ -272,6 +406,7 @@ def capture_pg_env(database_url: str) -> dict:
 def capture_host_env() -> dict:
     try:
         import multiprocessing
+
         cpu_count = multiprocessing.cpu_count()
     except Exception:
         cpu_count = None
@@ -330,6 +465,7 @@ def write_manifest(manifest: dict, path: Path) -> None:
 # ────────────────────────────────────────────────────────────────────────
 # README for the results directory
 # ────────────────────────────────────────────────────────────────────────
+
 
 def write_run_readme(path: Path, *, scenario: str | None, phases: list[Phase]) -> None:
     phase_desc = " → ".join(
