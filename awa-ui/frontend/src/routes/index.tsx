@@ -353,13 +353,20 @@ export function DashboardPage() {
                       }
                     >
                       <TableCell className="font-medium">
-                        <Link
-                          to="/queues/$name"
-                          params={{ name: q.queue }}
-                          className="text-primary no-underline hover:underline"
-                      >
-                          {q.queue}
-                        </Link>
+                        <div>
+                          <Link
+                            to="/queues/$name"
+                            params={{ name: q.queue }}
+                            className="text-primary no-underline hover:underline"
+                          >
+                            {q.display_name ?? q.queue}
+                          </Link>
+                          {q.display_name && (
+                            <div className="text-xs font-normal text-muted-fg">
+                              {q.queue}
+                            </div>
+                          )}
+                        </div>
                       </TableCell>
                       <TableCell>{q.total_queued.toLocaleString()}</TableCell>
                       <TableCell>{q.scheduled.toLocaleString()}</TableCell>

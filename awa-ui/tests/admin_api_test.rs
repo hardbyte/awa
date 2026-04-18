@@ -51,6 +51,12 @@ async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
             .await
             .expect("failed to clean queue meta");
 
+        sqlx::query("DELETE FROM awa.queue_descriptors WHERE queue = ANY($1)")
+            .bind(queues)
+            .execute(pool)
+            .await
+            .expect("failed to clean queue descriptors");
+
         sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = ANY($1)")
             .bind(queues)
             .execute(pool)
@@ -467,6 +473,80 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
             .and_then(Value::as_f64)
             .unwrap_or(0.0)
             > 0.0
+    );
+}
+
+#[tokio::test]
+async fn test_queues_endpoint_surfaces_descriptors_for_declared_empty_queue() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_queue_descriptor_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new()
+                .display_name("Billing")
+                .description("Invoice and payment processing")
+                .owner("finance-platform")
+                .docs_url("https://example.test/billing")
+                .tag("critical"),
+        }],
+    )
+    .await
+    .expect("descriptor sync should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, "/api/queues").await;
+    let queue_stats = payload
+        .as_array()
+        .expect("queues payload should be an array")
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue.as_str()))
+        .expect("declared queue should be present");
+
+    assert_eq!(
+        queue_stats.get("display_name").and_then(Value::as_str),
+        Some("Billing")
+    );
+    assert_eq!(
+        queue_stats.get("description").and_then(Value::as_str),
+        Some("Invoice and payment processing")
+    );
+    assert_eq!(
+        queue_stats.get("owner").and_then(Value::as_str),
+        Some("finance-platform")
+    );
+    assert_eq!(
+        queue_stats.get("docs_url").and_then(Value::as_str),
+        Some("https://example.test/billing")
+    );
+    assert_eq!(
+        queue_stats.get("total_queued").and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        queue_stats
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let detail = get_json(&app, &format!("/api/queues/{queue}")).await;
+    assert_eq!(
+        detail.get("queue").and_then(Value::as_str),
+        Some(queue.as_str())
+    );
+    assert_eq!(
+        detail.get("display_name").and_then(Value::as_str),
+        Some("Billing")
     );
 }
 

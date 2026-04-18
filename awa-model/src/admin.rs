@@ -477,10 +477,182 @@ where
     Ok(result.rows_affected())
 }
 
-/// Queue statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct QueueStats {
+/// Code-declared, operator-facing descriptor for a queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueDescriptor {
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub docs_url: Option<String>,
+    pub tags: Vec<String>,
+    pub extra: serde_json::Value,
+}
+
+impl Default for QueueDescriptor {
+    fn default() -> Self {
+        Self {
+            display_name: None,
+            description: None,
+            owner: None,
+            docs_url: None,
+            tags: Vec::new(),
+            extra: serde_json::json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NamedQueueDescriptor {
     pub queue: String,
+    #[serde(flatten)]
+    pub descriptor: QueueDescriptor,
+}
+
+/// Upsert queue descriptors declared by the worker runtime.
+///
+/// Descriptor rows are part of the control-plane catalog and intentionally
+/// separate from mutable queue runtime state in `awa.queue_meta`.
+pub async fn sync_queue_descriptors(
+    pool: &PgPool,
+    descriptors: &[NamedQueueDescriptor],
+) -> Result<(), AwaError> {
+    for named in descriptors {
+        let hash = named.descriptor.descriptor_hash();
+        sqlx::query(
+            r#"
+            INSERT INTO awa.queue_descriptors (
+                queue,
+                display_name,
+                description,
+                owner,
+                docs_url,
+                tags,
+                extra,
+                descriptor_hash,
+                created_at,
+                updated_at,
+                last_seen_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now(), now())
+            ON CONFLICT (queue) DO UPDATE SET
+                display_name = EXCLUDED.display_name,
+                description = EXCLUDED.description,
+                owner = EXCLUDED.owner,
+                docs_url = EXCLUDED.docs_url,
+                tags = EXCLUDED.tags,
+                extra = EXCLUDED.extra,
+                descriptor_hash = EXCLUDED.descriptor_hash,
+                updated_at = CASE
+                    WHEN awa.queue_descriptors.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash
+                    THEN now()
+                    ELSE awa.queue_descriptors.updated_at
+                END,
+                last_seen_at = now()
+            "#,
+        )
+        .bind(&named.queue)
+        .bind(named.descriptor.display_name.as_deref())
+        .bind(named.descriptor.description.as_deref())
+        .bind(named.descriptor.owner.as_deref())
+        .bind(named.descriptor.docs_url.as_deref())
+        .bind(&named.descriptor.tags)
+        .bind(&named.descriptor.extra)
+        .bind(&hash)
+        .execute(pool)
+        .await?;
+    }
+
+    Ok(())
+}
+
+impl QueueDescriptor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    pub fn docs_url(mut self, docs_url: impl Into<String>) -> Self {
+        self.docs_url = Some(docs_url.into());
+        self
+    }
+
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    pub fn extra(mut self, extra: serde_json::Value) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn descriptor_hash(&self) -> String {
+        let payload = serde_json::json!({
+            "display_name": self.display_name,
+            "description": self.description,
+            "owner": self.owner,
+            "docs_url": self.docs_url,
+            "tags": self.tags,
+            "extra": canonicalize_json(&self.extra),
+        });
+        let encoded = serde_json::to_vec(&payload)
+            .expect("queue descriptor JSON serialization should not fail");
+        hex::encode(blake3::hash(&encoded).as_bytes())
+    }
+}
+
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for key in keys {
+                if let Some(child) = map.get(&key) {
+                    out.insert(key, canonicalize_json(child));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct QueueOverview {
+    pub queue: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub docs_url: Option<String>,
+    pub tags: Vec<String>,
+    pub extra: serde_json::Value,
     /// All non-terminal jobs for the queue, including running and waiting_external.
     pub total_queued: i64,
     pub scheduled: i64,
@@ -876,7 +1048,7 @@ where
     Ok(summaries)
 }
 
-/// Get statistics for all queues.
+/// Get queue overviews for all known queues.
 ///
 /// Hybrid read: per-state counts come from the `queue_state_counts`
 /// cache table (eventually consistent, ~2s lag), while `lag_seconds`
@@ -888,28 +1060,18 @@ where
 ///
 /// For exact cached counts in tests without a running maintenance
 /// leader, call `flush_dirty_admin_metadata()` first.
-pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
+pub async fn queue_overviews<'e, E>(executor: E) -> Result<Vec<QueueOverview>, AwaError>
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            Option<f64>,
-            bool,
-        ),
-    >(
+    let rows = sqlx::query_as::<_, QueueOverview>(
         r#"
-        WITH available_lag AS (
+        WITH all_queues AS (
+            SELECT queue FROM awa.queue_state_counts
+            UNION
+            SELECT queue FROM awa.queue_descriptors
+        ),
+        available_lag AS (
             SELECT
                 queue,
                 EXTRACT(EPOCH FROM (now() - min(run_at)))::float8 AS lag_seconds
@@ -927,57 +1089,48 @@ where
             GROUP BY queue
         )
         SELECT
-            qs.queue,
-            qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external AS total_queued,
-            qs.scheduled,
-            qs.available,
-            qs.retryable,
-            qs.running,
-            qs.failed,
-            qs.waiting_external,
+            q.queue,
+            qd.display_name,
+            qd.description,
+            qd.owner,
+            qd.docs_url,
+            COALESCE(qd.tags, ARRAY[]::text[]) AS tags,
+            COALESCE(qd.extra, '{}'::jsonb) AS extra,
+            COALESCE(qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external, 0) AS total_queued,
+            COALESCE(qs.scheduled, 0) AS scheduled,
+            COALESCE(qs.available, 0) AS available,
+            COALESCE(qs.retryable, 0) AS retryable,
+            COALESCE(qs.running, 0) AS running,
+            COALESCE(qs.failed, 0) AS failed,
+            COALESCE(qs.waiting_external, 0) AS waiting_external,
             COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
             al.lag_seconds,
             COALESCE(qm.paused, FALSE) AS paused
-        FROM awa.queue_state_counts qs
-        LEFT JOIN available_lag al ON al.queue = qs.queue
-        LEFT JOIN completed_recent cr ON cr.queue = qs.queue
-        LEFT JOIN awa.queue_meta qm ON qm.queue = qs.queue
-        ORDER BY qs.queue
+        FROM all_queues q
+        LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue
+        LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
+        LEFT JOIN available_lag al ON al.queue = q.queue
+        LEFT JOIN completed_recent cr ON cr.queue = q.queue
+        LEFT JOIN awa.queue_meta qm ON qm.queue = q.queue
+        ORDER BY q.queue
         "#,
     )
     .fetch_all(executor)
     .await?;
 
-    Ok(rows
-        .into_iter()
-        .map(
-            |(
-                queue,
-                total_queued,
-                scheduled,
-                available,
-                retryable,
-                running,
-                failed,
-                waiting_external,
-                completed_last_hour,
-                lag_seconds,
-                paused,
-            )| QueueStats {
-                queue,
-                total_queued,
-                scheduled,
-                available,
-                retryable,
-                running,
-                failed,
-                waiting_external,
-                completed_last_hour,
-                lag_seconds,
-                paused,
-            },
-        )
-        .collect())
+    Ok(rows)
+}
+
+/// Get one queue overview by name.
+pub async fn queue_overview<'e, E>(
+    executor: E,
+    queue: &str,
+) -> Result<Option<QueueOverview>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = queue_overviews(executor).await?;
+    Ok(rows.into_iter().find(|row| row.queue == queue))
 }
 
 /// List jobs with optional filters.

@@ -6,8 +6,8 @@ use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
 use awa_model::admin::{
-    self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
-    RuntimeSnapshotInput,
+    self, NamedQueueDescriptor, QueueDescriptor, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
+    QueueRuntimeSnapshot, RateLimitSnapshot, RuntimeSnapshotInput,
 };
 use awa_model::{JobArgs, PeriodicJob};
 use chrono::{DateTime, Utc};
@@ -29,6 +29,8 @@ use uuid::Uuid;
 pub enum BuildError {
     #[error("at least one queue must be configured")]
     NoQueuesConfigured,
+    #[error("queue descriptor declared for unknown queue '{queue}'")]
+    QueueDescriptorWithoutQueue { queue: String },
     #[error("sum of min_workers ({total_min}) exceeds global_max_workers ({global_max})")]
     MinWorkersExceedGlobal { total_min: u32, global_max: u32 },
     #[error("rate_limit max_rate must be > 0.0")]
@@ -78,6 +80,7 @@ pub enum QueueCapacity {
 pub struct ClientBuilder {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
+    queue_descriptors: HashMap<String, QueueDescriptor>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
@@ -105,6 +108,7 @@ impl ClientBuilder {
         Self {
             pool,
             queues: Vec::new(),
+            queue_descriptors: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
             state: HashMap::new(),
@@ -131,6 +135,16 @@ impl ClientBuilder {
     /// Add a queue with its configuration.
     pub fn queue(mut self, name: impl Into<String>, config: QueueConfig) -> Self {
         self.queues.push((name.into(), config));
+        self
+    }
+
+    /// Attach a control-plane descriptor to a declared queue.
+    pub fn queue_descriptor(
+        mut self,
+        name: impl Into<String>,
+        descriptor: QueueDescriptor,
+    ) -> Self {
+        self.queue_descriptors.insert(name.into(), descriptor);
         self
     }
 
@@ -365,6 +379,14 @@ impl ClientBuilder {
             return Err(BuildError::NoQueuesConfigured);
         }
 
+        for queue in self.queue_descriptors.keys() {
+            if !self.queues.iter().any(|(name, _)| name == queue) {
+                return Err(BuildError::QueueDescriptorWithoutQueue {
+                    queue: queue.clone(),
+                });
+            }
+        }
+
         // Validate rate limits and weights
         for (_, config) in &self.queues {
             if let Some(rl) = &config.rate_limit {
@@ -437,6 +459,7 @@ impl ClientBuilder {
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
+            queue_descriptors: self.queue_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             state: Arc::new(self.state),
@@ -514,6 +537,7 @@ where
 pub struct Client {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
+    queue_descriptors: HashMap<String, QueueDescriptor>,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
@@ -586,6 +610,20 @@ impl Client {
         ClientBuilder::new(pool)
     }
 
+    fn declared_queue_descriptors(&self) -> Vec<NamedQueueDescriptor> {
+        self.queues
+            .iter()
+            .map(|(queue, _)| NamedQueueDescriptor {
+                queue: queue.clone(),
+                descriptor: self
+                    .queue_descriptors
+                    .get(queue)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
     fn runtime_reporter_state(&self) -> RuntimeReporterState {
         RuntimeReporterState {
             pool: self.pool.clone(),
@@ -619,6 +657,8 @@ impl Client {
             workers = self.workers.len(),
             "Starting Awa worker runtime"
         );
+
+        admin::sync_queue_descriptors(&self.pool, &self.declared_queue_descriptors()).await?;
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -898,6 +938,41 @@ impl Client {
             leader,
             queues,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn lazy_pool() -> PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .expect("lazy pool should build")
+    }
+
+    #[tokio::test]
+    async fn queue_descriptor_requires_declared_queue() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::QueueDescriptorWithoutQueue { queue }) if queue == "billing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_descriptor_allows_declared_queue() {
+        let result = Client::builder(lazy_pool())
+            .queue("billing", QueueConfig::default())
+            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
+            .build();
+
+        assert!(result.is_ok(), "descriptor for declared queue should build");
     }
 }
 

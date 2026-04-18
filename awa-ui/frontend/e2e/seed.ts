@@ -34,6 +34,7 @@ export default async function globalSetup() {
     -- Clean up any previous E2E data
     DELETE FROM awa.jobs WHERE queue = 'e2e_test';
     DELETE FROM awa.queue_meta WHERE queue = 'e2e_test';
+    DELETE FROM awa.queue_descriptors WHERE queue = 'e2e_test';
 
     -- Available jobs
     INSERT INTO awa.jobs (kind, queue, state, args, priority, max_attempts, tags)
