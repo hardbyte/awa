@@ -29,6 +29,38 @@ def database_url() -> str:
     return url
 
 
+async def migrate_with_retry(c, *, attempts: int = 4, base_delay: float = 0.5) -> None:
+    """Run c.migrate() with retry on transient lock errors.
+
+    The chaos harness can leave Postgres backends from previously SIGKILL'd
+    worker containers holding session-scoped advisory locks (AWA_MIGR) and
+    AccessExclusive locks on awa.* cache tables for a brief window. The next
+    container's migrate() then races those leftovers and Postgres returns
+    40P01 (deadlock detected) or a lock_timeout-style failure. The migration
+    is idempotent, so retrying with backoff is safe.
+    """
+    last_exc: BaseException | None = None
+    for attempt in range(attempts):
+        try:
+            await c.migrate()
+            return
+        except (
+            Exception
+        ) as exc:  # awa.DatabaseError surfaces as a generic Exception via PyO3
+            msg = str(exc)
+            if "deadlock detected" not in msg and "lock_not_available" not in msg:
+                raise
+            last_exc = exc
+            delay = base_delay * (2**attempt)
+            print(
+                f"[awa-python] migrate() transient lock failure (attempt {attempt + 1}/{attempts}): {msg}; retrying in {delay:.1f}s",
+                file=sys.stderr,
+            )
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 def env_int(key: str, default: int) -> int:
     value = os.environ.get(key)
     return int(value) if value is not None else default
@@ -121,7 +153,7 @@ async def enqueue_batch(c: awa.AsyncClient, queue: str, count: int) -> None:
 
 async def scenario_enqueue_throughput(job_count: int) -> dict:
     c = client()
-    await c.migrate()
+    await migrate_with_retry(c)
     queue = "awa_python_enqueue_bench"
     await clean_queue(c, queue)
 
@@ -144,7 +176,7 @@ async def scenario_enqueue_throughput(job_count: int) -> dict:
 
 async def scenario_worker_throughput(job_count: int, worker_count: int) -> dict:
     c = client()
-    await c.migrate()
+    await migrate_with_retry(c)
     queue = "awa_python_worker_bench"
     await clean_queue(c, queue)
     await enqueue_batch(c, queue, job_count)
@@ -174,7 +206,7 @@ async def scenario_worker_throughput(job_count: int, worker_count: int) -> dict:
 
 async def scenario_pickup_latency(iterations: int, worker_count: int) -> dict:
     c = client()
-    await c.migrate()
+    await migrate_with_retry(c)
     queue = "awa_python_latency_bench"
     await clean_queue(c, queue)
 
@@ -215,14 +247,14 @@ async def scenario_pickup_latency(iterations: int, worker_count: int) -> dict:
 
 async def scenario_migrate_only() -> None:
     c = client()
-    await c.migrate()
+    await migrate_with_retry(c)
     await c.close()
     print("[awa-python] Migrations complete.", file=sys.stderr)
 
 
 async def scenario_worker_only() -> None:
     c = client()
-    await c.migrate()
+    await migrate_with_retry(c)
 
     worker_count = env_int("WORKER_COUNT", 10)
     job_duration_ms = env_int("JOB_DURATION_MS", 30000)
@@ -281,7 +313,7 @@ async def scenario_long_horizon() -> None:
     work_ms = env_int("JOB_WORK_MS", 1)
 
     c = client()
-    await c.migrate()
+    await migrate_with_retry(c)
     queue = "awa_python_longhorizon_bench"
     db_name = database_url().rsplit("/", 1)[-1]
 

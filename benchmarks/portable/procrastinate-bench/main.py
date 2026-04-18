@@ -57,12 +57,12 @@ app = procrastinate.App(
 )
 
 
-@app.task(queue="portable_default")
+@app.task(queue="portable_default", name="bench_job")
 async def bench_job(seq: int) -> None:
     return None
 
 
-@app.task(queue="chaos")
+@app.task(queue="chaos", name="chaos_job")
 async def chaos_job(seq: int) -> None:
     await asyncio.sleep(env_int("JOB_DURATION_MS", 30000) / 1000.0)
 
@@ -504,6 +504,25 @@ def _percentiles(events, *, window_s: float, now: float):
     return q(0.50), q(0.95), q(0.99)
 
 
+async def ensure_schema_applied() -> None:
+    """Apply procrastinate's schema only if not already present.
+
+    procrastinate.SchemaManager.apply_schema_async() is not idempotent — it
+    issues raw CREATE TYPE / CREATE TABLE without IF NOT EXISTS, so a second
+    invocation crashes with DuplicateObject. We therefore probe for the core
+    table first and skip if it exists. Without this guard a worker container
+    started after the migrate_only container would die before processing
+    any jobs (silent worker crash → 100% job loss in chaos scenarios).
+    """
+    async with await connect() as conn:
+        async with conn.cursor() as cur:
+            await cur.execute("SELECT to_regclass('public.procrastinate_jobs')")
+            row = await cur.fetchone()
+    if row and row[next(iter(row))] is not None:
+        return
+    await app.schema_manager.apply_schema_async()
+
+
 async def main() -> None:
     scenario = os.environ.get("SCENARIO", "all")
     job_count = env_int("JOB_COUNT", 10000)
@@ -511,7 +530,7 @@ async def main() -> None:
     latency_iterations = env_int("LATENCY_ITERATIONS", 100)
 
     async with app.open_async():
-        await app.schema_manager.apply_schema_async()
+        await ensure_schema_applied()
         if scenario == "migrate_only":
             await scenario_migrate_only()
             return

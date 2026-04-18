@@ -142,10 +142,29 @@ def stop_postgres():
 
 
 def reset_db(db: str):
-    # Drop both public and awa schemas (Awa uses awa.*, River/Oban use public.*)
+    # Force-terminate any backend still attached to this database before dropping
+    # schemas. Without this, lingering Postgres backends from a chaos worker
+    # container that was just SIGKILL'd (Docker tears the container down
+    # asynchronously) hold RowShareLocks on procrastinate_jobs / awa.* and
+    # deadlock with the cascade's AccessExclusiveLock acquisition. Mirrors
+    # bench_harness/orchestrator.py's preflight pattern.
+    psql(
+        "postgres",
+        f"""
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = '{db}' AND pid <> pg_backend_pid();
+        """,
+    )
+    # Drop both public and awa schemas (Awa uses awa.*, River/Oban use public.*).
+    # Set lock_timeout so we fail fast with a clear error instead of waiting on
+    # deadlock_timeout if a backend somehow slipped past the terminate above.
     psql(
         db,
-        "DROP SCHEMA IF EXISTS awa CASCADE; DROP SCHEMA public CASCADE; CREATE SCHEMA public;",
+        "SET lock_timeout = '5s'; "
+        "DROP SCHEMA IF EXISTS awa CASCADE; "
+        "DROP SCHEMA public CASCADE; "
+        "CREATE SCHEMA public;",
     )
 
 
@@ -220,7 +239,7 @@ SYSTEMS = {
         "state_col": "status",
         "enqueue_sql": """
             INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, attempts)
-            SELECT 'main.chaos_job', 'chaos', jsonb_build_object('seq', g),
+            SELECT 'chaos_job', 'chaos', jsonb_build_object('seq', g),
                    'todo', 0
             FROM generate_series(1, {count}) g
         """,
@@ -455,14 +474,32 @@ def start_procrastinate_worker() -> subprocess.Popen:
 
 
 def kill_worker(proc: subprocess.Popen, system: str):
-    """SIGKILL the worker process."""
+    """SIGKILL the worker process and wait for full teardown.
+
+    For Docker-based workers, ``docker kill`` returns once the daemon has
+    delivered SIGKILL, but the container's TCP sockets to Postgres are not
+    closed until the kernel has fully torn down its network namespace. We
+    therefore ``docker wait`` for the container to be reaped and ``docker rm``
+    it, so the next scenario's reset_db / migrate_system does not race lingering
+    Postgres backends. Mirrors the safety pattern in orchestrator.py.
+    """
     if system == "awa":
         os.kill(proc.pid, signal.SIGKILL)
     else:
-        # Docker container — force kill
+        # Docker container — force kill, then wait for the daemon to reap it.
         container = f"{system}-chaos-worker"
         subprocess.run(
             ["docker", "kill", "--signal", "KILL", container],
+            capture_output=True,
+            timeout=10,
+        )
+        subprocess.run(
+            ["docker", "wait", container],
+            capture_output=True,
+            timeout=15,
+        )
+        subprocess.run(
+            ["docker", "rm", "-f", container],
             capture_output=True,
             timeout=10,
         )
@@ -1067,7 +1104,7 @@ def scenario_retry_storm(system: str, job_count: int = 500) -> dict:
         """,
         "procrastinate": """
             INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, attempts)
-            SELECT 'main.chaos_job', 'chaos', jsonb_build_object('seq', g),
+            SELECT 'chaos_job', 'chaos', jsonb_build_object('seq', g),
                    'todo', 1
             FROM generate_series(1, {count}) g
         """,
@@ -1504,7 +1541,7 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
         """,
         "procrastinate": """
             INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, priority)
-            SELECT 'main.chaos_job', 'chaos', jsonb_build_object('seq', g, 'prio', 'low'),
+            SELECT 'chaos_job', 'chaos', jsonb_build_object('seq', g, 'prio', 'low'),
                    'todo', 0
             FROM generate_series(1, {count}) g
         """,
@@ -1609,7 +1646,7 @@ def scenario_priority_starvation(system: str, job_count: int = 20) -> dict:
         "awa": "INSERT INTO awa.jobs_hot (kind, queue, args, state, priority, run_at) SELECT 'chaos_job', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'available', 1, now() FROM generate_series(1, {batch}) g",
         "river": "INSERT INTO river_job (kind, queue, args, state, max_attempts, scheduled_at, priority) SELECT 'chaos_job', 'default', jsonb_build_object('prio', 'high', 'seq', g), 'available', 5, now(), 1 FROM generate_series(1, {batch}) g",
         "oban": "INSERT INTO oban_jobs (worker, queue, args, state, max_attempts, scheduled_at, inserted_at, priority) SELECT 'ObanBench.ChaosWorker', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'available', 5, now(), now(), 0 FROM generate_series(1, {batch}) g",
-        "procrastinate": "INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, priority) SELECT 'main.chaos_job', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'todo', 10 FROM generate_series(1, {batch}) g",
+        "procrastinate": "INSERT INTO procrastinate_jobs (task_name, queue_name, args, status, priority) SELECT 'chaos_job', 'chaos', jsonb_build_object('prio', 'high', 'seq', g), 'todo', 10 FROM generate_series(1, {batch}) g",
     }[system]
 
     start_time = time.time()
