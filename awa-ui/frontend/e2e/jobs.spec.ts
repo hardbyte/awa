@@ -37,6 +37,21 @@ test.describe("Jobs page", () => {
     await expect(rows).not.toHaveCount(1);
   });
 
+  test("descriptor-backed and legacy labels both render in jobs table", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
+      page.goto("/jobs"),
+    ]);
+
+    const jobTable = page.getByRole("grid", { name: "Jobs" });
+    await expect(jobTable.getByText("E2E Job").first()).toBeVisible();
+    await expect(jobTable.getByText("e2e_job").first()).toBeVisible();
+    await expect(jobTable.getByText("E2E Queue").first()).toBeVisible();
+    await expect(jobTable.getByText("e2e_test").first()).toBeVisible();
+    await expect(jobTable.getByText("legacy_job").first()).toBeVisible();
+    await expect(jobTable.getByText("legacy_queue").first()).toBeVisible();
+  });
+
   test("URL-driven state: navigate to /jobs?state=failed, failed pill active", async ({
     page,
   }) => {

@@ -667,6 +667,11 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
     .await
     .expect("fixture insert should succeed");
 
+    sqlx::query("SELECT awa.rebuild_admin_metadata()")
+        .execute(&pool)
+        .await
+        .expect("admin metadata rebuild should succeed");
+
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
@@ -690,6 +695,42 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
             .and_then(Value::as_str),
         Some("Reconcile invoice")
     );
+}
+
+#[tokio::test]
+async fn test_jobs_endpoint_keeps_legacy_rows_without_descriptors() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_legacy_queue_{suffix}");
+    let kind = format!("api_legacy_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES ($1, $2, '{}'::jsonb, 'available', now())
+        "#,
+    )
+    .bind(&kind)
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("fixture insert should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, &format!("/api/jobs?queue={queue}")).await;
+    let job = payload
+        .as_array()
+        .expect("jobs payload should be an array")
+        .first()
+        .expect("job should be present");
+
+    assert_eq!(job.get("queue_descriptor").and_then(Value::as_object), None);
+    assert_eq!(job.get("kind_descriptor").and_then(Value::as_object), None);
 }
 
 #[tokio::test]
