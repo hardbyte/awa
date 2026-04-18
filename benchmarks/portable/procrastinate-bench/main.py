@@ -8,6 +8,7 @@ import signal
 import sys
 from dataclasses import dataclass
 from time import monotonic
+from urllib.parse import urlparse
 
 import procrastinate
 from psycopg import AsyncConnection
@@ -279,7 +280,9 @@ async def scenario_long_horizon() -> None:
     work_ms = env_int("JOB_WORK_MS", 1)
 
     queue = "procrastinate_longhorizon_bench"
-    db_name = database_url().rsplit("/", 1)[-1]
+    # Parse the URL path so query params like ?sslmode=disable don't leak
+    # into the descriptor's reported db_name.
+    db_name = (urlparse(database_url()).path or "/").lstrip("/") or "procrastinate_bench"
 
     _emit(
         {

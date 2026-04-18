@@ -58,18 +58,29 @@ def enter_idle_in_tx(runtime: PhaseRuntime) -> None:
     holder["thread"] = thread
     runtime.state["idle-in-tx"] = holder
 
+    def _abort_holder() -> None:
+        # The registry's exit hook won't run if we raise, so tear the
+        # holder down here. Otherwise the thread could finish its connect
+        # later and pin a transaction across subsequent phases.
+        stop.set()
+        runtime.state.pop("idle-in-tx", None)
+        thread.join(timeout=1.0)
+
     # Wait until the holder either opens its transaction or errors out. The
     # phase is measuring "what happens when the MVCC horizon is pinned," so
     # silently running without a held transaction would make the measurement
     # meaningless.
     if not ready.wait(timeout=5.0):
+        _abort_holder()
         raise RuntimeError(
             "idle-in-tx holder thread did not open a transaction within 5s"
         )
     if "error" in holder:
+        err = holder["error"]
+        _abort_holder()
         raise RuntimeError(
-            f"idle-in-tx holder thread failed to open transaction: {holder['error']}"
-        ) from holder["error"]
+            f"idle-in-tx holder thread failed to open transaction: {err}"
+        ) from err
 
 
 def exit_idle_in_tx(runtime: PhaseRuntime) -> None:

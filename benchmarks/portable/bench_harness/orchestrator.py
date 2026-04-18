@@ -731,6 +731,22 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+    # Reject invalid cadence up front. A 0/negative value would otherwise
+    # reach _next_aligned_tick (integer division) and the adapter-side
+    # alignment math, turning a trivial CLI mistake into an opaque crash
+    # mid-run.
+    if args.sample_every <= 0:
+        parser.error(
+            f"--sample-every must be > 0, got {args.sample_every}"
+        )
+    if args.producer_rate < 0:
+        parser.error(
+            f"--producer-rate must be >= 0, got {args.producer_rate}"
+        )
+    if args.worker_count <= 0:
+        parser.error(
+            f"--worker-count must be > 0, got {args.worker_count}"
+        )
     phases = resolve_scenario(args.scenario, args.phase)
     systems = [s.strip() for s in args.systems.split(",") if s.strip()]
     drive(
