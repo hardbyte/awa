@@ -222,6 +222,12 @@ fn build_otlp_meter_provider(endpoint: &str, service_name: &str) -> SdkMeterProv
 
 async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: i64) {
     let start = std::time::Instant::now();
+    // 60s is tight when a rescue + retry path depends on the promote timer,
+    // dispatcher claim, worker sleep, and completion flush all completing
+    // for 2–4 jobs in sequence. 120s keeps the test deterministic on loaded
+    // CI runners without masking a genuine regression (steady-state the
+    // wait resolves in single-digit seconds).
+    let timeout = Duration::from_secs(120);
     loop {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM awa.jobs WHERE queue = $1 AND state = $2::awa.job_state",
@@ -236,8 +242,19 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
             return;
         }
 
-        if start.elapsed() > Duration::from_secs(60) {
-            panic!("Timed out waiting for {min} {state} jobs in queue {queue}; only {count} found");
+        if start.elapsed() > timeout {
+            let breakdown: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT state::text, COUNT(*)::bigint \
+                 FROM awa.jobs WHERE queue = $1 GROUP BY state ORDER BY state",
+            )
+            .bind(queue)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            panic!(
+                "Timed out waiting for {min} {state} jobs in queue {queue}; \
+                 only {count} found. Full state breakdown: {breakdown:?}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
