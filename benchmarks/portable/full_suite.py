@@ -27,6 +27,7 @@ DEFAULT_SYSTEMS = [
     "procrastinate",
     "river",
     "oban",
+    "pgque",
 ]
 
 CHART_COLORS = [
