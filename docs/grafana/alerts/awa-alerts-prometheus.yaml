@@ -1,0 +1,250 @@
+# Grafana unified-alerting rules for an awa fleet that emits OTLP metrics
+# to a Prometheus-compatible datasource. Import via
+# `grafana-provisioning/alerting/` or the `/api/v1/provisioning/alert-rules`
+# API. All rules fire on steady-state thresholds with a 5m+ "for" window so
+# brief spikes don't page.
+#
+# Datasource UID substitution: set DS_PROMETHEUS below to the uid of your
+# Prometheus datasource (default "prom" — adjust to match your deploy).
+#
+# These rules correspond 1:1 with panels on awa-dashboard.json; every rule
+# cites the panel an operator should look at when it fires.
+
+apiVersion: 1
+groups:
+  - orgId: 1
+    name: awa
+    folder: awa
+    interval: 1m
+    rules:
+
+      - uid: awa_queue_lag_high
+        title: "awa queue lag > 5 minutes"
+        condition: "B"
+        for: 2m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Queue {{ $labels.awa_job_queue }} has jobs waiting >5m"
+          description: |
+            The oldest `available` job on {{ $labels.awa_job_queue }} has been
+            waiting more than 5 minutes — workers aren't keeping up with the
+            producer rate. See the "Queue Lag" panel on the Awa Job Queue
+            dashboard and drill into /queues/{{ $labels.awa_job_queue }} in
+            awa-ui for per-job detail and pause/drain controls.
+        data:
+          - refId: A
+            datasourceUid: DS_PROMETHEUS
+            model:
+              expr: max by (awa_job_queue) (awa_queue_lag_seconds)
+              intervalMs: 60000
+              maxDataPoints: 43200
+              refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [300] }
+              refId: B
+
+      - uid: awa_error_rate_elevated
+        title: "awa error rate > 5% for 5m"
+        condition: "B"
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Error rate {{ printf \"%.1f%%\" ($values.A.Value * 100) }} over the last 5 minutes"
+          description: |
+            failed / (completed + failed) has been above 5% for 5 minutes.
+            Something systematic is breaking — see the "Error rate" stat on
+            the dashboard, then /jobs?state=failed in awa-ui for the
+            specific failures.
+        data:
+          - refId: A
+            datasourceUid: DS_PROMETHEUS
+            model:
+              expr: |
+                sum(rate(awa_job_failed_total[5m]))
+                  / clamp_min(
+                    sum(rate(awa_job_completed_total[5m]))
+                      + sum(rate(awa_job_failed_total[5m])),
+                    1e-9
+                  )
+              refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [0.05] }
+              refId: B
+
+      - uid: awa_rescues_spiking
+        title: "awa rescues > 1/s sustained"
+        condition: "B"
+        for: 5m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Jobs are being rescued faster than 1/s (heartbeat / deadline / callback)"
+          description: |
+            Maintenance is rescuing jobs at a sustained rate >1/s. Likely
+            causes: worker OOMs or handler deadlocks (heartbeat rescues),
+            handlers exceeding job deadline, or external callbacks timing
+            out. See "Maintenance Rescues" on the dashboard and worker
+            logs for the rescue kind distribution.
+        data:
+          - refId: A
+            datasourceUid: DS_PROMETHEUS
+            model:
+              expr: sum(rate(awa_maintenance_rescues_total[5m]))
+              refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1] }
+              refId: B
+
+      - uid: awa_no_active_runtime
+        title: "awa fleet has no live runtime"
+        condition: "B"
+        for: 5m
+        noDataState: Alerting
+        execErrState: Error
+        labels:
+          severity: critical
+          owner: awa
+        annotations:
+          summary: "No runtime has emitted awa_job_in_flight in the last 5 minutes"
+          description: |
+            Every worker in the fleet has either stopped exporting metrics
+            or is down. See the "Active runtimes" stat on the dashboard
+            and /runtime in awa-ui. Page the on-call for awa.
+        data:
+          - refId: A
+            datasourceUid: DS_PROMETHEUS
+            model:
+              expr: count(count by (service_name, instance) (awa_job_in_flight))
+              refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: lt, params: [1] }
+              refId: B
+
+      - uid: awa_throughput_collapsed
+        title: "awa completion throughput dropped below 10% of baseline"
+        condition: "B"
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Completion rate collapsed: {{ printf \"%.2f/s\" $values.A.Value }} vs baseline {{ printf \"%.2f/s\" $values.C.Value }}"
+          description: |
+            Completion rate over the last 5 minutes is <10% of the 1-hour
+            baseline. Unlike "error rate", this catches silent stalls
+            (deadlock, worker pool exhausted, all producers offline) that
+            don't surface as failures. Correlate with "Queue Lag" and
+            "Active runtimes" — one of those usually explains it.
+        data:
+          - refId: A
+            datasourceUid: DS_PROMETHEUS
+            model:
+              expr: sum(rate(awa_job_completed_total[5m]))
+              refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+          - refId: C
+            datasourceUid: DS_PROMETHEUS
+            model:
+              expr: clamp_min(sum(rate(awa_job_completed_total[1h])), 0.01)
+              refId: C
+            relativeTimeRange:
+              from: 3600
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: math
+              expression: $A < ($C * 0.1)
+              refId: B
+
+      - uid: awa_descriptor_drift_persistent
+        title: "awa descriptor drift lasting > 15 minutes"
+        condition: "B"
+        for: 15m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: info
+          owner: awa
+        annotations:
+          summary: "Descriptor drift hasn't cleared within 15 minutes of rollout window"
+          description: |
+            Two or more live runtimes are reporting different BLAKE3 hashes
+            for the same queue / kind descriptor. Brief drift is normal
+            during a rolling deploy; persistent drift means two code
+            revisions are running simultaneously. See the "Descriptor
+            Health" panel on the Postgres dashboard (this one reads from
+            the Postgres source of truth) or drill into /runtime in awa-ui
+            to find the offending instances.
+        data:
+          - refId: A
+            datasourceUid: DS_PROMETHEUS
+            model:
+              # Drift expressed as: for each queue/kind, count of distinct
+              # display_name values across live info-gauge series.
+              # Any value > 1 on that grouping means two runtimes disagree.
+              expr: |
+                max(
+                  count by (awa_job_queue) (count by (awa_job_queue, awa_queue_display_name, awa_queue_owner, awa_queue_tags) (awa_queue_info))
+                ) or max(
+                  count by (awa_job_kind) (count by (awa_job_kind, awa_job_kind_display_name, awa_job_kind_owner, awa_job_kind_tags) (awa_job_kind_info))
+                )
+              refId: A
+            relativeTimeRange:
+              from: 900
+              to: 0
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator: { type: gt, params: [1] }
+              refId: B
