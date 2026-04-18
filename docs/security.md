@@ -130,6 +130,14 @@ The runtime grants look broad (`SELECT, INSERT, UPDATE, DELETE ON ALL TABLES`) b
 
 Since these triggers run with the caller's privileges, the runtime role needs write access to these internal tables even though application code never touches them directly.
 
+The runtime also directly upserts into the descriptor catalogs on startup and on each runtime snapshot tick:
+
+- `awa.queue_descriptors` — declared queue display names, ownership, tags
+- `awa.job_kind_descriptors` — declared job-kind display names, ownership, tags
+- `awa.runtime_instances` — the runtime's own liveness row, including per-queue and per-kind descriptor hashes used for drift detection
+
+These writes are not trigger-driven; they come from `ClientBuilder::build()` / `AsyncClient.start()` and from the snapshot reporter. The broad grant already covers them.
+
 Other PostgreSQL features used at runtime:
 
 | Feature | Purpose | Privilege needed |
