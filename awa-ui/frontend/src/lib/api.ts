@@ -31,8 +31,14 @@ export interface JobRow {
   original_priority: number;
 }
 
-export interface QueueStats {
+export interface QueueOverview {
   queue: string;
+  display_name: string | null;
+  description: string | null;
+  owner: string | null;
+  docs_url: string | null;
+  tags: string[];
+  extra: unknown;
   total_queued: number;
   scheduled: number;
   available: number;
@@ -44,6 +50,8 @@ export interface QueueStats {
   lag_seconds: number | null;
   paused: boolean;
 }
+
+export type QueueStats = QueueOverview;
 
 export interface RateLimitSnapshot {
   max_rate: number;
@@ -199,8 +207,12 @@ export function bulkCancel(ids: number[]): Promise<JobRow[]> {
 }
 
 // Queues
-export function fetchQueues(): Promise<QueueStats[]> {
+export function fetchQueues(): Promise<QueueOverview[]> {
   return apiFetch("/queues");
+}
+
+export function fetchQueue(queue: string): Promise<QueueOverview> {
+  return apiFetch(`/queues/${encodeURIComponent(queue)}`);
 }
 
 export function fetchQueueRuntime(): Promise<QueueRuntimeSummary[]> {

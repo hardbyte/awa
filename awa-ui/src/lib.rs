@@ -70,6 +70,7 @@ pub async fn router_with(
             "/queues/runtime",
             get(handlers::runtime::list_queue_runtime),
         )
+        .route("/queues/{queue}", get(handlers::queues::get_queue))
         .route("/queues/{queue}/pause", post(handlers::queues::pause_queue))
         .route(
             "/queues/{queue}/resume",

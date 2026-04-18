@@ -159,6 +159,7 @@ export function JobsPage() {
   const queueStats = activeQueue
     ? queuesQuery.data?.find((q) => q.queue === activeQueue)
     : undefined;
+  const activeQueueLabel = queueStats?.display_name ?? activeQueue;
 
   const pauseQueueMutation = useMutation({
     mutationFn: () => pauseQueue(activeQueue!, "ui"),
@@ -247,8 +248,11 @@ export function JobsPage() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-4">
         <Heading level={2}>
-          {activeQueue ? `Queue: ${activeQueue}` : "Jobs"}
+          {activeQueue ? `Queue: ${activeQueueLabel}` : "Jobs"}
         </Heading>
+        {activeQueue && queueStats?.display_name && (
+          <span className="text-sm text-muted-fg">{queueStats.queue}</span>
+        )}
         {total !== undefined && !activeQueue && (
           <span className="text-sm text-muted-fg">
             {total.toLocaleString()} total
@@ -263,6 +267,9 @@ export function JobsPage() {
             <Badge intent="warning">Paused</Badge>
           ) : (
             <Badge intent="success">Active</Badge>
+          )}
+          {queueStats.description && (
+            <span className="text-sm text-muted-fg">{queueStats.description}</span>
           )}
           <span className="text-sm text-muted-fg">
             {queueStats.available} available &middot;{" "}

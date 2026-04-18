@@ -19,7 +19,7 @@ use moka::future::Cache;
 #[derive(Clone)]
 pub struct DashboardCache {
     pub stats: Cache<(), HashMap<JobState, i64>>,
-    pub queues: Cache<(), Vec<admin::QueueStats>>,
+    pub queues: Cache<(), Vec<admin::QueueOverview>>,
     pub runtime: Cache<(), admin::RuntimeOverview>,
     pub queue_runtime: Cache<(), Vec<admin::QueueRuntimeSummary>>,
 }
