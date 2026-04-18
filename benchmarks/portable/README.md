@@ -136,6 +136,93 @@ to connect to the shared Postgres.
   aging and synthetic retry-promotion shortcuts; those remain available via the
   `extended` suite for diagnostics rather than apples-to-apples comparisons
 
+## Long-horizon scenario runner
+
+`long_horizon.py` drives multi-hour workloads against each system, collects
+Postgres-side and adapter-side telemetry on a shared timebase, and renders
+publication-quality plots. Use this to compare awa to peer systems on slow
+failure modes (idle-in-tx bloat, sustained high load, soak drift) that the
+short-horizon suite above cannot see.
+
+```bash
+# Named scenario (idle_in_tx_saturation ≈ 2h40m; long_horizon ≈ 6h10m):
+uv run python benchmarks/portable/long_horizon.py --scenario idle_in_tx_saturation
+
+# Custom phases (label=type:duration):
+uv run python benchmarks/portable/long_horizon.py \
+    --phase warmup=warmup:10m \
+    --phase clean_1=clean:60m \
+    --phase idle_1=idle-in-tx:60m \
+    --phase recovery_1=recovery:30m \
+    --systems awa,river
+
+# Developer fast path — single PG, DB-only recreation, short phases:
+uv run python benchmarks/portable/long_horizon.py \
+    --scenario idle_in_tx_saturation --fast
+```
+
+Phase types: `warmup`, `clean`, `idle-in-tx`, `recovery`, `active-readers`,
+`high-load`. `warmup` samples are kept in `raw.csv` but excluded from
+`summary.json`. New phase types plug in via `bench_harness.phases` +
+`bench_harness.hooks`.
+
+### Outputs
+
+Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
+- `raw.csv` — tidy long-form, one row per (system, subject, metric, sample)
+- `summary.json` — per-system per-phase aggregates + recovery metrics
+- `manifest.json` — PG version, config, host info, adapter versions, CLI args
+- `plots/` — `dead_tuples`, `dead_tuples_faceted`, `claim_p99`, `throughput`,
+  `table_size`, `queue_depth` (PNG 300 DPI + SVG)
+
+### Default system matrix differs from the steady-state suite
+
+| System | Steady-state suite (`run.py`) | Long-horizon runner (`long_horizon.py`) |
+|---|:---:|:---:|
+| awa (native) | ✓ | ✓ |
+| awa-docker | ✓ | opt-in only |
+| awa-python | ✓ | ✓ |
+| procrastinate | ✓ | ✓ |
+| river | ✓ | ✓ |
+| oban | ✓ | ✓ |
+
+`awa-docker` is excluded by default from the long-horizon runner because its
+line on any multi-hour dead-tuple / latency plot is the awa-native line —
+same Rust binary, same SQL, same DB-observable behaviour. Keeping it in the
+default would double the runtime and clutter plots with an overlapping
+series. Run it explicitly via `--systems awa-docker` if you're validating
+Docker packaging under long-horizon pressure.
+
+### Reproducibility
+
+- PG image pinned to a specific minor (`postgres:17.2-alpine` by default).
+- `postgres.conf` committed alongside `docker-compose.yml` with explicit
+  autovacuum settings (they dominate recovery curves).
+- Per-system PG container rebuilt fresh between systems — no warmed shared
+  buffers, no lingering autovacuum state, no cross-system competition for
+  locks. `--fast` opts into DB-only recreation for developer iteration.
+- `manifest.json` captures PG version, every relevant setting, host CPU/RAM,
+  Docker version, per-adapter git sha / schema version, and the exact CLI
+  used.
+
+### Relationship to the Rust MVCC benches
+
+The long-horizon runner is the **cross-system visualization** track: slower,
+multi-system, plot-producing, no regression gates. The awa-only MVCC
+benches (`test_mvcc_horizon_overlap_benchmark` nightly,
+`test_mvcc_horizon_planetscale_soak` weekly) are the **awa regression
+detection** track: fast, precise, Rust harness, hard thresholds on
+`overlap_handler_per_s` / `dead_tup_delta`. Both stay. See
+`docs/benchmarking.md` for the full split.
+
+### Adding a new system
+
+See [`CONTRIBUTING_ADAPTERS.md`](CONTRIBUTING_ADAPTERS.md) for the full
+adapter contract. Summary: ship `adapter.json` declaring `system`,
+`db_name`, `event_tables`, `extensions`; add a builder + launcher in
+`bench_harness/adapters.py`; implement the JSONL protocol (descriptor +
+samples, SIGTERM handling) in your adapter's own language.
+
 ## Chaos / Correctness Scenarios
 
 ```bash

@@ -25,6 +25,9 @@ defmodule ObanBench do
         IO.puts(:stderr, "[oban] worker_only: processing chaos queue (limit=#{chaos_concurrency}), blocking forever...")
         Process.sleep(:infinity)
 
+      "long_horizon" ->
+        ObanBench.LongHorizon.run()
+
       _ ->
         # Original benchmark scenarios
         run_benchmarks(scenario, job_count, worker_count, latency_iterations)

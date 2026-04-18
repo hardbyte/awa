@@ -13,4 +13,4 @@ COPY benchmarks/portable/procrastinate-bench ./benchmarks/portable/procrastinate
 WORKDIR /app/benchmarks/portable/procrastinate-bench
 RUN uv sync
 
-ENTRYPOINT ["sh", "-lc", "cd /app/benchmarks/portable/procrastinate-bench && uv run python main.py"]
+ENTRYPOINT ["sh", "-lc", "cd /app/benchmarks/portable/procrastinate-bench && exec uv run python main.py"]

@@ -1,0 +1,14 @@
+{
+  "system": "procrastinate",
+  "display_name": "Procrastinate (Python)",
+  "db_name": "procrastinate_bench",
+  "event_tables": [
+    "public.procrastinate_jobs",
+    "public.procrastinate_events"
+  ],
+  "event_indexes": [
+    "public.procrastinate_jobs_queueing_lock_idx",
+    "public.procrastinate_jobs_id_lock_idx"
+  ],
+  "extensions": []
+}

@@ -117,6 +117,36 @@ mixed-workload setup:
 That soak benchmark is wired into CI as a weekly/manual run, while the shorter
 `test_mvcc_horizon_overlap_benchmark` remains the daily nightly smoke.
 
+## Cross-system visualisation: the long-horizon portable bench
+
+Awa's MVCC benches above are the **awa regression detection** track: fast,
+precise, Rust harness, hard thresholds on `overlap_handler_per_s` /
+`dead_tup_delta`. They run only against awa and exist to catch awa-specific
+regressions between commits.
+
+A separate **cross-system visualisation** track lives at
+`benchmarks/portable/long_horizon.py`. It drives multi-hour scenarios
+against awa plus peer systems (awa-python, river, procrastinate, oban, and
+future pgmq / pg-boss / PgQ adapters), collects Postgres-side and
+adapter-side telemetry on a shared timebase, and produces
+publication-quality cross-system plots (dead tuples, p99 latency,
+throughput, table size, queue depth, and a faceted per-event-table view).
+
+See `benchmarks/portable/README.md` for usage and
+`benchmarks/portable/CONTRIBUTING_ADAPTERS.md` for the adapter contract.
+
+The two tracks are deliberately separate:
+
+| Question | Authoritative benchmark |
+|---|---|
+| Did awa regress overnight? | `test_mvcc_horizon_overlap_benchmark` (nightly) / `test_mvcc_horizon_planetscale_soak` (weekly) |
+| How does awa compare to other systems under multi-hour pressure? | `long_horizon.py`, named scenarios (`idle_in_tx_saturation`, `long_horizon`) |
+
+If the two ever diverge on workload shape or thresholds, the awa-only
+benches are canonical for awa's own numbers and the long-horizon runner
+defers. The long-horizon runner does **not** carry awa-specific regression
+gates.
+
 Useful knobs:
 
 - `AWA_MVCC_JOB_RATE` — steady producer rate in jobs/sec

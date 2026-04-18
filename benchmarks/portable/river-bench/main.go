@@ -9,9 +9,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
+	"os/signal"
 	"sort"
 	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -77,6 +83,25 @@ func envInt(key string, def int) int {
 		log.Fatalf("%s must be an integer: %v", key, err)
 	}
 	return v
+}
+
+func readProducerRate(def int) int {
+	path := os.Getenv("PRODUCER_RATE_CONTROL_FILE")
+	if path == "" {
+		return def
+	}
+	buf, err := os.ReadFile(path)
+	if err != nil {
+		return def
+	}
+	value, err := strconv.ParseFloat(strings.TrimSpace(string(buf)), 64)
+	if err != nil {
+		return def
+	}
+	if value < 0 {
+		return 0
+	}
+	return int(value)
 }
 
 func mustPool(ctx context.Context) *pgxpool.Pool {
@@ -368,6 +393,323 @@ func scenarioPickupLatency(ctx context.Context, pool *pgxpool.Pool, iterations i
 	}
 }
 
+// ── Long-horizon scenario ─────────────────────────────────────────
+
+// LongHorizonArgs is the job payload for the long-horizon scenario. The padding
+// field lets us approximate the declared payload size.
+type LongHorizonArgs struct {
+	Seq     int64  `json:"seq"`
+	Padding string `json:"padding"`
+}
+
+func (LongHorizonArgs) Kind() string { return "long_horizon_job" }
+
+type longHorizonState struct {
+	mu           sync.Mutex
+	latenciesMs  []latencyEvent
+	completed    atomic.Uint64
+	enqueued     atomic.Uint64
+	queueDepth   atomic.Int64
+	workMs       int
+	maxLatencies int
+}
+
+type latencyEvent struct {
+	recordedAt time.Time
+	latencyMs  float64
+}
+
+type LongHorizonWorker struct {
+	river.WorkerDefaults[LongHorizonArgs]
+	state *longHorizonState
+}
+
+func (w *LongHorizonWorker) Work(ctx context.Context, job *river.Job[LongHorizonArgs]) error {
+	// Pickup latency = now - created_at. River's Job struct exposes CreatedAt.
+	latencyMs := float64(time.Since(job.CreatedAt).Milliseconds())
+	if latencyMs < 0 {
+		latencyMs = 0
+	}
+	w.state.mu.Lock()
+	w.state.latenciesMs = append(w.state.latenciesMs, latencyEvent{time.Now(), latencyMs})
+	if len(w.state.latenciesMs) > w.state.maxLatencies {
+		// Drop oldest. Bounded memory is part of the contract.
+		w.state.latenciesMs = w.state.latenciesMs[len(w.state.latenciesMs)-w.state.maxLatencies:]
+	}
+	w.state.mu.Unlock()
+	if w.state.workMs > 0 {
+		time.Sleep(time.Duration(w.state.workMs) * time.Millisecond)
+	}
+	w.state.completed.Add(1)
+	return nil
+}
+
+func emitJSONL(rec map[string]interface{}) {
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return
+	}
+	fmt.Println(string(b))
+}
+
+func nowISO() string {
+	return time.Now().UTC().Format("2006-01-02T15:04:05.000Z07:00")
+}
+
+func percentiles(state *longHorizonState, windowS float64) (p50, p95, p99 float64) {
+	state.mu.Lock()
+	cutoff := time.Now().Add(-time.Duration(windowS * float64(time.Second)))
+	values := make([]float64, 0, len(state.latenciesMs))
+	for _, e := range state.latenciesMs {
+		if e.recordedAt.After(cutoff) {
+			values = append(values, e.latencyMs)
+		}
+	}
+	state.mu.Unlock()
+	if len(values) == 0 {
+		return 0, 0, 0
+	}
+	sort.Float64s(values)
+	n := len(values)
+	pick := func(q float64) float64 {
+		idx := int(q * float64(n-1))
+		if idx < 0 {
+			idx = 0
+		}
+		if idx >= n {
+			idx = n - 1
+		}
+		return values[idx]
+	}
+	return pick(0.50), pick(0.95), pick(0.99)
+}
+
+func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
+	producerRate := envInt("PRODUCER_RATE", 800)
+	producerMode := envOrDefault("PRODUCER_MODE", "fixed")
+	targetDepth := envInt("TARGET_DEPTH", 1000)
+	sampleEveryS := envInt("SAMPLE_EVERY_S", 10)
+	if sampleEveryS <= 0 {
+		log.Fatalf("SAMPLE_EVERY_S must be > 0; got %d", sampleEveryS)
+	}
+	payloadBytes := envInt("JOB_PAYLOAD_BYTES", 256)
+	workMs := envInt("JOB_WORK_MS", 1)
+
+	dbName := "river_bench"
+	if parsed, err := url.Parse(databaseURL()); err == nil {
+		if name := strings.TrimPrefix(parsed.Path, "/"); name != "" {
+			dbName = name
+		}
+	}
+
+	emitJSONL(map[string]interface{}{
+		"kind":           "descriptor",
+		"system":         "river",
+		"event_tables":   []string{"public.river_job"},
+		"extensions":     []string{},
+		"version":        "0.1.0",
+		"schema_version": envOrDefault("RIVER_SCHEMA_VERSION", "current"),
+		"db_name":        dbName,
+		"started_at":     nowISO(),
+	})
+
+	state := &longHorizonState{
+		workMs:       workMs,
+		maxLatencies: 32768,
+	}
+	var producerTargetRate atomic.Int64
+	producerTargetRate.Store(int64(producerRate))
+
+	workers := river.NewWorkers()
+	river.AddWorker(workers, &LongHorizonWorker{state: state})
+
+	client, err := river.NewClient(riverpgxv5.New(pool), &river.Config{
+		Queues: map[string]river.QueueConfig{
+			river.QueueDefault: {MaxWorkers: workerCount},
+		},
+		Workers:           workers,
+		JobTimeout:        -1,
+		FetchCooldown:     50 * time.Millisecond,
+		FetchPollInterval: 50 * time.Millisecond,
+	})
+	if err != nil {
+		log.Fatalf("long_horizon: failed to create client: %v", err)
+	}
+	if err := client.Start(ctx); err != nil {
+		log.Fatalf("long_horizon: failed to start client: %v", err)
+	}
+
+	shutdown := make(chan struct{})
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
+
+	padding := strings.Repeat("x", maxInt(0, payloadBytes-32))
+
+	// Producer
+	var producerWG sync.WaitGroup
+	producerWG.Add(1)
+	go func() {
+		defer producerWG.Done()
+		var seq int64
+		for {
+			select {
+			case <-shutdown:
+				return
+			default:
+			}
+
+			if producerMode == "depth-target" {
+				producerTargetRate.Store(0)
+				if state.queueDepth.Load() >= int64(targetDepth) {
+					time.Sleep(50 * time.Millisecond)
+					continue
+				}
+			} else {
+				currentRate := readProducerRate(producerRate)
+				producerTargetRate.Store(int64(currentRate))
+				if currentRate <= 0 {
+					time.Sleep(100 * time.Millisecond)
+					continue
+				}
+				time.Sleep(time.Second / time.Duration(currentRate))
+			}
+
+			_, err := client.Insert(ctx, LongHorizonArgs{Seq: seq, Padding: padding}, nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "[river] producer insert failed: %v\n", err)
+				continue
+			}
+			state.enqueued.Add(1)
+			seq++
+		}
+	}()
+
+	// Queue-depth poller
+	var depthWG sync.WaitGroup
+	depthWG.Add(1)
+	go func() {
+		defer depthWG.Done()
+		tick := time.NewTicker(1 * time.Second)
+		defer tick.Stop()
+		for {
+			select {
+			case <-shutdown:
+				return
+			case <-tick.C:
+				var n int64
+				err := pool.QueryRow(ctx,
+					"SELECT count(*) FROM river_job WHERE state = 'available'",
+				).Scan(&n)
+				if err == nil {
+					state.queueDepth.Store(n)
+				}
+			}
+		}
+	}()
+
+	// Sampler: clock-aligned to the sample_every_s boundary.
+	var samplerWG sync.WaitGroup
+	samplerWG.Add(1)
+	go func() {
+		defer samplerWG.Done()
+		nowEpoch := time.Now().Unix()
+		next := time.Unix(((nowEpoch/int64(sampleEveryS))+1)*int64(sampleEveryS), 0)
+		// Sleepable wait: a SIGTERM during startup would otherwise block
+		// here for up to SAMPLE_EVERY_S seconds. The select below makes
+		// the initial alignment cancellable.
+		alignTimer := time.NewTimer(time.Until(next))
+		select {
+		case <-shutdown:
+			alignTimer.Stop()
+			return
+		case <-alignTimer.C:
+		}
+		lastEnq := state.enqueued.Load()
+		lastCmp := state.completed.Load()
+		lastTick := time.Now()
+		ticker := time.NewTicker(time.Duration(sampleEveryS) * time.Second)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-shutdown:
+				return
+			case <-ticker.C:
+				now := time.Now()
+				dt := now.Sub(lastTick).Seconds()
+				if dt < 0.001 {
+					dt = 0.001
+				}
+				lastTick = now
+				enq := state.enqueued.Load()
+				cmp := state.completed.Load()
+				enqRate := float64(enq-lastEnq) / dt
+				cmpRate := float64(cmp-lastCmp) / dt
+				lastEnq = enq
+				lastCmp = cmp
+				p50, p95, p99 := percentiles(state, 30.0)
+				depth := float64(state.queueDepth.Load())
+				targetRate := float64(producerTargetRate.Load())
+				ts := nowISO()
+
+				type metric struct {
+					name    string
+					value   float64
+					windowS float64
+				}
+				for _, m := range []metric{
+					{"claim_p50_ms", p50, 30},
+					{"claim_p95_ms", p95, 30},
+					{"claim_p99_ms", p99, 30},
+					{"enqueue_rate", enqRate, float64(sampleEveryS)},
+					{"completion_rate", cmpRate, float64(sampleEveryS)},
+					{"queue_depth", depth, 0},
+					{"producer_target_rate", targetRate, 0},
+				} {
+					emitJSONL(map[string]interface{}{
+						"t":            ts,
+						"system":       "river",
+						"kind":         "adapter",
+						"subject_kind": "adapter",
+						"subject":      "",
+						"metric":       m.name,
+						"value":        m.value,
+						"window_s":     m.windowS,
+					})
+				}
+			}
+		}
+	}()
+
+	// Wait for SIGTERM / SIGINT.
+	<-sigCh
+	fmt.Fprintln(os.Stderr, "[river] long_horizon: shutdown signal received")
+	close(shutdown)
+
+	done := make(chan struct{})
+	go func() {
+		producerWG.Wait()
+		depthWG.Wait()
+		samplerWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		fmt.Fprintln(os.Stderr, "[river] long_horizon: timed out waiting for workers to stop")
+	}
+
+	stopCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	client.Stop(stopCtx)
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // ── Main ──────────────────────────────────────────────────────────
 
 func main() {
@@ -399,6 +741,11 @@ func main() {
 
 	if scenario == "migrate_only" {
 		fmt.Fprintln(os.Stderr, "[river] migrate_only: migrations applied, exiting.")
+		return
+	}
+
+	if scenario == "long_horizon" {
+		runLongHorizon(ctx, pool, workerCount)
 		return
 	}
 

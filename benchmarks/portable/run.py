@@ -32,13 +32,41 @@ def pg_url(dbname: str, host: str = "localhost") -> str:
     return f"postgres://{PG_USER}:{PG_PASS}@{host}:{PG_PORT}/{dbname}"
 
 
-def run_cmd(cmd: list[str], cwd: str | None = None, env: dict | None = None,
-            capture: bool = False, timeout: int = 600) -> subprocess.CompletedProcess:
+def awa_binary_path() -> Path:
+    result = run_cmd(
+        [
+            "cargo",
+            "metadata",
+            "--no-deps",
+            "--format-version",
+            "1",
+            "--manifest-path",
+            str(SCRIPT_DIR / "awa-bench" / "Cargo.toml"),
+        ],
+        capture=True,
+    )
+    if result.returncode != 0:
+        raise RuntimeError("Failed to resolve cargo target directory for awa-bench")
+    target_dir = Path(json.loads(result.stdout)["target_directory"])
+    return target_dir / "release" / "awa-bench"
+
+
+def run_cmd(
+    cmd: list[str],
+    cwd: str | None = None,
+    env: dict | None = None,
+    capture: bool = False,
+    timeout: int = 600,
+) -> subprocess.CompletedProcess:
     merged_env = {**os.environ, **(env or {})}
     print(f"  $ {' '.join(cmd)}", file=sys.stderr)
     return subprocess.run(
-        cmd, cwd=cwd, env=merged_env, capture_output=capture,
-        text=True, timeout=timeout,
+        cmd,
+        cwd=cwd,
+        env=merged_env,
+        capture_output=capture,
+        text=True,
+        timeout=timeout,
     )
 
 
@@ -62,9 +90,19 @@ def start_postgres(pg_image: str):
     # Wait for readiness
     for _ in range(30):
         result = run_cmd(
-            ["docker", "compose", "exec", "-T", "postgres",
-             "pg_isready", "-U", PG_USER],
-            cwd=str(SCRIPT_DIR), capture=True, env=postgres_env(pg_image),
+            [
+                "docker",
+                "compose",
+                "exec",
+                "-T",
+                "postgres",
+                "pg_isready",
+                "-U",
+                PG_USER,
+            ],
+            cwd=str(SCRIPT_DIR),
+            capture=True,
+            env=postgres_env(pg_image),
         )
         if result.returncode == 0:
             return
@@ -98,9 +136,12 @@ def build_awa_docker():
     print("\n=== Building Awa (Docker) benchmark ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "build",
-            "-f", str(SCRIPT_DIR / "awa-bench" / "Dockerfile"),
-            "-t", "awa-bench-docker",
+            "docker",
+            "build",
+            "-f",
+            str(SCRIPT_DIR / "awa-bench" / "Dockerfile"),
+            "-t",
+            "awa-bench-docker",
             ".",
         ],
         cwd=str(REPO_ROOT),
@@ -109,12 +150,13 @@ def build_awa_docker():
         raise RuntimeError("Failed to build awa-bench-docker image")
 
 
-def run_awa(scenario: str, job_count: int, worker_count: int,
-            latency_iterations: int) -> list[dict]:
+def run_awa(
+    scenario: str, job_count: int, worker_count: int, latency_iterations: int
+) -> list[dict]:
     """Run Awa benchmark natively."""
     print("\n=== Running Awa benchmarks ===", file=sys.stderr)
     result = run_cmd(
-        [str(SCRIPT_DIR / "awa-bench" / "target" / "release" / "awa-bench")],
+        [str(awa_binary_path())],
         env={
             "DATABASE_URL": pg_url("awa_bench"),
             "SCENARIO": scenario,
@@ -122,7 +164,8 @@ def run_awa(scenario: str, job_count: int, worker_count: int,
             "WORKER_COUNT": str(worker_count),
             "LATENCY_ITERATIONS": str(latency_iterations),
         },
-        capture=True, timeout=300,
+        capture=True,
+        timeout=300,
     )
     if result.returncode != 0:
         print(f"Awa stderr: {result.stderr}", file=sys.stderr)
@@ -131,22 +174,32 @@ def run_awa(scenario: str, job_count: int, worker_count: int,
     return with_system_name(json.loads(result.stdout), "awa")
 
 
-def run_awa_docker(scenario: str, job_count: int, worker_count: int,
-                   latency_iterations: int) -> list[dict]:
+def run_awa_docker(
+    scenario: str, job_count: int, worker_count: int, latency_iterations: int
+) -> list[dict]:
     """Run Awa benchmark in Docker."""
     print("\n=== Running Awa (Docker) benchmarks ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "run", "--rm",
-            "--network", "host",
-            "-e", f"DATABASE_URL={pg_url('awa_docker_bench')}",
-            "-e", f"SCENARIO={scenario}",
-            "-e", f"JOB_COUNT={job_count}",
-            "-e", f"WORKER_COUNT={worker_count}",
-            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-e",
+            f"DATABASE_URL={pg_url('awa_docker_bench')}",
+            "-e",
+            f"SCENARIO={scenario}",
+            "-e",
+            f"JOB_COUNT={job_count}",
+            "-e",
+            f"WORKER_COUNT={worker_count}",
+            "-e",
+            f"LATENCY_ITERATIONS={latency_iterations}",
             "awa-bench-docker",
         ],
-        capture=True, timeout=300,
+        capture=True,
+        timeout=300,
     )
     if result.returncode != 0:
         print(f"Awa (Docker) stderr: {result.stderr}", file=sys.stderr)
@@ -160,9 +213,12 @@ def build_awa_python():
     print("\n=== Building Awa-Python benchmark ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "build",
-            "-f", str(SCRIPT_DIR / "awa-python-bench" / "Dockerfile"),
-            "-t", "awa-python-bench",
+            "docker",
+            "build",
+            "-f",
+            str(SCRIPT_DIR / "awa-python-bench" / "Dockerfile"),
+            "-t",
+            "awa-python-bench",
             ".",
         ],
         cwd=str(REPO_ROOT),
@@ -177,9 +233,12 @@ def build_procrastinate():
     print("\n=== Building Procrastinate benchmark ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "build",
-            "-f", str(SCRIPT_DIR / "procrastinate-bench" / "Dockerfile"),
-            "-t", "procrastinate-bench",
+            "docker",
+            "build",
+            "-f",
+            str(SCRIPT_DIR / "procrastinate-bench" / "Dockerfile"),
+            "-t",
+            "procrastinate-bench",
             ".",
         ],
         cwd=str(REPO_ROOT),
@@ -189,22 +248,32 @@ def build_procrastinate():
         raise RuntimeError("Failed to build procrastinate-bench image")
 
 
-def run_awa_python(scenario: str, job_count: int, worker_count: int,
-                   latency_iterations: int) -> list[dict]:
+def run_awa_python(
+    scenario: str, job_count: int, worker_count: int, latency_iterations: int
+) -> list[dict]:
     """Run Awa-Python benchmark in Docker."""
     print("\n=== Running Awa-Python benchmarks ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "run", "--rm",
-            "--network", "host",
-            "-e", f"DATABASE_URL={pg_url('awa_python_bench')}",
-            "-e", f"SCENARIO={scenario}",
-            "-e", f"JOB_COUNT={job_count}",
-            "-e", f"WORKER_COUNT={worker_count}",
-            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-e",
+            f"DATABASE_URL={pg_url('awa_python_bench')}",
+            "-e",
+            f"SCENARIO={scenario}",
+            "-e",
+            f"JOB_COUNT={job_count}",
+            "-e",
+            f"WORKER_COUNT={worker_count}",
+            "-e",
+            f"LATENCY_ITERATIONS={latency_iterations}",
             "awa-python-bench",
         ],
-        capture=True, timeout=600,
+        capture=True,
+        timeout=600,
     )
     if result.returncode != 0:
         print(f"Awa-Python stderr: {result.stderr}", file=sys.stderr)
@@ -213,22 +282,32 @@ def run_awa_python(scenario: str, job_count: int, worker_count: int,
     return with_system_name(json.loads(result.stdout), "awa-python")
 
 
-def run_procrastinate(scenario: str, job_count: int, worker_count: int,
-                      latency_iterations: int) -> list[dict]:
+def run_procrastinate(
+    scenario: str, job_count: int, worker_count: int, latency_iterations: int
+) -> list[dict]:
     """Run Procrastinate benchmark in Docker."""
     print("\n=== Running Procrastinate benchmarks ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "run", "--rm",
-            "--network", "host",
-            "-e", f"DATABASE_URL={pg_url('procrastinate_bench')}",
-            "-e", f"SCENARIO={scenario}",
-            "-e", f"JOB_COUNT={job_count}",
-            "-e", f"WORKER_COUNT={worker_count}",
-            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-e",
+            f"DATABASE_URL={pg_url('procrastinate_bench')}",
+            "-e",
+            f"SCENARIO={scenario}",
+            "-e",
+            f"JOB_COUNT={job_count}",
+            "-e",
+            f"WORKER_COUNT={worker_count}",
+            "-e",
+            f"LATENCY_ITERATIONS={latency_iterations}",
             "procrastinate-bench",
         ],
-        capture=True, timeout=1800,
+        capture=True,
+        timeout=1800,
     )
     if result.returncode != 0:
         print(f"Procrastinate stderr: {result.stderr}", file=sys.stderr)
@@ -248,22 +327,32 @@ def build_river():
         raise RuntimeError("Failed to build river-bench image")
 
 
-def run_river(scenario: str, job_count: int, worker_count: int,
-              latency_iterations: int) -> list[dict]:
+def run_river(
+    scenario: str, job_count: int, worker_count: int, latency_iterations: int
+) -> list[dict]:
     """Run River benchmark in Docker."""
     print("\n=== Running River benchmarks ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "run", "--rm",
-            "--network", "host",
-            "-e", f"DATABASE_URL={pg_url('river_bench')}",
-            "-e", f"SCENARIO={scenario}",
-            "-e", f"JOB_COUNT={job_count}",
-            "-e", f"WORKER_COUNT={worker_count}",
-            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-e",
+            f"DATABASE_URL={pg_url('river_bench')}",
+            "-e",
+            f"SCENARIO={scenario}",
+            "-e",
+            f"JOB_COUNT={job_count}",
+            "-e",
+            f"WORKER_COUNT={worker_count}",
+            "-e",
+            f"LATENCY_ITERATIONS={latency_iterations}",
             "river-bench",
         ],
-        capture=True, timeout=300,
+        capture=True,
+        timeout=300,
     )
     if result.returncode != 0:
         print(f"River stderr: {result.stderr}", file=sys.stderr)
@@ -283,22 +372,32 @@ def build_oban():
         raise RuntimeError("Failed to build oban-bench image")
 
 
-def run_oban(scenario: str, job_count: int, worker_count: int,
-             latency_iterations: int) -> list[dict]:
+def run_oban(
+    scenario: str, job_count: int, worker_count: int, latency_iterations: int
+) -> list[dict]:
     """Run Oban benchmark in Docker."""
     print("\n=== Running Oban benchmarks ===", file=sys.stderr)
     result = run_cmd(
         [
-            "docker", "run", "--rm",
-            "--network", "host",
-            "-e", f"DATABASE_URL={pg_url('oban_bench')}",
-            "-e", f"SCENARIO={scenario}",
-            "-e", f"JOB_COUNT={job_count}",
-            "-e", f"WORKER_COUNT={worker_count}",
-            "-e", f"LATENCY_ITERATIONS={latency_iterations}",
+            "docker",
+            "run",
+            "--rm",
+            "--network",
+            "host",
+            "-e",
+            f"DATABASE_URL={pg_url('oban_bench')}",
+            "-e",
+            f"SCENARIO={scenario}",
+            "-e",
+            f"JOB_COUNT={job_count}",
+            "-e",
+            f"WORKER_COUNT={worker_count}",
+            "-e",
+            f"LATENCY_ITERATIONS={latency_iterations}",
             "oban-bench",
         ],
-        capture=True, timeout=300,
+        capture=True,
+        timeout=300,
     )
     if result.returncode != 0:
         print(f"Oban stderr: {result.stderr}", file=sys.stderr)
@@ -324,34 +423,52 @@ def print_comparison(all_results: list[dict]):
         if scenario in ("enqueue_throughput", "worker_throughput"):
             # Sort by jobs_per_sec descending
             results.sort(key=lambda r: r["results"]["jobs_per_sec"], reverse=True)
-            print(f"  {'System':<{system_width}} {'Jobs/sec':>12} {'Duration (ms)':>15}")
-            print(f"  {'-'*system_width} {'-'*12} {'-'*15}")
+            print(
+                f"  {'System':<{system_width}} {'Jobs/sec':>12} {'Duration (ms)':>15}"
+            )
+            print(f"  {'-' * system_width} {'-' * 12} {'-' * 15}")
             for r in results:
                 res = r["results"]
-                print(f"  {r['system']:<{system_width}} {res['jobs_per_sec']:>12,.0f} {res['duration_ms']:>15,}")
+                print(
+                    f"  {r['system']:<{system_width}} {res['jobs_per_sec']:>12,.0f} {res['duration_ms']:>15,}"
+                )
         elif scenario == "pickup_latency":
             results.sort(key=lambda r: r["results"]["p50_us"])
-            print(f"  {'System':<{system_width}} {'p50 (us)':>10} {'p95 (us)':>10} {'p99 (us)':>10} {'mean (us)':>10}")
-            print(f"  {'-'*system_width} {'-'*10} {'-'*10} {'-'*10} {'-'*10}")
+            print(
+                f"  {'System':<{system_width}} {'p50 (us)':>10} {'p95 (us)':>10} {'p99 (us)':>10} {'mean (us)':>10}"
+            )
+            print(f"  {'-' * system_width} {'-' * 10} {'-' * 10} {'-' * 10} {'-' * 10}")
             for r in results:
                 res = r["results"]
-                print(f"  {r['system']:<{system_width}} {res['p50_us']:>10,.0f} {res['p95_us']:>10,.0f} {res['p99_us']:>10,.0f} {res['mean_us']:>10,.0f}")
+                print(
+                    f"  {r['system']:<{system_width}} {res['p50_us']:>10,.0f} {res['p95_us']:>10,.0f} {res['p99_us']:>10,.0f} {res['mean_us']:>10,.0f}"
+                )
     print()
 
 
 def main():
     parser = argparse.ArgumentParser(description="Portable benchmark runner")
-    parser.add_argument("--scenario", default="all",
-                        choices=["all", "enqueue_throughput", "worker_throughput", "pickup_latency"])
+    parser.add_argument(
+        "--scenario",
+        default="all",
+        choices=["all", "enqueue_throughput", "worker_throughput", "pickup_latency"],
+    )
     parser.add_argument("--job-count", type=int, default=10000)
     parser.add_argument("--worker-count", type=int, default=50)
     parser.add_argument("--latency-iterations", type=int, default=100)
-    parser.add_argument("--systems", default="awa,awa-docker,awa-python,procrastinate,river,oban",
-                        help="Comma-separated list of systems to benchmark")
-    parser.add_argument("--skip-build", action="store_true",
-                        help="Skip building, use cached images/binaries")
-    parser.add_argument("--keep-pg", action="store_true",
-                        help="Don't stop Postgres after benchmarks")
+    parser.add_argument(
+        "--systems",
+        default="awa,awa-docker,awa-python,procrastinate,river,oban",
+        help="Comma-separated list of systems to benchmark",
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Skip building, use cached images/binaries",
+    )
+    parser.add_argument(
+        "--keep-pg", action="store_true", help="Don't stop Postgres after benchmarks"
+    )
     parser.add_argument(
         "--pg-image",
         default=DEFAULT_PG_IMAGE,
@@ -392,7 +509,9 @@ def main():
         for system in systems:
             try:
                 results = runners[system](
-                    args.scenario, args.job_count, args.worker_count,
+                    args.scenario,
+                    args.job_count,
+                    args.worker_count,
                     args.latency_iterations,
                 )
                 all_results.extend(results)
@@ -403,18 +522,22 @@ def main():
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         result_file = RESULTS_DIR / f"results_{timestamp}.json"
         with open(result_file, "w") as f:
-            json.dump({
-                "timestamp": timestamp,
-                "config": {
-                    "scenario": args.scenario,
-                    "job_count": args.job_count,
-                    "worker_count": args.worker_count,
-                    "latency_iterations": args.latency_iterations,
-                    "systems": systems,
-                    "pg_image": args.pg_image,
+            json.dump(
+                {
+                    "timestamp": timestamp,
+                    "config": {
+                        "scenario": args.scenario,
+                        "job_count": args.job_count,
+                        "worker_count": args.worker_count,
+                        "latency_iterations": args.latency_iterations,
+                        "systems": systems,
+                        "pg_image": args.pg_image,
+                    },
+                    "results": all_results,
                 },
-                "results": all_results,
-            }, f, indent=2)
+                f,
+                indent=2,
+            )
         print(f"\nResults saved to {result_file}", file=sys.stderr)
 
         # Print comparison

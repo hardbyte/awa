@@ -1,0 +1,15 @@
+{
+  "system": "river",
+  "display_name": "River (Go)",
+  "db_name": "river_bench",
+  "event_tables": [
+    "public.river_job"
+  ],
+  "event_indexes": [
+    "public.river_job_args_index",
+    "public.river_job_kind",
+    "public.river_job_state_and_finalized_at_index",
+    "public.river_job_prioritized_fetching_index"
+  ],
+  "extensions": []
+}

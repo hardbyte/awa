@@ -19,4 +19,4 @@ WORKDIR /app/awa-python
 RUN uv sync --group dev
 
 WORKDIR /app
-ENTRYPOINT ["sh", "-lc", "cd /app/awa-python && uv run python /app/benchmarks/portable/awa-python-bench/main.py"]
+ENTRYPOINT ["sh", "-lc", "cd /app/awa-python && exec uv run python /app/benchmarks/portable/awa-python-bench/main.py"]

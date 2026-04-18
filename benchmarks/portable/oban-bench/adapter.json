@@ -1,0 +1,14 @@
+{
+  "system": "oban",
+  "display_name": "Oban (Elixir)",
+  "db_name": "oban_bench",
+  "event_tables": [
+    "public.oban_jobs",
+    "public.oban_peers"
+  ],
+  "event_indexes": [
+    "public.oban_jobs_args_index",
+    "public.oban_jobs_state_queue_priority_scheduled_at_id_index"
+  ],
+  "extensions": []
+}

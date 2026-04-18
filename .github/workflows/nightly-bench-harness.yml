@@ -1,0 +1,114 @@
+name: Nightly bench harness
+
+# Runs a reduced-scale idle_in_tx_saturation scenario against awa only,
+# verifying the long-horizon harness itself is not broken end-to-end
+# (adapter contract, JSONL tailer, raw.csv writer, plot renderer, phase
+# hooks). Plots are uploaded as artifacts.
+#
+# This workflow does NOT gate regressions. Performance regression gates
+# live in the awa-only MVCC benches:
+#  - .github/workflows/nightly-chaos.yml :: test_mvcc_horizon_overlap_benchmark
+#  - test_mvcc_horizon_planetscale_soak (weekly/manual)
+#
+# The long-horizon runner exists to produce cross-system visualisations,
+# not to police regressions. See docs/benchmarking.md for the relationship
+# between the two tracks.
+
+on:
+  schedule:
+    - cron: "0 3 * * *"   # 03:00 UTC daily
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: "Scenario gate: set to 'long_horizon' to also run the full long-horizon job. Any other value (incl. 'idle_in_tx_saturation', 'custom') only runs the smoke job."
+        default: "idle_in_tx_saturation"
+        required: false
+      systems:
+        description: "Comma-separated systems to run"
+        default: "awa"
+        required: false
+      producer_rate:
+        description: "Fixed-rate producer target (jobs/s)"
+        default: "100"
+        required: false
+      worker_count:
+        description: "Consumer concurrency"
+        default: "8"
+        required: false
+
+jobs:
+  nightly-smoke:
+    name: Long-horizon nightly smoke (awa, reduced scale)
+    runs-on: ubuntu-latest
+    # Short reduced-scale run: warmup 30s + clean 30s + idle 30s + recovery 30s
+    # = ~2m of bench, plus build/restart overhead. Budget 20m for safety.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+      - name: Sync harness env
+        working-directory: benchmarks/portable
+        run: |
+          uv venv .venv
+          uv pip install -e .
+      - name: Run reduced-scale idle_in_tx_saturation
+        working-directory: benchmarks/portable
+        env:
+          SQLX_OFFLINE: "true"
+        run: |
+          SYSTEMS="${{ github.event.inputs.systems || 'awa' }}"
+          PRODUCER_RATE="${{ github.event.inputs.producer_rate || '100' }}"
+          WORKER_COUNT="${{ github.event.inputs.worker_count || '8' }}"
+          uv run python long_horizon.py \
+            --phase warmup=warmup:30s \
+            --phase clean_1=clean:30s \
+            --phase idle_1=idle-in-tx:30s \
+            --phase recovery_1=recovery:30s \
+            --systems "$SYSTEMS" \
+            --producer-rate "$PRODUCER_RATE" \
+            --worker-count "$WORKER_COUNT" \
+            --sample-every 2
+      - name: Upload harness artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-harness-nightly-${{ github.run_id }}
+          path: benchmarks/portable/results/**
+          retention-days: 14
+
+  long-horizon-full:
+    name: Full long_horizon run (all default systems)
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.scenario == 'long_horizon'
+    runs-on: ubuntu-latest
+    timeout-minutes: 720   # up to 12h for a full ≈6h10m scenario
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: astral-sh/setup-uv@v6
+      - name: Sync harness env
+        working-directory: benchmarks/portable
+        run: uv venv .venv && uv pip install -e .
+      - name: Run long_horizon (default systems)
+        working-directory: benchmarks/portable
+        env:
+          SQLX_OFFLINE: "true"
+        run: uv run python long_horizon.py --scenario long_horizon
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: long-horizon-${{ github.run_id }}
+          path: benchmarks/portable/results/**
+          retention-days: 90
