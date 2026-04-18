@@ -538,119 +538,141 @@ pub struct NamedJobKindDescriptor {
     pub descriptor: JobKindDescriptor,
 }
 
+/// Columns bound per descriptor row. Must match the order used in
+/// [`build_descriptor_upsert`] and the bind loop below.
+const DESCRIPTOR_PARAMS_PER_ROW: u32 = 9;
+
+/// Postgres caps bound parameters at 65535 per statement. 9 params × 7000 rows
+/// = 63k, so chunk below that with a comfortable margin.
+const DESCRIPTOR_BATCH_SIZE: usize = 5000;
+
+/// Build a batched INSERT ... VALUES (...), (...), ... ON CONFLICT upsert for
+/// a descriptor catalog. `table` is `awa.queue_descriptors` or
+/// `awa.job_kind_descriptors`; `pk` is `queue` or `kind`.
+fn build_descriptor_upsert(table: &str, pk: &str, count: usize) -> String {
+    let mut query = format!(
+        "INSERT INTO {table} (\
+             {pk}, display_name, description, owner, docs_url, tags, extra, \
+             descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at\
+         ) VALUES "
+    );
+    let mut param_index = 1u32;
+    for i in 0..count {
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now(), now(), now())",
+            param_index,
+            param_index + 1,
+            param_index + 2,
+            param_index + 3,
+            param_index + 4,
+            param_index + 5,
+            param_index + 6,
+            param_index + 7,
+            param_index + 8,
+        ));
+        param_index += DESCRIPTOR_PARAMS_PER_ROW;
+    }
+    // updated_at only advances when the hash changes — so an untouched
+    // descriptor keeps its original `updated_at` timestamp across ticks
+    // but still gets a fresh `last_seen_at` for liveness.
+    query.push_str(&format!(
+        " ON CONFLICT ({pk}) DO UPDATE SET \
+             display_name = EXCLUDED.display_name, \
+             description = EXCLUDED.description, \
+             owner = EXCLUDED.owner, \
+             docs_url = EXCLUDED.docs_url, \
+             tags = EXCLUDED.tags, \
+             extra = EXCLUDED.extra, \
+             descriptor_hash = EXCLUDED.descriptor_hash, \
+             sync_interval_ms = EXCLUDED.sync_interval_ms, \
+             updated_at = CASE \
+                 WHEN {table}.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash \
+                 THEN now() ELSE {table}.updated_at \
+             END, \
+             last_seen_at = now()"
+    ));
+    query
+}
+
 /// Upsert queue descriptors declared by the worker runtime.
 ///
 /// Descriptor rows are part of the control-plane catalog and intentionally
 /// separate from mutable queue runtime state in `awa.queue_meta`.
+///
+/// Descriptors are upserted in batched multi-row statements — one round-trip
+/// per [`DESCRIPTOR_BATCH_SIZE`] descriptors rather than one per descriptor.
+/// For typical fleets (≤100 queues / ≤500 kinds) that collapses to a single
+/// round-trip per sync call.
 pub async fn sync_queue_descriptors(
     pool: &PgPool,
     descriptors: &[NamedQueueDescriptor],
     sync_interval: std::time::Duration,
 ) -> Result<(), AwaError> {
-    for named in descriptors {
-        let hash = named.descriptor.descriptor_hash();
-        sqlx::query(
-            r#"
-            INSERT INTO awa.queue_descriptors (
-                queue,
-                display_name,
-                description,
-                owner,
-                docs_url,
-                tags,
-                extra,
-                descriptor_hash,
-                sync_interval_ms,
-                created_at,
-                updated_at,
-                last_seen_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), now())
-            ON CONFLICT (queue) DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                description = EXCLUDED.description,
-                owner = EXCLUDED.owner,
-                docs_url = EXCLUDED.docs_url,
-                tags = EXCLUDED.tags,
-                extra = EXCLUDED.extra,
-                descriptor_hash = EXCLUDED.descriptor_hash,
-                sync_interval_ms = EXCLUDED.sync_interval_ms,
-                updated_at = CASE
-                    WHEN awa.queue_descriptors.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash
-                    THEN now()
-                    ELSE awa.queue_descriptors.updated_at
-                END,
-                last_seen_at = now()
-            "#,
-        )
-        .bind(&named.queue)
-        .bind(named.descriptor.display_name.as_deref())
-        .bind(named.descriptor.description.as_deref())
-        .bind(named.descriptor.owner.as_deref())
-        .bind(named.descriptor.docs_url.as_deref())
-        .bind(&named.descriptor.tags)
-        .bind(&named.descriptor.extra)
-        .bind(&hash)
-        .bind(sync_interval.as_millis() as i64)
-        .execute(pool)
-        .await?;
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+    let sync_interval_ms = sync_interval.as_millis() as i64;
+
+    for chunk in descriptors.chunks(DESCRIPTOR_BATCH_SIZE) {
+        let hashes: Vec<String> = chunk
+            .iter()
+            .map(|named| named.descriptor.descriptor_hash())
+            .collect();
+        let sql = build_descriptor_upsert("awa.queue_descriptors", "queue", chunk.len());
+        let mut query = sqlx::query(&sql);
+        for (named, hash) in chunk.iter().zip(hashes.iter()) {
+            query = query
+                .bind(&named.queue)
+                .bind(named.descriptor.display_name.as_deref())
+                .bind(named.descriptor.description.as_deref())
+                .bind(named.descriptor.owner.as_deref())
+                .bind(named.descriptor.docs_url.as_deref())
+                .bind(&named.descriptor.tags)
+                .bind(&named.descriptor.extra)
+                .bind(hash.as_str())
+                .bind(sync_interval_ms);
+        }
+        query.execute(pool).await?;
     }
 
     Ok(())
 }
 
+/// Upsert job-kind descriptors declared by the worker runtime. Batched the
+/// same way as [`sync_queue_descriptors`].
 pub async fn sync_job_kind_descriptors(
     pool: &PgPool,
     descriptors: &[NamedJobKindDescriptor],
     sync_interval: std::time::Duration,
 ) -> Result<(), AwaError> {
-    for named in descriptors {
-        let hash = named.descriptor.descriptor_hash();
-        sqlx::query(
-            r#"
-            INSERT INTO awa.job_kind_descriptors (
-                kind,
-                display_name,
-                description,
-                owner,
-                docs_url,
-                tags,
-                extra,
-                descriptor_hash,
-                sync_interval_ms,
-                created_at,
-                updated_at,
-                last_seen_at
-            )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), now())
-            ON CONFLICT (kind) DO UPDATE SET
-                display_name = EXCLUDED.display_name,
-                description = EXCLUDED.description,
-                owner = EXCLUDED.owner,
-                docs_url = EXCLUDED.docs_url,
-                tags = EXCLUDED.tags,
-                extra = EXCLUDED.extra,
-                descriptor_hash = EXCLUDED.descriptor_hash,
-                sync_interval_ms = EXCLUDED.sync_interval_ms,
-                updated_at = CASE
-                    WHEN awa.job_kind_descriptors.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash
-                    THEN now()
-                    ELSE awa.job_kind_descriptors.updated_at
-                END,
-                last_seen_at = now()
-            "#,
-        )
-        .bind(&named.kind)
-        .bind(named.descriptor.display_name.as_deref())
-        .bind(named.descriptor.description.as_deref())
-        .bind(named.descriptor.owner.as_deref())
-        .bind(named.descriptor.docs_url.as_deref())
-        .bind(&named.descriptor.tags)
-        .bind(&named.descriptor.extra)
-        .bind(&hash)
-        .bind(sync_interval.as_millis() as i64)
-        .execute(pool)
-        .await?;
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+    let sync_interval_ms = sync_interval.as_millis() as i64;
+
+    for chunk in descriptors.chunks(DESCRIPTOR_BATCH_SIZE) {
+        let hashes: Vec<String> = chunk
+            .iter()
+            .map(|named| named.descriptor.descriptor_hash())
+            .collect();
+        let sql = build_descriptor_upsert("awa.job_kind_descriptors", "kind", chunk.len());
+        let mut query = sqlx::query(&sql);
+        for (named, hash) in chunk.iter().zip(hashes.iter()) {
+            query = query
+                .bind(&named.kind)
+                .bind(named.descriptor.display_name.as_deref())
+                .bind(named.descriptor.description.as_deref())
+                .bind(named.descriptor.owner.as_deref())
+                .bind(named.descriptor.docs_url.as_deref())
+                .bind(&named.descriptor.tags)
+                .bind(&named.descriptor.extra)
+                .bind(hash.as_str())
+                .bind(sync_interval_ms);
+        }
+        query.execute(pool).await?;
     }
 
     Ok(())
