@@ -44,6 +44,8 @@ export interface DescriptorFields {
 
 export interface QueueOverview extends DescriptorFields {
   queue: string;
+  descriptor_last_seen_at: string | null;
+  descriptor_stale: boolean;
   total_queued: number;
   scheduled: number;
   available: number;
@@ -60,6 +62,8 @@ export type QueueStats = QueueOverview;
 
 export interface JobKindOverview extends DescriptorFields {
   kind: string;
+  descriptor_last_seen_at: string | null;
+  descriptor_stale: boolean;
   job_count: number;
   queue_count: number;
   completed_last_hour: number;

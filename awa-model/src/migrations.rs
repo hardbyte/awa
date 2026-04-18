@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 9;
+pub const CURRENT_VERSION: i32 = 10;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -36,6 +36,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     ),
     (8, "Queue descriptor catalog", &[V8_UP]),
     (9, "Job kind descriptor catalog", &[V9_UP]),
+    (10, "Descriptor liveness tracking", &[V10_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -47,6 +48,7 @@ const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.s
 const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
 const V8_UP: &str = include_str!("../migrations/v008_queue_descriptors.sql");
 const V9_UP: &str = include_str!("../migrations/v009_job_kind_descriptors.sql");
+const V10_UP: &str = include_str!("../migrations/v010_descriptor_liveness.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

@@ -610,6 +610,9 @@ pub struct Client {
 struct RuntimeReporterState {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
+    queue_descriptors: HashMap<String, QueueDescriptor>,
+    job_kind_descriptors: HashMap<String, JobKindDescriptor>,
+    worker_kinds: Vec<String>,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
@@ -672,6 +675,9 @@ impl Client {
         RuntimeReporterState {
             pool: self.pool.clone(),
             queues: self.queues.clone(),
+            queue_descriptors: self.queue_descriptors.clone(),
+            job_kind_descriptors: self.job_kind_descriptors.clone(),
+            worker_kinds: self.workers.keys().cloned().collect(),
             queue_in_flight: self.queue_in_flight.clone(),
             dispatcher_alive: self.dispatcher_alive.clone(),
             heartbeat_alive: self.heartbeat_alive.clone(),
@@ -702,8 +708,18 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
-        admin::sync_queue_descriptors(&self.pool, &self.declared_queue_descriptors()).await?;
-        admin::sync_job_kind_descriptors(&self.pool, &self.declared_job_kind_descriptors()).await?;
+        admin::sync_queue_descriptors(
+            &self.pool,
+            &self.declared_queue_descriptors(),
+            self.runtime_snapshot_interval,
+        )
+        .await?;
+        admin::sync_job_kind_descriptors(
+            &self.pool,
+            &self.declared_job_kind_descriptors(),
+            self.runtime_snapshot_interval,
+        )
+        .await?;
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -1039,6 +1055,43 @@ mod tests {
 }
 
 impl RuntimeReporterState {
+    fn declared_queue_descriptors(&self) -> Vec<NamedQueueDescriptor> {
+        self.queues
+            .iter()
+            .map(|(queue, _)| NamedQueueDescriptor {
+                queue: queue.clone(),
+                descriptor: self
+                    .queue_descriptors
+                    .get(queue)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    fn declared_job_kind_descriptors(&self) -> Vec<NamedJobKindDescriptor> {
+        let mut kinds = self.worker_kinds.clone();
+        for kind in self.job_kind_descriptors.keys() {
+            if !kinds.iter().any(|existing| existing == kind) {
+                kinds.push(kind.clone());
+            }
+        }
+        kinds.sort();
+        kinds.dedup();
+
+        kinds
+            .into_iter()
+            .map(|kind| NamedJobKindDescriptor {
+                descriptor: self
+                    .job_kind_descriptors
+                    .get(&kind)
+                    .cloned()
+                    .unwrap_or_default(),
+                kind,
+            })
+            .collect()
+    }
+
     fn queue_snapshot(&self, queue: &str, config: &QueueConfig) -> QueueRuntimeSnapshot {
         let in_flight = self
             .queue_in_flight
@@ -1127,6 +1180,25 @@ impl RuntimeReporterState {
     }
 
     async fn publish_snapshot(&self) {
+        if let Err(err) = admin::sync_queue_descriptors(
+            &self.pool,
+            &self.declared_queue_descriptors(),
+            self.snapshot_interval,
+        )
+        .await
+        {
+            warn!(error = %err, "Failed to sync queue descriptors");
+        }
+        if let Err(err) = admin::sync_job_kind_descriptors(
+            &self.pool,
+            &self.declared_job_kind_descriptors(),
+            self.snapshot_interval,
+        )
+        .await
+        {
+            warn!(error = %err, "Failed to sync job kind descriptors");
+        }
+
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
