@@ -464,11 +464,18 @@ impl AwaMetrics {
     }
 
     /// Record a bulk admin move into the DLQ. Emits a single counter
-    /// increment with the row count and no per-row kind labels — admin
-    /// bulk moves can span many kinds, so the per-kind breakdown isn't
-    /// meaningful. Queue is optional because `awa dlq move --kind X`
-    /// (no queue filter) can span queues.
-    pub fn record_dlq_moved_bulk(&self, queue: Option<&str>, reason: &str, count: u64) {
+    /// increment with the row count, matching the per-row `record_dlq_moved`
+    /// label set where filters supply the value. Kind and queue are both
+    /// optional because `awa dlq move` accepts either (or both) as the
+    /// filter, and a bulk move that spans a dimension has no single value
+    /// to attach for it.
+    pub fn record_dlq_moved_bulk(
+        &self,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        reason: &str,
+        count: u64,
+    ) {
         if count == 0 {
             return;
         }
@@ -476,6 +483,12 @@ impl AwaMetrics {
             "awa.dlq.reason",
             reason.to_string(),
         )];
+        if let Some(kind) = kind {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.kind",
+                kind.to_string(),
+            ));
+        }
         if let Some(queue) = queue {
             attrs.push(opentelemetry::KeyValue::new(
                 "awa.job.queue",

@@ -1267,19 +1267,19 @@ pub async fn run_dlq_cleanup_pass(
         .map(|(queue, _)| queue.as_str())
         .collect();
 
-    let retention_secs = format!("{} seconds", dlq_retention.as_secs());
+    let retention_secs: i64 = dlq_retention.as_secs().min(i64::MAX as u64) as i64;
     let global_result = if override_queues.is_empty() {
         sqlx::query(
             r#"
             DELETE FROM awa.jobs_dlq
             WHERE id IN (
                 SELECT id FROM awa.jobs_dlq
-                WHERE dlq_at < now() - $1::interval
+                WHERE dlq_at < now() - make_interval(secs => $1::bigint)
                 LIMIT $2
             )
             "#,
         )
-        .bind(&retention_secs)
+        .bind(retention_secs)
         .bind(dlq_cleanup_batch_size)
         .execute(pool)
         .await
@@ -1289,13 +1289,13 @@ pub async fn run_dlq_cleanup_pass(
             DELETE FROM awa.jobs_dlq
             WHERE id IN (
                 SELECT id FROM awa.jobs_dlq
-                WHERE dlq_at < now() - $1::interval
+                WHERE dlq_at < now() - make_interval(secs => $1::bigint)
                   AND queue != ALL($3::text[])
                 LIMIT $2
             )
             "#,
         )
-        .bind(&retention_secs)
+        .bind(retention_secs)
         .bind(dlq_cleanup_batch_size)
         .bind(&override_queues)
         .execute(pool)

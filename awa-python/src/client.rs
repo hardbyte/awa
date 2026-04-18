@@ -1009,18 +1009,21 @@ impl PyClient {
     }
 
     /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    ///
+    /// Requires at least one of `kind`, `queue`, or `tag` unless `all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
     fn bulk_retry_from_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
-            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter)
+            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
                 .await
                 .map_err(map_awa_error)?;
             Ok(count)
@@ -1088,18 +1091,21 @@ impl PyClient {
     }
 
     /// Bulk-purge DLQ rows matching the filter.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    ///
+    /// Requires at least one of `kind`, `queue`, or `tag` unless `all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
     fn purge_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
-            let count = awa_model::dlq::purge_dlq(&pool, &filter)
+            let count = awa_model::dlq::purge_dlq(&pool, &filter, all)
                 .await
                 .map_err(map_awa_error)?;
             Ok(count)
@@ -2044,19 +2050,20 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
     fn bulk_retry_from_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter)
+                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
                     .await
                     .map_err(map_awa_error)
             })
@@ -2114,19 +2121,20 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
     fn purge_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::dlq::purge_dlq(&pool, &filter)
+                awa_model::dlq::purge_dlq(&pool, &filter, all)
                     .await
                     .map_err(map_awa_error)
             })

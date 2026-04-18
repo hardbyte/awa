@@ -5,7 +5,7 @@
 //! routing decision when a queue has DLQ enabled.
 
 use awa::model::dlq::{self, ListDlqFilter, RetryFromDlqOpts};
-use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, UniqueOpts, Worker};
 use awa_testing::TestClient;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -681,11 +681,44 @@ async fn test_purge_dlq() {
             queue: Some(queue.into()),
             ..Default::default()
         },
+        false,
     )
     .await
     .unwrap();
     assert_eq!(deleted, 4);
     assert_eq!(dlq::dlq_depth(pool, Some(queue)).await.unwrap(), 0);
+}
+
+/// Empty-filter bulk ops must be rejected unless the caller explicitly opts in
+/// with `allow_all=true`. Guards against the UI or CLI accidentally reviving
+/// or wiping the entire DLQ from an empty payload.
+#[tokio::test]
+async fn test_bulk_retry_and_purge_reject_empty_filter_without_allow_all() {
+    let test_client = setup().await;
+    let pool = test_client.pool();
+
+    let empty = ListDlqFilter::default();
+
+    let err = dlq::bulk_retry_from_dlq(pool, &empty, false)
+        .await
+        .expect_err("empty-filter bulk retry must be rejected");
+    assert!(
+        matches!(err, awa::AwaError::Validation(_)),
+        "expected Validation error, got: {err:?}"
+    );
+
+    let err = dlq::purge_dlq(pool, &empty, false)
+        .await
+        .expect_err("empty-filter purge must be rejected");
+    assert!(
+        matches!(err, awa::AwaError::Validation(_)),
+        "expected Validation error, got: {err:?}"
+    );
+
+    // Guard-only test: the Validation rejection above is the whole contract.
+    // Exercising `allow_all=true` against a shared DLQ (other tests may have
+    // left rows here) would risk incidental effects like unique-claim
+    // collisions or racing with a parallel test's cleanup.
 }
 
 /// End-to-end: a queue with DLQ enabled routes a terminal failure through the
@@ -1160,4 +1193,82 @@ async fn test_executor_keeps_terminal_failure_in_hot_when_disabled() {
         .unwrap();
     assert_eq!(row.map(|r| r.0), Some("failed".to_string()));
     assert!(dlq::get_dlq_job(pool, job.id).await.unwrap().is_none());
+}
+
+/// A DLQ'd job retains its `unique_key`. If a replacement job with the same
+/// key enters `jobs_hot` while the original is in the DLQ, retrying the
+/// DLQ'd row must surface a structured `UniqueConflict` rather than a raw
+/// trigger-level constraint violation — and the DLQ row must stay put so
+/// the operator can resolve the conflict (purge, or cancel the live job)
+/// before retrying again.
+#[tokio::test]
+async fn test_retry_from_dlq_surfaces_unique_conflict() {
+    let test_client = setup().await;
+    let pool = test_client.pool();
+    let queue = "dlq_retry_unique";
+    clean_queue(pool, queue).await;
+
+    // Original unique job: move through failed → DLQ.
+    let original = awa::model::insert_with(
+        pool,
+        &DlqTestJob {
+            value: "unique".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.into(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query("UPDATE awa.jobs_hot SET state='failed', finalized_at=now() WHERE id=$1")
+        .bind(original.id)
+        .execute(pool)
+        .await
+        .unwrap();
+
+    let moved = dlq::move_failed_to_dlq(pool, original.id, "test")
+        .await
+        .unwrap();
+    assert!(moved.is_some(), "original should land in DLQ");
+
+    // Replacement with same kind+queue+args takes over the unique-claim slot.
+    let replacement = awa::model::insert_with(
+        pool,
+        &DlqTestJob {
+            value: "unique".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.into(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_ne!(replacement.id, original.id);
+
+    let err = dlq::retry_from_dlq(pool, original.id, &RetryFromDlqOpts::default())
+        .await
+        .expect_err("retry must fail while replacement holds the unique claim");
+    assert!(
+        matches!(err, awa::AwaError::UniqueConflict { .. }),
+        "expected UniqueConflict, got: {err:?}"
+    );
+
+    // DLQ row must still be present so the operator can resolve the conflict.
+    assert!(
+        dlq::get_dlq_job(pool, original.id).await.unwrap().is_some(),
+        "DLQ row should survive the failed retry",
+    );
 }

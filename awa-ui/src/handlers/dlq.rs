@@ -97,6 +97,10 @@ pub struct BulkFilterPayload {
     pub queue: Option<String>,
     #[serde(default)]
     pub tag: Option<String>,
+    /// Explicit opt-in to act on every row in the DLQ when no filter is
+    /// provided. The model layer rejects empty filters otherwise.
+    #[serde(default)]
+    pub all: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,7 +119,7 @@ pub async fn bulk_retry_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let count = dlq::bulk_retry_from_dlq(&state.pool, &filter).await?;
+    let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
     Ok(Json(CountResponse { count }))
 }
 
@@ -141,7 +145,7 @@ pub async fn bulk_purge_dlq(
         tag: payload.tag,
         ..Default::default()
     };
-    let count = dlq::purge_dlq(&state.pool, &filter).await?;
+    let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
     Ok(Json(CountResponse { count }))
 }
 
@@ -178,7 +182,8 @@ pub async fn bulk_move_failed(
     // dashboards reflect admin bulk moves alongside automatic routing.
     // Done inline against the global OTel meter rather than through an
     // awa-worker dependency, which would pull in the dispatcher/runtime
-    // crate graph for a single counter increment.
+    // crate graph for a single counter increment. Attribute set matches
+    // `AwaMetrics::record_dlq_moved_bulk` so dashboards don't drift.
     if count > 0 {
         let meter = opentelemetry::global::meter("awa");
         let counter = meter
@@ -190,6 +195,12 @@ pub async fn bulk_move_failed(
             "awa.dlq.reason",
             payload.reason.clone(),
         )];
+        if let Some(kind) = payload.kind.as_deref() {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.kind",
+                kind.to_string(),
+            ));
+        }
         if let Some(queue) = payload.queue.as_deref() {
             attrs.push(opentelemetry::KeyValue::new(
                 "awa.job.queue",

@@ -91,7 +91,7 @@ fn homogeneous_target_table(rows: &[PreparedRow]) -> Option<TargetTable> {
         .then_some(first)
 }
 
-fn map_sqlx_error(err: sqlx::Error) -> AwaError {
+pub(crate) fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     if let sqlx::Error::Database(ref db_err) = err {
         if db_err.code().as_deref() == Some("23505") {
             return AwaError::UniqueConflict {

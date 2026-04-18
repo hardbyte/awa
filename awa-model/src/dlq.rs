@@ -293,8 +293,14 @@ pub struct RetryFromDlqOpts {
 ///
 /// Atomic: deletes from `jobs_dlq` and inserts a fresh row into `jobs_hot`
 /// (or `scheduled_jobs` if `run_at` is in the future). Resets `attempt = 0`,
-/// `run_lease = 0`, clears callback/heartbeat fields, and preserves the full
-/// error history for post-mortem visibility.
+/// `run_lease = 0`, clears callback/heartbeat fields, discards any handler
+/// progress snapshot (since the attempt counter restarts at zero), and
+/// preserves the full error history for post-mortem visibility.
+///
+/// If the DLQ'd row carries a `unique_key` and a live job with the same key
+/// already occupies `jobs_hot` / `scheduled_jobs`, the retry will fail with
+/// [`AwaError::UniqueConflict`] — the row stays in the DLQ so the operator
+/// can purge it or resolve the live job first.
 ///
 /// Returns the revived `JobRow`, or `None` if the DLQ row was already removed.
 pub async fn retry_from_dlq<'e, E>(
@@ -307,8 +313,14 @@ where
 {
     let scheduled = opts.run_at.map(|t| t > Utc::now()).unwrap_or(false);
 
+    // The INSERT side fires the unique-claim trigger on `jobs_hot` /
+    // `scheduled_jobs`, which can collide with a replacement job submitted
+    // while this row was in the DLQ. Map SQLSTATE 23505 to
+    // `UniqueConflict` so callers get a structured error instead of a raw
+    // trigger-level constraint violation. The DLQ row stays put because
+    // the enclosing CTE rolls back on error.
     if scheduled {
-        let row = sqlx::query_as::<_, JobRow>(
+        sqlx::query_as::<_, JobRow>(
             r#"
             WITH moved AS (
                 DELETE FROM awa.jobs_dlq WHERE id = $1 RETURNING *
@@ -339,10 +351,10 @@ where
         .bind(opts.priority)
         .bind(opts.queue.as_deref())
         .fetch_optional(executor)
-        .await?;
-        Ok(row)
+        .await
+        .map_err(crate::insert::map_sqlx_error)
     } else {
-        let row = sqlx::query_as::<_, JobRow>(
+        sqlx::query_as::<_, JobRow>(
             r#"
             WITH moved AS (
                 DELETE FROM awa.jobs_dlq WHERE id = $1 RETURNING *
@@ -372,19 +384,31 @@ where
         .bind(opts.priority)
         .bind(opts.queue.as_deref())
         .fetch_optional(executor)
-        .await?;
-        Ok(row)
+        .await
+        .map_err(crate::insert::map_sqlx_error)
     }
 }
 
 /// Bulk-retry DLQ rows matching a filter. Returns the count of revived jobs.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` to be set unless
+/// `allow_all` is `true`. This guard prevents an empty payload from
+/// accidentally reviving the entire DLQ — a thundering-herd hazard that was
+/// easy to trigger through the UI or CLI before the guard existed.
 pub async fn bulk_retry_from_dlq<'e, E>(
     executor: E,
     filter: &ListDlqFilter,
+    allow_all: bool,
 ) -> Result<u64, AwaError>
 where
     E: PgExecutor<'e>,
 {
+    if !allow_all && filter.kind.is_none() && filter.queue.is_none() && filter.tag.is_none() {
+        return Err(AwaError::Validation(
+            "bulk_retry_from_dlq requires at least one of kind, queue, or tag (or allow_all=true)"
+                .into(),
+        ));
+    }
     let res = sqlx::query(
         r#"
         WITH moved AS (
@@ -418,10 +442,23 @@ where
 }
 
 /// Purge (delete) DLQ rows matching a filter. Returns the count of rows deleted.
-pub async fn purge_dlq<'e, E>(executor: E, filter: &ListDlqFilter) -> Result<u64, AwaError>
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`. The explicit opt-in avoids accidentally wiping the DLQ via an
+/// empty filter from the UI or CLI.
+pub async fn purge_dlq<'e, E>(
+    executor: E,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+) -> Result<u64, AwaError>
 where
     E: PgExecutor<'e>,
 {
+    if !allow_all && filter.kind.is_none() && filter.queue.is_none() && filter.tag.is_none() {
+        return Err(AwaError::Validation(
+            "purge_dlq requires at least one of kind, queue, or tag (or allow_all=true)".into(),
+        ));
+    }
     let res = sqlx::query(
         r#"
         DELETE FROM awa.jobs_dlq
@@ -465,19 +502,19 @@ pub async fn cleanup_dlq<'e, E>(
 where
     E: PgExecutor<'e>,
 {
-    let retention_secs = format!("{} seconds", retention.as_secs());
+    let retention_secs: i64 = retention.as_secs().min(i64::MAX as u64) as i64;
     let res = sqlx::query(
         r#"
         DELETE FROM awa.jobs_dlq
         WHERE id IN (
             SELECT id FROM awa.jobs_dlq
-            WHERE dlq_at < now() - $1::interval
+            WHERE dlq_at < now() - make_interval(secs => $1::bigint)
               AND ($3::text IS NULL OR queue = $3)
             LIMIT $2
         )
         "#,
     )
-    .bind(&retention_secs)
+    .bind(retention_secs)
     .bind(batch_size)
     .bind(queue)
     .execute(executor)

@@ -178,6 +178,11 @@ enum DlqCommands {
         queue: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Retry every row in the DLQ when no filter is provided.
+        /// Required without `--kind`, `--queue`, or `--tag` to guard against
+        /// accidentally reviving the entire DLQ.
+        #[arg(long)]
+        all: bool,
     },
     /// Move existing failed jobs (in jobs_hot) into the DLQ
     Move {
@@ -196,6 +201,11 @@ enum DlqCommands {
         queue: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        /// Purge every row in the DLQ when no filter is provided.
+        /// Required without `--kind`, `--queue`, or `--tag` to guard against
+        /// accidentally wiping the DLQ.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -510,14 +520,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             None => println!("No DLQ row with id {id}"),
                         }
                     }
-                    DlqCommands::RetryBulk { kind, queue, tag } => {
+                    DlqCommands::RetryBulk {
+                        kind,
+                        queue,
+                        tag,
+                        all,
+                    } => {
                         let filter = awa_model::dlq::ListDlqFilter {
                             kind,
                             queue,
                             tag,
                             ..Default::default()
                         };
-                        let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter).await?;
+                        let count =
+                            awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
                         println!("Retried {count} DLQ rows.");
                     }
                     DlqCommands::Move {
@@ -536,20 +552,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // executor uses for automatic routing, so dashboards
                         // and alerting see admin bulk moves too.
                         awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                            kind.as_deref(),
                             queue.as_deref(),
                             &reason,
                             count,
                         );
                         println!("Moved {count} failed jobs into the DLQ.");
                     }
-                    DlqCommands::Purge { kind, queue, tag } => {
+                    DlqCommands::Purge {
+                        kind,
+                        queue,
+                        tag,
+                        all,
+                    } => {
                         let filter = awa_model::dlq::ListDlqFilter {
                             kind,
                             queue,
                             tag,
                             ..Default::default()
                         };
-                        let count = awa_model::dlq::purge_dlq(&pool, &filter).await?;
+                        let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
                         println!("Purged {count} DLQ rows.");
                     }
                 },
