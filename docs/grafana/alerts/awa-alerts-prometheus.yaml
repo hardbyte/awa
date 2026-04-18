@@ -4,11 +4,18 @@
 # API. All rules fire on steady-state thresholds with a 5m+ "for" window so
 # brief spikes don't page.
 #
-# Datasource UID substitution: set DS_PROMETHEUS below to the uid of your
-# Prometheus datasource (default "prom" — adjust to match your deploy).
+# Datasource UID substitution: before import, replace DS_PROMETHEUS with
+# the uid of your Prometheus-compatible datasource (visible in Grafana at
+# /datasources). Example:
+#   sed 's/DS_PROMETHEUS/prom/' awa-alerts-prometheus.yaml > /tmp/awa.yaml
 #
-# These rules correspond 1:1 with panels on awa-dashboard.json; every rule
-# cites the panel an operator should look at when it fires.
+# Rule structure: each rule runs a Prometheus query (refId A), reduces
+# every returned series to its latest value (refId B), then either
+# thresholds that single value (refId C) or compares it against a second
+# query with a math expression. The explicit reduce step is what lets
+# Grafana's unified alerting engine handle multi-series queries — without
+# it Grafana rejects the evaluation with "frame cannot uniquely be
+# identified by its labels".
 
 apiVersion: 1
 groups:
@@ -20,7 +27,7 @@ groups:
 
       - uid: awa_queue_lag_high
         title: "awa queue lag > 5 minutes"
-        condition: "B"
+        condition: "C"
         for: 2m
         noDataState: OK
         execErrState: Error
@@ -37,27 +44,43 @@ groups:
             awa-ui for per-job detail and pause/drain controls.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
-              expr: max by (awa_job_queue) (awa_queue_lag_seconds)
-              intervalMs: 60000
-              maxDataPoints: 43200
               refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: max by (awa_job_queue) (awa_queue_lag_seconds)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [300] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [300] }
 
       - uid: awa_error_rate_elevated
         title: "awa error rate > 5% for 5m"
-        condition: "B"
+        condition: "C"
         for: 5m
         noDataState: OK
         execErrState: Error
@@ -65,7 +88,7 @@ groups:
           severity: warning
           owner: awa
         annotations:
-          summary: "Error rate {{ printf \"%.1f%%\" ($values.A.Value * 100) }} over the last 5 minutes"
+          summary: "Error rate above 5% over the last 5 minutes"
           description: |
             failed / (completed + failed) has been above 5% for 5 minutes.
             Something systematic is breaking — see the "Error rate" stat on
@@ -73,8 +96,11 @@ groups:
             specific failures.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
               expr: |
                 sum(rate(awa_job_failed_total[5m]))
                   / clamp_min(
@@ -82,22 +108,37 @@ groups:
                       + sum(rate(awa_job_failed_total[5m])),
                     1e-9
                   )
-              refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [0.05] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0.05] }
 
       - uid: awa_rescues_spiking
         title: "awa rescues > 1/s sustained"
-        condition: "B"
+        condition: "C"
         for: 5m
         noDataState: OK
         execErrState: Error
@@ -105,34 +146,51 @@ groups:
           severity: warning
           owner: awa
         annotations:
-          summary: "Jobs are being rescued faster than 1/s (heartbeat / deadline / callback)"
+          summary: "Jobs are being rescued faster than 1/s"
           description: |
             Maintenance is rescuing jobs at a sustained rate >1/s. Likely
             causes: worker OOMs or handler deadlocks (heartbeat rescues),
             handlers exceeding job deadline, or external callbacks timing
-            out. See "Maintenance Rescues" on the dashboard and worker
-            logs for the rescue kind distribution.
+            out. See "Maintenance Rescues" on the dashboard.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
-              expr: sum(rate(awa_maintenance_rescues_total[5m]))
               refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: sum(rate(awa_maintenance_rescues_total[5m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [1] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [1] }
 
       - uid: awa_no_active_runtime
         title: "awa fleet has no live runtime"
-        condition: "B"
+        condition: "C"
         for: 5m
         noDataState: Alerting
         execErrState: Error
@@ -147,25 +205,43 @@ groups:
             and /runtime in awa-ui. Page the on-call for awa.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
-              expr: count(count by (service_name, instance) (awa_job_in_flight))
               refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: count(count by (service_name, instance) (awa_job_in_flight))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: lt, params: [1] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: replaceNN, replaceWithValue: 0 }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: lt, params: [1] }
 
       - uid: awa_throughput_collapsed
         title: "awa completion throughput dropped below 10% of baseline"
-        condition: "B"
+        condition: "D"
         for: 10m
         noDataState: OK
         execErrState: Error
@@ -173,7 +249,7 @@ groups:
           severity: warning
           owner: awa
         annotations:
-          summary: "Completion rate collapsed: {{ printf \"%.2f/s\" $values.A.Value }} vs baseline {{ printf \"%.2f/s\" $values.C.Value }}"
+          summary: "Completion rate has collapsed vs the 1-hour baseline"
           description: |
             Completion rate over the last 5 minutes is <10% of the 1-hour
             baseline. Unlike "error rate", this catches silent stalls
@@ -182,31 +258,47 @@ groups:
             "Active runtimes" — one of those usually explains it.
         data:
           - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
-              expr: sum(rate(awa_job_completed_total[5m]))
               refId: A
-            relativeTimeRange:
-              from: 300
-              to: 0
-          - refId: C
-            datasourceUid: DS_PROMETHEUS
-            model:
-              expr: clamp_min(sum(rate(awa_job_completed_total[1h])), 0.01)
-              refId: C
-            relativeTimeRange:
-              from: 3600
-              to: 0
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: sum(rate(awa_job_completed_total[5m]))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: math
-              expression: $A < ($C * 0.1)
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: replaceNN, replaceWithValue: 0 }
+          - refId: C
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: C
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: clamp_min(sum(rate(awa_job_completed_total[1h])), 0.01)
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: D
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: D
+              type: math
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: $B < ($C * 0.1)
 
       - uid: awa_descriptor_drift_persistent
         title: "awa descriptor drift lasting > 15 minutes"
-        condition: "B"
+        condition: "C"
         for: 15m
         noDataState: OK
         execErrState: Error
@@ -220,31 +312,47 @@ groups:
             for the same queue / kind descriptor. Brief drift is normal
             during a rolling deploy; persistent drift means two code
             revisions are running simultaneously. See the "Descriptor
-            Health" panel on the Postgres dashboard (this one reads from
-            the Postgres source of truth) or drill into /runtime in awa-ui
-            to find the offending instances.
+            Health" panel on the Postgres dashboard or /runtime in awa-ui.
         data:
           - refId: A
+            relativeTimeRange: { from: 900, to: 0 }
             datasourceUid: DS_PROMETHEUS
             model:
-              # Drift expressed as: for each queue/kind, count of distinct
-              # display_name values across live info-gauge series.
-              # Any value > 1 on that grouping means two runtimes disagree.
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              # For each queue/kind, count distinct descriptor attribute
+              # tuples across live info-gauge series. >1 means two runtimes
+              # disagree on that target.
               expr: |
                 max(
                   count by (awa_job_queue) (count by (awa_job_queue, awa_queue_display_name, awa_queue_owner, awa_queue_tags) (awa_queue_info))
-                ) or max(
+                  or
                   count by (awa_job_kind) (count by (awa_job_kind, awa_job_kind_display_name, awa_job_kind_owner, awa_job_kind_tags) (awa_job_kind_info))
                 )
-              refId: A
-            relativeTimeRange:
-              from: 900
-              to: 0
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
           - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
             datasourceUid: __expr__
             model:
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator: { type: gt, params: [1] }
               refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [1] }
