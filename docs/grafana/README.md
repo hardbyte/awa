@@ -5,7 +5,23 @@ Two dashboards are provided:
 - **`awa-dashboard.json`** — Prometheus / OTel metrics dashboard. Requires an OTLP collector (e.g., Grafana LGTM, Prometheus + OTLP receiver). Shows time-series metrics: throughput, latency, queue depth, rescues, completion flush performance.
 - **`awa-dashboard-postgres.json`** — SQL dashboard querying Postgres directly. No collector needed. Shows queue depth, lag, descriptor health, recent failures, cron schedules, and runtime instances. Queue depth and stat panels read from `queue_state_counts` (cache table, eventually consistent within the ~2s dirty-key recompute window). Lag and recent failure panels use targeted queries on `jobs_hot` with appropriate indexes. Queue-related tables LEFT JOIN `queue_descriptors` so declared display names and owners appear alongside raw queue names, and declared-but-idle queues stay visible. The **Descriptor Health** panel surfaces stale and drifted descriptors (see `docs/architecture.md#control-plane-descriptors` for the model); an empty table = healthy fleet.
 
-The Prometheus / OTel dashboard (`awa-dashboard.json`) is not descriptor-aware — descriptor state is only surfaced via the Postgres dashboard until the runtime emits dedicated descriptor metrics.
+### Descriptor metrics on the OTel dashboard
+
+The Prometheus / OTel dashboard surfaces descriptors via two info-style gauges the runtime emits every snapshot tick:
+
+- `awa_queue_info{awa_job_queue, awa_queue_display_name, awa_queue_owner, awa_queue_tags, awa_queue_docs_url, awa_queue_description}` — always 1
+- `awa_job_kind_info{awa_job_kind, awa_job_kind_display_name, awa_job_kind_owner, ...}` — always 1
+
+This is the idiomatic Prometheus/OTel pattern (same shape as `kube-state-metrics` `kube_deployment_labels`): the value is a constant and the descriptor fields live in the label set. That keeps cardinality under control — you don't want `display_name` as a label on every `awa_job_completed_total` sample, because a rolling descriptor change would split every metric into new time series. Dashboards lift descriptor fields into panels at query time via a `group_left` join:
+
+```promql
+sum by (awa_job_queue, awa_queue_display_name) (
+    rate(awa_job_completed_total[$__rate_interval])
+    * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info
+)
+```
+
+The dashboard ships three example panels — **Queue Descriptor Catalog**, **Job Kind Descriptor Catalog** (both instant-query tables), and **Throughput by Queue (with display names)** (a live timeseries demonstrating the join). Descriptor drift / stale detection still lives on the Postgres dashboard because deriving it from metrics alone would require emitting per-runtime hash gauges, which the Postgres catalog does more cleanly.
 
 ## Prometheus / OTel Dashboard
 
@@ -127,3 +143,14 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `awa.heartbeat.batches` | Counter | — | Heartbeat updates |
+
+### Descriptors (info-style gauges)
+
+Emitted on every `runtime_snapshot_interval` tick. Value is always 1; the useful payload is the label set. Use with `group_left` joins to enrich other panels (see the "Descriptor metrics on the OTel dashboard" section above).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `awa.queue.info` | Gauge | queue, display_name?, description?, owner?, docs_url?, tags? | Declared queue descriptor (label-join target) |
+| `awa.job_kind.info` | Gauge | kind, display_name?, description?, owner?, docs_url?, tags? | Declared job-kind descriptor (label-join target) |
+
+Optional labels are only emitted when the corresponding descriptor field is set (no empty-string series).
