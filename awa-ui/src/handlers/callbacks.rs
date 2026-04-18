@@ -84,6 +84,7 @@ pub async fn complete_callback(
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
     let job = awa_model::admin::complete_external(&state.pool, uuid, body.payload, None).await?;
+    state.invalidate_dashboard_caches();
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
@@ -108,6 +109,7 @@ pub async fn fail_callback(
         .map_err(|e| ApiError::Awa(awa_model::AwaError::Validation(e.to_string())))?;
 
     let job = awa_model::admin::fail_external(&state.pool, uuid, &body.error, None).await?;
+    state.invalidate_dashboard_caches();
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({

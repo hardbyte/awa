@@ -40,5 +40,6 @@ pub async fn trigger_cron_job(
 ) -> Result<Json<JobRow>, ApiError> {
     state.require_writable()?;
     let job = cron::trigger_cron_job(&state.pool, &name).await?;
+    state.invalidate_dashboard_caches();
     Ok(Json(job))
 }

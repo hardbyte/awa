@@ -1,4 +1,16 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page, type Response } from "@playwright/test";
+
+function isQueuesListResponse(response: Response): boolean {
+  const url = new URL(response.url());
+  return response.ok() && response.request().method() === "GET" && url.pathname === "/api/queues";
+}
+
+async function loadQueuesPage(page: Page) {
+  await Promise.all([
+    page.waitForResponse(isQueuesListResponse),
+    page.goto("/queues"),
+  ]);
+}
 
 test.describe("Queues page", () => {
   test("navigate to /queues, heading visible", async ({ page }) => {
@@ -7,10 +19,7 @@ test.describe("Queues page", () => {
   });
 
   test("queue table renders with seeded data", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     // Desktop table (visible at default viewport)
     const queueTable = page.getByRole("grid", { name: "Queues" });
@@ -40,10 +49,7 @@ test.describe("Queues page", () => {
   });
 
   test("queue table shows descriptor description", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(
@@ -52,10 +58,7 @@ test.describe("Queues page", () => {
   });
 
   test("queue table includes runtime columns", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
@@ -69,10 +72,7 @@ test.describe("Queues page", () => {
   });
 
   test("click queue navigates to queue detail", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     const queueLink = queueTable.getByRole("link", { name: "E2E Queue" });
@@ -153,10 +153,7 @@ test.describe("Queues page", () => {
   });
 
   test("Pause/Resume button is visible for each queue", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
@@ -177,10 +174,7 @@ test.describe("Queues page", () => {
   });
 
   test("Pause executes mutation and shows success toast", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });
@@ -196,8 +190,7 @@ test.describe("Queues page", () => {
         ),
         resumeBtn.click(),
       ]);
-      // Wait for table to update
-      await page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok());
+      await page.waitForResponse(isQueuesListResponse);
     }
 
     // Now pause the queue
@@ -216,10 +209,7 @@ test.describe("Queues page", () => {
   });
 
   test("Resume executes mutation after pause", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });
@@ -235,13 +225,10 @@ test.describe("Queues page", () => {
         ),
         pauseBtn.click(),
       ]);
-      await page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok());
-      await page.reload();
+      await page.waitForResponse(isQueuesListResponse);
     }
 
-    // Now resume the queue
-    const refreshedTable = page.getByRole("grid", { name: "Queues" });
-    const refreshedRow = refreshedTable.getByRole("row", { name: /e2e_test/ });
+    const refreshedRow = queueTable.getByRole("row", { name: /e2e_test/ });
     const resumeBtn = refreshedRow.getByRole("button", { name: "Resume" });
     await expect(resumeBtn).toBeVisible();
 
@@ -253,13 +240,12 @@ test.describe("Queues page", () => {
     ]);
 
     expect(resumeResponse.ok()).toBeTruthy();
+    await page.waitForResponse(isQueuesListResponse);
+    await expect(refreshedRow.getByRole("button", { name: "Pause" })).toBeVisible();
   });
 
   test("Drain shows confirmation dialog", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
-      page.goto("/queues"),
-    ]);
+    await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });

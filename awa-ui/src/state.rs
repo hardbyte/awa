@@ -40,6 +40,16 @@ impl AppState {
         }
         Ok(())
     }
+
+    /// UI mutations change multiple dashboard surfaces, and the server caches
+    /// those aggregate endpoints independently. Invalidate them as a unit so
+    /// follow-up reads do not serve stale queue/job state after a mutation.
+    pub fn invalidate_dashboard_caches(&self) {
+        self.cache.stats.invalidate_all();
+        self.cache.queues.invalidate_all();
+        self.cache.runtime.invalidate_all();
+        self.cache.queue_runtime.invalidate_all();
+    }
 }
 
 pub async fn detect_read_only(pool: &PgPool) -> Result<bool, sqlx::Error> {

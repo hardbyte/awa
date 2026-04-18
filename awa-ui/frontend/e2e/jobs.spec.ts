@@ -1,4 +1,9 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Response } from "@playwright/test";
+
+function isQueuesListResponse(response: Response): boolean {
+  const url = new URL(response.url());
+  return response.ok() && response.request().method() === "GET" && url.pathname === "/api/queues";
+}
 
 test.describe("Jobs page", () => {
   test("navigate to /jobs, heading visible", async ({ page }) => {
@@ -383,7 +388,7 @@ test.describe("Pagination", () => {
 test.describe("Queue context banner", () => {
   test("banner appears when filtering by a single queue", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
         (r) =>
           r.url().includes("/api/jobs") &&
@@ -411,7 +416,7 @@ test.describe("Queue context banner", () => {
 
   test("banner shows Pause button for active queue", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
         (r) =>
           r.url().includes("/api/jobs") &&
@@ -439,7 +444,7 @@ test.describe("Queue context banner", () => {
 
   test("Drain button shows confirmation dialog", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
         (r) =>
           r.url().includes("/api/jobs") &&

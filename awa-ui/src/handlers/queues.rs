@@ -49,6 +49,7 @@ pub async fn pause_queue(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.require_writable()?;
     admin::pause_queue(&state.pool, &queue, payload.paused_by.as_deref()).await?;
+    state.invalidate_dashboard_caches();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -58,6 +59,7 @@ pub async fn resume_queue(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.require_writable()?;
     admin::resume_queue(&state.pool, &queue).await?;
+    state.invalidate_dashboard_caches();
     Ok(Json(serde_json::json!({ "ok": true })))
 }
 
@@ -67,5 +69,6 @@ pub async fn drain_queue(
 ) -> Result<Json<serde_json::Value>, ApiError> {
     state.require_writable()?;
     let count = admin::drain_queue(&state.pool, &queue).await?;
+    state.invalidate_dashboard_caches();
     Ok(Json(serde_json::json!({ "drained": count })))
 }
