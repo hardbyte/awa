@@ -443,7 +443,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("Drained {count} jobs from queue '{queue}'");
                     }
                     QueueCommands::Stats => {
-                        let stats = awa_model::admin::queue_stats(&pool).await?;
+                        let stats = awa_model::admin::queue_overviews(&pool).await?;
                         if stats.is_empty() {
                             println!("No queues found.");
                         } else {

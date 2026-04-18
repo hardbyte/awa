@@ -141,7 +141,14 @@ impl ClientBuilder {
         self
     }
 
-    /// Attach a control-plane descriptor to a declared queue.
+    /// Attach descriptive metadata (display name, description, owner,
+    /// docs URL, tags, extra JSON) to a queue so it appears labelled in
+    /// the admin API and UI. The queue must also be declared via
+    /// [`queue`]; otherwise [`build`] fails with
+    /// [`BuildError::QueueDescriptorWithoutQueue`].
+    ///
+    /// [`queue`]: ClientBuilder::queue
+    /// [`build`]: ClientBuilder::build
     pub fn queue_descriptor(
         mut self,
         name: impl Into<String>,
@@ -151,14 +158,16 @@ impl ClientBuilder {
         self
     }
 
-    /// Attach a control-plane descriptor to a typed job kind.
+    /// Attach descriptive metadata to a typed job kind. The kind string is
+    /// taken from [`JobArgs::kind`] on `T`.
     pub fn job_kind_descriptor<T: JobArgs>(mut self, descriptor: JobKindDescriptor) -> Self {
         self.job_kind_descriptors
             .insert(T::kind().to_string(), descriptor);
         self
     }
 
-    /// Attach a control-plane descriptor to a job kind by name.
+    /// Attach descriptive metadata to a job kind by string name. Useful
+    /// when the kind is known dynamically (e.g. from language bridges).
     pub fn job_kind_descriptor_kind(
         mut self,
         kind: impl Into<String>,
@@ -1002,58 +1011,6 @@ impl Client {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sqlx::postgres::PgPoolOptions;
-
-    fn lazy_pool() -> PgPool {
-        PgPoolOptions::new()
-            .connect_lazy("postgres://postgres:test@localhost/awa_test")
-            .expect("lazy pool should build")
-    }
-
-    #[tokio::test]
-    async fn queue_descriptor_requires_declared_queue() {
-        let result = Client::builder(lazy_pool())
-            .queue("default", QueueConfig::default())
-            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
-            .build();
-
-        assert!(matches!(
-            result,
-            Err(BuildError::QueueDescriptorWithoutQueue { queue }) if queue == "billing"
-        ));
-    }
-
-    #[tokio::test]
-    async fn queue_descriptor_allows_declared_queue() {
-        let result = Client::builder(lazy_pool())
-            .queue("billing", QueueConfig::default())
-            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
-            .build();
-
-        assert!(result.is_ok(), "descriptor for declared queue should build");
-    }
-
-    #[tokio::test]
-    async fn job_kind_descriptor_allows_registered_kind() {
-        #[derive(serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
-        struct TestJob;
-
-        let result = Client::builder(lazy_pool())
-            .queue("default", QueueConfig::default())
-            .register::<TestJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
-            .job_kind_descriptor::<TestJob>(JobKindDescriptor::new().display_name("Test job"))
-            .build();
-
-        assert!(
-            result.is_ok(),
-            "descriptor for registered kind should build"
-        );
-    }
-}
-
 impl RuntimeReporterState {
     fn queue_descriptor_hashes(&self) -> HashMap<String, String> {
         self.declared_queue_descriptors()
@@ -1236,5 +1193,57 @@ impl RuntimeReporterState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn lazy_pool() -> PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .expect("lazy pool should build")
+    }
+
+    #[tokio::test]
+    async fn queue_descriptor_requires_declared_queue() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::QueueDescriptorWithoutQueue { queue }) if queue == "billing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_descriptor_allows_declared_queue() {
+        let result = Client::builder(lazy_pool())
+            .queue("billing", QueueConfig::default())
+            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
+            .build();
+
+        assert!(result.is_ok(), "descriptor for declared queue should build");
+    }
+
+    #[tokio::test]
+    async fn job_kind_descriptor_allows_registered_kind() {
+        #[derive(serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
+        struct TestJob;
+
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .register::<TestJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+            .job_kind_descriptor::<TestJob>(JobKindDescriptor::new().display_name("Test job"))
+            .build();
+
+        assert!(
+            result.is_ok(),
+            "descriptor for registered kind should build"
+        );
     }
 }
