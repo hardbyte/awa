@@ -71,6 +71,12 @@ async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
     }
 
     if !kinds.is_empty() {
+        sqlx::query("DELETE FROM awa.job_kind_descriptors WHERE kind = ANY($1)")
+            .bind(kinds)
+            .execute(pool)
+            .await
+            .expect("failed to clean kind descriptors");
+
         sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
             .bind(kinds)
             .execute(pool)
@@ -547,6 +553,124 @@ async fn test_queues_endpoint_surfaces_descriptors_for_declared_empty_queue() {
     assert_eq!(
         detail.get("display_name").and_then(Value::as_str),
         Some("Billing")
+    );
+}
+
+#[tokio::test]
+async fn test_kinds_endpoint_surfaces_descriptors_for_declared_empty_kind() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let kind = format!("api_kind_descriptor_{suffix}");
+    clean_jobs(&pool, &[], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new()
+                .display_name("Reconcile invoice")
+                .description("Reconcile invoice state against PSP settlement events")
+                .owner("finance-platform")
+                .docs_url("https://example.test/reconcile")
+                .tag("billing"),
+        }],
+    )
+    .await
+    .expect("descriptor sync should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+    let payload = get_json(&app, "/api/kinds").await;
+    let kind_overview = payload
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind.as_str()))
+        .expect("declared kind should be present");
+
+    assert_eq!(
+        kind_overview.get("display_name").and_then(Value::as_str),
+        Some("Reconcile invoice")
+    );
+    assert_eq!(
+        kind_overview.get("job_count").and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        kind_overview.get("queue_count").and_then(Value::as_i64),
+        Some(0)
+    );
+}
+
+#[tokio::test]
+async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_job_desc_queue_{suffix}");
+    let kind = format!("api_job_desc_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new()
+                .display_name("Billing")
+                .description("Invoice and payment processing"),
+        }],
+    )
+    .await
+    .expect("queue descriptor sync should succeed");
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new()
+                .display_name("Reconcile invoice")
+                .description("Reconcile invoice state against PSP settlement events"),
+        }],
+    )
+    .await
+    .expect("kind descriptor sync should succeed");
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES ($1, $2, '{}'::jsonb, 'available', now())
+        "#,
+    )
+    .bind(&kind)
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("fixture insert should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, &format!("/api/jobs?queue={queue}")).await;
+    let job = payload
+        .as_array()
+        .expect("jobs payload should be an array")
+        .first()
+        .expect("job should be present");
+
+    assert_eq!(
+        job.get("queue_descriptor")
+            .and_then(|value| value.get("display_name"))
+            .and_then(Value::as_str),
+        Some("Billing")
+    );
+    assert_eq!(
+        job.get("kind_descriptor")
+            .and_then(|value| value.get("display_name"))
+            .and_then(Value::as_str),
+        Some("Reconcile invoice")
     );
 }
 
