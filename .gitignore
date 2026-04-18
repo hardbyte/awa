@@ -22,3 +22,11 @@ awa-python/python/awa/lib_awa.dylib.dSYM/
 /artifacts/
 /awa-cli/dist/
 /corectness/
+
+# Local IDE / MCP cruft
+/.idea/
+/.mcp.json
+/.playwright-mcp/
+
+# Benchmark run artifacts
+/benchmarks/portable/results/

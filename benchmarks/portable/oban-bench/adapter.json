@@ -1,5 +1,6 @@
 {
   "system": "oban",
+  "display_name": "Oban (Elixir)",
   "db_name": "oban_bench",
   "event_tables": [
     "public.oban_jobs",

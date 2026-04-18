@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Iterable
 
 import matplotlib
+
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import numpy as np
@@ -26,9 +27,55 @@ from .phases import PHASE_TINTS, Phase, PhaseType
 # Tableau 10 (muted), reused across plots so each system has one colour
 # everywhere.
 _PALETTE = [
-    "#4E79A7", "#F28E2B", "#59A14F", "#E15759", "#76B7B2",
-    "#EDC948", "#B07AA1", "#FF9DA7", "#9C755F", "#BAB0AC",
+    "#4E79A7",
+    "#F28E2B",
+    "#59A14F",
+    "#E15759",
+    "#76B7B2",
+    "#EDC948",
+    "#B07AA1",
+    "#FF9DA7",
+    "#9C755F",
+    "#BAB0AC",
 ]
+
+# Linestyles cycled across variants within a family (e.g. awa-native solid,
+# awa-docker dashed, awa-python dotted). Single-variant systems always get "-".
+_VARIANT_LINESTYLES = ["-", "--", ":", "-."]
+
+
+# Mapping system → (family, display_name). When a system is missing, we treat
+# it as its own family with the bare system name as label — so existing
+# callers that pass nothing keep working exactly as before.
+SystemMeta = dict[str, tuple[str, str]]
+
+
+def _assign_styles(
+    systems: list[str], meta: SystemMeta | None
+) -> dict[str, tuple[str, str, str]]:
+    """For each system, return (color, linestyle, label).
+
+    Systems sharing a `family` get the same base palette colour and are
+    distinguished by linestyle in their listed order. Systems with no
+    metadata default to (system, system) — own family, bare label.
+    """
+    meta = meta or {}
+    family_order: list[str] = []
+    by_family: dict[str, list[tuple[str, str]]] = {}
+    for system in systems:
+        family, label = meta.get(system, (system, system))
+        if family not in by_family:
+            family_order.append(family)
+            by_family[family] = []
+        by_family[family].append((system, label))
+
+    out: dict[str, tuple[str, str, str]] = {}
+    for family_index, family in enumerate(family_order):
+        base_color = _PALETTE[family_index % len(_PALETTE)]
+        for variant_index, (system, label) in enumerate(by_family[family]):
+            linestyle = _VARIANT_LINESTYLES[variant_index % len(_VARIANT_LINESTYLES)]
+            out[system] = (base_color, linestyle, label)
+    return out
 
 
 @dataclass
@@ -38,8 +85,8 @@ class PlotSpec:
     y_label: str
     log_scale: bool = False
     use_raw_underlay: bool = False
-    sum_by_subject: bool = True       # aggregate across subject per system
-    subject_kind: str | None = None   # filter to a kind (e.g. "table")
+    sum_by_subject: bool = True  # aggregate across subject per system
+    subject_kind: str | None = None  # filter to a kind (e.g. "table")
 
 
 PLOT_SPECS: dict[str, PlotSpec] = {
@@ -88,7 +135,10 @@ PLOT_SPECS: dict[str, PlotSpec] = {
 # Reference: Steinarsson 2013.
 # ────────────────────────────────────────────────────────────────────────
 
-def lttb(xs: np.ndarray, ys: np.ndarray, threshold: int) -> tuple[np.ndarray, np.ndarray]:
+
+def lttb(
+    xs: np.ndarray, ys: np.ndarray, threshold: int
+) -> tuple[np.ndarray, np.ndarray]:
     """Downsample series (xs, ys) to `threshold` points using LTTB. If the
     input is already <= threshold, returns it unchanged."""
     n = len(xs)
@@ -104,8 +154,16 @@ def lttb(xs: np.ndarray, ys: np.ndarray, threshold: int) -> tuple[np.ndarray, np
         next_bucket_start = int(np.floor((i + 1) * bucket_size)) + 1
         next_bucket_end = int(np.floor((i + 2) * bucket_size)) + 1
         next_bucket_end = min(next_bucket_end, n)
-        avg_x = np.mean(xs[next_bucket_start:next_bucket_end]) if next_bucket_end > next_bucket_start else xs[-1]
-        avg_y = np.mean(ys[next_bucket_start:next_bucket_end]) if next_bucket_end > next_bucket_start else ys[-1]
+        avg_x = (
+            np.mean(xs[next_bucket_start:next_bucket_end])
+            if next_bucket_end > next_bucket_start
+            else xs[-1]
+        )
+        avg_y = (
+            np.mean(ys[next_bucket_start:next_bucket_end])
+            if next_bucket_end > next_bucket_start
+            else ys[-1]
+        )
 
         # Current bucket range.
         bucket_start = int(np.floor(i * bucket_size)) + 1
@@ -138,6 +196,7 @@ def lttb(xs: np.ndarray, ys: np.ndarray, threshold: int) -> tuple[np.ndarray, np
 # ────────────────────────────────────────────────────────────────────────
 # Data loading
 # ────────────────────────────────────────────────────────────────────────
+
 
 def load_raw_csv(path: Path) -> list[dict]:
     with path.open("r", newline="") as fh:
@@ -199,6 +258,7 @@ def _phase_boundaries(phases: Iterable[Phase]) -> list[tuple[float, float, Phase
 # Rendering
 # ────────────────────────────────────────────────────────────────────────
 
+
 def _setup_axes(
     ax: plt.Axes,
     *,
@@ -215,10 +275,14 @@ def _setup_axes(
         # Label at top — position inside the band.
         mid = (start + end) / 2
         ax.text(
-            mid, 1.01, phase.describe(),
+            mid,
+            1.01,
+            phase.describe(),
             transform=ax.get_xaxis_transform(),
-            ha="center", va="bottom",
-            fontsize=8, color="#333",
+            ha="center",
+            va="bottom",
+            fontsize=8,
+            color="#333",
         )
     ax.set_title(title, pad=18)
     ax.set_ylabel(y_label)
@@ -273,6 +337,7 @@ def render_plot(
     phases: list[Phase],
     out_dir: Path,
     lttb_target: int = 1000,
+    system_meta: SystemMeta | None = None,
 ) -> None:
     fig, ax = plt.subplots(figsize=(11, 5.2))
     _setup_axes(
@@ -283,14 +348,18 @@ def render_plot(
         log_scale=spec.log_scale,
     )
     fig.text(
-        0.5, 0.925,
+        0.5,
+        0.925,
         _subtitle_for(phases),
-        ha="center", va="bottom",
-        fontsize=9, color="#555",
+        ha="center",
+        va="bottom",
+        fontsize=9,
+        color="#555",
     )
 
-    for i, system in enumerate(systems):
-        color = _PALETTE[i % len(_PALETTE)]
+    styles = _assign_styles(systems, system_meta)
+    for system in systems:
+        color, linestyle, label = styles[system]
         xs, ys = _series_for(
             rows,
             system=system,
@@ -301,10 +370,18 @@ def render_plot(
         if xs.size == 0:
             continue
         if spec.use_raw_underlay and xs.size > lttb_target:
-            ax.plot(xs, ys, color=color, alpha=0.18, linewidth=0.8, zorder=2)
+            ax.plot(
+                xs,
+                ys,
+                color=color,
+                alpha=0.18,
+                linewidth=0.8,
+                linestyle=linestyle,
+                zorder=2,
+            )
         px, py = lttb(xs, ys, lttb_target)
-        ax.plot(px, py, color=color, linewidth=1.6, zorder=3)
-        _label_end(ax, px[-1], py[-1], system, color)
+        ax.plot(px, py, color=color, linestyle=linestyle, linewidth=1.6, zorder=3)
+        _label_end(ax, px[-1], py[-1], label, color)
 
     out_dir.mkdir(parents=True, exist_ok=True)
     png_path = out_dir / f"{spec.filename_stem}.png"
@@ -322,14 +399,27 @@ def render_faceted_dead_tuples(
     phases: list[Phase],
     out_dir: Path,
     lttb_target: int = 1000,
+    system_meta: SystemMeta | None = None,
 ) -> None:
     """Small multiples, one panel per system, one line per event table."""
     if not systems:
         return
     cols = min(3, len(systems))
     rowsn = (len(systems) + cols - 1) // cols
-    fig, axes = plt.subplots(rowsn, cols, figsize=(5 * cols, 3.5 * rowsn),
-                             sharex=True, squeeze=False)
+    fig, axes = plt.subplots(
+        rowsn, cols, figsize=(5 * cols, 3.5 * rowsn), sharex=True, squeeze=False
+    )
+    meta = system_meta or {}
+    for idx, system in enumerate(systems):
+        ax = axes[idx // cols][idx % cols]
+        _, panel_title = meta.get(system, (system, system))
+        _setup_axes(
+            ax,
+            phases=phases,
+            title=panel_title,
+            y_label="n_dead_tup",
+            log_scale=False,
+        )
     for idx, system in enumerate(systems):
         ax = axes[idx // cols][idx % cols]
         _setup_axes(
@@ -340,17 +430,24 @@ def render_faceted_dead_tuples(
             log_scale=False,
         )
         # One line per subject (table) for this system.
-        subjects = sorted({
-            r["subject"] for r in rows
-            if r["system"] == system and r["metric"] == "n_dead_tup"
-            and r["subject_kind"] == "table"
-        })
+        subjects = sorted(
+            {
+                r["subject"]
+                for r in rows
+                if r["system"] == system
+                and r["metric"] == "n_dead_tup"
+                and r["subject_kind"] == "table"
+            }
+        )
         for j, subj in enumerate(subjects):
             color = _PALETTE[j % len(_PALETTE)]
             items = []
             for r in rows:
-                if (r["system"] == system and r["metric"] == "n_dead_tup"
-                        and r["subject"] == subj):
+                if (
+                    r["system"] == system
+                    and r["metric"] == "n_dead_tup"
+                    and r["subject"] == subj
+                ):
                     try:
                         items.append((float(r["elapsed_s"]), float(r["value"])))
                     except (TypeError, ValueError):
@@ -381,6 +478,7 @@ def render_all(
     systems: list[str],
     phases: list[Phase],
     out_dir: Path,
+    system_meta: SystemMeta | None = None,
 ) -> list[Path]:
     rows = load_raw_csv(raw_csv)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -393,10 +491,15 @@ def render_all(
             spec=spec,
             phases=phases,
             out_dir=out_dir,
+            system_meta=system_meta,
         )
         out.append(out_dir / f"{spec.filename_stem}.png")
     render_faceted_dead_tuples(
-        rows, systems=systems, phases=phases, out_dir=out_dir,
+        rows,
+        systems=systems,
+        phases=phases,
+        out_dir=out_dir,
+        system_meta=system_meta,
     )
     out.append(out_dir / "dead_tuples_faceted.png")
     return out

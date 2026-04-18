@@ -31,7 +31,9 @@ behave today."
   "db_name": "<name>_bench",
   "event_tables": ["<schema>.<table>", "..."],
   "event_indexes": ["<schema>.<indexname>", "..."],
-  "extensions": ["<ext>", "..."]
+  "extensions": ["<ext>", "..."],
+  "family": "<optional, defaults to system>",
+  "display_name": "<optional, defaults to system>"
 }
 ```
 
@@ -47,6 +49,30 @@ Runtime drift is caught: when your adapter emits its descriptor record on
 startup (below), the harness checks the runtime descriptor's
 `event_tables` / `extensions` are a **superset** of the static manifest.
 Mismatch fails the run loudly.
+
+### 2a. SDK variants of the same system
+
+Some systems ship multiple SDKs over the same on-disk schema (e.g. Awa
+has a Rust core, a Rust binary running in Docker, and a Python SDK). Each
+variant gets its own `<system>-bench/` directory, its own `system` key
+(used as the unique row identifier in `raw.csv`), but shares a `family`
+so plots colour them with one base hue and distinguish variants by
+linestyle (`-`, `--`, `:`, `-.` cycled in registration order):
+
+```json
+// awa-bench/adapter.json
+{ "system": "awa",        "family": "awa", "display_name": "Awa (Rust, native)", ... }
+// awa-docker-bench/adapter.json
+{ "system": "awa-docker", "family": "awa", "display_name": "Awa (Rust, Docker)", ... }
+// awa-python-bench/adapter.json
+{ "system": "awa-python", "family": "awa", "display_name": "Awa (Python SDK)",  ... }
+```
+
+Both fields are optional. Standalone systems can omit `family` (it
+defaults to the system name) and `display_name` (defaults to the system
+name); they will plot exactly as before. If you only want a friendlier
+plot label without grouping, set `display_name` and leave `family`
+unset.
 
 ## 3. Runtime contract
 
@@ -121,6 +147,35 @@ Adapters that ship Postgres extensions not bundled in the stock image
 installs the extension binaries. The harness calls `CREATE EXTENSION`
 from the static manifest; your Dockerfile only needs to provide the
 binaries.
+
+### 4a. Vendoring SUTs (optional submodule pattern)
+
+The existing adapters all pin their SUT through the language's package
+manager (`go.sum`, `uv.lock`, `mix.lock`, `Cargo.lock`) and let the
+adapter run the SUT's standard `migrate` entry point at startup. That
+keeps the bench reproducible without copying any DDL into this repo.
+
+If your SUT requires bringing schema or migration files into the bench
+directory (rare — most projects publish migrations as part of their
+distributed package), prefer a git submodule over copy-pasting:
+
+```bash
+# Pin the upstream repo as a submodule
+git submodule add https://github.com/<org>/<sut>.git \
+  benchmarks/portable/<system>-bench/vendor/<sut>
+
+# Use a local path in your manifest of choice:
+# Go (go.mod):       replace github.com/<org>/<sut> => ./vendor/<sut>
+# Python (pyproject): [tool.uv.sources]  <sut> = { path = "vendor/<sut>" }
+# Elixir (mix.exs):   {:<sut>, path: "vendor/<sut>"}
+# Rust (Cargo.toml):  <sut> = { path = "vendor/<sut>" }
+```
+
+Pin the submodule to a tagged release SHA, never a moving branch. Have
+your adapter's startup descriptor include the submodule SHA in its
+`version` field (e.g. read it from `git -C vendor/<sut> rev-parse HEAD`
+in the Dockerfile and bake it in at build time) so it's captured in
+`manifest.json` for every run.
 
 ## 5. Registration — four touchpoints
 

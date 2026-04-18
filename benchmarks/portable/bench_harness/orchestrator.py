@@ -603,7 +603,22 @@ def drive(
     summary = compute_summary(raw_csv, run_id=run_id, scenario=scenario, phases=phases)
     write_summary(summary, run_dir / "summary.json")
     write_run_readme(run_dir / "README.md", scenario=scenario, phases=phases)
-    render_all(raw_csv, systems=systems, phases=phases, out_dir=run_dir / "plots")
+    # Build system_meta so plots can group variants of the same family
+    # (e.g. awa, awa-docker, awa-python all share the "awa" family colour).
+    system_meta: dict[str, tuple[str, str]] = {}
+    for system in systems:
+        try:
+            m = AdapterManifest.load(ADAPTERS[system].bench_dir)
+            system_meta[system] = (m.family, m.display_name)
+        except Exception:
+            system_meta[system] = (system, system)
+    render_all(
+        raw_csv,
+        systems=systems,
+        phases=phases,
+        out_dir=run_dir / "plots",
+        system_meta=system_meta,
+    )
 
     print(f"\n[harness] results at: {run_dir}", file=sys.stderr)
     return run_dir

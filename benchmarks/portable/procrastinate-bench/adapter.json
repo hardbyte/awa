@@ -1,5 +1,6 @@
 {
   "system": "procrastinate",
+  "display_name": "Procrastinate (Python)",
   "db_name": "procrastinate_bench",
   "event_tables": [
     "public.procrastinate_jobs",

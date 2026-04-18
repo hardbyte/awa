@@ -40,6 +40,16 @@ class AdapterManifest:
     event_tables: list[str]
     event_indexes: list[str]
     extensions: list[str]
+    family: str = ""
+    display_name: str = ""
+
+    def __post_init__(self) -> None:
+        # Sensible defaults: standalone systems are their own family and
+        # render under their bare name. Variants opt-in by setting `family`.
+        if not self.family:
+            self.family = self.system
+        if not self.display_name:
+            self.display_name = self.system
 
     @classmethod
     def load(cls, bench_dir: Path) -> "AdapterManifest":
@@ -52,6 +62,8 @@ class AdapterManifest:
             event_tables=list(data.get("event_tables", [])),
             event_indexes=list(data.get("event_indexes", [])),
             extensions=list(data.get("extensions", [])),
+            family=data.get("family", "") or "",
+            display_name=data.get("display_name", "") or "",
         )
 
 

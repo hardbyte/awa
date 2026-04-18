@@ -1,5 +1,7 @@
 {
   "system": "awa",
+  "family": "awa",
+  "display_name": "Awa (Rust, native)",
   "db_name": "awa_bench",
   "event_tables": [
     "awa.jobs_hot",

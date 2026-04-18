@@ -1,5 +1,7 @@
 {
   "system": "awa-docker",
+  "family": "awa",
+  "display_name": "Awa (Rust, Docker)",
   "db_name": "awa_docker_bench",
   "event_tables": [
     "awa.jobs_hot",

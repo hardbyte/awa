@@ -1,5 +1,6 @@
 {
   "system": "river",
+  "display_name": "River (Go)",
   "db_name": "river_bench",
   "event_tables": [
     "public.river_job"

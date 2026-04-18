@@ -1,5 +1,7 @@
 {
   "system": "awa-python",
+  "family": "awa",
+  "display_name": "Awa (Python SDK)",
   "db_name": "awa_python_bench",
   "event_tables": [
     "awa.jobs_hot",
