@@ -124,6 +124,7 @@ export function QueueDetailPage() {
           <Badge intent="success">Active</Badge>
         )}
         {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
+        {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
       </div>
 
       {queue.description && (
@@ -186,9 +187,11 @@ export function QueueDetailPage() {
               </>
             )}
 
-            <DescriptionTerm>Descriptor sync</DescriptionTerm>
+            <DescriptionTerm>Descriptor health</DescriptionTerm>
             <DescriptionDetails>
-              {descriptorSyncLabel ? (
+              {queue.descriptor_mismatch ? (
+                "Live runtimes disagree on this queue descriptor"
+              ) : descriptorSyncLabel ? (
                 <span>
                   {queue.descriptor_stale ? "Stale" : "Live"} · seen {descriptorSyncLabel}
                 </span>

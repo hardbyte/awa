@@ -6,6 +6,7 @@ use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
 use serde_json::Value;
+use std::collections::HashMap;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
@@ -47,6 +48,8 @@ async fn seed_runtime_snapshot(pool: &sqlx::PgPool, queue: &str, hostname: &str)
                 overflow_held: Some(1),
                 config: weighted_config(3),
             }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
         },
     )
     .await
@@ -154,6 +157,8 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
                 overflow_held: Some(4),
                 config: weighted_config(5),
             }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
         },
     )
     .await;
@@ -180,6 +185,8 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
                 overflow_held: Some(1),
                 config: weighted_config(3),
             }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
         },
     )
     .await;
@@ -314,6 +321,8 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
                 overflow_held: Some(1),
                 config: weighted_config(3),
             }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
         },
     )
     .await;
@@ -341,6 +350,8 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
                 overflow_held: Some(2),
                 config: weighted_config(5),
             }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
         },
     )
     .await;
@@ -368,6 +379,8 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
                 overflow_held: Some(50),
                 config: weighted_config(9),
             }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
         },
     )
     .await;

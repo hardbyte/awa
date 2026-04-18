@@ -805,6 +805,7 @@ pub struct QueueOverview {
     pub extra: serde_json::Value,
     pub descriptor_last_seen_at: Option<DateTime<Utc>>,
     pub descriptor_stale: bool,
+    pub descriptor_mismatch: bool,
     /// All non-terminal jobs for the queue, including running and waiting_external.
     pub total_queued: i64,
     pub scheduled: i64,
@@ -829,6 +830,7 @@ pub struct JobKindOverview {
     pub extra: serde_json::Value,
     pub descriptor_last_seen_at: Option<DateTime<Utc>>,
     pub descriptor_stale: bool,
+    pub descriptor_mismatch: bool,
     pub job_count: i64,
     pub queue_count: i64,
     pub completed_last_hour: i64,
@@ -890,6 +892,8 @@ pub struct RuntimeSnapshotInput {
     pub leader: bool,
     pub global_max_workers: Option<u32>,
     pub queues: Vec<QueueRuntimeSnapshot>,
+    pub queue_descriptor_hashes: HashMap<String, String>,
+    pub job_kind_descriptor_hashes: HashMap<String, String>,
 }
 
 /// A worker runtime instance as exposed through the admin API.
@@ -1015,10 +1019,12 @@ where
             shutting_down,
             leader,
             global_max_workers,
-            queues
+            queues,
+            queue_descriptor_hashes,
+            job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
@@ -1035,7 +1041,9 @@ where
             shutting_down = EXCLUDED.shutting_down,
             leader = EXCLUDED.leader,
             global_max_workers = EXCLUDED.global_max_workers,
-            queues = EXCLUDED.queues
+            queues = EXCLUDED.queues,
+            queue_descriptor_hashes = EXCLUDED.queue_descriptor_hashes,
+            job_kind_descriptor_hashes = EXCLUDED.job_kind_descriptor_hashes
         "#,
     )
     .bind(snapshot.instance_id)
@@ -1053,6 +1061,8 @@ where
     .bind(snapshot.leader)
     .bind(snapshot.global_max_workers.map(|v| v as i32))
     .bind(Json(&snapshot.queues))
+    .bind(Json(&snapshot.queue_descriptor_hashes))
+    .bind(Json(&snapshot.job_kind_descriptor_hashes))
     .execute(executor)
     .await?;
 
@@ -1239,6 +1249,17 @@ where
             UNION
             SELECT queue FROM awa.queue_descriptors
         ),
+        live_queue_descriptor_variants AS (
+            SELECT
+                descriptor.key AS queue,
+                count(DISTINCT descriptor.value)::bigint AS descriptor_variant_count
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.queue_descriptor_hashes) AS descriptor(key, value)
+            WHERE runtime.last_seen_at + make_interval(
+                secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+            ) >= now()
+            GROUP BY descriptor.key
+        ),
         available_lag AS (
             SELECT
                 queue,
@@ -1271,6 +1292,7 @@ where
                     secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
                 ) < now()
             END AS descriptor_stale,
+            COALESCE(qdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
             COALESCE(qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external, 0) AS total_queued,
             COALESCE(qs.scheduled, 0) AS scheduled,
             COALESCE(qs.available, 0) AS available,
@@ -1284,6 +1306,7 @@ where
         FROM all_queues q
         LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue
         LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
+        LEFT JOIN live_queue_descriptor_variants qdv ON qdv.queue = q.queue
         LEFT JOIN available_lag al ON al.queue = q.queue
         LEFT JOIN completed_recent cr ON cr.queue = q.queue
         LEFT JOIN awa.queue_meta qm ON qm.queue = q.queue
@@ -1678,6 +1701,17 @@ where
             UNION
             SELECT kind FROM awa.job_kind_descriptors
         ),
+        live_kind_descriptor_variants AS (
+            SELECT
+                descriptor.key AS kind,
+                count(DISTINCT descriptor.value)::bigint AS descriptor_variant_count
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.job_kind_descriptor_hashes) AS descriptor(key, value)
+            WHERE runtime.last_seen_at + make_interval(
+                secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+            ) >= now()
+            GROUP BY descriptor.key
+        ),
         completed_recent AS (
             SELECT
                 kind,
@@ -1709,12 +1743,14 @@ where
                     secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
                 ) < now()
             END AS descriptor_stale,
+            COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
             COALESCE(kc.ref_count, 0) AS job_count,
             COALESCE(qc.queue_count, 0) AS queue_count,
             COALESCE(cr.completed_last_hour, 0) AS completed_last_hour
         FROM all_kinds k
         LEFT JOIN awa.job_kind_catalog kc ON kc.kind = k.kind
         LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
+        LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
         LEFT JOIN queue_counts qc ON qc.kind = k.kind
         LEFT JOIN completed_recent cr ON cr.kind = k.kind
         ORDER BY k.kind

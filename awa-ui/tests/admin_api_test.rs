@@ -773,6 +773,132 @@ async fn test_descriptor_endpoints_surface_stale_status() {
 }
 
 #[tokio::test]
+async fn test_descriptor_endpoints_surface_drift_status() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_drift_queue_{suffix}");
+    let kind = format!("api_drift_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new().display_name("Drift queue"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("queue descriptor sync should succeed");
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new().display_name("Drift kind"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("kind descriptor sync should succeed");
+
+    let queue_hash_a = awa_model::QueueDescriptor::new()
+        .display_name("Queue A")
+        .descriptor_hash();
+    let queue_hash_b = awa_model::QueueDescriptor::new()
+        .display_name("Queue B")
+        .descriptor_hash();
+    let kind_hash_a = awa_model::JobKindDescriptor::new()
+        .display_name("Kind A")
+        .descriptor_hash();
+    let kind_hash_b = awa_model::JobKindDescriptor::new()
+        .display_name("Kind B")
+        .descriptor_hash();
+
+    for (instance_id, queue_hash, kind_hash) in [
+        (Uuid::new_v4(), queue_hash_a.as_str(), kind_hash_a.as_str()),
+        (Uuid::new_v4(), queue_hash_b.as_str(), kind_hash_b.as_str()),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO awa.runtime_instances (
+                instance_id,
+                hostname,
+                pid,
+                version,
+                started_at,
+                last_seen_at,
+                snapshot_interval_ms,
+                healthy,
+                postgres_connected,
+                poll_loop_alive,
+                heartbeat_alive,
+                maintenance_alive,
+                shutting_down,
+                leader,
+                global_max_workers,
+                queues,
+                queue_descriptor_hashes,
+                job_kind_descriptor_hashes
+            )
+            VALUES (
+                $1, 'test-host', 1234, 'test', now(), now(), 1000,
+                true, true, true, true, true, false, false, NULL,
+                '[]'::jsonb,
+                jsonb_build_object($2, $3),
+                jsonb_build_object($4, $5)
+            )
+            ON CONFLICT (instance_id) DO UPDATE SET
+                last_seen_at = now(),
+                queue_descriptor_hashes = EXCLUDED.queue_descriptor_hashes,
+                job_kind_descriptor_hashes = EXCLUDED.job_kind_descriptor_hashes
+            "#,
+        )
+        .bind(instance_id)
+        .bind(&queue)
+        .bind(queue_hash)
+        .bind(&kind)
+        .bind(kind_hash)
+        .execute(&pool)
+        .await
+        .expect("runtime snapshot insert should succeed");
+    }
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let queues = get_json(&app, "/api/queues").await;
+    let queue_overview = queues
+        .as_array()
+        .expect("queues payload should be an array")
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue.as_str()))
+        .expect("declared queue should be present");
+    assert_eq!(
+        queue_overview
+            .get("descriptor_mismatch")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let kinds = get_json(&app, "/api/kinds").await;
+    let kind_overview = kinds
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind.as_str()))
+        .expect("declared kind should be present");
+    assert_eq!(
+        kind_overview
+            .get("descriptor_mismatch")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
 async fn test_capabilities_endpoint_reports_writable_mode() {
     let _guard = test_lock().lock().await;
     let pool = setup_pool().await;
