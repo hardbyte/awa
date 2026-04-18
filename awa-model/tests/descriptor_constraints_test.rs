@@ -7,9 +7,10 @@
 //! database with the current schema applied.
 
 use awa_model::admin::{
-    sync_job_kind_descriptors, sync_queue_descriptors, JobKindDescriptor, NamedJobKindDescriptor,
-    NamedQueueDescriptor, QueueDescriptor,
+    cleanup_stale_descriptors, sync_job_kind_descriptors, sync_queue_descriptors,
+    JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
 };
+use chrono::TimeDelta;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::time::Duration;
@@ -198,6 +199,152 @@ async fn job_kind_descriptor_rejects_oversized_docs_url() {
         .await;
         let err = result.expect_err(">2048-char docs_url should violate CHECK");
         assert!(is_check_violation(&err), "unexpected error: {err:?}");
+    })
+    .await;
+}
+
+// ── Retention ────────────────────────────────────────────────────────────
+
+async fn backdate_queue_last_seen(pool: &PgPool, queue: &str, days: i32) {
+    sqlx::query(
+        "UPDATE awa.queue_descriptors \
+         SET last_seen_at = now() - make_interval(days => $2) \
+         WHERE queue = $1",
+    )
+    .bind(queue)
+    .bind(days)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn backdate_kind_last_seen(pool: &PgPool, kind: &str, days: i32) {
+    sqlx::query(
+        "UPDATE awa.job_kind_descriptors \
+         SET last_seen_at = now() - make_interval(days => $2) \
+         WHERE kind = $1",
+    )
+    .bind(kind)
+    .bind(days)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn queue_exists(pool: &PgPool, queue: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM awa.queue_descriptors WHERE queue = $1)",
+    )
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn kind_exists(pool: &PgPool, kind: &str) -> bool {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS(SELECT 1 FROM awa.job_kind_descriptors WHERE kind = $1)",
+    )
+    .bind(kind)
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn cleanup_stale_descriptors_deletes_beyond_window() {
+    with_clean_catalog("retention_", |p| async move {
+        sync_queue_descriptors(
+            &p,
+            &[NamedQueueDescriptor {
+                queue: "retention_old_queue".into(),
+                descriptor: QueueDescriptor::new().display_name("ancient"),
+            }],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+        sync_job_kind_descriptors(
+            &p,
+            &[NamedJobKindDescriptor {
+                kind: "retention_old_kind".into(),
+                descriptor: JobKindDescriptor::new().display_name("ancient"),
+            }],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        backdate_queue_last_seen(&p, "retention_old_queue", 40).await;
+        backdate_kind_last_seen(&p, "retention_old_kind", 40).await;
+
+        let q_deleted = cleanup_stale_descriptors(
+            &p,
+            "awa.queue_descriptors",
+            TimeDelta::try_days(30).unwrap(),
+        )
+        .await
+        .unwrap();
+        let k_deleted = cleanup_stale_descriptors(
+            &p,
+            "awa.job_kind_descriptors",
+            TimeDelta::try_days(30).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(q_deleted, 1, "stale queue descriptor should be deleted");
+        assert_eq!(k_deleted, 1, "stale kind descriptor should be deleted");
+        assert!(!queue_exists(&p, "retention_old_queue").await);
+        assert!(!kind_exists(&p, "retention_old_kind").await);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cleanup_stale_descriptors_preserves_fresh_rows() {
+    with_clean_catalog("retention_", |p| async move {
+        sync_queue_descriptors(
+            &p,
+            &[NamedQueueDescriptor {
+                queue: "retention_fresh_queue".into(),
+                descriptor: QueueDescriptor::new().display_name("fresh"),
+            }],
+            Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        // A just-synced descriptor is well inside the 30-day window.
+        let deleted = cleanup_stale_descriptors(
+            &p,
+            "awa.queue_descriptors",
+            TimeDelta::try_days(30).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(deleted, 0, "fresh descriptor must not be deleted");
+        assert!(queue_exists(&p, "retention_fresh_queue").await);
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn cleanup_stale_descriptors_rejects_unknown_table() {
+    with_clean_catalog("retention_", |p| async move {
+        let result = cleanup_stale_descriptors(
+            &p,
+            "awa.jobs", // not a descriptor catalog
+            TimeDelta::try_days(30).unwrap(),
+        )
+        .await;
+        let err = result.expect_err("unknown table must be rejected");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Validation") || msg.contains("unknown table"),
+            "expected validation error, got {msg}"
+        );
     })
     .await;
 }

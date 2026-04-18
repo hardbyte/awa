@@ -28,6 +28,10 @@ The source-of-truth split matters because the three concerns have different life
 
 Declared-but-empty queues and kinds still appear in the admin surfaces because the catalog is authoritative; before descriptors existed, listings were driven by `queue_state_counts`, so an idle-but-declared queue would disappear from the UI.
 
+### Catalog retention
+
+The maintenance leader also garbage-collects the catalog: descriptor rows whose `last_seen_at` is older than the configured `descriptor_retention` (default 30 days) are deleted on the normal cleanup cycle. This keeps long-running fleets from accumulating descriptors for retired queues and kinds — a worker rollout that stops declaring `legacy_thing` drops that row within 30 days instead of showing it as permanently stale forever. The retention is tunable via `ClientBuilder::descriptor_retention` (Rust) or `AsyncClient.start(..., descriptor_retention_days=...)` (Python); passing `Duration::ZERO` / `0` disables cleanup for operators who manage the catalog externally. Runtime liveness rows in `awa.runtime_instances` are unrelated and already garbage-collected at a shorter 24h horizon — a stale k8s pod name can only contribute to drift detection for ~30s after the pod dies, and drops out of the table entirely within a day.
+
 ### Performance profile
 
 The descriptor surface is deliberately off the hot path:

@@ -419,6 +419,7 @@ class AsyncClient:
         global_max_workers: int | None = None,
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
+        descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,
@@ -428,13 +429,21 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
     ) -> None:
-        """Start the worker runtime."""
+        """Start the worker runtime.
+
+        ``descriptor_retention_days`` controls how long a declared queue
+        or job-kind descriptor can sit un-refreshed before the maintenance
+        leader deletes it from ``awa.queue_descriptors`` /
+        ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
+        disable retention (useful if you manage the catalog externally).
+        """
         return await self._raw.start(
             queues,
             poll_interval_ms=poll_interval_ms,
             global_max_workers=global_max_workers,
             completed_retention_hours=completed_retention_hours,
             failed_retention_hours=failed_retention_hours,
+            descriptor_retention_days=descriptor_retention_days,
             cleanup_batch_size=cleanup_batch_size,
             leader_election_interval_ms=leader_election_interval_ms,
             heartbeat_interval_ms=heartbeat_interval_ms,
