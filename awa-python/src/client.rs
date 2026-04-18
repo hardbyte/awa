@@ -904,7 +904,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -914,6 +914,7 @@ impl PyClient {
         global_max_workers: Option<u32>,
         completed_retention_hours: Option<f64>,
         failed_retention_hours: Option<f64>,
+        descriptor_retention_days: Option<f64>,
         cleanup_batch_size: Option<i64>,
         leader_election_interval_ms: Option<u64>,
         heartbeat_interval_ms: Option<u64>,
@@ -978,6 +979,14 @@ impl PyClient {
                 ));
             }
             builder = builder.failed_retention(Duration::from_secs_f64(hours * 3600.0));
+        }
+        if let Some(days) = descriptor_retention_days {
+            if !days.is_finite() || days < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "descriptor_retention_days must be a non-negative finite number (0 disables)",
+                ));
+            }
+            builder = builder.descriptor_retention(Duration::from_secs_f64(days * 86400.0));
         }
         if let Some(batch_size) = cleanup_batch_size {
             if batch_size <= 0 {

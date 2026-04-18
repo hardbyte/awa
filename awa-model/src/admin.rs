@@ -1110,6 +1110,38 @@ where
     Ok(result.rows_affected())
 }
 
+/// Delete descriptor rows whose `last_seen_at` is older than `max_age`.
+///
+/// Intended to run on the maintenance leader's cleanup cycle — a descriptor
+/// whose declaring code has been retired would otherwise linger in the
+/// catalog forever, showing as permanently stale. Descriptors are
+/// best-effort (no FK from `awa.jobs*`), so deletion is safe: if a worker
+/// later re-declares the same queue / kind, the next sync recreates the
+/// row from the declaration.
+///
+/// `table` must be `awa.queue_descriptors` or `awa.job_kind_descriptors`;
+/// the caller is expected to dispatch both in turn.
+pub async fn cleanup_stale_descriptors<'e, E>(
+    executor: E,
+    table: &str,
+    max_age: Duration,
+) -> Result<u64, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    if !matches!(table, "awa.queue_descriptors" | "awa.job_kind_descriptors") {
+        return Err(AwaError::Validation(format!(
+            "cleanup_stale_descriptors: unknown table {table:?}"
+        )));
+    }
+    let seconds = max(max_age.num_seconds(), 1);
+    // Table name is an authenticated literal from the match above — safe
+    // to interpolate into the statement.
+    let sql = format!("DELETE FROM {table} WHERE last_seen_at < now() - make_interval(secs => $1)");
+    let result = sqlx::query(&sql).bind(seconds).execute(executor).await?;
+    Ok(result.rows_affected())
+}
+
 /// List all runtime instances ordered with leader/live instances first.
 pub async fn list_runtime_instances<'e, E>(executor: E) -> Result<Vec<RuntimeInstance>, AwaError>
 where

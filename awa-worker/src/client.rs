@@ -98,6 +98,7 @@ pub struct ClientBuilder {
     leader_check_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
+    descriptor_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
@@ -127,6 +128,7 @@ impl ClientBuilder {
             leader_check_interval: None,
             completed_retention: None,
             failed_retention: None,
+            descriptor_retention: None,
             cleanup_batch_size: None,
             cleanup_interval: None,
             queue_retention_overrides: HashMap::new(),
@@ -363,6 +365,15 @@ impl ClientBuilder {
         self
     }
 
+    /// How long a descriptor catalog row can go un-refreshed before the
+    /// maintenance leader deletes it (default: 30 days). Pass
+    /// `Duration::ZERO` to disable — the catalog will then accumulate
+    /// rows indefinitely. See [`MaintenanceService::descriptor_retention`].
+    pub fn descriptor_retention(mut self, retention: Duration) -> Self {
+        self.descriptor_retention = Some(retention);
+        self
+    }
+
     /// Set the maximum number of jobs to delete per cleanup pass (default: 1000).
     pub fn cleanup_batch_size(mut self, batch_size: i64) -> Self {
         self.cleanup_batch_size = Some(batch_size);
@@ -517,6 +528,7 @@ impl ClientBuilder {
             leader_check_interval: self.leader_check_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
+            descriptor_retention: self.descriptor_retention,
             cleanup_batch_size: self.cleanup_batch_size,
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
@@ -602,6 +614,7 @@ pub struct Client {
     leader_check_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
+    descriptor_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
@@ -803,6 +816,9 @@ impl Client {
         }
         if let Some(retention) = self.failed_retention {
             maintenance = maintenance.failed_retention(retention);
+        }
+        if let Some(retention) = self.descriptor_retention {
+            maintenance = maintenance.descriptor_retention(retention);
         }
         if let Some(batch_size) = self.cleanup_batch_size {
             maintenance = maintenance.cleanup_batch_size(batch_size);
