@@ -26,6 +26,7 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
 import type { QueueRuntimeSummary } from "@/lib/api";
+import { timeAgo } from "@/lib/time";
 
 export function QueueDetailPage() {
   const { name } = useParams({ strict: false });
@@ -97,6 +98,9 @@ export function QueueDetailPage() {
   const queue = queueQuery.data;
   const runtime = runtimeQuery.data?.find((entry) => entry.queue === queue.queue);
   const title = queue.display_name ?? queue.queue;
+  const descriptorSyncLabel = queue.descriptor_last_seen_at
+    ? timeAgo(queue.descriptor_last_seen_at)
+    : null;
 
   return (
     <div className="space-y-6">
@@ -119,6 +123,7 @@ export function QueueDetailPage() {
         ) : (
           <Badge intent="success">Active</Badge>
         )}
+        {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
       </div>
 
       {queue.description && (
@@ -180,6 +185,17 @@ export function QueueDetailPage() {
                 <DescriptionDetails>{queue.owner}</DescriptionDetails>
               </>
             )}
+
+            <DescriptionTerm>Descriptor sync</DescriptionTerm>
+            <DescriptionDetails>
+              {descriptorSyncLabel ? (
+                <span>
+                  {queue.descriptor_stale ? "Stale" : "Live"} · seen {descriptorSyncLabel}
+                </span>
+              ) : (
+                "Not declared by a live worker"
+              )}
+            </DescriptionDetails>
 
             {queue.docs_url && (
               <>

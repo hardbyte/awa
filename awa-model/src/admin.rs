@@ -545,6 +545,7 @@ pub struct NamedJobKindDescriptor {
 pub async fn sync_queue_descriptors(
     pool: &PgPool,
     descriptors: &[NamedQueueDescriptor],
+    sync_interval: std::time::Duration,
 ) -> Result<(), AwaError> {
     for named in descriptors {
         let hash = named.descriptor.descriptor_hash();
@@ -559,11 +560,12 @@ pub async fn sync_queue_descriptors(
                 tags,
                 extra,
                 descriptor_hash,
+                sync_interval_ms,
                 created_at,
                 updated_at,
                 last_seen_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), now())
             ON CONFLICT (queue) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 description = EXCLUDED.description,
@@ -572,6 +574,7 @@ pub async fn sync_queue_descriptors(
                 tags = EXCLUDED.tags,
                 extra = EXCLUDED.extra,
                 descriptor_hash = EXCLUDED.descriptor_hash,
+                sync_interval_ms = EXCLUDED.sync_interval_ms,
                 updated_at = CASE
                     WHEN awa.queue_descriptors.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash
                     THEN now()
@@ -588,6 +591,7 @@ pub async fn sync_queue_descriptors(
         .bind(&named.descriptor.tags)
         .bind(&named.descriptor.extra)
         .bind(&hash)
+        .bind(sync_interval.as_millis() as i64)
         .execute(pool)
         .await?;
     }
@@ -598,6 +602,7 @@ pub async fn sync_queue_descriptors(
 pub async fn sync_job_kind_descriptors(
     pool: &PgPool,
     descriptors: &[NamedJobKindDescriptor],
+    sync_interval: std::time::Duration,
 ) -> Result<(), AwaError> {
     for named in descriptors {
         let hash = named.descriptor.descriptor_hash();
@@ -612,11 +617,12 @@ pub async fn sync_job_kind_descriptors(
                 tags,
                 extra,
                 descriptor_hash,
+                sync_interval_ms,
                 created_at,
                 updated_at,
                 last_seen_at
             )
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now(), now(), now())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, now(), now(), now())
             ON CONFLICT (kind) DO UPDATE SET
                 display_name = EXCLUDED.display_name,
                 description = EXCLUDED.description,
@@ -625,6 +631,7 @@ pub async fn sync_job_kind_descriptors(
                 tags = EXCLUDED.tags,
                 extra = EXCLUDED.extra,
                 descriptor_hash = EXCLUDED.descriptor_hash,
+                sync_interval_ms = EXCLUDED.sync_interval_ms,
                 updated_at = CASE
                     WHEN awa.job_kind_descriptors.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash
                     THEN now()
@@ -641,6 +648,7 @@ pub async fn sync_job_kind_descriptors(
         .bind(&named.descriptor.tags)
         .bind(&named.descriptor.extra)
         .bind(&hash)
+        .bind(sync_interval.as_millis() as i64)
         .execute(pool)
         .await?;
     }
@@ -795,6 +803,8 @@ pub struct QueueOverview {
     pub docs_url: Option<String>,
     pub tags: Vec<String>,
     pub extra: serde_json::Value,
+    pub descriptor_last_seen_at: Option<DateTime<Utc>>,
+    pub descriptor_stale: bool,
     /// All non-terminal jobs for the queue, including running and waiting_external.
     pub total_queued: i64,
     pub scheduled: i64,
@@ -817,6 +827,8 @@ pub struct JobKindOverview {
     pub docs_url: Option<String>,
     pub tags: Vec<String>,
     pub extra: serde_json::Value,
+    pub descriptor_last_seen_at: Option<DateTime<Utc>>,
+    pub descriptor_stale: bool,
     pub job_count: i64,
     pub queue_count: i64,
     pub completed_last_hour: i64,
@@ -1252,6 +1264,13 @@ where
             qd.docs_url,
             COALESCE(qd.tags, ARRAY[]::text[]) AS tags,
             COALESCE(qd.extra, '{}'::jsonb) AS extra,
+            qd.last_seen_at AS descriptor_last_seen_at,
+            CASE
+                WHEN qd.last_seen_at IS NULL THEN FALSE
+                ELSE qd.last_seen_at + make_interval(
+                    secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
+                ) < now()
+            END AS descriptor_stale,
             COALESCE(qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external, 0) AS total_queued,
             COALESCE(qs.scheduled, 0) AS scheduled,
             COALESCE(qs.available, 0) AS available,
@@ -1683,6 +1702,13 @@ where
             kd.docs_url,
             COALESCE(kd.tags, ARRAY[]::text[]) AS tags,
             COALESCE(kd.extra, '{}'::jsonb) AS extra,
+            kd.last_seen_at AS descriptor_last_seen_at,
+            CASE
+                WHEN kd.last_seen_at IS NULL THEN FALSE
+                ELSE kd.last_seen_at + make_interval(
+                    secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
+                ) < now()
+            END AS descriptor_stale,
             COALESCE(kc.ref_count, 0) AS job_count,
             COALESCE(qc.queue_count, 0) AS queue_count,
             COALESCE(cr.completed_last_hour, 0) AS completed_last_hour

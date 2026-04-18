@@ -501,6 +501,7 @@ async fn test_queues_endpoint_surfaces_descriptors_for_declared_empty_queue() {
                 .docs_url("https://example.test/billing")
                 .tag("critical"),
         }],
+        Duration::from_secs(10),
     )
     .await
     .expect("descriptor sync should succeed");
@@ -544,6 +545,14 @@ async fn test_queues_endpoint_surfaces_descriptors_for_declared_empty_queue() {
             .map(Vec::len),
         Some(1)
     );
+    assert_eq!(
+        queue_stats.get("descriptor_stale").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(queue_stats
+        .get("descriptor_last_seen_at")
+        .and_then(Value::as_str)
+        .is_some());
 
     let detail = get_json(&app, &format!("/api/queues/{queue}")).await;
     assert_eq!(
@@ -575,6 +584,7 @@ async fn test_kinds_endpoint_surfaces_descriptors_for_declared_empty_kind() {
                 .docs_url("https://example.test/reconcile")
                 .tag("billing"),
         }],
+        Duration::from_secs(10),
     )
     .await
     .expect("descriptor sync should succeed");
@@ -602,6 +612,12 @@ async fn test_kinds_endpoint_surfaces_descriptors_for_declared_empty_kind() {
         kind_overview.get("queue_count").and_then(Value::as_i64),
         Some(0)
     );
+    assert_eq!(
+        kind_overview
+            .get("descriptor_stale")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
 }
 
 #[tokio::test]
@@ -621,6 +637,7 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
                 .display_name("Billing")
                 .description("Invoice and payment processing"),
         }],
+        Duration::from_secs(10),
     )
     .await
     .expect("queue descriptor sync should succeed");
@@ -633,6 +650,7 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
                 .display_name("Reconcile invoice")
                 .description("Reconcile invoice state against PSP settlement events"),
         }],
+        Duration::from_secs(10),
     )
     .await
     .expect("kind descriptor sync should succeed");
@@ -671,6 +689,86 @@ async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
             .and_then(|value| value.get("display_name"))
             .and_then(Value::as_str),
         Some("Reconcile invoice")
+    );
+}
+
+#[tokio::test]
+async fn test_descriptor_endpoints_surface_stale_status() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_stale_queue_{suffix}");
+    let kind = format!("api_stale_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new().display_name("Stale queue"),
+        }],
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("queue descriptor sync should succeed");
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new().display_name("Stale kind"),
+        }],
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("kind descriptor sync should succeed");
+
+    sqlx::query(
+        "UPDATE awa.queue_descriptors SET last_seen_at = now() - interval '5 minutes' WHERE queue = $1",
+    )
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("queue descriptor age update should succeed");
+
+    sqlx::query(
+        "UPDATE awa.job_kind_descriptors SET last_seen_at = now() - interval '5 minutes' WHERE kind = $1",
+    )
+    .bind(&kind)
+    .execute(&pool)
+    .await
+    .expect("kind descriptor age update should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let queues = get_json(&app, "/api/queues").await;
+    let queue_overview = queues
+        .as_array()
+        .expect("queues payload should be an array")
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue.as_str()))
+        .expect("declared queue should be present");
+    assert_eq!(
+        queue_overview
+            .get("descriptor_stale")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let kinds = get_json(&app, "/api/kinds").await;
+    let kind_overview = kinds
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind.as_str()))
+        .expect("declared kind should be present");
+    assert_eq!(
+        kind_overview
+            .get("descriptor_stale")
+            .and_then(Value::as_bool),
+        Some(true)
     );
 }
 
