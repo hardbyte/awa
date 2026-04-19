@@ -2,7 +2,7 @@
 
 mod bench_output;
 
-use awa::model::{AwaError, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome};
+use awa::model::{migrations, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome};
 use bench_output::{BenchLatency, BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
@@ -11,17 +11,81 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-fn database_url() -> String {
+fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
-async fn pool_with(max_conns: u32) -> sqlx::PgPool {
-    PgPoolOptions::new()
-        .max_connections(max_conns)
-        .connect(&database_url())
+fn replace_database_name(url: &str, database_name: &str) -> String {
+    let (without_query, query_suffix) = match url.split_once('?') {
+        Some((prefix, query)) => (prefix, Some(query)),
+        None => (url, None),
+    };
+    let (base, _) = without_query
+        .rsplit_once('/')
+        .expect("database URL should include a database name");
+    let mut out = format!("{base}/{database_name}");
+    if let Some(query) = query_suffix {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+fn database_name(url: &str) -> String {
+    let without_query = url.split_once('?').map(|(prefix, _)| prefix).unwrap_or(url);
+    without_query
+        .rsplit_once('/')
+        .map(|(_, database_name)| database_name.to_string())
+        .expect("database URL should include a database name")
+}
+
+fn validate_database_name(database_name: &str) {
+    assert!(
+        !database_name.is_empty()
+            && database_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "queue_storage benchmark database names must use only [A-Za-z0-9_]"
+    );
+}
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL_QUEUE_STORAGE")
+        .unwrap_or_else(|_| replace_database_name(&base_database_url(), "awa_test_queue_storage"))
+}
+
+async fn ensure_database_exists(url: &str) {
+    let database_name = database_name(url);
+    validate_database_name(&database_name);
+    let admin_url = replace_database_name(url, "postgres");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
         .await
-        .expect("Failed to connect to database")
+        .expect("Failed to connect to admin database for queue_storage benchmarks");
+    let create_sql = format!("CREATE DATABASE {database_name}");
+    match sqlx::query(&create_sql).execute(&admin_pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+        Err(err) => panic!(
+            "Failed to create queue_storage benchmark database {database_name}: {err}"
+        ),
+    }
+}
+
+async fn pool_with(max_conns: u32) -> sqlx::PgPool {
+    let url = database_url();
+    ensure_database_exists(&url).await;
+    let pool = PgPoolOptions::new()
+        .max_connections(max_conns)
+        .connect(&url)
+        .await
+        .expect("Failed to connect to database");
+    migrations::run(&pool)
+        .await
+        .expect("Failed to run queue_storage benchmark migrations");
+    pool
 }
 
 fn env_u32(name: &str, default: u32) -> u32 {
@@ -55,6 +119,7 @@ struct QueueStorageSample {
     ready_dead_tup: i64,
     done_dead_tup: i64,
     leases_dead_tup: i64,
+    attempt_state_dead_tup: i64,
     queue_prune_ok: u64,
     queue_prune_blocked: u64,
     queue_prune_skipped_active: u64,
@@ -72,6 +137,7 @@ struct QueueStorageSnapshot {
     ready_dead_tup: i64,
     done_dead_tup: i64,
     leases_dead_tup: i64,
+    attempt_state_dead_tup: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize)]
@@ -80,6 +146,7 @@ struct ExactDeadTuples {
     ready: i64,
     done: i64,
     leases: i64,
+    attempt_state: i64,
 }
 
 #[derive(Default)]
@@ -167,6 +234,7 @@ async fn sample_exact_dead_tuples(
         ready: sample_pgstattuple_dead_tuples(pool, store.schema(), "ready_entries_%").await?,
         done: sample_pgstattuple_dead_tuples(pool, store.schema(), "done_entries_%").await?,
         leases: sample_pgstattuple_dead_tuples(pool, store.schema(), "leases_%").await?,
+        attempt_state: sample_pgstattuple_dead_tuples(pool, store.schema(), "attempt_state").await?,
     })
 }
 
@@ -196,6 +264,7 @@ async fn sample_snapshot(
     let ready_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "ready_entries_%").await;
     let done_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "done_entries_%").await;
     let leases_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "leases_%").await;
+    let attempt_state_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "attempt_state").await;
 
     QueueStorageSnapshot {
         available: counts.available,
@@ -205,6 +274,7 @@ async fn sample_snapshot(
         ready_dead_tup,
         done_dead_tup,
         leases_dead_tup,
+        attempt_state_dead_tup,
     }
 }
 
@@ -705,6 +775,7 @@ async fn test_queue_storage_storage_benchmark() {
             ready_dead_tup: snapshot.ready_dead_tup,
             done_dead_tup: snapshot.done_dead_tup,
             leases_dead_tup: snapshot.leases_dead_tup,
+            attempt_state_dead_tup: snapshot.attempt_state_dead_tup,
             queue_prune_ok: maintenance_counters.queue_prune_ok.load(Ordering::Relaxed),
             queue_prune_blocked: maintenance_counters
                 .queue_prune_blocked
@@ -722,7 +793,7 @@ async fn test_queue_storage_storage_benchmark() {
         };
 
         println!(
-            "[queue storage] second={:>2} seeded={} completed={} (+{}) available={} running={} dead(q_lanes/ready/done/leases)={}/{}/{}/{} queue_prune_ok={} queue_prune_blocked={} lease_prune_ok={} lease_prune_blocked={}",
+            "[queue storage] second={:>2} seeded={} completed={} (+{}) available={} running={} dead(q_lanes/ready/done/leases/attempt)={}/{}/{}/{}/{} queue_prune_ok={} queue_prune_blocked={} lease_prune_ok={} lease_prune_blocked={}",
             sample.second,
             sample.seeded_total,
             sample.completed_total,
@@ -733,6 +804,7 @@ async fn test_queue_storage_storage_benchmark() {
             sample.ready_dead_tup,
             sample.done_dead_tup,
             sample.leases_dead_tup,
+            sample.attempt_state_dead_tup,
             sample.queue_prune_ok,
             sample.queue_prune_blocked,
             sample.lease_prune_ok,
@@ -781,13 +853,15 @@ async fn test_queue_storage_storage_benchmark() {
                 + sample.ready_dead_tup
                 + sample.done_dead_tup
                 + sample.leases_dead_tup
+                + sample.attempt_state_dead_tup
         })
         .max()
         .unwrap_or(0);
     let final_total_dead_tup = final_snapshot.queue_lanes_dead_tup
         + final_snapshot.ready_dead_tup
         + final_snapshot.done_dead_tup
-        + final_snapshot.leases_dead_tup;
+        + final_snapshot.leases_dead_tup
+        + final_snapshot.attempt_state_dead_tup;
 
     let claim_latencies = claim_latencies_ms
         .lock()
@@ -824,12 +898,13 @@ async fn test_queue_storage_storage_benchmark() {
     );
     if let Some(exact) = final_exact_dead {
         println!(
-            "[queue storage] exact_dead_tuples queue_lanes={} ready={} done={} leases={} total={}",
+            "[queue storage] exact_dead_tuples queue_lanes={} ready={} done={} leases={} attempt_state={} total={}",
             exact.queue_lanes,
             exact.ready,
             exact.done,
             exact.leases,
-            exact.queue_lanes + exact.ready + exact.done + exact.leases,
+            exact.attempt_state,
+            exact.queue_lanes + exact.ready + exact.done + exact.leases + exact.attempt_state,
         );
     } else {
         println!("[queue storage] exact_dead_tuples unavailable");
@@ -878,13 +953,14 @@ async fn test_queue_storage_storage_benchmark() {
             "baseline_completed_per_s": baseline_rate,
             "overlap_completed_per_s": overlap_rate,
             "cooldown_completed_per_s": cooldown_rate,
-            "initial_total_dead_tup": initial.queue_lanes_dead_tup + initial.ready_dead_tup + initial.done_dead_tup + initial.leases_dead_tup,
+            "initial_total_dead_tup": initial.queue_lanes_dead_tup + initial.ready_dead_tup + initial.done_dead_tup + initial.leases_dead_tup + initial.attempt_state_dead_tup,
             "max_total_dead_tup": max_total_dead_tup,
             "final_total_dead_tup": final_total_dead_tup,
             "final_queue_lanes_dead_tup": final_snapshot.queue_lanes_dead_tup,
             "final_ready_dead_tup": final_snapshot.ready_dead_tup,
             "final_done_dead_tup": final_snapshot.done_dead_tup,
             "final_leases_dead_tup": final_snapshot.leases_dead_tup,
+            "final_attempt_state_dead_tup": final_snapshot.attempt_state_dead_tup,
             "exact_final_dead_tuples": final_exact_dead,
             "queue_prune_ok": maintenance_counters.queue_prune_ok.load(Ordering::Relaxed),
             "queue_prune_blocked": maintenance_counters.queue_prune_blocked.load(Ordering::Relaxed),

@@ -8,8 +8,8 @@ Accepted
 
 ADR-019 changes the physical storage of progress. The user-facing progress
 model in this ADR stays the same, but queue storage persists progress inside
-the lease/runtime payload rather than dedicated `progress` columns on
-`jobs_hot` and `scheduled_jobs`.
+`attempt_state` and `active_leases` rather than dedicated `progress` columns
+on `jobs_hot` and `scheduled_jobs`.
 
 ## Context
 

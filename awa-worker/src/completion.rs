@@ -3,15 +3,33 @@ use crate::storage::RuntimeStorage;
 use awa_model::AwaError;
 use sqlx::PgPool;
 use std::collections::HashSet;
+use std::env;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 const COMPLETION_BATCH_SIZE: usize = 512;
-const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
-const COMPLETION_SHARDS: usize = 8;
+
+fn completion_flush_interval() -> Duration {
+    env::var("AWA_COMPLETION_FLUSH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(1))
+}
+
+fn completion_shards(storage: &RuntimeStorage) -> usize {
+    env::var("AWA_COMPLETION_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| match storage {
+            RuntimeStorage::Canonical => 8,
+            RuntimeStorage::QueueStorage(_) => 4,
+        })
+}
 const COMPLETE_BATCH_SQL: &str = r#"
     WITH completed (id, run_lease) AS (
         SELECT * FROM unnest($1::bigint[], $2::bigint[])
@@ -76,10 +94,12 @@ impl CompletionBatcher {
         metrics: crate::metrics::AwaMetrics,
         storage: RuntimeStorage,
     ) -> (Self, CompletionBatcherHandle) {
-        let mut shards = Vec::with_capacity(COMPLETION_SHARDS);
-        let mut workers = Vec::with_capacity(COMPLETION_SHARDS);
+        let shard_count = completion_shards(&storage);
+        let flush_interval = completion_flush_interval();
+        let mut shards = Vec::with_capacity(shard_count);
+        let mut workers = Vec::with_capacity(shard_count);
 
-        for shard_id in 0..COMPLETION_SHARDS {
+        for shard_id in 0..shard_count {
             let (tx, rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
             shards.push(tx);
             workers.push(CompletionWorker {
@@ -89,6 +109,7 @@ impl CompletionBatcher {
                 cancel: cancel.clone(),
                 metrics: metrics.clone(),
                 storage: storage.clone(),
+                flush_interval,
             });
         }
 
@@ -110,6 +131,7 @@ struct CompletionWorker {
     cancel: CancellationToken,
     metrics: crate::metrics::AwaMetrics,
     storage: RuntimeStorage,
+    flush_interval: Duration,
 }
 
 impl CompletionWorker {
@@ -128,7 +150,7 @@ impl CompletionWorker {
                     }
                 }
             } else {
-                let timer = tokio::time::sleep(COMPLETION_FLUSH_INTERVAL);
+                let timer = tokio::time::sleep(self.flush_interval);
                 tokio::pin!(timer);
 
                 tokio::select! {

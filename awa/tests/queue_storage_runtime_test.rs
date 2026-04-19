@@ -18,15 +18,75 @@ use tokio::sync::Mutex;
 
 static QUEUE_STORAGE_RUNTIME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-fn database_url() -> String {
+fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
+fn replace_database_name(url: &str, database_name: &str) -> String {
+    let (without_query, query_suffix) = match url.split_once('?') {
+        Some((prefix, query)) => (prefix, Some(query)),
+        None => (url, None),
+    };
+    let (base, _) = without_query
+        .rsplit_once('/')
+        .expect("database URL should include a database name");
+    let mut out = format!("{base}/{database_name}");
+    if let Some(query) = query_suffix {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+fn database_name(url: &str) -> String {
+    let without_query = url.split_once('?').map(|(prefix, _)| prefix).unwrap_or(url);
+    without_query
+        .rsplit_once('/')
+        .map(|(_, database_name)| database_name.to_string())
+        .expect("database URL should include a database name")
+}
+
+fn validate_database_name(database_name: &str) {
+    assert!(
+        !database_name.is_empty()
+            && database_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "queue_storage test database names must use only [A-Za-z0-9_]"
+    );
+}
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL_QUEUE_STORAGE")
+        .unwrap_or_else(|_| replace_database_name(&base_database_url(), "awa_test_queue_storage"))
+}
+
+async fn ensure_database_exists(url: &str) {
+    let database_name = database_name(url);
+    validate_database_name(&database_name);
+    let admin_url = replace_database_name(url, "postgres");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("Failed to connect to admin database for queue_storage tests");
+    let create_sql = format!("CREATE DATABASE {database_name}");
+    match sqlx::query(&create_sql).execute(&admin_pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+        Err(err) => panic!(
+            "Failed to create queue_storage test database {database_name}: {err}"
+        ),
+    }
+}
+
 async fn setup_pool(max_connections: u32) -> sqlx::PgPool {
+    let url = database_url();
+    ensure_database_exists(&url).await;
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
-        .connect(&database_url())
+        .connect(&url)
         .await
         .expect("Failed to connect to database");
     migrations::run(&pool)
@@ -54,6 +114,14 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     store.install(pool).await.expect("Failed to install store");
     store.reset(pool).await.expect("Failed to reset store");
     store
+}
+
+async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!("SELECT count(*)::bigint FROM {}.attempt_state", store.schema());
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count attempt_state rows")
 }
 
 fn queue_storage_client<W: Worker + 'static>(
@@ -211,6 +279,17 @@ async fn dlq_reason(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) -> S
     .expect("Failed to fetch dlq reason")
 }
 
+fn failed_unique_insert_opts(queue: &str) -> InsertOpts {
+    InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(awa::UniqueOpts {
+            states: 1 << JobState::Failed.bit_position(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct RetryJob {
     id: i64,
@@ -299,6 +378,27 @@ impl Worker for TerminalFailureWorker {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct CompleteJob {
+    id: i64,
+}
+
+struct BlockingCompleteWorker {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Worker for BlockingCompleteWorker {
+    fn kind(&self) -> &'static str {
+        "complete_job"
+    }
+
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        self.release.notified().await;
+        Ok(JobResult::Completed)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_retry_after() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -341,6 +441,72 @@ async fn test_queue_storage_runtime_retry_after() {
     assert_eq!(completed.attempt, 2);
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_attempt_state_short_job";
+    let schema = "awa_qs_runtime_attempt_state_short";
+    let store = create_store(&pool, schema).await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        BlockingCompleteWorker {
+            release: release.clone(),
+        },
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start short-job client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+
+    release.notify_waiters();
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+
+    client
+        .shutdown(Duration::from_secs(5))
+        .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -701,5 +867,247 @@ async fn test_queue_storage_dlq_api_round_trip() {
             .await
             .expect("Failed to resample dlq depth"),
         0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_done() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_discard_failed_done";
+    let schema = "awa_qs_discard_failed_done";
+    let store = create_store(&pool, schema).await;
+    let opts = failed_unique_insert_opts(queue);
+    let job_id = enqueue_job(&pool, &store, &DlqJob { id: 7 }, opts.clone()).await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        TerminalFailureWorker,
+    );
+    client
+        .start()
+        .await
+        .expect("Failed to start discard-failed client");
+
+    let failed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(failed.state, JobState::Failed);
+    client.shutdown(Duration::from_secs(5)).await;
+
+    assert_eq!(failed_done_count(&pool, &store, queue).await, 1);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("Failed to sample queue counts")
+            .completed,
+        1
+    );
+
+    let discarded = admin::discard_failed(&pool, TerminalFailureWorker.kind())
+        .await
+        .expect("Failed to discard failed jobs");
+    assert_eq!(discarded, 1);
+    assert_eq!(failed_done_count(&pool, &store, queue).await, 0);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("Failed to resample queue counts")
+            .completed,
+        0
+    );
+
+    let reinserted = insert::insert_with(&pool, &DlqJob { id: 7 }, opts)
+        .await
+        .expect("discard_failed should release failed-state unique claims");
+    assert_eq!(reinserted.state, JobState::Available);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_discard_failed_dlq";
+    let schema = "awa_qs_discard_failed_dlq";
+    let store = create_store(&pool, schema).await;
+    let opts = failed_unique_insert_opts(queue);
+    let job_id = enqueue_job(&pool, &store, &DlqJob { id: 8 }, opts.clone()).await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(TerminalFailureWorker)
+        .dlq_enabled_by_default(true)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build discard-failed dlq client");
+    client
+        .start()
+        .await
+        .expect("Failed to start discard-failed dlq client");
+
+    let failed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(failed.state, JobState::Failed);
+    client.shutdown(Duration::from_secs(5)).await;
+
+    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+
+    let discarded = admin::discard_failed(&pool, TerminalFailureWorker.kind())
+        .await
+        .expect("Failed to discard dlq jobs");
+    assert_eq!(discarded, 1);
+    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+
+    let reinserted = insert::insert_with(&pool, &DlqJob { id: 8 }, opts)
+        .await
+        .expect("discard_failed should release dlq unique claims");
+    assert_eq!(reinserted.state, JobState::Available);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_jobs_view_compat";
+    let schema = "awa_qs_jobs_view_compat";
+    let store = create_store(&pool, schema).await;
+
+    let available_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, metadata, tags)
+        VALUES ($1, $2, $3, 'available', $4, $5)
+        RETURNING id
+        "#,
+    )
+    .bind("raw_view_available")
+    .bind(queue)
+    .bind(serde_json::json!({"id": 9}))
+    .bind(serde_json::json!({"source": "raw_view"}))
+    .bind(vec!["raw".to_string()])
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to insert available row through awa.jobs");
+
+    let scheduled_id: i64 = sqlx::query_scalar(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES ($1, $2, $3, 'scheduled', now() + interval '5 minutes')
+        RETURNING id
+        "#,
+    )
+    .bind("raw_view_scheduled")
+    .bind(queue)
+    .bind(serde_json::json!({"id": 10}))
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to insert scheduled row through awa.jobs");
+
+    let jobs: Vec<JobRow> = sqlx::query_as("SELECT * FROM awa.jobs WHERE queue = $1 ORDER BY id")
+        .bind(queue)
+        .fetch_all(&pool)
+        .await
+        .expect("Failed to read queue_storage rows through awa.jobs");
+    assert_eq!(jobs.len(), 2);
+    assert_eq!(jobs[0].id, available_id);
+    assert_eq!(jobs[0].state, JobState::Available);
+    assert_eq!(jobs[0].metadata["source"], serde_json::json!("raw_view"));
+    assert_eq!(jobs[0].tags, vec!["raw".to_string()]);
+    assert_eq!(jobs[1].id, scheduled_id);
+    assert_eq!(jobs[1].state, JobState::Scheduled);
+
+    let ready_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count ready entries");
+    assert_eq!(ready_count, 1);
+
+    let deferred_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count deferred rows");
+    assert_eq!(deferred_count, 1);
+
+    let deleted = sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("Failed to delete queue_storage rows through awa.jobs")
+        .rows_affected();
+
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs WHERE queue = $1")
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .expect("Failed to count remaining awa.jobs rows");
+    let ready_after_delete: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to recount ready entries");
+    let deferred_after_delete: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to recount deferred rows");
+    assert_eq!(remaining, 0);
+    assert_eq!(ready_after_delete, 0);
+    assert_eq!(deferred_after_delete, 0);
+    assert_eq!(
+        deleted, 0,
+        "Postgres reports zero rows for this INSTEAD OF DELETE view path even when the underlying queue rows are removed"
     );
 }

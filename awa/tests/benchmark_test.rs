@@ -85,6 +85,10 @@ async fn sample_pgstattuple_dead_tuples(
 
 /// Clean only jobs and queue_meta for a specific queue.
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to clear active queue storage backend");
     sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
         .bind(queue)
         .execute(pool)
@@ -104,6 +108,10 @@ async fn reset_runtime_state(pool: &sqlx::PgPool) {
     .execute(pool)
     .await
     .expect("Failed to reset runtime benchmark state");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to clear active queue storage backend");
 }
 
 #[derive(Debug, Clone)]
@@ -642,17 +650,21 @@ async fn test_throughput_rust_workers_queue_storage() {
                 sample_pgstattuple_dead_tuples(&pool, store.schema(), "done_entries_%").await;
             let leases_dead =
                 sample_pgstattuple_dead_tuples(&pool, store.schema(), "leases_%").await;
+            let attempt_state_dead =
+                sample_pgstattuple_dead_tuples(&pool, store.schema(), "attempt_state").await;
 
             println!(
-                "[bench-va] exact_dead_tuples queue_lanes={} ready={} done={} leases={} total={}",
+                "[bench-va] exact_dead_tuples queue_lanes={} ready={} done={} leases={} attempt_state={} total={}",
                 queue_lanes_dead.unwrap_or(-1),
                 ready_dead.unwrap_or(-1),
                 done_dead.unwrap_or(-1),
                 leases_dead.unwrap_or(-1),
+                attempt_state_dead.unwrap_or(-1),
                 queue_lanes_dead.unwrap_or(0)
                     + ready_dead.unwrap_or(0)
                     + done_dead.unwrap_or(0)
-                    + leases_dead.unwrap_or(0),
+                    + leases_dead.unwrap_or(0)
+                    + attempt_state_dead.unwrap_or(0),
             );
 
             assert!(

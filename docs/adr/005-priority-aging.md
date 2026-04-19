@@ -9,7 +9,8 @@ Accepted
 The starvation-prevention policy in this ADR still applies under ADR-019. The
 implementation detail changes: the canonical engine ages rows in place on
 `awa.jobs_hot`, while the queue storage engine must age work by moving entries
-between queue lanes/segments rather than rewriting a single hot heap row.
+between `lane_state`-tracked segments rather than rewriting a single hot heap
+row.
 
 ## Context
 
