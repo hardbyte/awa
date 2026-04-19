@@ -12,6 +12,15 @@ const databaseUrl =
   process.env.DATABASE_URL ??
   "postgres://postgres:test@localhost:15432/awa_test";
 const queueStorageSchema = "awa_e2e_qs";
+const queueSlotCount = 16;
+const leaseSlotCount = 8;
+
+function ringSlotRows(count: number): string {
+  return Array.from({ length: count }, (_, slot) => {
+    const generation = slot === 0 ? 0 : -1;
+    return `(${slot}, ${generation})`;
+  }).join(",\n      ");
+}
 
 export default async function globalSetup() {
   try {
@@ -28,10 +37,56 @@ export default async function globalSetup() {
   const port = pgUrl.port || "5432";
   const db = pgUrl.pathname.slice(1);
   const user = pgUrl.username;
+  const queueRingSlotRows = ringSlotRows(queueSlotCount);
+  const leaseRingSlotRows = ringSlotRows(leaseSlotCount);
 
   const sql = `
     DROP SCHEMA IF EXISTS ${queueStorageSchema} CASCADE;
     CREATE SCHEMA ${queueStorageSchema};
+
+    CREATE SEQUENCE ${queueStorageSchema}.job_id_seq;
+
+    CREATE TABLE ${queueStorageSchema}.queue_ring_state (
+      singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+      current_slot INT NOT NULL,
+      generation   BIGINT NOT NULL,
+      slot_count   INT NOT NULL
+    );
+
+    INSERT INTO ${queueStorageSchema}.queue_ring_state (
+      singleton, current_slot, generation, slot_count
+    )
+    VALUES (TRUE, 0, 0, ${queueSlotCount});
+
+    CREATE TABLE ${queueStorageSchema}.queue_ring_slots (
+      slot       INT PRIMARY KEY,
+      generation BIGINT NOT NULL
+    );
+
+    INSERT INTO ${queueStorageSchema}.queue_ring_slots (slot, generation)
+    VALUES
+      ${queueRingSlotRows};
+
+    CREATE TABLE ${queueStorageSchema}.lease_ring_state (
+      singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+      current_slot INT NOT NULL,
+      generation   BIGINT NOT NULL,
+      slot_count   INT NOT NULL
+    );
+
+    INSERT INTO ${queueStorageSchema}.lease_ring_state (
+      singleton, current_slot, generation, slot_count
+    )
+    VALUES (TRUE, 0, 0, ${leaseSlotCount});
+
+    CREATE TABLE ${queueStorageSchema}.lease_ring_slots (
+      slot       INT PRIMARY KEY,
+      generation BIGINT NOT NULL
+    );
+
+    INSERT INTO ${queueStorageSchema}.lease_ring_slots (slot, generation)
+    VALUES
+      ${leaseRingSlotRows};
 
     CREATE TABLE ${queueStorageSchema}.queue_lanes (
       queue           TEXT NOT NULL,

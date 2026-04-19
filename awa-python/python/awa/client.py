@@ -555,10 +555,11 @@ class AsyncClient:
         ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
         disable retention (useful if you manage the catalog externally).
 
-        Set ``queue_storage_schema`` to run this worker against the queue
-        storage engine. All workers on the same database should agree on the
-        active storage engine; mixed canonical and queue-storage fleets are
-        not supported during normal operation.
+        Workers run against the queue-storage engine by default. Set
+        ``queue_storage_schema`` to override the schema name; all workers on
+        the same database should agree on that active queue-storage schema.
+        Mixed canonical and queue-storage fleets are not supported during
+        normal operation.
         """
         return await self._raw.start(
             queues,

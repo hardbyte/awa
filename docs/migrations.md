@@ -309,6 +309,7 @@ awa --database-url "$DATABASE_URL" migrate
 awa --database-url "$DATABASE_URL" storage status
 
 # 3. Roll out workers
+#    (On the queue-storage branch, Rust and Python worker runtimes default to queue storage.)
 # 4. Verify runtime health / queue stats
 awa --database-url "$DATABASE_URL" queue stats
 ```

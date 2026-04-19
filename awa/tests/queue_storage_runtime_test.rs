@@ -685,6 +685,149 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_admin_runtime";
+    let schema = "awa_qs_admin_runtime";
+    let store = create_store(&pool, schema).await;
+    let release = Arc::new(tokio::sync::Notify::new());
+
+    let running_job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 91 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let failed_job_id = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 92 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(BlockingCompleteWorker {
+            release: release.clone(),
+        })
+        .register_worker(TerminalFailureWorker)
+        .dlq_enabled_by_default(true)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build queue_storage admin client");
+    client
+        .start()
+        .await
+        .expect("Failed to start queue_storage admin client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        running_job_id,
+        &[JobState::Running],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+
+    let failed = wait_for_job_state(
+        &store,
+        &pool,
+        failed_job_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(failed.state, JobState::Failed);
+
+    let queues = admin::queue_overviews(&pool)
+        .await
+        .expect("Failed to load queue overviews");
+    let queue_overview = queues
+        .iter()
+        .find(|overview| overview.queue == queue)
+        .expect("Missing queue overview for queue_storage queue");
+    assert_eq!(queue_overview.running, 1);
+    assert_eq!(queue_overview.failed, 1);
+    assert_eq!(queue_overview.total_queued, 1);
+
+    let job_kinds = admin::job_kind_overviews(&pool)
+        .await
+        .expect("Failed to load job kind overviews");
+    let complete_kind = job_kinds
+        .iter()
+        .find(|overview| overview.kind == "complete_job")
+        .expect("Missing complete_job kind overview");
+    assert_eq!(complete_kind.job_count, 1);
+    assert_eq!(complete_kind.queue_count, 1);
+    let failed_kind = job_kinds
+        .iter()
+        .find(|overview| overview.kind == "dlq_job")
+        .expect("Missing dlq_job kind overview");
+    assert_eq!(failed_kind.job_count, 1);
+    assert_eq!(failed_kind.queue_count, 1);
+
+    let running_jobs = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Running),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to list running queue_storage jobs");
+    assert_eq!(running_jobs.len(), 1);
+    assert_eq!(running_jobs[0].id, running_job_id);
+
+    let failed_jobs = admin::list_jobs(
+        &pool,
+        &admin::ListJobsFilter {
+            state: Some(JobState::Failed),
+            queue: Some(queue.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to list failed queue_storage jobs");
+    assert_eq!(failed_jobs.len(), 1);
+    assert_eq!(failed_jobs[0].id, failed_job_id);
+
+    release.notify_waiters();
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;

@@ -48,7 +48,7 @@ groups:
                   now() AS time,
                   queue,
                   EXTRACT(EPOCH FROM (now() - min(run_at)))::float8 AS value
-                FROM awa.jobs_hot
+                FROM awa.jobs
                 WHERE state = 'available'
                 GROUP BY queue
               format: time_series
@@ -105,10 +105,10 @@ groups:
                 SELECT
                   now() AS time,
                   COALESCE(
-                    (SELECT count(*)::float FROM awa.jobs_hot
+                    (SELECT count(*)::float FROM awa.jobs
                        WHERE state = 'failed' AND finalized_at > now() - interval '5 minutes')
                     / GREATEST(
-                      (SELECT count(*)::float FROM awa.jobs_hot
+                      (SELECT count(*)::float FROM awa.jobs
                          WHERE state IN ('completed', 'failed')
                            AND finalized_at > now() - interval '5 minutes'),
                       1

@@ -58,7 +58,7 @@ The maintenance leader also garbage-collects the catalog: descriptor rows whose 
 
 The descriptor surface is deliberately off the hot path:
 
-- **Dispatcher, claim query, completion batcher, heartbeat, maintenance rescue** — none of these touch `awa.queue_descriptors`, `awa.job_kind_descriptors`, or the descriptor-hash columns on `awa.runtime_instances`. The claim query still hits `awa.jobs_hot` + `awa.queue_meta` only, so latency on the job lifecycle is unchanged.
+- **Dispatcher, claim query, completion batcher, heartbeat, maintenance rescue** — none of these touch `awa.queue_descriptors`, `awa.job_kind_descriptors`, or the descriptor-hash columns on `awa.runtime_instances`. The hot path now hits queue-storage lane / lease / attempt-state tables plus `awa.queue_meta`, so descriptor sync still stays off the execution path.
 - **Startup and steady-state sync** — `ClientBuilder::build()` / `AsyncClient.start()` and every `runtime_snapshot_interval` tick (default 10 s) call `sync_queue_descriptors` / `sync_job_kind_descriptors`. Both are batched: all declared descriptors go into a single multi-row `INSERT ... ON CONFLICT` statement (chunked at 5000 rows to stay well under Postgres' 65k-parameter limit). Measured end-to-end against a local Postgres: ~2 ms / 10 descriptors, ~4.5 ms / 100, ~8 ms / 500, ~24 ms / 2000. That's a single round-trip per call at realistic fleet sizes and the per-descriptor cost drops sharply with batch size (from ~200 µs at n=10 to ~12 µs at n=2000 as the fixed round-trip overhead amortises). Sync runs on a separate pool connection from the dispatcher, so it cannot starve job processing.
 - **BLAKE3 hash cost** — hashes are computed per descriptor on each tick from the canonicalized JSON body. For a ~200 byte descriptor this is well under 1 µs; the total hash work per tick stays in the low-microsecond range even for hundreds of descriptors.
 - **Read side** — `admin::queue_overviews` and `admin::job_kind_overviews` grew a CTE that scans `runtime_instances` and `CROSS JOIN LATERAL jsonb_each_text(...)` on the per-runtime hash columns. Measured at 0.2 ms against 100 queues + 34 live-runtime rows (buffer-cache resident). The computation is O(live_runtimes × declared_descriptors_per_runtime), so very large fleets (≥1000 runtimes × ≥500 descriptors) will want a materialised view here, but the read path already sits behind the `/api/queues` cache layer so this is bounded by TTL rather than polling frequency.
@@ -157,20 +157,27 @@ awa_model::insert() / insert_with() / insert_many()
     ▼
 INSERT INTO awa.jobs (...) VALUES (...)
     │
-    ├── `awa.jobs` is a compatibility view
-    ├── available/immediate rows route to `awa.jobs_hot`
-    ├── future `scheduled` / `retryable` rows route to `awa.scheduled_jobs`
-    ├── unique_key computed via BLAKE3 (if UniqueOpts provided)
-    └── TRIGGER: pg_notify('awa:<queue>', '') fires on hot available jobs
+    ├── `awa.jobs` / `awa.insert_job_compat()` remain compatibility surfaces
+    ├── immediate rows append into `{schema}.ready_entries`
+    ├── future `scheduled` / `retryable` rows append into `{schema}.deferred_jobs`
+    ├── uniqueness claims live in `awa.job_unique_claims`
+    └── `pg_notify('awa:<queue>', '')` wakes dispatchers for newly-ready work
 ```
 
-`awa.jobs` preserves raw SQL compatibility for tests, admin queries, and non-Rust producers, but dispatch and promotion use the physical tables directly so the planner only touches the hot runnable set on the execution path.
+`awa.jobs` preserves raw SQL compatibility for tests, admin queries, and
+non-Rust producers, but the worker runtime itself operates on queue-storage
+tables in the active schema recorded in `awa.runtime_storage_backends`.
+Immediate jobs become immutable ready entries; deferred jobs become immutable
+deferred rows; only the lease/control plane remains mutable.
 
-Insert accepts a `PgExecutor`, so it works inside an existing transaction — the job becomes visible only when the outer transaction commits. This is the transactional enqueue pattern.
+Insert accepts a `PgExecutor`, so it works inside an existing transaction — the
+job becomes visible only when the outer transaction commits. This is the
+transactional enqueue pattern.
 
 ### Batch Insert via COPY
 
-For high-throughput ingestion (10K+ jobs), `insert_many_copy` uses PostgreSQL's COPY protocol via a staging table approach (see ADR-008):
+For high-throughput ingestion (10K+ jobs), `insert_many_copy` uses PostgreSQL's
+COPY protocol via a staging table approach (see ADR-008):
 
 ```
 insert_many_copy(conn, jobs)
@@ -178,14 +185,16 @@ insert_many_copy(conn, jobs)
     ├── CREATE TEMP TABLE IF NOT EXISTS pg_temp.awa_copy_staging (...) ON COMMIT DELETE ROWS
     ├── TRUNCATE pg_temp.awa_copy_staging
     ├── COPY pg_temp.awa_copy_staging FROM STDIN (CSV)
-    ├── INSERT INTO awa.jobs_hot / awa.scheduled_jobs
-    │     (or `awa.jobs` for mixed-state batches)
-    │     SELECT ... FROM staging
+    ├── route staged rows through `awa.insert_job_compat(...)`
+    │     into the active queue-storage schema
     └── unique rows use per-row savepoints to skip duplicates without aborting the batch
         RETURNING *
 ```
 
-The staging table is session-local and reused across transactions so repeated COPY calls avoid temp-table catalog churn. Accepts `&mut PgConnection`, so it works within caller-managed transactions. `insert_many_copy_from_pool` is a convenience wrapper that manages its own transaction.
+The staging table is session-local and reused across transactions so repeated
+COPY calls avoid temp-table catalog churn. Accepts `&mut PgConnection`, so it
+works within caller-managed transactions. `insert_many_copy_from_pool` is a
+convenience wrapper that manages its own transaction.
 
 ### Poll and Claim (Dispatcher)
 
@@ -205,18 +214,11 @@ Dispatcher::run()
             │
             ▼
             Claim query:
-              UPDATE awa.jobs_hot
-              SET state='running', attempt=attempt+1, run_lease=run_lease+1, ...
-              FROM (
-                SELECT id FROM awa.jobs_hot
-                WHERE state='available' AND queue=$1 AND run_at<=now()
-                  AND NOT EXISTS (SELECT 1 FROM awa.queue_meta WHERE queue=$1 AND paused=TRUE)
-                ORDER BY priority ASC, run_at ASC, id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED             ◄── concurrent-safe dispatch
-              ) AS claimed
-              WHERE awa.jobs_hot.id = claimed.id
-              RETURNING awa.jobs_hot.*
+              lock lane state (`queue_lanes`) for queue + priority
+              lock `lease_ring_state` FOR SHARE
+              read the next runnable entry from the current ready segment
+              INSERT an active lease in the current lease segment
+              hydrate the runtime job from the immutable ready entry + lease
             │
             ├── Release excess permits (if DB returned fewer jobs)
             ├── Consume rate limit tokens
@@ -224,17 +226,23 @@ Dispatcher::run()
             For each claimed job + permit → executor.execute(job)
 ```
 
-Permits are pre-acquired before the DB claim to guarantee every `running` job has a reserved execution slot. `FOR UPDATE SKIP LOCKED` ensures that multiple workers polling the same queue never claim the same job. The subquery uses the `idx_awa_jobs_hot_dequeue` partial index on `(queue, priority, run_at, id) WHERE state = 'available'`, keeping the claim query planner-friendly even under large hot backlogs.
+Permits are pre-acquired before the DB claim to guarantee every `running` job
+has a reserved execution slot. The claim path is cursor-based rather than a
+scan over a mutable heap: `claim_seq` on each lane chooses the next lane-local
+ready entry, while the lease insert records the exact `(job_id, run_lease,
+ready_slot, ready_generation, lease_slot, lease_generation)` snapshot used by
+completion and rescue.
 
-The dispatch query uses strict priority ordering (`priority ASC, run_at ASC, id ASC`). Cross-priority fairness is handled separately by the maintenance leader's `age_waiting_priorities` task, which periodically decrements the `priority` column for long-waiting available jobs. This keeps the claim query simple while ensuring lower-priority jobs are gradually promoted.
+Dispatch still uses strict priority ordering by `(queue, priority, lane_seq)`.
+Cross-priority fairness is handled separately by the maintenance leader's
+priority-aging task, which lowers priority values for long-waiting ready work.
 
-The hot/deferred split keeps deferred frontiers out of the hot dispatch heap,
-but it does not eliminate MVCC pressure on `awa.jobs_hot`. Long-lived snapshots
-on the same primary can still pin the MVCC horizon while handlers and cleanup
-continue to churn rows. In practice that means Awa benefits from the same
-Postgres discipline as any high-churn queue table: keep analytical reads short,
-prefer replicas for long-running read-only work, and watch `pg_stat_user_tables`
-for dead-tuple growth if cleanup falls behind.
+Ready segments stay append-only, so MVCC churn is concentrated in rotating
+lease segments and the optional `attempt_state` table. That moves Awa off the
+old “one hot heap row per lifecycle transition” failure mode, but Postgres
+discipline still matters: long-lived readers can pin old lease or terminal
+segments and delay prune, so keep analytical reads short and prefer replicas
+for long-running read-only work.
 
 ### Execute (Executor)
 
@@ -249,54 +257,79 @@ tokio::spawn(async {
     worker.perform(&job, &ctx)         ◄── dispatch to registered handler
     │
     ▼
-    complete_job(pool, job, &result)    ◄── lease-guarded finalize, batched for Completed
+    complete_job(pool, job, &result)    ◄── lease-guarded finalize using the claim snapshot
     │
     ├── Ok(true):  state transitioned → record metrics
     ├── Ok(false): already rescued/cancelled → skip metrics
     └── Err:       DB error → log error
     │
-    ├── Ok(Completed)    → state = 'completed'
-    ├── Ok(RetryAfter)   → state = 'retryable', run_at = now() + duration
-    ├── Ok(Snooze)       → state = 'scheduled', attempt -= 1
-    ├── Ok(Cancel)       → state = 'cancelled'
-    ├── Err(Terminal)    → state = 'failed'
-    └── Err(Retryable)   → state = 'retryable' (with backoff) or 'failed' (if max attempts)
+    ├── Ok(Completed)    → append `terminal_entries`, delete the active lease
+    ├── Ok(RetryAfter)   → append `deferred_jobs`, delete the active lease
+    ├── Ok(Snooze)       → append `deferred_jobs` without advancing attempt
+    ├── Ok(Cancel)       → append terminal `cancelled`
+    ├── Err(Terminal)    → append terminal `failed` or route to `dlq_entries`
+    └── Err(Retryable)   → append deferred retry or terminal failure, then release lease
     │
     ▼
     in_flight.remove(job_id)
 })
 ```
 
-Backoff uses a database-side function `awa.backoff_duration(attempt, max_attempts)` implementing exponential backoff with jitter, capped at 24 hours. See [ADR-003](adr/003-heartbeat-deadline-hybrid.md) for the crash recovery design that drives retry timing.
+Backoff uses a database-side function `awa.backoff_duration(attempt,
+max_attempts)` implementing exponential backoff with jitter, capped at 24
+hours. See [ADR-003](adr/003-heartbeat-deadline-hybrid.md) for the crash
+recovery design that drives retry timing.
 
 ### Progress Tracking
 
-Handlers can report structured progress during execution via an in-memory buffer that is flushed to Postgres on each heartbeat cycle and atomically with state transitions.
+Handlers can report structured progress during execution via an in-memory
+buffer that is flushed to Postgres on each heartbeat cycle and atomically with
+state transitions.
 
 Three flush paths:
 
-1. **Heartbeat piggyback** — on every heartbeat cycle, jobs with pending progress updates get a combined `SET heartbeat_at = now(), progress = v.progress` query. Jobs without changes get the original heartbeat-only query. At most two queries per cycle regardless of job count.
+1. **Heartbeat piggyback** — on every heartbeat cycle, jobs with pending
+   progress updates get a combined lease-heartbeat + `attempt_state` upsert.
+   Jobs without changes still use the heartbeat-only path. At most two queries
+   per cycle regardless of job count.
 
-2. **State-transition atomic** — when `complete_job()` runs, the latest progress snapshot is included in the same UPDATE that transitions state.
+2. **State-transition atomic** — when `complete_job()` runs, the latest
+   progress snapshot is carried into the same queue-storage transaction that
+   appends terminal/deferred rows and removes the lease.
 
-3. **Explicit flush** — `ctx.flush_progress()` performs a direct `UPDATE jobs_hot SET progress = $2 WHERE id = $1 AND run_lease = $3`. This is the reliable path for critical checkpoints.
+3. **Explicit flush** — `ctx.flush_progress()` upserts
+   `{schema}.attempt_state(job_id, run_lease, progress)` guarded by the active
+   lease. This is the reliable path for critical checkpoints.
 
 ```
 ctx.set_progress(50, "halfway")       ──► ProgressState.latest updated, generation bumped
 ctx.update_metadata({"cursor": N})    ──► metadata shallow-merged, generation bumped
 
 heartbeat_once()                      ──► if generation > acked_generation:
-                                            flush progress with heartbeat (batched)
+                                            heartbeat active lease
+                                            upsert attempt_state.progress (batched)
                                             ack generation on success
 
-ctx.flush_progress()                  ──► direct UPDATE, ack generation on success
+ctx.flush_progress()                  ──► direct attempt_state upsert, ack generation on success
 
-complete_job(result, progress_snapshot) ──► progress included in state transition UPDATE
+complete_job(result, progress_snapshot) ──► progress included in the terminal/deferred append
 ```
 
-**Storage:** The `progress` column is a nullable JSONB on both `jobs_hot` and `scheduled_jobs`, structured as `{"percent": 0-100, "message": "...", "metadata": {...}}`. The `metadata` sub-object is shallow-merged on each `update_metadata` call — top-level keys overwrite, nested objects are replaced.
+**Storage:** While a job is actively running, progress lives in
+`{schema}.attempt_state.progress` keyed by `(job_id, run_lease)`. When the
+attempt leaves the execution path, the latest snapshot is copied into the
+payload on the deferred / terminal row. Short jobs can therefore complete
+without ever allocating `attempt_state`, while long-running or callback-heavy
+jobs still have durable checkpoints.
 
-**Buffer design:** Each in-flight job has an `Arc<Mutex<ProgressState>>` shared between the handler and the heartbeat service. The buffer tracks a `generation` counter (bumped on mutation) and an `acked_generation` (advanced when Postgres confirms the write). The heartbeat service snapshots pending progress into an `in_flight` field before flushing, preventing double-snapshots and enabling retry on failure without data loss. `std::sync::Mutex` is used (not tokio) because the critical section is pure in-memory JSON assembly with no async work.
+**Buffer design:** Each in-flight job has an `Arc<Mutex<ProgressState>>` shared
+between the handler and the heartbeat service. The buffer tracks a
+`generation` counter (bumped on mutation) and an `acked_generation` (advanced
+when Postgres confirms the write). The heartbeat service snapshots pending
+progress into an `in_flight` field before flushing, preventing double-snapshots
+and enabling retry on failure without data loss. `std::sync::Mutex` is used
+(not tokio) because the critical section is pure in-memory JSON assembly with
+no async work.
 
 **Lifecycle semantics:**
 
@@ -308,22 +341,37 @@ complete_job(result, progress_snapshot) ──► progress included in state tra
 | Cancel | Preserved (operator inspection) |
 | WaitForCallback | Preserved |
 | Failed (terminal or exhausted) | Preserved (operator inspection) |
-| Rescue (stale heartbeat / deadline / callback timeout) | Preserved (implicit via view trigger) |
+| Rescue (stale heartbeat / deadline / callback timeout) | Preserved |
 
-On retry, the handler can read the previous attempt's checkpoint from `ctx.job.progress` and resume work from where it left off.
+On retry, the handler can read the previous attempt's checkpoint from
+`ctx.job.progress` and resume work from where it left off.
 
 ### State Guard on Completion
 
-Every running attempt carries a durable `run_lease` token that is incremented at claim time. Heartbeats, callback registration, and finalization all match on `id`, `state = 'running'`, and `run_lease`, so a stale worker cannot mutate a newer running attempt of the same job ID. If `rows_affected() == 0`, the job was already rescued, reclaimed, or cancelled — the stale result is silently discarded. Metrics are only recorded when the guarded transition succeeds.
+Every running attempt carries a durable `run_lease` token that is incremented
+at claim time. Heartbeats, callback registration, and finalization all match
+on `job_id` and `run_lease`, so a stale worker cannot mutate a newer running
+attempt of the same job ID. If the guarded update affects zero rows, the job
+was already rescued, reclaimed, or cancelled — the stale result is silently
+discarded. Metrics are only recorded when the guarded transition succeeds.
 
-Successful `Completed` outcomes are flushed through a small batched finalizer. The worker does not release local in-flight tracking or capacity until the batch flush acknowledges success or stale rejection, so shutdown drain and heartbeat semantics still match the correctness model. Locally, in-flight attempts are tracked in a sharded registry keyed by `(job_id, run_lease)` rather than a single global lock, which preserves the lease model while reducing executor/heartbeat contention.
+Successful `Completed` outcomes are flushed through a small batched finalizer.
+The worker does not release local in-flight tracking or capacity until the
+batch flush acknowledges success or stale rejection, so shutdown drain and
+heartbeat semantics still match the correctness model. Locally, in-flight
+attempts are tracked in a sharded registry keyed by `(job_id, run_lease)`
+rather than a single global lock, which preserves the lease model while
+reducing executor/heartbeat contention.
 
 ### External Callbacks and Sequential Waits
 
 External callback support has two related execution patterns:
 
-1. `JobResult::WaitForCallback` parks the job in `waiting_external` and releases the handler task.
-2. `ctx.wait_for_callback(token)` / `job.wait_for_callback(token)` parks the job in `waiting_external` but keeps the same handler task alive so it can resume in-process and continue with later steps.
+1. `JobResult::WaitForCallback` parks the job in `waiting_external` and
+   releases the handler task.
+2. `ctx.wait_for_callback(token)` / `job.wait_for_callback(token)` parks the
+   job in `waiting_external` but keeps the same handler task alive so it can
+   resume in-process and continue with later steps.
 
 Sequential waits work like this:
 
@@ -344,48 +392,64 @@ wait_for_callback(...)
 
 Two details matter for correctness:
 
-- `wait_for_callback` is token-specific. It only waits on the callback ID it registered and rejects stale tokens once a new callback is registered.
-- `resume_external` is accepted while the job is still `running` as well as `waiting_external`, so an early callback can win the race before the handler finishes its transition into `waiting_external`.
+- `wait_for_callback` is token-specific. It only waits on the callback ID it
+  registered and rejects stale tokens once a new callback is registered.
+- `resume_external` is accepted while the job is still `running` as well as
+  `waiting_external`, so an early callback can win the race before the handler
+  finishes its transition into `waiting_external`.
 
 This is the behavior captured by the callback TLA+ model.
 
 ### HTTP Callback Receiver
 
-`awa-ui` can expose callback receiver endpoints for `HttpWorker` and other external systems:
+`awa-ui` can expose callback receiver endpoints for `HttpWorker` and other
+external systems:
 
 - `POST /api/callbacks/:callback_id/complete`
 - `POST /api/callbacks/:callback_id/fail`
 - `POST /api/callbacks/:callback_id/heartbeat`
 
-When `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) is configured on `awa serve`, these endpoints require a valid `X-Awa-Signature` header derived from the callback ID using the shared 32-byte BLAKE3 key.
+When `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) is configured on
+`awa serve`, these endpoints require a valid `X-Awa-Signature` header derived
+from the callback ID using the shared 32-byte BLAKE3 key.
 
 ### Promotion (Scheduled → Available)
 
-Future-dated and retryable jobs live in `awa.scheduled_jobs` until their `run_at` time arrives. The maintenance leader promotes due jobs into the hot table in bounded batches, using partial due-time indexes so large deferred frontiers do not require scanning the execution table:
+Future-dated and retryable jobs live in `{schema}.deferred_jobs` until their
+`run_at` time arrives. The maintenance leader promotes due rows in bounded
+batches by materializing fresh ready entries in the current ready segment:
 
 ```
 WITH due AS (
-    DELETE FROM awa.scheduled_jobs
-    WHERE id IN (
-        SELECT id
-        FROM awa.scheduled_jobs
-        WHERE state = 'retryable' AND run_at <= now()
-        ORDER BY run_at ASC, id ASC
+    DELETE FROM {schema}.deferred_jobs
+    WHERE ctid IN (
+        SELECT ctid
+        FROM {schema}.deferred_jobs
+        WHERE state IN ('scheduled', 'retryable') AND run_at <= now()
+        ORDER BY run_at ASC, job_id ASC
         LIMIT ...
         FOR UPDATE SKIP LOCKED
     )
     RETURNING *
 )
-INSERT INTO awa.jobs_hot (...)
+INSERT INTO {schema}.ready_entries (...)
 SELECT ..., 'available', ...
 FROM due
 ```
 
 ### Uniqueness
 
-Jobs can declare uniqueness constraints via `UniqueOpts`. The unique key is a BLAKE3 hash of the job kind plus optional queue, args, and time-period components. A separate `awa.job_unique_claims` table holds one row per active claim, enforced by a unique index. Triggers on both `jobs_hot` and `scheduled_jobs` insert/remove claims as jobs transition between states.
+Jobs can declare uniqueness constraints via `UniqueOpts`. The unique key is a
+BLAKE3 hash of the job kind plus optional queue, args, and time-period
+components. A separate `awa.job_unique_claims` table holds one row per active
+claim, enforced by a unique index.
 
-Each job carries a `unique_states` bitmask (BIT(8)) specifying which states count as "active" for uniqueness purposes (default: scheduled, available, running, completed, retryable). A job only holds a uniqueness claim while its current state is set in its bitmask. This allows the hot and deferred tables to share one uniqueness boundary without keeping all jobs in a single heap.
+Each job carries a `unique_states` bitmask (BIT(8)) specifying which states
+count as "active" for uniqueness purposes (default: scheduled, available,
+running, completed, retryable). Queue storage acquires or releases
+`awa.job_unique_claims` as it appends ready/deferred/terminal/DLQ rows, so the
+uniqueness boundary survives retries and storage rotation without one giant
+mutable jobs heap.
 
 ## Queue Concurrency Modes
 
@@ -592,7 +656,13 @@ Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch 
 
 ### Queue Statistics (SQL)
 
-The `admin::queue_stats()` function is a hybrid read: per-state counts come from the `queue_state_counts` cache table (eventually consistent, ~2s lag from the maintenance leader's dirty-key recompute), while `lag_seconds` and `completed_last_hour` are computed live from `jobs_hot`. The cache is maintained by dirty-key statement triggers on `jobs_hot` and `scheduled_jobs` that mark touched queues/kinds for targeted recompute — no synchronous counter updates on the hot path. For exact cached counts (e.g., in tests), call `flush_dirty_admin_metadata()` first. Full reconciliation via `refresh_admin_metadata()` runs every ~60s as a safety net.
+The `admin::queue_overviews()` / `queue stats` read path is hybrid. Under the
+queue-storage engine, the function first resolves the active schema from
+`awa.runtime_storage_backends`, then reads live queue state through the
+compatibility CTE over ready, deferred, lease, terminal, and DLQ rows. The old
+`queue_state_counts` cache table still exists for backward compatibility, but
+queue-storage workers no longer depend on trigger-maintained counters on
+`jobs_hot` / `scheduled_jobs` to keep operator views fresh.
 
 ## Web UI
 

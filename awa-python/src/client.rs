@@ -1298,38 +1298,36 @@ impl PyClient {
         if let Some(ms) = callback_rescue_interval_ms {
             builder = builder.callback_rescue_interval(Duration::from_millis(ms));
         }
-        if let Some(schema) = queue_storage_schema {
-            if queue_storage_queue_slot_count == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "queue_storage_queue_slot_count must be > 0",
-                ));
-            }
-            if queue_storage_lease_slot_count == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "queue_storage_lease_slot_count must be > 0",
-                ));
-            }
-            if queue_storage_queue_rotate_interval_ms == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "queue_storage_queue_rotate_interval_ms must be > 0",
-                ));
-            }
-            if queue_storage_lease_rotate_interval_ms == 0 {
-                return Err(pyo3::exceptions::PyValueError::new_err(
-                    "queue_storage_lease_rotate_interval_ms must be > 0",
-                ));
-            }
-
-            builder = builder.queue_storage(
-                QueueStorageConfig {
-                    schema,
-                    queue_slot_count: queue_storage_queue_slot_count as usize,
-                    lease_slot_count: queue_storage_lease_slot_count as usize,
-                },
-                Duration::from_millis(queue_storage_queue_rotate_interval_ms),
-                Duration::from_millis(queue_storage_lease_rotate_interval_ms),
-            );
+        if queue_storage_queue_slot_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_queue_slot_count must be > 0",
+            ));
         }
+        if queue_storage_lease_slot_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_lease_slot_count must be > 0",
+            ));
+        }
+        if queue_storage_queue_rotate_interval_ms == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_queue_rotate_interval_ms must be > 0",
+            ));
+        }
+        if queue_storage_lease_rotate_interval_ms == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_lease_rotate_interval_ms must be > 0",
+            ));
+        }
+
+        builder = builder.queue_storage(
+            QueueStorageConfig {
+                schema: queue_storage_schema.unwrap_or_else(|| QueueStorageConfig::default().schema),
+                queue_slot_count: queue_storage_queue_slot_count as usize,
+                lease_slot_count: queue_storage_lease_slot_count as usize,
+            },
+            Duration::from_millis(queue_storage_queue_rotate_interval_ms),
+            Duration::from_millis(queue_storage_lease_rotate_interval_ms),
+        );
 
         for entry in &entries {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
