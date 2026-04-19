@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from enum import IntEnum
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
@@ -45,6 +46,22 @@ class QueueStat:
 class CallbackToken:
     @property
     def id(self) -> str: ...
+
+class DlqEntry:
+    """An entry in the Dead Letter Queue.
+
+    Combines the original `Job` snapshot with DLQ-specific metadata (reason
+    for moving, timestamp, and the run_lease of the final attempt).
+    """
+
+    @property
+    def job(self) -> Job[dict[str, Any]]: ...
+    @property
+    def reason(self) -> str: ...
+    @property
+    def dlq_at(self) -> Any: ...  # datetime.datetime
+    @property
+    def original_run_lease(self) -> int: ...
 
 class Job(Generic[T]):
     @property
@@ -252,6 +269,14 @@ class Client:
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def migrate(self) -> None: ...
+    async def install_queue_storage(
+        self,
+        *,
+        schema: str = "awa_py",
+        queue_slot_count: int = 4,
+        lease_slot_count: int = 2,
+        reset: bool = False,
+    ) -> None: ...
     async def transaction(self) -> Transaction: ...
     def worker(
         self,
@@ -290,6 +315,98 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     async def get_job(self, job_id: int) -> Job[dict[str, Any]]: ...
+    async def list_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list[DlqEntry]: ...
+    def list_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list[DlqEntry]: ...
+    async def get_dlq_job(self, job_id: int) -> DlqEntry | None: ...
+    def get_dlq_job_sync(self, job_id: int) -> DlqEntry | None: ...
+    async def dlq_depth(self, *, queue: str | None = None) -> int: ...
+    def dlq_depth_sync(self, *, queue: str | None = None) -> int: ...
+    async def dlq_depth_by_queue(self) -> list[tuple[str, int]]: ...
+    def dlq_depth_by_queue_sync(self) -> list[tuple[str, int]]: ...
+    async def retry_from_dlq(
+        self,
+        job_id: int,
+        *,
+        run_at: datetime.datetime | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job[dict[str, Any]] | None: ...
+    def retry_from_dlq_sync(
+        self,
+        job_id: int,
+        *,
+        run_at: datetime.datetime | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job[dict[str, Any]] | None: ...
+    async def bulk_retry_from_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
+    def bulk_retry_from_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
+    async def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None: ...
+    def move_failed_to_dlq_sync(self, job_id: int, reason: str) -> DlqEntry | None: ...
+    async def bulk_move_failed_to_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+        allow_all: bool = False,
+    ) -> int: ...
+    def bulk_move_failed_to_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+        allow_all: bool = False,
+    ) -> int: ...
+    async def purge_dlq_job(self, job_id: int) -> bool: ...
+    def purge_dlq_job_sync(self, job_id: int) -> bool: ...
+    async def purge_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
+    def purge_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
     async def health_check(self) -> HealthCheck: ...
     async def insert_many_copy(
         self,
@@ -380,6 +497,14 @@ class Client:
     ) -> Job[dict[str, Any]]: ...
     def close_sync(self) -> None: ...
     def migrate_sync(self) -> None: ...
+    def install_queue_storage_sync(
+        self,
+        *,
+        schema: str = "awa_py",
+        queue_slot_count: int = 4,
+        lease_slot_count: int = 2,
+        reset: bool = False,
+    ) -> None: ...
     def transaction_sync(self) -> SyncTransaction: ...
     def retry_sync(self, job_id: int) -> Job[dict[str, Any]] | None: ...
     def cancel_sync(self, job_id: int) -> Job[dict[str, Any]] | None: ...

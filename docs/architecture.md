@@ -111,7 +111,29 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 
 Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled).
 
+The Dead Letter Queue is not a dispatchable `job_state`. On DLQ-enabled queues,
+terminal failures are materialized as separate rows in queue-storage
+`dlq_entries`, preserving the failed snapshot plus DLQ metadata while keeping
+that history off the runnable path. See [ADR-020](adr/020-dead-letter-queue.md).
+
 Jobs carry an optional `progress` JSONB column that handlers can write during execution. Progress is cleared to NULL on completion but preserved across all other transitions (retry, snooze, cancel, fail, rescue), enabling checkpoint-based resumption on retry.
+
+## Dead Letter Queue
+
+Queue storage keeps DLQ rows in a dedicated append-only table,
+`{schema}.dlq_entries`.
+
+- Runtime routing moves terminal failures and exhausted callback-timeout
+  attempts into `dlq_entries` on DLQ-enabled queues.
+- Admin moves can backfill already-failed terminal rows into the DLQ after a
+  queue opts in.
+- Retry deletes the DLQ row and reinserts a fresh ready or deferred entry with
+  `attempt = 0` and `run_lease = 0`.
+- Purge deletes the DLQ row permanently.
+
+This separation lets Awa keep forensic failure history out of the hot claim and
+lease paths while giving operators an explicit retry/purge surface in the CLI,
+REST API, Python bindings, and Web UI.
 
 ## Data Flow
 

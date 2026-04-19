@@ -11,11 +11,13 @@ or migration from the 0.4.x ``_sync`` pattern.
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any, Awaitable, Callable, TypeVar
 
 from awa._awa import (
     CallbackToken,
     Client as RawClient,
+    DlqEntry,
     HealthCheck,
     Job,
     QueueStat,
@@ -120,6 +122,22 @@ class AsyncClient:
         """Run database migrations."""
         return await self._raw.migrate()
 
+    async def install_queue_storage(
+        self,
+        *,
+        schema: str = "awa_py",
+        queue_slot_count: int = 4,
+        lease_slot_count: int = 2,
+        reset: bool = False,
+    ) -> None:
+        """Install or select a queue-storage backend schema for this database."""
+        return await self._raw.install_queue_storage(
+            schema=schema,
+            queue_slot_count=queue_slot_count,
+            lease_slot_count=lease_slot_count,
+            reset=reset,
+        )
+
     async def transaction(self) -> Transaction:
         """Start an async transaction (use as async context manager)."""
         return await self._raw.transaction()
@@ -194,6 +212,101 @@ class AsyncClient:
         """List jobs with optional filters."""
         return await self._raw.list_jobs(
             state=state, kind=kind, queue=queue, limit=limit
+        )
+
+    # --- Dead Letter Queue -------------------------------------------------
+    #
+    # DLQ rows live in queue_storage `dlq_entries`, outside the hot claim
+    # path. These methods expose the operator-level admin surface: inspect,
+    # retry, move failed jobs in, and purge. See `awa-model/src/dlq.rs` for
+    # semantics.
+
+    async def list_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list["DlqEntry"]:
+        """List DLQ entries, newest first. `before_id` enables cursor pagination."""
+        return await self._raw.list_dlq(
+            kind=kind, queue=queue, tag=tag, before_id=before_id, limit=limit
+        )
+
+    async def get_dlq_job(self, job_id: int) -> "DlqEntry | None":
+        """Fetch a DLQ entry by id. Returns None if not in the DLQ."""
+        return await self._raw.get_dlq_job(job_id)
+
+    async def dlq_depth(self, *, queue: str | None = None) -> int:
+        """Total DLQ row count, optionally filtered by queue."""
+        return await self._raw.dlq_depth(queue=queue)
+
+    async def dlq_depth_by_queue(self) -> list[tuple[str, int]]:
+        """DLQ row counts grouped by queue (descending)."""
+        return await self._raw.dlq_depth_by_queue()
+
+    async def retry_from_dlq(
+        self,
+        job_id: int,
+        *,
+        run_at: dt.datetime | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job | None:
+        """Revive a DLQ'd job back to `available` (or `scheduled` if run_at is future)."""
+        return await self._raw.retry_from_dlq(
+            job_id, run_at=run_at, priority=priority, queue=queue
+        )
+
+    async def bulk_retry_from_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int:
+        """Bulk-retry DLQ rows matching the filter. Returns revived count."""
+        return await self._raw.bulk_retry_from_dlq(
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+        )
+
+    async def move_failed_to_dlq(
+        self, job_id: int, reason: str
+    ) -> "DlqEntry | None":
+        """Move an already-failed job into the DLQ."""
+        return await self._raw.move_failed_to_dlq(job_id, reason)
+
+    async def bulk_move_failed_to_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+        allow_all: bool = False,
+    ) -> int:
+        """Bulk-move failed jobs into the DLQ."""
+        return await self._raw.bulk_move_failed_to_dlq(
+            kind=kind, queue=queue, reason=reason, allow_all=allow_all
+        )
+
+    async def purge_dlq_job(self, job_id: int) -> bool:
+        """Delete a single DLQ row. Returns True if it was deleted."""
+        return await self._raw.purge_dlq_job(job_id)
+
+    async def purge_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int:
+        """Bulk-delete DLQ rows matching the filter."""
+        return await self._raw.purge_dlq(
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
         )
 
     async def health_check(self) -> HealthCheck:
@@ -536,6 +649,22 @@ class Client:
         """Run database migrations."""
         return self._raw.migrate_sync()
 
+    def install_queue_storage(
+        self,
+        *,
+        schema: str = "awa_py",
+        queue_slot_count: int = 4,
+        lease_slot_count: int = 2,
+        reset: bool = False,
+    ) -> None:
+        """Install or select a queue-storage backend schema for this database."""
+        return self._raw.install_queue_storage_sync(
+            schema=schema,
+            queue_slot_count=queue_slot_count,
+            lease_slot_count=lease_slot_count,
+            reset=reset,
+        )
+
     def transaction(self) -> SyncTransaction:
         """Start a sync transaction (use as context manager)."""
         return self._raw.transaction_sync()
@@ -649,4 +778,92 @@ class Client:
         """Resolve a callback with optional CEL expression evaluation."""
         return self._raw.resolve_callback_sync(
             callback_id, payload=payload, default_action=default_action
+        )
+
+    # --- Dead Letter Queue (sync) -----------------------------------------
+
+    def list_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        limit: int = 100,
+    ) -> list[DlqEntry]:
+        """List DLQ entries, newest first."""
+        return self._raw.list_dlq_sync(
+            kind=kind, queue=queue, tag=tag, before_id=before_id, limit=limit
+        )
+
+    def get_dlq_job(self, job_id: int) -> DlqEntry | None:
+        """Fetch a DLQ entry by id."""
+        return self._raw.get_dlq_job_sync(job_id)
+
+    def dlq_depth(self, *, queue: str | None = None) -> int:
+        """Total DLQ depth, optionally filtered by queue."""
+        return self._raw.dlq_depth_sync(queue=queue)
+
+    def dlq_depth_by_queue(self) -> list[tuple[str, int]]:
+        """DLQ depth grouped by queue."""
+        return self._raw.dlq_depth_by_queue_sync()
+
+    def retry_from_dlq(
+        self,
+        job_id: int,
+        *,
+        run_at: dt.datetime | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job | None:
+        """Revive a DLQ'd job."""
+        return self._raw.retry_from_dlq_sync(
+            job_id, run_at=run_at, priority=priority, queue=queue
+        )
+
+    def bulk_retry_from_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int:
+        """Bulk-retry DLQ rows matching the filter."""
+        return self._raw.bulk_retry_from_dlq_sync(
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+        )
+
+    def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None:
+        """Move an already-failed job into the DLQ."""
+        return self._raw.move_failed_to_dlq_sync(job_id, reason)
+
+    def bulk_move_failed_to_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+        allow_all: bool = False,
+    ) -> int:
+        """Bulk-move failed jobs into the DLQ."""
+        return self._raw.bulk_move_failed_to_dlq_sync(
+            kind=kind, queue=queue, reason=reason, allow_all=allow_all
+        )
+
+    def purge_dlq_job(self, job_id: int) -> bool:
+        """Delete a single DLQ row."""
+        return self._raw.purge_dlq_job_sync(job_id)
+
+    def purge_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int:
+        """Bulk-delete DLQ rows matching the filter."""
+        return self._raw.purge_dlq_sync(
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
         )

@@ -224,6 +224,44 @@ Pay particular attention to:
 If you want to reproduce the behavior locally before changing settings, run the
 MVCC benchmark documented in `docs/benchmarking.md`.
 
+## Something's In The DLQ
+
+The Dead Letter Queue is where terminal failures land when a queue has DLQ
+enabled. These rows are never claimed. Operators retry them, purge them, or let
+retention remove them.
+
+Quick checks:
+
+```bash
+awa --database-url "$DATABASE_URL" dlq depth
+awa --database-url "$DATABASE_URL" dlq list --limit 20
+awa --database-url "$DATABASE_URL" dlq list --queue email
+```
+
+`dlq_reason` tells you how the row got there:
+
+- `terminal_error`
+- `max_attempts_exhausted`
+- `callback_timeout`
+- an operator-supplied reason from `awa dlq move`
+
+Useful actions:
+
+```bash
+awa --database-url "$DATABASE_URL" dlq retry <job-id>
+awa --database-url "$DATABASE_URL" dlq retry-bulk --queue email
+awa --database-url "$DATABASE_URL" dlq purge --queue email
+awa --database-url "$DATABASE_URL" dlq move --queue email --reason backfill
+```
+
+If DLQ depth is growing quickly:
+
+- inspect a few rows and compare `dlq_reason`
+- sample `awa job dump <id>` for the full error/progress chain
+- pause the upstream queue or producer if one failure mode is dominating
+- tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too
+  long for the incident volume
+
 ## Common Error Cases
 
 ### `SchemaNotMigrated`

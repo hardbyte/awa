@@ -1,9 +1,10 @@
+import { useEffect } from "react";
 import {
   useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useParams, Link } from "@tanstack/react-router";
+import { useParams, Link, useNavigate } from "@tanstack/react-router";
 import { fetchJob, retryJob, cancelJob } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
@@ -33,12 +34,22 @@ function hasMetadata(job: JobRow): boolean {
   );
 }
 
+// Treat empty display_name the same as missing — the contract is
+// "display name if set, otherwise the raw key". `??` alone would let
+// `display_name: ""` render a blank label.
+function descriptorLabel(
+  displayName: string | null | undefined,
+  fallback: string,
+): string {
+  return displayName?.trim() ? displayName : fallback;
+}
+
 function jobKindLabel(job: JobRow): string {
-  return job.kind_descriptor?.display_name ?? job.kind;
+  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
 }
 
 function queueLabel(job: JobRow): string {
-  return job.queue_descriptor?.display_name ?? job.queue;
+  return descriptorLabel(job.queue_descriptor?.display_name, job.queue);
 }
 
 export function JobDetailPage() {
@@ -46,6 +57,7 @@ export function JobDetailPage() {
   const jobId = Number(id);
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
+  const navigate = useNavigate();
 
   const jobQuery = useQuery<JobRow>({
     queryKey: ["job", jobId],
@@ -53,6 +65,19 @@ export function JobDetailPage() {
     enabled: !isNaN(jobId),
     refetchInterval: POLL.FAST,
   });
+
+  // If this job has been moved to the DLQ, /jobs/:id retry/cancel routes will
+  // fail (the row no longer lives in `jobs_hot`). Redirect to the DLQ detail
+  // page which has the correct retry/purge actions wired to `/api/dlq/*`.
+  useEffect(() => {
+    if (jobQuery.data?.dlq) {
+      void navigate({
+        to: "/dlq/$id",
+        params: { id: String(jobId) },
+        replace: true,
+      });
+    }
+  }, [jobQuery.data?.dlq, jobId, navigate]);
 
   const retryMutation = useMutation({
     mutationFn: () => retryJob(jobId),
@@ -110,13 +135,13 @@ export function JobDetailPage() {
         <Heading level={2}>
           Job #{job.id} &mdash; {jobKindLabel(job)}
         </Heading>
-        {job.kind_descriptor?.display_name && (
+        {job.kind_descriptor?.display_name?.trim() && (
           <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
         )}
         <StateBadge state={job.state} />
       </div>
 
-      {job.kind_descriptor?.description && (
+      {job.kind_descriptor?.description?.trim() && (
         <p className="max-w-3xl text-sm text-muted-fg">
           {job.kind_descriptor.description}
         </p>
@@ -158,7 +183,7 @@ export function JobDetailPage() {
           >
             {queueLabel(job)}
           </Link>
-          {job.queue_descriptor?.display_name && (
+          {job.queue_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.queue}</span>
           )}
         </DescriptionDetails>
@@ -166,7 +191,7 @@ export function JobDetailPage() {
         <DescriptionTerm>Kind</DescriptionTerm>
         <DescriptionDetails>
           {jobKindLabel(job)}
-          {job.kind_descriptor?.display_name && (
+          {job.kind_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.kind}</span>
           )}
         </DescriptionDetails>

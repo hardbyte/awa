@@ -1,5 +1,6 @@
 mod args;
 mod client;
+mod dlq;
 mod errors;
 mod job;
 mod transaction;
@@ -91,6 +92,7 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::PyHealthCheck>()?;
     m.add_class::<job::PyCallbackToken>()?;
     m.add_class::<client::PyResolveResult>()?;
+    m.add_class::<dlq::PyDlqEntry>()?;
 
     // Functions
     m.add_function(wrap_pyfunction!(derive_kind, m)?)?;

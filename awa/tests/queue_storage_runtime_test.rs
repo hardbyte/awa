@@ -4,11 +4,12 @@
 //! queue_storage backend enabled.
 
 use awa::model::{
-    admin, insert, migrations, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome,
+    admin, insert, migrations, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig,
+    RotateOutcome,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
-    Worker,
+    UniqueOpts, Worker,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -1180,6 +1181,231 @@ async fn test_queue_storage_dlq_api_round_trip() {
             .await
             .expect("Failed to resample dlq depth"),
         0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_dlq_bulk_ops";
+    let schema = "awa_qs_runtime_dlq_bulk_ops";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        TerminalFailureWorker,
+    );
+    client
+        .start()
+        .await
+        .expect("Failed to start bulk move client");
+
+    let failed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(failed_done_count(&pool, &store, queue).await, 1);
+    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+
+    client.shutdown(Duration::from_secs(5)).await;
+
+    let move_err = awa::model::dlq::bulk_move_failed_to_dlq(&pool, None, None, "ops_move", false)
+        .await
+        .expect_err("bulk move without scope should be rejected");
+    assert!(matches!(move_err, AwaError::Validation(_)));
+
+    let moved = awa::model::dlq::bulk_move_failed_to_dlq(&pool, None, None, "ops_move", true)
+        .await
+        .expect("Failed to bulk-move failed rows into the DLQ");
+    assert_eq!(moved, 1);
+    assert_eq!(failed_done_count(&pool, &store, queue).await, 0);
+    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+
+    let empty_filter = awa::model::ListDlqFilter::default();
+    let retry_err = awa::model::dlq::bulk_retry_from_dlq(&pool, &empty_filter, false)
+        .await
+        .expect_err("bulk retry without scope should be rejected");
+    assert!(matches!(retry_err, AwaError::Validation(_)));
+
+    let retried = awa::model::dlq::bulk_retry_from_dlq(&pool, &empty_filter, true)
+        .await
+        .expect("Failed to bulk-retry DLQ rows");
+    assert_eq!(retried, 1);
+    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+
+    let revived = admin::get_job(&pool, job_id)
+        .await
+        .expect("Failed to load revived job");
+    assert_eq!(revived.state, JobState::Available);
+    assert_eq!(revived.attempt, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_dlq_purge_guard";
+    let schema = "awa_qs_runtime_dlq_purge_guard";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &DlqJob { id: 8 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(TerminalFailureWorker)
+        .dlq_enabled_by_default(true)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build purge-guard client");
+    client
+        .start()
+        .await
+        .expect("Failed to start purge-guard client");
+
+    let failed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(failed.state, JobState::Failed);
+    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+
+    client.shutdown(Duration::from_secs(5)).await;
+
+    let empty_filter = awa::model::ListDlqFilter::default();
+    let purge_err = awa::model::dlq::purge_dlq(&pool, &empty_filter, false)
+        .await
+        .expect_err("purge without scope should be rejected");
+    assert!(matches!(purge_err, AwaError::Validation(_)));
+
+    let purged = awa::model::dlq::purge_dlq(&pool, &empty_filter, true)
+        .await
+        .expect("Failed to purge filtered DLQ rows");
+    assert_eq!(purged, 1);
+    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_dlq_unique_conflict";
+    let schema = "awa_qs_runtime_dlq_unique_conflict";
+    let store = create_store(&pool, schema).await;
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts {
+            by_queue: true,
+            by_args: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    let original_id = enqueue_job(&pool, &store, &DlqJob { id: 9 }, opts.clone()).await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        TerminalFailureWorker,
+    );
+    client
+        .start()
+        .await
+        .expect("Failed to start unique-conflict client");
+
+    let failed = wait_for_job_state(
+        &store,
+        &pool,
+        original_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(failed.state, JobState::Failed);
+    client.shutdown(Duration::from_secs(5)).await;
+
+    let moved = awa::model::dlq::move_failed_to_dlq(&pool, original_id, "unique_conflict")
+        .await
+        .expect("Failed to move failed row into the DLQ");
+    assert!(moved.is_some(), "original row should land in the DLQ");
+
+    let replacement_id = enqueue_job(&pool, &store, &DlqJob { id: 9 }, opts).await;
+    assert_ne!(replacement_id, original_id);
+
+    let retry_err = awa::model::dlq::retry_from_dlq(
+        &pool,
+        original_id,
+        &awa::model::RetryFromDlqOpts::default(),
+    )
+    .await
+    .expect_err("retry must fail while replacement holds the unique claim");
+    assert!(matches!(retry_err, AwaError::UniqueConflict { .. }));
+
+    let dlq_entry = awa::model::dlq::get_dlq_job(&pool, original_id)
+        .await
+        .expect("Failed to fetch DLQ row after unique conflict");
+    assert!(
+        dlq_entry.is_some(),
+        "DLQ row should survive the failed retry"
     );
 }
 

@@ -10,6 +10,7 @@ use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DlqMetadata {
@@ -20,7 +21,9 @@ pub struct DlqMetadata {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DlqRow {
+    #[serde(flatten)]
     pub job: JobRow,
+    #[serde(rename = "dlq_reason")]
     pub reason: String,
     pub dlq_at: DateTime<Utc>,
     pub original_run_lease: i64,
@@ -51,6 +54,7 @@ pub struct ListDlqFilter {
     pub queue: Option<String>,
     pub tag: Option<String>,
     pub before_id: Option<i64>,
+    pub before_dlq_at: Option<DateTime<Utc>>,
     pub limit: Option<i64>,
 }
 
@@ -155,6 +159,10 @@ async fn active_queue_storage(pool: &PgPool) -> Result<QueueStorage, AwaError> {
     QueueStorage::from_existing_schema(schema)
 }
 
+fn filter_requires_scope(filter: &ListDlqFilter) -> bool {
+    filter.kind.is_none() && filter.queue.is_none() && filter.tag.is_none()
+}
+
 pub async fn move_failed_to_dlq(
     pool: &PgPool,
     job_id: i64,
@@ -169,6 +177,34 @@ pub async fn move_failed_to_dlq(
         return Ok(None);
     }
     get_dlq_job(pool, job_id).await
+}
+
+/// Bulk-move failed terminal rows into the DLQ.
+///
+/// Returns the number of rows moved. Requires at least one of `kind` or
+/// `queue` unless `allow_all` is `true`, which is an explicit opt-in to move
+/// every failed row currently stored in queue_storage.
+///
+/// Preserves the source row's progress snapshot and error history so manual
+/// operator moves do not discard the last known execution state.
+pub async fn bulk_move_failed_to_dlq(
+    pool: &PgPool,
+    kind: Option<&str>,
+    queue: Option<&str>,
+    reason: &str,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
+    if !allow_all && kind.is_none() && queue.is_none() {
+        return Err(AwaError::Validation(
+            "bulk_move_failed_to_dlq requires at least one of kind or queue (or allow_all=true)"
+                .into(),
+        ));
+    }
+
+    let store = active_queue_storage(pool).await?;
+    store
+        .bulk_move_failed_to_dlq(pool, kind, queue, reason)
+        .await
 }
 
 pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRow>, AwaError> {
@@ -199,15 +235,23 @@ pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRo
         WHERE ($1::text IS NULL OR kind = $1)
           AND ($2::text IS NULL OR queue = $2)
           AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-          AND ($4::bigint IS NULL OR job_id < $4)
+          AND (
+              $4::bigint IS NULL
+              OR (
+                  $5::timestamptz IS NULL
+                  AND job_id < $4
+              )
+              OR (dlq_at, job_id) < ($5, $4)
+          )
         ORDER BY dlq_at DESC, job_id DESC
-        LIMIT $5
+        LIMIT $6
         "#
     ))
     .bind(&filter.kind)
     .bind(&filter.queue)
     .bind(&filter.tag)
     .bind(filter.before_id)
+    .bind(filter.before_dlq_at)
     .bind(filter.limit.unwrap_or(100))
     .fetch_all(pool)
     .await?;
@@ -282,6 +326,15 @@ pub async fn dlq_depth_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>, Awa
     .map_err(Into::into)
 }
 
+/// Retry a single DLQ row back into live queue storage.
+///
+/// Atomic: deletes the DLQ row and inserts a fresh ready/deferred row in one
+/// transaction. Resets `attempt = 0`, `run_lease = 0`, and clears any
+/// per-attempt progress snapshot because a revived attempt starts from zero.
+/// Error history is preserved in payload metadata for post-mortem visibility.
+///
+/// If the revived row conflicts with a live unique claim, this returns
+/// [`AwaError::UniqueConflict`] and the DLQ row remains in place.
 pub async fn retry_from_dlq(
     pool: &PgPool,
     job_id: i64,
@@ -291,7 +344,46 @@ pub async fn retry_from_dlq(
     store.retry_from_dlq(pool, job_id, opts).await
 }
 
-pub async fn purge_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<u64, AwaError> {
+/// Bulk-retry DLQ rows matching the filter.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`. This guard prevents an empty payload from reviving the entire DLQ
+/// by accident.
+///
+/// Like single-row retry, unique-claim conflicts abort the transaction and
+/// leave the affected DLQ rows untouched.
+pub async fn bulk_retry_from_dlq(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
+    if !allow_all && filter_requires_scope(filter) {
+        return Err(AwaError::Validation(
+            "bulk_retry_from_dlq requires at least one of kind, queue, or tag (or allow_all=true)"
+                .into(),
+        ));
+    }
+
+    let store = active_queue_storage(pool).await?;
+    store.bulk_retry_from_dlq(pool, filter).await
+}
+
+/// Purge DLQ rows matching the filter.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`, which is the explicit "yes, purge the whole DLQ" escape hatch for
+/// operator tooling.
+pub async fn purge_dlq(
+    pool: &PgPool,
+    filter: &ListDlqFilter,
+    allow_all: bool,
+) -> Result<u64, AwaError> {
+    if !allow_all && filter_requires_scope(filter) {
+        return Err(AwaError::Validation(
+            "purge_dlq requires at least one of kind, queue, or tag (or allow_all=true)".into(),
+        ));
+    }
+
     let store = active_queue_storage(pool).await?;
     let result = sqlx::query(&format!(
         r#"
@@ -299,7 +391,14 @@ pub async fn purge_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<u64, Awa
         WHERE ($1::text IS NULL OR kind = $1)
           AND ($2::text IS NULL OR queue = $2)
           AND ($3::text IS NULL OR payload -> 'tags' ? $3)
-          AND ($4::bigint IS NULL OR job_id < $4)
+          AND (
+              $4::bigint IS NULL
+              OR (
+                  $5::timestamptz IS NULL
+                  AND job_id < $4
+              )
+              OR (dlq_at, job_id) < ($5, $4)
+          )
         "#,
         store.schema()
     ))
@@ -307,6 +406,7 @@ pub async fn purge_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<u64, Awa
     .bind(&filter.queue)
     .bind(&filter.tag)
     .bind(filter.before_id)
+    .bind(filter.before_dlq_at)
     .execute(pool)
     .await?;
     Ok(result.rows_affected())
@@ -322,4 +422,40 @@ pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError>
     .execute(pool)
     .await?;
     Ok(result.rows_affected() > 0)
+}
+
+/// Purge DLQ rows older than the configured retention horizon.
+///
+/// Deletes up to `batch_size` rows per call, ordered by oldest-first
+/// `(dlq_at, job_id)`, optionally restricted to a single queue. Intended for
+/// maintenance loops rather than interactive operator use.
+pub async fn cleanup_dlq(
+    pool: &PgPool,
+    retention: Duration,
+    batch_size: i64,
+    queue: Option<&str>,
+) -> Result<u64, AwaError> {
+    let store = active_queue_storage(pool).await?;
+    let retention_secs = retention.as_secs().min(i64::MAX as u64) as i64;
+    let result = sqlx::query(&format!(
+        r#"
+        DELETE FROM {}.dlq_entries
+        WHERE job_id IN (
+            SELECT job_id
+            FROM {}.dlq_entries
+            WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+              AND ($3::text IS NULL OR queue = $3)
+            ORDER BY dlq_at ASC, job_id ASC
+            LIMIT $2
+        )
+        "#,
+        store.schema(),
+        store.schema()
+    ))
+    .bind(retention_secs)
+    .bind(batch_size)
+    .bind(queue)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
 }
