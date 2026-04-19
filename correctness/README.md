@@ -56,11 +56,24 @@ What is intentionally not modeled:
 - `storage/AwaSegmentedStorage.tla` / `storage/AwaSegmentedStorage.cfg`: focused
   segmented-storage model covering `ready_entries`, `deferred_entries`,
   `waiting_entries`, `active_leases`, optional `attempt_state`,
-  `terminal_entries`, queue-local append/claim cursors, and segment
-  rotation/prune safety for the vacuum-aware 0.6+ design direction
+  `terminal_entries`, `dlq_entries`, queue-local append/claim cursors, and
+  segment rotation/prune safety for all five families. Heartbeat freshness
+  lives on `active_leases` (matching the Rust implementation) so short-job
+  rescue is reachable. DLQ modelling covers both executor-side `FailToDlq`
+  and admin-side `MoveFailedToDlq`, plus `RetryFromDlq` (with `run_lease`
+  reset) and `PurgeDlq`. See [`storage/MAPPING.md`](storage/MAPPING.md) for
+  the TLA+ ↔ Rust correspondence table.
 - `storage/AwaSegmentedStorageInterleavings.cfg`: alternate two-worker config
   for the same segmented-storage spec, used to exercise stale completion and
   waiting/resume interleavings without changing the base safety model
+- `storage/AwaSegmentedStorageRaces.tla` / `storage/AwaSegmentedStorageRaces.cfg`
+  / `storage/AwaSegmentedStorageRacesSafe.cfg`: focused race-exposure spec
+  that splits `Claim` into `BeginClaim` / `CommitClaim` to model the claim
+  path's cursor-read-without-lock behaviour. The race config produces a
+  counterexample trace (claim snapshots segment, rotate+prune fire, commit
+  lands lease in pruned segment — simultaneously the claim-vs-rotate race
+  and the prune check-then-act race). The safe config uses a checked
+  commit and passes.
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -99,6 +112,8 @@ From the repository root:
 ./correctness/run-tlc.sh core/AwaCore.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
