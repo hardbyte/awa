@@ -89,7 +89,7 @@ struct QueueStorageDlqRow {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct QueueStoragePayload {
-    #[serde(default)]
+    #[serde(default = "default_queue_storage_payload_metadata")]
     metadata: serde_json::Value,
     #[serde(default)]
     tags: Vec<String>,
@@ -97,6 +97,10 @@ struct QueueStoragePayload {
     errors: Vec<serde_json::Value>,
     #[serde(default)]
     progress: Option<serde_json::Value>,
+}
+
+fn default_queue_storage_payload_metadata() -> serde_json::Value {
+    serde_json::json!({})
 }
 
 impl Default for QueueStoragePayload {

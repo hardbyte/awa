@@ -1346,12 +1346,201 @@ impl RuntimeReporterState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use awa_model::{migrations, JobArgs, QueueStorageConfig};
     use sqlx::postgres::PgPoolOptions;
+    use sqlx::PgPool;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
+    use std::time::{Duration, Instant};
+    use tokio::sync::{oneshot, Notify};
+
+    static TEST_MUTEX: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    fn test_mutex() -> &'static tokio::sync::Mutex<()> {
+        TEST_MUTEX.get_or_init(|| tokio::sync::Mutex::new(()))
+    }
 
     fn lazy_pool() -> PgPool {
         PgPoolOptions::new()
             .connect_lazy("postgres://postgres:test@localhost/awa_test")
             .expect("lazy pool should build")
+    }
+
+    fn base_database_url() -> String {
+        std::env::var("DATABASE_URL")
+            .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+    }
+
+    fn replace_database_name(url: &str, database_name: &str) -> String {
+        let (without_query, query_suffix) = match url.split_once('?') {
+            Some((prefix, query)) => (prefix, Some(query)),
+            None => (url, None),
+        };
+        let (base, _) = without_query
+            .rsplit_once('/')
+            .expect("database URL should include a database name");
+        let mut out = format!("{base}/{database_name}");
+        if let Some(query) = query_suffix {
+            out.push('?');
+            out.push_str(query);
+        }
+        out
+    }
+
+    fn database_url() -> String {
+        std::env::var("DATABASE_URL_WORKER_CLIENT").unwrap_or_else(|_| {
+            replace_database_name(&base_database_url(), "awa_test_worker_client")
+        })
+    }
+
+    async fn ensure_database_exists(url: &str) {
+        let database_name = url
+            .split_once('?')
+            .map(|(prefix, _)| prefix)
+            .unwrap_or(url)
+            .rsplit_once('/')
+            .map(|(_, database_name)| database_name.to_string())
+            .expect("database URL should include a database name");
+        let admin_url = replace_database_name(url, "postgres");
+        let admin_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&admin_url)
+            .await
+            .expect("Failed to connect to admin database for client tests");
+        let create_sql = format!("CREATE DATABASE {database_name}");
+        match sqlx::query(&create_sql).execute(&admin_pool).await {
+            Ok(_) => {}
+            Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+            Err(err) => panic!("Failed to create client test database {database_name}: {err}"),
+        }
+    }
+
+    async fn setup_pool(max_connections: u32) -> PgPool {
+        let url = database_url();
+        ensure_database_exists(&url).await;
+        PgPoolOptions::new()
+            .max_connections(max_connections)
+            .acquire_timeout(Duration::from_secs(5))
+            .connect(&url)
+            .await
+            .expect("Failed to connect to client test database")
+    }
+
+    async fn reset_schema(pool: &PgPool) {
+        sqlx::raw_sql("DROP SCHEMA IF EXISTS awa CASCADE")
+            .execute(pool)
+            .await
+            .expect("Failed to drop awa schema");
+    }
+
+    async fn apply_migrations_through(pool: &PgPool, version: i32) {
+        for (_version, _desc, sql) in migrations::migration_sql_range(0, version) {
+            sqlx::raw_sql(&sql).execute(pool).await.unwrap();
+        }
+    }
+
+    async fn drop_queue_storage_schema(pool: &PgPool, schema: &str) {
+        let sql = format!("DROP SCHEMA IF EXISTS {schema} CASCADE");
+        sqlx::query(&sql)
+            .execute(pool)
+            .await
+            .expect("Failed to drop queue storage schema");
+    }
+
+    async fn insert_available_job(pool: &PgPool, kind: &str, queue: &str) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO awa.jobs (
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                max_attempts,
+                run_at,
+                metadata,
+                tags
+            )
+            VALUES (
+                $1,
+                $2,
+                '{}'::jsonb,
+                'available'::awa.job_state,
+                2,
+                25,
+                clock_timestamp(),
+                '{}'::jsonb,
+                '{}'::text[]
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(kind)
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to insert job")
+    }
+
+    async fn active_queue_storage_schema(pool: &PgPool) -> Option<String> {
+        sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+            .fetch_one(pool)
+            .await
+            .expect("Failed to fetch active queue storage schema")
+    }
+
+    async fn wait_for_state(pool: &PgPool, job_id: i64, state: &str, timeout: Duration) {
+        let start = Instant::now();
+        loop {
+            let current: Option<String> = sqlx::query_scalar(
+                "SELECT state::text FROM awa.jobs_hot WHERE id = $1 UNION ALL SELECT state::text FROM awa.scheduled_jobs WHERE id = $1 LIMIT 1",
+            )
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .expect("Failed to fetch canonical job state");
+            if current.as_deref() == Some(state) {
+                return;
+            }
+            assert!(
+                start.elapsed() <= timeout,
+                "Timed out waiting for job {job_id} to reach state {state}; last_state={current:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn wait_for_queue_storage_done(
+        pool: &PgPool,
+        schema: &str,
+        job_id: i64,
+        timeout: Duration,
+    ) {
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM {schema}.done_entries WHERE job_id = $1 AND state = 'completed')"
+        );
+        let start = Instant::now();
+        loop {
+            let done: bool = sqlx::query_scalar(&sql)
+                .bind(job_id)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to query queue storage terminal rows");
+            if done {
+                return;
+            }
+            assert!(
+                start.elapsed() <= timeout,
+                "Timed out waiting for queue storage job {job_id} to complete"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    fn force_canonical(mut builder: ClientBuilder) -> ClientBuilder {
+        builder.storage = RuntimeStorage::Canonical;
+        builder.storage_error = None;
+        builder
     }
 
     #[tokio::test]
@@ -1392,5 +1581,191 @@ mod tests {
             result.is_ok(),
             "descriptor for registered kind should build"
         );
+    }
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
+    struct CutoverLongJob {}
+
+    #[derive(Clone, serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
+    struct CutoverShortJob {}
+
+    #[tokio::test]
+    async fn canonical_runtime_drains_in_flight_jobs_across_schema_upgrade_before_queue_storage_cutover(
+    ) {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(8).await;
+        let queue_storage_schema = "awa_cutover_runtime";
+        reset_schema(&pool).await;
+        drop_queue_storage_schema(&pool, queue_storage_schema).await;
+        apply_migrations_through(&pool, 9).await;
+
+        let long_started_flag = Arc::new(AtomicBool::new(false));
+        let (long_started_tx_inner, long_started_rx) = oneshot::channel::<()>();
+        let long_started_tx = Arc::new(Mutex::new(Some(long_started_tx_inner)));
+        let long_release = Arc::new(Notify::new());
+        let canonical_short_seen = Arc::new(AtomicUsize::new(0));
+        let queue_storage_short_seen = Arc::new(AtomicUsize::new(0));
+
+        let canonical_client = {
+            let started = long_started_flag.clone();
+            let started_tx = long_started_tx.clone();
+            let release = long_release.clone();
+            let canonical_short_seen = canonical_short_seen.clone();
+            let builder = Client::builder(pool.clone())
+                .queue(
+                    "cutover",
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        ..QueueConfig::default()
+                    },
+                )
+                .register::<CutoverLongJob, _, _>(move |_args, _ctx| {
+                    let started = started.clone();
+                    let started_tx = started_tx.clone();
+                    let release = release.clone();
+                    async move {
+                        started.store(true, Ordering::SeqCst);
+                        if let Some(tx) =
+                            started_tx.lock().expect("long-start mutex poisoned").take()
+                        {
+                            let _ = tx.send(());
+                        }
+                        release.notified().await;
+                        Ok(JobResult::Completed)
+                    }
+                })
+                .register::<CutoverShortJob, _, _>(move |_args, _ctx| {
+                    let canonical_short_seen = canonical_short_seen.clone();
+                    async move {
+                        canonical_short_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(JobResult::Completed)
+                    }
+                })
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .deadline_rescue_interval(Duration::from_millis(100))
+                .callback_rescue_interval(Duration::from_millis(100));
+            force_canonical(builder)
+                .build()
+                .expect("Failed to build canonical client")
+        };
+
+        canonical_client
+            .start()
+            .await
+            .expect("Failed to start canonical client");
+
+        let long_id =
+            insert_available_job(&pool, <CutoverLongJob as JobArgs>::kind(), "cutover").await;
+        tokio::time::timeout(Duration::from_secs(5), long_started_rx)
+            .await
+            .expect("Timed out waiting for long canonical job to start")
+            .expect("Long job start signal dropped");
+        assert!(
+            long_started_flag.load(Ordering::SeqCst),
+            "long-running canonical job should be in flight before migration"
+        );
+
+        migrations::run(&pool)
+            .await
+            .expect("Schema upgrade from 0.5.x to 0.6 should succeed during canonical runtime");
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            None,
+            "schema upgrade alone must not activate queue storage"
+        );
+
+        let canonical_short_id =
+            insert_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover").await;
+        let canonical_short_start = Instant::now();
+        while canonical_short_seen.load(Ordering::SeqCst) == 0 {
+            assert!(
+                canonical_short_start.elapsed() <= Duration::from_secs(5),
+                "canonical worker stopped processing new jobs after schema upgrade"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for_state(
+            &pool,
+            canonical_short_id,
+            "completed",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        long_release.notify_waiters();
+        wait_for_state(&pool, long_id, "completed", Duration::from_secs(5)).await;
+        canonical_client.shutdown(Duration::from_secs(5)).await;
+
+        let store_config = QueueStorageConfig {
+            schema: queue_storage_schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        };
+        let queue_storage_client = {
+            let queue_storage_short_seen = queue_storage_short_seen.clone();
+            Client::builder(pool.clone())
+                .queue(
+                    "cutover",
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config.clone(),
+                    Duration::from_millis(1_000),
+                    Duration::from_millis(50),
+                )
+                .register::<CutoverShortJob, _, _>(move |_args, _ctx| {
+                    let queue_storage_short_seen = queue_storage_short_seen.clone();
+                    async move {
+                        queue_storage_short_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(JobResult::Completed)
+                    }
+                })
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .deadline_rescue_interval(Duration::from_millis(100))
+                .callback_rescue_interval(Duration::from_millis(100))
+                .build()
+                .expect("Failed to build queue storage client")
+        };
+
+        queue_storage_client
+            .start()
+            .await
+            .expect("Failed to start queue storage client");
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            Some(queue_storage_schema.to_string()),
+            "queue storage activation should happen only when the new runtime starts"
+        );
+
+        let queue_storage_job_id =
+            insert_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover").await;
+        let queue_storage_start = Instant::now();
+        while queue_storage_short_seen.load(Ordering::SeqCst) == 0 {
+            assert!(
+                queue_storage_start.elapsed() <= Duration::from_secs(5),
+                "queue storage runtime failed to process new work after cutover"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for_queue_storage_done(
+            &pool,
+            queue_storage_schema,
+            queue_storage_job_id,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        queue_storage_client.shutdown(Duration::from_secs(5)).await;
     }
 }

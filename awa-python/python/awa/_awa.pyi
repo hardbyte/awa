@@ -59,7 +59,7 @@ class DlqEntry:
     @property
     def reason(self) -> str: ...
     @property
-    def dlq_at(self) -> Any: ...  # datetime.datetime
+    def dlq_at(self) -> datetime.datetime: ...
     @property
     def original_run_lease(self) -> int: ...
 
@@ -272,7 +272,7 @@ class Client:
     async def install_queue_storage(
         self,
         *,
-        schema: str = "awa_py",
+        schema: str = "awa_exp",
         queue_slot_count: int = 4,
         lease_slot_count: int = 2,
         reset: bool = False,
@@ -322,6 +322,7 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
         limit: int = 100,
     ) -> list[DlqEntry]: ...
     def list_dlq_sync(
@@ -331,6 +332,7 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
         limit: int = 100,
     ) -> list[DlqEntry]: ...
     async def get_dlq_job(self, job_id: int) -> DlqEntry | None: ...
@@ -506,7 +508,7 @@ class Client:
     def install_queue_storage_sync(
         self,
         *,
-        schema: str = "awa_py",
+        schema: str = "awa_exp",
         queue_slot_count: int = 4,
         lease_slot_count: int = 2,
         reset: bool = False,

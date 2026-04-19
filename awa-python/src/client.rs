@@ -472,6 +472,11 @@ impl PyClient {
         lease_slot_count: u32,
         reset: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if self.runtime.lock().expect("runtime mutex poisoned").is_some() {
+            return Err(state_error(
+                "cannot install queue storage while the worker runtime is running",
+            ));
+        }
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let store = QueueStorage::new(QueueStorageConfig {
@@ -480,6 +485,13 @@ impl PyClient {
                 lease_slot_count: lease_slot_count as usize,
             })
             .map_err(map_awa_error)?;
+            if reset {
+                let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
+                sqlx::query(&drop_sql)
+                    .execute(&pool)
+                    .await
+                    .map_err(map_sqlx_error)?;
+            }
             store.install(&pool).await.map_err(map_awa_error)?;
             if reset {
                 store.reset(&pool).await.map_err(map_awa_error)?;
@@ -923,7 +935,7 @@ impl PyClient {
     /// List DLQ entries, optionally filtered by kind/queue/tag. `before_id`
     /// enables cursor pagination (pass the smallest id from the previous
     /// page). Rows are ordered by `dlq_at DESC, id DESC`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, limit=100))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
     fn list_dlq<'py>(
         &self,
         py: Python<'py>,
@@ -931,11 +943,13 @@ impl PyClient {
         queue: Option<String>,
         tag: Option<String>,
         before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
         limit: i64,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let filter = crate::dlq::build_filter(kind, queue, tag, before_id, Some(limit));
+            let filter =
+                crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
             let rows = awa_model::dlq::list_dlq(&pool, &filter)
                 .await
                 .map_err(map_awa_error)?;
@@ -1041,7 +1055,7 @@ impl PyClient {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let queue_attr = queue.clone();
-            let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+            let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
             let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
@@ -1066,6 +1080,13 @@ impl PyClient {
             let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
                 .await
                 .map_err(map_awa_error)?;
+            if let Some(row) = row.as_ref() {
+                awa_worker::AwaMetrics::from_global().record_dlq_moved(
+                    &row.job.kind,
+                    &row.job.queue,
+                    &reason,
+                );
+            }
             Python::attach(|py| {
                 Ok(match row {
                     Some(row) => crate::dlq::dlq_row_to_entry(py, row)?
@@ -1092,6 +1113,8 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let kind_attr = kind.clone();
+            let queue_attr = queue.clone();
             let count = awa_model::dlq::bulk_move_failed_to_dlq(
                 &pool,
                 kind.as_deref(),
@@ -1101,6 +1124,14 @@ impl PyClient {
             )
             .await
             .map_err(map_awa_error)?;
+            if count > 0 {
+                awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                    kind_attr.as_deref(),
+                    queue_attr.as_deref(),
+                    &reason,
+                    count,
+                );
+            }
             Ok(count)
         })
     }
@@ -1139,7 +1170,7 @@ impl PyClient {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let queue_attr = queue.clone();
-            let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+            let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
             let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
@@ -1822,6 +1853,11 @@ impl PyClient {
         lease_slot_count: u32,
         reset: bool,
     ) -> PyResult<()> {
+        if self.runtime.lock().expect("runtime mutex poisoned").is_some() {
+            return Err(state_error(
+                "cannot install queue storage while the worker runtime is running",
+            ));
+        }
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -1831,6 +1867,13 @@ impl PyClient {
                     lease_slot_count: lease_slot_count as usize,
                 })
                 .map_err(map_awa_error)?;
+                if reset {
+                    let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
+                    sqlx::query(&drop_sql)
+                        .execute(&pool)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                }
                 store.install(&pool).await.map_err(map_awa_error)?;
                 if reset {
                     store.reset(&pool).await.map_err(map_awa_error)?;
@@ -2064,7 +2107,7 @@ impl PyClient {
 
     // --- DLQ sync versions -------------------------------------------------
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, limit=100))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
     fn list_dlq_sync(
         &self,
         py: Python<'_>,
@@ -2072,10 +2115,12 @@ impl PyClient {
         queue: Option<String>,
         tag: Option<String>,
         before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
         limit: i64,
     ) -> PyResult<Vec<crate::dlq::PyDlqEntry>> {
         let pool = self.pool.clone();
-        let filter = crate::dlq::build_filter(kind, queue, tag, before_id, Some(limit));
+        let filter =
+            crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let rows = awa_model::dlq::list_dlq(&pool, &filter)
@@ -2164,7 +2209,7 @@ impl PyClient {
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let queue_attr = queue.clone();
-        let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+        let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
@@ -2191,6 +2236,13 @@ impl PyClient {
                 let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
                     .await
                     .map_err(map_awa_error)?;
+                if let Some(row) = row.as_ref() {
+                    awa_worker::AwaMetrics::from_global().record_dlq_moved(
+                        &row.job.kind,
+                        &row.job.queue,
+                        &reason,
+                    );
+                }
                 Python::attach(|py| row.map(|r| crate::dlq::dlq_row_to_entry(py, r)).transpose())
             })
         })
@@ -2206,9 +2258,11 @@ impl PyClient {
         allow_all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
+        let kind_attr = kind.clone();
+        let queue_attr = queue.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::dlq::bulk_move_failed_to_dlq(
+                let count = awa_model::dlq::bulk_move_failed_to_dlq(
                     &pool,
                     kind.as_deref(),
                     queue.as_deref(),
@@ -2216,7 +2270,16 @@ impl PyClient {
                     allow_all,
                 )
                 .await
-                .map_err(map_awa_error)
+                .map_err(map_awa_error)?;
+                if count > 0 {
+                    awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                        kind_attr.as_deref(),
+                        queue_attr.as_deref(),
+                        &reason,
+                        count,
+                    );
+                }
+                Ok(count)
             })
         })
     }
@@ -2251,7 +2314,7 @@ impl PyClient {
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let queue_attr = queue.clone();
-        let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
+        let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)

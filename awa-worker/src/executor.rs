@@ -1093,7 +1093,13 @@ async fn complete_job_queue_storage(
             );
             let Some(updated_job) = runtime
                 .store
-                .cancel_running(pool, job.id, job.run_lease, progress_snapshot.clone())
+                .cancel_running(
+                    pool,
+                    job.id,
+                    job.run_lease,
+                    &reason,
+                    progress_snapshot.clone(),
+                )
                 .await?
             else {
                 warn!(

@@ -1462,7 +1462,7 @@ impl MaintenanceService {
                 SELECT
                     queue,
                     count(*)::bigint AS available,
-                    EXTRACT(EPOCH FROM clock_timestamp() - min(created_at))::double precision
+                    EXTRACT(EPOCH FROM clock_timestamp() - min(run_at))::double precision
                         AS lag_seconds
                 FROM {schema}.ready_entries
                 GROUP BY queue

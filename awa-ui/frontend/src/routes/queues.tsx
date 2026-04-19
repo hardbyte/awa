@@ -160,6 +160,7 @@ export function QueuesPage() {
         <div className="space-y-3 sm:hidden">
           {queues.map((q) => {
             const runtime = runtimeByQueue.get(q.queue);
+            const dlqCount = dlqByQueue.get(q.queue);
             return (
               <div key={q.queue} className="rounded-lg border p-4">
               <div className="flex items-center justify-between">
@@ -229,6 +230,17 @@ export function QueuesPage() {
                   </>
                 )}
               </div>
+              {dlqCount ? (
+                <div className="mt-3">
+                  <Link
+                    to="/dlq"
+                    search={{ q: `queue:${q.queue}` }}
+                    className="text-xs text-danger underline"
+                  >
+                    Inspect {dlqCount.toLocaleString()} DLQ job(s)
+                  </Link>
+                </div>
+              ) : null}
               <div className="mt-3 flex gap-2">
                 {q.paused ? (
                   <Button
