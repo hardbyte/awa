@@ -7,6 +7,29 @@ use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 use crate::error::ApiError;
 use crate::state::AppState;
 
+/// Emit an OTel counter against the global meter.
+///
+/// The UI crate intentionally avoids depending on `awa-worker` (which would
+/// pull in the dispatcher/runtime crate graph) for the sake of a few counter
+/// increments. The OTel SDK caches instruments by name so repeated builds are
+/// a hashmap lookup; attribute sets here match `AwaMetrics` so dashboards
+/// don't drift between UI and worker sources.
+fn emit_counter(name: &'static str, description: &'static str, count: u64, queue: Option<&str>) {
+    if count == 0 {
+        return;
+    }
+    let meter = opentelemetry::global::meter("awa");
+    let counter = meter
+        .u64_counter(name)
+        .with_description(description)
+        .with_unit("{job}")
+        .build();
+    let attrs: Vec<opentelemetry::KeyValue> = queue
+        .map(|q| vec![opentelemetry::KeyValue::new("awa.job.queue", q.to_string())])
+        .unwrap_or_default();
+    counter.add(count, &attrs);
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ListDlqParams {
     pub kind: Option<String>,
@@ -86,6 +109,14 @@ pub async fn retry_dlq_job(
         None => RetryFromDlqOpts::default(),
     };
     let job = dlq::retry_from_dlq(&state.pool, job_id, &opts).await?;
+    if let Some(job) = job.as_ref() {
+        emit_counter(
+            "awa.job.dlq_retried",
+            "Number of jobs retried out of the Dead Letter Queue",
+            1,
+            Some(&job.queue),
+        );
+    }
     Ok(Json(job))
 }
 
@@ -113,6 +144,7 @@ pub async fn bulk_retry_dlq(
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
+    let queue_attr = payload.queue.clone();
     let filter = ListDlqFilter {
         kind: payload.kind,
         queue: payload.queue,
@@ -120,6 +152,12 @@ pub async fn bulk_retry_dlq(
         ..Default::default()
     };
     let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
+    emit_counter(
+        "awa.job.dlq_retried",
+        "Number of jobs retried out of the Dead Letter Queue",
+        count,
+        queue_attr.as_deref(),
+    );
     Ok(Json(CountResponse { count }))
 }
 
@@ -128,10 +166,20 @@ pub async fn purge_dlq_job(
     Path(job_id): Path<i64>,
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
+    // Look up the queue before deleting so the purge counter carries the same
+    // `awa.job.queue` attribute the retention-sweep counter uses.
+    let queue = dlq::get_dlq_job(&state.pool, job_id)
+        .await?
+        .map(|row| row.queue);
     let deleted = dlq::purge_dlq_job(&state.pool, job_id).await?;
-    Ok(Json(CountResponse {
-        count: if deleted { 1 } else { 0 },
-    }))
+    let count = if deleted { 1 } else { 0 };
+    emit_counter(
+        "awa.job.dlq_purged",
+        "Number of DLQ rows purged",
+        count,
+        queue.as_deref(),
+    );
+    Ok(Json(CountResponse { count }))
 }
 
 pub async fn bulk_purge_dlq(
@@ -139,6 +187,7 @@ pub async fn bulk_purge_dlq(
     Json(payload): Json<BulkFilterPayload>,
 ) -> Result<Json<CountResponse>, ApiError> {
     state.require_writable()?;
+    let queue_attr = payload.queue.clone();
     let filter = ListDlqFilter {
         kind: payload.kind,
         queue: payload.queue,
@@ -146,6 +195,12 @@ pub async fn bulk_purge_dlq(
         ..Default::default()
     };
     let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
+    emit_counter(
+        "awa.job.dlq_purged",
+        "Number of DLQ rows purged",
+        count,
+        queue_attr.as_deref(),
+    );
     Ok(Json(CountResponse { count }))
 }
 

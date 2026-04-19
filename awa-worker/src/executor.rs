@@ -665,36 +665,36 @@ async fn complete_job(
                         });
                     }
                     Some((_, None)) => {
-                        // Still running but no callback_id — programming error
+                        // Still running but no callback_id — programming error.
+                        // Route through apply_terminal_failure so this branch
+                        // respects the DLQ policy the same way Terminal errors
+                        // and exhausted Retryable do; otherwise a DLQ-enabled
+                        // queue would leak this specific permanent failure
+                        // into jobs_hot.
                         error!(
                             job_id = job.id,
                             "WaitForCallback returned without calling register_callback"
                         );
-                        sqlx::query(
-                            r#"
-                            UPDATE awa.jobs
-                            SET state = 'failed',
-                                finalized_at = now(),
-                                errors = errors || $2::jsonb
-                            WHERE id = $1 AND state = 'running' AND run_lease = $3
-                            "#,
-                        )
-                        .bind(job.id)
-                        .bind(serde_json::json!({
-                            "error": "WaitForCallback returned without calling register_callback",
+                        let error_msg =
+                            "WaitForCallback returned without calling register_callback";
+                        let error_json = serde_json::json!({
+                            "error": error_msg,
                             "attempt": job.attempt,
                             "at": chrono::Utc::now().to_rfc3339(),
-                            "terminal": true
-                        }))
-                        .bind(job.run_lease)
-                        .execute(pool)
-                        .await?;
-                        // Terminal: the handler returned WaitForCallback without
-                        // registering one, so we forced the job to `failed` above.
-                        return Ok(CompletionOutcome::Applied {
-                            event: None,
-                            terminal: true,
+                            "terminal": true,
                         });
+                        return apply_terminal_failure(
+                            pool,
+                            job,
+                            error_json,
+                            progress_snapshot.as_ref(),
+                            dlq_enabled,
+                            "wait_for_callback_without_register",
+                            error_msg,
+                            needs_event,
+                            metrics,
+                        )
+                        .await;
                     }
                     _ => {
                         warn!(

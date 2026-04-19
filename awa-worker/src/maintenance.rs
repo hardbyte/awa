@@ -1302,14 +1302,20 @@ pub async fn run_dlq_cleanup_pass(
         .await
     };
 
-    match global_result {
+    // Track the global-pass error (if any). We still run per-queue passes
+    // below so one misbehaving queue's retention policy doesn't block the
+    // others; any error is returned at the end so callers can observe
+    // persistent failures instead of the function silently succeeding.
+    let deferred_err = match global_result {
         Ok(result) => {
             *global_purged = result.rows_affected();
+            None
         }
         Err(err) => {
             tracing::warn!(error = %err, "Failed to clean up DLQ rows (global pass)");
+            Some(err)
         }
-    }
+    };
 
     for (queue, policy) in overrides {
         let Some(retention) = policy.dlq else {
@@ -1332,5 +1338,8 @@ pub async fn run_dlq_cleanup_pass(
         }
     }
 
+    if let Some(err) = deferred_err {
+        return Err(err);
+    }
     Ok(())
 }

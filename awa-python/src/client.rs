@@ -999,6 +999,9 @@ impl PyClient {
             let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
                 .await
                 .map_err(map_awa_error)?;
+            if let Some(job) = job.as_ref() {
+                awa_worker::AwaMetrics::from_global().record_dlq_retried(Some(&job.queue), 1);
+            }
             Python::attach(|py| {
                 Ok(match job {
                     Some(job) => PyJob::from(job).into_pyobject(py)?.into_any().unbind(),
@@ -1022,10 +1025,15 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
             let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
                 .await
                 .map_err(map_awa_error)?;
+            if count > 0 {
+                awa_worker::AwaMetrics::from_global()
+                    .record_dlq_retried(queue_attr.as_deref(), count);
+            }
             Ok(count)
         })
     }
@@ -1083,9 +1091,16 @@ impl PyClient {
     fn purge_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let queue = awa_model::dlq::get_dlq_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?
+                .map(|row| row.queue);
             let deleted = awa_model::dlq::purge_dlq_job(&pool, job_id)
                 .await
                 .map_err(map_awa_error)?;
+            if deleted {
+                awa_worker::AwaMetrics::from_global().record_dlq_purged(queue.as_deref(), 1);
+            }
             Ok(deleted)
         })
     }
@@ -1104,10 +1119,15 @@ impl PyClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
             let count = awa_model::dlq::purge_dlq(&pool, &filter, all)
                 .await
                 .map_err(map_awa_error)?;
+            if count > 0 {
+                awa_worker::AwaMetrics::from_global()
+                    .record_dlq_purged(queue_attr.as_deref(), count);
+            }
             Ok(count)
         })
     }
@@ -2045,6 +2065,9 @@ impl PyClient {
                 let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
                     .await
                     .map_err(map_awa_error)?;
+                if let Some(job) = job.as_ref() {
+                    awa_worker::AwaMetrics::from_global().record_dlq_retried(Some(&job.queue), 1);
+                }
                 Ok(job.map(PyJob::from))
             })
         })
@@ -2060,12 +2083,18 @@ impl PyClient {
         all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
+        let queue_attr = queue.clone();
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
+                let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
                     .await
-                    .map_err(map_awa_error)
+                    .map_err(map_awa_error)?;
+                if count > 0 {
+                    awa_worker::AwaMetrics::from_global()
+                        .record_dlq_retried(queue_attr.as_deref(), count);
+                }
+                Ok(count)
             })
         })
     }
@@ -2114,9 +2143,17 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::dlq::purge_dlq_job(&pool, job_id)
+                let queue = awa_model::dlq::get_dlq_job(&pool, job_id)
                     .await
-                    .map_err(map_awa_error)
+                    .map_err(map_awa_error)?
+                    .map(|row| row.queue);
+                let deleted = awa_model::dlq::purge_dlq_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                if deleted {
+                    awa_worker::AwaMetrics::from_global().record_dlq_purged(queue.as_deref(), 1);
+                }
+                Ok(deleted)
             })
         })
     }
@@ -2131,12 +2168,18 @@ impl PyClient {
         all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
+        let queue_attr = queue.clone();
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                awa_model::dlq::purge_dlq(&pool, &filter, all)
+                let count = awa_model::dlq::purge_dlq(&pool, &filter, all)
                     .await
-                    .map_err(map_awa_error)
+                    .map_err(map_awa_error)?;
+                if count > 0 {
+                    awa_worker::AwaMetrics::from_global()
+                        .record_dlq_purged(queue_attr.as_deref(), count);
+                }
+                Ok(count)
             })
         })
     }

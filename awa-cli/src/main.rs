@@ -516,7 +516,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     DlqCommands::Retry { id } => {
                         let opts = awa_model::dlq::RetryFromDlqOpts::default();
                         match awa_model::dlq::retry_from_dlq(&pool, id, &opts).await? {
-                            Some(job) => println!("Retried DLQ job {id} → job state {}", job.state),
+                            Some(job) => {
+                                awa_worker::AwaMetrics::from_global()
+                                    .record_dlq_retried(Some(&job.queue), 1);
+                                println!("Retried DLQ job {id} → job state {}", job.state);
+                            }
                             None => println!("No DLQ row with id {id}"),
                         }
                     }
@@ -528,12 +532,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } => {
                         let filter = awa_model::dlq::ListDlqFilter {
                             kind,
-                            queue,
+                            queue: queue.clone(),
                             tag,
                             ..Default::default()
                         };
                         let count =
                             awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
+                        if count > 0 {
+                            awa_worker::AwaMetrics::from_global()
+                                .record_dlq_retried(queue.as_deref(), count);
+                        }
                         println!("Retried {count} DLQ rows.");
                     }
                     DlqCommands::Move {
@@ -567,11 +575,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     } => {
                         let filter = awa_model::dlq::ListDlqFilter {
                             kind,
-                            queue,
+                            queue: queue.clone(),
                             tag,
                             ..Default::default()
                         };
                         let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
+                        if count > 0 {
+                            awa_worker::AwaMetrics::from_global()
+                                .record_dlq_purged(queue.as_deref(), count);
+                        }
                         println!("Purged {count} DLQ rows.");
                     }
                 },
