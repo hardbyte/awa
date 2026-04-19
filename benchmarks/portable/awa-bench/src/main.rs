@@ -3,19 +3,83 @@
 //! Runs standardised benchmark scenarios and outputs JSON results.
 //! Usage: awa-bench [--scenario <name>] [--job-count N] [--worker-count N]
 //!
-//! Env: DATABASE_URL (required)
+//! Env:
+//! - `DATABASE_URL` (required)
+//! - `QUEUE_STORAGE_SCHEMA` — queue_storage schema name (default `awa_exp`)
+//! - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` — slot sizing (defaults 16 / 8)
+//! - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` — rotate intervals (defaults 1000 / 50)
+//!
+//! The adapter always runs against the vacuum-aware queue_storage subsystem
+//! — canonical storage is transition-only and not benchmarked here. Each
+//! scenario calls `QueueStorage::install` + `QueueStorage::reset` to ensure
+//! a clean slot set before measuring, so results are reproducible.
 
 mod long_horizon;
 
 use async_trait::async_trait;
 use awa_macros::JobArgs;
-use awa_model::{insert_many, insert_many_copy, insert_with, migrations, InsertOpts};
+use awa_model::{
+    insert_many, insert_many_copy, insert_with, migrations, InsertOpts, QueueStorage,
+    QueueStorageConfig,
+};
 use awa_worker::{Client, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{Acquire, PgPool};
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+// ── Queue-storage configuration ───────────────────────────────────
+
+fn queue_storage_config() -> QueueStorageConfig {
+    QueueStorageConfig {
+        schema: std::env::var("QUEUE_STORAGE_SCHEMA").unwrap_or_else(|_| "awa_exp".into()),
+        queue_slot_count: std::env::var("QUEUE_SLOT_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(16),
+        lease_slot_count: std::env::var("LEASE_SLOT_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+    }
+}
+
+fn queue_rotate_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("QUEUE_ROTATE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1_000),
+    )
+}
+
+fn lease_rotate_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("LEASE_ROTATE_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(50),
+    )
+}
+
+/// Migrate the canonical schema, then install + reset the queue_storage
+/// backend so inserts through `awa.jobs` route into it and slot state
+/// starts from a clean baseline for each benchmark run.
+async fn prepare_queue_storage(pool: &PgPool) -> (QueueStorage, QueueStorageConfig) {
+    migrations::run(pool).await.unwrap();
+    let config = queue_storage_config();
+    let store = QueueStorage::new(config.clone()).expect("Invalid QueueStorageConfig");
+    store
+        .install(pool)
+        .await
+        .expect("Failed to install queue_storage backend");
+    store
+        .reset(pool)
+        .await
+        .expect("Failed to reset queue_storage state");
+    (store, config)
+}
 
 // ── Job type ──────────────────────────────────────────────────────
 
@@ -160,7 +224,12 @@ async fn enqueue_batch(pool: &PgPool, queue_name: &str, count: i64, use_copy: bo
     }
 }
 
-fn build_client(pool: PgPool, queue_name: &str, max_workers: u32) -> Client {
+fn build_client(
+    pool: PgPool,
+    queue_name: &str,
+    max_workers: u32,
+    storage: QueueStorageConfig,
+) -> Client {
     Client::builder(pool)
         .queue(
             queue_name,
@@ -170,6 +239,7 @@ fn build_client(pool: PgPool, queue_name: &str, max_workers: u32) -> Client {
                 ..QueueConfig::default()
             },
         )
+        .queue_storage(storage, queue_rotate_interval(), lease_rotate_interval())
         .register_worker(NoopWorker)
         .build()
         .expect("Failed to build client")
@@ -188,7 +258,7 @@ struct BenchmarkResult {
 /// Scenario 1: Enqueue throughput — insert N jobs as fast as possible.
 async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    migrations::run(&pool).await.unwrap();
+    let (_store, _config) = prepare_queue_storage(&pool).await;
     let queue = "awa_enqueue_bench";
     clean_queue(&pool, queue).await;
 
@@ -213,7 +283,7 @@ async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
 /// Scenario 2: Worker throughput — enqueue N jobs, then drain with workers.
 async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    migrations::run(&pool).await.unwrap();
+    let (_store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_worker_bench";
     clean_queue(&pool, queue).await;
 
@@ -221,7 +291,7 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
     enqueue_batch(&pool, queue, job_count, true).await;
 
     // Start workers and measure drain time
-    let client = build_client(pool.clone(), queue, worker_count);
+    let client = build_client(pool.clone(), queue, worker_count, config);
     let start = Instant::now();
     client.start().await.expect("Failed to start client");
 
@@ -250,11 +320,11 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
 /// Scenario 3: Pickup latency — enqueue one job at a time to an idle queue.
 async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    migrations::run(&pool).await.unwrap();
+    let (_store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_latency_bench";
     clean_queue(&pool, queue).await;
 
-    let client = build_client(pool.clone(), queue, worker_count);
+    let client = build_client(pool.clone(), queue, worker_count, config);
     client.start().await.expect("Failed to start client");
 
     // Let the client stabilise
@@ -307,11 +377,13 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
     }
 }
 
-/// Scenario: migrate_only — connect, run migrations, exit. No workers.
+/// Scenario: migrate_only — connect, run migrations + install the queue_storage
+/// backend, exit. No workers. Used by chaos harnesses that need a warm schema
+/// before they start their own inserts.
 async fn scenario_migrate_only() {
     let pool = create_pool(5).await;
-    migrations::run(&pool).await.unwrap();
-    eprintln!("[awa] Migrations complete.");
+    prepare_queue_storage(&pool).await;
+    eprintln!("[awa] Migrations + queue_storage install complete.");
 }
 
 /// Scenario: worker_only — connect, run migrations, start a ChaosWorker client, block until killed.
@@ -326,7 +398,7 @@ async fn scenario_worker_only() {
         .connect(&database_url())
         .await
         .expect("Failed to connect to database");
-    migrations::run(&pool).await.unwrap();
+    let (_store, config) = prepare_queue_storage(&pool).await;
 
     let worker_count: u32 = std::env::var("WORKER_COUNT")
         .unwrap_or_else(|_| "10".into())
@@ -361,6 +433,7 @@ async fn scenario_worker_only() {
                 ..QueueConfig::default()
             },
         )
+        .queue_storage(config, queue_rotate_interval(), lease_rotate_interval())
         .heartbeat_interval(Duration::from_secs(5))
         .heartbeat_staleness(Duration::from_secs(heartbeat_staleness_secs))
         .heartbeat_rescue_interval(Duration::from_secs(rescue_interval_secs))
