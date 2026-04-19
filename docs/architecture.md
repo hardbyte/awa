@@ -6,6 +6,19 @@ Awa (Maori: river) is a Postgres-native background job queue providing durable, 
 
 The Rust runtime owns all queue machinery -- polling, heartbeating, crash recovery, and dispatch. Python workers are callbacks invoked by this runtime via PyO3, inheriting Rust-grade reliability without reimplementing queue internals.
 
+## Queue storage status
+
+The queue storage engine is in transition.
+
+ADR-019 is now the source of truth for storage internals:
+
+- [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
+
+This architecture overview is still useful for runtime boundaries and
+subsystems, but sections below that mention `awa.jobs_hot`,
+`awa.scheduled_jobs`, or the old mutable-row hot path describe the canonical
+engine and need a full rewrite for queue storage.
+
 ## Control-plane descriptors
 
 Awa keeps two operator-facing descriptor catalogs, distinct from per-job payload metadata:

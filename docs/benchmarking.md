@@ -28,6 +28,44 @@ These are local engineering benchmarks, not published vendor-style numbers. The
 main goal is to compare shapes, validate architecture changes, and catch
 regressions.
 
+## Positioning Proof Checklist
+
+Queue storage changes Awa's comparison set.
+
+The interesting public question is no longer "can Postgres run jobs?" It is
+"can a Postgres job queue keep dispatch latency low while also keeping hot-path
+dead tuples bounded?"
+
+That means the benchmark burden for positioning is different from the benchmark
+burden for internal regressions. Before making the strongest public claim, the
+comparison needs to be rerun cleanly on the same hardware against the right
+reference points:
+
+- Awa queue storage
+- PgQue
+- River
+- optionally Oban Pro as a paid partitioned reference
+
+The benchmark set should include:
+
+- idle pickup latency
+- sustained runtime throughput
+- overlap readers / MVCC horizon pressure
+- mixed workload soak
+- terminal-failure burst
+
+Operational differences should be called out, not hidden:
+
+- Awa does not require `pg_cron`; the worker runtime owns dispatch, rescue,
+  rotation, and prune.
+- PgQue is designed around a periodic ticker and recommends `pg_cron`.
+- River and Oban are job frameworks rather than shared-log event queues, so
+  they remain the more comparable references for worker semantics.
+
+Commands and raw output for any public-facing table should live in-repo under
+`docs/adr/bench/` or another stable location so the resulting claim is
+auditable.
+
 ## Methodology Notes
 
 The most important lesson from this round of work is that benchmark isolation
