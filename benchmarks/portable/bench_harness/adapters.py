@@ -169,6 +169,18 @@ def build_oban(skip: bool) -> None:
     )
 
 
+def build_pgque(skip: bool) -> None:
+    # Build context is REPO_ROOT so the Dockerfile can COPY the vendored
+    # pgque submodule alongside the adapter source. Reminds developers to
+    # `git submodule update --init` (the README documents this).
+    _docker_build(
+        "pgque-bench",
+        SCRIPT_DIR / "pgque-bench" / "Dockerfile",
+        REPO_ROOT,
+        skip,
+    )
+
+
 # ─── Launch specs ────────────────────────────────────────────────────────
 
 
@@ -246,6 +258,10 @@ def launch_oban(manifest, overrides):
     return _docker_launch("oban-bench", manifest, overrides)
 
 
+def launch_pgque(manifest, overrides):
+    return _docker_launch("pgque-bench", manifest, overrides)
+
+
 # ─── Registry ────────────────────────────────────────────────────────────
 
 
@@ -287,8 +303,13 @@ ADAPTERS: dict[str, AdapterEntry] = {
         builder=build_oban,
         launcher=launch_oban,
     ),
+    "pgque": AdapterEntry(
+        bench_dir=SCRIPT_DIR / "pgque-bench",
+        builder=build_pgque,
+        launcher=launch_pgque,
+    ),
 }
 
 # Default --systems list for long-horizon. awa-docker is opt-in (it duplicates
 # the awa-native line in cross-system plots — same Rust, same SQL).
-DEFAULT_SYSTEMS = ["awa", "awa-python", "procrastinate", "river", "oban"]
+DEFAULT_SYSTEMS = ["awa", "awa-python", "procrastinate", "river", "oban", "pgque"]
