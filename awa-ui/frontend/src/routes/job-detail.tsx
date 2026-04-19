@@ -33,12 +33,22 @@ function hasMetadata(job: JobRow): boolean {
   );
 }
 
+// Treat empty display_name the same as missing — the contract is
+// "display name if set, otherwise the raw key". `??` alone would let
+// `display_name: ""` render a blank label.
+function descriptorLabel(
+  displayName: string | null | undefined,
+  fallback: string,
+): string {
+  return displayName?.trim() ? displayName : fallback;
+}
+
 function jobKindLabel(job: JobRow): string {
-  return job.kind_descriptor?.display_name ?? job.kind;
+  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
 }
 
 function queueLabel(job: JobRow): string {
-  return job.queue_descriptor?.display_name ?? job.queue;
+  return descriptorLabel(job.queue_descriptor?.display_name, job.queue);
 }
 
 export function JobDetailPage() {
@@ -110,13 +120,13 @@ export function JobDetailPage() {
         <Heading level={2}>
           Job #{job.id} &mdash; {jobKindLabel(job)}
         </Heading>
-        {job.kind_descriptor?.display_name && (
+        {job.kind_descriptor?.display_name?.trim() && (
           <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
         )}
         <StateBadge state={job.state} />
       </div>
 
-      {job.kind_descriptor?.description && (
+      {job.kind_descriptor?.description?.trim() && (
         <p className="max-w-3xl text-sm text-muted-fg">
           {job.kind_descriptor.description}
         </p>
@@ -158,7 +168,7 @@ export function JobDetailPage() {
           >
             {queueLabel(job)}
           </Link>
-          {job.queue_descriptor?.display_name && (
+          {job.queue_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.queue}</span>
           )}
         </DescriptionDetails>
@@ -166,7 +176,7 @@ export function JobDetailPage() {
         <DescriptionTerm>Kind</DescriptionTerm>
         <DescriptionDetails>
           {jobKindLabel(job)}
-          {job.kind_descriptor?.display_name && (
+          {job.kind_descriptor?.display_name?.trim() && (
             <span className="ml-2 text-xs text-muted-fg">{job.kind}</span>
           )}
         </DescriptionDetails>

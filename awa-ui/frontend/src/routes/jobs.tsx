@@ -71,12 +71,18 @@ function timeColumnLabel(state: string): string {
   return "Created";
 }
 
+// Treat empty display_name as missing — `??` alone would let
+// `display_name: ""` render a blank label.
 function jobKindLabel(job: JobRow): string {
-  return job.kind_descriptor?.display_name ?? job.kind;
+  return job.kind_descriptor?.display_name?.trim()
+    ? job.kind_descriptor.display_name
+    : job.kind;
 }
 
 function queueLabel(job: JobRow): string {
-  return job.queue_descriptor?.display_name ?? job.queue;
+  return job.queue_descriptor?.display_name?.trim()
+    ? job.queue_descriptor.display_name
+    : job.queue;
 }
 
 function useJobFilters() {
@@ -167,7 +173,9 @@ export function JobsPage() {
   const queueStats = activeQueue
     ? queuesQuery.data?.find((q) => q.queue === activeQueue)
     : undefined;
-  const activeQueueLabel = queueStats?.display_name ?? activeQueue;
+  const activeQueueLabel = queueStats?.display_name?.trim()
+    ? queueStats.display_name
+    : activeQueue;
 
   const pauseQueueMutation = useMutation({
     mutationFn: () => pauseQueue(activeQueue!, "ui"),

@@ -1299,9 +1299,21 @@ where
     let rows = sqlx::query_as::<_, QueueOverview>(
         r#"
         WITH all_queues AS (
+            -- Union every source of queue-name knowledge so /queues never
+            -- hides a queue that exists *somewhere* in the system:
+            --   - queue_state_counts: has observed jobs
+            --   - queue_descriptors:   declared by worker code
+            --   - queue_meta:          pause state recorded by an operator
+            --   - runtime_instances:   registered by a currently-running worker
             SELECT queue FROM awa.queue_state_counts
             UNION
             SELECT queue FROM awa.queue_descriptors
+            UNION
+            SELECT queue FROM awa.queue_meta
+            UNION
+            SELECT DISTINCT descriptor.key AS queue
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.queue_descriptor_hashes) AS descriptor(key, value)
         ),
         live_queue_descriptor_variants AS (
             SELECT
@@ -1751,9 +1763,18 @@ where
     let rows = sqlx::query_as::<_, JobKindOverview>(
         r#"
         WITH all_kinds AS (
+            -- Union every source of kind-name knowledge so /kinds never
+            -- hides a kind that exists *somewhere* in the system:
+            --   - job_kind_catalog: has observed jobs
+            --   - job_kind_descriptors: declared by worker code
+            --   - runtime_instances: reported by a currently-running worker
             SELECT kind FROM awa.job_kind_catalog WHERE ref_count > 0
             UNION
             SELECT kind FROM awa.job_kind_descriptors
+            UNION
+            SELECT DISTINCT descriptor.key AS kind
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.job_kind_descriptor_hashes) AS descriptor(key, value)
         ),
         live_kind_descriptor_variants AS (
             SELECT
@@ -1776,10 +1797,18 @@ where
             GROUP BY kind
         ),
         queue_counts AS (
+            -- Restrict the per-kind queue fan-out to `jobs_hot` rather than
+            -- the full `awa.jobs` view. jobs_hot is bounded by retention
+            -- (default 24h completed / 72h failed) so the scan cost is
+            -- tied to in-flight volume, not historical volume. The
+            -- semantic this produces — "queues this kind is currently
+            -- active on" — is the one admin surfaces actually care about;
+            -- a kind that hasn't enqueued in 3 months shouldn't be
+            -- counted as still spanning N queues.
             SELECT
                 kind,
                 count(DISTINCT queue)::bigint AS queue_count
-            FROM awa.jobs
+            FROM awa.jobs_hot
             GROUP BY kind
         )
         SELECT

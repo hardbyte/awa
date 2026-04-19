@@ -245,11 +245,40 @@ async def test_undeclared_queue_descriptor_fails_start(client):
 
     client.queue_descriptor(orphan_queue, display_name="Nobody runs me")
 
-    with pytest.raises(Exception, match=r"(?i)orphan|descriptor"):
+    # Matches the Rust BuildError::QueueDescriptorWithoutQueue message —
+    # "queue descriptor declared for unknown queue '<name>'".
+    with pytest.raises(Exception, match=r"(?i)descriptor.*unknown queue"):
         await client.start([(running_queue, 1)])
 
     # No runtime was started; nothing to shut down. Clean up any stray row.
     _cleanup(orphan_queue, "descriptor_test_job")
+
+
+@pytest.mark.asyncio
+async def test_descriptor_mutation_after_start_rejected(client):
+    """Declaring a descriptor on a client whose runtime is already running
+    can't take effect (the runtime only reads descriptors at start()). Make
+    that failure loud instead of silently no-op."""
+    suffix = uuid.uuid4().hex[:8]
+    queue = f"py_mutation_{suffix}"
+
+    @client.task(DescriptorTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    client.queue_descriptor(queue, display_name="First")
+    await client.start([(queue, 1)])
+    try:
+        with pytest.raises(Exception, match=r"(?i)before start"):
+            client.queue_descriptor(queue, display_name="Second, too late")
+        with pytest.raises(Exception, match=r"(?i)before start"):
+            client.job_kind_descriptor(
+                "descriptor_test_job",
+                display_name="Also too late",
+            )
+    finally:
+        await client.shutdown()
+        _cleanup(queue, "descriptor_test_job")
 
 
 @pytest.mark.asyncio

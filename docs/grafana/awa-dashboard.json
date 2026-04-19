@@ -162,8 +162,8 @@
       },
       "targets": [
         {
-          "expr": "(awa_queue_lag_seconds{awa_job_queue=~\"$queue\"} * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info) or awa_queue_lag_seconds{awa_job_queue=~\"$queue\"}",
-          "legendFormat": "{{awa_queue_display_name}}{{awa_job_queue}}"
+          "expr": "(awa_queue_lag_seconds{awa_job_queue=~\"$queue\"} * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info) or label_replace(awa_queue_lag_seconds{awa_job_queue=~\"$queue\"}, \"awa_queue_display_name\", \"$1\", \"awa_job_queue\", \"(.*)\")",
+          "legendFormat": "{{awa_queue_display_name}} ({{awa_job_queue}})"
         }
       ],
       "datasource": { "uid": "${DS_PROMETHEUS}" }
@@ -283,8 +283,8 @@
           },
           "targets": [
             {
-              "expr": "sum by (awa_job_queue, awa_queue_display_name) (\n  rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])\n  * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info\n) or sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval]))",
-              "legendFormat": "{{awa_queue_display_name}}{{awa_job_queue}}"
+              "expr": "sum by (awa_job_queue, awa_queue_display_name) (\n  rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])\n  * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info\n) or label_replace(\n  sum by (awa_job_queue) (rate(awa_job_completed_total{awa_job_queue=~\"$queue\"}[$__rate_interval])),\n  \"awa_queue_display_name\", \"$1\", \"awa_job_queue\", \"(.*)\"\n)",
+              "legendFormat": "{{awa_queue_display_name}} ({{awa_job_queue}})"
             }
           ],
           "datasource": { "uid": "${DS_PROMETHEUS}" }

@@ -109,7 +109,9 @@ export function QueuesPage() {
   }
 
   function queueLabel(q: QueueStats): string {
-    return q.display_name ?? q.queue;
+    // Treat empty display_name as missing — `??` alone would let
+    // `display_name: ""` render a blank label.
+    return q.display_name?.trim() ? q.display_name : q.queue;
   }
 
   function descriptorSyncLabel(q: QueueStats): string {
@@ -140,7 +142,7 @@ export function QueuesPage() {
                   >
                     {queueLabel(q)}
                   </Link>
-                  {q.display_name && (
+                  {q.display_name?.trim() && (
                     <div className="text-xs text-muted-fg">{q.queue}</div>
                   )}
                   <div className="mt-1 text-xs text-muted-fg">

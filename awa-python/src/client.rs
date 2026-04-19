@@ -593,6 +593,19 @@ impl PyClient {
         tags: Option<Vec<String>>,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        // Mutation after start() is a footgun: the runtime only reads
+        // queue_descriptors during startup, so the late call would
+        // silently have no effect. Fail loudly instead.
+        if self
+            .runtime
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_some()
+        {
+            return Err(state_error(
+                "queue_descriptor() must be called before start()",
+            ));
+        }
         let descriptor = build_queue_descriptor(
             py,
             display_name,
@@ -632,6 +645,16 @@ impl PyClient {
         tags: Option<Vec<String>>,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<()> {
+        if self
+            .runtime
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_some()
+        {
+            return Err(state_error(
+                "job_kind_descriptor() must be called before start()",
+            ));
+        }
         let descriptor = build_job_kind_descriptor(
             py,
             display_name,
