@@ -20,8 +20,9 @@ The original COPY design predated later architectural changes:
 
 ADR-019 supersedes the hot/deferred physical layout as Awa's primary storage
 engine. The staging-table decision in this ADR still stands, but backend-aware
-routing now needs to target the active storage engine rather than assuming the
-canonical tables are the hot path forever.
+routing now targets the active storage engine. References in this ADR to
+`awa.jobs_hot` / `awa.scheduled_jobs` describe the canonical compatibility
+path, not the universal hot path.
 
 ## Decision
 

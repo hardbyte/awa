@@ -16,6 +16,7 @@ fn completion_flush_interval() -> Duration {
     env::var("AWA_COMPLETION_FLUSH_MS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
         .map(Duration::from_millis)
         .unwrap_or_else(|| Duration::from_millis(1))
 }

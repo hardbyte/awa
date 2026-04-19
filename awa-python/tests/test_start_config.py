@@ -20,7 +20,14 @@ DATABASE_URL = os.environ.get(
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    return c
+    tx = await c.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute("DROP SCHEMA IF EXISTS awa_exp CASCADE")
+    await tx.commit()
+    try:
+        yield c
+    finally:
+        await c.close()
 
 
 @dataclass
@@ -328,4 +335,32 @@ async def test_queue_storage_start_selects_runtime_backend(client):
         tx = await client.transaction()
         await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
         await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await tx.commit()
+
+
+@pytest.mark.asyncio
+async def test_install_queue_storage_rejected_while_runtime_is_running(client):
+    """install_queue_storage() is blocked once the worker runtime has started."""
+    queue = "cfg_install_queue_storage_guard"
+    schema = "awa_py_cfg_runtime_guard"
+
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    await tx.commit()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    try:
+        await client.start([(queue, 1)], poll_interval_ms=25, queue_storage_schema=schema)
+        with pytest.raises(awa.AwaError, match="cannot install queue storage while the worker runtime is running"):
+            await client.install_queue_storage(schema=f"{schema}_other")
+    finally:
+        await client.shutdown()
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema}_other CASCADE")
         await tx.commit()

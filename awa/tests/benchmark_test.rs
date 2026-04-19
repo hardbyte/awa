@@ -42,9 +42,10 @@ async fn setup(max_conns: u32) -> sqlx::PgPool {
 }
 
 async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
-    let _ = sqlx::query("CREATE EXTENSION IF NOT EXISTS pgstattuple")
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS pgstattuple")
         .execute(pool)
-        .await;
+        .await
+        .expect("Failed to create pgstattuple extension for benchmark dead-tuple sampling");
 }
 
 async fn recreate_queue_storage_schema(pool: &sqlx::PgPool, store: &QueueStorage) {

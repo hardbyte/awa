@@ -2936,11 +2936,12 @@ impl QueueStorage {
             .collect();
         let priorities: Vec<i16> = claimed.iter().map(|entry| entry.claim.priority).collect();
         let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
+        let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
 
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
-            WITH completed(lease_slot, queue, priority, lane_seq) AS (
-                SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[])
+            WITH completed(lease_slot, queue, priority, lane_seq, run_lease) AS (
+                SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
             )
             DELETE FROM {schema}.leases AS leases
             USING completed
@@ -2948,6 +2949,7 @@ impl QueueStorage {
               AND leases.queue = completed.queue
               AND leases.priority = completed.priority
               AND leases.lane_seq = completed.lane_seq
+              AND leases.run_lease = completed.run_lease
             RETURNING
                 leases.ready_slot,
                 leases.ready_generation,
@@ -2970,6 +2972,7 @@ impl QueueStorage {
         .bind(&queues)
         .bind(&priorities)
         .bind(&lane_seqs)
+        .bind(&run_leases)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -5112,6 +5115,7 @@ impl QueueStorage {
         pool: &PgPool,
         job_id: i64,
         run_lease: i64,
+        reason: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
@@ -5154,11 +5158,19 @@ impl QueueStorage {
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted running lease");
 
-        let payload =
-            Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
-        let done = moved
-            .clone()
-            .into_done_row(JobState::Cancelled, Utc::now(), payload);
+        let mut payload = RuntimePayload::from_json(Self::with_progress(
+            moved.payload.clone(),
+            progress.or(moved.progress.clone()),
+        )?)?;
+        payload.push_error(lifecycle_error(
+            format!("cancelled: {reason}"),
+            moved.attempt,
+            false,
+        ));
+        let done =
+            moved
+                .clone()
+                .into_done_row(JobState::Cancelled, Utc::now(), payload.into_json());
         self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
             .await?;
         self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)

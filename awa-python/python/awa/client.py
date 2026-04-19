@@ -125,7 +125,7 @@ class AsyncClient:
     async def install_queue_storage(
         self,
         *,
-        schema: str = "awa_py",
+        schema: str = "awa_exp",
         queue_slot_count: int = 4,
         lease_slot_count: int = 2,
         reset: bool = False,
@@ -228,11 +228,17 @@ class AsyncClient:
         queue: str | None = None,
         tag: str | None = None,
         before_id: int | None = None,
+        before_dlq_at: dt.datetime | None = None,
         limit: int = 100,
     ) -> list["DlqEntry"]:
-        """List DLQ entries, newest first. `before_id` enables cursor pagination."""
+        """List DLQ entries, newest first. Use `(before_dlq_at, before_id)` as the cursor."""
         return await self._raw.list_dlq(
-            kind=kind, queue=queue, tag=tag, before_id=before_id, limit=limit
+            kind=kind,
+            queue=queue,
+            tag=tag,
+            before_id=before_id,
+            before_dlq_at=before_dlq_at,
+            limit=limit,
         )
 
     async def get_dlq_job(self, job_id: int) -> "DlqEntry | None":
@@ -668,7 +674,7 @@ class Client:
     def install_queue_storage(
         self,
         *,
-        schema: str = "awa_py",
+        schema: str = "awa_exp",
         queue_slot_count: int = 4,
         lease_slot_count: int = 2,
         reset: bool = False,
@@ -805,11 +811,17 @@ class Client:
         queue: str | None = None,
         tag: str | None = None,
         before_id: int | None = None,
+        before_dlq_at: dt.datetime | None = None,
         limit: int = 100,
     ) -> list[DlqEntry]:
-        """List DLQ entries, newest first."""
+        """List DLQ entries, newest first. Use `(before_dlq_at, before_id)` as the cursor."""
         return self._raw.list_dlq_sync(
-            kind=kind, queue=queue, tag=tag, before_id=before_id, limit=limit
+            kind=kind,
+            queue=queue,
+            tag=tag,
+            before_id=before_id,
+            before_dlq_at=before_dlq_at,
+            limit=limit,
         )
 
     def get_dlq_job(self, job_id: int) -> DlqEntry | None:

@@ -68,7 +68,7 @@ The descriptor surface is deliberately off the hot path:
 
 ## Crate Structure
 
-```
+```text
 awa (workspace)
 ├── awa-macros        proc-macro crate: #[derive(JobArgs)] and CamelCase→snake_case
 ├── awa-model         Core types, SQL, migrations, insert/admin/cron APIs
@@ -86,7 +86,7 @@ awa (workspace)
 
 Jobs follow this state machine:
 
-```
+```text
 INSERT ──► scheduled ──► available ──► running ──► completed
                │              ▲           │
                │              │           ├──► retryable ──► available (via promotion)
@@ -149,7 +149,7 @@ REST API, Python bindings, and Web UI.
 
 ### Insert (Producer)
 
-```
+```text
 Application code
     │
     ▼
@@ -178,7 +178,7 @@ transactional enqueue pattern.
 For high-throughput ingestion (10K+ jobs), `insert_many_copy` uses PostgreSQL's
 COPY protocol via a staging table approach (see ADR-008):
 
-```
+```text
 insert_many_copy(conn, jobs)
     │
     ├── CREATE TEMP TABLE IF NOT EXISTS pg_temp.awa_copy_staging (...) ON COMMIT DELETE ROWS
@@ -199,7 +199,7 @@ convenience wrapper that manages its own transaction.
 
 Each queue has a `Dispatcher` that runs a poll loop:
 
-```
+```text
 Dispatcher::run()
     │
     ├── LISTEN awa:<queue>        (PgListener for instant wakeup)
@@ -245,7 +245,7 @@ for long-running read-only work.
 
 ### Execute (Executor)
 
-```
+```text
 JobExecutor::execute(job)
     │
     ▼
@@ -300,7 +300,7 @@ Three flush paths:
    `{schema}.attempt_state(job_id, run_lease, progress)` guarded by the active
    lease. This is the reliable path for critical checkpoints.
 
-```
+```text
 ctx.set_progress(50, "halfway")       ──► ProgressState.latest updated, generation bumped
 ctx.update_metadata({"cursor": N})    ──► metadata shallow-merged, generation bumped
 
@@ -317,9 +317,11 @@ complete_job(result, progress_snapshot) ──► progress included in the termi
 **Storage:** While a job is actively running, progress lives in
 `{schema}.attempt_state.progress` keyed by `(job_id, run_lease)`. When the
 attempt leaves the execution path, the latest snapshot is copied into the
-payload on the deferred / terminal row. Short jobs can therefore complete
-without ever allocating `attempt_state`, while long-running or callback-heavy
-jobs still have durable checkpoints.
+payload on the deferred / terminal row. On successful completion that durable
+payload snapshot is the retained record, while the live `attempt_state` row is
+deleted, which is why the lifecycle table below shows `Completed` as `NULL`.
+Short jobs can therefore complete without ever allocating `attempt_state`,
+while long-running or callback-heavy jobs still have durable checkpoints.
 
 **Buffer design:** Each in-flight job has an `Arc<Mutex<ProgressState>>` shared
 between the handler and the heartbeat service. The buffer tracks a
@@ -418,7 +420,7 @@ Future-dated and retryable jobs live in `{schema}.deferred_jobs` until their
 `run_at` time arrives. The maintenance leader promotes due rows in bounded
 batches by materializing fresh ready entries in the current ready segment:
 
-```
+```sql
 WITH due AS (
     DELETE FROM {schema}.deferred_jobs
     WHERE ctid IN (
@@ -536,7 +538,7 @@ If the side effect must be durable or retried, enqueue another job instead.
 
 ### Scheduler Flow (Leader-Only)
 
-```
+```text
 MaintenanceService (leader)
     │
     ├── Every 60s: sync_periodic_jobs_to_db()
@@ -667,7 +669,7 @@ operator views fresh.
 
 The `awa-ui` crate provides a built-in dashboard, job inspector, queue management, and cron controls via `awa serve`. The frontend is React/TypeScript with IntentUI components, embedded into the binary via `rust-embed`. The backend is an axum REST API backed by `awa-model` admin functions.
 
-```
+```text
 awa --database-url $DATABASE_URL serve
 # → http://127.0.0.1:3000
 ```

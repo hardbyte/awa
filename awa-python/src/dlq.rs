@@ -67,6 +67,7 @@ pub(crate) fn build_filter(
     queue: Option<String>,
     tag: Option<String>,
     before_id: Option<i64>,
+    before_dlq_at: Option<DateTime<Utc>>,
     limit: Option<i64>,
 ) -> ListDlqFilter {
     ListDlqFilter {
@@ -74,7 +75,7 @@ pub(crate) fn build_filter(
         queue,
         tag,
         before_id,
-        before_dlq_at: None,
+        before_dlq_at,
         limit,
     }
 }

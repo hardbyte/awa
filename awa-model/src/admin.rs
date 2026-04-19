@@ -334,46 +334,58 @@ async fn list_queue_storage_jobs(
         queue_storage_current_jobs_cte(store.schema())
     );
 
-    let ids: Vec<i64> = sqlx::query_scalar(&sql)
-        .bind(filter.state)
-        .bind(&filter.kind)
-        .bind(&filter.queue)
-        .bind(filter.before_id)
-        .bind(candidate_limit)
-        .fetch_all(pool)
-        .await?;
-
     let mut jobs = Vec::new();
-    for job_id in ids {
-        let Some(job) = store.load_job(pool, job_id).await? else {
-            continue;
-        };
+    let mut cursor = filter.before_id;
 
-        if let Some(state) = filter.state {
-            if job.state != state {
-                continue;
-            }
-        }
-        if let Some(kind) = &filter.kind {
-            if &job.kind != kind {
-                continue;
-            }
-        }
-        if let Some(queue) = &filter.queue {
-            if &job.queue != queue {
-                continue;
-            }
-        }
-        if let Some(tag) = &filter.tag {
-            if !job.tags.iter().any(|job_tag| job_tag == tag) {
-                continue;
-            }
-        }
-
-        jobs.push(job);
-        if jobs.len() as i64 >= limit {
+    loop {
+        let ids: Vec<i64> = sqlx::query_scalar(&sql)
+            .bind(filter.state)
+            .bind(&filter.kind)
+            .bind(&filter.queue)
+            .bind(cursor)
+            .bind(candidate_limit)
+            .fetch_all(pool)
+            .await?;
+        if ids.is_empty() {
             break;
         }
+
+        for job_id in &ids {
+            let Some(job) = store.load_job(pool, *job_id).await? else {
+                continue;
+            };
+
+            if let Some(state) = filter.state {
+                if job.state != state {
+                    continue;
+                }
+            }
+            if let Some(kind) = &filter.kind {
+                if &job.kind != kind {
+                    continue;
+                }
+            }
+            if let Some(queue) = &filter.queue {
+                if &job.queue != queue {
+                    continue;
+                }
+            }
+            if let Some(tag) = &filter.tag {
+                if !job.tags.iter().any(|job_tag| job_tag == tag) {
+                    continue;
+                }
+            }
+
+            jobs.push(job);
+            if jobs.len() as i64 >= limit {
+                break;
+            }
+        }
+
+        if jobs.len() as i64 >= limit || ids.len() < candidate_limit as usize {
+            break;
+        }
+        cursor = ids.last().copied();
     }
 
     jobs.sort_by_key(|job| std::cmp::Reverse(job.id));
