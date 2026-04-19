@@ -413,20 +413,9 @@ where
 
     sqlx::query_as::<_, JobRow>(
         r#"
-        SELECT *
-        FROM awa.insert_job_compat(
-            $1,
-            $2,
-            $3,
-            $4,
-            $5,
-            $6,
-            $7,
-            $8,
-            $9,
-            $10,
-            $11::bit(8)
-        )
+        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
+        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10, $11::bit(8))
+        RETURNING *
         "#,
     )
     .bind(kind)

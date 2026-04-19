@@ -365,6 +365,37 @@ impl AwaMetrics {
         self.dlq_moved.add(1, &attrs);
     }
 
+    /// Record a bulk admin move into the DLQ.
+    pub fn record_dlq_moved_bulk(
+        &self,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        reason: &str,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+
+        let mut attrs = vec![opentelemetry::KeyValue::new(
+            "awa.dlq.reason",
+            reason.to_string(),
+        )];
+        if let Some(kind) = kind {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.kind",
+                kind.to_string(),
+            ));
+        }
+        if let Some(queue) = queue {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.queue",
+                queue.to_string(),
+            ));
+        }
+        self.dlq_moved.add(count, &attrs);
+    }
+
     /// Record jobs retried out of the DLQ.
     pub fn record_dlq_retried(&self, queue: Option<&str>, count: u64) {
         let attrs: Vec<opentelemetry::KeyValue> = queue

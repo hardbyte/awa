@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use axum::http::header;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use rust_embed::Embed;
 use sqlx::PgPool;
@@ -91,6 +91,15 @@ pub async fn router_with(
         .route("/stats/kinds", get(handlers::stats::get_distinct_kinds))
         .route("/stats/queues", get(handlers::stats::get_distinct_queues))
         .route("/capabilities", get(handlers::stats::get_capabilities))
+        // DLQ
+        .route("/dlq", get(handlers::dlq::list_dlq))
+        .route("/dlq/depth", get(handlers::dlq::dlq_depth))
+        .route("/dlq/{id}", get(handlers::dlq::get_dlq_job))
+        .route("/dlq/{id}", delete(handlers::dlq::purge_dlq_job))
+        .route("/dlq/{id}/retry", post(handlers::dlq::retry_dlq_job))
+        .route("/dlq/bulk-retry", post(handlers::dlq::bulk_retry_dlq))
+        .route("/dlq/bulk-purge", post(handlers::dlq::bulk_purge_dlq))
+        .route("/dlq/bulk-move", post(handlers::dlq::bulk_move_failed))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime))
         // Callbacks (for HTTP workers and external systems)

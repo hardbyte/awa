@@ -169,6 +169,7 @@ const NAV_ITEMS = [
   { to: "/jobs", label: "Jobs" },
   { to: "/kinds", label: "Kinds" },
   { to: "/queues", label: "Queues" },
+  { to: "/dlq", label: "DLQ" },
   { to: "/runtime", label: "Runtime" },
   { to: "/cron", label: "Cron" },
 ] as const;

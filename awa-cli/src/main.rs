@@ -61,6 +61,11 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommands,
     },
+    /// Dead Letter Queue management
+    Dlq {
+        #[command(subcommand)]
+        command: DlqCommands,
+    },
     /// Start the web UI server
     Serve {
         /// Host to bind to
@@ -147,6 +152,65 @@ enum JobCommands {
         queue: Option<String>,
         #[arg(long, default_value = "20")]
         limit: i64,
+    },
+}
+
+#[derive(Subcommand)]
+enum DlqCommands {
+    /// List rows in the Dead Letter Queue
+    List {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show DLQ depth (total, optionally by queue)
+    Depth {
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// Retry a single DLQ'd job by id
+    Retry { id: i64 },
+    /// Retry DLQ rows in bulk matching the filter
+    RetryBulk {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        /// Retry every row in the DLQ when no filter is provided.
+        /// Required without `--kind`, `--queue`, or `--tag` to guard against
+        /// accidentally reviving the entire DLQ.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Move existing failed jobs (in jobs_hot) into the DLQ
+    Move {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long, default_value = "manual")]
+        reason: String,
+    },
+    /// Purge (delete) DLQ rows matching the filter
+    Purge {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        /// Purge every row in the DLQ when no filter is provided.
+        /// Required without `--kind`, `--queue`, or `--tag` to guard against
+        /// accidentally wiping the DLQ.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -418,6 +482,136 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             println!("\n{} jobs listed.", jobs.len());
                         }
+                    }
+                },
+
+                Commands::Dlq { command } => match command {
+                    DlqCommands::List {
+                        kind,
+                        queue,
+                        tag,
+                        limit,
+                    } => {
+                        let filter = awa_model::dlq::ListDlqFilter {
+                            kind,
+                            queue,
+                            tag,
+                            limit: Some(limit),
+                            ..Default::default()
+                        };
+                        let rows = awa_model::dlq::list_dlq(&pool, &filter).await?;
+                        if rows.is_empty() {
+                            println!("DLQ is empty (no matching rows).");
+                        } else {
+                            println!(
+                                "{:<8} {:<25} {:<10} {:<30} {:<25}",
+                                "ID", "KIND", "QUEUE", "REASON", "DLQ_AT"
+                            );
+                            for row in &rows {
+                                // Truncate by characters, not bytes: byte
+                                // slicing mid-codepoint panics on Unicode
+                                // reasons (e.g. an operator typing a
+                                // non-ASCII note).
+                                let char_count = row.reason.chars().count();
+                                let reason = if char_count > 30 {
+                                    let prefix: String = row.reason.chars().take(27).collect();
+                                    format!("{prefix}...")
+                                } else {
+                                    row.reason.clone()
+                                };
+                                println!(
+                                    "{:<8} {:<25} {:<10} {:<30} {:<25}",
+                                    row.job.id, row.job.kind, row.job.queue, reason, row.dlq_at
+                                );
+                            }
+                            println!("\n{} rows.", rows.len());
+                        }
+                    }
+                    DlqCommands::Depth { queue } => {
+                        if let Some(queue_name) = queue {
+                            let depth = awa_model::dlq::dlq_depth(&pool, Some(&queue_name)).await?;
+                            println!("{queue_name}: {depth}");
+                        } else {
+                            let total = awa_model::dlq::dlq_depth(&pool, None).await?;
+                            let by_queue = awa_model::dlq::dlq_depth_by_queue(&pool).await?;
+                            println!("Total: {total}");
+                            for (q, count) in &by_queue {
+                                println!("  {q}: {count}");
+                            }
+                        }
+                    }
+                    DlqCommands::Retry { id } => {
+                        let opts = awa_model::dlq::RetryFromDlqOpts::default();
+                        match awa_model::dlq::retry_from_dlq(&pool, id, &opts).await? {
+                            Some(job) => {
+                                awa_worker::AwaMetrics::from_global()
+                                    .record_dlq_retried(Some(&job.queue), 1);
+                                println!("Retried DLQ job {id} → job state {}", job.state);
+                            }
+                            None => println!("No DLQ row with id {id}"),
+                        }
+                    }
+                    DlqCommands::RetryBulk {
+                        kind,
+                        queue,
+                        tag,
+                        all,
+                    } => {
+                        let filter = awa_model::dlq::ListDlqFilter {
+                            kind,
+                            queue: queue.clone(),
+                            tag,
+                            ..Default::default()
+                        };
+                        let count =
+                            awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
+                        if count > 0 {
+                            awa_worker::AwaMetrics::from_global()
+                                .record_dlq_retried(queue.as_deref(), count);
+                        }
+                        println!("Retried {count} DLQ rows.");
+                    }
+                    DlqCommands::Move {
+                        kind,
+                        queue,
+                        reason,
+                    } => {
+                        let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                            &pool,
+                            kind.as_deref(),
+                            queue.as_deref(),
+                            &reason,
+                        )
+                        .await?;
+                        // Emit the same `awa.job.dlq_moved` counter the
+                        // executor uses for automatic routing, so dashboards
+                        // and alerting see admin bulk moves too.
+                        awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                            kind.as_deref(),
+                            queue.as_deref(),
+                            &reason,
+                            count,
+                        );
+                        println!("Moved {count} failed jobs into the DLQ.");
+                    }
+                    DlqCommands::Purge {
+                        kind,
+                        queue,
+                        tag,
+                        all,
+                    } => {
+                        let filter = awa_model::dlq::ListDlqFilter {
+                            kind,
+                            queue: queue.clone(),
+                            tag,
+                            ..Default::default()
+                        };
+                        let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
+                        if count > 0 {
+                            awa_worker::AwaMetrics::from_global()
+                                .record_dlq_purged(queue.as_deref(), count);
+                        }
+                        println!("Purged {count} DLQ rows.");
                     }
                 },
 
