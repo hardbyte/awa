@@ -220,37 +220,6 @@ async fn wait_for_completion(
     }
 }
 
-async fn wait_for_job_completion(
-    store: &QueueStorage,
-    pool: &PgPool,
-    queue_name: &str,
-    job_id: i64,
-    timeout: Duration,
-) {
-    let start = Instant::now();
-    loop {
-        if let Some(job) = store
-            .load_job(pool, job_id)
-            .await
-            .expect("Failed to load queue_storage job")
-        {
-            if job.state == awa_model::JobState::Completed {
-                return;
-            }
-        }
-
-        if start.elapsed() > timeout {
-            let state_counts = count_by_state(store, pool, queue_name).await;
-            panic!(
-                "Timeout after {:?}: job {} did not complete, state counts: {:?}",
-                timeout, job_id, state_counts
-            );
-        }
-
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
-}
-
 async fn enqueue_batch(pool: &PgPool, queue_name: &str, count: i64, use_copy: bool) {
     let batch_size = 500;
     if use_copy {
@@ -332,7 +301,6 @@ async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
     let pool = create_pool(20).await;
     let (_store, _config) = prepare_queue_storage(&pool).await;
     let queue = "awa_enqueue_bench";
-    clean_queue(&pool, queue).await;
 
     let start = Instant::now();
     enqueue_batch(&pool, queue, job_count, true).await;
@@ -357,7 +325,6 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
     let pool = create_pool(20).await;
     let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_worker_bench";
-    clean_queue(&pool, queue).await;
 
     // Pre-enqueue all jobs
     enqueue_batch(&pool, queue, job_count, true).await;
@@ -394,7 +361,6 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
     let pool = create_pool(20).await;
     let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_latency_bench";
-    clean_queue(&pool, queue).await;
 
     let client = build_client(pool.clone(), queue, worker_count, config);
     client.start().await.expect("Failed to start client");
@@ -406,7 +372,7 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
 
     for i in 0..iterations {
         let insert_time = Instant::now();
-        let inserted = insert_with(
+        insert_with(
             &pool,
             &BenchJob { seq: i },
             InsertOpts {
@@ -417,7 +383,10 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
         .await
         .unwrap();
 
-        wait_for_job_completion(&store, &pool, queue, inserted.id, Duration::from_secs(10)).await;
+        // Observe cumulative completed count instead of polling one job row.
+        // Queue-storage prune can rotate completed rows away, but queue_counts()
+        // preserves the terminal rollup.
+        wait_for_completion(&store, &pool, queue, i + 1, Duration::from_secs(10)).await;
         latencies_us.push(insert_time.elapsed().as_micros() as u64);
     }
 
