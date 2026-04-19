@@ -513,6 +513,7 @@ impl Dispatcher {
                     .map(|job| DispatchedJob {
                         job,
                         queue_storage_claim: None,
+                        queue_storage_unique_states: None,
                     })
                     .collect(),
                 Err(err) => {
@@ -535,6 +536,7 @@ impl Dispatcher {
                     .map(|claimed| DispatchedJob {
                         job: claimed.job,
                         queue_storage_claim: Some(claimed.claim),
+                        queue_storage_unique_states: claimed.unique_states,
                     })
                     .collect(),
                 Err(err) => {
