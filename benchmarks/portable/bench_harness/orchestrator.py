@@ -46,6 +46,7 @@ from .phases import (
 )
 from .plots import render_all
 from .sample import Sample
+from .versions import capture_adapter_revision
 from .writers import (
     RawCsvWriter,
     build_manifest,
@@ -600,7 +601,17 @@ def drive(
                 worker_count=worker_count,
                 high_load_multiplier=high_load_multiplier,
             )
-            adapter_descriptors[system] = descriptor or {}
+            # Merge the runtime descriptor the adapter emitted with the
+            # harness-proven revision block (git SHA / submodule SHA /
+            # pinned upstream version). The runtime half records what the
+            # process claimed about itself; the harness half records what
+            # we can prove by inspecting the source tree and pinned
+            # manifests. Both ship in manifest.json so a reader can tell
+            # *exactly* which code was under test without cross-referencing
+            # anything outside the run directory.
+            entry = dict(descriptor or {})
+            entry["revision"] = capture_adapter_revision(system)
+            adapter_descriptors[system] = entry
     finally:
         drain_stop.set()
         drain_thread.join(timeout=10)
@@ -623,7 +634,12 @@ def drive(
     write_manifest(manifest, run_dir / "manifest.json")
     summary = compute_summary(raw_csv, run_id=run_id, scenario=scenario, phases=phases)
     write_summary(summary, run_dir / "summary.json")
-    write_run_readme(run_dir / "README.md", scenario=scenario, phases=phases)
+    write_run_readme(
+        run_dir / "README.md",
+        scenario=scenario,
+        phases=phases,
+        adapters=adapter_descriptors,
+    )
     # Build system_meta so plots can group variants of the same family
     # (e.g. awa, awa-docker, awa-python all share the "awa" family colour).
     system_meta: dict[str, tuple[str, str]] = {}

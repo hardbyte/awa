@@ -467,7 +467,35 @@ def write_manifest(manifest: dict, path: Path) -> None:
 # ────────────────────────────────────────────────────────────────────────
 
 
-def write_run_readme(path: Path, *, scenario: str | None, phases: list[Phase]) -> None:
+def _versions_section(adapters: dict[str, dict] | None) -> str:
+    if not adapters:
+        return ""
+    from .versions import format_revision_oneline
+
+    lines = ["## Adapter versions", ""]
+    lines.append("| System | Revision |")
+    lines.append("| :--- | :--- |")
+    for system in sorted(adapters):
+        lines.append(
+            f"| `{system}` | {format_revision_oneline(system, adapters[system])} |"
+        )
+    lines.append("")
+    lines.append(
+        "_Full detail (git SHA, branch, dirty flag, submodule describe, pinned "
+        "dep version, adapter-reported runtime metadata) is in `manifest.json` "
+        "under `adapters.<system>.revision`._"
+    )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def write_run_readme(
+    path: Path,
+    *,
+    scenario: str | None,
+    phases: list[Phase],
+    adapters: dict[str, dict] | None = None,
+) -> None:
     phase_desc = " → ".join(
         f"{p.label} ({p.type.value}, {p.duration_s}s)" for p in phases
     )
@@ -475,6 +503,7 @@ def write_run_readme(path: Path, *, scenario: str | None, phases: list[Phase]) -
         "# Long-horizon bench run\n\n"
         f"- Scenario: `{scenario or 'custom'}`\n"
         f"- Phases: {phase_desc}\n\n"
+        f"{_versions_section(adapters)}"
         "## Files\n\n"
         "- `raw.csv` — tidy long-form per-sample metrics (system × subject × metric).\n"
         "- `summary.json` — per-system per-phase aggregates + recovery metrics.\n"
@@ -482,8 +511,9 @@ def write_run_readme(path: Path, *, scenario: str | None, phases: list[Phase]) -
         "- `plots/` — publication-quality plots (PNG 300dpi + SVG).\n\n"
         "## Rerun\n\n"
         "Reproduce with the exact CLI in `manifest.json -> cli`, using the same\n"
-        "pinned PG image. Results will differ slightly across hardware; the\n"
-        "shape of the curves is what matters cross-system.\n"
+        "pinned PG image, and the same git SHA / submodule pointers recorded\n"
+        "under `adapters.<system>.revision`. Results will differ slightly\n"
+        "across hardware; the shape of the curves is what matters cross-system.\n"
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(body)
