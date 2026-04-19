@@ -73,7 +73,18 @@ What is intentionally not modeled:
   counterexample trace (claim snapshots segment, rotate+prune fire, commit
   lands lease in pruned segment — simultaneously the claim-vs-rotate race
   and the prune check-then-act race). The safe config uses a checked
-  commit and passes.
+  commit and passes. Mitigated in production by `FOR SHARE` on
+  `lease_ring_state` and `ACCESS EXCLUSIVE` on partition children — see
+  `storage/MAPPING.md` for the full analysis.
+- `storage/AwaStorageLockOrder.tla` / `storage/AwaStorageLockOrder.cfg` /
+  `storage/AwaStorageLockOrderDeadlockDemo.cfg`: lock-ordering protocol
+  spec. Models each storage-engine transaction (claim, rotate-leases,
+  prune-leases, rotate-ready, prune-ready) as an ordered sequence of
+  Postgres lock acquisitions with a shared/exclusive compatibility matrix.
+  Checks `NoDeadlock` via a waits-for cycle detector. The main config
+  passes cleanly (2,076 distinct states), confirming the current lock
+  ordering is deadlock-free. The demo config uses a deliberately
+  cycle-creating plan pair to prove the detector itself works.
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -114,6 +125,8 @@ From the repository root:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
