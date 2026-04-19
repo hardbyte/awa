@@ -6,6 +6,22 @@ use sqlx::postgres::PgConnection;
 use sqlx::{PgExecutor, PgPool};
 
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
+const INSERT_COMPAT_SQL: &str = r#"
+    SELECT *
+    FROM awa.insert_job_compat(
+        $1,
+        $2,
+        $3,
+        $4,
+        $5,
+        $6,
+        $7,
+        $8,
+        $9,
+        $10,
+        $11::bit(8)
+    )
+"#;
 
 // ── Shared insert preparation ───────────────────────────────────────────
 //
@@ -62,35 +78,6 @@ pub(crate) struct PreparedRow {
     pub unique_states: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TargetTable {
-    JobsHot,
-    ScheduledJobs,
-}
-
-impl TargetTable {
-    fn as_str(self) -> &'static str {
-        match self {
-            TargetTable::JobsHot => "awa.jobs_hot",
-            TargetTable::ScheduledJobs => "awa.scheduled_jobs",
-        }
-    }
-}
-
-fn target_table_for_state(state: JobState) -> TargetTable {
-    match state {
-        JobState::Scheduled | JobState::Retryable => TargetTable::ScheduledJobs,
-        _ => TargetTable::JobsHot,
-    }
-}
-
-fn homogeneous_target_table(rows: &[PreparedRow]) -> Option<TargetTable> {
-    let first = rows.first().map(|row| target_table_for_state(row.state))?;
-    rows.iter()
-        .all(|row| target_table_for_state(row.state) == first)
-        .then_some(first)
-}
-
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     if let sqlx::Error::Database(ref db_err) = err {
         if db_err.code().as_deref() == Some("23505") {
@@ -102,10 +89,9 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
     AwaError::Database(err)
 }
 
-fn build_multi_insert_query(target_table: &str, count: usize) -> String {
-    let mut query = format!(
-        "INSERT INTO {} (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) VALUES ",
-        target_table
+fn build_multi_insert_query(count: usize) -> String {
+    let mut query = String::from(
+        "WITH input (ord, kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) AS (VALUES ",
     );
 
     let params_per_row = 11u32;
@@ -115,7 +101,8 @@ fn build_multi_insert_query(target_table: &str, count: usize) -> String {
             query.push_str(", ");
         }
         query.push_str(&format!(
-            "(${}, ${}, ${}, ${}, ${}, ${}, COALESCE(${}, now()), ${}, ${}, ${}, ${}::bit(8))",
+            "({}, ${}, ${}::text, ${}::jsonb, ${}::awa.job_state, ${}::smallint, ${}::smallint, ${}::timestamptz, ${}::jsonb, ${}::text[], ${}, ${}::bit(8))",
+            i,
             param_index,
             param_index + 1,
             param_index + 2,
@@ -130,7 +117,25 @@ fn build_multi_insert_query(target_table: &str, count: usize) -> String {
         ));
         param_index += params_per_row;
     }
-    query.push_str(" RETURNING *");
+    query.push_str(
+        ") \
+         SELECT inserted.* \
+         FROM input \
+         CROSS JOIN LATERAL awa.insert_job_compat(\
+             input.kind, \
+             input.queue, \
+             input.args, \
+             input.state, \
+             input.priority, \
+             input.max_attempts, \
+             input.run_at, \
+             input.metadata, \
+             input.tags, \
+             input.unique_key, \
+             input.unique_states\
+         ) AS inserted \
+         ORDER BY input.ord",
+    );
     query
 }
 
@@ -229,16 +234,7 @@ where
     E: PgExecutor<'e>,
 {
     let row = prepare_row(args, opts)?;
-    let query = format!(
-        r#"
-        INSERT INTO {} (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
-        VALUES ($1, $2, $3, $4, $5, $6, COALESCE($7, now()), $8, $9, $10, $11::bit(8))
-        RETURNING *
-        "#,
-        target_table_for_state(row.state).as_str()
-    );
-
-    sqlx::query_as::<_, JobRow>(&query)
+    sqlx::query_as::<_, JobRow>(INSERT_COMPAT_SQL)
         .bind(&row.kind)
         .bind(&row.queue)
         .bind(&row.args)
@@ -276,10 +272,7 @@ where
     }
 
     let rows = precompute_rows(jobs)?;
-    let target_table = homogeneous_target_table(&rows)
-        .map(TargetTable::as_str)
-        .unwrap_or("awa.jobs");
-    let query = build_multi_insert_query(target_table, rows.len());
+    let query = build_multi_insert_query(rows.len());
 
     let mut sql_query = sqlx::query_as::<_, JobRow>(&query);
 
@@ -319,9 +312,6 @@ pub async fn insert_many_copy(
     }
 
     let rows = precompute_rows(jobs)?;
-    let target_table = homogeneous_target_table(&rows)
-        .map(TargetTable::as_str)
-        .unwrap_or("awa.jobs");
 
     // 1. Create or reuse a session-local staging table.
     //
@@ -370,7 +360,7 @@ pub async fn insert_many_copy(
         // deferred tables, so the old `ON CONFLICT` path is no longer available
         // here. Keep COPY for staging/parsing, then insert unique rows one at a
         // time and skip duplicates explicitly.
-        let staged_rows = sqlx::query_as::<
+            let staged_rows = sqlx::query_as::<
             _,
             (
                 String,
@@ -424,15 +414,7 @@ pub async fn insert_many_copy(
                 .execute(&mut *conn)
                 .await?;
 
-            let query = format!(
-                r#"
-                INSERT INTO {} (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
-                VALUES ($1, $2, $3, $4::awa.job_state, $5, $6, COALESCE($7, now()), $8, $9, $10, $11::bit(8))
-                RETURNING *
-                "#,
-                target_table
-            );
-            let result = sqlx::query_as::<_, JobRow>(&query)
+            let result = sqlx::query_as::<_, JobRow>(INSERT_COMPAT_SQL)
                 .bind(&kind)
                 .bind(&queue)
                 .bind(&args)
@@ -477,28 +459,32 @@ pub async fn insert_many_copy(
 
         inserted
     } else {
-        let insert_sql = format!(
-            r#"
-            INSERT INTO {} (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
-            SELECT
-                s.kind,
-                s.queue,
-                s.args,
-                s.state::awa.job_state,
-                s.priority,
-                s.max_attempts,
-                COALESCE(s.run_at, now()),
-                s.metadata,
-                s.tags,
-                s.unique_key,
-                s.unique_states
-            FROM pg_temp.awa_copy_staging s
-            RETURNING *
-        "#,
-            target_table
-        );
+        let insert_sql = r#"
+            WITH staged AS (
+                SELECT
+                    *,
+                    row_number() OVER () AS ord
+                FROM pg_temp.awa_copy_staging
+            )
+            SELECT inserted.*
+            FROM staged
+            CROSS JOIN LATERAL awa.insert_job_compat(
+                staged.kind,
+                staged.queue,
+                staged.args,
+                staged.state,
+                staged.priority,
+                staged.max_attempts,
+                staged.run_at,
+                staged.metadata,
+                staged.tags,
+                staged.unique_key,
+                staged.unique_states
+            ) AS inserted
+            ORDER BY staged.ord
+        "#;
 
-        sqlx::query_as::<_, JobRow>(&insert_sql)
+        sqlx::query_as::<_, JobRow>(insert_sql)
             .fetch_all(&mut *conn)
             .await?
     };
