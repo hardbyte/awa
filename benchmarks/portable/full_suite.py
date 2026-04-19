@@ -20,6 +20,9 @@ CHAOS = SCRIPT_DIR / "chaos.py"
 RESULTS_DIR = SCRIPT_DIR / "results"
 RESULT_PATH_RE = re.compile(r"Results saved to (.+)")
 
+sys.path.insert(0, str(SCRIPT_DIR))
+from bench_harness.versions import capture_all, format_revision_oneline  # noqa: E402
+
 DEFAULT_SYSTEMS = [
     "awa",
     "awa-docker",
@@ -285,6 +288,36 @@ def print_repetition_summary(summary: dict[str, dict]) -> None:
             )
 
 
+def _versions_preamble(systems: list[str]) -> list[str]:
+    """Emit an 'Adapter versions' table at the top of a full_suite report.
+
+    full_suite.py runs multiple reps across adapters and aggregates. The
+    per-run manifest.json already carries revision info (orchestrator
+    writes it); at the aggregate layer the operator-facing Markdown
+    benefits from having the same info inlined so a report stands alone.
+    """
+    revisions = capture_all(systems)
+    lines = ["## Adapter versions", ""]
+    lines.append("| System | Revision |")
+    lines.append("| :--- | :--- |")
+    for system in sorted(revisions):
+        # The aggregate report doesn't have the runtime descriptor
+        # (adapter.started_at etc.) — synthesise a minimal entry so
+        # format_revision_oneline renders just the revision half.
+        entry = {"revision": revisions[system]}
+        lines.append(
+            f"| `{system}` | {format_revision_oneline(system, entry)} |"
+        )
+    lines.append("")
+    lines.append(
+        "_Full detail (adapter runtime version, schema version, docker image "
+        "digest) is in each run's `manifest.json` under "
+        "`adapters.<system>`._"
+    )
+    lines.append("")
+    return lines
+
+
 def write_benchmark_exports(summary: dict[str, dict], timestamp: str) -> None:
     markdown_path = RESULTS_DIR / f"benchmark_summary_{timestamp}.md"
     csv_path = RESULTS_DIR / f"benchmark_summary_{timestamp}.csv"
@@ -323,12 +356,16 @@ def write_benchmark_exports(summary: dict[str, dict], timestamp: str) -> None:
         writer.writeheader()
         writer.writerows(benchmark_rows)
 
-    lines = [
-        "# Benchmark Summary",
-        "",
-        "| System | Worker Throughput Mean | Worker Throughput Stdev | Pickup p50 Mean |",
-        "|---|---:|---:|---:|",
-    ]
+    lines: list[str] = ["# Benchmark Summary", ""]
+    lines.extend(_versions_preamble(list(summary.keys())))
+    lines.extend(
+        [
+            "## Results",
+            "",
+            "| System | Worker Throughput Mean | Worker Throughput Stdev | Pickup p50 Mean |",
+            "|---|---:|---:|---:|",
+        ]
+    )
     for system, data in summary.items():
         worker = data["benchmarks"].get("worker_throughput", {})
         latency = data["benchmarks"].get("pickup_latency", {})
@@ -361,12 +398,16 @@ def write_chaos_exports(summary: dict[str, dict], timestamp: str) -> None:
         writer.writeheader()
         writer.writerows(chaos_rows)
 
-    lines = [
-        "# Chaos Summary",
-        "",
-        "| System | Scenario | Successes | Max Lost | Mean Total (s) |",
-        "|---|---|---:|---:|---:|",
-    ]
+    lines: list[str] = ["# Chaos Summary", ""]
+    lines.extend(_versions_preamble(list(summary.keys())))
+    lines.extend(
+        [
+            "## Results",
+            "",
+            "| System | Scenario | Successes | Max Lost | Mean Total (s) |",
+            "|---|---|---:|---:|---:|",
+        ]
+    )
     for system, data in summary.items():
         for scenario, values in data["chaos"].items():
             lines.append(

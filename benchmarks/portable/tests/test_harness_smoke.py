@@ -243,3 +243,91 @@ def test_format_validation_error_is_readable():
         # and one bullet per error.
         assert "invalid configuration" in formatted
         assert formatted.count("\n  - ") >= 2
+
+
+# ── versions / README revision rendering ────────────────────────────────
+
+
+from bench_harness.versions import capture_adapter_revision, capture_all
+from bench_harness.writers import write_run_readme
+
+
+def test_versions_known_systems_return_dicts():
+    # Every registered adapter must get *some* dict back — the harness is
+    # the authoritative source on what was compared, so silently returning
+    # nothing would be a reporting regression.
+    for system in ("awa", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque"):
+        rev = capture_adapter_revision(system)
+        assert isinstance(rev, dict)
+        assert "source" in rev
+
+
+def test_versions_unknown_system_is_still_a_dict():
+    rev = capture_adapter_revision("totally-made-up")
+    assert rev.get("source") == "unknown"
+    assert "note" in rev
+
+
+def test_versions_capture_all_covers_each():
+    out = capture_all(["awa", "procrastinate"])
+    assert set(out) == {"awa", "procrastinate"}
+
+
+def test_versions_upstream_pins_resolve():
+    # These are read from pyproject.toml / go.mod / mix.exs — regressions
+    # here (e.g. regex drift after a file reformat) silently drop versions
+    # from the report, so pin them explicitly.
+    assert capture_adapter_revision("procrastinate").get("pinned_version")
+    assert capture_adapter_revision("river").get("pinned_version")
+    assert capture_adapter_revision("oban").get("pinned_version_constraint")
+
+
+def test_readme_includes_versions_table(tmp_path: Path):
+    phases = [
+        parse_phase_spec("warmup_1=warmup:10s"),
+        parse_phase_spec("smoke=clean:20s"),
+    ]
+    adapters = {
+        "awa": {
+            "version": "0.5.4-alpha.1",
+            "schema_version": "current",
+            "revision": {
+                "source": "awa repo",
+                "git_short": "abc1234",
+                "git_branch": "main",
+                "dirty": False,
+            },
+        },
+        "procrastinate": {
+            "version": "3.7.3",
+            "revision": {
+                "source": "procrastinate-bench/pyproject.toml",
+                "library": "procrastinate",
+                "pinned_version": "3.7.3",
+            },
+        },
+        "pgque": {
+            "revision": {
+                "source": "awa repo + pgque submodule",
+                "git_short": "abc1234",
+                "git_branch": "main",
+                "dirty": False,
+                "pgque_submodule_sha": "3b75f585c3d3fe3985a1688266d0f232c79213ec",
+                "pgque_submodule_describe": "alpha3-5-g3b75f58",
+            },
+        },
+    }
+    out = tmp_path / "README.md"
+    write_run_readme(out, scenario="custom", phases=phases, adapters=adapters)
+    body = out.read_text()
+    assert "Adapter versions" in body
+    assert "abc1234" in body  # awa SHA
+    assert "procrastinate" in body and "3.7.3" in body  # pinned upstream
+    assert "3b75f58" in body  # pgque submodule short SHA
+
+
+def test_readme_omits_section_when_no_adapters(tmp_path: Path):
+    phases = [parse_phase_spec("warmup_1=warmup:10s")]
+    out = tmp_path / "README.md"
+    write_run_readme(out, scenario=None, phases=phases, adapters=None)
+    assert "Adapter versions" not in out.read_text()
