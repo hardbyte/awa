@@ -2,12 +2,11 @@
 
 This doc pins each TLA+ action in `AwaSegmentedStorage.tla` to the Rust
 code and SQL that implements it. It is intended as a mechanical cross-check
-as names and internals drift on the `feature/vacuum-aware-storage-redesign`
-line.
+as names and internals evolve.
 
-File references are at the time of writing (2026-04-19). When the
-prototype renames (e.g. `leases` → `active_leases`, `done_entries` →
-`terminal_entries`) land per ADR-019, update this table accordingly.
+File references are at the time of writing (2026-04-19). This table maps the
+logical storage names used in ADR-019 onto the current Rust / SQL
+implementation.
 
 ## Variable mapping
 
@@ -74,7 +73,7 @@ prototype renames (e.g. `leases` → `active_leases`, `done_entries` →
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
 | `PrunedXSegmentsAreEmpty` | per-family prune requires no live-row precondition before TRUNCATE |
-| `LaneStateConsistent` | `queue_lanes.ready_count` / `leased_count` are maintained by the claim/complete paths (**note**: the redesign branch has a known accounting inconsistency here — see ADR-019 review) |
+| `LaneStateConsistent` | `queue_lanes.ready_count` / `leased_count` are maintained by the claim/complete paths (**note**: see ADR-019 for the current accounting constraints and validation findings) |
 
 ## Known modelling gaps with implementation implications
 

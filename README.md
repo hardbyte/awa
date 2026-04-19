@@ -5,9 +5,8 @@
 Awa (Māori: river) provides durable, transactional job enqueueing with typed
 handlers in both Rust and Python. It is a full job queue, not just a message
 stream: priorities, unique jobs, retries, cron, callbacks, DLQ, and a built-in
-UI all run on Postgres with no Redis or RabbitMQ. Under the queue-storage
-engine, append-only queue entries and fast-rotating execution leases keep
-vacuum pressure off the main dispatch path.
+UI all run on Postgres with no Redis or RabbitMQ. Segmented queue storage keeps
+queue history and execution churn off the main dispatch path.
 
 ![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
@@ -47,17 +46,15 @@ Core concurrency invariants (no duplicate processing after rescue, stale complet
 
 ## Where Awa Fits
 
-Awa sits between Postgres event/message queues and language-specific job
-frameworks.
+Awa is for teams that already trust Postgres and want a real job queue, not
+just a stream or a framework tied to one host language.
 
-- If you want a shared event log with independent consumer cursors and a queue
-  that is explicitly optimized around zero-bloat rotation, PgQue is a strong
-  fit.
-- If you want a Go-native or Oban-native job framework, River and Oban Pro are
-  strong reference points.
-- If you want a Postgres job queue with priorities, unique jobs, cron,
-  callbacks, DLQ, Rust and Python workers, and a storage engine designed around
-  bounded hot-path bloat, that is where Awa fits.
+- Choose Awa when you want priorities, unique jobs, retries, cron, callbacks,
+  DLQ, and operator tooling on one Postgres-backed runtime.
+- Choose PgQue-style systems when you want an event queue with independent
+  consumer cursors and event-log semantics first.
+- Choose River or Oban Pro when you want a job framework tightly shaped around
+  one surrounding language ecosystem.
 
 See [docs/positioning.md](https://github.com/hardbyte/awa/blob/main/docs/positioning.md) for the category map and messaging guidance.
 

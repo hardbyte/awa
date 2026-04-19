@@ -23,13 +23,14 @@ In production, treat these as separate concerns:
 
 `awa serve` is an operator UI and admin API. It is not the worker runtime.
 
-## Storage Engine Rollout
+## Queue Storage Cutover
 
-Treat the worker storage engine as a database-wide choice.
+Treat queue storage as the worker runtime and the canonical tables as upgrade
+compatibility only.
 
-- queue storage is the intended worker engine
-- canonical tables remain for compatibility and migration, not as a peer worker
-  runtime
+- queue storage is the worker engine
+- canonical tables remain in the schema for migration, rollback, and
+  compatibility SQL surfaces
 - mixed canonical and queue-storage worker fleets on the same database are not
   supported
 
@@ -72,7 +73,7 @@ Examples:
 
 The Python client defaults to `max_connections=10`. `awa serve` defaults to a pool of `10` connections (configurable via `--pool-max` / `AWA_POOL_MAX`). Other CLI subcommands use a single connection.
 
-## PostgreSQL Workload Discipline
+## Primary Database Hygiene
 
 Queue storage keeps the main ready path append-only, but Awa is still a
 high-churn Postgres workload. The main operational pitfall is no longer one
