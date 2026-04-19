@@ -16,7 +16,7 @@ vacuum pressure off the main dispatch path.
 - **Postgres-only** — one dependency you already have.
 - **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone.
 - **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
-- **Rust and Python workers** — same queues, identical semantics, mixed deployments.
+- **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Runtime-owned maintenance** — dispatch, rescue, segment rotation, and pruning run in the worker fleet; no `pg_cron` ticker required.
 - **Web UI** — dashboard, job inspector, queue management, cron controls.
@@ -277,11 +277,12 @@ awa --database-url $DATABASE_URL job dump-run 123
  └───────┬────────┘  └────────┬───────┘
          └────────┬───────────┘
                   ▼
-       ┌────────────────────┐
-       │     PostgreSQL     │
-       │     jobs_hot       │
-       │     scheduled_jobs │
-       └─────────┬──────────┘
+       ┌──────────────────────────────┐
+       │          PostgreSQL          │
+       │ ready / deferred entries     │
+       │ active leases / attempt_state│
+       │ terminal / dlq entries       │
+       └──────────────┬───────────────┘
                  │
        ┌─────────┼─────────┐
        ▼         ▼         ▼
@@ -291,7 +292,11 @@ awa --database-url $DATABASE_URL job dump-run 123
    └────────┘└────────┘└────────┘
 ```
 
-All coordination through Postgres. The Rust runtime owns polling, heartbeats, shutdown, and crash recovery for both languages. Mixed Rust and Python workers coexist on the same queues. See [architecture overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) for full details.
+All coordination through Postgres. The Rust runtime owns dispatch, leases,
+heartbeats, rescue, rotation, prune, and shutdown for both languages. Mixed
+Rust and Python workers coexist on the same queues. See [architecture
+overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) for
+full details.
 
 ## Workspace
 

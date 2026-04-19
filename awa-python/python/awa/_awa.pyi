@@ -442,6 +442,7 @@ class Client:
         global_max_workers: int | None = None,
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
+        descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,
@@ -450,6 +451,11 @@ class Client:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        queue_storage_schema: str | None = None,
+        queue_storage_queue_slot_count: int = 16,
+        queue_storage_lease_slot_count: int = 8,
+        queue_storage_queue_rotate_interval_ms: int = 1000,
+        queue_storage_lease_rotate_interval_ms: int = 50,
     ) -> None: ...
     async def shutdown(self, timeout_ms: int = 2000) -> None: ...
     async def close(self) -> None: ...
