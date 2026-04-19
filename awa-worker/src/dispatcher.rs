@@ -1,4 +1,4 @@
-use crate::executor::JobExecutor;
+use crate::executor::{DispatchedJob, JobExecutor};
 use crate::runtime::InFlightMap;
 use crate::storage::RuntimeStorage;
 use awa_model::JobRow;
@@ -472,7 +472,7 @@ impl Dispatcher {
         let deadline_secs = self.config.deadline_duration.as_secs_f64();
         let claim_start = Instant::now();
 
-        let jobs: Vec<JobRow> = match &self.storage {
+        let jobs: Vec<DispatchedJob> = match &self.storage {
             RuntimeStorage::Canonical => match sqlx::query_as::<_, JobRow>(
                 r#"
                 WITH claimed AS (
@@ -508,7 +508,13 @@ impl Dispatcher {
             .fetch_all(&self.pool)
             .await
             {
-                Ok(jobs) => jobs,
+                Ok(jobs) => jobs
+                    .into_iter()
+                    .map(|job| DispatchedJob {
+                        job,
+                        queue_storage_claim: None,
+                    })
+                    .collect(),
                 Err(err) => {
                     warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
                     return false;
@@ -516,7 +522,7 @@ impl Dispatcher {
             },
             RuntimeStorage::QueueStorage(runtime) => match runtime
                 .store
-                .claim_job_batch(
+                .claim_runtime_batch(
                     &self.pool,
                     &self.queue,
                     batch_size as i64,
@@ -524,7 +530,13 @@ impl Dispatcher {
                 )
                 .await
             {
-                Ok(jobs) => jobs,
+                Ok(jobs) => jobs
+                    .into_iter()
+                    .map(|claimed| DispatchedJob {
+                        job: claimed.job,
+                        queue_storage_claim: Some(claimed.claim),
+                    })
+                    .collect(),
                 Err(err) => {
                     warn!(
                         queue = %self.queue,
@@ -541,9 +553,9 @@ impl Dispatcher {
             self.metrics
                 .record_job_claimed(&self.queue, jobs.len() as u64);
             for job in &jobs {
-                if let Some(attempted_at) = job.attempted_at {
+                if let Some(attempted_at) = job.job.attempted_at {
                     let wait_secs =
-                        (attempted_at - job.created_at).num_milliseconds() as f64 / 1000.0;
+                        (attempted_at - job.job.created_at).num_milliseconds() as f64 / 1000.0;
                     if wait_secs >= 0.0 {
                         self.metrics.record_wait_duration(&self.queue, wait_secs);
                     }

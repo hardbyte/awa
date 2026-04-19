@@ -32,7 +32,8 @@ pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_po
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
 pub use storage::StorageStatus;
 pub use queue_storage::{
-    ClaimedEntry, PruneOutcome, QueueCounts, QueueStorage, QueueStorageConfig, RotateOutcome,
+    ClaimedEntry, ClaimedRuntimeJob, PruneOutcome, QueueCounts, QueueStorage,
+    QueueStorageConfig, RotateOutcome,
 };
 
 // Re-export the derive macro
