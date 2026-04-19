@@ -3,7 +3,7 @@ use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
 use crate::storage::{QueueStorageRuntime, RuntimeStorage};
-use awa_model::{AwaError, ClaimedEntry, JobRow, JobState};
+use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob, JobRow, JobState};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -172,6 +172,7 @@ enum CompletionOutcome {
 pub(crate) struct DispatchedJob {
     pub job: JobRow,
     pub queue_storage_claim: Option<ClaimedEntry>,
+    pub queue_storage_unique_states: Option<String>,
 }
 
 /// Manages job execution — spawns worker futures and tracks in-flight jobs.
@@ -226,6 +227,7 @@ impl JobExecutor {
     ) -> impl std::future::Future<Output = ()> + Send + 'static {
         let job = dispatched.job;
         let queue_storage_claim = dispatched.queue_storage_claim;
+        let queue_storage_unique_states = dispatched.queue_storage_unique_states;
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let lifecycle_handlers = self.lifecycle_handlers.clone();
@@ -305,6 +307,7 @@ impl JobExecutor {
                 &pool,
                 &job,
                 queue_storage_claim.as_ref(),
+                queue_storage_unique_states.as_deref(),
                 &result,
                 &completion_batcher,
                 progress_snapshot,
@@ -414,6 +417,7 @@ async fn complete_job(
     pool: &PgPool,
     job: &JobRow,
     queue_storage_claim: Option<&ClaimedEntry>,
+    queue_storage_unique_states: Option<&str>,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
     progress_snapshot: Option<serde_json::Value>,
@@ -444,6 +448,7 @@ async fn complete_job(
                 pool,
                 job,
                 queue_storage_claim,
+                queue_storage_unique_states,
                 result,
                 completion_batcher,
                 progress_snapshot,
@@ -928,6 +933,7 @@ async fn complete_job_queue_storage(
     pool: &PgPool,
     job: &JobRow,
     queue_storage_claim: Option<&ClaimedEntry>,
+    queue_storage_unique_states: Option<&str>,
     result: &Result<JobResult, JobError>,
     completion_batcher: &CompletionBatcherHandle,
     progress_snapshot: Option<serde_json::Value>,
@@ -943,7 +949,12 @@ async fn complete_job_queue_storage(
             let updated = match match queue_storage_claim {
                 Some(claim) => {
                     completion_batcher
-                        .complete_claimed(job.id, job.run_lease, claim.clone())
+                        .complete_runtime_job(ClaimedRuntimeJob {
+                            claim: claim.clone(),
+                            job: job.clone(),
+                            unique_states: queue_storage_unique_states
+                                .map(std::string::ToString::to_string),
+                        })
                         .await
                 }
                 None => completion_batcher.complete(job.id, job.run_lease).await,
@@ -955,8 +966,14 @@ async fn complete_job_queue_storage(
                         error = %err,
                         "Completion batch flush failed, falling back to direct finalize"
                     );
-                    direct_complete_job_queue_storage(runtime, pool, job, queue_storage_claim)
-                        .await?
+                    direct_complete_job_queue_storage(
+                        runtime,
+                        pool,
+                        job,
+                        queue_storage_claim,
+                        queue_storage_unique_states,
+                    )
+                    .await?
                 }
             };
             if !updated {
@@ -1353,9 +1370,18 @@ async fn direct_complete_job_queue_storage(
     pool: &PgPool,
     job: &JobRow,
     queue_storage_claim: Option<&ClaimedEntry>,
+    queue_storage_unique_states: Option<&str>,
 ) -> Result<bool, AwaError> {
     let updated = if let Some(claim) = queue_storage_claim {
-        runtime.store.complete_claimed_batch(pool, std::slice::from_ref(claim)).await?
+        let runtime_job = ClaimedRuntimeJob {
+            claim: claim.clone(),
+            job: job.clone(),
+            unique_states: queue_storage_unique_states.map(std::string::ToString::to_string),
+        };
+        runtime
+            .store
+            .complete_runtime_batch(pool, std::slice::from_ref(&runtime_job))
+            .await?
     } else {
         runtime
             .store
