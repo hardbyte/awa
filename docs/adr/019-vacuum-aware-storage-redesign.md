@@ -103,6 +103,45 @@ Important observations:
 - A long history reader still blocked queue-segment prune attempts, but it did
   not reintroduce lease churn or hot dead tuples.
 
+### Full Runtime Validation
+
+The segmented store has also been wired through the full `Client` runtime in
+[client.rs](/Users/brian/dev/awa/awa-worker/src/client.rs#L1),
+[dispatcher.rs](/Users/brian/dev/awa/awa-worker/src/dispatcher.rs#L1),
+[executor.rs](/Users/brian/dev/awa/awa-worker/src/executor.rs#L1),
+[completion.rs](/Users/brian/dev/awa/awa-worker/src/completion.rs#L1), and
+[maintenance.rs](/Users/brian/dev/awa/awa-worker/src/maintenance.rs#L1), with
+runtime benchmarks in
+[benchmark_test.rs](/Users/brian/dev/awa/awa/tests/benchmark_test.rs#L398).
+
+Two results matter:
+
+- the segmented storage engine stays competitive once it is exercised through
+  the real dispatcher/worker path
+- the dispatcher also needs an internal capacity wake when permits are
+  released, otherwise fast jobs are artificially capped by `poll_interval`
+
+Measured on repeated full runtime benchmark runs after adding permit-release
+wakeups:
+
+| Runtime path | Throughput | Pickup p50 | Pickup p95 | Pickup p99 | Exact final dead |
+|---|---:|---:|---:|---:|---:|
+| canonical `jobs_hot` | `4.7k-4.9k/s` | `~2.2 ms` | `~15-46 ms` | `~79 ms` | n/a |
+| segmented vacuum-aware | `5.8k-6.2k/s` | `~3.8-4.1 ms` | `~16-29 ms` | `~45-63 ms` | `243-322` |
+
+The current canonical throughput benchmark runs `5000` jobs and the segmented
+runtime benchmark runs `10000` jobs so it can also sample exact end-state dead
+tuples. The reported `jobs/sec` rate is directly comparable across both runs.
+
+Across repeated exact `pgstattuple` samples, the segmented path stayed in this
+range:
+
+- `queue_lanes=77-96`
+- `ready=0`
+- `done=0`
+- `leases=166-226`
+- `total=243-322`
+
 ## Why This Closes the Gap
 
 The critical change is that dead tuples now scale with the lease-cycle window,
@@ -147,7 +186,8 @@ supporting Awa's current semantics from
 ### Positive
 
 - closes the dead-tuple problem on the throughput path
-- preserves competitive throughput and latency in the prototype
+- preserves competitive throughput and latency in both the prototype and the
+  full dispatcher/worker runtime
 - makes maintenance-owned pruning practical for the hot path
 - separates queue retention concerns from running-attempt churn
 
@@ -185,3 +225,6 @@ operational model should remain single-mode.
   table entirely.
 - The recommended public model is still one engine, not two user-facing modes.
   The internal storage can and should use multiple table families.
+- The runtime benchmark also exposed an independent dispatcher behavior: fast
+  queues need a capacity-triggered wake on permit release, or throughput is
+  bounded by `max_workers / poll_interval` regardless of storage design.

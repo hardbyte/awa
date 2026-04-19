@@ -5,12 +5,13 @@ use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
+use crate::storage::{RuntimeStorage, VacuumAwareRuntime};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput,
 };
-use awa_model::{JobArgs, PeriodicJob};
+use awa_model::{JobArgs, PeriodicJob, VacuumAwareConfig};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -40,6 +41,8 @@ pub enum BuildError {
     InvalidWeight,
     #[error("cleanup_batch_size must be > 0")]
     InvalidBatchSize,
+    #[error("invalid vacuum-aware storage config: {0}")]
+    InvalidVacuumAwareStorage(String),
 }
 
 /// Health check result.
@@ -104,6 +107,8 @@ pub struct ClientBuilder {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
+    storage: RuntimeStorage,
+    storage_error: Option<BuildError>,
 }
 
 impl ClientBuilder {
@@ -134,6 +139,8 @@ impl ClientBuilder {
             queue_retention_overrides: HashMap::new(),
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
+            storage: RuntimeStorage::Canonical,
+            storage_error: None,
         }
     }
 
@@ -404,6 +411,30 @@ impl ClientBuilder {
         self
     }
 
+    /// Enable the experimental vacuum-aware runtime backend.
+    ///
+    /// This currently targets the immediate/completed hot path used by runtime
+    /// throughput benchmarks. Advanced lifecycle transitions still use the
+    /// canonical storage engine.
+    pub fn experimental_vacuum_aware_storage(
+        mut self,
+        config: VacuumAwareConfig,
+        queue_rotate_interval: Duration,
+        lease_rotate_interval: Duration,
+    ) -> Self {
+        match VacuumAwareRuntime::new(config, queue_rotate_interval, lease_rotate_interval) {
+            Ok(runtime) => {
+                self.storage = RuntimeStorage::VacuumAware(runtime);
+                self.storage_error = None;
+            }
+            Err(err) => {
+                self.storage = RuntimeStorage::Canonical;
+                self.storage_error = Some(BuildError::InvalidVacuumAwareStorage(err.to_string()));
+            }
+        }
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -417,6 +448,10 @@ impl ClientBuilder {
     pub fn build(self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
+        }
+
+        if let Some(err) = self.storage_error.clone() {
+            return Err(err);
         }
 
         for queue in self.queue_descriptors.keys() {
@@ -533,6 +568,7 @@ impl ClientBuilder {
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
             queue_stats_interval: self.queue_stats_interval,
+            storage: self.storage,
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
             runtime_instance_id: Uuid::new_v4(),
@@ -619,6 +655,7 @@ pub struct Client {
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Option<Duration>,
+    storage: RuntimeStorage,
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
     runtime_instance_id: Uuid,
@@ -745,12 +782,17 @@ impl Client {
         )
         .await?;
 
+        if let Some(store) = self.storage.vacuum_aware_store() {
+            store.install(&self.pool).await?;
+        }
+
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
         let (completion_batcher, completion_handle) = CompletionBatcher::new(
             self.pool.clone(),
             self.service_cancel.clone(),
             self.metrics.clone(),
+            self.storage.clone(),
         );
 
         // Create executor with metrics
@@ -763,6 +805,7 @@ impl Client {
             self.state.clone(),
             self.metrics.clone(),
             completion_handle,
+            self.storage.clone(),
         ));
 
         let mut service_handles = self.service_handles.write().await;
@@ -791,6 +834,7 @@ impl Client {
             self.service_cancel.clone(),
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
+            self.storage.clone(),
         )
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
@@ -866,6 +910,7 @@ impl Client {
                     self.dispatch_cancel.clone(),
                     self.job_set.clone(),
                     concurrency,
+                    self.storage.clone(),
                 )
             } else {
                 // Hard-reserved mode (default)
@@ -879,6 +924,7 @@ impl Client {
                     alive,
                     self.dispatch_cancel.clone(),
                     self.job_set.clone(),
+                    self.storage.clone(),
                 )
             };
             dispatcher_handles.push(tokio::spawn(async move {
