@@ -452,6 +452,7 @@ fn mode_cycle() -> Vec<&'static str> {
     modes
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_for_drain(
     pool: &sqlx::PgPool,
     store: &QueueStorage,

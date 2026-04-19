@@ -302,6 +302,7 @@ async fn wait_or_stop(duration: Duration, stop: &mut tokio::sync::watch::Receive
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn producer_loop(
     pool: sqlx::PgPool,
     store: Arc<QueueStorage>,

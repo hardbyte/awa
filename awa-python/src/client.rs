@@ -6,7 +6,9 @@ use crate::transaction::{
 };
 use crate::worker::PythonWorker;
 use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
-use awa_model::{InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage, QueueStorageConfig};
+use awa_model::{
+    InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage, QueueStorageConfig,
+};
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -607,6 +609,7 @@ impl PyClient {
         tags=None,
         extra=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn queue_descriptor(
         &self,
         py: Python<'_>,
@@ -631,15 +634,8 @@ impl PyClient {
                 "queue_descriptor() must be called before start()",
             ));
         }
-        let descriptor = build_queue_descriptor(
-            py,
-            display_name,
-            description,
-            owner,
-            docs_url,
-            tags,
-            extra,
-        )?;
+        let descriptor =
+            build_queue_descriptor(py, display_name, description, owner, docs_url, tags, extra)?;
         self.queue_descriptors
             .lock()
             .expect("queue_descriptors mutex poisoned")
@@ -659,6 +655,7 @@ impl PyClient {
         tags=None,
         extra=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn job_kind_descriptor(
         &self,
         py: Python<'_>,
@@ -680,15 +677,8 @@ impl PyClient {
                 "job_kind_descriptor() must be called before start()",
             ));
         }
-        let descriptor = build_job_kind_descriptor(
-            py,
-            display_name,
-            description,
-            owner,
-            docs_url,
-            tags,
-            extra,
-        )?;
+        let descriptor =
+            build_job_kind_descriptor(py, display_name, description, owner, docs_url, tags, extra)?;
         self.job_kind_descriptors
             .lock()
             .expect("job_kind_descriptors mutex poisoned")
