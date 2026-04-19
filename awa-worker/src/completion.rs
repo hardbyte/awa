@@ -1,6 +1,6 @@
 use crate::runtime::RunLease;
 use crate::storage::RuntimeStorage;
-use awa_model::AwaError;
+use awa_model::{AwaError, ClaimedEntry};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::env;
@@ -56,6 +56,7 @@ const COMPLETE_BATCH_SQL: &str = r#"
 struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
+    claim: Option<ClaimedEntry>,
     response: oneshot::Sender<Result<bool, AwaError>>,
 }
 
@@ -66,12 +67,31 @@ pub(crate) struct CompletionBatcherHandle {
 
 impl CompletionBatcherHandle {
     pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
+        self.complete_inner(job_id, run_lease, None).await
+    }
+
+    pub async fn complete_claimed(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+        claim: ClaimedEntry,
+    ) -> Result<bool, AwaError> {
+        self.complete_inner(job_id, run_lease, Some(claim)).await
+    }
+
+    async fn complete_inner(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+        claim: Option<ClaimedEntry>,
+    ) -> Result<bool, AwaError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
         self.shards[shard]
             .send(CompletionRequest {
                 job_id,
                 run_lease,
+                claim,
                 response: response_tx,
             })
             .await
@@ -204,17 +224,28 @@ impl CompletionWorker {
                 .await
                 .map_err(AwaError::Database),
             RuntimeStorage::QueueStorage(runtime) => {
-                runtime
-                    .store
-                    .complete_job_batch_by_id(
-                        &self.pool,
-                        &job_ids
-                            .iter()
-                            .copied()
-                            .zip(run_leases.iter().copied())
-                            .collect::<Vec<_>>(),
-                    )
-                    .await
+                if let Some(claimed) = batch
+                    .iter()
+                    .map(|request| request.claim.clone())
+                    .collect::<Option<Vec<ClaimedEntry>>>()
+                {
+                    runtime
+                        .store
+                        .complete_claimed_batch(&self.pool, &claimed)
+                        .await
+                } else {
+                    runtime
+                        .store
+                        .complete_job_batch_by_id(
+                            &self.pool,
+                            &job_ids
+                                .iter()
+                                .copied()
+                                .zip(run_leases.iter().copied())
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                }
             }
         };
 
