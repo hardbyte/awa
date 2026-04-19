@@ -42,6 +42,12 @@ pub struct ClaimedEntry {
     pub lease_generation: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct ClaimedRuntimeJob {
+    pub claim: ClaimedEntry,
+    pub job: JobRow,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueueCounts {
     pub available: i64,
@@ -323,6 +329,11 @@ impl ReadyTransitionRow {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReadyJobLeaseRow {
+    ready_slot: i32,
+    ready_generation: i64,
+    lane_seq: i64,
+    lease_slot: i32,
+    lease_generation: i64,
     job_id: i64,
     kind: String,
     queue: String,
@@ -342,6 +353,18 @@ struct ReadyJobLeaseRow {
 }
 
 impl ReadyJobLeaseRow {
+    fn claim_ref(&self) -> ClaimedEntry {
+        ClaimedEntry {
+            queue: self.queue.clone(),
+            priority: self.priority,
+            lane_seq: self.lane_seq,
+            ready_slot: self.ready_slot,
+            ready_generation: self.ready_generation,
+            lease_slot: self.lease_slot,
+            lease_generation: self.lease_generation,
+        }
+    }
+
     fn into_job_row(self) -> Result<JobRow, AwaError> {
         let payload = RuntimePayload::from_json(self.payload)?;
 
@@ -374,6 +397,12 @@ impl ReadyJobLeaseRow {
             callback_transform: None,
             progress: payload.progress,
         })
+    }
+
+    fn into_claimed_runtime_job(self) -> Result<ClaimedRuntimeJob, AwaError> {
+        let claim = self.claim_ref();
+        let job = self.into_job_row()?;
+        Ok(ClaimedRuntimeJob { claim, job })
     }
 }
 
@@ -2477,13 +2506,13 @@ impl QueueStorage {
         Ok(claimed)
     }
 
-    pub async fn claim_job_batch(
+    pub async fn claim_runtime_batch(
         &self,
         pool: &PgPool,
         queue: &str,
         max_batch: i64,
         deadline_duration: Duration,
-    ) -> Result<Vec<JobRow>, AwaError> {
+    ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
         if max_batch <= 0 {
             return Ok(Vec::new());
         }
@@ -2591,6 +2620,8 @@ impl QueueStorage {
                 RETURNING
                     ready_slot,
                     ready_generation,
+                    lease_slot,
+                    lease_generation,
                     queue,
                     priority,
                     lane_seq,
@@ -2602,6 +2633,11 @@ impl QueueStorage {
                     attempted_at
             )
             SELECT
+                claimed.ready_slot,
+                claimed.ready_generation,
+                claimed.lane_seq,
+                claimed.lease_slot,
+                claimed.lease_generation,
                 selected.job_id,
                 selected.kind,
                 selected.queue,
@@ -2651,8 +2687,20 @@ impl QueueStorage {
 
         claimed
             .into_iter()
-            .map(ReadyJobLeaseRow::into_job_row)
+            .map(ReadyJobLeaseRow::into_claimed_runtime_job)
             .collect()
+    }
+
+    pub async fn claim_job_batch(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        max_batch: i64,
+        deadline_duration: Duration,
+    ) -> Result<Vec<JobRow>, AwaError> {
+        self.claim_runtime_batch(pool, queue, max_batch, deadline_duration)
+            .await
+            .map(|claimed| claimed.into_iter().map(|row| row.job).collect())
     }
 
     pub async fn complete_batch(
@@ -2660,8 +2708,18 @@ impl QueueStorage {
         pool: &PgPool,
         claimed: &[ClaimedEntry],
     ) -> Result<usize, AwaError> {
+        self.complete_claimed_batch(pool, claimed)
+            .await
+            .map(|updated| updated.len())
+    }
+
+    pub async fn complete_claimed_batch(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedEntry],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
         if claimed.is_empty() {
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         let schema = self.schema();
@@ -2711,7 +2769,7 @@ impl QueueStorage {
 
         if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(0);
+            return Ok(Vec::new());
         }
 
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
@@ -2736,7 +2794,10 @@ impl QueueStorage {
             .await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(moved.len())
+        Ok(moved
+            .into_iter()
+            .map(|entry| (entry.job_id, entry.run_lease))
+            .collect())
     }
 
     pub async fn complete_job_batch_by_id(
