@@ -83,10 +83,42 @@ def read_producer_rate(default: int) -> int:
         return default
 
 
+def queue_storage_schema() -> str:
+    return os.environ.get("QUEUE_STORAGE_SCHEMA", "awa_exp")
+
+
+def queue_slot_count() -> int:
+    return env_int("QUEUE_SLOT_COUNT", 16)
+
+
+def lease_slot_count() -> int:
+    return env_int("LEASE_SLOT_COUNT", 8)
+
+
+def queue_rotate_ms() -> int:
+    return env_int("QUEUE_ROTATE_MS", 1000)
+
+
+def lease_rotate_ms() -> int:
+    return env_int("LEASE_ROTATE_MS", 50)
+
+
 def client() -> awa.AsyncClient:
     return awa.AsyncClient(
         database_url(), max_connections=env_int("MAX_CONNECTIONS", 20)
     )
+
+
+async def prepare_queue_storage(c: awa.AsyncClient) -> str:
+    await migrate_with_retry(c)
+    schema = queue_storage_schema()
+    await c.install_queue_storage(
+        schema=schema,
+        queue_slot_count=queue_slot_count(),
+        lease_slot_count=lease_slot_count(),
+        reset=True,
+    )
+    return schema
 
 
 async def clean_queue(c: awa.AsyncClient, queue: str) -> None:
@@ -100,14 +132,44 @@ async def clean_queue(c: awa.AsyncClient, queue: str) -> None:
         raise
 
 
-async def count_by_state(c: awa.AsyncClient, queue: str) -> dict[str, int]:
+async def count_by_state(c: awa.AsyncClient, queue: str, schema: str) -> dict[str, int]:
     tx = await c.transaction()
     try:
         rows = await tx.fetch_all(
-            """
-            SELECT state::text AS state, count(*)::bigint AS count
-            FROM awa.jobs
-            WHERE queue = $1
+            f"""
+            SELECT state, sum(count)::bigint AS count
+            FROM (
+                SELECT 'available'::text AS state, count(*)::bigint AS count
+                FROM {schema}.ready_entries
+                WHERE queue = $1
+
+                UNION ALL
+
+                SELECT state::text AS state, count(*)::bigint AS count
+                FROM {schema}.leases
+                WHERE queue = $1
+                GROUP BY state
+
+                UNION ALL
+
+                SELECT state::text AS state, count(*)::bigint AS count
+                FROM {schema}.deferred_jobs
+                WHERE queue = $1
+                GROUP BY state
+
+                UNION ALL
+
+                SELECT state::text AS state, count(*)::bigint AS count
+                FROM {schema}.done_entries
+                WHERE queue = $1
+                GROUP BY state
+
+                UNION ALL
+
+                SELECT 'dlq'::text AS state, count(*)::bigint AS count
+                FROM {schema}.dlq_entries
+                WHERE queue = $1
+            ) counts
             GROUP BY state
             """,
             queue,
@@ -118,17 +180,27 @@ async def count_by_state(c: awa.AsyncClient, queue: str) -> dict[str, int]:
 
 
 async def wait_for_completion(
-    c: awa.AsyncClient, queue: str, expected: int, timeout_secs: float
+    c: awa.AsyncClient, queue: str, expected: int, timeout_secs: float, schema: str
 ) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_secs
     while True:
         tx = await c.transaction()
         try:
             row = await tx.fetch_one(
-                """
-                SELECT count(*)::bigint AS cnt
-                FROM awa.jobs
-                WHERE queue = $1 AND state = 'completed'
+                f"""
+                WITH lane_counts AS (
+                    SELECT COALESCE(sum(completed_count), 0)::bigint AS pruned_completed
+                    FROM {schema}.queue_lanes
+                    WHERE queue = $1
+                ),
+                live_terminal AS (
+                    SELECT count(*)::bigint AS completed
+                    FROM {schema}.done_entries
+                    WHERE queue = $1
+                )
+                SELECT lane_counts.pruned_completed + live_terminal.completed AS cnt
+                FROM lane_counts
+                CROSS JOIN live_terminal
                 """,
                 queue,
             )
@@ -137,11 +209,27 @@ async def wait_for_completion(
         if int(row["cnt"]) >= expected:
             return
         if asyncio.get_running_loop().time() >= deadline:
-            counts = await count_by_state(c, queue)
+            counts = await count_by_state(c, queue, schema)
             raise TimeoutError(
                 f"Timeout waiting for {expected} completions on {queue}: {counts}"
             )
         await asyncio.sleep(0.05)
+
+
+async def wait_for_job_completion(
+    c: awa.AsyncClient, queue: str, job_id: int, timeout_secs: float, schema: str
+) -> None:
+    deadline = asyncio.get_running_loop().time() + timeout_secs
+    while True:
+        job = await c.get_job(job_id)
+        if job.state == awa.JobState.Completed:
+            return
+        if asyncio.get_running_loop().time() >= deadline:
+            counts = await count_by_state(c, queue, schema)
+            raise TimeoutError(
+                f"Timeout waiting for job {job_id} completion on {queue}: {counts}"
+            )
+        await asyncio.sleep(0.025)
 
 
 async def enqueue_batch(c: awa.AsyncClient, queue: str, count: int) -> None:
@@ -154,7 +242,7 @@ async def enqueue_batch(c: awa.AsyncClient, queue: str, count: int) -> None:
 
 async def scenario_enqueue_throughput(job_count: int) -> dict:
     c = client()
-    await migrate_with_retry(c)
+    await prepare_queue_storage(c)
     queue = "awa_python_enqueue_bench"
     await clean_queue(c, queue)
 
@@ -177,7 +265,7 @@ async def scenario_enqueue_throughput(job_count: int) -> dict:
 
 async def scenario_worker_throughput(job_count: int, worker_count: int) -> dict:
     c = client()
-    await migrate_with_retry(c)
+    schema = await prepare_queue_storage(c)
     queue = "awa_python_worker_bench"
     await clean_queue(c, queue)
     await enqueue_batch(c, queue, job_count)
@@ -187,8 +275,16 @@ async def scenario_worker_throughput(job_count: int, worker_count: int) -> dict:
         return None
 
     start = asyncio.get_running_loop().time()
-    await c.start([(queue, worker_count)], poll_interval_ms=50)
-    await wait_for_completion(c, queue, job_count, 120)
+    await c.start(
+        [(queue, worker_count)],
+        poll_interval_ms=50,
+        queue_storage_schema=schema,
+        queue_storage_queue_slot_count=queue_slot_count(),
+        queue_storage_lease_slot_count=lease_slot_count(),
+        queue_storage_queue_rotate_interval_ms=queue_rotate_ms(),
+        queue_storage_lease_rotate_interval_ms=lease_rotate_ms(),
+    )
+    await wait_for_completion(c, queue, job_count, 120, schema)
     elapsed = asyncio.get_running_loop().time() - start
 
     await c.shutdown(timeout_ms=5000)
@@ -207,7 +303,7 @@ async def scenario_worker_throughput(job_count: int, worker_count: int) -> dict:
 
 async def scenario_pickup_latency(iterations: int, worker_count: int) -> dict:
     c = client()
-    await migrate_with_retry(c)
+    schema = await prepare_queue_storage(c)
     queue = "awa_python_latency_bench"
     await clean_queue(c, queue)
 
@@ -215,14 +311,22 @@ async def scenario_pickup_latency(iterations: int, worker_count: int) -> dict:
     async def handle(_job: awa.Job[BenchJob]) -> None:
         return None
 
-    await c.start([(queue, worker_count)], poll_interval_ms=50)
+    await c.start(
+        [(queue, worker_count)],
+        poll_interval_ms=50,
+        queue_storage_schema=schema,
+        queue_storage_queue_slot_count=queue_slot_count(),
+        queue_storage_lease_slot_count=lease_slot_count(),
+        queue_storage_queue_rotate_interval_ms=queue_rotate_ms(),
+        queue_storage_lease_rotate_interval_ms=lease_rotate_ms(),
+    )
     await asyncio.sleep(0.5)
 
     latencies_us: list[int] = []
     for i in range(iterations):
         start = asyncio.get_running_loop().time()
         await c.insert(BenchJob(seq=i), queue=queue)
-        await wait_for_completion(c, queue, i + 1, 10)
+        await wait_for_completion(c, queue, i + 1, 10, schema)
         latencies_us.append(
             round((asyncio.get_running_loop().time() - start) * 1_000_000)
         )
@@ -248,14 +352,14 @@ async def scenario_pickup_latency(iterations: int, worker_count: int) -> dict:
 
 async def scenario_migrate_only() -> None:
     c = client()
-    await migrate_with_retry(c)
+    await prepare_queue_storage(c)
     await c.close()
-    print("[awa-python] Migrations complete.", file=sys.stderr)
+    print("[awa-python] Migrations + queue_storage install complete.", file=sys.stderr)
 
 
 async def scenario_worker_only() -> None:
     c = client()
-    await migrate_with_retry(c)
+    schema = await prepare_queue_storage(c)
 
     worker_count = env_int("WORKER_COUNT", 10)
     job_duration_ms = env_int("JOB_DURATION_MS", 30000)
@@ -281,6 +385,11 @@ async def scenario_worker_only() -> None:
         heartbeat_interval_ms=5000,
         heartbeat_rescue_interval_ms=rescue_interval_secs * 1000,
         heartbeat_staleness_ms=heartbeat_staleness_secs * 1000,
+        queue_storage_schema=schema,
+        queue_storage_queue_slot_count=queue_slot_count(),
+        queue_storage_lease_slot_count=lease_slot_count(),
+        queue_storage_queue_rotate_interval_ms=queue_rotate_ms(),
+        queue_storage_lease_rotate_interval_ms=lease_rotate_ms(),
     )
     print(
         (
