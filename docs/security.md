@@ -204,7 +204,15 @@ This is additive — no schema changes, no downtime.
 
 ## Future: tighter runtime grants
 
-The current model requires broad table grants because triggers use `SECURITY INVOKER`. A future migration could convert internal trigger functions to `SECURITY DEFINER` (running as `awa_owner`), which would let the runtime role be restricted to just the core tables (`jobs_hot`, `scheduled_jobs`, `queue_meta`, `cron_jobs`, `runtime_instances`). This is tracked but not yet implemented — the current model is secure for the separation it provides (runtime can't modify schema).
+The current model requires broad table grants because compatibility triggers
+and helper functions still use `SECURITY INVOKER`. A future migration could
+convert the internal queue-storage helpers to `SECURITY DEFINER` (running as
+`awa_owner`), which would let the runtime role be restricted to the active
+queue-storage schema plus the shared control tables (`queue_meta`,
+`job_unique_claims`, `cron_jobs`, `runtime_instances`, and
+`runtime_storage_backends`). This is tracked but not yet implemented — the
+current model is secure for the separation it provides (runtime can't modify
+schema).
 
 ## Admin Surface
 

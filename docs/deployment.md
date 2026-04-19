@@ -40,6 +40,10 @@ When cutting over a database to queue storage:
 3. start only queue-storage workers
 4. verify `awa.runtime_storage_backends` and queue health before scaling out
 
+Current Rust and Python worker starts already default to queue storage. Only
+set `queue_storage_schema` / `ClientBuilder::queue_storage(...)` when you need
+to override the default schema name or segment sizing.
+
 ## Connection Pool Sizing
 
 Practical starting point, based on the current runtime internals:

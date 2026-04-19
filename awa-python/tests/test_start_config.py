@@ -249,6 +249,43 @@ async def test_per_queue_retention_in_dict_config(client):
 
 
 @pytest.mark.asyncio
+async def test_default_start_uses_queue_storage_backend(client):
+    """start() uses queue storage by default and records the active schema."""
+    queue = "cfg_default_queue_storage_runtime"
+    seen = asyncio.Event()
+
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.commit()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    try:
+        await client.start([(queue, 1)], poll_interval_ms=25)
+        job = await client.insert(ConfigTestJob(value="default-queue-storage"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=2.0)
+        await client.shutdown()
+
+        fetched = await client.get_job(job.id)
+        assert fetched.state == awa.JobState.Completed
+
+        tx = await client.transaction()
+        backend = await tx.fetch_one(
+            "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+        )
+        await tx.commit()
+        assert backend["schema_name"] == "awa_exp"
+    finally:
+        await client.shutdown()
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.commit()
+
+
+@pytest.mark.asyncio
 async def test_queue_storage_start_selects_runtime_backend(client):
     """start() can explicitly run the Python worker on queue storage."""
     queue = "cfg_queue_storage_runtime"

@@ -276,8 +276,21 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
             FROM {schema}.deferred_jobs
             UNION ALL
-            SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
-            FROM {schema}.leases
+            SELECT
+                leases.job_id,
+                ready.kind,
+                leases.queue,
+                leases.state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.leases AS leases
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = leases.ready_slot
+             AND ready.ready_generation = leases.ready_generation
+             AND ready.queue = leases.queue
+             AND ready.priority = leases.priority
+             AND ready.lane_seq = leases.lane_seq
             UNION ALL
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
             FROM {schema}.done_entries

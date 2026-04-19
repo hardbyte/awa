@@ -117,6 +117,18 @@ pub struct ClientBuilder {
 
 impl ClientBuilder {
     pub fn new(pool: PgPool) -> Self {
+        let (storage, storage_error) = match QueueStorageRuntime::new(
+            QueueStorageConfig::default(),
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        ) {
+            Ok(runtime) => (RuntimeStorage::QueueStorage(runtime), None),
+            Err(err) => (
+                RuntimeStorage::Canonical,
+                Some(BuildError::InvalidQueueStorage(err.to_string())),
+            ),
+        };
+
         Self {
             pool,
             queues: Vec::new(),
@@ -147,8 +159,8 @@ impl ClientBuilder {
             dlq_retention: None,
             dlq_cleanup_batch_size: None,
             dlq_overrides: HashMap::new(),
-            storage: RuntimeStorage::Canonical,
-            storage_error: None,
+            storage,
+            storage_error,
         }
     }
 
@@ -443,11 +455,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Enable the segmented queue storage backend for this runtime.
+    /// Override the segmented queue storage configuration for this runtime.
     ///
-    /// All workers against the same database should agree on the active
-    /// storage engine. Canonical tables remain as migration compatibility,
-    /// not as a second supported worker runtime.
+    /// Queue storage is the default worker engine. Canonical tables remain
+    /// migration compatibility, not a second supported worker runtime.
+    /// Use this to change the schema name or rotation sizing/timing.
     pub fn queue_storage(
         mut self,
         config: QueueStorageConfig,

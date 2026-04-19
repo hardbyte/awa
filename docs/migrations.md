@@ -205,7 +205,8 @@ explicit release documentation.
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Roll out one worker engine
+# 2. Roll out workers
+#    (Rust and Python worker runtimes default to queue storage)
 # 3. Verify runtime health / queue stats
 awa --database-url "$DATABASE_URL" queue stats
 ```

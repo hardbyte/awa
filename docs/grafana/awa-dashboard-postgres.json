@@ -64,7 +64,7 @@
         }
       },
       "targets": [
-        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'completed' AND finalized_at > now() - interval '1 minute'", "format": "table", "refId": "A" }
+        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs WHERE state = 'completed' AND finalized_at > now() - interval '1 minute'", "format": "table", "refId": "A" }
       ],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
@@ -88,7 +88,7 @@
         }
       },
       "targets": [
-        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'failed' AND finalized_at > now() - interval '1 hour'", "format": "table", "refId": "A" }
+        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs WHERE state = 'failed' AND finalized_at > now() - interval '1 hour'", "format": "table", "refId": "A" }
       ],
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
@@ -190,7 +190,7 @@
       "options": { "sortBy": [{ "displayName": "lag_s", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT j.queue, qd.display_name, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(j.run_at)))::float8 AS lag_s FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state = 'available' GROUP BY j.queue, qd.display_name ORDER BY lag_s DESC NULLS LAST LIMIT 20",
+          "rawSql": "SELECT j.queue, qd.display_name, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(j.run_at)))::float8 AS lag_s FROM awa.jobs j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state = 'available' GROUP BY j.queue, qd.display_name ORDER BY lag_s DESC NULLS LAST LIMIT 20",
           "format": "table",
           "refId": "A"
         }
@@ -222,7 +222,7 @@
           },
           "targets": [
             {
-              "rawSql": "SELECT date_trunc('minute', finalized_at) AS time, (COALESCE(qd.display_name, j.queue) || ' · ' || j.state::text) AS metric, count(*)::bigint AS value FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state IN ('completed', 'failed') AND finalized_at > now() - interval '1 hour' GROUP BY 1, 2 ORDER BY 1",
+              "rawSql": "SELECT date_trunc('minute', finalized_at) AS time, (COALESCE(qd.display_name, j.queue) || ' · ' || j.state::text) AS metric, count(*)::bigint AS value FROM awa.jobs j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state IN ('completed', 'failed') AND finalized_at > now() - interval '1 hour' GROUP BY 1, 2 ORDER BY 1",
               "format": "time_series",
               "refId": "A"
             }
