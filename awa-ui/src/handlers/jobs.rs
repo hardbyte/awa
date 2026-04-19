@@ -116,10 +116,9 @@ pub async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
 ) -> Result<Json<JobResponse>, ApiError> {
-    // Falls back to jobs_dlq so operators inspecting a DLQ'd job via the
-    // standard job-detail URL see it instead of a 404. The response surfaces
-    // the DLQ metadata under `.dlq` so the frontend can route retry/cancel
-    // through the DLQ endpoints.
+    // Queue storage keeps DLQ rows in `dlq_entries`, not the live job tables.
+    // `get_job_with_source` resolves that and surfaces `.dlq` metadata so the
+    // frontend can route retry/cancel through the `/api/dlq/*` endpoints.
     let (job, dlq) = admin::get_job_with_source(&state.pool, job_id).await?;
     let queue_descriptors =
         admin::queue_descriptors_for_names(&state.pool, std::slice::from_ref(&job.queue)).await?;

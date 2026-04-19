@@ -11,6 +11,7 @@ const awaBinary = path.resolve(__dirname, "../../../target/debug/awa");
 const databaseUrl =
   process.env.DATABASE_URL ??
   "postgres://postgres:test@localhost:15432/awa_test";
+const queueStorageSchema = "awa_e2e_qs";
 
 export default async function globalSetup() {
   try {
@@ -18,12 +19,10 @@ export default async function globalSetup() {
       stdio: "pipe",
       timeout: 30_000,
     });
-  } catch (e) {
+  } catch {
     console.warn("Could not run migrations before E2E seed");
   }
 
-  // Insert test jobs in various states so E2E tests have data
-  // Use psql via the DATABASE_URL since awa CLI doesn't have a raw SQL command
   const pgUrl = new URL(databaseUrl);
   const host = pgUrl.hostname;
   const port = pgUrl.port || "5432";
@@ -31,12 +30,145 @@ export default async function globalSetup() {
   const user = pgUrl.username;
 
   const sql = `
-    -- Clean up any previous E2E data. Also strip runtime-snapshot hash
-    -- entries for these queues/kinds — otherwise hashes left over from a
-    -- previous run can resurface as spurious 'drift' or 'stale' badges on
-    -- the next Playwright run, purely as test-order noise.
-    DELETE FROM awa.jobs WHERE queue IN ('e2e_test', 'legacy_queue');
-    DELETE FROM awa.queue_meta WHERE queue IN ('e2e_test', 'legacy_queue');
+    DROP SCHEMA IF EXISTS ${queueStorageSchema} CASCADE;
+    CREATE SCHEMA ${queueStorageSchema};
+
+    CREATE TABLE ${queueStorageSchema}.queue_lanes (
+      queue           TEXT NOT NULL,
+      priority        SMALLINT NOT NULL,
+      next_seq        BIGINT NOT NULL DEFAULT 1,
+      claim_seq       BIGINT NOT NULL DEFAULT 1,
+      available_count BIGINT NOT NULL DEFAULT 0,
+      running_count   BIGINT NOT NULL DEFAULT 0,
+      completed_count BIGINT NOT NULL DEFAULT 0,
+      PRIMARY KEY (queue, priority)
+    );
+
+    CREATE TABLE ${queueStorageSchema}.ready_entries (
+      ready_slot        INT NOT NULL,
+      ready_generation  BIGINT NOT NULL,
+      job_id            BIGINT NOT NULL,
+      kind              TEXT NOT NULL,
+      queue             TEXT NOT NULL,
+      args              JSONB NOT NULL DEFAULT '{}'::jsonb,
+      priority          SMALLINT NOT NULL,
+      attempt           SMALLINT NOT NULL DEFAULT 0,
+      run_lease         BIGINT NOT NULL DEFAULT 0,
+      max_attempts      SMALLINT NOT NULL DEFAULT 25,
+      lane_seq          BIGINT NOT NULL,
+      run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      attempted_at      TIMESTAMPTZ,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      unique_key        BYTEA,
+      unique_states     TEXT,
+      payload           JSONB NOT NULL DEFAULT '{}'::jsonb,
+      PRIMARY KEY (ready_slot, queue, priority, lane_seq)
+    );
+
+    CREATE TABLE ${queueStorageSchema}.leases (
+      lease_slot          INT NOT NULL,
+      lease_generation    BIGINT NOT NULL,
+      ready_slot          INT NOT NULL,
+      ready_generation    BIGINT NOT NULL,
+      job_id              BIGINT NOT NULL,
+      queue               TEXT NOT NULL,
+      state               awa.job_state NOT NULL DEFAULT 'running',
+      priority            SMALLINT NOT NULL,
+      attempt             SMALLINT NOT NULL DEFAULT 1,
+      run_lease           BIGINT NOT NULL DEFAULT 1,
+      max_attempts        SMALLINT NOT NULL DEFAULT 25,
+      lane_seq            BIGINT NOT NULL,
+      heartbeat_at        TIMESTAMPTZ,
+      deadline_at         TIMESTAMPTZ,
+      attempted_at        TIMESTAMPTZ,
+      callback_id         UUID,
+      callback_timeout_at TIMESTAMPTZ,
+      PRIMARY KEY (lease_slot, queue, priority, lane_seq)
+    );
+
+    CREATE TABLE ${queueStorageSchema}.attempt_state (
+      job_id               BIGINT NOT NULL,
+      run_lease            BIGINT NOT NULL,
+      progress             JSONB,
+      callback_filter      TEXT,
+      callback_on_complete TEXT,
+      callback_on_fail     TEXT,
+      callback_transform   TEXT,
+      callback_result      JSONB,
+      updated_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      PRIMARY KEY (job_id, run_lease)
+    );
+
+    CREATE TABLE ${queueStorageSchema}.done_entries (
+      ready_slot        INT NOT NULL,
+      ready_generation  BIGINT NOT NULL,
+      job_id            BIGINT NOT NULL,
+      kind              TEXT NOT NULL,
+      queue             TEXT NOT NULL,
+      args              JSONB NOT NULL DEFAULT '{}'::jsonb,
+      state             awa.job_state NOT NULL DEFAULT 'completed',
+      priority          SMALLINT NOT NULL,
+      attempt           SMALLINT NOT NULL DEFAULT 1,
+      run_lease         BIGINT NOT NULL DEFAULT 1,
+      max_attempts      SMALLINT NOT NULL DEFAULT 25,
+      lane_seq          BIGINT NOT NULL,
+      run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      attempted_at      TIMESTAMPTZ,
+      finalized_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      unique_key        BYTEA,
+      unique_states     TEXT,
+      payload           JSONB NOT NULL DEFAULT '{}'::jsonb,
+      PRIMARY KEY (ready_slot, queue, priority, lane_seq)
+    );
+
+    CREATE TABLE ${queueStorageSchema}.deferred_jobs (
+      job_id            BIGINT PRIMARY KEY,
+      kind              TEXT NOT NULL,
+      queue             TEXT NOT NULL,
+      args              JSONB NOT NULL DEFAULT '{}'::jsonb,
+      state             awa.job_state NOT NULL,
+      priority          SMALLINT NOT NULL,
+      attempt           SMALLINT NOT NULL DEFAULT 0,
+      run_lease         BIGINT NOT NULL DEFAULT 0,
+      max_attempts      SMALLINT NOT NULL DEFAULT 25,
+      run_at            TIMESTAMPTZ NOT NULL,
+      attempted_at      TIMESTAMPTZ,
+      finalized_at      TIMESTAMPTZ,
+      created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      unique_key        BYTEA,
+      unique_states     TEXT,
+      payload           JSONB NOT NULL DEFAULT '{}'::jsonb
+    );
+
+    CREATE TABLE ${queueStorageSchema}.dlq_entries (
+      job_id             BIGINT PRIMARY KEY,
+      kind               TEXT NOT NULL,
+      queue              TEXT NOT NULL,
+      args               JSONB NOT NULL DEFAULT '{}'::jsonb,
+      state              awa.job_state NOT NULL DEFAULT 'failed',
+      priority           SMALLINT NOT NULL,
+      attempt            SMALLINT NOT NULL DEFAULT 1,
+      run_lease          BIGINT NOT NULL DEFAULT 1,
+      max_attempts       SMALLINT NOT NULL DEFAULT 25,
+      run_at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      attempted_at       TIMESTAMPTZ,
+      finalized_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      created_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      unique_key         BYTEA,
+      unique_states      TEXT,
+      payload            JSONB NOT NULL DEFAULT '{}'::jsonb,
+      dlq_reason         TEXT NOT NULL,
+      dlq_at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+      original_run_lease BIGINT NOT NULL
+    );
+
+    INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+    VALUES ('queue_storage', '${queueStorageSchema}', now())
+    ON CONFLICT (backend)
+    DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
+
+    DELETE FROM awa.queue_meta WHERE queue IN ('e2e_test', 'legacy_queue', 'e2e_dlq');
     DELETE FROM awa.queue_descriptors WHERE queue IN ('e2e_test', 'legacy_queue');
     DELETE FROM awa.job_kind_descriptors WHERE kind IN ('e2e_job', 'legacy_job');
     UPDATE awa.runtime_instances SET
@@ -45,7 +177,6 @@ export default async function globalSetup() {
     WHERE queue_descriptor_hashes    ?| ARRAY['e2e_test', 'legacy_queue']
        OR job_kind_descriptor_hashes ?| ARRAY['e2e_job', 'legacy_job'];
 
-    -- Descriptor-backed queue and kind used by the new UI surfaces
     INSERT INTO awa.queue_descriptors (
       queue, display_name, description, owner, docs_url, tags, extra,
       descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at
@@ -84,48 +215,95 @@ export default async function globalSetup() {
       now()
     );
 
-    -- Available jobs
-    INSERT INTO awa.jobs (kind, queue, state, args, priority, max_attempts, tags)
+    INSERT INTO ${queueStorageSchema}.queue_lanes (queue, priority, next_seq, claim_seq, available_count)
     VALUES
-      ('e2e_job', 'e2e_test', 'available', '{"test": true}', 2, 5, '{e2e}'),
-      ('e2e_job', 'e2e_test', 'available', '{"test": true}', 1, 3, '{e2e,priority}');
+      ('e2e_test', 2, 6, 2, 1),
+      ('e2e_test', 1, 2, 1, 1),
+      ('legacy_queue', 2, 2, 1, 1),
+      ('e2e_dlq', 2, 1, 1, 0);
 
-    -- Running job with progress
-    INSERT INTO awa.jobs (kind, queue, state, args, priority, attempt, max_attempts, tags, heartbeat_at, attempted_at, progress)
-    VALUES ('e2e_job', 'e2e_test', 'running', '{"test": true}', 2, 1, 5, '{e2e}', now(), now(), '{"percent": 50, "message": "halfway"}');
+    INSERT INTO ${queueStorageSchema}.ready_entries (
+      ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt,
+      run_lease, max_attempts, lane_seq, run_at, attempted_at, created_at, payload
+    )
+    VALUES
+      (
+        0, 0, 800006, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 2, 0,
+        0, 5, 2, now() - interval '15 seconds', NULL, now() - interval '5 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb
+      ),
+      (
+        0, 0, 800005, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 1, 0,
+        0, 3, 1, now() - interval '10 seconds', NULL, now() - interval '4 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["e2e","priority"],"errors":[],"progress":null}'::jsonb
+      ),
+      (
+        0, 0, 800004, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 2, 1,
+        1, 5, 1, now() - interval '30 seconds', now() - interval '20 seconds', now() - interval '3 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb
+      ),
+      (
+        0, 0, 700001, 'legacy_job', 'legacy_queue', '{"legacy": true}'::jsonb, 2, 0,
+        0, 3, 1, now() - interval '5 seconds', NULL, now() - interval '2 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["legacy"],"errors":[],"progress":null}'::jsonb
+      );
 
-    -- Failed job with errors
-    INSERT INTO awa.jobs (kind, queue, state, args, priority, attempt, max_attempts, tags, finalized_at, attempted_at, errors)
-    VALUES ('e2e_job', 'e2e_test', 'failed', '{"test": true}', 2, 3, 3, '{e2e}', now(), now(),
-      ARRAY['{"error": "connection refused", "attempt": 1, "at": "2026-01-01T00:00:00Z"}'::jsonb,
-            '{"error": "timeout", "attempt": 2, "at": "2026-01-01T00:01:00Z"}'::jsonb,
-            '{"error": "max retries exceeded", "attempt": 3, "at": "2026-01-01T00:02:00Z"}'::jsonb]);
+    INSERT INTO ${queueStorageSchema}.leases (
+      lease_slot, lease_generation, ready_slot, ready_generation, job_id, queue, state,
+      priority, attempt, run_lease, max_attempts, lane_seq, heartbeat_at, deadline_at, attempted_at
+    )
+    VALUES (
+      0, 0, 0, 0, 800004, 'e2e_test', 'running', 2, 1, 1, 5, 1,
+      now(), now() + interval '30 seconds', now() - interval '20 seconds'
+    );
 
-    -- Completed job
-    INSERT INTO awa.jobs (kind, queue, state, args, priority, attempt, max_attempts, tags, finalized_at, attempted_at)
-    VALUES ('e2e_job', 'e2e_test', 'completed', '{"test": true}', 2, 1, 5, '{e2e}', now(), now());
+    INSERT INTO ${queueStorageSchema}.attempt_state (
+      job_id, run_lease, progress, updated_at
+    )
+    VALUES (
+      800004, 1, '{"percent": 50, "message": "halfway"}'::jsonb, now()
+    );
 
-    -- Cancelled job
-    INSERT INTO awa.jobs (kind, queue, state, args, priority, attempt, max_attempts, tags, finalized_at)
-    VALUES ('e2e_job', 'e2e_test', 'cancelled', '{"test": true}', 2, 1, 5, '{e2e}', now());
+    INSERT INTO ${queueStorageSchema}.done_entries (
+      ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt,
+      run_lease, max_attempts, lane_seq, run_at, attempted_at, finalized_at, created_at, payload
+    )
+    VALUES
+      (
+        0, 0, 800003, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 'failed', 2, 3,
+        3, 3, 3, now() - interval '3 minutes', now() - interval '2 minutes', now() - interval '1 minute', now() - interval '10 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[{"error":"connection refused","attempt":1,"at":"2026-01-01T00:00:00Z"},{"error":"timeout","attempt":2,"at":"2026-01-01T00:01:00Z"},{"error":"max retries exceeded","attempt":3,"at":"2026-01-01T00:02:00Z"}],"progress":null}'::jsonb
+      ),
+      (
+        0, 0, 800002, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 'completed', 2, 1,
+        1, 5, 4, now() - interval '4 minutes', now() - interval '3 minutes', now() - interval '2 minutes', now() - interval '12 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb
+      ),
+      (
+        0, 0, 800001, 'e2e_job', 'e2e_test', '{"test": true}'::jsonb, 'cancelled', 2, 1,
+        1, 5, 5, now() - interval '2 minutes', NULL, now() - interval '90 seconds', now() - interval '8 minutes',
+        '{"metadata":{"source":"playwright"},"tags":["e2e"],"errors":[],"progress":null}'::jsonb
+      );
 
-    -- Legacy queue/kind with no descriptors to validate backwards compatibility
-    INSERT INTO awa.jobs (kind, queue, state, args, priority, max_attempts, tags)
-    VALUES ('legacy_job', 'legacy_queue', 'available', '{"legacy": true}', 2, 3, '{legacy}');
-
-    -- Flush dirty admin metadata so queue_stats cache is fresh for E2E tests
-    -- (awa serve does not run a maintenance leader)
-    SELECT awa.recompute_dirty_admin_metadata(100);
+    INSERT INTO ${queueStorageSchema}.dlq_entries (
+      job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts,
+      run_at, attempted_at, finalized_at, created_at, payload, dlq_reason, dlq_at, original_run_lease
+    )
+    VALUES (
+      600001, 'dlq_job', 'e2e_dlq', '{"test": true}'::jsonb, 'failed', 2, 2, 2, 5,
+      now() - interval '6 minutes', now() - interval '5 minutes', now() - interval '4 minutes', now() - interval '15 minutes',
+      '{"metadata":{"source":"playwright"},"tags":["dlq"],"errors":[{"error":"dead lettered","attempt":2,"at":"2026-01-01T00:03:00Z","terminal":true}],"progress":null}'::jsonb,
+      'manual_test', now() - interval '3 minutes', 2
+    );
   `;
 
   try {
     execSync(
       `PGPASSWORD=${pgUrl.password} psql -h ${host} -p ${port} -U ${user} -d ${db} -c "${sql.replace(/"/g, '\\"')}"`,
-      { stdio: "pipe", timeout: 10_000 }
+      { stdio: "pipe", timeout: 15_000 }
     );
     console.log("E2E seed data inserted");
-  } catch (e) {
-    // If psql isn't available, try docker exec (CI uses service containers)
+  } catch {
     try {
       const containerId = execSync(
         `docker ps --format '{{.ID}} {{.Ports}}' | awk '$0 ~ /:${port}->5432\\/tcp/ {print $1; exit}'`
@@ -137,7 +315,7 @@ export default async function globalSetup() {
       }
       execSync(
         `docker exec -i ${containerId} psql -U ${user} -d ${db} -c "${sql.replace(/"/g, '\\"')}"`,
-        { stdio: "pipe", timeout: 10_000 }
+        { stdio: "pipe", timeout: 15_000 }
       );
       console.log("E2E seed data inserted (via docker)");
     } catch {

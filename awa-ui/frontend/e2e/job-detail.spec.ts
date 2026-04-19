@@ -1,6 +1,17 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Job detail page", () => {
+  test("dlq job detail redirects to /dlq/:id", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => /\/api\/jobs\/600001$/.test(r.url()) && r.ok()),
+      page.goto("/jobs/600001"),
+    ]);
+
+    await page.waitForURL(/\/dlq\/600001$/);
+    await page.waitForResponse((r) => /\/api\/dlq\/600001$/.test(r.url()) && r.ok());
+    await expect(page.getByRole("heading", { name: /#600001/ })).toBeVisible();
+  });
+
   test("click job row navigates to detail", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),

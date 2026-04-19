@@ -5364,6 +5364,11 @@ impl QueueStorage {
         Ok(Some(dlq_row.into_job_row()?))
     }
 
+    #[tracing::instrument(
+        skip(self, pool, dlq_reason),
+        fields(kind = ?kind, queue = ?queue),
+        name = "queue_storage.bulk_move_failed_to_dlq"
+    )]
     pub async fn bulk_move_failed_to_dlq(
         &self,
         pool: &PgPool,
@@ -5507,6 +5512,11 @@ impl QueueStorage {
         ))
     }
 
+    #[tracing::instrument(
+        skip(self, pool, filter),
+        fields(kind = ?filter.kind, queue = ?filter.queue, tag = ?filter.tag),
+        name = "queue_storage.bulk_retry_from_dlq"
+    )]
     pub async fn bulk_retry_from_dlq(
         &self,
         pool: &PgPool,
@@ -5567,13 +5577,18 @@ impl QueueStorage {
         let run_at = Utc::now();
         let mut queues = BTreeSet::new();
         let mut ready_rows = Vec::with_capacity(moved.len());
-        for moved in moved {
-            let queue = moved.queue.clone();
-            let priority = moved.priority;
+        for moved_row in moved {
+            let queue = moved_row.queue.clone();
+            let priority = moved_row.priority;
             queues.insert(queue.clone());
-            let mut payload = RuntimePayload::from_json(moved.payload.clone())?;
+            let mut payload = RuntimePayload::from_json(moved_row.payload.clone())?;
             payload.set_progress(None);
-            ready_rows.push(moved.into_retry_ready_row(queue, priority, run_at, payload.into_json()));
+            ready_rows.push(moved_row.into_retry_ready_row(
+                queue,
+                priority,
+                run_at,
+                payload.into_json(),
+            ));
         }
 
         let revived = ready_rows.len() as u64;

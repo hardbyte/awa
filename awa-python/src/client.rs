@@ -1037,21 +1037,22 @@ impl PyClient {
 
     /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
     ///
-    /// Requires at least one of `kind`, `queue`, or `tag` unless `all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
+    /// Requires at least one of `kind`, `queue`, or `tag` unless
+    /// `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
     fn bulk_retry_from_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
-        all: bool,
+        allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
-            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
+            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
             if count > 0 {
@@ -1087,15 +1088,17 @@ impl PyClient {
         })
     }
 
-    /// Bulk-move all failed jobs matching the filter into the DLQ. At least
-    /// one of `kind` or `queue` must be provided.
-    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string()))]
+    /// Bulk-move failed jobs into the DLQ.
+    ///
+    /// Requires at least one of `kind` or `queue` unless `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false))]
     fn bulk_move_failed_to_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         reason: String,
+        allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1104,6 +1107,7 @@ impl PyClient {
                 kind.as_deref(),
                 queue.as_deref(),
                 &reason,
+                allow_all,
             )
             .await
             .map_err(map_awa_error)?;
@@ -1131,21 +1135,22 @@ impl PyClient {
 
     /// Bulk-purge DLQ rows matching the filter.
     ///
-    /// Requires at least one of `kind`, `queue`, or `tag` unless `all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
+    /// Requires at least one of `kind`, `queue`, or `tag` unless
+    /// `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
     fn purge_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
-        all: bool,
+        allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let queue_attr = queue.clone();
             let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
-            let count = awa_model::dlq::purge_dlq(&pool, &filter, all)
+            let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
             if count > 0 {
@@ -2123,21 +2128,21 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
     fn bulk_retry_from_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
-        all: bool,
+        allow_all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let queue_attr = queue.clone();
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all)
+                let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
                     .await
                     .map_err(map_awa_error)?;
                 if count > 0 {
@@ -2166,13 +2171,14 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string()))]
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false))]
     fn bulk_move_failed_to_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         reason: String,
+        allow_all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         py.detach(|| {
@@ -2182,6 +2188,7 @@ impl PyClient {
                     kind.as_deref(),
                     queue.as_deref(),
                     &reason,
+                    allow_all,
                 )
                 .await
                 .map_err(map_awa_error)
@@ -2208,21 +2215,21 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
     fn purge_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
-        all: bool,
+        allow_all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let queue_attr = queue.clone();
         let filter = crate::dlq::build_filter(kind, queue, tag, None, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let count = awa_model::dlq::purge_dlq(&pool, &filter, all)
+                let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
                     .await
                     .map_err(map_awa_error)?;
                 if count > 0 {

@@ -295,6 +295,7 @@ export function bulkRetryDlq(filter: {
   kind?: string;
   queue?: string;
   tag?: string;
+  all?: boolean;
 }): Promise<DlqBulkResult> {
   return apiFetch("/dlq/bulk-retry", {
     method: "POST",
@@ -306,6 +307,7 @@ export function bulkPurgeDlq(filter: {
   kind?: string;
   queue?: string;
   tag?: string;
+  all?: boolean;
 }): Promise<DlqBulkResult> {
   return apiFetch("/dlq/bulk-purge", {
     method: "POST",
@@ -317,6 +319,7 @@ export function bulkMoveFailedToDlq(body: {
   kind?: string;
   queue?: string;
   reason?: string;
+  all?: boolean;
 }): Promise<DlqBulkResult> {
   return apiFetch("/dlq/bulk-move", {
     method: "POST",
