@@ -435,7 +435,7 @@ async fn test_throughput_rust_workers() {
 
     // Insert jobs in batches
     let insert_start = Instant::now();
-    for batch_start in (0..total_jobs).step_by(batch_size as usize) {
+    for batch_start in (0..total_jobs).step_by(batch_size) {
         let batch_end = (batch_start + batch_size as i64).min(total_jobs);
         let params: Vec<_> = (batch_start..batch_end)
             .map(|i| {

@@ -81,8 +81,10 @@ pub struct MaintenanceService {
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
+type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
 
 impl MaintenanceService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pool: PgPool,
         metrics: crate::metrics::AwaMetrics,
@@ -1438,9 +1440,8 @@ impl MaintenanceService {
         runtime: &crate::storage::QueueStorageRuntime,
     ) {
         let schema = runtime.store.schema();
-        let rows: Vec<(String, i64, i64, i64, i64, i64, i64, i64, Option<f64>)> =
-            match sqlx::query_as(&format!(
-                r#"
+        let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
+            r#"
             WITH queues AS (
                 SELECT DISTINCT queue
                 FROM (
@@ -1520,16 +1521,16 @@ impl MaintenanceService {
               ON dlq.queue = queues.queue
             ORDER BY queues.queue
             "#
-            ))
-            .fetch_all(&self.pool)
-            .await
-            {
-                Ok(rows) => rows,
-                Err(err) => {
-                    tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
-                    return;
-                }
-            };
+        ))
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
+                return;
+            }
+        };
 
         for (
             queue,
