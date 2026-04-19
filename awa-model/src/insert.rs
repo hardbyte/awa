@@ -360,7 +360,7 @@ pub async fn insert_many_copy(
         // deferred tables, so the old `ON CONFLICT` path is no longer available
         // here. Keep COPY for staging/parsing, then insert unique rows one at a
         // time and skip duplicates explicitly.
-            let staged_rows = sqlx::query_as::<
+        let staged_rows = sqlx::query_as::<
             _,
             (
                 String,
