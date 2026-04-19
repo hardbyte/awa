@@ -1898,8 +1898,12 @@ pub async fn get_job(pool: &PgPool, job_id: i64) -> Result<JobRow, AwaError> {
     row.ok_or(AwaError::JobNotFound { id: job_id })
 }
 
-/// Build a read-only inspection snapshot for one job.
-pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
+/// Fetch a job plus optional DLQ metadata for admin surfaces that need to
+/// distinguish a DLQ row from a normal live or terminal row.
+pub async fn get_job_with_source(
+    pool: &PgPool,
+    job_id: i64,
+) -> Result<(JobRow, Option<DlqMetadata>), AwaError> {
     let job = get_job(pool, job_id).await?;
     let dlq = if active_queue_storage(pool).await?.is_some() {
         crate::dlq::get_dlq_job(pool, job_id)
@@ -1908,6 +1912,12 @@ pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
     } else {
         None
     };
+    Ok((job, dlq))
+}
+
+/// Build a read-only inspection snapshot for one job.
+pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
+    let (job, dlq) = get_job_with_source(pool, job_id).await?;
     Ok(build_job_dump(job, dlq))
 }
 

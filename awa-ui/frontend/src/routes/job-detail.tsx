@@ -1,9 +1,10 @@
+import { useEffect } from "react";
 import {
   useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useParams, Link } from "@tanstack/react-router";
+import { useParams, Link, useNavigate } from "@tanstack/react-router";
 import { fetchJob, retryJob, cancelJob } from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
@@ -56,6 +57,7 @@ export function JobDetailPage() {
   const jobId = Number(id);
   const queryClient = useQueryClient();
   const readOnly = useReadOnly();
+  const navigate = useNavigate();
 
   const jobQuery = useQuery<JobRow>({
     queryKey: ["job", jobId],
@@ -63,6 +65,19 @@ export function JobDetailPage() {
     enabled: !isNaN(jobId),
     refetchInterval: POLL.FAST,
   });
+
+  // If this job has been moved to the DLQ, /jobs/:id retry/cancel routes will
+  // fail (the row no longer lives in `jobs_hot`). Redirect to the DLQ detail
+  // page which has the correct retry/purge actions wired to `/api/dlq/*`.
+  useEffect(() => {
+    if (jobQuery.data?.dlq) {
+      void navigate({
+        to: "/dlq/$id",
+        params: { id: String(jobId) },
+        replace: true,
+      });
+    }
+  }, [jobQuery.data?.dlq, jobId, navigate]);
 
   const retryMutation = useMutation({
     mutationFn: () => retryJob(jobId),
