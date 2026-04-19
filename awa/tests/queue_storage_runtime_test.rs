@@ -3,7 +3,9 @@
 //! These tests exercise the full dispatcher/worker/maintenance wiring with the
 //! queue_storage backend enabled.
 
-use awa::model::{admin, insert, migrations, QueueStorage, QueueStorageConfig};
+use awa::model::{
+    admin, insert, migrations, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome,
+};
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
     Worker,
@@ -400,6 +402,40 @@ impl Worker for BlockingCompleteWorker {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct HeartbeatRescueJob {
+    id: i64,
+}
+
+struct StaleHeartbeatWorker;
+
+#[async_trait::async_trait]
+impl Worker for StaleHeartbeatWorker {
+    fn kind(&self) -> &'static str {
+        "heartbeat_rescue_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if ctx.job.attempt == 1 {
+            let started = Instant::now();
+            loop {
+                if ctx.is_cancelled() {
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(5) {
+                    return Err(JobError::terminal(
+                        "heartbeat rescue did not cancel stale attempt",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok(JobResult::RetryAfter(Duration::from_millis(50)))
+        } else {
+            Ok(JobResult::Completed)
+        }
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_retry_after() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -552,6 +588,284 @@ async fn test_queue_storage_runtime_snooze() {
     assert_eq!(completed.attempt, 1, "snooze should not consume an attempt");
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_heartbeat_rescue";
+    let schema = "awa_qs_runtime_heartbeat_rescue";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 3 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::from_secs(30),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(StaleHeartbeatWorker)
+        .heartbeat_interval(Duration::from_secs(5))
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .heartbeat_staleness(Duration::from_millis(250))
+        .deadline_rescue_interval(Duration::from_secs(10))
+        .callback_rescue_interval(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build heartbeat rescue client");
+    client
+        .start()
+        .await
+        .expect("Failed to start heartbeat rescue client");
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(completed.attempt, 2);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_prune_live_slot";
+    let schema = "awa_qs_runtime_prune_live_slot";
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+    })
+    .expect("Failed to create queue_storage store");
+    recreate_store_schema(&pool, &store).await;
+    store.install(&pool).await.expect("Failed to install store");
+    store.reset(&pool).await.expect("Failed to reset store");
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        BlockingCompleteWorker {
+            release: release.clone(),
+        },
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start prune-live-slot client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+
+    let rotated = store
+        .rotate(&pool)
+        .await
+        .expect("Failed to rotate queue ring");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let prune_while_running = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune oldest live slot");
+    assert!(
+        matches!(prune_while_running, PruneOutcome::SkippedActive { slot: 0 }),
+        "unexpected prune outcome while lease is live: {prune_while_running:?}"
+    );
+
+    release.notify_waiters();
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+
+    let prune_after_completion = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune oldest completed slot");
+    assert!(
+        matches!(prune_after_completion, PruneOutcome::Pruned { slot: 0 }),
+        "unexpected prune outcome after completion: {prune_after_completion:?}"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_claim_runtime_waits_for_lease_rotation_lock() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_claim_lease_lock";
+    let schema = "awa_qs_runtime_claim_lease_lock";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("Failed to enqueue lease-lock job");
+
+    let mut lock_tx = pool.begin().await.expect("Failed to begin lease lock tx");
+    sqlx::query(&format!(
+        r#"
+        SELECT current_slot
+        FROM {schema}.lease_ring_state
+        WHERE singleton = TRUE
+        FOR UPDATE
+        "#
+    ))
+    .execute(lock_tx.as_mut())
+    .await
+    .expect("Failed to lock lease ring state");
+
+    let blocked_claim = tokio::time::timeout(
+        Duration::from_millis(200),
+        store.claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30)),
+    )
+    .await;
+    assert!(
+        blocked_claim.is_err(),
+        "claim should wait behind lease ring rotation lock"
+    );
+
+    lock_tx
+        .rollback()
+        .await
+        .expect("Failed to release lease ring lock");
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim after lease ring lock release");
+    assert_eq!(claimed.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_oldest_blocks_on_reader_lock() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_prune_reader_lock";
+    let schema = "awa_qs_runtime_prune_reader_lock";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("Failed to enqueue prune-reader job");
+    let claimed = store
+        .claim_batch(&pool, queue, 1)
+        .await
+        .expect("Failed to claim prune-reader job");
+    assert_eq!(claimed.len(), 1);
+    let completed = store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("Failed to complete prune-reader job");
+    assert_eq!(completed, 1);
+
+    let rotated = store
+        .rotate(&pool)
+        .await
+        .expect("Failed to rotate queue ring for prune-reader test");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let mut reader_tx = pool.begin().await.expect("Failed to begin reader lock tx");
+    sqlx::query(&format!(
+        "LOCK TABLE {schema}.ready_entries_0, {schema}.done_entries_0 IN ACCESS SHARE MODE"
+    ))
+    .execute(reader_tx.as_mut())
+    .await
+    .expect("Failed to lock ready/done reader tables");
+
+    let blocked = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune while reader lock held");
+    assert!(
+        matches!(blocked, PruneOutcome::Blocked { slot: 0 }),
+        "unexpected prune outcome while reader lock held: {blocked:?}"
+    );
+
+    reader_tx
+        .rollback()
+        .await
+        .expect("Failed to release reader lock");
+
+    let pruned = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune after reader lock release");
+    assert!(
+        matches!(pruned, PruneOutcome::Pruned { slot: 0 }),
+        "unexpected prune outcome after reader lock release: {pruned:?}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
