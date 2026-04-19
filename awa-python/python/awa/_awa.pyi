@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from enum import IntEnum
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
@@ -342,7 +343,7 @@ class Client:
         self,
         job_id: int,
         *,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         priority: int | None = None,
         queue: str | None = None,
     ) -> Job[dict[str, Any]] | None: ...
@@ -350,7 +351,7 @@ class Client:
         self,
         job_id: int,
         *,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         priority: int | None = None,
         queue: str | None = None,
     ) -> Job[dict[str, Any]] | None: ...
@@ -360,7 +361,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int: ...
     def bulk_retry_from_dlq_sync(
         self,
@@ -368,7 +369,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int: ...
     async def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None: ...
     def move_failed_to_dlq_sync(self, job_id: int, reason: str) -> DlqEntry | None: ...
@@ -378,6 +379,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         reason: str = "manual",
+        allow_all: bool = False,
     ) -> int: ...
     def bulk_move_failed_to_dlq_sync(
         self,
@@ -385,6 +387,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         reason: str = "manual",
+        allow_all: bool = False,
     ) -> int: ...
     async def purge_dlq_job(self, job_id: int) -> bool: ...
     def purge_dlq_job_sync(self, job_id: int) -> bool: ...
@@ -394,7 +397,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int: ...
     def purge_dlq_sync(
         self,
@@ -402,7 +405,7 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int: ...
     async def health_check(self) -> HealthCheck: ...
     async def insert_many_copy(

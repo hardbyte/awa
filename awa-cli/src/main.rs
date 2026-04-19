@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
@@ -165,6 +166,10 @@ enum DlqCommands {
         queue: Option<String>,
         #[arg(long)]
         tag: Option<String>,
+        #[arg(long)]
+        before_id: Option<i64>,
+        #[arg(long)]
+        before_dlq_at: Option<DateTime<Utc>>,
         #[arg(long, default_value = "20")]
         limit: i64,
     },
@@ -197,6 +202,9 @@ enum DlqCommands {
         queue: Option<String>,
         #[arg(long, default_value = "manual")]
         reason: String,
+        /// Move every failed row when no filter is provided.
+        #[arg(long)]
+        all: bool,
     },
     /// Purge (delete) DLQ rows matching the filter
     Purge {
@@ -490,12 +498,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         kind,
                         queue,
                         tag,
+                        before_id,
+                        before_dlq_at,
                         limit,
                     } => {
                         let filter = awa_model::dlq::ListDlqFilter {
                             kind,
                             queue,
                             tag,
+                            before_id,
+                            before_dlq_at,
                             limit: Some(limit),
                             ..Default::default()
                         };
@@ -525,6 +537,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 );
                             }
                             println!("\n{} rows.", rows.len());
+                            if let Some(last) = rows.last() {
+                                println!(
+                                    "Next page: --before-id {} --before-dlq-at {}",
+                                    last.job.id, last.dlq_at
+                                );
+                            }
                         }
                     }
                     DlqCommands::Depth { queue } => {
@@ -575,12 +593,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         kind,
                         queue,
                         reason,
+                        all,
                     } => {
                         let count = awa_model::dlq::bulk_move_failed_to_dlq(
                             &pool,
                             kind.as_deref(),
                             queue.as_deref(),
                             &reason,
+                            all,
                         )
                         .await?;
                         // Emit the same `awa.job.dlq_moved` counter the

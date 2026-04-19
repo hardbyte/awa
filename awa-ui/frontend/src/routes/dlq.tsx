@@ -117,6 +117,7 @@ export function DlqPage() {
     onError: () => toast.error("Failed to purge DLQ rows"),
   });
 
+  const [showRetryConfirm, setShowRetryConfirm] = useState(false);
   const [showPurgeConfirm, setShowPurgeConfirm] = useState(false);
 
   const rows = dlqQuery.data ?? [];
@@ -170,8 +171,8 @@ export function DlqPage() {
         <div className="flex gap-2">
           <Button
             size="xs"
-            onPress={() => retryFilterMutation.mutate()}
-            isDisabled={retryFilterMutation.isPending || rows.length === 0}
+            onPress={() => setShowRetryConfirm(true)}
+            isDisabled={retryFilterMutation.isPending}
           >
             Retry matching ({rows.length}+)
           </Button>
@@ -180,7 +181,7 @@ export function DlqPage() {
             size="xs"
             className="text-danger"
             onPress={() => setShowPurgeConfirm(true)}
-            isDisabled={purgeFilterMutation.isPending || rows.length === 0}
+            isDisabled={purgeFilterMutation.isPending}
           >
             Purge matching
           </Button>
@@ -259,6 +260,16 @@ export function DlqPage() {
           </Button>
         </div>
       )}
+
+      <ConfirmDialog
+        isOpen={showRetryConfirm}
+        onOpenChange={setShowRetryConfirm}
+        title="Retry DLQ rows"
+        description="This retries every DLQ row matching the current filter and resets each attempt back to a fresh runnable job."
+        confirmLabel="Retry"
+        confirmIntent="primary"
+        onConfirm={() => retryFilterMutation.mutate()}
+      />
 
       <ConfirmDialog
         isOpen={showPurgeConfirm}
