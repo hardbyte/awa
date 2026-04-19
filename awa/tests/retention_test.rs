@@ -225,6 +225,7 @@ async fn test_per_queue_retention_override() {
             RetentionPolicy {
                 completed: Duration::from_secs(3600), // 1h
                 failed: Duration::from_secs(3600),
+                dlq: None,
             },
         )
         .build()

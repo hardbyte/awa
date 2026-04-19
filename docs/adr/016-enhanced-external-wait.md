@@ -131,7 +131,7 @@ No schema changes — reuses existing `callback_timeout_at` column.
 
 ## What we explicitly don't build
 
-- **Fan-in** (wait for N signals) — model as separate jobs with a coordinator. If demand materialises, address in v0.6+ alongside #14 (job dependencies).
+- **Fan-in** (wait for N signals) — model as separate jobs with a coordinator. If demand materialises, address it alongside a future job-dependency design rather than extending the callback primitive itself.
 - **Named callback channels** — over-engineering for current use cases.
 - **Full resumable execution / durable promises** — that's Temporal territory. Awa is a job queue, not a workflow engine.
 - **Automatic timeout compensation** — the lifecycle hook system already handles this. `Retried` events from callback timeout rescue can trigger cleanup logic.

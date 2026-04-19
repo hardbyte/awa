@@ -514,7 +514,7 @@ impl Dispatcher {
                     return false;
                 }
             },
-            RuntimeStorage::VacuumAware(runtime) => match runtime
+            RuntimeStorage::QueueStorage(runtime) => match runtime
                 .store
                 .claim_job_batch(
                     &self.pool,
@@ -529,7 +529,7 @@ impl Dispatcher {
                     warn!(
                         queue = %self.queue,
                         error = %err,
-                        "Failed to claim vacuum-aware jobs"
+                        "Failed to claim queue storage jobs"
                     );
                     return false;
                 }

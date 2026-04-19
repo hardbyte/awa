@@ -4,6 +4,14 @@
 
 Accepted
 
+## Note
+
+ADR-019 changes Awa's primary physical storage layout from the canonical
+`jobs_hot` / `scheduled_jobs` split to queue segments plus a lease/runtime
+sidecar. The decision in this ADR still stands: Awa remains Postgres-only, and
+the redesign continues to lean on Postgres-native primitives rather than a
+pluggable storage abstraction.
+
 ## Context
 
 When designing a background job queue, one of the first architectural decisions is whether to support multiple storage backends (e.g., Postgres + Redis + MySQL) or commit to a single backend. Existing Rust job queues like `fang` take the multi-backend approach, abstracting over storage via traits. Systems like River (Go), Oban (Elixir), and GoodJob (Ruby) take the opposite approach -- they are Postgres-only and leverage that commitment for deeper feature integration.

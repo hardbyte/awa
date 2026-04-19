@@ -13,8 +13,8 @@ pub use awa_model;
 pub use awa_model::{
     self as model, admin, bridge, insert, insert_many, insert_many_copy,
     insert_many_copy_from_pool, insert_with, migrations, AwaError, CallbackConfig, DefaultAction,
-    InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState, QueueDescriptor,
-    ResolveOutcome, UniqueOpts,
+    DlqMetadata, DlqRow, InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState,
+    ListDlqFilter, QueueDescriptor, ResolveOutcome, RetryFromDlqOpts, UniqueOpts,
 };
 
 // Re-export worker runtime

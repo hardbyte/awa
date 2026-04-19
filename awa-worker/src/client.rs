@@ -1,17 +1,17 @@
 use crate::completion::CompletionBatcher;
 use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
 use crate::events::{BoxedUntypedEventHandler, JobEvent, UntypedJobEvent};
-use crate::executor::{BoxedWorker, JobError, JobExecutor, JobResult, Worker};
+use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
-use crate::storage::{RuntimeStorage, VacuumAwareRuntime};
+use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput,
 };
-use awa_model::{JobArgs, PeriodicJob, VacuumAwareConfig};
+use awa_model::{JobArgs, PeriodicJob, QueueStorageConfig};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -41,8 +41,8 @@ pub enum BuildError {
     InvalidWeight,
     #[error("cleanup_batch_size must be > 0")]
     InvalidBatchSize,
-    #[error("invalid vacuum-aware storage config: {0}")]
-    InvalidVacuumAwareStorage(String),
+    #[error("invalid queue storage config: {0}")]
+    InvalidQueueStorage(String),
 }
 
 /// Health check result.
@@ -107,6 +107,10 @@ pub struct ClientBuilder {
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     runtime_snapshot_interval: Duration,
     queue_stats_interval: Option<Duration>,
+    dlq_enabled_by_default: bool,
+    dlq_retention: Option<Duration>,
+    dlq_cleanup_batch_size: Option<i64>,
+    dlq_overrides: HashMap<String, bool>,
     storage: RuntimeStorage,
     storage_error: Option<BuildError>,
 }
@@ -139,6 +143,10 @@ impl ClientBuilder {
             queue_retention_overrides: HashMap::new(),
             runtime_snapshot_interval: Duration::from_secs(10),
             queue_stats_interval: None,
+            dlq_enabled_by_default: false,
+            dlq_retention: None,
+            dlq_cleanup_batch_size: None,
+            dlq_overrides: HashMap::new(),
             storage: RuntimeStorage::Canonical,
             storage_error: None,
         }
@@ -411,25 +419,49 @@ impl ClientBuilder {
         self
     }
 
-    /// Enable the experimental vacuum-aware runtime backend.
+    /// Enable or disable DLQ routing by default.
+    pub fn dlq_enabled_by_default(mut self, enabled: bool) -> Self {
+        self.dlq_enabled_by_default = enabled;
+        self
+    }
+
+    /// Override DLQ routing for a single queue.
+    pub fn queue_dlq_enabled(mut self, queue: impl Into<String>, enabled: bool) -> Self {
+        self.dlq_overrides.insert(queue.into(), enabled);
+        self
+    }
+
+    /// Set retention for DLQ rows.
+    pub fn dlq_retention(mut self, retention: Duration) -> Self {
+        self.dlq_retention = Some(retention);
+        self
+    }
+
+    /// Set the maximum number of DLQ rows deleted per cleanup pass.
+    pub fn dlq_cleanup_batch_size(mut self, batch_size: i64) -> Self {
+        self.dlq_cleanup_batch_size = Some(batch_size);
+        self
+    }
+
+    /// Enable the segmented queue storage backend.
     ///
     /// This currently targets the immediate/completed hot path used by runtime
     /// throughput benchmarks. Advanced lifecycle transitions still use the
     /// canonical storage engine.
-    pub fn experimental_vacuum_aware_storage(
+    pub fn queue_storage(
         mut self,
-        config: VacuumAwareConfig,
+        config: QueueStorageConfig,
         queue_rotate_interval: Duration,
         lease_rotate_interval: Duration,
     ) -> Self {
-        match VacuumAwareRuntime::new(config, queue_rotate_interval, lease_rotate_interval) {
+        match QueueStorageRuntime::new(config, queue_rotate_interval, lease_rotate_interval) {
             Ok(runtime) => {
-                self.storage = RuntimeStorage::VacuumAware(runtime);
+                self.storage = RuntimeStorage::QueueStorage(runtime);
                 self.storage_error = None;
             }
             Err(err) => {
                 self.storage = RuntimeStorage::Canonical;
-                self.storage_error = Some(BuildError::InvalidVacuumAwareStorage(err.to_string()));
+                self.storage_error = Some(BuildError::InvalidQueueStorage(err.to_string()));
             }
         }
         self
@@ -530,6 +562,7 @@ impl ClientBuilder {
                 .map(|(name, _)| (name.clone(), Arc::new(AtomicBool::new(false))))
                 .collect(),
         );
+        let dlq_policy = DlqPolicy::new(self.dlq_enabled_by_default, self.dlq_overrides);
 
         Ok(Client {
             pool: self.pool,
@@ -568,6 +601,9 @@ impl ClientBuilder {
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
             queue_stats_interval: self.queue_stats_interval,
+            dlq_policy,
+            dlq_retention: self.dlq_retention,
+            dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
             storage: self.storage,
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
@@ -655,6 +691,9 @@ pub struct Client {
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Option<Duration>,
+    dlq_policy: DlqPolicy,
+    dlq_retention: Option<Duration>,
+    dlq_cleanup_batch_size: Option<i64>,
     storage: RuntimeStorage,
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
@@ -782,7 +821,7 @@ impl Client {
         )
         .await?;
 
-        if let Some(store) = self.storage.vacuum_aware_store() {
+        if let Some(store) = self.storage.queue_storage_store() {
             store.install(&self.pool).await?;
         }
 
@@ -806,6 +845,7 @@ impl Client {
             self.metrics.clone(),
             completion_handle,
             self.storage.clone(),
+            self.dlq_policy.clone(),
         ));
 
         let mut service_handles = self.service_handles.write().await;
@@ -815,6 +855,7 @@ impl Client {
         // Start heartbeat service (uses service_cancel — stays alive during drain)
         let heartbeat = HeartbeatService::new(
             self.pool.clone(),
+            self.storage.clone(),
             self.in_flight.clone(),
             self.heartbeat_interval,
             self.heartbeat_alive.clone(),
@@ -877,6 +918,13 @@ impl Client {
         if let Some(interval) = self.queue_stats_interval {
             maintenance = maintenance.queue_stats_interval(interval);
         }
+        if let Some(retention) = self.dlq_retention {
+            maintenance = maintenance.dlq_retention(retention);
+        }
+        if let Some(batch_size) = self.dlq_cleanup_batch_size {
+            maintenance = maintenance.dlq_cleanup_batch_size(batch_size);
+        }
+        maintenance = maintenance.dlq_policy(self.dlq_policy.clone());
         service_handles.push(tokio::spawn(async move {
             maintenance.run().await;
         }));

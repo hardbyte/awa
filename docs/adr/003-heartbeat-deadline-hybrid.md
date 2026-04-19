@@ -4,6 +4,13 @@
 
 Accepted
 
+## Note
+
+ADR-019 changes where the mutable runtime fields live. In the canonical engine
+the heartbeat and deadline timestamps sit on `awa.jobs_hot`; in the queue
+storage redesign they move to the lease/runtime sidecar. The recovery policy in
+this ADR remains unchanged.
+
 ## Context
 
 A Postgres-based job queue must handle the case where a worker claims a job and then fails to complete it. Without recovery, the job stays in `running` state forever -- it is effectively lost. The two canonical approaches are:
