@@ -860,6 +860,79 @@ async fn test_rescue_callback_timeout_routes_to_dlq_when_enabled() {
     assert_eq!(dlq_row.dlq_reason, "callback_timeout");
 }
 
+/// Atomicity: if the DLQ `INSERT` phase fails mid-rescue, the whole batch
+/// must roll back so the rescued row returns to `waiting_external` for the
+/// next pass. Otherwise a transient DB error would strand the row as
+/// `failed` in `jobs_hot` with no sweep to recover it — the exact scenario
+/// the "permanent failures land in DLQ" invariant exists to prevent.
+///
+/// Provokes the failure by pre-inserting a poison row into `jobs_dlq` with
+/// the same `id` as the to-be-rescued job. When `move_failed_to_dlq` runs
+/// inside the rescue transaction, the `INSERT INTO awa.jobs_dlq` collides
+/// on the primary key, rolling back the tx. The job must end up back in
+/// `waiting_external`, not `failed`.
+#[tokio::test]
+async fn test_rescue_callback_timeout_rolls_back_on_dlq_insert_failure() {
+    let test_client = setup().await;
+    let pool = test_client.pool();
+    let queue = "dlq_rescue_atomic";
+    clean_queue(pool, queue).await;
+
+    let job = insert_job_in_callback_timeout(pool, queue, "atomic", 1, 1).await;
+
+    // Poison `jobs_dlq` with a row at the same id so the DLQ INSERT will hit
+    // the primary-key constraint.
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs_dlq (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, created_at, errors, metadata, tags,
+            run_lease, dlq_reason, dlq_at, original_run_lease
+        ) VALUES (
+            $1, 'dlq_test_job', $2, '{}'::jsonb, 'failed'::awa.job_state, 2, 1, 1,
+            now(), now(), '{}'::jsonb[], '{}'::jsonb, '{}'::text[],
+            0, 'poison', now(), 0
+        )
+        "#,
+    )
+    .bind(job.id)
+    .bind(queue)
+    .execute(pool)
+    .await
+    .unwrap();
+
+    let mut overrides = std::collections::HashMap::new();
+    overrides.insert(queue.to_string(), true);
+    let policy = awa::DlqPolicy::new(false, overrides);
+    let metrics = awa::worker::AwaMetrics::from_global();
+
+    awa::rescue_expired_callbacks_once(pool, &policy, &metrics).await;
+
+    // Rescue transaction must have rolled back. The row should still be in
+    // `waiting_external`, NOT `failed` stranded in jobs_hot with no recovery.
+    let state: Option<(String,)> =
+        sqlx::query_as("SELECT state::text FROM awa.jobs_hot WHERE id=$1")
+            .bind(job.id)
+            .fetch_optional(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        state.map(|r| r.0),
+        Some("waiting_external".to_string()),
+        "rescue must roll back when the DLQ INSERT fails, so the row stays in waiting_external for the next pass"
+    );
+
+    // The poison DLQ row must still be there (we didn't overwrite it) and
+    // there must be exactly one DLQ row for this id — the poison.
+    let dlq_count: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs_dlq WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(dlq_count, 1, "only the poison DLQ row should exist");
+}
+
 /// Inverse: DLQ disabled — callback-timeout rescue keeps the row in jobs_hot.
 #[tokio::test]
 async fn test_rescue_callback_timeout_keeps_row_when_dlq_disabled() {

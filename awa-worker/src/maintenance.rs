@@ -920,6 +920,16 @@ impl MaintenanceService {
 /// Run a single callback-timeout rescue pass followed by the DLQ sweep,
 /// bypassing leader election.
 ///
+/// The rescue `UPDATE` and the subsequent per-row DLQ moves run inside one
+/// Postgres transaction so the batch is atomic: either every exhausted
+/// timeout lands in `jobs_dlq` and every still-retryable row reaches
+/// `retryable`, or nothing changes and the next rescue pass re-tries the
+/// same rows from `waiting_external`. Without this coupling, a transient
+/// failure during `move_failed_to_dlq` would strand rows as `failed` in
+/// `jobs_hot`: the next rescue pass can't see them (they're no longer
+/// `waiting_external`), so they'd miss the "permanent failures land in
+/// DLQ" invariant until an operator notices.
+///
 /// Exposed (doc-hidden) so integration tests can drive the rescue directly
 /// without contending with other tests for the maintenance advisory lock.
 /// Production code paths go through [`MaintenanceService::run`] which owns
@@ -930,7 +940,15 @@ pub async fn rescue_expired_callbacks_once(
     dlq_policy: &DlqPolicy,
     metrics: &crate::metrics::AwaMetrics,
 ) {
-    match sqlx::query_as::<_, JobRow>(
+    let mut tx = match pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            error!(error = %err, "Failed to begin callback-timeout rescue transaction");
+            return;
+        }
+    };
+
+    let rescued: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
         SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
@@ -959,53 +977,79 @@ pub async fn rescue_expired_callbacks_once(
         RETURNING *
         "#,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await
     {
-        Ok(rescued) if !rescued.is_empty() => {
-            metrics.maintenance_rescues.add(
-                rescued.len() as u64,
-                &[opentelemetry::KeyValue::new(
-                    "awa.rescue.kind",
-                    "callback_timeout",
-                )],
-            );
-            warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
-            // Single-invariant: permanent failures land in DLQ. Callback-timeout
-            // is the only rescue path that can transition directly to `failed`
-            // (on exhausted attempts) without passing through the executor's
-            // apply_terminal_failure. Sweep those rows into the DLQ now,
-            // guarded by `state='failed'` so concurrent admin actions or
-            // operator retries win naturally.
-            for job in &rescued {
-                if job.state != JobState::Failed || !dlq_policy.enabled_for(&job.queue) {
-                    continue;
-                }
-                match awa_model::dlq::move_failed_to_dlq(pool, job.id, "callback_timeout").await {
-                    Ok(Some(_)) => {
-                        metrics.record_dlq_moved(&job.kind, &job.queue, "callback_timeout");
-                        debug!(job_id = job.id, "Routed rescue failure into DLQ");
-                    }
-                    Ok(None) => {
-                        debug!(
-                            job_id = job.id,
-                            "Rescue-failure row no longer in failed state; DLQ move skipped"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            job_id = job.id,
-                            error = %err,
-                            "Failed to route rescue failure into DLQ"
-                        );
-                    }
-                }
-            }
-        }
+        Ok(rows) => rows,
         Err(err) => {
             error!(error = %err, "Failed to rescue callback-timed-out jobs");
+            let _ = tx.rollback().await;
+            return;
         }
-        _ => {}
+    };
+
+    if rescued.is_empty() {
+        let _ = tx.commit().await;
+        return;
+    }
+
+    // Second phase: route exhausted-attempt rows into DLQ for queues that
+    // opted in. A failure here (transient DB error, PK conflict, etc.) must
+    // roll back the whole batch so the rescued rows return to
+    // `waiting_external` for the next pass — otherwise they'd be stuck as
+    // `failed` with no sweep to re-attempt the DLQ move.
+    let mut dlq_moves: Vec<(String, String)> = Vec::new();
+    for job in &rescued {
+        if job.state != JobState::Failed || !dlq_policy.enabled_for(&job.queue) {
+            continue;
+        }
+        match awa_model::dlq::move_failed_to_dlq(&mut *tx, job.id, "callback_timeout").await {
+            Ok(Some(_)) => {
+                dlq_moves.push((job.kind.clone(), job.queue.clone()));
+                debug!(job_id = job.id, "Routed rescue failure into DLQ");
+            }
+            Ok(None) => {
+                // Row wasn't in `failed` state when the move ran. Within this
+                // transaction that means the UPDATE above didn't produce
+                // `failed` for this id (it picked `retryable`) — inconsistent
+                // with `job.state == Failed` on the rescued snapshot, so roll
+                // back and let the next pass reconcile.
+                warn!(
+                    job_id = job.id,
+                    "DLQ move returned empty on just-rescued failed row; rolling back batch"
+                );
+                let _ = tx.rollback().await;
+                return;
+            }
+            Err(err) => {
+                warn!(
+                    job_id = job.id,
+                    error = %err,
+                    "DLQ move failed mid-rescue; rolling back batch so waiting_external rows are retried"
+                );
+                let _ = tx.rollback().await;
+                return;
+            }
+        }
+    }
+
+    if let Err(err) = tx.commit().await {
+        error!(error = %err, "Failed to commit callback-timeout rescue batch");
+        return;
+    }
+
+    // Emit metrics only after commit so rolled-back batches don't produce
+    // phantom counter increments.
+    metrics.maintenance_rescues.add(
+        rescued.len() as u64,
+        &[opentelemetry::KeyValue::new(
+            "awa.rescue.kind",
+            "callback_timeout",
+        )],
+    );
+    warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
+    for (kind, queue) in &dlq_moves {
+        metrics.record_dlq_moved(kind, queue, "callback_timeout");
     }
 }
 
