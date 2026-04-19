@@ -31,6 +31,12 @@ What it models:
 - rescue flow that re-enqueues at the tail of `ready_entries`
 - stale completion rejection via per-worker lease snapshots
 - segment rotation and prune safety for ready, deferred, waiting, and lease segment families
+- split-phase claim (BeginClaim snapshots a candidate row, CommitClaim re-validates the
+  snapshot against the live lane cursor before installing the lease; AbortClaim drops
+  a stale snapshot)
+- split-phase prune (BeginPrune observes a sealed segment has no live rows, CommitPrune
+  re-checks the same predicate before erasing the segment; an invariant confirms that
+  once observed prunable, a sealed segment stays prunable)
 - a second config with two workers to exercise interleavings on the same storage invariants
 - a third config with two jobs to exercise lane ordering and uniqueness under enqueue/promote/resume churn
 
@@ -48,7 +54,6 @@ What it intentionally does not model:
 - MVCC horizons or autovacuum timing
 - queue priorities and fairness
 - liveness/fairness properties; this spec is still safety-oriented
-- split-phase claim/rotate and prune/claim races; claim and prune are still modeled as atomic actions
 - dedicated DLQ storage families; DLQ behavior is currently subsumed into `terminal_entries`
 - terminal-family rotation/prune; `terminal_entries` is modeled as retained history only
 - cancel-of-running in this storage model; see `AwaCore` for lease-guarded cancel/finalize races

@@ -59,7 +59,9 @@ VARIABLES readyEntries,
           deferredSegmentCursor,
           waitingSegmentCursor,
           leaseSegmentCursor,
-          laneState
+          laneState,
+          pendingClaim,
+          pendingPrune
 
 vars == <<readyEntries,
           deferredEntries,
@@ -85,7 +87,9 @@ vars == <<readyEntries,
           deferredSegmentCursor,
           waitingSegmentCursor,
           leaseSegmentCursor,
-          laneState>>
+          laneState,
+          pendingClaim,
+          pendingPrune>>
 
 NextReadySegment(s) == IF s = ReadySegmentCount THEN 1 ELSE s + 1
 NextDeferredSegment(s) == IF s = DeferredSegmentCount THEN 1 ELSE s + 1
@@ -126,6 +130,8 @@ Init ==
     /\ waitingSegmentCursor = 1
     /\ leaseSegmentCursor = 1
     /\ laneState = [appendSeq |-> 1, claimSeq |-> 1, readyCount |-> 0, leasedCount |-> 0]
+    /\ pendingClaim = {}
+    /\ pendingPrune = {}
 
 EnqueueReady(j) ==
     /\ j \in Jobs
@@ -162,7 +168,9 @@ EnqueueReady(j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 EnqueueDeferred(j) ==
     /\ j \in Jobs
@@ -196,7 +204,9 @@ EnqueueDeferred(j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 PromoteDeferred(j) ==
     /\ j \in deferredEntries
@@ -229,7 +239,9 @@ PromoteDeferred(j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 AdvanceClaimCursor ==
     /\ laneState.claimSeq < laneState.appendSeq
@@ -258,27 +270,32 @@ AdvanceClaimCursor ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
-Claim(w, j) ==
+\* Claim is modeled as two phases. BeginClaim snapshots the candidate (job,
+\* lane cursor) in pendingClaim. Any other action can interleave between
+\* Begin and Commit: another worker may commit first, segments may rotate or
+\* prune, rescues may re-append the job. CommitClaim re-validates the
+\* snapshot against live state before installing the lease. AbortClaim fires
+\* when the snapshot has gone stale so the worker can retry.
+BeginClaim(w, j) ==
     /\ w \in Workers
+    /\ ~ \E c \in pendingClaim : c.worker = w
     /\ j \in CurrentReady
     /\ laneSeq[j] = laneState.claimSeq
     /\ runLease[j] < MaxRunLease
-    /\ leaseSegments[leaseSegmentCursor] = "open"
-    /\ activeLeases' = activeLeases \cup {j}
-    /\ leaseOwner' = [leaseOwner EXCEPT ![j] = w]
-    /\ runLease' = [runLease EXCEPT ![j] = runLease[j] + 1]
-    /\ taskLease' = [taskLease EXCEPT ![w][j] = runLease[j] + 1]
-    /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = leaseSegmentCursor]
-    /\ laneState' = [laneState EXCEPT
-                        !.claimSeq = laneState.claimSeq + 1,
-                        !.readyCount = laneState.readyCount - 1,
-                        !.leasedCount = laneState.leasedCount + 1]
+    /\ pendingClaim' = pendingClaim \cup
+           {[worker |-> w, job |-> j, laneSeqSnapshot |-> laneSeq[j]]}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingEntries,
                    terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
                    attemptState,
                    heartbeatFresh,
                    progressTouched,
@@ -286,6 +303,7 @@ Claim(w, j) ==
                    readySegmentOf,
                    deferredSegmentOf,
                    waitingSegmentOf,
+                   leaseSegmentOf,
                    readySegments,
                    deferredSegments,
                    waitingSegments,
@@ -293,7 +311,84 @@ Claim(w, j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   laneState,
+                   pendingPrune>>
+
+CommitClaim(w) ==
+    \E c \in pendingClaim :
+        /\ c.worker = w
+        /\ c.job \in CurrentReady
+        /\ laneSeq[c.job] = c.laneSeqSnapshot
+        /\ laneState.claimSeq = c.laneSeqSnapshot
+        /\ leaseSegments[leaseSegmentCursor] = "open"
+        /\ runLease[c.job] < MaxRunLease
+        /\ activeLeases' = activeLeases \cup {c.job}
+        /\ leaseOwner' = [leaseOwner EXCEPT ![c.job] = w]
+        /\ runLease' = [runLease EXCEPT ![c.job] = runLease[c.job] + 1]
+        /\ taskLease' = [taskLease EXCEPT ![w][c.job] = runLease[c.job] + 1]
+        /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![c.job] = leaseSegmentCursor]
+        /\ laneState' = [laneState EXCEPT
+                            !.claimSeq = laneState.claimSeq + 1,
+                            !.readyCount = laneState.readyCount - 1,
+                            !.leasedCount = laneState.leasedCount + 1]
+        /\ pendingClaim' = pendingClaim \ {c}
+        /\ UNCHANGED <<readyEntries,
+                       deferredEntries,
+                       waitingEntries,
+                       terminalEntries,
+                       attemptState,
+                       heartbeatFresh,
+                       progressTouched,
+                       laneSeq,
+                       readySegmentOf,
+                       deferredSegmentOf,
+                       waitingSegmentOf,
+                       readySegments,
+                       deferredSegments,
+                       waitingSegments,
+                       leaseSegments,
+                       readySegmentCursor,
+                       deferredSegmentCursor,
+                       waitingSegmentCursor,
+                       leaseSegmentCursor,
+                       pendingPrune>>
+
+AbortClaim(w) ==
+    \E c \in pendingClaim :
+        /\ c.worker = w
+        /\ \/ c.job \notin CurrentReady
+           \/ laneSeq[c.job] # c.laneSeqSnapshot
+           \/ laneState.claimSeq # c.laneSeqSnapshot
+           \/ leaseSegments[leaseSegmentCursor] # "open"
+           \/ runLease[c.job] >= MaxRunLease
+        /\ pendingClaim' = pendingClaim \ {c}
+        /\ UNCHANGED <<readyEntries,
+                       deferredEntries,
+                       waitingEntries,
+                       terminalEntries,
+                       activeLeases,
+                       leaseOwner,
+                       runLease,
+                       taskLease,
+                       attemptState,
+                       heartbeatFresh,
+                       progressTouched,
+                       laneSeq,
+                       readySegmentOf,
+                       deferredSegmentOf,
+                       waitingSegmentOf,
+                       leaseSegmentOf,
+                       readySegments,
+                       deferredSegments,
+                       waitingSegments,
+                       leaseSegments,
+                       readySegmentCursor,
+                       deferredSegmentCursor,
+                       waitingSegmentCursor,
+                       leaseSegmentCursor,
+                       laneState,
+                       pendingPrune>>
 
 MaterializeAttemptState(j) ==
     /\ j \in activeLeases
@@ -322,7 +417,9 @@ MaterializeAttemptState(j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 Heartbeat(j) ==
     /\ j \in activeLeases
@@ -350,7 +447,9 @@ Heartbeat(j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 LoseHeartbeat(j) ==
     /\ j \in activeLeases
@@ -379,7 +478,9 @@ LoseHeartbeat(j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 ProgressFlush(j) ==
     /\ j \in attemptState
@@ -407,7 +508,9 @@ ProgressFlush(j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 ParkToWaiting(w, j) ==
     /\ w \in Workers
@@ -440,7 +543,9 @@ ParkToWaiting(w, j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 ResumeWaitingToReady(j) ==
     \* Callback resolution and timeout resume share this same storage move.
@@ -474,7 +579,9 @@ ResumeWaitingToReady(j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 TimeoutWaitingToReady(j) ==
     /\ j \in waitingEntries
@@ -507,7 +614,9 @@ TimeoutWaitingToReady(j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 FastComplete(w, j) ==
     /\ w \in Workers
@@ -539,7 +648,9 @@ FastComplete(w, j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 StatefulComplete(w, j) ==
     /\ w \in Workers
@@ -571,7 +682,9 @@ StatefulComplete(w, j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 RetryToDeferred(w, j) ==
     /\ w \in Workers
@@ -603,7 +716,9 @@ RetryToDeferred(w, j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 RescueToReady(j) ==
     /\ j \in activeLeases
@@ -637,7 +752,9 @@ RescueToReady(j) ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   leaseSegmentCursor>>
+                   leaseSegmentCursor,
+                   pendingClaim,
+                   pendingPrune>>
 
 CancelWaitingToTerminal(j) ==
     /\ j \in waitingEntries
@@ -665,7 +782,9 @@ CancelWaitingToTerminal(j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 StaleCompleteRejected(w, j) ==
     /\ w \in Workers
@@ -696,7 +815,9 @@ StaleCompleteRejected(w, j) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 RotateReadySegments ==
     LET next == NextReadySegment(readySegmentCursor) IN
@@ -728,7 +849,9 @@ RotateReadySegments ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 RotateDeferredSegments ==
     LET next == NextDeferredSegment(deferredSegmentCursor) IN
@@ -760,7 +883,9 @@ RotateDeferredSegments ==
                    readySegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 RotateWaitingSegments ==
     LET next == NextWaitingSegment(waitingSegmentCursor) IN
@@ -792,7 +917,9 @@ RotateWaitingSegments ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
 RotateLeaseSegments ==
     LET next == NextLeaseSegment(leaseSegmentCursor) IN
@@ -824,16 +951,79 @@ RotateLeaseSegments ==
                    readySegmentCursor,
                    deferredSegmentCursor,
                    waitingSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim,
+                   pendingPrune>>
 
-PruneReadySegment(seg) ==
+\* Prune is modeled as two phases. BeginPrune captures an observation that
+\* a segment is sealed and contains no live rows. Any other action can
+\* interleave before CommitPrune re-checks the same predicate and performs
+\* the prune. The accompanying PendingPrunesStillValid invariant asserts
+\* that once observed prunable, a sealed segment stays prunable (new rows
+\* only land in the open cursor segment, and completed rows cannot return
+\* to a live table), so commit never has to abort.
+ReadySegPrunable(seg) ==
     /\ seg \in ReadySegments
     /\ readySegments[seg] = "sealed"
     /\ \A j \in Jobs : readySegmentOf[j] = seg => j \notin CurrentReady /\ j \notin activeLeases
+
+DeferredSegPrunable(seg) ==
+    /\ seg \in DeferredSegments
+    /\ deferredSegments[seg] = "sealed"
+    /\ \A j \in Jobs : deferredSegmentOf[j] = seg => j \notin deferredEntries
+
+WaitingSegPrunable(seg) ==
+    /\ seg \in WaitingSegments
+    /\ waitingSegments[seg] = "sealed"
+    /\ \A j \in Jobs : waitingSegmentOf[j] = seg => j \notin waitingEntries
+
+LeaseSegPrunable(seg) ==
+    /\ seg \in LeaseSegments
+    /\ leaseSegments[seg] = "sealed"
+    /\ \A j \in Jobs : leaseSegmentOf[j] = seg => j \notin activeLeases /\ j \notin attemptState
+
+PendingPruneContains(fam, seg) ==
+    \E p \in pendingPrune : p.family = fam /\ p.seg = seg
+
+BeginPruneReadySegment(seg) ==
+    /\ ReadySegPrunable(seg)
+    /\ ~ PendingPruneContains("ready", seg)
+    /\ pendingPrune' = pendingPrune \cup {[family |-> "ready", seg |-> seg]}
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   waitingSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState,
+                   pendingClaim>>
+
+CommitPruneReadySegment(seg) ==
+    /\ PendingPruneContains("ready", seg)
+    /\ ReadySegPrunable(seg)
     /\ readyEntries' = readyEntries \ JobsInReadySegment(seg)
     /\ laneSeq' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoLaneSeq ELSE laneSeq[j]]
     /\ readySegmentOf' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoReadySegment ELSE readySegmentOf[j]]
     /\ readySegments' = [readySegments EXCEPT ![seg] = "pruned"]
+    /\ pendingPrune' = pendingPrune \ {[family |-> "ready", seg |-> seg]}
     /\ UNCHANGED <<deferredEntries,
                    waitingEntries,
                    terminalEntries,
@@ -854,14 +1044,46 @@ PruneReadySegment(seg) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim>>
 
-PruneDeferredSegment(seg) ==
-    /\ seg \in DeferredSegments
-    /\ deferredSegments[seg] = "sealed"
-    /\ \A j \in Jobs : deferredSegmentOf[j] = seg => j \notin deferredEntries
+BeginPruneDeferredSegment(seg) ==
+    /\ DeferredSegPrunable(seg)
+    /\ ~ PendingPruneContains("deferred", seg)
+    /\ pendingPrune' = pendingPrune \cup {[family |-> "deferred", seg |-> seg]}
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   waitingSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState,
+                   pendingClaim>>
+
+CommitPruneDeferredSegment(seg) ==
+    /\ PendingPruneContains("deferred", seg)
+    /\ DeferredSegPrunable(seg)
     /\ deferredSegmentOf' = [j \in Jobs |-> IF deferredSegmentOf[j] = seg THEN NoDeferredSegment ELSE deferredSegmentOf[j]]
     /\ deferredSegments' = [deferredSegments EXCEPT ![seg] = "pruned"]
+    /\ pendingPrune' = pendingPrune \ {[family |-> "deferred", seg |-> seg]}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingEntries,
@@ -884,14 +1106,46 @@ PruneDeferredSegment(seg) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim>>
 
-PruneWaitingSegment(seg) ==
-    /\ seg \in WaitingSegments
-    /\ waitingSegments[seg] = "sealed"
-    /\ \A j \in Jobs : waitingSegmentOf[j] = seg => j \notin waitingEntries
+BeginPruneWaitingSegment(seg) ==
+    /\ WaitingSegPrunable(seg)
+    /\ ~ PendingPruneContains("waiting", seg)
+    /\ pendingPrune' = pendingPrune \cup {[family |-> "waiting", seg |-> seg]}
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   waitingSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState,
+                   pendingClaim>>
+
+CommitPruneWaitingSegment(seg) ==
+    /\ PendingPruneContains("waiting", seg)
+    /\ WaitingSegPrunable(seg)
     /\ waitingSegmentOf' = [j \in Jobs |-> IF waitingSegmentOf[j] = seg THEN NoWaitingSegment ELSE waitingSegmentOf[j]]
     /\ waitingSegments' = [waitingSegments EXCEPT ![seg] = "pruned"]
+    /\ pendingPrune' = pendingPrune \ {[family |-> "waiting", seg |-> seg]}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingEntries,
@@ -914,14 +1168,46 @@ PruneWaitingSegment(seg) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim>>
 
-PruneLeaseSegment(seg) ==
-    /\ seg \in LeaseSegments
-    /\ leaseSegments[seg] = "sealed"
-    /\ \A j \in Jobs : leaseSegmentOf[j] = seg => j \notin activeLeases /\ j \notin attemptState
+BeginPruneLeaseSegment(seg) ==
+    /\ LeaseSegPrunable(seg)
+    /\ ~ PendingPruneContains("lease", seg)
+    /\ pendingPrune' = pendingPrune \cup {[family |-> "lease", seg |-> seg]}
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   waitingSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState,
+                   pendingClaim>>
+
+CommitPruneLeaseSegment(seg) ==
+    /\ PendingPruneContains("lease", seg)
+    /\ LeaseSegPrunable(seg)
     /\ leaseSegmentOf' = [j \in Jobs |-> IF leaseSegmentOf[j] = seg THEN NoLeaseSegment ELSE leaseSegmentOf[j]]
     /\ leaseSegments' = [leaseSegments EXCEPT ![seg] = "pruned"]
+    /\ pendingPrune' = pendingPrune \ {[family |-> "lease", seg |-> seg]}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingEntries,
@@ -944,7 +1230,8 @@ PruneLeaseSegment(seg) ==
                    deferredSegmentCursor,
                    waitingSegmentCursor,
                    leaseSegmentCursor,
-                   laneState>>
+                   laneState,
+                   pendingClaim>>
 
 Stutter == /\ UNCHANGED vars
 
@@ -953,7 +1240,9 @@ Next ==
     \/ \E j \in Jobs : EnqueueDeferred(j)
     \/ \E j \in Jobs : PromoteDeferred(j)
     \/ AdvanceClaimCursor
-    \/ \E w \in Workers, j \in Jobs : Claim(w, j)
+    \/ \E w \in Workers, j \in Jobs : BeginClaim(w, j)
+    \/ \E w \in Workers : CommitClaim(w)
+    \/ \E w \in Workers : AbortClaim(w)
     \/ \E j \in Jobs : MaterializeAttemptState(j)
     \/ \E j \in Jobs : Heartbeat(j)
     \/ \E j \in Jobs : LoseHeartbeat(j)
@@ -971,10 +1260,14 @@ Next ==
     \/ RotateDeferredSegments
     \/ RotateWaitingSegments
     \/ RotateLeaseSegments
-    \/ \E seg \in ReadySegments : PruneReadySegment(seg)
-    \/ \E seg \in DeferredSegments : PruneDeferredSegment(seg)
-    \/ \E seg \in WaitingSegments : PruneWaitingSegment(seg)
-    \/ \E seg \in LeaseSegments : PruneLeaseSegment(seg)
+    \/ \E seg \in ReadySegments : BeginPruneReadySegment(seg)
+    \/ \E seg \in ReadySegments : CommitPruneReadySegment(seg)
+    \/ \E seg \in DeferredSegments : BeginPruneDeferredSegment(seg)
+    \/ \E seg \in DeferredSegments : CommitPruneDeferredSegment(seg)
+    \/ \E seg \in WaitingSegments : BeginPruneWaitingSegment(seg)
+    \/ \E seg \in WaitingSegments : CommitPruneWaitingSegment(seg)
+    \/ \E seg \in LeaseSegments : BeginPruneLeaseSegment(seg)
+    \/ \E seg \in LeaseSegments : CommitPruneLeaseSegment(seg)
     \/ Stutter
 
 Spec == Init /\ [][Next]_vars
@@ -1016,6 +1309,9 @@ TypeOK ==
     /\ laneState.claimSeq \in 1..(MaxAppendSeq + 1)
     /\ laneState.readyCount \in 0..Cardinality(Jobs)
     /\ laneState.leasedCount \in 0..Cardinality(Jobs)
+    /\ pendingClaim \in SUBSET [worker: Workers, job: Jobs, laneSeqSnapshot: 0..MaxAppendSeq]
+    /\ pendingPrune \in SUBSET [family: {"ready", "deferred", "waiting", "lease"},
+                                seg: ReadySegments \cup DeferredSegments \cup WaitingSegments \cup LeaseSegments]
 
 OneOpenReadySegment == Cardinality({s \in ReadySegments : readySegments[s] = "open"}) = 1
 OneOpenDeferredSegment == Cardinality({s \in DeferredSegments : deferredSegments[s] = "open"}) = 1
@@ -1077,5 +1373,20 @@ LaneStateConsistent ==
 
 TaskLeaseBounded ==
     \A w \in Workers, j \in Jobs : taskLease[w][j] <= runLease[j]
+
+AtMostOnePendingClaimPerWorker ==
+    \A w \in Workers :
+        Cardinality({c \in pendingClaim : c.worker = w}) <= 1
+
+\* Once a sealed segment is observed prunable, no interleaving action can
+\* make it non-prunable. This is the actual safety property behind
+\* split-phase prune: the observation is a stable witness, so the commit
+\* never needs to abort.
+PendingPrunesStillValid ==
+    \A p \in pendingPrune :
+        \/ (p.family = "ready" /\ p.seg \in ReadySegments /\ ReadySegPrunable(p.seg))
+        \/ (p.family = "deferred" /\ p.seg \in DeferredSegments /\ DeferredSegPrunable(p.seg))
+        \/ (p.family = "waiting" /\ p.seg \in WaitingSegments /\ WaitingSegPrunable(p.seg))
+        \/ (p.family = "lease" /\ p.seg \in LeaseSegments /\ LeaseSegPrunable(p.seg))
 
 =============================================================================

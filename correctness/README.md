@@ -186,11 +186,15 @@ only exist for leased or waiting jobs, waiting jobs hold no live lease,
 deferred jobs hold no live runtime state, and ready/deferred/waiting/lease
 segments cannot be pruned while they still own live rows.
 
-Important scope note: `AwaSegmentedStorage` still models claim and prune as
-atomic actions. That means it does not yet cover split-phase races like
-"snapshot cursor, rotate, then commit with stale cursor" or "check prune
-precondition, interleave a rescue, then prune". It also does not yet model a
-dedicated DLQ family or terminal-family rotation/prune.
+Claim and prune are modeled as split-phase actions. `BeginClaim` snapshots a
+candidate row and the current lane cursor into `pendingClaim`; other actions
+(rotation, rescue, another worker's commit) may interleave before
+`CommitClaim` re-validates the snapshot and installs the lease, or
+`AbortClaim` drops a stale snapshot. `BeginPrune`/`CommitPrune` work the
+same way for each segment family, with the `PendingPrunesStillValid`
+invariant asserting that once a sealed segment is observed prunable it
+stays prunable under any interleaving. `AwaSegmentedStorage` still does not
+yet model a dedicated DLQ family or terminal-family rotation/prune.
 
 `AwaPriorityAging` is a separate scheduling model for ADR-005. It deliberately
 keeps storage out of scope and instead checks the dispatch rule itself:
