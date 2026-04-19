@@ -55,9 +55,12 @@ What is intentionally not modeled:
   stale completion protection
 - `storage/AwaSegmentedStorage.tla` / `storage/AwaSegmentedStorage.cfg`: focused
   segmented-storage model covering `ready_entries`, `deferred_entries`,
-  `active_leases`, optional `attempt_state`, `terminal_entries`, queue-local
-  append/claim cursors, and segment rotation/prune safety for the vacuum-aware
-  0.6+ design direction
+  `waiting_entries`, `active_leases`, optional `attempt_state`,
+  `terminal_entries`, queue-local append/claim cursors, and segment
+  rotation/prune safety for the vacuum-aware 0.6+ design direction
+- `storage/AwaSegmentedStorageInterleavings.cfg`: alternate two-worker config
+  for the same segmented-storage spec, used to exercise stale completion and
+  waiting/resume interleavings without changing the base safety model
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -95,6 +98,7 @@ From the repository root:
 ```bash
 ./correctness/run-tlc.sh core/AwaCore.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
@@ -159,14 +163,15 @@ protocol rather than re-exploring the full cancel surface.
 
 `AwaSegmentedStorage` focuses on the proposed storage split behind the
 vacuum-aware runtime direction rather than the full worker lifecycle protocol.
-It treats `ready_entries` as append-only runnable records, `deferred_entries`
-as a separate promoted family, `active_leases` as the narrow claim surface,
-`attempt_state` as an optional per-attempt mutable row, and `terminal_entries`
-as reclaimable completion history. It also models `lane_state` with explicit
-append/claim cursors and a gap-skipping claim advance. The key invariants are
-that `attempt_state` can only exist for leased jobs, deferred jobs hold no live
-runtime state, and ready/deferred/lease segments cannot be pruned while they
-still own live rows.
+It treats `ready_entries` as runnable queue records, `deferred_entries` as a
+separate promoted family, `waiting_entries` as parked callback/timeout work,
+`active_leases` as the narrow claim surface, `attempt_state` as an optional
+per-attempt mutable row, and `terminal_entries` as reclaimable completion
+history. It also models `lane_state` with explicit append/claim cursors and a
+gap-skipping claim advance. The key invariants are that `attempt_state` can
+only exist for leased or waiting jobs, waiting jobs hold no live lease,
+deferred jobs hold no live runtime state, and ready/deferred/waiting/lease
+segments cannot be pruned while they still own live rows.
 
 `AwaBatcher` models the async completion path between handler return and DB
 update. In the real system (`awa-worker/src/completion.rs`), completed jobs

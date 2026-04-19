@@ -6,33 +6,38 @@ EXTENDS TLC, Naturals, FiniteSets
 \* It checks the relationships behind:
 \* - ready_entries
 \* - deferred_entries
+\* - waiting_entries
 \* - active_leases
 \* - attempt_state
 \* - terminal_entries
 \* - lane_state
-\* - ready_segments / ready_segment_cursor
-\* - deferred_segments / deferred_segment_cursor
-\* - lease_segments / lease_segment_cursor
+\* - ready/deferred/waiting/lease segment families
 
-Jobs == {"j1", "j2"}
-Workers == {"w1"}
+CONSTANTS Jobs,
+          Workers,
+          ReadySegmentCount,
+          DeferredSegmentCount,
+          WaitingSegmentCount,
+          LeaseSegmentCount,
+          MaxRunLease,
+          MaxAppendSeq
 
-ReadySegments == 1..2
-DeferredSegments == 1..2
-LeaseSegments == 1..2
+ReadySegments == 1..ReadySegmentCount
+DeferredSegments == 1..DeferredSegmentCount
+WaitingSegments == 1..WaitingSegmentCount
+LeaseSegments == 1..LeaseSegmentCount
 SegmentStates == {"open", "sealed", "pruned"}
 
 NoWorker == "none"
 NoReadySegment == 0
 NoDeferredSegment == 0
+NoWaitingSegment == 0
 NoLeaseSegment == 0
 NoLaneSeq == 0
 
-MaxRunLease == 2
-MaxAppendSeq == 4
-
 VARIABLES readyEntries,
           deferredEntries,
+          waitingEntries,
           terminalEntries,
           activeLeases,
           leaseOwner,
@@ -40,22 +45,25 @@ VARIABLES readyEntries,
           taskLease,
           attemptState,
           heartbeatFresh,
-          waitingExternal,
           progressTouched,
           laneSeq,
           readySegmentOf,
           deferredSegmentOf,
+          waitingSegmentOf,
           leaseSegmentOf,
           readySegments,
           deferredSegments,
+          waitingSegments,
           leaseSegments,
           readySegmentCursor,
           deferredSegmentCursor,
+          waitingSegmentCursor,
           leaseSegmentCursor,
           laneState
 
 vars == <<readyEntries,
           deferredEntries,
+          waitingEntries,
           terminalEntries,
           activeLeases,
           leaseOwner,
@@ -63,31 +71,39 @@ vars == <<readyEntries,
           taskLease,
           attemptState,
           heartbeatFresh,
-          waitingExternal,
           progressTouched,
           laneSeq,
           readySegmentOf,
           deferredSegmentOf,
+          waitingSegmentOf,
           leaseSegmentOf,
           readySegments,
           deferredSegments,
+          waitingSegments,
           leaseSegments,
           readySegmentCursor,
           deferredSegmentCursor,
+          waitingSegmentCursor,
           leaseSegmentCursor,
           laneState>>
 
-NextReadySegment(s) == IF s = 2 THEN 1 ELSE s + 1
-NextDeferredSegment(s) == IF s = 2 THEN 1 ELSE s + 1
-NextLeaseSegment(s) == IF s = 2 THEN 1 ELSE s + 1
+NextReadySegment(s) == IF s = ReadySegmentCount THEN 1 ELSE s + 1
+NextDeferredSegment(s) == IF s = DeferredSegmentCount THEN 1 ELSE s + 1
+NextWaitingSegment(s) == IF s = WaitingSegmentCount THEN 1 ELSE s + 1
+NextLeaseSegment(s) == IF s = LeaseSegmentCount THEN 1 ELSE s + 1
 
-CurrentReady == (readyEntries \ terminalEntries) \ activeLeases
+CurrentReady == (((readyEntries \ terminalEntries) \ activeLeases) \ deferredEntries) \ waitingEntries
+
 JobsInReadySegment(seg) == {j \in Jobs : readySegmentOf[j] = seg}
 JobsInDeferredSegment(seg) == {j \in Jobs : deferredSegmentOf[j] = seg}
+JobsInWaitingSegment(seg) == {j \in Jobs : waitingSegmentOf[j] = seg}
+
+InitSegments(Range) == [s \in Range |-> IF s = 1 THEN "open" ELSE "pruned"]
 
 Init ==
     /\ readyEntries = {}
     /\ deferredEntries = {}
+    /\ waitingEntries = {}
     /\ terminalEntries = {}
     /\ activeLeases = {}
     /\ leaseOwner = [j \in Jobs |-> NoWorker]
@@ -95,17 +111,19 @@ Init ==
     /\ taskLease = [w \in Workers |-> [j \in Jobs |-> 0]]
     /\ attemptState = {}
     /\ heartbeatFresh = {}
-    /\ waitingExternal = {}
     /\ progressTouched = {}
     /\ laneSeq = [j \in Jobs |-> NoLaneSeq]
     /\ readySegmentOf = [j \in Jobs |-> NoReadySegment]
     /\ deferredSegmentOf = [j \in Jobs |-> NoDeferredSegment]
+    /\ waitingSegmentOf = [j \in Jobs |-> NoWaitingSegment]
     /\ leaseSegmentOf = [j \in Jobs |-> NoLeaseSegment]
-    /\ readySegments = [s \in ReadySegments |-> IF s = 1 THEN "open" ELSE "pruned"]
-    /\ deferredSegments = [s \in DeferredSegments |-> IF s = 1 THEN "open" ELSE "pruned"]
-    /\ leaseSegments = [s \in LeaseSegments |-> IF s = 1 THEN "open" ELSE "pruned"]
+    /\ readySegments = InitSegments(ReadySegments)
+    /\ deferredSegments = InitSegments(DeferredSegments)
+    /\ waitingSegments = InitSegments(WaitingSegments)
+    /\ leaseSegments = InitSegments(LeaseSegments)
     /\ readySegmentCursor = 1
     /\ deferredSegmentCursor = 1
+    /\ waitingSegmentCursor = 1
     /\ leaseSegmentCursor = 1
     /\ laneState = [appendSeq |-> 1, claimSeq |-> 1, readyCount |-> 0, leasedCount |-> 0]
 
@@ -114,6 +132,7 @@ EnqueueReady(j) ==
     /\ runLease[j] = 0
     /\ j \notin readyEntries
     /\ j \notin deferredEntries
+    /\ j \notin waitingEntries
     /\ j \notin terminalEntries
     /\ laneState.appendSeq <= MaxAppendSeq
     /\ readySegments[readySegmentCursor] = "open"
@@ -124,6 +143,7 @@ EnqueueReady(j) ==
                         !.appendSeq = laneState.appendSeq + 1,
                         !.readyCount = laneState.readyCount + 1]
     /\ UNCHANGED <<deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -131,15 +151,17 @@ EnqueueReady(j) ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 EnqueueDeferred(j) ==
@@ -147,11 +169,13 @@ EnqueueDeferred(j) ==
     /\ runLease[j] = 0
     /\ j \notin readyEntries
     /\ j \notin deferredEntries
+    /\ j \notin waitingEntries
     /\ j \notin terminalEntries
     /\ deferredSegments[deferredSegmentCursor] = "open"
     /\ deferredEntries' = deferredEntries \cup {j}
     /\ deferredSegmentOf' = [deferredSegmentOf EXCEPT ![j] = deferredSegmentCursor]
     /\ UNCHANGED <<readyEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -159,16 +183,18 @@ EnqueueDeferred(j) ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -185,21 +211,24 @@ PromoteDeferred(j) ==
     /\ laneState' = [laneState EXCEPT
                         !.appendSeq = laneState.appendSeq + 1,
                         !.readyCount = laneState.readyCount + 1]
-    /\ UNCHANGED <<terminalEntries,
+    /\ UNCHANGED <<waitingEntries,
+                   terminalEntries,
                    activeLeases,
                    leaseOwner,
                    runLease,
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 AdvanceClaimCursor ==
@@ -208,6 +237,7 @@ AdvanceClaimCursor ==
     /\ laneState' = [laneState EXCEPT !.claimSeq = laneState.claimSeq + 1]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -215,17 +245,19 @@ AdvanceClaimCursor ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 Claim(w, j) ==
@@ -245,19 +277,22 @@ Claim(w, j) ==
                         !.leasedCount = laneState.leasedCount + 1]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 MaterializeAttemptState(j) ==
@@ -267,73 +302,84 @@ MaterializeAttemptState(j) ==
     /\ heartbeatFresh' = heartbeatFresh \cup {j}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
                    runLease,
                    taskLease,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
 Heartbeat(j) ==
     /\ j \in attemptState
+    /\ j \in activeLeases
     /\ heartbeatFresh' = heartbeatFresh \cup {j}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
                    runLease,
                    taskLease,
                    attemptState,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
 LoseHeartbeat(j) ==
     /\ j \in attemptState
+    /\ j \in activeLeases
     /\ j \in heartbeatFresh
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
                    runLease,
                    taskLease,
                    attemptState,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -342,6 +388,7 @@ ProgressFlush(j) ==
     /\ progressTouched' = progressTouched \cup {j}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -349,68 +396,119 @@ ProgressFlush(j) ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
-RegisterWait(j) ==
+ParkToWaiting(w, j) ==
+    /\ w \in Workers
+    /\ j \in activeLeases
     /\ j \in attemptState
-    /\ waitingExternal' = waitingExternal \cup {j}
-    /\ UNCHANGED <<readyEntries,
-                   deferredEntries,
+    /\ leaseOwner[j] = w
+    /\ taskLease[w][j] = runLease[j]
+    /\ waitingSegments[waitingSegmentCursor] = "open"
+    /\ activeLeases' = activeLeases \ {j}
+    /\ waitingEntries' = waitingEntries \cup {j}
+    /\ readyEntries' = readyEntries \ {j}
+    /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
+    /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
+    /\ heartbeatFresh' = heartbeatFresh \ {j}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
+    /\ waitingSegmentOf' = [waitingSegmentOf EXCEPT ![j] = waitingSegmentCursor]
+    /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
+    /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
+    /\ UNCHANGED <<deferredEntries,
                    terminalEntries,
-                   activeLeases,
-                   leaseOwner,
                    runLease,
-                   taskLease,
                    attemptState,
-                   heartbeatFresh,
                    progressTouched,
-                   laneSeq,
-                   readySegmentOf,
                    deferredSegmentOf,
-                   leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
-                   leaseSegmentCursor,
-                   laneState>>
+                   waitingSegmentCursor,
+                   leaseSegmentCursor>>
 
-ResolveWait(j) ==
-    /\ j \in waitingExternal
-    /\ waitingExternal' = waitingExternal \ {j}
-    /\ UNCHANGED <<readyEntries,
-                   deferredEntries,
+ResumeWaitingToReady(j) ==
+    /\ j \in waitingEntries
+    /\ j \in attemptState
+    /\ laneState.appendSeq <= MaxAppendSeq
+    /\ readySegments[readySegmentCursor] = "open"
+    /\ waitingEntries' = waitingEntries \ {j}
+    /\ readyEntries' = readyEntries \cup {j}
+    /\ attemptState' = attemptState \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ waitingSegmentOf' = [waitingSegmentOf EXCEPT ![j] = NoWaitingSegment]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
+    /\ laneState' = [laneState EXCEPT
+                        !.appendSeq = laneState.appendSeq + 1,
+                        !.readyCount = laneState.readyCount + 1]
+    /\ UNCHANGED <<deferredEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
                    runLease,
                    taskLease,
-                   attemptState,
                    heartbeatFresh,
-                   progressTouched,
-                   laneSeq,
-                   readySegmentOf,
                    deferredSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
-                   leaseSegmentCursor,
-                   laneState>>
+                   waitingSegmentCursor,
+                   leaseSegmentCursor>>
+
+TimeoutWaitingToReady(j) ==
+    /\ j \in waitingEntries
+    /\ j \in attemptState
+    /\ laneState.appendSeq <= MaxAppendSeq
+    /\ readySegments[readySegmentCursor] = "open"
+    /\ waitingEntries' = waitingEntries \ {j}
+    /\ readyEntries' = readyEntries \cup {j}
+    /\ attemptState' = attemptState \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ waitingSegmentOf' = [waitingSegmentOf EXCEPT ![j] = NoWaitingSegment]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
+    /\ laneState' = [laneState EXCEPT
+                        !.appendSeq = laneState.appendSeq + 1,
+                        !.readyCount = laneState.readyCount + 1]
+    /\ UNCHANGED <<deferredEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   heartbeatFresh,
+                   deferredSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   waitingSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor>>
 
 FastComplete(w, j) ==
     /\ w \in Workers
@@ -426,19 +524,22 @@ FastComplete(w, j) ==
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    runLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 StatefulComplete(w, j) ==
@@ -453,21 +554,24 @@ StatefulComplete(w, j) ==
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
-    /\ waitingExternal' = waitingExternal \ {j}
     /\ progressTouched' = progressTouched \ {j}
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    runLease,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 RetryToDeferred(w, j) ==
@@ -483,20 +587,23 @@ RetryToDeferred(w, j) ==
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
-    /\ waitingExternal' = waitingExternal \ {j}
     /\ progressTouched' = progressTouched \ {j}
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ deferredSegmentOf' = [deferredSegmentOf EXCEPT ![j] = deferredSegmentCursor]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
-    /\ UNCHANGED <<terminalEntries,
+    /\ UNCHANGED <<waitingEntries,
+                   terminalEntries,
                    runLease,
+                   waitingSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
 
 RescueToReady(j) ==
@@ -509,7 +616,6 @@ RescueToReady(j) ==
     /\ readyEntries' = readyEntries \cup {j}
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ attemptState' = attemptState \ {j}
-    /\ waitingExternal' = waitingExternal \ {j}
     /\ progressTouched' = progressTouched \ {j}
     /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
@@ -519,17 +625,49 @@ RescueToReady(j) ==
                         !.readyCount = laneState.readyCount + 1,
                         !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    runLease,
                    taskLease,
                    heartbeatFresh,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor>>
+
+CancelWaitingToTerminal(j) ==
+    /\ j \in waitingEntries
+    /\ terminalEntries' = terminalEntries \cup {j}
+    /\ waitingEntries' = waitingEntries \ {j}
+    /\ attemptState' = attemptState \ {j}
+    /\ heartbeatFresh' = heartbeatFresh \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ waitingSegmentOf' = [waitingSegmentOf EXCEPT ![j] = NoWaitingSegment]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   waitingSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState>>
 
 StaleCompleteRejected(w, j) ==
     /\ w \in Workers
@@ -539,23 +677,26 @@ StaleCompleteRejected(w, j) ==
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
                    runLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -569,6 +710,7 @@ RotateReadySegments ==
     /\ readySegmentCursor' = next
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -576,15 +718,17 @@ RotateReadySegments ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -598,6 +742,7 @@ RotateDeferredSegments ==
     /\ deferredSegmentCursor' = next
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -605,15 +750,49 @@ RotateDeferredSegments ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState>>
+
+RotateWaitingSegments ==
+    LET next == NextWaitingSegment(waitingSegmentCursor) IN
+    /\ waitingSegments[waitingSegmentCursor] = "open"
+    /\ waitingSegments[next] = "pruned"
+    /\ waitingSegments' = [waitingSegments EXCEPT
+                             ![waitingSegmentCursor] = "sealed",
+                             ![next] = "open"]
+    /\ waitingSegmentCursor' = next
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -627,6 +806,7 @@ RotateLeaseSegments ==
     /\ leaseSegmentCursor' = next
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -634,27 +814,30 @@ RotateLeaseSegments ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    laneState>>
 
 PruneReadySegment(seg) ==
     /\ seg \in ReadySegments
     /\ readySegments[seg] = "sealed"
-    /\ \A j \in Jobs : readySegmentOf[j] = seg => j \in terminalEntries
+    /\ \A j \in Jobs : readySegmentOf[j] = seg => j \notin CurrentReady /\ j \notin activeLeases
     /\ readyEntries' = readyEntries \ JobsInReadySegment(seg)
     /\ laneSeq' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoLaneSeq ELSE laneSeq[j]]
     /\ readySegmentOf' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoReadySegment ELSE readySegmentOf[j]]
     /\ readySegments' = [readySegments EXCEPT ![seg] = "pruned"]
     /\ UNCHANGED <<deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -662,14 +845,16 @@ PruneReadySegment(seg) ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    deferredSegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -681,6 +866,7 @@ PruneDeferredSegment(seg) ==
     /\ deferredSegments' = [deferredSegments EXCEPT ![seg] = "pruned"]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -688,15 +874,47 @@ PruneDeferredSegment(seg) ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
+                   waitingSegmentOf,
                    leaseSegmentOf,
                    readySegments,
+                   waitingSegments,
                    leaseSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
+                   leaseSegmentCursor,
+                   laneState>>
+
+PruneWaitingSegment(seg) ==
+    /\ seg \in WaitingSegments
+    /\ waitingSegments[seg] = "sealed"
+    /\ \A j \in Jobs : waitingSegmentOf[j] = seg => j \notin waitingEntries
+    /\ waitingSegmentOf' = [j \in Jobs |-> IF waitingSegmentOf[j] = seg THEN NoWaitingSegment ELSE waitingSegmentOf[j]]
+    /\ waitingSegments' = [waitingSegments EXCEPT ![seg] = "pruned"]
+    /\ UNCHANGED <<readyEntries,
+                   deferredEntries,
+                   waitingEntries,
+                   terminalEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   taskLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   laneSeq,
+                   readySegmentOf,
+                   deferredSegmentOf,
+                   leaseSegmentOf,
+                   readySegments,
+                   deferredSegments,
+                   leaseSegments,
+                   readySegmentCursor,
+                   deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
@@ -708,6 +926,7 @@ PruneLeaseSegment(seg) ==
     /\ leaseSegments' = [leaseSegments EXCEPT ![seg] = "pruned"]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
+                   waitingEntries,
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
@@ -715,20 +934,21 @@ PruneLeaseSegment(seg) ==
                    taskLease,
                    attemptState,
                    heartbeatFresh,
-                   waitingExternal,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
+                   waitingSegmentOf,
                    readySegments,
                    deferredSegments,
+                   waitingSegments,
                    readySegmentCursor,
                    deferredSegmentCursor,
+                   waitingSegmentCursor,
                    leaseSegmentCursor,
                    laneState>>
 
-Stutter ==
-    /\ UNCHANGED vars
+Stutter == /\ UNCHANGED vars
 
 Next ==
     \/ \E j \in Jobs : EnqueueReady(j)
@@ -740,26 +960,39 @@ Next ==
     \/ \E j \in Jobs : Heartbeat(j)
     \/ \E j \in Jobs : LoseHeartbeat(j)
     \/ \E j \in Jobs : ProgressFlush(j)
-    \/ \E j \in Jobs : RegisterWait(j)
-    \/ \E j \in Jobs : ResolveWait(j)
+    \/ \E w \in Workers, j \in Jobs : ParkToWaiting(w, j)
+    \/ \E j \in Jobs : ResumeWaitingToReady(j)
+    \/ \E j \in Jobs : TimeoutWaitingToReady(j)
     \/ \E w \in Workers, j \in Jobs : FastComplete(w, j)
     \/ \E w \in Workers, j \in Jobs : StatefulComplete(w, j)
     \/ \E w \in Workers, j \in Jobs : RetryToDeferred(w, j)
     \/ \E j \in Jobs : RescueToReady(j)
+    \/ \E j \in Jobs : CancelWaitingToTerminal(j)
     \/ \E w \in Workers, j \in Jobs : StaleCompleteRejected(w, j)
     \/ RotateReadySegments
     \/ RotateDeferredSegments
+    \/ RotateWaitingSegments
     \/ RotateLeaseSegments
     \/ \E seg \in ReadySegments : PruneReadySegment(seg)
     \/ \E seg \in DeferredSegments : PruneDeferredSegment(seg)
+    \/ \E seg \in WaitingSegments : PruneWaitingSegment(seg)
     \/ \E seg \in LeaseSegments : PruneLeaseSegment(seg)
     \/ Stutter
 
 Spec == Init /\ [][Next]_vars
 
 TypeOK ==
+    /\ Jobs # {}
+    /\ Workers # {}
+    /\ ReadySegmentCount >= 1
+    /\ DeferredSegmentCount >= 1
+    /\ WaitingSegmentCount >= 1
+    /\ LeaseSegmentCount >= 1
+    /\ MaxRunLease >= 1
+    /\ MaxAppendSeq >= Cardinality(Jobs)
     /\ readyEntries \subseteq Jobs
     /\ deferredEntries \subseteq Jobs
+    /\ waitingEntries \subseteq Jobs
     /\ terminalEntries \subseteq Jobs
     /\ activeLeases \subseteq Jobs
     /\ leaseOwner \in [Jobs -> Workers \cup {NoWorker}]
@@ -767,17 +1000,19 @@ TypeOK ==
     /\ taskLease \in [Workers -> [Jobs -> 0..MaxRunLease]]
     /\ attemptState \subseteq Jobs
     /\ heartbeatFresh \subseteq Jobs
-    /\ waitingExternal \subseteq Jobs
     /\ progressTouched \subseteq Jobs
     /\ laneSeq \in [Jobs -> 0..MaxAppendSeq]
     /\ readySegmentOf \in [Jobs -> ReadySegments \cup {NoReadySegment}]
     /\ deferredSegmentOf \in [Jobs -> DeferredSegments \cup {NoDeferredSegment}]
+    /\ waitingSegmentOf \in [Jobs -> WaitingSegments \cup {NoWaitingSegment}]
     /\ leaseSegmentOf \in [Jobs -> LeaseSegments \cup {NoLeaseSegment}]
     /\ readySegments \in [ReadySegments -> SegmentStates]
     /\ deferredSegments \in [DeferredSegments -> SegmentStates]
+    /\ waitingSegments \in [WaitingSegments -> SegmentStates]
     /\ leaseSegments \in [LeaseSegments -> SegmentStates]
     /\ readySegmentCursor \in ReadySegments
     /\ deferredSegmentCursor \in DeferredSegments
+    /\ waitingSegmentCursor \in WaitingSegments
     /\ leaseSegmentCursor \in LeaseSegments
     /\ laneState.appendSeq \in 1..(MaxAppendSeq + 1)
     /\ laneState.claimSeq \in 1..(MaxAppendSeq + 1)
@@ -786,35 +1021,39 @@ TypeOK ==
 
 OneOpenReadySegment == Cardinality({s \in ReadySegments : readySegments[s] = "open"}) = 1
 OneOpenDeferredSegment == Cardinality({s \in DeferredSegments : deferredSegments[s] = "open"}) = 1
+OneOpenWaitingSegment == Cardinality({s \in WaitingSegments : waitingSegments[s] = "open"}) = 1
 OneOpenLeaseSegment == Cardinality({s \in LeaseSegments : leaseSegments[s] = "open"}) = 1
 
 ReadyCursorIsOpen == readySegments[readySegmentCursor] = "open"
 DeferredCursorIsOpen == deferredSegments[deferredSegmentCursor] = "open"
+WaitingCursorIsOpen == waitingSegments[waitingSegmentCursor] = "open"
 LeaseCursorIsOpen == leaseSegments[leaseSegmentCursor] = "open"
 
-ReadyAndDeferredDisjoint == readyEntries \cap deferredEntries = {}
 DeferredHasNoLiveRuntime ==
     /\ deferredEntries \cap activeLeases = {}
     /\ deferredEntries \cap attemptState = {}
-    /\ deferredEntries \cap terminalEntries = {}
+    /\ deferredEntries \cap waitingEntries = {}
+
+WaitingHasNoLiveLease == waitingEntries \cap activeLeases = {}
+WaitingRequiresAttemptState == waitingEntries \subseteq attemptState
 
 ActiveLeasesSubsetReadyEntries == activeLeases \subseteq readyEntries
-AttemptStateRequiresLease == attemptState \subseteq activeLeases
+AttemptStateRequiresLeaseOrWaiting == attemptState \subseteq (activeLeases \cup waitingEntries)
 FreshHeartbeatRequiresAttemptState == heartbeatFresh \subseteq attemptState
-WaitingRequiresAttemptState == waitingExternal \subseteq attemptState
 ProgressRequiresAttemptState == progressTouched \subseteq attemptState
 
 TerminalHasNoLiveRuntime ==
-    \A j \in Jobs : j \in terminalEntries => j \notin activeLeases /\ j \notin attemptState
+    \A j \in Jobs : j \in terminalEntries => j \notin activeLeases /\ j \notin attemptState /\ j \notin waitingEntries
 
 ReadyEntriesHaveLaneSeq ==
-    \A j \in Jobs : j \in readyEntries => laneSeq[j] # NoLaneSeq
+    \A j \in CurrentReady : laneSeq[j] # NoLaneSeq
 
-NonReadyEntriesClearLaneSeq ==
-    \A j \in Jobs : j \notin readyEntries => laneSeq[j] = NoLaneSeq
+DeferredEntriesClearLaneSeq == \A j \in deferredEntries : laneSeq[j] = NoLaneSeq
+
+WaitingEntriesClearLaneSeq == \A j \in waitingEntries : laneSeq[j] = NoLaneSeq
 
 ReadyLaneSeqUnique ==
-    \A j1, j2 \in readyEntries : j1 # j2 => laneSeq[j1] # laneSeq[j2]
+    \A j1, j2 \in CurrentReady : j1 # j2 => laneSeq[j1] # laneSeq[j2]
 
 ClaimCursorBounded == laneState.claimSeq <= laneState.appendSeq
 
@@ -826,6 +1065,9 @@ PrunedReadySegmentsAreEmpty ==
 
 PrunedDeferredSegmentsAreEmpty ==
     \A j \in Jobs : deferredSegmentOf[j] # NoDeferredSegment => deferredSegments[deferredSegmentOf[j]] # "pruned"
+
+PrunedWaitingSegmentsAreEmpty ==
+    \A j \in Jobs : waitingSegmentOf[j] # NoWaitingSegment => waitingSegments[waitingSegmentOf[j]] # "pruned"
 
 PrunedLeaseSegmentsAreEmpty ==
     \A j \in Jobs : leaseSegmentOf[j] # NoLeaseSegment => leaseSegments[leaseSegmentOf[j]] # "pruned"
