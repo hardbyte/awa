@@ -2,6 +2,7 @@ use crate::completion::CompletionBatcherHandle;
 use crate::context::{CallbackGuard, JobContext};
 use crate::events::{BoxedUntypedEventHandler, UntypedJobEvent};
 use crate::runtime::{InFlightMap, InFlightState, ProgressState};
+use crate::storage::RuntimeStorage;
 use awa_model::{AwaError, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
@@ -151,6 +152,7 @@ pub struct JobExecutor {
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
     metrics: crate::metrics::AwaMetrics,
     completion_batcher: CompletionBatcherHandle,
+    storage: RuntimeStorage,
 }
 
 impl JobExecutor {
@@ -164,6 +166,7 @@ impl JobExecutor {
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         metrics: crate::metrics::AwaMetrics,
         completion_batcher: CompletionBatcherHandle,
+        storage: RuntimeStorage,
     ) -> Self {
         Self {
             pool,
@@ -174,6 +177,7 @@ impl JobExecutor {
             state,
             metrics,
             completion_batcher,
+            storage,
         }
     }
 
@@ -193,6 +197,7 @@ impl JobExecutor {
         let state = self.state.clone();
         let metrics = self.metrics.clone();
         let completion_batcher = self.completion_batcher.clone();
+        let storage = self.storage.clone();
         let job_id = job.id;
         let job_run_lease = job.run_lease;
         let job_kind = job.kind.clone();
@@ -264,6 +269,7 @@ impl JobExecutor {
                 progress_snapshot,
                 duration,
                 has_lifecycle_handlers,
+                &storage,
             )
             .await;
 
@@ -356,7 +362,49 @@ async fn complete_job(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
+    storage: &RuntimeStorage,
 ) -> Result<CompletionOutcome, AwaError> {
+    if matches!(storage, RuntimeStorage::VacuumAware(_)) {
+        return match result {
+            Ok(JobResult::Completed) => {
+                tracing::Span::current().record("otel.status_code", "OK");
+                info!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    attempt = job.attempt,
+                    "Job completed"
+                );
+                let updated = completion_batcher.complete(job.id, job.run_lease).await?;
+                if !updated {
+                    warn!(
+                        job_id = job.id,
+                        "Vacuum-aware job already finalized, completion ignored"
+                    );
+                    return Ok(CompletionOutcome::IgnoredStale);
+                }
+
+                let event = if needs_event {
+                    let mut completed_job = job.clone();
+                    completed_job.state = awa_model::JobState::Completed;
+                    completed_job.finalized_at = Some(chrono::Utc::now());
+                    completed_job.progress = None;
+                    Some(UntypedJobEvent::Completed {
+                        job: completed_job,
+                        duration,
+                    })
+                } else {
+                    None
+                };
+
+                Ok(CompletionOutcome::Applied { event })
+            }
+            _ => Err(AwaError::Validation(
+                "vacuum-aware runtime integration currently supports only JobResult::Completed"
+                    .to_string(),
+            )),
+        };
+    }
+
     match result {
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");

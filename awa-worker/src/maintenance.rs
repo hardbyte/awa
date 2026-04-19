@@ -1,6 +1,7 @@
 use crate::runtime::InFlightMap;
+use crate::storage::RuntimeStorage;
 use awa_model::cron::{atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow};
-use awa_model::{JobRow, PeriodicJob};
+use awa_model::{JobRow, PeriodicJob, PruneOutcome, RotateOutcome};
 use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
@@ -44,6 +45,7 @@ pub struct MaintenanceService {
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
+    storage: RuntimeStorage,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
@@ -82,6 +84,7 @@ impl MaintenanceService {
         cancel: CancellationToken,
         periodic_jobs: Arc<Vec<PeriodicJob>>,
         in_flight: InFlightMap,
+        storage: RuntimeStorage,
     ) -> Self {
         Self {
             pool,
@@ -91,6 +94,7 @@ impl MaintenanceService {
             alive,
             periodic_jobs,
             in_flight,
+            storage,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             callback_rescue_interval: Duration::from_secs(30),
@@ -276,6 +280,14 @@ impl MaintenanceService {
             let mut metadata_reconciliation_timer =
                 tokio::time::interval(self.metadata_reconciliation_interval);
             let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
+            let mut vacuum_queue_timer = self
+                .storage
+                .vacuum_aware()
+                .map(|runtime| tokio::time::interval(runtime.queue_rotate_interval));
+            let mut vacuum_lease_timer = self
+                .storage
+                .vacuum_aware()
+                .map(|runtime| tokio::time::interval(runtime.lease_rotate_interval));
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -290,6 +302,12 @@ impl MaintenanceService {
             dirty_key_timer.tick().await;
             metadata_reconciliation_timer.tick().await;
             priority_aging_timer.tick().await;
+            if let Some(timer) = &mut vacuum_queue_timer {
+                timer.tick().await;
+            }
+            if let Some(timer) = &mut vacuum_lease_timer {
+                timer.tick().await;
+            }
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
@@ -338,6 +356,24 @@ impl MaintenanceService {
                     }
                     _ = priority_aging_timer.tick() => {
                         self.age_waiting_priorities().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut vacuum_queue_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if vacuum_queue_timer.is_some() => {
+                        self.rotate_vacuum_aware_queue().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut vacuum_lease_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if vacuum_lease_timer.is_some() => {
+                        self.rotate_vacuum_aware_leases().await;
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -813,6 +849,76 @@ impl MaintenanceService {
 
         tx.commit().await?;
         Ok((promoted, queues))
+    }
+
+    async fn rotate_vacuum_aware_queue(&self) {
+        let Some(runtime) = self.storage.vacuum_aware() else {
+            return;
+        };
+
+        match runtime.store.rotate(&self.pool).await {
+            Ok(RotateOutcome::Rotated { slot, generation }) => {
+                debug!(slot, generation, "Rotated vacuum-aware queue segment");
+            }
+            Ok(RotateOutcome::SkippedBusy { slot }) => {
+                debug!(slot, "Skipped busy vacuum-aware queue segment");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rotate vacuum-aware queue segments");
+                return;
+            }
+        }
+
+        match runtime.store.prune_oldest(&self.pool).await {
+            Ok(PruneOutcome::Noop) => {}
+            Ok(PruneOutcome::Pruned { slot }) => {
+                debug!(slot, "Pruned vacuum-aware queue segment");
+            }
+            Ok(PruneOutcome::Blocked { slot }) => {
+                debug!(slot, "Vacuum-aware queue segment prune blocked");
+            }
+            Ok(PruneOutcome::SkippedActive { slot }) => {
+                debug!(slot, "Vacuum-aware queue segment still active");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to prune vacuum-aware queue segments");
+            }
+        }
+    }
+
+    async fn rotate_vacuum_aware_leases(&self) {
+        let Some(runtime) = self.storage.vacuum_aware() else {
+            return;
+        };
+
+        match runtime.store.rotate_leases(&self.pool).await {
+            Ok(RotateOutcome::Rotated { slot, generation }) => {
+                debug!(slot, generation, "Rotated vacuum-aware lease segment");
+            }
+            Ok(RotateOutcome::SkippedBusy { slot }) => {
+                debug!(slot, "Skipped busy vacuum-aware lease segment");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rotate vacuum-aware lease segments");
+                return;
+            }
+        }
+
+        match runtime.store.prune_oldest_leases(&self.pool).await {
+            Ok(PruneOutcome::Noop) => {}
+            Ok(PruneOutcome::Pruned { slot }) => {
+                debug!(slot, "Pruned vacuum-aware lease segment");
+            }
+            Ok(PruneOutcome::Blocked { slot }) => {
+                debug!(slot, "Vacuum-aware lease segment prune blocked");
+            }
+            Ok(PruneOutcome::SkippedActive { slot }) => {
+                debug!(slot, "Vacuum-aware lease segment still active");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to prune vacuum-aware lease segments");
+            }
+        }
     }
 
     /// Clean up completed/failed/cancelled jobs past retention.

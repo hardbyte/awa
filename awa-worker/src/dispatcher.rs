@@ -1,12 +1,13 @@
 use crate::executor::JobExecutor;
 use crate::runtime::InFlightMap;
+use crate::storage::RuntimeStorage;
 use awa_model::JobRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -231,6 +232,8 @@ pub struct Dispatcher {
     cancel: CancellationToken,
     job_set: Arc<Mutex<JoinSet<()>>>,
     rate_limiter: Option<TokenBucket>,
+    storage: RuntimeStorage,
+    capacity_wake: Arc<Notify>,
 }
 
 impl Dispatcher {
@@ -245,6 +248,7 @@ impl Dispatcher {
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
+        storage: RuntimeStorage,
     ) -> Self {
         let concurrency = ConcurrencyMode::HardReserved {
             semaphore: Arc::new(Semaphore::new(config.max_workers as usize)),
@@ -262,6 +266,8 @@ impl Dispatcher {
             cancel,
             job_set,
             rate_limiter,
+            storage,
+            capacity_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -278,6 +284,7 @@ impl Dispatcher {
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
         concurrency: ConcurrencyMode,
+        storage: RuntimeStorage,
     ) -> Self {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
         Self {
@@ -292,6 +299,8 @@ impl Dispatcher {
             cancel,
             job_set,
             rate_limiter,
+            storage,
+            capacity_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -346,6 +355,9 @@ impl Dispatcher {
                         }
                     }
                 }
+                _ = self.capacity_wake.notified() => {
+                    self.drain_ready().await;
+                }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
                     self.drain_ready().await;
                 }
@@ -362,6 +374,9 @@ impl Dispatcher {
                 _ = self.cancel.cancelled() => {
                     debug!(queue = %self.queue, "Dispatcher (poll-only) shutting down");
                     break;
+                }
+                _ = self.capacity_wake.notified() => {
+                    self.drain_ready().await;
                 }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
                     self.drain_ready().await;
@@ -457,46 +472,68 @@ impl Dispatcher {
         let deadline_secs = self.config.deadline_duration.as_secs_f64();
         let claim_start = Instant::now();
 
-        let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
-            r#"
-            WITH claimed AS (
-                SELECT id
-                FROM awa.jobs_hot
-                WHERE state = 'available'
-                  AND queue = $1
-                  AND run_at <= now()
-                  AND NOT EXISTS (
-                      SELECT 1 FROM awa.queue_meta
-                      WHERE queue = $1 AND paused = TRUE
-                  )
-                ORDER BY priority ASC, run_at ASC, id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
+        let jobs: Vec<JobRow> = match &self.storage {
+            RuntimeStorage::Canonical => match sqlx::query_as::<_, JobRow>(
+                r#"
+                WITH claimed AS (
+                    SELECT id
+                    FROM awa.jobs_hot
+                    WHERE state = 'available'
+                      AND queue = $1
+                      AND run_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM awa.queue_meta
+                          WHERE queue = $1 AND paused = TRUE
+                      )
+                    ORDER BY priority ASC, run_at ASC, id ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE awa.jobs_hot
+                SET state = 'running',
+                    attempt = attempt + 1,
+                    run_lease = run_lease + 1,
+                    attempted_at = now(),
+                    heartbeat_at = now(),
+                    deadline_at = now() + make_interval(secs => $3)
+                FROM claimed
+                WHERE awa.jobs_hot.id = claimed.id
+                  AND awa.jobs_hot.state = 'available'
+                RETURNING awa.jobs_hot.*
+                "#,
             )
-            UPDATE awa.jobs_hot
-            SET state = 'running',
-                attempt = attempt + 1,
-                run_lease = run_lease + 1,
-                attempted_at = now(),
-                heartbeat_at = now(),
-                deadline_at = now() + make_interval(secs => $3)
-            FROM claimed
-            WHERE awa.jobs_hot.id = claimed.id
-              AND awa.jobs_hot.state = 'available'
-            RETURNING awa.jobs_hot.*
-            "#,
-        )
-        .bind(&self.queue)
-        .bind(batch_size as i32)
-        .bind(deadline_secs)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(jobs) => jobs,
-            Err(err) => {
-                warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
-                return false;
-            }
+            .bind(&self.queue)
+            .bind(batch_size as i32)
+            .bind(deadline_secs)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(jobs) => jobs,
+                Err(err) => {
+                    warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
+                    return false;
+                }
+            },
+            RuntimeStorage::VacuumAware(runtime) => match runtime
+                .store
+                .claim_job_batch(
+                    &self.pool,
+                    &self.queue,
+                    batch_size as i64,
+                    self.config.deadline_duration,
+                )
+                .await
+            {
+                Ok(jobs) => jobs,
+                Err(err) => {
+                    warn!(
+                        queue = %self.queue,
+                        error = %err,
+                        "Failed to claim vacuum-aware jobs"
+                    );
+                    return false;
+                }
+            },
         };
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
@@ -544,9 +581,11 @@ impl Dispatcher {
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let task = self.executor.execute_task(job, cancel_flag);
+            let capacity_wake = self.capacity_wake.clone();
             set.spawn(async move {
                 task.await;
                 drop(permit);
+                capacity_wake.notify_one();
             });
         }
 

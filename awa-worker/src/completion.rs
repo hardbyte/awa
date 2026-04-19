@@ -1,4 +1,5 @@
 use crate::runtime::RunLease;
+use crate::storage::RuntimeStorage;
 use awa_model::AwaError;
 use sqlx::PgPool;
 use std::collections::HashSet;
@@ -73,6 +74,7 @@ impl CompletionBatcher {
         pool: PgPool,
         cancel: CancellationToken,
         metrics: crate::metrics::AwaMetrics,
+        storage: RuntimeStorage,
     ) -> (Self, CompletionBatcherHandle) {
         let mut shards = Vec::with_capacity(COMPLETION_SHARDS);
         let mut workers = Vec::with_capacity(COMPLETION_SHARDS);
@@ -86,6 +88,7 @@ impl CompletionBatcher {
                 rx,
                 cancel: cancel.clone(),
                 metrics: metrics.clone(),
+                storage: storage.clone(),
             });
         }
 
@@ -106,6 +109,7 @@ struct CompletionWorker {
     rx: mpsc::Receiver<CompletionRequest>,
     cancel: CancellationToken,
     metrics: crate::metrics::AwaMetrics,
+    storage: RuntimeStorage,
 }
 
 impl CompletionWorker {
@@ -170,11 +174,27 @@ impl CompletionWorker {
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
 
-        let updated = sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
-            .bind(&job_ids)
-            .bind(&run_leases)
-            .fetch_all(&self.pool)
-            .await;
+        let updated = match &self.storage {
+            RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
+                .bind(&job_ids)
+                .bind(&run_leases)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(AwaError::Database),
+            RuntimeStorage::VacuumAware(runtime) => {
+                runtime
+                    .store
+                    .complete_job_batch_by_id(
+                        &self.pool,
+                        &job_ids
+                            .iter()
+                            .copied()
+                            .zip(run_leases.iter().copied())
+                            .collect::<Vec<_>>(),
+                    )
+                    .await
+            }
+        };
 
         match updated {
             Ok(updated_rows) => {
@@ -464,6 +484,7 @@ mod tests {
             pool.clone(),
             CancellationToken::new(),
             crate::metrics::AwaMetrics::from_global(),
+            crate::storage::RuntimeStorage::Canonical,
         );
         let workers = batcher.spawn();
 
@@ -625,6 +646,7 @@ mod tests {
             pool.clone(),
             CancellationToken::new(),
             crate::metrics::AwaMetrics::from_global(),
+            crate::storage::RuntimeStorage::Canonical,
         );
         let workers = batcher.spawn();
 

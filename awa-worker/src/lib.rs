@@ -10,6 +10,7 @@ pub mod http_worker;
 pub mod maintenance;
 pub mod metrics;
 mod runtime;
+mod storage;
 
 // Re-exports
 pub use awa_model::{CallbackConfig, PeriodicJob, PeriodicJobBuilder};

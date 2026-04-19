@@ -1,6 +1,10 @@
 use crate::error::AwaError;
+use crate::insert::prepare_row_raw;
+use crate::{InsertParams, JobRow, JobState};
+use chrono::{DateTime, Utc};
 use sqlx::PgPool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 const DEFAULT_SCHEMA: &str = "awa_exp";
 const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
@@ -98,6 +102,92 @@ fn lease_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.leases_{slot}")
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ClaimedJobLeaseRow {
+    job_id: i64,
+    kind: String,
+    queue: String,
+    args: serde_json::Value,
+    priority: i16,
+    max_attempts: i16,
+    created_at: DateTime<Utc>,
+    run_lease: i64,
+    claimed_at: DateTime<Utc>,
+}
+
+impl ClaimedJobLeaseRow {
+    fn into_job_row(self, deadline_duration: Duration) -> Result<JobRow, AwaError> {
+        let deadline_delta = chrono::Duration::from_std(deadline_duration).map_err(|err| {
+            AwaError::Validation(format!(
+                "invalid vacuum-aware deadline duration for claimed job {}: {err}",
+                self.job_id
+            ))
+        })?;
+
+        Ok(JobRow {
+            id: self.job_id,
+            kind: self.kind,
+            queue: self.queue,
+            args: self.args,
+            state: JobState::Running,
+            priority: self.priority,
+            attempt: 1,
+            run_lease: self.run_lease,
+            max_attempts: self.max_attempts,
+            run_at: self.created_at,
+            heartbeat_at: Some(self.claimed_at),
+            deadline_at: Some(self.claimed_at + deadline_delta),
+            attempted_at: Some(self.claimed_at),
+            finalized_at: None,
+            created_at: self.created_at,
+            errors: None,
+            metadata: serde_json::json!({}),
+            tags: Vec::new(),
+            unique_key: None,
+            unique_states: None,
+            callback_id: None,
+            callback_timeout_at: None,
+            callback_filter: None,
+            callback_on_complete: None,
+            callback_on_fail: None,
+            callback_transform: None,
+            progress: None,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeReadyRow {
+    kind: String,
+    queue: String,
+    args: serde_json::Value,
+    priority: i16,
+    max_attempts: i16,
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeReadyInsert {
+    job_id: i64,
+    kind: String,
+    queue: String,
+    args: serde_json::Value,
+    priority: i16,
+    max_attempts: i16,
+    lane_seq: i64,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct CompletedLeaseRow {
+    job_id: i64,
+    queue: String,
+    priority: i16,
+    lane_seq: i64,
+    ready_slot: i32,
+    ready_generation: i64,
+    run_lease: i64,
+}
+
 /// Experimental vacuum-aware storage prototype.
 ///
 /// Design goals:
@@ -109,6 +199,7 @@ fn lease_child_name(schema: &str, slot: usize) -> String {
 ///
 /// This is intentionally experimental and currently powers benchmark/tests
 /// rather than the main Awa runtime.
+#[derive(Debug)]
 pub struct VacuumAwareStore {
     config: VacuumAwareConfig,
 }
@@ -168,6 +259,15 @@ impl VacuumAwareStore {
             .execute(pool)
             .await
             .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            CREATE SEQUENCE IF NOT EXISTS {schema}.job_id_seq
+            "#
+        ))
+        .execute(pool)
+        .await
+        .map_err(map_sqlx_error)?;
 
         sqlx::query(&format!(
             r#"
@@ -270,9 +370,15 @@ impl VacuumAwareStore {
                 lease_generation  BIGINT NOT NULL,
                 ready_slot        INT NOT NULL,
                 ready_generation  BIGINT NOT NULL,
+                job_id            BIGINT NOT NULL,
+                kind              TEXT NOT NULL,
                 queue             TEXT NOT NULL,
+                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 priority          SMALLINT NOT NULL,
+                max_attempts      SMALLINT NOT NULL DEFAULT 25,
                 lane_seq          BIGINT NOT NULL,
+                created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                run_lease         BIGINT NOT NULL DEFAULT 1,
                 claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 PRIMARY KEY (lease_slot, queue, priority, lane_seq)
             ) PARTITION BY LIST (lease_slot)
@@ -287,8 +393,12 @@ impl VacuumAwareStore {
             CREATE TABLE IF NOT EXISTS {schema}.ready_entries (
                 ready_slot        INT NOT NULL,
                 ready_generation  BIGINT NOT NULL,
+                job_id            BIGINT NOT NULL,
+                kind              TEXT NOT NULL,
                 queue             TEXT NOT NULL,
+                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 priority          SMALLINT NOT NULL,
+                max_attempts      SMALLINT NOT NULL DEFAULT 25,
                 lane_seq          BIGINT NOT NULL,
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 payload           JSONB NOT NULL DEFAULT '{{}}'::jsonb,
@@ -305,6 +415,7 @@ impl VacuumAwareStore {
             CREATE TABLE IF NOT EXISTS {schema}.done_entries (
                 ready_slot        INT NOT NULL,
                 ready_generation  BIGINT NOT NULL,
+                job_id            BIGINT NOT NULL,
                 queue             TEXT NOT NULL,
                 priority          SMALLINT NOT NULL,
                 lane_seq          BIGINT NOT NULL,
@@ -342,6 +453,17 @@ impl VacuumAwareStore {
 
             sqlx::query(&format!(
                 r#"
+                CREATE INDEX IF NOT EXISTS idx_{schema}_ready_{slot}_job
+                    ON {} (job_id)
+                "#,
+                ready_child_name(schema, slot)
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
                 CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.done_entries
                 FOR VALUES IN ({slot})
                 "#,
@@ -355,6 +477,17 @@ impl VacuumAwareStore {
                 r#"
                 CREATE INDEX IF NOT EXISTS idx_{schema}_done_{slot}_lane
                     ON {} (queue, priority, lane_seq)
+                "#,
+                done_child_name(schema, slot)
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_{schema}_done_{slot}_job
+                    ON {} (job_id)
                 "#,
                 done_child_name(schema, slot)
             ))
@@ -396,9 +529,50 @@ impl VacuumAwareStore {
             .execute(pool)
             .await
             .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_job
+                    ON {} (job_id, run_lease)
+                "#,
+                lease_child_name(schema, slot)
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
         }
 
-        self.reset(pool).await
+        for slot in 0..self.queue_slot_count() {
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {schema}.queue_ring_slots (slot, generation)
+                VALUES ($1, $2)
+                ON CONFLICT (slot) DO NOTHING
+                "#
+            ))
+            .bind(slot as i32)
+            .bind(if slot == 0 { 0_i64 } else { -1_i64 })
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        for slot in 0..self.lease_slot_count() {
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {schema}.lease_ring_slots (slot, generation)
+                VALUES ($1, $2)
+                ON CONFLICT (slot) DO NOTHING
+                "#
+            ))
+            .bind(slot as i32)
+            .bind(if slot == 0 { 0_i64 } else { -1_i64 })
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        Ok(())
     }
 
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {
@@ -415,6 +589,13 @@ impl VacuumAwareStore {
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            "ALTER SEQUENCE {schema}.job_id_seq RESTART WITH 1"
         ))
         .execute(tx.as_mut())
         .await
@@ -501,6 +682,188 @@ impl VacuumAwareStore {
         Ok(())
     }
 
+    async fn current_queue_ring<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    ) -> Result<(i32, i64), AwaError> {
+        let schema = self.schema();
+        sqlx::query_as(&format!(
+            r#"
+            SELECT current_slot, generation
+            FROM {schema}.queue_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
+    async fn next_job_ids<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        count: usize,
+    ) -> Result<Vec<i64>, AwaError> {
+        if count == 0 {
+            return Ok(Vec::new());
+        }
+
+        let query = format!(
+            "SELECT nextval('{}')::bigint FROM generate_series(1, $1::int)",
+            self.job_id_sequence()
+        );
+
+        sqlx::query_scalar(&query)
+            .bind(count as i32)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)
+    }
+
+    async fn enqueue_runtime_rows(
+        &self,
+        pool: &PgPool,
+        rows: Vec<RuntimeReadyRow>,
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let ring = self.current_queue_ring(&mut tx).await?;
+
+        let mut grouped: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
+        for row in rows {
+            grouped
+                .entry((row.queue.clone(), row.priority))
+                .or_default()
+                .push(row);
+        }
+
+        let total_rows: usize = grouped.values().map(Vec::len).sum();
+        let job_ids = self.next_job_ids(&mut tx, total_rows).await?;
+        let now = Utc::now();
+
+        let mut ready_rows = Vec::with_capacity(total_rows);
+        let mut job_id_iter = job_ids.into_iter();
+
+        for ((queue, priority), lane_rows) in grouped {
+            self.ensure_lane(&mut tx, &queue, priority).await?;
+
+            let count = lane_rows.len() as i64;
+            let start_seq: i64 = sqlx::query_scalar(&format!(
+                r#"
+                UPDATE {schema}.queue_lanes
+                SET next_seq = next_seq + $3,
+                    available_count = available_count + $3
+                WHERE queue = $1 AND priority = $2
+                RETURNING next_seq - $3
+                "#
+            ))
+            .bind(&queue)
+            .bind(priority)
+            .bind(count)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            for (offset, row) in lane_rows.into_iter().enumerate() {
+                ready_rows.push(RuntimeReadyInsert {
+                    job_id: job_id_iter.next().ok_or_else(|| {
+                        AwaError::Validation("vacuum-aware job id allocation underflow".to_string())
+                    })?,
+                    kind: row.kind,
+                    queue: row.queue,
+                    args: row.args,
+                    priority: row.priority,
+                    max_attempts: row.max_attempts,
+                    lane_seq: start_seq + offset as i64,
+                    created_at: now,
+                });
+            }
+        }
+
+        let job_ids: Vec<i64> = ready_rows.iter().map(|row| row.job_id).collect();
+        let kinds: Vec<String> = ready_rows.iter().map(|row| row.kind.clone()).collect();
+        let queues: Vec<String> = ready_rows.iter().map(|row| row.queue.clone()).collect();
+        let args: Vec<serde_json::Value> = ready_rows.iter().map(|row| row.args.clone()).collect();
+        let priorities: Vec<i16> = ready_rows.iter().map(|row| row.priority).collect();
+        let max_attempts: Vec<i16> = ready_rows.iter().map(|row| row.max_attempts).collect();
+        let lane_seqs: Vec<i64> = ready_rows.iter().map(|row| row.lane_seq).collect();
+        let created_at: Vec<DateTime<Utc>> = ready_rows.iter().map(|row| row.created_at).collect();
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.ready_entries (
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                priority,
+                max_attempts,
+                lane_seq,
+                created_at,
+                payload
+            )
+            SELECT
+                $1,
+                $2,
+                rows.job_id,
+                rows.kind,
+                rows.queue,
+                rows.args,
+                rows.priority,
+                rows.max_attempts,
+                rows.lane_seq,
+                rows.created_at,
+                jsonb_build_object(
+                    'job_id', rows.job_id,
+                    'lane_seq', rows.lane_seq,
+                    'kind', rows.kind
+                )
+            FROM unnest(
+                $3::bigint[],
+                $4::text[],
+                $5::text[],
+                $6::jsonb[],
+                $7::smallint[],
+                $8::smallint[],
+                $9::bigint[],
+                $10::timestamptz[]
+            ) AS rows(job_id, kind, queue, args, priority, max_attempts, lane_seq, created_at)
+            "#
+        ))
+        .bind(ring.0)
+        .bind(ring.1)
+        .bind(&job_ids)
+        .bind(&kinds)
+        .bind(&queues)
+        .bind(&args)
+        .bind(&priorities)
+        .bind(&max_attempts)
+        .bind(&lane_seqs)
+        .bind(&created_at)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let queues_to_notify: BTreeSet<String> =
+            ready_rows.iter().map(|row| row.queue.clone()).collect();
+        for queue in queues_to_notify {
+            sqlx::query("SELECT pg_notify($1, '')")
+                .bind(format!("awa:{queue}"))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(total_rows)
+    }
+
     pub async fn enqueue_batch(
         &self,
         pool: &PgPool,
@@ -512,69 +875,60 @@ impl VacuumAwareStore {
             return Ok(0);
         }
 
-        let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_lane(&mut tx, queue, priority).await?;
-
-        let ring: (i32, i64) = sqlx::query_as(&format!(
-            r#"
-            SELECT current_slot, generation
-            FROM {schema}.queue_ring_state
-            WHERE singleton = TRUE
-            "#
-        ))
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let start_seq: i64 = sqlx::query_scalar(&format!(
-            r#"
-            UPDATE {schema}.queue_lanes
-            SET next_seq = next_seq + $3,
-                available_count = available_count + $3
-            WHERE queue = $1 AND priority = $2
-            RETURNING next_seq - $3
-            "#
-        ))
-        .bind(queue)
-        .bind(priority)
-        .bind(count)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        sqlx::query(&format!(
-            r#"
-            INSERT INTO {schema}.ready_entries (
-                ready_slot,
-                ready_generation,
-                queue,
+        let rows = (0..count)
+            .map(|seq| RuntimeReadyRow {
+                kind: "bench_job".to_string(),
+                queue: queue.to_string(),
+                args: serde_json::json!({ "seq": seq }),
                 priority,
-                lane_seq,
-                payload
-            )
-            SELECT
-                $1,
-                $2,
-                $3,
-                $4,
-                $5 + g - 1,
-                jsonb_build_object('lane_seq', $5 + g - 1)
-            FROM generate_series(1, $6::bigint) AS g
-            "#
-        ))
-        .bind(ring.0)
-        .bind(ring.1)
-        .bind(queue)
-        .bind(priority)
-        .bind(start_seq)
-        .bind(count)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+                max_attempts: 25,
+            })
+            .collect();
 
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(count)
+        self.enqueue_runtime_rows(pool, rows)
+            .await
+            .map(|count| count as i64)
+    }
+
+    pub async fn enqueue_params_batch(
+        &self,
+        pool: &PgPool,
+        jobs: &[InsertParams],
+    ) -> Result<usize, AwaError> {
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+
+        let mut rows = Vec::with_capacity(jobs.len());
+        for job in jobs {
+            let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
+            if prepared.state != JobState::Available {
+                return Err(AwaError::Validation(
+                    "vacuum-aware runtime currently only supports immediate available jobs"
+                        .to_string(),
+                ));
+            }
+            if prepared.unique_key.is_some() || prepared.unique_states.is_some() {
+                return Err(AwaError::Validation(
+                    "vacuum-aware runtime currently does not support uniqueness".to_string(),
+                ));
+            }
+            if prepared.metadata != serde_json::json!({}) || !prepared.tags.is_empty() {
+                return Err(AwaError::Validation(
+                    "vacuum-aware runtime currently requires empty metadata and tags".to_string(),
+                ));
+            }
+
+            rows.push(RuntimeReadyRow {
+                kind: prepared.kind,
+                queue: prepared.queue,
+                args: prepared.args,
+                priority: prepared.priority,
+                max_attempts: prepared.max_attempts,
+            });
+        }
+
+        self.enqueue_runtime_rows(pool, rows).await
     }
 
     pub async fn claim_batch(
@@ -656,9 +1010,15 @@ impl VacuumAwareStore {
                 lease_generation,
                 ready_slot,
                 ready_generation,
+                job_id,
+                kind,
                 queue,
+                args,
                 priority,
+                max_attempts,
                 lane_seq,
+                created_at,
+                run_lease,
                 claimed_at
             )
             SELECT
@@ -666,9 +1026,15 @@ impl VacuumAwareStore {
                 $2,
                 ready.ready_slot,
                 ready.ready_generation,
+                ready.job_id,
+                ready.kind,
                 ready.queue,
+                ready.args,
                 ready.priority,
+                ready.max_attempts,
                 ready.lane_seq,
+                ready.created_at,
+                1,
                 clock_timestamp()
             FROM {schema}.ready_entries AS ready
             WHERE ready.queue = $3
@@ -707,6 +1073,155 @@ impl VacuumAwareStore {
         Ok(claimed)
     }
 
+    pub async fn claim_job_batch(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        max_batch: i64,
+        deadline_duration: Duration,
+    ) -> Result<Vec<JobRow>, AwaError> {
+        if max_batch <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let lane: Option<(i16, i64, i64, i64)> = sqlx::query_as(&format!(
+            r#"
+            SELECT priority, claim_seq, next_seq, available_count
+            FROM {schema}.queue_lanes
+            WHERE queue = $1
+              AND claim_seq < next_seq
+              AND available_count > 0
+            ORDER BY priority ASC
+            LIMIT 1
+            FOR UPDATE
+            "#
+        ))
+        .bind(queue)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let Some((priority, claim_seq, next_seq, available_count)) = lane else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Vec::new());
+        };
+
+        let reserve = (next_seq - claim_seq).min(available_count).min(max_batch);
+        if reserve <= 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Vec::new());
+        }
+
+        let start_seq = claim_seq;
+        let end_seq = claim_seq + reserve;
+
+        sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.queue_lanes
+            SET claim_seq = $3,
+                available_count = available_count - $4,
+                running_count = running_count + $4
+            WHERE queue = $1 AND priority = $2
+            "#
+        ))
+        .bind(queue)
+        .bind(priority)
+        .bind(end_seq)
+        .bind(reserve)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let lease_ring: (i32, i64) = sqlx::query_as(&format!(
+            r#"
+            SELECT current_slot, generation
+            FROM {schema}.lease_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let claimed: Vec<ClaimedJobLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            INSERT INTO {schema}.leases (
+                lease_slot,
+                lease_generation,
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                priority,
+                max_attempts,
+                lane_seq,
+                created_at,
+                run_lease,
+                claimed_at
+            )
+            SELECT
+                $1,
+                $2,
+                ready.ready_slot,
+                ready.ready_generation,
+                ready.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                ready.priority,
+                ready.max_attempts,
+                ready.lane_seq,
+                ready.created_at,
+                1,
+                clock_timestamp()
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.queue = $3
+              AND ready.priority = $4
+              AND ready.lane_seq >= $5
+              AND ready.lane_seq < $6
+            ORDER BY ready.lane_seq ASC
+            RETURNING
+                job_id,
+                kind,
+                queue,
+                args,
+                priority,
+                max_attempts,
+                created_at,
+                run_lease,
+                claimed_at
+            "#
+        ))
+        .bind(lease_ring.0)
+        .bind(lease_ring.1)
+        .bind(queue)
+        .bind(priority)
+        .bind(start_seq)
+        .bind(end_seq)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if claimed.len() as i64 != reserve {
+            return Err(AwaError::Validation(format!(
+                "vacuum-aware runtime claim reservation mismatch: reserved {reserve}, claimed {}",
+                claimed.len()
+            )));
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+
+        claimed
+            .into_iter()
+            .map(|row| row.into_job_row(deadline_duration))
+            .collect()
+    }
+
     pub async fn complete_batch(
         &self,
         pool: &PgPool,
@@ -724,7 +1239,7 @@ impl VacuumAwareStore {
         let priorities: Vec<i16> = claimed.iter().map(|entry| entry.priority).collect();
         let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.lane_seq).collect();
 
-        let moved: Vec<ClaimedEntry> = sqlx::query_as(&format!(
+        let moved: Vec<CompletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH completed(lease_slot, queue, priority, lane_seq) AS (
                 SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[])
@@ -736,13 +1251,13 @@ impl VacuumAwareStore {
               AND leases.priority = completed.priority
               AND leases.lane_seq = completed.lane_seq
             RETURNING
+                leases.job_id,
                 leases.queue,
                 leases.priority,
                 leases.lane_seq,
                 leases.ready_slot,
                 leases.ready_generation,
-                leases.lease_slot,
-                leases.lease_generation
+                leases.run_lease
             "#
         ))
         .bind(&lease_slots)
@@ -758,6 +1273,7 @@ impl VacuumAwareStore {
             return Ok(0);
         }
 
+        let moved_job_ids: Vec<i64> = moved.iter().map(|entry| entry.job_id).collect();
         let moved_ready_slots: Vec<i32> = moved.iter().map(|entry| entry.ready_slot).collect();
         let moved_ready_generations: Vec<i64> =
             moved.iter().map(|entry| entry.ready_generation).collect();
@@ -770,23 +1286,26 @@ impl VacuumAwareStore {
             INSERT INTO {schema}.done_entries (
                 ready_slot,
                 ready_generation,
+                job_id,
                 queue,
                 priority,
                 lane_seq,
                 completed_at
             )
-            SELECT ready_slot, ready_generation, queue, priority, lane_seq, clock_timestamp()
+            SELECT ready_slot, ready_generation, job_id, queue, priority, lane_seq, clock_timestamp()
             FROM unnest(
                 $1::int[],
                 $2::bigint[],
-                $3::text[],
-                $4::smallint[],
-                $5::bigint[]
-            ) AS moved(ready_slot, ready_generation, queue, priority, lane_seq)
+                $3::bigint[],
+                $4::text[],
+                $5::smallint[],
+                $6::bigint[]
+            ) AS moved(ready_slot, ready_generation, job_id, queue, priority, lane_seq)
             "#
         ))
         .bind(&moved_ready_slots)
         .bind(&moved_ready_generations)
+        .bind(&moved_job_ids)
         .bind(&moved_queues)
         .bind(&moved_priorities)
         .bind(&moved_lane_seqs)
@@ -820,6 +1339,125 @@ impl VacuumAwareStore {
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(moved.len())
+    }
+
+    pub async fn complete_job_batch_by_id(
+        &self,
+        pool: &PgPool,
+        completions: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if completions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let job_ids: Vec<i64> = completions.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = completions
+            .iter()
+            .map(|(_, run_lease)| *run_lease)
+            .collect();
+
+        let moved: Vec<CompletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH completed(job_id, run_lease) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            )
+            DELETE FROM {schema}.leases AS leases
+            USING completed
+            WHERE leases.job_id = completed.job_id
+              AND leases.run_lease = completed.run_lease
+            RETURNING
+                leases.job_id,
+                leases.queue,
+                leases.priority,
+                leases.lane_seq,
+                leases.ready_slot,
+                leases.ready_generation,
+                leases.run_lease
+            "#
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if moved.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Vec::new());
+        }
+
+        let moved_job_ids: Vec<i64> = moved.iter().map(|entry| entry.job_id).collect();
+        let moved_ready_slots: Vec<i32> = moved.iter().map(|entry| entry.ready_slot).collect();
+        let moved_ready_generations: Vec<i64> =
+            moved.iter().map(|entry| entry.ready_generation).collect();
+        let moved_queues: Vec<String> = moved.iter().map(|entry| entry.queue.clone()).collect();
+        let moved_priorities: Vec<i16> = moved.iter().map(|entry| entry.priority).collect();
+        let moved_lane_seqs: Vec<i64> = moved.iter().map(|entry| entry.lane_seq).collect();
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.done_entries (
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                priority,
+                lane_seq,
+                completed_at
+            )
+            SELECT ready_slot, ready_generation, job_id, queue, priority, lane_seq, clock_timestamp()
+            FROM unnest(
+                $1::int[],
+                $2::bigint[],
+                $3::bigint[],
+                $4::text[],
+                $5::smallint[],
+                $6::bigint[]
+            ) AS moved(ready_slot, ready_generation, job_id, queue, priority, lane_seq)
+            "#
+        ))
+        .bind(&moved_ready_slots)
+        .bind(&moved_ready_generations)
+        .bind(&moved_job_ids)
+        .bind(&moved_queues)
+        .bind(&moved_priorities)
+        .bind(&moved_lane_seqs)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut per_lane: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        for entry in &moved {
+            *per_lane
+                .entry((entry.queue.clone(), entry.priority))
+                .or_insert(0) += 1;
+        }
+
+        for ((queue, priority), count) in per_lane {
+            sqlx::query(&format!(
+                r#"
+                UPDATE {schema}.queue_lanes
+                SET running_count = GREATEST(0, running_count - $3),
+                    completed_count = completed_count + $3
+                WHERE queue = $1 AND priority = $2
+                "#
+            ))
+            .bind(&queue)
+            .bind(priority)
+            .bind(count)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(moved
+            .into_iter()
+            .map(|entry| (entry.job_id, entry.run_lease))
+            .collect())
     }
 
     pub async fn queue_counts(&self, pool: &PgPool, queue: &str) -> Result<QueueCounts, AwaError> {
@@ -1161,6 +1799,10 @@ impl VacuumAwareStore {
             .await
             .map_err(map_sqlx_error)?;
         Ok(())
+    }
+
+    fn job_id_sequence(&self) -> String {
+        format!("{}.job_id_seq", self.schema())
     }
 
     fn leases_table(&self) -> String {
