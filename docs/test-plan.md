@@ -238,6 +238,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA4 | AwaCron | No duplicate fire under leader failover |
 | TLA5 | AwaBatcher | At-most-once completion, DirectCompleteFail recovery |
 | TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
+| TLA7 | AwaSegmentedStorage | Segmented storage safety, optional attempt-state, prune safety |
 
 ## Running Tests
 
@@ -298,6 +299,7 @@ cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test 
 
 # TLA+ correctness models (requires Docker)
 ./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
