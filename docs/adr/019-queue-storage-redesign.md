@@ -171,24 +171,33 @@ The runtime validation on this branch covers:
 - callback-timeout rescue to DLQ
 - DLQ get/list/retry flow plus job-dump DLQ metadata
 
+Hot-path details now validated in code:
+
+- claim uses a schema-local SQL function to lock `lane_state`, find the oldest
+  runnable segment-local entry, and insert `active_leases` in one server-side
+  step
+- short successful completion carries the immutable claim-time job snapshot
+  through the completion batcher so the terminal append path does not have to
+  reload `ready_entries`
+
 ## Validation
 
 Latest local full-runtime benchmark runs on this branch:
 
 | Runtime path | Throughput | Pickup p50 | Pickup p95 | Pickup p99 | Exact final dead |
 |---|---:|---:|---:|---:|---:|
-| canonical runtime | `8087/s` | `5.595 ms` | `102.805 ms` | `218.468 ms` | not sampled |
-| queue storage runtime | `6886/s` | `3.983 ms` | `43.553 ms` | `64.706 ms` | `86` |
+| canonical runtime | `9607/s` | `5.825 ms` | `64.574 ms` | `223.503 ms` | not sampled |
+| queue storage runtime | `9508/s` | `4.021 ms` | `39.679 ms` | `49.768 ms` | `196` |
 
 Latest exact dead-tuple breakdown for the queue storage run
 (using current prototype table names):
 
-- `queue_lanes = 63`
+- `queue_lanes = 57`
 - `ready = 0`
 - `done = 0`
-- `leases = 23`
+- `leases = 139`
 - `attempt_state = 0`
-- `total = 86`
+- `total = 196`
 
 These numbers matter more than the earlier storage-only spike because they come
 through the real dispatcher, executor, callback, maintenance, and DLQ paths.
@@ -200,7 +209,7 @@ through the real dispatcher, executor, callback, maintenance, and DLQ paths.
 - Dead tuples are bounded by the lease rotation window and the tiny `lane_state`
   cache,
   not by total queue history.
-- Queue throughput remains competitive with the canonical runtime while
+- Queue throughput is now near-parity with the canonical runtime while still
   substantially reducing claim-tail latency under the benchmark workload.
 - DLQ becomes a first-class storage concern instead of an afterthought bolted
   onto the hot table model.

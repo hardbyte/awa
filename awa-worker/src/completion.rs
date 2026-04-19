@@ -1,6 +1,6 @@
 use crate::runtime::RunLease;
 use crate::storage::RuntimeStorage;
-use awa_model::{AwaError, ClaimedEntry};
+use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob};
 use sqlx::PgPool;
 use std::collections::HashSet;
 use std::env;
@@ -57,6 +57,7 @@ struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
     claim: Option<ClaimedEntry>,
+    runtime_job: Option<ClaimedRuntimeJob>,
     response: oneshot::Sender<Result<bool, AwaError>>,
 }
 
@@ -67,16 +68,20 @@ pub(crate) struct CompletionBatcherHandle {
 
 impl CompletionBatcherHandle {
     pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
-        self.complete_inner(job_id, run_lease, None).await
+        self.complete_inner(job_id, run_lease, None, None).await
     }
 
-    pub async fn complete_claimed(
+    pub async fn complete_runtime_job(
         &self,
-        job_id: i64,
-        run_lease: RunLease,
-        claim: ClaimedEntry,
+        runtime_job: ClaimedRuntimeJob,
     ) -> Result<bool, AwaError> {
-        self.complete_inner(job_id, run_lease, Some(claim)).await
+        self.complete_inner(
+            runtime_job.job.id,
+            runtime_job.job.run_lease,
+            Some(runtime_job.claim.clone()),
+            Some(runtime_job),
+        )
+        .await
     }
 
     async fn complete_inner(
@@ -84,6 +89,7 @@ impl CompletionBatcherHandle {
         job_id: i64,
         run_lease: RunLease,
         claim: Option<ClaimedEntry>,
+        runtime_job: Option<ClaimedRuntimeJob>,
     ) -> Result<bool, AwaError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
@@ -92,6 +98,7 @@ impl CompletionBatcherHandle {
                 job_id,
                 run_lease,
                 claim,
+                runtime_job,
                 response: response_tx,
             })
             .await
@@ -224,7 +231,16 @@ impl CompletionWorker {
                 .await
                 .map_err(AwaError::Database),
             RuntimeStorage::QueueStorage(runtime) => {
-                if let Some(claimed) = batch
+                if let Some(runtime_jobs) = batch
+                    .iter()
+                    .map(|request| request.runtime_job.clone())
+                    .collect::<Option<Vec<ClaimedRuntimeJob>>>()
+                {
+                    runtime
+                        .store
+                        .complete_runtime_batch(&self.pool, &runtime_jobs)
+                        .await
+                } else if let Some(claimed) = batch
                     .iter()
                     .map(|request| request.claim.clone())
                     .collect::<Option<Vec<ClaimedEntry>>>()
