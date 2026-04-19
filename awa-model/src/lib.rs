@@ -7,6 +7,7 @@ pub mod job;
 pub mod kind;
 pub mod migrations;
 pub mod unique;
+pub mod vacuum_aware;
 
 // Re-exports for ergonomics
 pub use admin::{
@@ -26,6 +27,9 @@ pub use cron::{CronJobRow, PeriodicJob, PeriodicJobBuilder};
 pub use error::AwaError;
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
+pub use vacuum_aware::{
+    ClaimedEntry, PruneOutcome, QueueCounts, RotateOutcome, VacuumAwareConfig, VacuumAwareStore,
+};
 
 // Re-export the derive macro
 pub use awa_macros::JobArgs;
