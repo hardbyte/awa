@@ -1,8 +1,13 @@
 # Awa
 
-**Postgres-native background job queue for Rust and Python.**
+**Postgres-native job queue for Rust and Python.**
 
-Awa (Māori: river) provides durable, transactional job enqueueing with typed handlers in both Rust and Python. All queue state lives in Postgres — no Redis, no RabbitMQ. The Rust runtime handles polling, heartbeating, crash recovery, and dispatch. Python workers run on that same runtime via PyO3, getting Rust-grade reliability with Python-native ergonomics.
+Awa (Māori: river) provides durable, transactional job enqueueing with typed
+handlers in both Rust and Python. It is a full job queue, not just a message
+stream: priorities, unique jobs, retries, cron, callbacks, DLQ, and a built-in
+UI all run on Postgres with no Redis or RabbitMQ. Under the queue-storage
+engine, append-only queue entries and fast-rotating execution leases keep
+vacuum pressure off the main dispatch path.
 
 ![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
@@ -13,6 +18,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
 - **Rust and Python workers** — same queues, identical semantics, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
+- **Runtime-owned maintenance** — dispatch, rescue, segment rotation, and pruning run in the worker fleet; no `pg_cron` ticker required.
 - **Web UI** — dashboard, job inspector, queue management, cron controls.
 - **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
 - **Periodic/cron jobs** — leader-elected scheduler with timezone support and atomic enqueue.
@@ -20,30 +26,57 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Webhook callbacks** — park jobs for external completion with optional CEL expression filtering.
 - **Sequential callbacks** — `wait_for_callback()` suspends a handler mid-execution; `resume_external()` wakes it with a payload. Enables multi-step orchestration within a single handler.
 - **HTTP Worker** — feature-gated `Worker` that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-blake3 callback auth.
-- **LISTEN/NOTIFY wakeup** — sub-10ms pickup latency.
+- **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
 - **Production alerting metrics** — queue depth, lag, and wait-duration histogram via OpenTelemetry.
 - **OpenTelemetry** — 20+ built-in metrics (counters, histograms, gauges) for Prometheus/Grafana.
-- **Hot/cold storage** — runnable work in a hot table, deferred work in a cold table.
+- **Segmented queue storage** — append-only queue entries with rotating lease segments keep hot-path churn bounded.
 - **Rate limiting** — per-queue token bucket.
 - **Weighted concurrency** — global worker pool with per-queue guarantees.
 - **Operator descriptors** — code-declared queue and job-kind names/descriptions with stale/drift visibility in the UI.
 
 ![AWA Web UI — Queue detail (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-queue-detail-dark.png)
 
-Local benchmarks show ~5.6k jobs/sec sustained throughput (Rust workers, with OTel metrics enabled), ~3.1k jobs/sec (Python workers), and sub-10ms p50 pickup latency. Enqueue throughput reaches ~30k/s single-producer, ~100k/s multi-producer. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) for methodology and caveats.
+Current local queue-storage validation recorded `9537/s`
+runtime throughput, `3.671 ms` pickup p50, `22.013 ms` pickup p95, and `417`
+exact final dead tuples on the recorded 5k runtime run. Enqueue throughput
+still reaches ~30k/s single-producer and ~100k/s multi-producer in the local
+engineering benchmarks. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md)
+for methodology, caveats, and the remaining head-to-head work.
 
 Core concurrency invariants (no duplicate processing after rescue, stale completions rejected, shutdown drain ordering) are checked with [TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md) covering single and multi-instance deployments.
+
+## Where Awa Fits
+
+Awa sits between Postgres event/message queues and language-specific job
+frameworks.
+
+- If you want a shared event log with independent consumer cursors and a queue
+  that is explicitly optimized around zero-bloat rotation, PgQue is a strong
+  fit.
+- If you want a Go-native or Oban-native job framework, River and Oban Pro are
+  strong reference points.
+- If you want a Postgres job queue with priorities, unique jobs, cron,
+  callbacks, DLQ, Rust and Python workers, and a storage engine designed around
+  bounded hot-path bloat, that is where Awa fits.
+
+See [docs/positioning.md](https://github.com/hardbyte/awa/blob/main/docs/positioning.md) for the category map and messaging guidance.
 
 ## Getting Started
 
 The quickest way to reason about Awa is:
 
-- your app inserts a durable job row inside Postgres, often in the same transaction as business data
-- workers claim runnable rows, heartbeat while they are executing, and safely rescue stale work after crashes
-- the job row itself is the source of truth for state, progress, callbacks, and retry history
-- operators inspect and control that state through the CLI or the built-in UI
+- your app inserts durable queue entries inside Postgres, often in the same
+  transaction as business data
+- workers claim runnable entries through short-lived execution leases and safely
+  rescue stale work after crashes
+- long-running attempts touch `attempt_state` only when they need mutable
+  execution data like progress or callback state
+- operators inspect and control live, terminal, and DLQ state through the CLI
+  or the built-in UI
 
-If you keep that model in mind, the APIs make more sense: enqueue work, run workers, then inspect the resulting row rather than guessing what happened in memory.
+If you keep that model in mind, the APIs make more sense: enqueue work, run
+workers, then inspect the resulting job state rather than guessing what
+happened in memory.
 
 ```bash
 # 1. Install
