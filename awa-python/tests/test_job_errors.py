@@ -35,10 +35,7 @@ async def client():
     try:
         yield c
     finally:
-        try:
-            await c.shutdown()
-        except Exception:
-            pass
+        await c.shutdown()
         await c.close()
 
 
@@ -47,7 +44,10 @@ def sync_client():
     c = awa.Client(DATABASE_URL)
     c.migrate()
     c.install_queue_storage()
-    return c
+    try:
+        yield c
+    finally:
+        c.close()
 
 
 async def clean(client, queue):

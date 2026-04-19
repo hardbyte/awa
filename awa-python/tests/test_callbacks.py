@@ -25,10 +25,7 @@ async def client():
     try:
         yield c
     finally:
-        try:
-            await c.shutdown()
-        except Exception:
-            pass
+        await c.shutdown()
         await c.close()
 
 

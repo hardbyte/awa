@@ -707,7 +707,7 @@ async fn complete_job_canonical(
                             job_id = job.id,
                             "WaitForCallback returned without calling register_callback"
                         );
-                        sqlx::query(
+                        let result = sqlx::query(
                             r#"
                             UPDATE awa.jobs
                             SET state = 'failed',
@@ -726,6 +726,9 @@ async fn complete_job_canonical(
                         .bind(job.run_lease)
                         .execute(pool)
                         .await?;
+                        if result.rows_affected() == 0 {
+                            return Ok(CompletionOutcome::IgnoredStale);
+                        }
                         return Ok(CompletionOutcome::Applied {
                             event: None,
                             terminal: true,

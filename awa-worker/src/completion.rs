@@ -334,6 +334,11 @@ mod tests {
     }
 
     async fn clean_queue(pool: &PgPool, queue: &str) {
+        sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = $1")
+            .bind(queue)
+            .execute(pool)
+            .await
+            .expect("Failed to clean canonical queue jobs");
         sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
             .bind(queue)
             .execute(pool)

@@ -273,8 +273,8 @@ class Client:
         self,
         *,
         schema: str = "awa_exp",
-        queue_slot_count: int = 4,
-        lease_slot_count: int = 2,
+        queue_slot_count: int = 16,
+        lease_slot_count: int = 8,
         reset: bool = False,
     ) -> None: ...
     async def transaction(self) -> Transaction: ...
@@ -513,8 +513,8 @@ class Client:
         self,
         *,
         schema: str = "awa_exp",
-        queue_slot_count: int = 4,
-        lease_slot_count: int = 2,
+        queue_slot_count: int = 16,
+        lease_slot_count: int = 8,
         reset: bool = False,
     ) -> None: ...
     def transaction_sync(self) -> SyncTransaction: ...

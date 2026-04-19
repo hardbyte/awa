@@ -52,10 +52,7 @@ async def client():
     try:
         yield c
     finally:
-        try:
-            await c.shutdown()
-        except Exception:
-            pass
+        await c.shutdown()
         await c.close()
 
 
@@ -106,10 +103,15 @@ async def _setup_waiting_job(
     deadline = asyncio.get_event_loop().time() + _scaled(5)
     while not callback_ids and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.1)
-    await client.shutdown()
-
     assert len(callback_ids) == 1, f"handler should have registered a callback for {queue}"
-    return job, callback_ids[0]
+    waiting_job = await _wait_for_job_state(
+        client,
+        job.id,
+        (awa.JobState.WaitingExternal,),
+        _scaled(5),
+    )
+    await client.shutdown()
+    return waiting_job, callback_ids[0]
 
 
 # ── E5: Callback timeout rescue ──────────────────────────────────────

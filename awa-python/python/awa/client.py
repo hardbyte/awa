@@ -28,6 +28,10 @@ from awa._awa import (
 
 T = TypeVar("T")
 
+DEFAULT_QUEUE_STORAGE_SCHEMA = "awa_exp"
+DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT = 16
+DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT = 8
+
 
 class AsyncClient:
     """Async client for workers and async applications.
@@ -125,9 +129,9 @@ class AsyncClient:
     async def install_queue_storage(
         self,
         *,
-        schema: str = "awa_exp",
-        queue_slot_count: int = 4,
-        lease_slot_count: int = 2,
+        schema: str = DEFAULT_QUEUE_STORAGE_SCHEMA,
+        queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
+        lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
         reset: bool = False,
     ) -> None:
         """Install or select a queue-storage backend schema for this database."""
@@ -555,8 +559,8 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
         queue_storage_schema: str | None = None,
-        queue_storage_queue_slot_count: int = 16,
-        queue_storage_lease_slot_count: int = 8,
+        queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
+        queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 50,
     ) -> None:
@@ -681,9 +685,9 @@ class Client:
     def install_queue_storage(
         self,
         *,
-        schema: str = "awa_exp",
-        queue_slot_count: int = 4,
-        lease_slot_count: int = 2,
+        schema: str = DEFAULT_QUEUE_STORAGE_SCHEMA,
+        queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
+        lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
         reset: bool = False,
     ) -> None:
         """Install or select a queue-storage backend schema for this database."""

@@ -99,6 +99,8 @@ pub struct PyJob {
     cancelled: Option<Arc<AtomicBool>>,
     /// Database pool for callback registration (only set during dispatch).
     pool: Option<PgPool>,
+    /// Active queue-storage backend (only set during queue-storage dispatch).
+    queue_storage: Option<Arc<QueueStorage>>,
     /// Shared progress buffer for in-flight reporting (only set during dispatch).
     progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
     /// Progress JSON from the job row (for queried jobs).
@@ -128,6 +130,7 @@ impl Clone for PyJob {
             args_override: self.args_override.as_ref().map(|value| value.clone_ref(py)),
             cancelled: self.cancelled.clone(),
             pool: self.pool.clone(),
+            queue_storage: self.queue_storage.clone(),
             progress_buffer: self.progress_buffer.clone(),
             progress_json: self.progress_json.clone(),
             errors_json: self.errors_json.clone(),
@@ -270,6 +273,7 @@ impl PyJob {
         })?;
         let job_id = self.id;
         let run_lease = self.run_lease;
+        let queue_storage = self.queue_storage.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (snapshot, target_generation) = {
@@ -280,13 +284,17 @@ impl PyJob {
                 }
             };
 
-            if let Some(schema) = QueueStorage::active_schema(&pool)
+            if let Some(store) = queue_storage {
+                store
+                    .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                    .await
+                    .map_err(map_awa_error)?;
+            } else if let Some(schema) = QueueStorage::active_schema(&pool)
                 .await
                 .map_err(map_awa_error)?
             {
-                let store =
-                    QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
-                store
+                QueueStorage::from_existing_schema(schema)
+                    .map_err(map_awa_error)?
                     .flush_progress(&pool, job_id, run_lease, snapshot.clone())
                     .await
                     .map_err(map_awa_error)?;
@@ -333,6 +341,7 @@ impl PyJob {
         })?;
         let job_id = self.id;
         let run_lease = self.run_lease;
+        let queue_storage = self.queue_storage.clone();
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -344,13 +353,17 @@ impl PyJob {
                     }
                 };
 
-                if let Some(schema) = QueueStorage::active_schema(&pool)
+                if let Some(store) = queue_storage {
+                    store
+                        .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                        .await
+                        .map_err(map_awa_error)?;
+                } else if let Some(schema) = QueueStorage::active_schema(&pool)
                     .await
                     .map_err(map_awa_error)?
                 {
-                    let store =
-                        QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
-                    store
+                    QueueStorage::from_existing_schema(schema)
+                        .map_err(map_awa_error)?
                         .flush_progress(&pool, job_id, run_lease, snapshot.clone())
                         .await
                         .map_err(map_awa_error)?;
@@ -579,6 +592,7 @@ impl From<JobRow> for PyJob {
             args_override: None,
             cancelled: None,
             pool: None,
+            queue_storage: None,
             progress_buffer: None,
             progress_json,
             errors_json,
@@ -596,12 +610,14 @@ impl PyJob {
         args_override: Py<PyAny>,
         cancelled: Arc<AtomicBool>,
         pool: PgPool,
+        queue_storage: Option<Arc<QueueStorage>>,
         progress_buffer: Arc<std::sync::Mutex<ProgressState>>,
     ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
         job.cancelled = Some(cancelled);
         job.pool = Some(pool);
+        job.queue_storage = queue_storage;
         job.progress_buffer = Some(progress_buffer);
         job
     }

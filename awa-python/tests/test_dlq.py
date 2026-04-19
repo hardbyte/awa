@@ -379,6 +379,9 @@ def test_retry_from_dlq_surfaces_unique_conflict(sync_client):
 async def test_async_dlq_flow():
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.commit()
     await client.install_queue_storage(schema=SCHEMA, reset=True)
     try:
         job = await client.insert(DlqPyJob(value="async"), queue="pydlq_async")

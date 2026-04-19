@@ -36,10 +36,7 @@ async def client():
     try:
         yield c
     finally:
-        try:
-            await c.shutdown()
-        except Exception:
-            pass
+        await c.shutdown()
         await c.close()
 
 
@@ -216,7 +213,10 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
             "same fields must produce same descriptor_hash across runs"
         )
     finally:
-        await client2.shutdown()
+        try:
+            await client2.shutdown()
+        finally:
+            await client2.close()
 
     # Third declaration, changed field → different hash.
     client3 = awa.AsyncClient(DATABASE_URL)
@@ -237,8 +237,11 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
         third_hash = _fetch_queue_row(queue)["descriptor_hash"]
         assert third_hash != first_hash, "different fields must change the hash"
     finally:
-        await client3.shutdown()
-        _cleanup(queue, "descriptor_test_job")
+        try:
+            await client3.shutdown()
+        finally:
+            await client3.close()
+            _cleanup(queue, "descriptor_test_job")
 
 
 @pytest.mark.asyncio
@@ -324,5 +327,8 @@ async def test_last_seen_at_bumps_on_restart(client):
             "last_seen_at must advance on each client start"
         )
     finally:
-        await client2.shutdown()
-        _cleanup(queue, "descriptor_test_job")
+        try:
+            await client2.shutdown()
+        finally:
+            await client2.close()
+            _cleanup(queue, "descriptor_test_job")

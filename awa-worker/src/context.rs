@@ -1,6 +1,6 @@
 pub use crate::runtime::ProgressState;
 use crate::storage::RuntimeStorage;
-use awa_model::{AwaError, CallbackConfig, JobRow};
+use awa_model::{AwaError, CallbackConfig, JobRow, QueueStorage};
 use sqlx::PgPool;
 use std::any::Any;
 use std::collections::HashMap;
@@ -134,6 +134,11 @@ impl JobContext {
     /// Get a reference to the database pool.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Get the active queue-storage backend for this job, if any.
+    pub fn queue_storage_store(&self) -> Option<Arc<QueueStorage>> {
+        self.storage.queue_storage_store()
     }
 
     /// Register a callback for this job, writing the callback_id to the database
