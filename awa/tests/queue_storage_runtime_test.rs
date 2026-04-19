@@ -104,6 +104,30 @@ async fn recreate_store_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
         .expect("Failed to drop queue_storage schema");
 }
 
+async fn reset_shared_awa_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        TRUNCATE
+            awa.jobs_hot,
+            awa.scheduled_jobs,
+            awa.queue_meta,
+            awa.job_unique_claims,
+            awa.queue_state_counts,
+            awa.job_kind_catalog,
+            awa.job_queue_catalog,
+            awa.runtime_instances,
+            awa.queue_descriptors,
+            awa.job_kind_descriptors,
+            awa.cron_jobs,
+            awa.runtime_storage_backends
+        RESTART IDENTITY CASCADE
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to reset shared awa state for queue_storage tests");
+}
+
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     let store = QueueStorage::new(QueueStorageConfig {
         schema: schema.to_string(),
@@ -112,6 +136,7 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     })
     .expect("Failed to create queue_storage store");
     recreate_store_schema(pool, &store).await;
+    reset_shared_awa_state(pool).await;
     store.install(pool).await.expect("Failed to install store");
     store.reset(pool).await.expect("Failed to reset store");
     store
