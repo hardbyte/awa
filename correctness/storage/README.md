@@ -112,6 +112,48 @@ See [`MAPPING.md`](./MAPPING.md) for the action-by-action correspondence
 between TLA+ transitions and the Rust implementation, including the SQL
 statements that enforce each guard.
 
+## Lock-order companion spec
+
+[`AwaStorageLockOrder.tla`](./AwaStorageLockOrder.tla) models each
+storage-engine transaction (claim, rotate-leases, prune-leases,
+rotate-ready, prune-ready) as an ordered sequence of Postgres lock
+acquisitions, with a simplified shared/exclusive compatibility matrix
+that captures the cases relevant to deadlock analysis. Invariants:
+
+- `NoDeadlock`: the waits-for graph is acyclic
+- `LockCompatibility`: no two incompatible locks on the same resource
+- `HeldOnlyByRunningTxs`: committed transactions hold no locks
+- `NoGlobalStall`: there is always some running transaction that can
+  make progress (a stall-free-safety-check stand-in for liveness)
+
+Configs:
+
+- [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run
+  against the real Rust lock plans — **2,076 distinct states, clean**.
+  This is the positive artifact saying the current SQL lock ordering
+  is deadlock-free and the lock compatibility contract holds.
+- [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg):
+  sanity harness using a deliberately cycle-creating pair of plans —
+  **NoDeadlock tripped in 5 steps** (confirms the checker works).
+
+Run:
+
+```bash
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+```
+
+Coverage note: the plans model the lock steps that actually appear in
+the Rust SQL (`FOR UPDATE` / `FOR SHARE` / `LOCK TABLE ACCESS
+EXCLUSIVE` / the implicit AccessShare of SELECT on partition
+children). They do NOT model implicit table-level locks beyond what
+is named, or Postgres's lock-timeout / deadlock-detector abort choice.
+The spec treats a waits-for cycle as a safety violation, which is
+conservative — Postgres would abort one transaction and let the other
+proceed. For our purposes "this sequence of lock requests could
+produce a cycle" is the thing we want to catch, regardless of how
+the runtime resolves it.
+
 ## Race-exposure companion spec
 
 [`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla) refines the
@@ -136,17 +178,20 @@ Run either with `./correctness/run-tlc.sh`. The race-exposing config is
 expected to produce a counterexample; the safe config is expected to pass.
 
 What this proves: the race my code review flagged is real at the spec's
-abstraction level, and it is sufficient for the Rust claim path to
-re-check the lease segment state under the `queue_lanes` row lock before
-inserting the lease row. Either re-reading `lease_ring_state` under the
-lock or share-locking it across the insert would satisfy the safe
-refinement.
+abstraction level. Either re-reading `lease_ring_state` under a lock or
+share-locking it across the insert would satisfy the safe refinement.
 
-What this does not prove: whether the real Rust/SQL implementation
-actually has the race. That requires inspecting `claim_ready_runtime` at
-`awa-model/src/queue_storage.rs:1647` to confirm whether the cursor is
-re-read or share-locked. This model simply says: if the implementation
-does not do that, the race is observable.
+**Status in the Rust implementation: mitigated.** `claim_ready_runtime`
+(`awa-model/src/queue_storage.rs:1740-1746`) takes `FOR SHARE` on
+`lease_ring_state` across both the cursor read and the lease insert.
+`rotate_leases` (line 6194) and `prune_oldest_leases` (line 6398) take
+`FOR UPDATE` on the same row, which is incompatible with `FOR SHARE` —
+so they wait for in-flight claims to commit. `prune_oldest` for ready
+segments additionally takes `ACCESS EXCLUSIVE` on the ready partition
+and counts leases inside the prune transaction. The race spec thus
+functions as a regression harness: if any of those locks are weakened,
+the race re-appears. See [`MAPPING.md`](./MAPPING.md) for the full
+lock-interaction analysis.
 
 ## Known modelling gaps
 

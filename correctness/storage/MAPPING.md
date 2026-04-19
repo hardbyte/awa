@@ -78,57 +78,99 @@ prototype renames (e.g. `leases` → `active_leases`, `done_entries` →
 
 ## Known modelling gaps with implementation implications
 
-### Claim vs Rotate race — and prune check-then-act
+### Claim vs Rotate race — resolved by Postgres row locks
 
-Both were exposed in a single TLC trace from the companion spec
-[`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla). See
-`README.md` for the trace and the safe-refinement variant.
+The race-exposure spec
+[`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla) proves
+that a claim that snapshots the lease segment cursor without further
+synchronisation can land a lease in a segment that has since been
+rotated and pruned.
 
-The race, in terms of Rust code:
+**Status in the implementation: mitigated.** Inspection of
+`claim_ready_runtime` at `queue_storage.rs:1740-1746` shows:
 
-1. `claim_ready_runtime` at `queue_storage.rs:1647` locks the
-   `queue_lanes` row (for the job's queue+priority) via `FOR UPDATE`.
-2. It reads `lease_ring_state.current_slot` — **no lock** is taken on
-   `lease_ring_state` at this point (or it's not obvious from the
-   surrounding code that one is).
-3. It inserts into `{schema}.leases` tagged with the read slot value.
+```sql
+WITH lease_ring AS (
+    SELECT current_slot AS lease_slot, generation AS lease_generation
+    FROM {schema}.lease_ring_state
+    WHERE singleton = TRUE
+    FOR SHARE
+),
+...
+```
 
-Concurrently, the maintenance leader's `rotate_leases` path does not
-touch `queue_lanes`, so it is free to execute between (2) and (3). If
-both rotate and the subsequent `prune_oldest_leases` fire in that
-window, the insert at (3) lands in a segment that has since transitioned
-through sealed → pruned.
+Claim takes `FOR SHARE` on `lease_ring_state` across the cursor read
+AND the lease insert (both in the same CTE, same statement, same tx).
+The conflicting paths:
 
-The safe fix at the spec level is to re-read `leaseSegments[leaseSeg] =
-"open"` at commit time (see `CommitClaimChecked`). At the Rust level,
-any of the following would be equivalent:
+- `rotate_leases` at `queue_storage.rs:6194` uses `FOR UPDATE` on
+  `lease_ring_state` — incompatible with `FOR SHARE`, so rotate waits
+  until all in-flight claims commit
+- `prune_oldest_leases` at `queue_storage.rs:6398` also uses
+  `FOR UPDATE` on `lease_ring_state`, plus takes `ACCESS EXCLUSIVE` on
+  the lease partition child, and counts active leases inside the prune
+  transaction
 
-- re-read `lease_ring_state.current_slot` under the `queue_lanes` lock
-  and abort if it has moved
-- take a share lock (`FOR SHARE`) on `lease_ring_state` across the
-  read+insert
-- reshape the claim into a single CTE that reads the slot and inserts
-  atomically (the natural snapshot of one statement)
+So the race exists at the abstraction level of the TLA+ spec (which
+does not model Postgres row locks) but is unreachable in production.
+The race spec is still valuable because it proves that **removing any
+of those locks would expose the race** — it is a regression harness
+for the locking contract.
 
-Until one of these is confirmed in the SQL, the race is a real
-merge-blocker per my earlier review — the model has now converted it
-from "unproven" to "observable if the above guarantees are absent."
+### prune_oldest (ready) check-then-act — resolved
 
-### prune_oldest check-then-act race
+The spec's PruneLeaseSegment transition also captures the analogous
+concern on `prune_oldest` (for ready partitions) at
+`queue_storage.rs:6252`.
 
-The race spec's PruneLeaseSegment transition actually captures this
-already. In state 5 of the violating trace, `PruneLeaseSegment(1)`
-fires despite a pending `claimIntent[w1].leaseSeg = 1`, because the
-pending claim hasn't committed, so `activeLeases = {}` and the prune
-precondition `\A j : leaseSegmentOf[j] = seg => j \notin activeLeases`
-passes vacuously. This is structurally the same as the Rust
-`prune_oldest` (`queue_storage.rs:5994`) reading the active-leases
-count outside the TRUNCATE tx.
+**Status in the implementation: mitigated.** The prune path:
 
-Fixing the claim side closes both races: once CommitClaim either
-aborts (because the segment is no longer open) or lands on the current
-segment, prune can no longer race against an in-flight lease on the
-old segment.
+1. `FOR UPDATE` on `queue_ring_state` to serialise against concurrent
+   rotates (`queue_storage.rs:6265`)
+2. `FOR UPDATE` on the target `queue_ring_slots` row
+   (`queue_storage.rs:6280`)
+3. `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on the ready and done
+   partition children (`queue_storage.rs:6297`) — this blocks the
+   AccessShare lock that `claim_ready_runtime` takes when reading
+   `{schema}.ready_entries_%s`, forcing prune to wait for in-flight
+   claims to commit (or bail via the 50 ms `lock_timeout`)
+4. Only AFTER the lock is held does the count-active-leases check
+   run inside the same transaction — so any lease inserted by a
+   concurrent claim will be visible to the check
+
+All prune paths set `SET LOCAL lock_timeout = '50ms'` so they abort
+gracefully under contention rather than stalling.
+
+So the "check-then-act" framing is inaccurate: the Rust code is
+"lock-then-check-then-act", with the lock being the load-bearing part.
+
+### Role of the race spec going forward
+
+The spec plus `AwaSegmentedStorageRaces.cfg` (race-exposing) and
+`AwaSegmentedStorageRacesSafe.cfg` (checked-commit) is a regression
+harness. If any future refactor removes the `FOR SHARE` on
+`lease_ring_state`, or weakens the `ACCESS EXCLUSIVE` on the partition
+children, the race spec will still produce a counterexample and the
+safe spec will still pass — making the invariant the checked-commit
+enforces a clear statement of what the SQL locks are buying.
+
+### Lock-order regression harness
+
+`AwaStorageLockOrder.tla` (see [`README.md`](./README.md)) is the
+complementary positive artifact: it models the Postgres locks
+directly and checks that no interleaving of claim / rotate-leases /
+prune-leases / rotate-ready / prune-ready transactions produces a
+waits-for cycle. Current result: 2,076 distinct states, no
+deadlock. A deliberately-broken demo config
+(`AwaStorageLockOrderDeadlockDemo.cfg`) confirms the deadlock
+detector fires when a cycle exists.
+
+Together the two specs cover complementary risks:
+- `AwaSegmentedStorageRaces` catches data-level races that would
+  occur if the locks were removed — proves the locks are necessary
+- `AwaStorageLockOrder` catches deadlock-order bugs that would
+  occur if the lock ordering were changed — proves the current
+  ordering is safe
 
 ### Bulk ops atomicity
 
