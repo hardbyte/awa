@@ -245,6 +245,9 @@ export interface ListDlqParams {
   queue?: string;
   tag?: string;
   before_id?: number;
+  /** Pair with `before_id` for a race-free `(dlq_at, id)` cursor matching
+   *  the response sort order. ISO-8601 timestamp. */
+  before_dlq_at?: string;
   limit?: number;
 }
 

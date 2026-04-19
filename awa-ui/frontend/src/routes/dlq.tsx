@@ -31,6 +31,16 @@ import { timeAgo } from "@/lib/time";
 import { DEFAULT_PAGE_SIZE } from "@/lib/constants";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 
+/// Coerce a URL-param string to a positive integer, rejecting `NaN`,
+/// negatives, zero, and floats. Returns `undefined` on invalid input so
+/// callers can fall back to their default instead of forwarding junk
+/// to the backend.
+function parsePositiveInt(value: string | undefined): number | undefined {
+  if (!value) return undefined;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
 function useDlqFilters() {
   const searchParams = useSearch({ strict: false }) as Record<
     string,
@@ -38,10 +48,9 @@ function useDlqFilters() {
   >;
   return {
     search: searchParams.q ?? "",
-    beforeId: searchParams.before_id
-      ? Number(searchParams.before_id)
-      : undefined,
-    limit: searchParams.limit ? Number(searchParams.limit) : DEFAULT_PAGE_SIZE,
+    beforeId: parsePositiveInt(searchParams.before_id),
+    beforeDlqAt: searchParams.before_dlq_at,
+    limit: parsePositiveInt(searchParams.limit) ?? DEFAULT_PAGE_SIZE,
   };
 }
 
@@ -59,6 +68,7 @@ export function DlqPage() {
     queue: searchFilters.queue,
     tag: searchFilters.tag,
     before_id: filters.beforeId,
+    before_dlq_at: filters.beforeDlqAt,
     limit: filters.limit,
   };
 
@@ -133,7 +143,7 @@ export function DlqPage() {
   );
 
   const setSearch = (q: string) => {
-    setUrlParams({ q: q || undefined, before_id: undefined });
+    setUrlParams({ q: q || undefined, before_id: undefined, before_dlq_at: undefined });
   };
 
   return (
@@ -235,7 +245,13 @@ export function DlqPage() {
             onPress={() => {
               const last = rows[rows.length - 1];
               if (last) {
-                setUrlParams({ before_id: String(last.id) });
+                // Emit the full (dlq_at, id) cursor so pagination matches
+                // the backend sort order even when older failed rows are
+                // bulk-moved into DLQ after newer ones.
+                setUrlParams({
+                  before_id: String(last.id),
+                  before_dlq_at: last.dlq_at,
+                });
               }
             }}
           >

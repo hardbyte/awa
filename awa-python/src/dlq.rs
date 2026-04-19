@@ -74,6 +74,7 @@ pub(crate) fn build_filter(
         queue,
         tag,
         before_id,
+        before_dlq_at: None,
         limit,
     }
 }

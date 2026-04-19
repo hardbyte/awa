@@ -36,6 +36,10 @@ pub struct ListDlqParams {
     pub queue: Option<String>,
     pub tag: Option<String>,
     pub before_id: Option<i64>,
+    /// Pair with `before_id` for a race-free `(dlq_at, id)` cursor that
+    /// matches the response sort order. Legacy callers omitting this get
+    /// the old id-only cursor.
+    pub before_dlq_at: Option<chrono::DateTime<chrono::Utc>>,
     pub limit: Option<i64>,
 }
 
@@ -48,6 +52,7 @@ pub async fn list_dlq(
         queue: params.queue,
         tag: params.tag,
         before_id: params.before_id,
+        before_dlq_at: params.before_dlq_at,
         limit: params.limit,
     };
     let rows = dlq::list_dlq(&state.pool, &filter).await?;

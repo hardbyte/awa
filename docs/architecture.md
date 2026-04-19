@@ -97,9 +97,9 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 | `failed` | Exhausted max attempts or terminal error (terminal) |
 | `cancelled` | Cancelled by handler or admin (terminal) |
 | `waiting_external` | Parked for external callback completion or sequential resume |
-| `dlq` | Terminal, lives in `awa.jobs_dlq` — see [Dead Letter Queue](#dead-letter-queue) and [ADR-019](adr/019-dead-letter-queue.md) |
+| `dlq` | Terminal DLQ destination (not a `job_state` enum value): rows live in `awa.jobs_dlq` with `state='failed'` plus DLQ metadata. See [Dead Letter Queue](#dead-letter-queue) and [ADR-019](adr/019-dead-letter-queue.md) |
 
-Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled). DLQ rows live in their own table (`awa.jobs_dlq`) with an independent retention (default 30 days) — see [Dead Letter Queue](#dead-letter-queue).
+Terminal states (`completed`, `failed`, `cancelled`) have no further transitions in the hot/scheduled state machine. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled). DLQ storage is a separate terminal sink for failed rows in `awa.jobs_dlq` with independent retention (default 30 days) — see [Dead Letter Queue](#dead-letter-queue).
 
 Jobs carry an optional `progress` JSONB column that handlers can write during execution. Progress is cleared to NULL on completion but preserved across all other transitions (retry, snooze, cancel, fail, rescue), enabling checkpoint-based resumption on retry.
 

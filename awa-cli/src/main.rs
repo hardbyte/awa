@@ -487,8 +487,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 "ID", "KIND", "QUEUE", "REASON", "DLQ_AT"
                             );
                             for row in &rows {
-                                let reason = if row.dlq_reason.len() > 30 {
-                                    format!("{}...", &row.dlq_reason[..27])
+                                // Truncate by characters, not bytes: byte
+                                // slicing mid-codepoint panics on Unicode
+                                // reasons (e.g. an operator typing a
+                                // non-ASCII note).
+                                let char_count = row.dlq_reason.chars().count();
+                                let reason = if char_count > 30 {
+                                    let prefix: String = row.dlq_reason.chars().take(27).collect();
+                                    format!("{prefix}...")
                                 } else {
                                     row.dlq_reason.clone()
                                 };

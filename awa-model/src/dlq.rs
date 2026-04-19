@@ -119,8 +119,16 @@ pub struct ListDlqFilter {
     pub kind: Option<String>,
     pub queue: Option<String>,
     pub tag: Option<String>,
-    /// Pagination: only return rows with id < before_id. Results ordered by dlq_at DESC, id DESC.
+    /// Pagination cursor id. Pair with [`before_dlq_at`] for a lexicographic
+    /// `(dlq_at, id)` cursor that matches the query's `ORDER BY dlq_at DESC,
+    /// id DESC`. With only `before_id` set the older behaviour (strict
+    /// `id < before_id`) is kept for backwards compatibility, but that cursor
+    /// can skip rows when `dlq_at` and `id` are not monotonic (e.g. an admin
+    /// bulk-moves old `failed` rows after newer ones have already landed).
     pub before_id: Option<i64>,
+    /// Pagination cursor `dlq_at`. Must be supplied alongside `before_id` for
+    /// the cursor to be race-free against out-of-order DLQ entry.
+    pub before_dlq_at: Option<DateTime<Utc>>,
     pub limit: Option<i64>,
 }
 
@@ -209,21 +217,33 @@ where
     E: PgExecutor<'e>,
 {
     let limit = filter.limit.unwrap_or(100);
+    // Use a tuple cursor `(dlq_at, id) < (before_dlq_at, before_id)` to match
+    // the sort order. When only `before_id` is supplied (older callers),
+    // fall back to the strict id comparison — that path is only safe while
+    // `dlq_at` and `id` are monotonic, so new callers should always pass both.
     let rows = sqlx::query_as::<_, DlqRow>(
         r#"
         SELECT * FROM awa.jobs_dlq
         WHERE ($1::text IS NULL OR kind = $1)
           AND ($2::text IS NULL OR queue = $2)
           AND ($3::text IS NULL OR tags @> ARRAY[$3]::text[])
-          AND ($4::bigint IS NULL OR id < $4)
+          AND (
+              $4::bigint IS NULL
+              OR (
+                  $5::timestamptz IS NULL
+                  AND id < $4
+              )
+              OR (dlq_at, id) < ($5, $4)
+          )
         ORDER BY dlq_at DESC, id DESC
-        LIMIT $5
+        LIMIT $6
         "#,
     )
     .bind(&filter.kind)
     .bind(&filter.queue)
     .bind(&filter.tag)
     .bind(filter.before_id)
+    .bind(filter.before_dlq_at)
     .bind(limit)
     .fetch_all(executor)
     .await?;
