@@ -408,8 +408,14 @@ async fn test_throughput_rust_workers() {
     let queue = "bench_throughput";
     clean_queue(&pool, queue).await;
 
-    let total_jobs: i64 = 5_000;
-    let batch_size = 500;
+    let total_jobs: i64 = env_i64(
+        "AWA_RUNTIME_TOTAL_JOBS",
+        env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 5_000),
+    );
+    let batch_size = env_usize(
+        "AWA_RUNTIME_BATCH_SIZE",
+        env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500),
+    );
 
     // Build and start the Client with workers
     let client = Client::builder(pool.clone())
@@ -430,7 +436,7 @@ async fn test_throughput_rust_workers() {
     // Insert jobs in batches
     let insert_start = Instant::now();
     for batch_start in (0..total_jobs).step_by(batch_size as usize) {
-        let batch_end = (batch_start + batch_size).min(total_jobs);
+        let batch_end = (batch_start + batch_size as i64).min(total_jobs);
         let params: Vec<_> = (batch_start..batch_end)
             .map(|i| {
                 awa::model::insert::params_with(

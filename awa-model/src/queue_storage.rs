@@ -210,13 +210,6 @@ impl RuntimePayload {
             payload.unwrap_or(serde_json::Value::Null),
         );
     }
-
-    fn take_callback_result(&mut self) -> Option<serde_json::Value> {
-        self.metadata
-            .as_object_mut()
-            .expect("runtime payload metadata object")
-            .remove("_awa_callback_result")
-    }
 }
 
 fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
@@ -270,7 +263,6 @@ struct ReadyJobRow {
     attempted_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     unique_key: Option<Vec<u8>>,
-    unique_states: Option<String>,
     payload: serde_json::Value,
 }
 
@@ -703,18 +695,13 @@ struct DeletedLeaseRow {
     run_lease: i64,
     max_attempts: i16,
     lane_seq: i64,
-    heartbeat_at: Option<DateTime<Utc>>,
-    deadline_at: Option<DateTime<Utc>>,
     attempted_at: Option<DateTime<Utc>>,
-    callback_id: Option<Uuid>,
-    callback_timeout_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct ReadySnapshotRow {
     ready_slot: i32,
     ready_generation: i64,
-    job_id: i64,
     kind: String,
     queue: String,
     args: serde_json::Value,
@@ -754,12 +741,7 @@ struct LeaseTransitionRow {
     max_attempts: i16,
     lane_seq: i64,
     run_at: DateTime<Utc>,
-    heartbeat_at: Option<DateTime<Utc>>,
-    deadline_at: Option<DateTime<Utc>>,
     attempted_at: Option<DateTime<Utc>>,
-    callback_id: Option<Uuid>,
-    callback_timeout_at: Option<DateTime<Utc>>,
-    finalized_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
@@ -876,8 +858,6 @@ impl LeaseTransitionRow {
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct LeaseJobRow {
-    ready_slot: i32,
-    ready_generation: i64,
     job_id: i64,
     kind: String,
     queue: String,
@@ -887,7 +867,6 @@ struct LeaseJobRow {
     attempt: i16,
     run_lease: i64,
     max_attempts: i16,
-    lane_seq: i64,
     run_at: DateTime<Utc>,
     heartbeat_at: Option<DateTime<Utc>>,
     deadline_at: Option<DateTime<Utc>>,
@@ -895,7 +874,6 @@ struct LeaseJobRow {
     finalized_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     unique_key: Option<Vec<u8>>,
-    unique_states: Option<String>,
     callback_id: Option<Uuid>,
     callback_timeout_at: Option<DateTime<Utc>>,
     callback_filter: Option<String>,
@@ -2816,11 +2794,10 @@ impl QueueStorage {
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
         for entry in moved.iter().cloned() {
-            let mut payload =
-                RuntimePayload::from_json(Self::payload_with_attempt_state(
-                    entry.payload.clone(),
-                    entry.progress.clone(),
-                )?)?;
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                entry.payload.clone(),
+                entry.progress.clone(),
+            )?)?;
             payload.set_progress(None);
             done_rows.push(entry.into_done_row(
                 JobState::Completed,
@@ -2852,7 +2829,10 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         let lease_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.lease_slot).collect();
-        let queues: Vec<String> = claimed.iter().map(|entry| entry.claim.queue.clone()).collect();
+        let queues: Vec<String> = claimed
+            .iter()
+            .map(|entry| entry.claim.queue.clone())
+            .collect();
         let priorities: Vec<i16> = claimed.iter().map(|entry| entry.claim.priority).collect();
         let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
 
@@ -2928,8 +2908,9 @@ impl QueueStorage {
         let mut done_rows = Vec::with_capacity(deleted.len());
         let mut updated = Vec::with_capacity(deleted.len());
         for deleted_row in deleted {
-            if let Some(runtime_job) =
-                claimed_map.get(&(deleted_row.job_id, deleted_row.run_lease)).cloned()
+            if let Some(runtime_job) = claimed_map
+                .get(&(deleted_row.job_id, deleted_row.run_lease))
+                .cloned()
             {
                 done_rows.push(runtime_job.into_done_row(finalized_at)?);
                 updated.push((deleted_row.job_id, deleted_row.run_lease));
@@ -3004,11 +2985,10 @@ impl QueueStorage {
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
         for entry in moved.iter().cloned() {
-            let mut payload =
-                RuntimePayload::from_json(Self::payload_with_attempt_state(
-                    entry.payload.clone(),
-                    entry.progress.clone(),
-                )?)?;
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                entry.payload.clone(),
+                entry.progress.clone(),
+            )?)?;
             payload.set_progress(None);
             done_rows.push(entry.into_done_row(
                 JobState::Completed,
@@ -3106,8 +3086,10 @@ impl QueueStorage {
                 .into_iter()
                 .next()
                 .expect("deleted waiting lease");
-            let ready_payload =
-                Self::payload_with_attempt_state(waiting.payload.clone(), waiting.progress.clone())?;
+            let ready_payload = Self::payload_with_attempt_state(
+                waiting.payload.clone(),
+                waiting.progress.clone(),
+            )?;
             let ready_row = ExistingReadyRow {
                 attempt: 0,
                 run_lease: 0,
@@ -3115,8 +3097,12 @@ impl QueueStorage {
                 attempted_at: None,
                 ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
             };
-            self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(waiting.state))
-                .await?;
+            self.insert_existing_ready_rows_tx(
+                &mut tx,
+                vec![ready_row.clone()],
+                Some(waiting.state),
+            )
+            .await?;
             self.adjust_lane_counts(&mut tx, &waiting.queue, waiting.priority, 0, -1, 0)
                 .await?;
             self.notify_queues_tx(&mut tx, std::iter::once(waiting.queue.clone()))
@@ -3136,7 +3122,6 @@ impl QueueStorage {
                     attempted_at: ready_row.attempted_at,
                     created_at: ready_row.created_at,
                     unique_key: ready_row.unique_key,
-                    unique_states: ready_row.unique_states,
                     payload: ready_row.payload,
                 }
                 .into_job_row()?,
@@ -3199,8 +3184,12 @@ impl QueueStorage {
                 unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
-            self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(terminal.state))
-                .await?;
+            self.insert_existing_ready_rows_tx(
+                &mut tx,
+                vec![ready_row.clone()],
+                Some(terminal.state),
+            )
+            .await?;
             self.adjust_lane_counts(&mut tx, &terminal.queue, terminal.priority, 0, 0, -1)
                 .await?;
             self.notify_queues_tx(&mut tx, std::iter::once(terminal.queue.clone()))
@@ -3220,7 +3209,6 @@ impl QueueStorage {
                     attempted_at: ready_row.attempted_at,
                     created_at: ready_row.created_at,
                     unique_key: ready_row.unique_key,
-                    unique_states: ready_row.unique_states,
                     payload: ready_row.payload,
                 }
                 .into_job_row()?,
@@ -3280,11 +3268,16 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if let Some(ready) = ready {
-            let done = ready
-                .clone()
-                .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
-            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(JobState::Available))
-                .await?;
+            let done =
+                ready
+                    .clone()
+                    .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
+            self.insert_done_rows_tx(
+                &mut tx,
+                std::slice::from_ref(&done),
+                Some(JobState::Available),
+            )
+            .await?;
             self.adjust_lane_counts(&mut tx, &ready.queue, ready.priority, -1, 0, 1)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
@@ -3370,7 +3363,8 @@ impl QueueStorage {
 
         if let Some(deferred) = deferred {
             let (ready_slot, ready_generation) = self.current_queue_ring(&mut tx).await?;
-            self.ensure_lane(&mut tx, &deferred.queue, deferred.priority).await?;
+            self.ensure_lane(&mut tx, &deferred.queue, deferred.priority)
+                .await?;
             let done = DoneJobRow {
                 ready_slot,
                 ready_generation,
@@ -3484,14 +3478,11 @@ impl QueueStorage {
                 .or_default() += 1;
 
             let mut payload = RuntimePayload::from_json(row.payload)?;
-            let metadata = payload
-                .metadata
-                .as_object_mut()
-                .ok_or_else(|| {
-                    AwaError::Validation(
-                        "queue storage payload metadata must be a JSON object".to_string(),
-                    )
-                })?;
+            let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
+                AwaError::Validation(
+                    "queue storage payload metadata must be a JSON object".to_string(),
+                )
+            })?;
             metadata
                 .entry("_awa_original_priority".to_string())
                 .or_insert_with(|| serde_json::Value::from(i64::from(row.priority)));
@@ -3771,12 +3762,7 @@ impl QueueStorage {
                 max_attempts: deleted_row.max_attempts,
                 lane_seq: deleted_row.lane_seq,
                 run_at: ready.run_at,
-                heartbeat_at: deleted_row.heartbeat_at,
-                deadline_at: deleted_row.deadline_at,
                 attempted_at: deleted_row.attempted_at,
-                callback_id: deleted_row.callback_id,
-                callback_timeout_at: deleted_row.callback_timeout_at,
-                finalized_at: None,
                 created_at: ready.created_at,
                 unique_key: ready.unique_key.clone(),
                 unique_states: ready.unique_states.clone(),
@@ -4071,7 +4057,9 @@ impl QueueStorage {
         config: &CallbackConfig,
     ) -> Result<Uuid, AwaError> {
         if config.is_empty() {
-            return self.register_callback(pool, job_id, run_lease, timeout).await;
+            return self
+                .register_callback(pool, job_id, run_lease, timeout)
+                .await;
         }
 
         #[cfg(feature = "cel")]
@@ -4299,17 +4287,19 @@ impl QueueStorage {
                 self.leases_table(),
                 self.attempt_state_table()
             ))
-        .bind(job_id)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?;
+            .bind(job_id)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?;
 
         match row {
             Some((JobState::Running, None, run_lease, Some(_))) => {
                 let result = self.take_callback_result(pool, job_id, run_lease).await?;
                 Ok(CallbackPollResult::Resolved(result))
             }
-            Some((state, Some(current_callback_id), _, _)) if current_callback_id != callback_id => {
+            Some((state, Some(current_callback_id), _, _))
+                if current_callback_id != callback_id =>
+            {
                 Ok(CallbackPollResult::Stale {
                     token: callback_id,
                     current: current_callback_id,
@@ -4522,11 +4512,10 @@ impl QueueStorage {
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
-        let mut payload =
-            RuntimePayload::from_json(Self::payload_with_attempt_state(
-                moved.payload.clone(),
-                moved.progress.clone(),
-            )?)?;
+        let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+            moved.payload.clone(),
+            moved.progress.clone(),
+        )?)?;
         payload.set_progress(None);
         let done_row =
             moved
@@ -4605,11 +4594,10 @@ impl QueueStorage {
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
-        let mut payload =
-            RuntimePayload::from_json(Self::payload_with_attempt_state(
-                moved.payload.clone(),
-                moved.progress.clone(),
-            )?)?;
+        let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+            moved.payload.clone(),
+            moved.progress.clone(),
+        )?)?;
         let mut error_entry = match error_entry {
             serde_json::Value::Object(map) => serde_json::Value::Object(map),
             other => serde_json::json!({ "error": other }),
@@ -4693,9 +4681,7 @@ impl QueueStorage {
         let ready_row = ExistingReadyRow {
             attempt: 0,
             run_at: Utc::now(),
-            ..moved
-                .clone()
-                .into_ready_row(Utc::now(), ready_payload)
+            ..moved.clone().into_ready_row(Utc::now(), ready_payload)
         };
         self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(moved.state))
             .await?;
@@ -4717,7 +4703,6 @@ impl QueueStorage {
             attempted_at: ready_row.attempted_at,
             created_at: ready_row.created_at,
             unique_key: ready_row.unique_key,
-            unique_states: ready_row.unique_states,
             payload: ready_row.payload,
         }
         .into_job_row()
@@ -4924,7 +4909,8 @@ impl QueueStorage {
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted running lease");
 
-        let payload = Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
+        let payload =
+            Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let deferred = moved.clone().into_deferred_row(
             JobState::Retryable,
             Utc::now()
@@ -4990,7 +4976,8 @@ impl QueueStorage {
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted running lease");
 
-        let payload = Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
+        let payload =
+            Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let mut deferred = moved.clone().into_deferred_row(
             JobState::Scheduled,
             Utc::now()
@@ -5056,7 +5043,8 @@ impl QueueStorage {
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted running lease");
 
-        let payload = Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
+        let payload =
+            Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let done = moved
             .clone()
             .into_done_row(JobState::Cancelled, Utc::now(), payload);
@@ -5343,18 +5331,13 @@ impl QueueStorage {
                 attempted_at: ready.attempted_at,
                 created_at: ready.created_at,
                 unique_key: ready.unique_key,
-                unique_states: ready.unique_states,
                 payload: ready.payload,
             }
             .into_job_row()?,
         ))
     }
 
-    pub async fn discard_failed_by_kind(
-        &self,
-        pool: &PgPool,
-        kind: &str,
-    ) -> Result<u64, AwaError> {
+    pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 

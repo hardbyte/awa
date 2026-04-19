@@ -75,9 +75,7 @@ async fn ensure_database_exists(url: &str) {
     match sqlx::query(&create_sql).execute(&admin_pool).await {
         Ok(_) => {}
         Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
-        Err(err) => panic!(
-            "Failed to create queue_storage test database {database_name}: {err}"
-        ),
+        Err(err) => panic!("Failed to create queue_storage test database {database_name}: {err}"),
     }
 }
 
@@ -117,7 +115,10 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
 }
 
 async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
-    let sql = format!("SELECT count(*)::bigint FROM {}.attempt_state", store.schema());
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.attempt_state",
+        store.schema()
+    );
     sqlx::query_scalar::<_, i64>(&sql)
         .fetch_one(pool)
         .await
@@ -504,9 +505,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
 
-    client
-        .shutdown(Duration::from_secs(5))
-        .await;
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1082,11 +1081,12 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
         .expect("Failed to delete queue_storage rows through awa.jobs")
         .rows_affected();
 
-    let remaining: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs WHERE queue = $1")
-        .bind(queue)
-        .fetch_one(&pool)
-        .await
-        .expect("Failed to count remaining awa.jobs rows");
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs WHERE queue = $1")
+            .bind(queue)
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to count remaining awa.jobs rows");
     let ready_after_delete: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
         store.schema()

@@ -2,7 +2,9 @@
 
 mod bench_output;
 
-use awa::model::{migrations, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome};
+use awa::model::{
+    migrations, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome,
+};
 use bench_output::{BenchLatency, BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
@@ -68,9 +70,9 @@ async fn ensure_database_exists(url: &str) {
     match sqlx::query(&create_sql).execute(&admin_pool).await {
         Ok(_) => {}
         Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
-        Err(err) => panic!(
-            "Failed to create queue_storage benchmark database {database_name}: {err}"
-        ),
+        Err(err) => {
+            panic!("Failed to create queue_storage benchmark database {database_name}: {err}")
+        }
     }
 }
 
@@ -234,7 +236,8 @@ async fn sample_exact_dead_tuples(
         ready: sample_pgstattuple_dead_tuples(pool, store.schema(), "ready_entries_%").await?,
         done: sample_pgstattuple_dead_tuples(pool, store.schema(), "done_entries_%").await?,
         leases: sample_pgstattuple_dead_tuples(pool, store.schema(), "leases_%").await?,
-        attempt_state: sample_pgstattuple_dead_tuples(pool, store.schema(), "attempt_state").await?,
+        attempt_state: sample_pgstattuple_dead_tuples(pool, store.schema(), "attempt_state")
+            .await?,
     })
 }
 
@@ -264,7 +267,8 @@ async fn sample_snapshot(
     let ready_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "ready_entries_%").await;
     let done_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "done_entries_%").await;
     let leases_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "leases_%").await;
-    let attempt_state_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "attempt_state").await;
+    let attempt_state_dead_tup =
+        sample_dead_tuples(&mut conn, store.schema(), "attempt_state").await;
 
     QueueStorageSnapshot {
         available: counts.available,
