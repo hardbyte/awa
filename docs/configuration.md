@@ -156,6 +156,30 @@ Both surfaces must be called before `start()` / `build()`. Declaring a descripto
 
 All intervals have `_ms` suffixed kwargs in Python (e.g. `heartbeat_interval_ms=15000`).
 
+## Dead Letter Queue
+
+Queue-storage deployments can route terminal failures into the DLQ instead of
+leaving them in ordinary terminal history. The policy knobs currently live on
+the Rust runtime builder:
+
+```rust
+use std::time::Duration;
+
+let client = Client::builder(pool.clone())
+    .dlq_enabled_by_default(true)
+    .queue_dlq_enabled("metrics_flush", false)
+    .dlq_retention(Duration::from_secs(60 * 60 * 24 * 30))
+    .dlq_cleanup_batch_size(1000)
+    .build()
+    .await?;
+```
+
+Per-queue retention overrides still use `RetentionPolicy.dlq`.
+
+Python, CLI, REST, and Web UI surfaces can inspect and operate on DLQ rows once
+the deployment is using queue storage, but queue-policy declaration is still a
+runtime-side concern. See [ADR-020](adr/020-dead-letter-queue.md).
+
 ## CLI and `awa serve`
 
 The CLI reads `DATABASE_URL` from the environment or `--database-url`. All subcommands except `serve` use a single database connection.

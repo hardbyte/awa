@@ -80,6 +80,14 @@ test.describe("Job detail page", () => {
 
     await expect(page.getByRole("heading", { name: /legacy_job/ })).toBeVisible();
     await expect(page.getByText("legacy_queue")).toBeVisible();
+
+    // Legacy jobs have no descriptor, so descriptor-derived affordances
+    // must not render: no display-name heading for the descriptor-backed
+    // E2E queue, no kind description paragraph.
+    await expect(page.getByRole("heading", { name: /E2E Queue/ })).toHaveCount(0);
+    await expect(
+      page.getByText("End-to-end job kind used for UI coverage"),
+    ).toHaveCount(0);
   });
 
   test("arguments section shows JSON", async ({ page }) => {

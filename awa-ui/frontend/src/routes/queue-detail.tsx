@@ -97,7 +97,9 @@ export function QueueDetailPage() {
 
   const queue = queueQuery.data;
   const runtime = runtimeQuery.data?.find((entry) => entry.queue === queue.queue);
-  const title = queue.display_name ?? queue.queue;
+  // Treat empty display_name as missing so a declared-but-blank row
+  // doesn't render an empty page title.
+  const title = queue.display_name?.trim() ? queue.display_name : queue.queue;
   const descriptorSyncLabel = queue.descriptor_last_seen_at
     ? timeAgo(queue.descriptor_last_seen_at)
     : null;
@@ -113,7 +115,7 @@ export function QueueDetailPage() {
 
       <div className="flex flex-wrap items-center gap-4">
         <Heading level={2}>{title}</Heading>
-        {queue.display_name && (
+        {queue.display_name?.trim() && (
           <code className="rounded bg-muted px-1.5 py-0.5 text-sm">
             {queue.queue}
           </code>

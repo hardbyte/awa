@@ -16,7 +16,10 @@ import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
 
 function kindLabel(kind: JobKindOverview): string {
-  return kind.display_name ?? kind.kind;
+  // Treat empty display_name the same as missing — the contract is
+  // "display name if set, otherwise the raw key". `??` alone would let
+  // `display_name: ""` render a blank label.
+  return kind.display_name?.trim() ? kind.display_name : kind.kind;
 }
 
 function descriptorSyncLabel(kind: JobKindOverview): string {
@@ -63,9 +66,11 @@ export function KindsPage() {
                   </div>
                 </div>
                 <div className="flex flex-wrap gap-1">
-                  {kind.descriptor_stale && (
+                  {!kind.descriptor_last_seen_at ? (
+                    <Badge intent="secondary">Not declared</Badge>
+                  ) : kind.descriptor_stale ? (
                     <Badge intent="warning">Descriptor stale</Badge>
-                  )}
+                  ) : null}
                   {kind.descriptor_mismatch && (
                     <Badge intent="danger">Descriptor drift</Badge>
                   )}
@@ -127,7 +132,7 @@ export function KindsPage() {
                     >
                       {kindLabel(kind)}
                     </Link>
-                    {kind.display_name && (
+                    {kind.display_name?.trim() && (
                       <div className="text-xs font-normal text-muted-fg">{kind.kind}</div>
                     )}
                     {kind.description && (
@@ -146,7 +151,9 @@ export function KindsPage() {
                 <TableCell>{kind.owner ?? "—"}</TableCell>
                 <TableCell>
                   <div className="flex flex-wrap gap-1">
-                    {kind.descriptor_stale ? (
+                    {!kind.descriptor_last_seen_at ? (
+                      <Badge intent="secondary">Not declared</Badge>
+                    ) : kind.descriptor_stale ? (
                       <Badge intent="warning">Descriptor stale</Badge>
                     ) : (
                       <Badge intent="success">Live</Badge>

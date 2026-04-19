@@ -56,6 +56,15 @@ GET  /api/runtime/:instance_id
 GET  /api/cron
 POST /api/cron/:name/trigger
 
+GET  /api/dlq?kind=&queue=&tag=&limit=&before_id=&before_dlq_at=
+GET  /api/dlq/:id
+GET  /api/dlq/depth
+POST   /api/dlq/:id/retry
+DELETE /api/dlq/:id
+POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }
+POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }
+POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
+
 GET  /api/capabilities                  Feature flags / read-only detection
 ```
 
@@ -96,6 +105,21 @@ Cluster overview: instance count, liveness, leader status, and an attention pane
 ### Cron (`/cron`)
 
 Accordion list of registered periodic job schedules. Each entry shows the cron expression, job kind, target queue, priority, next fire time (countdown), and last run. Expandable to see full details including arguments and tags. "Trigger now" fires the job immediately without affecting the next scheduled run.
+
+### Dead Letter Queue (`/dlq`, `/dlq/:id`)
+
+Operator surface for queue-storage `dlq_entries`.
+
+- **List (`/dlq`)** — filterable table showing ID, kind, queue, reason, age,
+  and attempts.
+- **Bulk actions** — filter-scoped bulk retry and purge. Empty-filter actions
+  require explicit `all=true` confirmation through the API.
+- **Detail (`/dlq/:id`)** — single-row inspection with retry and purge actions.
+- **Queue badge** — `/queues` shows a `+N DLQ` link next to queues with non-zero
+  DLQ depth.
+
+The shared `/jobs/:id` detail page also carries DLQ metadata when a job has
+already moved into the DLQ, so direct links keep working after routing.
 
 ## Interaction Patterns
 

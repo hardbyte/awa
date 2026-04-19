@@ -31,11 +31,19 @@ export default async function globalSetup() {
   const user = pgUrl.username;
 
   const sql = `
-    -- Clean up any previous E2E data
+    -- Clean up any previous E2E data. Also strip runtime-snapshot hash
+    -- entries for these queues/kinds — otherwise hashes left over from a
+    -- previous run can resurface as spurious 'drift' or 'stale' badges on
+    -- the next Playwright run, purely as test-order noise.
     DELETE FROM awa.jobs WHERE queue IN ('e2e_test', 'legacy_queue');
     DELETE FROM awa.queue_meta WHERE queue IN ('e2e_test', 'legacy_queue');
     DELETE FROM awa.queue_descriptors WHERE queue IN ('e2e_test', 'legacy_queue');
     DELETE FROM awa.job_kind_descriptors WHERE kind IN ('e2e_job', 'legacy_job');
+    UPDATE awa.runtime_instances SET
+      queue_descriptor_hashes    = queue_descriptor_hashes    - ARRAY['e2e_test', 'legacy_queue'],
+      job_kind_descriptor_hashes = job_kind_descriptor_hashes - ARRAY['e2e_job', 'legacy_job']
+    WHERE queue_descriptor_hashes    ?| ARRAY['e2e_test', 'legacy_queue']
+       OR job_kind_descriptor_hashes ?| ARRAY['e2e_job', 'legacy_job'];
 
     -- Descriptor-backed queue and kind used by the new UI surfaces
     INSERT INTO awa.queue_descriptors (

@@ -1,5 +1,5 @@
 use crate::admin::{CallbackConfig, CallbackPollResult};
-use crate::dlq::RetryFromDlqOpts;
+use crate::dlq::{ListDlqFilter, RetryFromDlqOpts};
 use crate::error::AwaError;
 use crate::insert::prepare_row_raw;
 use crate::{InsertParams, JobRow, JobState};
@@ -4183,11 +4183,12 @@ impl QueueStorage {
                     let program = cel::Program::compile(src).map_err(|e| {
                         AwaError::Validation(format!("invalid CEL expression for {name}: {e}"))
                     })?;
-                    let bad_vars: Vec<&str> = program
-                        .references()
+                    let references = program.references();
+                    let bad_vars: Vec<String> = references
                         .variables()
                         .into_iter()
                         .filter(|v| *v != "payload")
+                        .map(str::to_string)
                         .collect();
                     if !bad_vars.is_empty() {
                         return Err(AwaError::Validation(format!(
@@ -5363,6 +5364,65 @@ impl QueueStorage {
         Ok(Some(dlq_row.into_job_row()?))
     }
 
+    pub async fn bulk_move_failed_to_dlq(
+        &self,
+        pool: &PgPool,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        dlq_reason: &str,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let moved: Vec<DoneJobRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.done_entries
+            WHERE state = 'failed'
+              AND ($1::text IS NULL OR kind = $1)
+              AND ($2::text IS NULL OR queue = $2)
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            "#
+        ))
+        .bind(kind)
+        .bind(queue)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if moved.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(0);
+        }
+
+        let dlq_at = Utc::now();
+        let rows: Vec<DlqJobRow> = moved
+            .into_iter()
+            .map(|row| row.into_dlq_row(dlq_reason.to_string(), dlq_at))
+            .collect();
+        self.insert_dlq_rows_tx(&mut tx, &rows, Some(JobState::Failed))
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows.len() as u64)
+    }
+
     pub async fn retry_from_dlq(
         &self,
         pool: &PgPool,
@@ -5445,6 +5505,83 @@ impl QueueStorage {
             }
             .into_job_row()?,
         ))
+    }
+
+    pub async fn bulk_retry_from_dlq(
+        &self,
+        pool: &PgPool,
+        filter: &ListDlqFilter,
+    ) -> Result<u64, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let moved: Vec<DlqJobRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE ($1::text IS NULL OR kind = $1)
+              AND ($2::text IS NULL OR queue = $2)
+              AND ($3::text IS NULL OR payload -> 'tags' ? $3)
+              AND (
+                  $4::bigint IS NULL
+                  OR (
+                      $5::timestamptz IS NULL
+                      AND job_id < $4
+                  )
+                  OR (dlq_at, job_id) < ($5, $4)
+              )
+            RETURNING
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload,
+                dlq_reason,
+                dlq_at,
+                original_run_lease
+            "#
+        ))
+        .bind(&filter.kind)
+        .bind(&filter.queue)
+        .bind(&filter.tag)
+        .bind(filter.before_id)
+        .bind(filter.before_dlq_at)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if moved.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(0);
+        }
+
+        let run_at = Utc::now();
+        let mut queues = BTreeSet::new();
+        let mut ready_rows = Vec::with_capacity(moved.len());
+        for moved in moved {
+            let queue = moved.queue.clone();
+            let priority = moved.priority;
+            queues.insert(queue.clone());
+            let mut payload = RuntimePayload::from_json(moved.payload.clone())?;
+            payload.set_progress(None);
+            ready_rows.push(moved.into_retry_ready_row(queue, priority, run_at, payload.into_json()));
+        }
+
+        let revived = ready_rows.len() as u64;
+        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Failed))
+            .await?;
+        self.notify_queues_tx(&mut tx, queues.into_iter()).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(revived)
     }
 
     pub async fn discard_failed_by_kind(&self, pool: &PgPool, kind: &str) -> Result<u64, AwaError> {

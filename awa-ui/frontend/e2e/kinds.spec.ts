@@ -15,12 +15,21 @@ test.describe("Kinds page", () => {
     const kindsTable = page.getByRole("grid", { name: "Job kinds" });
     await expect(kindsTable).toBeVisible();
 
+    // Descriptor-backed kind renders its display name + description.
     await expect(kindsTable.getByText("E2E Job")).toBeVisible();
     await expect(kindsTable.getByText("e2e_job")).toBeVisible();
     await expect(
       kindsTable.getByText("End-to-end job kind used for UI coverage")
     ).toBeVisible();
 
+    // Legacy kind has no descriptor, so its raw name is the display label
+    // and the status column shows "Not declared", not "Live". Match the
+    // badge exactly — "Not declared" also appears inside the
+    // descriptor-sync subtitle below the kind name, which would otherwise
+    // trip Playwright's strict-mode multi-match check.
+    await expect(kindsTable.getByText("legacy_job")).toBeVisible();
+    const legacyRow = kindsTable.getByRole("row", { name: /legacy_job/ });
+    await expect(legacyRow.getByText("Not declared", { exact: true })).toBeVisible();
   });
 
   test("clicking a kind navigates to jobs with kind filter", async ({ page }) => {

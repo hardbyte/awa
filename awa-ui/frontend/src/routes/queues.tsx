@@ -6,6 +6,7 @@ import {
 } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
 import {
+  fetchDlqDepth,
   fetchQueues,
   fetchQueueRuntime,
   pauseQueue,
@@ -40,6 +41,13 @@ export function QueuesPage() {
     queryKey: ["queues"],
     queryFn: fetchQueues,
     refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
+  const dlqDepthQuery = useQuery({
+    queryKey: ["dlq-depth"],
+    queryFn: fetchDlqDepth,
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
   });
 
   const runtimeQuery = useQuery<QueueRuntimeSummary[]>({
@@ -109,7 +117,9 @@ export function QueuesPage() {
   }
 
   function queueLabel(q: QueueStats): string {
-    return q.display_name ?? q.queue;
+    // Treat empty display_name as missing — `??` alone would let
+    // `display_name: ""` render a blank label.
+    return q.display_name?.trim() ? q.display_name : q.queue;
   }
 
   function descriptorSyncLabel(q: QueueStats): string {
@@ -120,9 +130,30 @@ export function QueuesPage() {
       : `Descriptor seen ${timeAgo(q.descriptor_last_seen_at)}`;
   }
 
+  const dlqByQueue = new Map<string, number>(
+    (dlqDepthQuery.data?.by_queue ?? []).map(({ queue, count }) => [queue, count]),
+  );
+
   return (
     <div className="space-y-4">
       <Heading level={2}>Queues</Heading>
+
+      {dlqDepthQuery.data && dlqDepthQuery.data.total > 0 && (
+        <Link
+          to="/dlq"
+          className="flex items-center justify-between rounded-lg border border-danger/30 bg-danger/5 p-3 no-underline hover:bg-danger/10"
+        >
+          <div className="flex items-center gap-2">
+            <Badge intent="danger">DLQ</Badge>
+            <span className="text-sm">
+              {dlqDepthQuery.data.total.toLocaleString()} permanently failed job(s)
+              {dlqDepthQuery.data.by_queue.length > 0 &&
+                ` across ${dlqDepthQuery.data.by_queue.length} queue(s)`}
+            </span>
+          </div>
+          <span className="text-sm text-muted-fg">Inspect →</span>
+        </Link>
+      )}
 
       {/* Mobile card layout */}
       {queues.length > 0 && (
@@ -140,7 +171,7 @@ export function QueuesPage() {
                   >
                     {queueLabel(q)}
                   </Link>
-                  {q.display_name && (
+                  {q.display_name?.trim() && (
                     <div className="text-xs text-muted-fg">{q.queue}</div>
                   )}
                   <div className="mt-1 text-xs text-muted-fg">
@@ -258,6 +289,7 @@ export function QueuesPage() {
           <TableBody>
             {queues.map((q) => {
               const runtime = runtimeByQueue.get(q.queue);
+              const dlqCount = dlqByQueue.get(q.queue);
               return (
                 <TableRow key={q.queue} id={q.queue}>
                   <TableCell className="font-medium">
@@ -291,6 +323,16 @@ export function QueuesPage() {
                     <span className={q.failed > 0 ? "text-danger" : ""}>
                       {q.failed.toLocaleString()}
                     </span>
+                    {dlqCount ? (
+                      <Link
+                        to="/dlq"
+                        search={{ q: `queue:${q.queue}` }}
+                        className="ml-2 text-xs text-danger underline"
+                        title="DLQ depth"
+                      >
+                        (+{dlqCount.toLocaleString()} DLQ)
+                      </Link>
+                    ) : null}
                   </TableCell>
                   <TableCell>
                     {q.waiting_external > 0 ? q.waiting_external.toLocaleString() : "-"}
