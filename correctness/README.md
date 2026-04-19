@@ -85,6 +85,14 @@ What is intentionally not modeled:
   passes cleanly (2,076 distinct states), confirming the current lock
   ordering is deadlock-free. The demo config uses a deliberately
   cycle-creating plan pair to prove the detector itself works.
+- `storage/AwaSegmentedStorageTrace.tla` /
+  `storage/AwaSegmentedStorageTrace.cfg` /
+  `storage/AwaSegmentedStorageTraceBroken.cfg`: trace-validation
+  harness. Takes a hand-transcribed sequence of events from a
+  queue-storage runtime test and verifies each transition is a legal
+  firing of the corresponding base spec action. The snooze trace
+  (6 events) is accepted; a deliberately-broken variant trips deadlock
+  at traceIdx = 2 to confirm the checker rejects invalid sequences.
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -127,6 +135,8 @@ From the repository root:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
