@@ -488,7 +488,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             before_id,
                             before_dlq_at,
                             limit: Some(limit),
-                            ..Default::default()
                         };
                         let rows = awa_model::dlq::list_dlq(&pool, &filter).await?;
                         if rows.is_empty() {

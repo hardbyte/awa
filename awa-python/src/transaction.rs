@@ -358,7 +358,7 @@ fn parse_datetime_str(value: &str) -> PyResult<DateTime<Utc>> {
 /// All keys are optional and default to UniqueOpts::default().
 pub fn parse_unique_opts(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<UniqueOpts> {
     let dict = value
-        .downcast::<PyDict>()
+        .cast::<PyDict>()
         .map_err(|_| validation_error("unique_opts must be a dict"))?;
 
     let mut opts = UniqueOpts::default();

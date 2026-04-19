@@ -432,10 +432,8 @@ impl PyJob {
         py: Python<'py>,
         token: PyRef<'_, PyCallbackToken>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use awa_model::admin::{
-            check_callback_state, enter_callback_wait, CallbackPollResult,
-        };
         use crate::errors::map_awa_error;
+        use awa_model::admin::{check_callback_state, enter_callback_wait, CallbackPollResult};
 
         let pool = self.pool.clone().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
@@ -464,7 +462,11 @@ impl PyJob {
                         return Python::attach(|py| json_to_py(py, &payload));
                     }
                     CallbackPollResult::Pending => { /* Already in waiting_external */ }
-                    CallbackPollResult::Stale { token, current, state } => {
+                    CallbackPollResult::Stale {
+                        token,
+                        current,
+                        state,
+                    } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
                             "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
                         ))));
@@ -502,7 +504,11 @@ impl PyJob {
                     CallbackPollResult::Pending => {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
-                    CallbackPollResult::Stale { token, current, state } => {
+                    CallbackPollResult::Stale {
+                        token,
+                        current,
+                        state,
+                    } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
                             "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
                         ))));

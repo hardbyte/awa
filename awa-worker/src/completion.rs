@@ -25,7 +25,7 @@ fn completion_shards(storage: &RuntimeStorage) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or_else(|| match storage {
+        .unwrap_or(match storage {
             RuntimeStorage::Canonical => 8,
             RuntimeStorage::QueueStorage(_) => 4,
         })

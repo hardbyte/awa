@@ -413,6 +413,7 @@ impl JobExecutor {
 ///
 /// Returns a `CompletionOutcome` indicating whether the state transition was
 /// applied (with an optional lifecycle event) or ignored as stale.
+#[allow(clippy::too_many_arguments)]
 async fn complete_job(
     pool: &PgPool,
     job: &JobRow,
