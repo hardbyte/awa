@@ -61,6 +61,10 @@ What is intentionally not modeled:
 - `storage/AwaSegmentedStorageInterleavings.cfg`: alternate two-worker config
   for the same segmented-storage spec, used to exercise stale completion and
   waiting/resume interleavings without changing the base safety model
+- `scheduling/AwaPriorityAging.tla` / `scheduling/AwaPriorityAging.cfg`:
+  focused liveness model for strict priority dispatch plus maintenance-based
+  aging, checking that long-waiting low-priority work eventually reaches the
+  worker even while high-priority work is recycled
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -99,6 +103,7 @@ From the repository root:
 ./correctness/run-tlc.sh core/AwaCore.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+./correctness/run-tlc.sh scheduling/AwaPriorityAging.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
@@ -172,6 +177,12 @@ gap-skipping claim advance. The key invariants are that `attempt_state` can
 only exist for leased or waiting jobs, waiting jobs hold no live lease,
 deferred jobs hold no live runtime state, and ready/deferred/waiting/lease
 segments cannot be pruned while they still own live rows.
+
+`AwaPriorityAging` is a separate scheduling model for ADR-005. It deliberately
+keeps storage out of scope and instead checks the dispatch rule itself:
+available work is claimed in strict `priority, enqueue-order` order, but the
+maintenance aging step eventually promotes long-waiting low-priority work to
+priority 1 so it cannot starve behind recurring high-priority traffic.
 
 `AwaBatcher` models the async completion path between handler return and DB
 update. In the real system (`awa-worker/src/completion.rs`), completed jobs
