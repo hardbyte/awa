@@ -500,13 +500,6 @@ BEGIN
     USING p_id;
 
     IF FOUND THEN
-        EXECUTE format(
-            'UPDATE %I.queue_lanes
-             SET running_count = GREATEST(0, running_count - 1)
-             WHERE queue = $1 AND priority = $2',
-            v_schema
-        )
-        USING v_queue, v_priority;
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,
@@ -526,13 +519,6 @@ BEGIN
     USING p_id;
 
     IF FOUND THEN
-        EXECUTE format(
-            'UPDATE %I.queue_lanes
-             SET completed_count = GREATEST(0, completed_count - 1)
-             WHERE queue = $1 AND priority = $2',
-            v_schema
-        )
-        USING v_queue, v_priority;
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,
