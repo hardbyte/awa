@@ -23,10 +23,13 @@ test.describe("Kinds page", () => {
     ).toBeVisible();
 
     // Legacy kind has no descriptor, so its raw name is the display label
-    // and the status column shows "Not declared", not "Live".
+    // and the status column shows "Not declared", not "Live". Match the
+    // badge exactly — "Not declared" also appears inside the
+    // descriptor-sync subtitle below the kind name, which would otherwise
+    // trip Playwright's strict-mode multi-match check.
     await expect(kindsTable.getByText("legacy_job")).toBeVisible();
     const legacyRow = kindsTable.getByRole("row", { name: /legacy_job/ });
-    await expect(legacyRow.getByText("Not declared")).toBeVisible();
+    await expect(legacyRow.getByText("Not declared", { exact: true })).toBeVisible();
   });
 
   test("clicking a kind navigates to jobs with kind filter", async ({ page }) => {
