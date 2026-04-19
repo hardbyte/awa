@@ -172,6 +172,79 @@ Together the two specs cover complementary risks:
   occur if the lock ordering were changed — proves the current
   ordering is safe
 
+## Trace validation
+
+`AwaSegmentedStorageTrace.tla` takes a hand-transcribed sequence of
+events from a queue-storage runtime test and verifies each transition
+is a legal firing of the corresponding base spec action. It is a
+single-threaded replay harness — one step at a time, no exploration
+of interleavings — but it catches:
+
+- **transcription errors**: if the transcribed sequence does not
+  correspond to any valid base spec behaviour, TLC reports deadlock
+  at the first failing step, and the traceIdx variable names the
+  event that could not fire
+- **spec regressions**: if a future edit to the base spec tightens a
+  precondition, an existing trace that used to pass will now fail;
+  TLC reports deadlock at the newly-rejected step
+- **inherited invariant regressions**: every safety invariant from
+  AwaSegmentedStorage is checked at every step of the replay, so a
+  trace that sneaks through an invalid intermediate state is caught
+
+### Transcribing a new trace
+
+Pick a test in `awa/tests/queue_storage_runtime_test.rs` whose
+lifecycle is clear. Typical shape: one enqueue, one or two claims,
+a terminal transition (complete / fail-to-dlq / cancel / etc.),
+optionally a retry-from-deferred or retry-from-dlq round trip.
+
+1. Read the test and its custom Worker impl. Work out the sequence of
+   **logical** transitions the test exercises — not the individual
+   SQL statements. The correspondence table above maps test-level
+   concepts (snooze, terminal failure, callback timeout) to base
+   spec actions.
+2. Write the sequence as a `<<...>>` tuple of event records in the
+   TLA file. Each event has an `action` field (the action name as a
+   string) and the arguments that action takes: `job` for most
+   events, plus `worker` for events that take `(w, j)`. See the
+   `SnoozeTrace` and `BrokenTrace` operators for shape.
+3. Add a specification in the TLA file:
+   `SpecYourTrace == TraceInit /\ [][TraceNextFor(YourTrace)]_<<vars, traceIdx>>`.
+4. Add a negative-witness invariant:
+   `YourTraceIncomplete == traceIdx < Len(YourTrace)`.
+5. Add a config file (e.g. `AwaSegmentedStorageTraceYours.cfg`) with
+   `SPECIFICATION SpecYourTrace` and `INVARIANTS ... YourTraceIncomplete`.
+6. Run with `./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceYours.cfg`.
+   Expected outcome for a valid trace: `Invariant YourTraceIncomplete
+   is violated` (the positive witness that the trace was fully consumed).
+
+### What the checker does not catch
+
+- **Races that require concurrent transactions.** The trace replay is
+  single-threaded. If a test's behaviour depends on a
+  rotate-mid-claim interleaving, the trace spec won't exercise that
+  path — use `AwaSegmentedStorageRaces` for race concerns.
+- **Timing-dependent maintenance steps.** The sample traces omit
+  heartbeat and rotate/prune events because they are noise the tests
+  tolerate. If a test's correctness DEPENDS on a specific
+  rotate-then-claim ordering, transcribe those events in too.
+- **Events outside the transcribed set.** If a test fires an action
+  the harness doesn't know about (e.g. a future `RetryFromDeferred`
+  variant we haven't modelled), extend the disjunction in
+  `TraceStep` to include it.
+
+### Current traces
+
+- `SnoozeTrace`: 6 events — EnqueueReady → Claim → RetryToDeferred →
+  PromoteDeferred → Claim → FastComplete. Accepts cleanly with 7
+  states (1 init + 6 steps). Transcribed from
+  `test_queue_storage_runtime_snooze`.
+- `BrokenTrace`: same 6 events but with steps 3 and 4 swapped so
+  PromoteDeferred fires before RetryToDeferred. TLC reports deadlock
+  at traceIdx = 2 (after EnqueueReady + Claim, before the
+  out-of-order PromoteDeferred). Confirms the checker rejects invalid
+  traces.
+
 ### Bulk ops atomicity
 
 `bulk_retry_from_dlq` / `purge_dlq` / `bulk_move_failed_to_dlq` run as

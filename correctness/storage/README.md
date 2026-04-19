@@ -217,6 +217,39 @@ functions as a regression harness: if any of those locks are weakened,
 the race re-appears. See [`MAPPING.md`](./MAPPING.md) for the full
 lock-interaction analysis.
 
+## Trace-validation harness
+
+[`AwaSegmentedStorageTrace.tla`](./AwaSegmentedStorageTrace.tla)
+extends the base spec with a replay harness that verifies a concrete
+sequence of events transcribed from a real queue-storage runtime
+test is accepted by the spec. The current checked-in traces:
+
+- `SnoozeTrace` (6 events: enqueue → claim → retry-to-deferred →
+  promote → claim → fast-complete) — accepted cleanly, 7 states.
+  Transcribed from `test_queue_storage_runtime_snooze`.
+- `BrokenTrace` (same events with steps 3 and 4 swapped) —
+  rejected with a deadlock at traceIdx = 2, proving the harness
+  catches invalid sequences.
+
+Run:
+
+```bash
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg
+```
+
+Expected outcomes:
+
+- Snooze config: TLC reports `Invariant SnoozeTraceIncomplete is
+  violated` — this is the **positive witness** that the trace was
+  fully consumed (traceIdx reached Len(Trace) = 6).
+- Broken config: TLC reports `Deadlock reached` at traceIdx = 2 —
+  the third event (`PromoteDeferred`) has no matching enabled spec
+  action.
+
+See [`MAPPING.md`](./MAPPING.md#trace-validation) for the full
+description of how to transcribe and add a new trace.
+
 ## Known modelling gaps
 
 See [`../README.md`](../README.md) for the full Known Divergences list.
