@@ -89,6 +89,12 @@ RecycleHi ==
     /\ highRecycles' = highRecycles + 1
     /\ UNCHANGED <<running, lastClaimed>>
 
+RecycleHiForever ==
+    /\ jobState["hi"] = "completed"
+    /\ jobState' = [jobState EXCEPT !["hi"] = "available"]
+    /\ priority' = [priority EXCEPT !["hi"] = 1]
+    /\ UNCHANGED <<enqueueOrder, nextEnqueueOrder, highRecycles, running, lastClaimed>>
+
 AgeLow ==
     /\ jobState["lo"] = "available"
     /\ priority["lo"] > 1
@@ -104,6 +110,7 @@ Next ==
     \/ CompleteHi
     \/ CompleteLo
     \/ RecycleHi
+    \/ RecycleHiForever
     \/ AgeLow
     \/ Stutter
 
@@ -117,6 +124,14 @@ FairSpec ==
     /\ WF_vars(CompleteLo)
     /\ WF_vars(RecycleHi)
     /\ WF_vars(AgeLow)
+
+NoAgingFairSpec ==
+    Spec
+    /\ WF_vars(ClaimHi)
+    /\ WF_vars(ClaimLo)
+    /\ WF_vars(CompleteHi)
+    /\ WF_vars(CompleteLo)
+    /\ WF_vars(RecycleHiForever)
 
 TypeOK ==
     /\ jobState \in [Jobs -> JobStates]

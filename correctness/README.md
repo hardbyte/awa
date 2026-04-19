@@ -61,10 +61,16 @@ What is intentionally not modeled:
 - `storage/AwaSegmentedStorageInterleavings.cfg`: alternate two-worker config
   for the same segmented-storage spec, used to exercise stale completion and
   waiting/resume interleavings without changing the base safety model
+- `storage/AwaSegmentedStorageTwoJobs.cfg`: alternate two-job config for the
+  same segmented-storage spec, used to exercise lane ordering and uniqueness
+  across enqueue/promotion/resume churn
 - `scheduling/AwaPriorityAging.tla` / `scheduling/AwaPriorityAging.cfg`:
   focused liveness model for strict priority dispatch plus maintenance-based
   aging, checking that long-waiting low-priority work eventually reaches the
   worker even while high-priority work is recycled
+- `scheduling/AwaPriorityNoAging.cfg`: alternate config for the same scheduling
+  model that removes fairness on the aging step; TLC should produce a
+  starvation counterexample for the low-priority job
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -103,7 +109,9 @@ From the repository root:
 ./correctness/run-tlc.sh core/AwaCore.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageTwoJobs.cfg
 ./correctness/run-tlc.sh scheduling/AwaPriorityAging.tla
+./correctness/run-tlc.sh scheduling/AwaPriorityAging.tla scheduling/AwaPriorityNoAging.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
@@ -178,11 +186,20 @@ only exist for leased or waiting jobs, waiting jobs hold no live lease,
 deferred jobs hold no live runtime state, and ready/deferred/waiting/lease
 segments cannot be pruned while they still own live rows.
 
+Important scope note: `AwaSegmentedStorage` still models claim and prune as
+atomic actions. That means it does not yet cover split-phase races like
+"snapshot cursor, rotate, then commit with stale cursor" or "check prune
+precondition, interleave a rescue, then prune". It also does not yet model a
+dedicated DLQ family or terminal-family rotation/prune.
+
 `AwaPriorityAging` is a separate scheduling model for ADR-005. It deliberately
 keeps storage out of scope and instead checks the dispatch rule itself:
 available work is claimed in strict `priority, enqueue-order` order, but the
 maintenance aging step eventually promotes long-waiting low-priority work to
 priority 1 so it cannot starve behind recurring high-priority traffic.
+`AwaPriorityNoAging.cfg` is the companion negative check: the same model without
+fairness on `AgeLow`, which should exhibit a starvation trace for the low-
+priority job.
 
 `AwaBatcher` models the async completion path between handler return and DB
 update. In the real system (`awa-worker/src/completion.rs`), completed jobs

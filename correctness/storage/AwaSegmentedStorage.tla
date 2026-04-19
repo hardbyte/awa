@@ -299,7 +299,6 @@ MaterializeAttemptState(j) ==
     /\ j \in activeLeases
     /\ j \notin attemptState
     /\ attemptState' = attemptState \cup {j}
-    /\ heartbeatFresh' = heartbeatFresh \cup {j}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingEntries,
@@ -308,6 +307,7 @@ MaterializeAttemptState(j) ==
                    leaseOwner,
                    runLease,
                    taskLease,
+                   heartbeatFresh,
                    progressTouched,
                    laneSeq,
                    readySegmentOf,
@@ -325,7 +325,6 @@ MaterializeAttemptState(j) ==
                    laneState>>
 
 Heartbeat(j) ==
-    /\ j \in attemptState
     /\ j \in activeLeases
     /\ heartbeatFresh' = heartbeatFresh \cup {j}
     /\ UNCHANGED <<readyEntries,
@@ -354,7 +353,6 @@ Heartbeat(j) ==
                    laneState>>
 
 LoseHeartbeat(j) ==
-    /\ j \in attemptState
     /\ j \in activeLeases
     /\ j \in heartbeatFresh
     /\ heartbeatFresh' = heartbeatFresh \ {j}
@@ -445,6 +443,7 @@ ParkToWaiting(w, j) ==
                    leaseSegmentCursor>>
 
 ResumeWaitingToReady(j) ==
+    \* Callback resolution and timeout resume share this same storage move.
     /\ j \in waitingEntries
     /\ j \in attemptState
     /\ laneState.appendSeq <= MaxAppendSeq
@@ -520,6 +519,8 @@ FastComplete(w, j) ==
     /\ activeLeases' = activeLeases \ {j}
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
+    /\ heartbeatFresh' = heartbeatFresh \ {j}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<readyEntries,
@@ -527,9 +528,7 @@ FastComplete(w, j) ==
                    waitingEntries,
                    runLease,
                    attemptState,
-                   heartbeatFresh,
                    progressTouched,
-                   laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
                    waitingSegmentOf,
@@ -555,13 +554,13 @@ StatefulComplete(w, j) ==
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ progressTouched' = progressTouched \ {j}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingEntries,
                    runLease,
-                   laneSeq,
                    readySegmentOf,
                    deferredSegmentOf,
                    waitingSegmentOf,
@@ -608,7 +607,6 @@ RetryToDeferred(w, j) ==
 
 RescueToReady(j) ==
     /\ j \in activeLeases
-    /\ j \in attemptState
     /\ j \notin heartbeatFresh
     /\ laneState.appendSeq <= MaxAppendSeq
     /\ readySegments[readySegmentCursor] = "open"
@@ -1040,6 +1038,7 @@ WaitingRequiresAttemptState == waitingEntries \subseteq attemptState
 ActiveLeasesSubsetReadyEntries == activeLeases \subseteq readyEntries
 AttemptStateRequiresLeaseOrWaiting == attemptState \subseteq (activeLeases \cup waitingEntries)
 FreshHeartbeatRequiresAttemptState == heartbeatFresh \subseteq attemptState
+FreshHeartbeatRequiresLease == heartbeatFresh \subseteq activeLeases
 ProgressRequiresAttemptState == progressTouched \subseteq attemptState
 
 TerminalHasNoLiveRuntime ==

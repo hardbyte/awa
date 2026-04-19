@@ -240,7 +240,9 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
 | TLA7 | AwaSegmentedStorage | Segmented storage safety, waiting flow, optional attempt-state, prune safety |
 | TLA8 | AwaSegmentedStorageInterleavings | Two-worker segmented-storage interleavings |
+| TLA8b | AwaSegmentedStorageTwoJobs | Two-job segmented-storage lane ordering and uniqueness |
 | TLA9 | AwaPriorityAging | Priority ordering plus starvation prevention via aging |
+| TLA10 | AwaPriorityNoAging | Negative check: starvation appears without aging fairness |
 
 ## Running Tests
 
@@ -303,7 +305,9 @@ cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test 
 ./correctness/run-tlc.sh core/AwaCore.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageTwoJobs.cfg
 ./correctness/run-tlc.sh scheduling/AwaPriorityAging.tla
+./correctness/run-tlc.sh scheduling/AwaPriorityAging.tla scheduling/AwaPriorityNoAging.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
