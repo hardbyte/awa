@@ -49,6 +49,15 @@ def _move_ready_to_failed_done(client: awa.Client, job_id: int) -> None:
                 unique_key,
                 unique_states,
                 payload
+        ),
+        released AS (
+            SELECT awa.release_queue_storage_unique_claim(
+                job_id,
+                unique_key,
+                unique_states,
+                'available'::awa.job_state
+            )
+            FROM moved
         )
         INSERT INTO {SCHEMA}.done_entries (
             ready_slot,
@@ -124,6 +133,15 @@ async def _move_ready_to_failed_done_async(client: awa.AsyncClient, job_id: int)
                     unique_key,
                     unique_states,
                     payload
+            ),
+            released AS (
+                SELECT awa.release_queue_storage_unique_claim(
+                    job_id,
+                    unique_key,
+                    unique_states,
+                    'available'::awa.job_state
+                )
+                FROM moved
             )
             INSERT INTO {SCHEMA}.done_entries (
                 ready_slot,
@@ -177,6 +195,9 @@ def sync_client():
     client = awa.Client(DATABASE_URL)
     client.migrate()
     client.install_queue_storage(schema=SCHEMA, reset=True)
+    tx = client.transaction()
+    tx.execute("DELETE FROM awa.job_unique_claims")
+    tx.commit()
     try:
         yield client
     finally:
@@ -214,7 +235,7 @@ def test_bulk_move_and_purge(sync_client):
         job = sync_client.insert(DlqPyJob(value=f"b{i}"), queue=queue)
         _move_ready_to_failed_done(sync_client, job.id)
 
-    moved = sync_client.bulk_move_failed_to_dlq(queue=queue, reason="py_bulk")
+    moved = sync_client.bulk_move_failed_to_dlq(reason="py_bulk", allow_all=True)
     assert moved == 3
     assert sync_client.dlq_depth(queue=queue) == 3
 
@@ -246,6 +267,60 @@ def test_purge_dlq_job_single(sync_client):
     assert sync_client.purge_dlq_job(job.id) is True
     assert sync_client.purge_dlq_job(job.id) is False
     assert sync_client.get_dlq_job(job.id) is None
+
+
+def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
+    retry_job = sync_client.insert(DlqPyJob(value="retry_all"), queue="pydlq_retry_all")
+    _move_ready_to_failed_done(sync_client, retry_job.id)
+    sync_client.move_failed_to_dlq(retry_job.id, "py_retry_all")
+
+    with pytest.raises(awa.ValidationError):
+        sync_client.bulk_retry_from_dlq()
+
+    retried = sync_client.bulk_retry_from_dlq(allow_all=True)
+    assert retried == 1
+    assert sync_client.dlq_depth(queue="pydlq_retry_all") == 0
+
+    purge_job = sync_client.insert(DlqPyJob(value="purge_all"), queue="pydlq_purge_all")
+    _move_ready_to_failed_done(sync_client, purge_job.id)
+    sync_client.move_failed_to_dlq(purge_job.id, "py_purge_all")
+
+    with pytest.raises(awa.ValidationError):
+        sync_client.purge_dlq()
+
+    purged = sync_client.purge_dlq(allow_all=True)
+    assert purged == 1
+    assert sync_client.dlq_depth(queue="pydlq_purge_all") == 0
+
+
+def test_retry_from_dlq_surfaces_unique_conflict(sync_client):
+    queue = "pydlq_unique"
+    unique_opts = {"by_queue": True, "by_args": True}
+
+    original = sync_client.insert(
+        DlqPyJob(value="same"),
+        queue=queue,
+        unique_opts=unique_opts,
+    )
+    _move_ready_to_failed_done(sync_client, original.id)
+    sync_client.move_failed_to_dlq(original.id, "py_unique")
+    tx = sync_client.transaction()
+    tx.execute("DELETE FROM awa.job_unique_claims WHERE job_id = $1", original.id)
+    tx.commit()
+
+    replacement = sync_client.insert(
+        DlqPyJob(value="same"),
+        queue=queue,
+        unique_opts=unique_opts,
+    )
+    assert replacement.id != original.id
+
+    with pytest.raises(awa.UniqueConflict):
+        sync_client.retry_from_dlq(original.id)
+
+    dlq_entry = sync_client.get_dlq_job(original.id)
+    assert dlq_entry is not None
+    assert dlq_entry.reason == "py_unique"
 
 
 @pytest.mark.asyncio

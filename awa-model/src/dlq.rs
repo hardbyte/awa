@@ -179,20 +179,32 @@ pub async fn move_failed_to_dlq(
     get_dlq_job(pool, job_id).await
 }
 
+/// Bulk-move failed terminal rows into the DLQ.
+///
+/// Returns the number of rows moved. Requires at least one of `kind` or
+/// `queue` unless `allow_all` is `true`, which is an explicit opt-in to move
+/// every failed row currently stored in queue_storage.
+///
+/// Preserves the source row's progress snapshot and error history so manual
+/// operator moves do not discard the last known execution state.
 pub async fn bulk_move_failed_to_dlq(
     pool: &PgPool,
     kind: Option<&str>,
     queue: Option<&str>,
     reason: &str,
+    allow_all: bool,
 ) -> Result<u64, AwaError> {
-    if kind.is_none() && queue.is_none() {
+    if !allow_all && kind.is_none() && queue.is_none() {
         return Err(AwaError::Validation(
-            "bulk_move_failed_to_dlq requires at least one of kind or queue".into(),
+            "bulk_move_failed_to_dlq requires at least one of kind or queue (or allow_all=true)"
+                .into(),
         ));
     }
 
     let store = active_queue_storage(pool).await?;
-    store.bulk_move_failed_to_dlq(pool, kind, queue, reason).await
+    store
+        .bulk_move_failed_to_dlq(pool, kind, queue, reason)
+        .await
 }
 
 pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRow>, AwaError> {
@@ -314,6 +326,15 @@ pub async fn dlq_depth_by_queue(pool: &PgPool) -> Result<Vec<(String, i64)>, Awa
     .map_err(Into::into)
 }
 
+/// Retry a single DLQ row back into live queue storage.
+///
+/// Atomic: deletes the DLQ row and inserts a fresh ready/deferred row in one
+/// transaction. Resets `attempt = 0`, `run_lease = 0`, and clears any
+/// per-attempt progress snapshot because a revived attempt starts from zero.
+/// Error history is preserved in payload metadata for post-mortem visibility.
+///
+/// If the revived row conflicts with a live unique claim, this returns
+/// [`AwaError::UniqueConflict`] and the DLQ row remains in place.
 pub async fn retry_from_dlq(
     pool: &PgPool,
     job_id: i64,
@@ -323,6 +344,14 @@ pub async fn retry_from_dlq(
     store.retry_from_dlq(pool, job_id, opts).await
 }
 
+/// Bulk-retry DLQ rows matching the filter.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`. This guard prevents an empty payload from reviving the entire DLQ
+/// by accident.
+///
+/// Like single-row retry, unique-claim conflicts abort the transaction and
+/// leave the affected DLQ rows untouched.
 pub async fn bulk_retry_from_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
@@ -339,6 +368,11 @@ pub async fn bulk_retry_from_dlq(
     store.bulk_retry_from_dlq(pool, filter).await
 }
 
+/// Purge DLQ rows matching the filter.
+///
+/// Requires at least one of `kind`, `queue`, or `tag` unless `allow_all` is
+/// `true`, which is the explicit "yes, purge the whole DLQ" escape hatch for
+/// operator tooling.
 pub async fn purge_dlq(
     pool: &PgPool,
     filter: &ListDlqFilter,
@@ -390,6 +424,11 @@ pub async fn purge_dlq_job(pool: &PgPool, job_id: i64) -> Result<bool, AwaError>
     Ok(result.rows_affected() > 0)
 }
 
+/// Purge DLQ rows older than the configured retention horizon.
+///
+/// Deletes up to `batch_size` rows per call, ordered by oldest-first
+/// `(dlq_at, job_id)`, optionally restricted to a single queue. Intended for
+/// maintenance loops rather than interactive operator use.
 pub async fn cleanup_dlq(
     pool: &PgPool,
     retention: Duration,

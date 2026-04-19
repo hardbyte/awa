@@ -217,15 +217,18 @@ pub struct BulkMovePayload {
     pub queue: Option<String>,
     #[serde(default = "default_move_reason")]
     pub reason: String,
+    #[serde(default)]
+    pub all: bool,
 }
 
 fn default_move_reason() -> String {
     "ui_bulk_move".to_string()
 }
 
-/// Bulk-move failed jobs from `jobs_hot` into the DLQ. Requires at least one
-/// of `kind` or `queue` to avoid accidentally archiving every failed row in
-/// the system.
+/// Bulk-move failed jobs from terminal storage into the DLQ.
+///
+/// Requires at least one of `kind` or `queue` unless `all=true` is provided
+/// explicitly.
 pub async fn bulk_move_failed(
     State(state): State<AppState>,
     Json(payload): Json<BulkMovePayload>,
@@ -236,6 +239,7 @@ pub async fn bulk_move_failed(
         payload.kind.as_deref(),
         payload.queue.as_deref(),
         &payload.reason,
+        payload.all,
     )
     .await?;
     // Mirror the worker: emit the `awa.job.dlq_moved` counter so operator

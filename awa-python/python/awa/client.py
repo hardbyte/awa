@@ -11,6 +11,7 @@ or migration from the 0.4.x ``_sync`` pattern.
 
 from __future__ import annotations
 
+import datetime as dt
 from typing import Any, Awaitable, Callable, TypeVar
 
 from awa._awa import (
@@ -250,7 +251,7 @@ class AsyncClient:
         self,
         job_id: int,
         *,
-        run_at: Any | None = None,
+        run_at: dt.datetime | None = None,
         priority: int | None = None,
         queue: str | None = None,
     ) -> Job | None:
@@ -265,11 +266,11 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int:
         """Bulk-retry DLQ rows matching the filter. Returns revived count."""
         return await self._raw.bulk_retry_from_dlq(
-            kind=kind, queue=queue, tag=tag, all=all
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
         )
 
     async def move_failed_to_dlq(
@@ -284,10 +285,11 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         reason: str = "manual",
+        allow_all: bool = False,
     ) -> int:
-        """Bulk-move failed jobs into the DLQ. At least one of kind/queue required."""
+        """Bulk-move failed jobs into the DLQ."""
         return await self._raw.bulk_move_failed_to_dlq(
-            kind=kind, queue=queue, reason=reason
+            kind=kind, queue=queue, reason=reason, allow_all=allow_all
         )
 
     async def purge_dlq_job(self, job_id: int) -> bool:
@@ -300,10 +302,12 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int:
         """Bulk-delete DLQ rows matching the filter."""
-        return await self._raw.purge_dlq(kind=kind, queue=queue, tag=tag, all=all)
+        return await self._raw.purge_dlq(
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+        )
 
     async def health_check(self) -> HealthCheck:
         """Runtime health check."""
@@ -808,7 +812,7 @@ class Client:
         self,
         job_id: int,
         *,
-        run_at: Any | None = None,
+        run_at: dt.datetime | None = None,
         priority: int | None = None,
         queue: str | None = None,
     ) -> Job | None:
@@ -823,11 +827,11 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int:
         """Bulk-retry DLQ rows matching the filter."""
         return self._raw.bulk_retry_from_dlq_sync(
-            kind=kind, queue=queue, tag=tag, all=all
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
         )
 
     def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None:
@@ -840,10 +844,11 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         reason: str = "manual",
+        allow_all: bool = False,
     ) -> int:
         """Bulk-move failed jobs into the DLQ."""
         return self._raw.bulk_move_failed_to_dlq_sync(
-            kind=kind, queue=queue, reason=reason
+            kind=kind, queue=queue, reason=reason, allow_all=allow_all
         )
 
     def purge_dlq_job(self, job_id: int) -> bool:
@@ -856,7 +861,9 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
-        all: bool = False,
+        allow_all: bool = False,
     ) -> int:
         """Bulk-delete DLQ rows matching the filter."""
-        return self._raw.purge_dlq_sync(kind=kind, queue=queue, tag=tag, all=all)
+        return self._raw.purge_dlq_sync(
+            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+        )
