@@ -33,7 +33,8 @@ REST, and Web UI APIs.
 ### Separate table, not a new live state
 
 DLQ rows are stored in `{schema}.dlq_entries`, not in `ready_entries`,
-`deferred_jobs`, or `done_entries`, and not as a new dispatchable `job_state`.
+`deferred_jobs`, or `terminal_entries`, and not as a new dispatchable
+`job_state`.
 The row keeps the failed job snapshot plus:
 
 - `dlq_reason`
@@ -44,7 +45,7 @@ This keeps dead-letter history off the runnable and lease-maintenance paths.
 
 ### Population paths
 
-There are two supported ways into the DLQ:
+There are two ways DLQ rows are created:
 
 1. Runtime routing for terminal failures on DLQ-enabled queues.
 2. Operator-initiated bulk or single-row moves of already-failed terminal rows.

@@ -6,17 +6,18 @@ Awa (Maori: river) is a Postgres-native background job queue providing durable, 
 
 The Rust runtime owns all queue machinery -- polling, heartbeating, crash recovery, and dispatch. Python workers are callbacks invoked by this runtime via PyO3, inheriting Rust-grade reliability without reimplementing queue internals.
 
-## Queue storage status
+## Storage Engine
 
-Queue storage is the intended worker engine for the redesign branch.
+Queue storage is Awa's worker engine.
 
 ADR-019 is the source of truth for storage internals:
 
 - [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
 
-This overview is still useful for runtime boundaries and subsystems, but parts
-of the deeper storage walkthrough still describe the historical canonical
-engine. When this document and ADR-019 disagree, ADR-019 wins.
+This overview focuses on the current runtime boundaries and subsystems. The
+migration and compatibility surfaces for older SQL entry points are documented
+in [migrations.md](migrations.md). ADR-019 is the storage-design source of
+truth when this overview needs more detail.
 
 ### Queue storage at a glance
 
@@ -155,20 +156,18 @@ Application code
 awa_model::insert() / insert_with() / insert_many()
     │
     ▼
-INSERT INTO awa.jobs (...) VALUES (...)
+enqueue into queue storage
     │
-    ├── `awa.jobs` / `awa.insert_job_compat()` remain compatibility surfaces
     ├── immediate rows append into `{schema}.ready_entries`
     ├── future `scheduled` / `retryable` rows append into `{schema}.deferred_jobs`
     ├── uniqueness claims live in `awa.job_unique_claims`
     └── `pg_notify('awa:<queue>', '')` wakes dispatchers for newly-ready work
 ```
 
-`awa.jobs` preserves raw SQL compatibility for tests, admin queries, and
-non-Rust producers, but the worker runtime itself operates on queue-storage
-tables in the active schema recorded in `awa.runtime_storage_backends`.
 Immediate jobs become immutable ready entries; deferred jobs become immutable
-deferred rows; only the lease/control plane remains mutable.
+deferred rows; only the lease/control plane remains mutable. Producer-facing
+compatibility SQL is part of the upgrade surface, not the storage model, and
+is covered in [migrations.md](migrations.md).
 
 Insert accepts a `PgExecutor`, so it works inside an existing transaction — the
 job becomes visible only when the outer transaction commits. This is the
@@ -214,8 +213,8 @@ Dispatcher::run()
             │
             ▼
             Claim query:
-              lock lane state (`queue_lanes`) for queue + priority
-              lock `lease_ring_state` FOR SHARE
+              lock lane state for queue + priority
+              lock the lease segment cursor FOR SHARE
               read the next runnable entry from the current ready segment
               INSERT an active lease in the current lease segment
               hydrate the runtime job from the immutable ready entry + lease
@@ -658,11 +657,11 @@ Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch 
 
 The `admin::queue_overviews()` / `queue stats` read path is hybrid. Under the
 queue-storage engine, the function first resolves the active schema from
-`awa.runtime_storage_backends`, then reads live queue state through the
-compatibility CTE over ready, deferred, lease, terminal, and DLQ rows. The old
-`queue_state_counts` cache table still exists for backward compatibility, but
-queue-storage workers no longer depend on trigger-maintained counters on
-`jobs_hot` / `scheduled_jobs` to keep operator views fresh.
+`awa.runtime_storage_backends`, then reads live queue state across ready,
+deferred, lease, terminal, and DLQ tables. The old `queue_state_counts` cache
+table still exists for compatibility, but queue-storage workers no longer
+depend on trigger-maintained counters on `jobs_hot` / `scheduled_jobs` to keep
+operator views fresh.
 
 ## Web UI
 

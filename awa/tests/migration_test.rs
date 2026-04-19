@@ -6,7 +6,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::migrations;
+use awa::model::{migrations, QueueStorage, QueueStorageConfig};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -39,6 +39,12 @@ async fn reset_schema(pool: &PgPool) {
         .execute(pool)
         .await
         .expect("Failed to drop schema");
+}
+
+async fn apply_migrations_through(pool: &PgPool, version: i32) {
+    for (_version, _desc, sql) in migrations::migration_sql_range(0, version) {
+        sqlx::raw_sql(&sql).execute(pool).await.unwrap();
+    }
 }
 
 // ── Fresh install ────────────────────────────────────────────────
@@ -163,6 +169,166 @@ async fn test_step_through_upgrade_preserves_data() {
     );
 
     sqlx::raw_sql("DELETE FROM awa.jobs WHERE queue = 'migration_test'; DELETE FROM awa.cron_jobs WHERE name = 'test_cron'; DELETE FROM awa.queue_meta WHERE queue = 'migration_test'")
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn test_upgrade_from_0_5_x_to_0_6_keeps_canonical_until_queue_storage_activation() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    apply_migrations_through(&pool, 9).await;
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(
+        version, 9,
+        "0.5.x schema should be version 9 before upgrade"
+    );
+
+    sqlx::raw_sql(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, priority)
+        VALUES
+            ('legacy_job', 'migration_old_a', '{"n": 1}'::jsonb, 'available', 2),
+            ('legacy_job', 'migration_old_b', '{"n": 2}'::jsonb, 'available', 2);
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrations::run(&pool).await.unwrap();
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+
+    let active_schema: Option<String> =
+        sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        active_schema, None,
+        "schema upgrade alone must not activate queue storage"
+    );
+
+    let legacy_visible: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.jobs WHERE queue IN ('migration_old_a', 'migration_old_b')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_visible, 2,
+        "legacy canonical rows should stay visible"
+    );
+
+    let inserted_id: i64 = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM awa.insert_job_compat(
+            'compat_job',
+            'migration_old_c',
+            '{"n": 3}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            now(),
+            '{}'::jsonb,
+            '{}'::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(inserted_id > 0);
+
+    let canonical_hot_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.jobs_hot WHERE queue LIKE 'migration_old_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        canonical_hot_count, 3,
+        "compat inserts should still route to canonical tables before queue-storage activation"
+    );
+
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "awa_upgrade_test_qs".to_string(),
+        ..Default::default()
+    })
+    .unwrap();
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS awa_upgrade_test_qs CASCADE")
+        .execute(&pool)
+        .await
+        .unwrap();
+    store.install(&pool).await.unwrap();
+
+    let active_schema: Option<String> =
+        sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(active_schema.as_deref(), Some("awa_upgrade_test_qs"));
+
+    let queued_id: i64 = sqlx::query_scalar(
+        r#"
+        SELECT id
+        FROM awa.insert_job_compat(
+            'queue_storage_job',
+            'migration_new_a',
+            '{"n": 4}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            now(),
+            '{}'::jsonb,
+            '{}'::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let ready_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa_upgrade_test_qs.ready_entries WHERE queue = 'migration_new_a'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(ready_count, 1);
+
+    let queue_storage_visible: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.jobs WHERE queue = 'migration_new_a' AND id = $1",
+    )
+    .bind(queued_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queue_storage_visible, 1);
+
+    let legacy_visible_after_activation: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM awa.jobs WHERE queue LIKE 'migration_old_%'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        legacy_visible_after_activation, 0,
+        "once queue storage is activated, awa.jobs follows the active backend only"
+    );
+
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS awa_upgrade_test_qs CASCADE")
         .execute(&pool)
         .await
         .unwrap();

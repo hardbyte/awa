@@ -1,8 +1,8 @@
 //! Dead-letter queue helpers for the queue_storage backend.
 //!
-//! On this branch the DLQ is part of the queue_storage engine. The public API
-//! resolves the active queue_storage schema from `awa.runtime_storage_backends`
-//! and operates against that backend.
+//! The DLQ is part of the queue_storage engine. The public API resolves the
+//! active queue_storage schema from `awa.runtime_storage_backends` and operates
+//! against that backend.
 
 use crate::error::AwaError;
 use crate::job::JobRow;

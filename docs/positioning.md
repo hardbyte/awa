@@ -1,131 +1,116 @@
 # Awa Positioning
 
-## Positioning
+## Short Version
 
-Awa is the Postgres job queue for teams that want full job-queue features and
-care about Postgres vacuum pressure under sustained load.
+Awa is a Postgres-native job queue for teams that want:
 
-The useful framing is:
+- full job-queue behavior, not just enqueue/dequeue
+- Rust and Python worker runtimes
+- transactional enqueue on the same Postgres you already run
+- low dispatch latency without turning the main queue path into a vacuum trap
 
-- Awa is the job-queue option in the vacuum-aware tier.
-- It is a job queue, not just a message queue.
-- The interesting claim is low dispatch latency with bounded hot-path dead
-  tuples.
+That puts Awa in a specific slot: more capable than a Postgres event queue,
+less ecosystem-bound than a language-specific job framework.
 
-Avoid turning "vacuum-aware" into the whole pitch. That is a design stance, not
-the product category.
+## Best Fit
 
-## Where Awa Fits
+Awa is a strong fit when you want:
 
-There are two nearby categories Awa should position against.
+- priorities, retries, snoozes, cron, callbacks, DLQ, and UI in one system
+- mixed Rust and Python worker fleets
+- Postgres as the only required infrastructure dependency
+- worker-owned dispatch, rescue, rotation, and prune instead of external
+  tickers or `pg_cron`
 
-### Event and message queues
+## Nearby Categories
 
-PgQue is the clearest reference point here. PgQue itself is new, but it
-deliberately revives the older PgQ storage ideas from Skype-era Postgres queue
-systems.
+### Postgres event and message queues
 
-That category is a strong fit when you want:
+PgQue is the clearest reference point here, and the older PgQ lineage is still
+the useful historical backdrop.
 
-- a shared event log
+That category is a good fit when you want:
+
+- an event log
 - independent consumer cursors
-- stable sustained-load behavior
+- a system optimized first around event-stream retention and rotation
 
-It is not the right category when you want:
+That category is not the right fit when you need:
 
 - per-job priorities
 - unique jobs
 - cron scheduling
-- rich per-job lifecycle
-- low-latency dispatch
+- callback orchestration
+- richer job lifecycle controls
 
-### Language-native Postgres job frameworks
+### Language-specific Postgres job frameworks
 
 River and Oban Pro are the clearest references here.
 
-That category is a strong fit when you are all-in on one surrounding runtime
-and want a mature framework shaped for that ecosystem.
+That category is a good fit when you want a job framework deeply shaped around
+one host language and one surrounding ecosystem.
 
 ## Awa's Slot
 
-Awa should sit between those two categories:
+Awa sits between those categories:
 
-- full Postgres job-queue semantics
-- first-class Rust and Python workers
-- transactional enqueue
-- priorities, retries, snoozes, cron, callbacks, DLQ, UI
-- a storage engine designed around bounded hot-path churn rather than a mutable
-  queue heap
-- runtime-owned dispatch, rescue, rotation, and prune, with no `pg_cron`
-  requirement
+- it is a job queue, not just a stream
+- it keeps Postgres as the only hard dependency
+- it supports Rust and Python as first-class runtimes
+- it uses segmented queue storage so queue history and lease churn do not sit
+  in one mutable queue heap
 
-That is the differentiator. Not "Awa is vacuum-aware." Instead:
-
-> Awa is the Postgres job queue for teams that care about vacuum pressure.
+That last point matters, but it is a differentiator, not the whole identity.
+The product story should start with "Postgres job queue for Rust and Python"
+and then explain why the storage engine matters operationally.
 
 ## What We Should Say
 
 - Postgres-native job queue for Rust and Python.
 - Full job-queue features without Redis or RabbitMQ.
-- Runtime-owned maintenance; no ticker or `pg_cron` required.
-- Designed for low dispatch latency and bounded hot-path dead tuples.
-- A real worker runtime in both Rust and Python, not just insert-only clients.
+- Runtime-owned maintenance; no `pg_cron` requirement.
+- Segmented queue storage designed to keep the hot path lean under sustained
+  load.
+- Built for priorities, retries, cron, callbacks, DLQ, and operator tooling.
 
 ## What We Should Not Say
 
 - Do not market "uniquely vacuum-aware."
-- Do not say "zero bloat" unless the benchmark literally proves it for the
-  named path.
 - Do not frame Awa as "better PgQue."
+- Do not claim "zero bloat."
 - Do not make the strongest latency-plus-bloat claim until the head-to-head
-  benchmark exists.
+  benchmark exists on the same hardware.
 
-## Proof Burden
+## Claims We Can Support Now
+
+The current local validation supports these claims:
+
+- queue storage keeps dead tuples out of the main ready path
+- queue storage materially improves pickup-latency tails versus Awa's older
+  mutable-row engine
+- Awa keeps full job-queue behavior while using a segmented storage engine
+
+Reference artifact:
+
+- [ADR-019 validation bench](adr/bench/019-queue-storage-validation-2026-04-19.md)
+
+## Proof Still Needed
 
 The strongest public claim would be:
 
 > Low dispatch latency and bounded dead tuples.
 
-That should only become headline copy after a clean same-hardware comparison
-against:
+That should be backed by a same-hardware comparison against:
 
 - Awa queue storage
 - PgQue
 - River
-- optionally Oban Pro as a paid partitioned reference
+- optionally Oban Pro as a partitioned paid reference
 
-The comparison set should include:
+The useful comparison set is:
 
 - idle pickup latency
 - sustained runtime throughput
 - overlap readers / MVCC horizon pressure
 - mixed workload soak
 - terminal-failure burst
-
-Commands and raw output should live in-repo.
-
-## What Is Safe To Say Now
-
-The current local validation already supports these weaker claims:
-
-- queue storage keeps dead tuples out of the main ready path
-- queue storage materially improves pickup-latency tails versus Awa's old
-  mutable-row engine
-- the redesign keeps full job-queue behavior rather than collapsing to a simple
-  enqueue/dequeue system
-
-Reference artifact:
-
-- [ADR-019 validation bench](adr/bench/019-queue-storage-validation-2026-04-19.md)
-
-## Candidate Lines
-
-Use now:
-
-- The Postgres job queue for the vacuum-aware tier.
-- A Postgres job queue with priorities, callbacks, DLQ, and bounded hot-path
-  dead tuples.
-
-Use only after the head-to-head benchmarks hold:
-
-- Low dispatch latency and bounded dead tuples.

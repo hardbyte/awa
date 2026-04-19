@@ -27,18 +27,12 @@ queue record.
 
 ### Terminology
 
-The intended storage vocabulary is:
+This ADR uses the following storage vocabulary:
 
 - Queue plane: `ready_entries`, `terminal_entries`
 - Execution plane: `active_leases`, `attempt_state`
 - Control plane: `lane_state`, `ready_segments`, `ready_segment_cursor`,
   `lease_segments`, `lease_segment_cursor`
-
-The current prototype still uses some older physical names (`leases`,
-`done_entries`, `queue_lanes`, and ring-state helper tables). That naming
-should converge toward the terminology above before the redesign is treated as
-finished. The intent of this ADR is the conceptual storage model, not the
-prototype-era names.
 
 ### Physical layout
 
@@ -160,7 +154,7 @@ liveness only after it owns the segment locks needed for `TRUNCATE`.
 
 ## Implementation
 
-The current prototype/runtime wiring lives in:
+The current implementation lives in:
 
 - `awa-model/src/queue_storage.rs`
 - `awa-model/src/dlq.rs`
@@ -171,7 +165,7 @@ The current prototype/runtime wiring lives in:
 - `awa/tests/queue_storage_runtime_test.rs`
 - `awa/tests/benchmark_test.rs`
 
-The runtime validation on this branch covers:
+The runtime validation covers:
 
 - `RetryAfter`
 - `Snooze`
@@ -191,20 +185,19 @@ Hot-path details now validated in code:
 
 ## Validation
 
-Latest local full-runtime benchmark runs on this branch:
+Recorded local full-runtime benchmark runs:
 
 | Runtime path | Throughput | Pickup p50 | Pickup p95 | Pickup p99 | Exact final dead |
 |---|---:|---:|---:|---:|---:|
 | canonical runtime | `9686/s` | `4.995 ms` | `38.998 ms` | `217.352 ms` | not sampled |
 | queue storage runtime | `9537/s` | `3.671 ms` | `22.013 ms` | `87.738 ms` | `417` |
 
-Latest exact dead-tuple breakdown for the queue storage run
-(using current prototype table names):
+Exact dead-tuple breakdown for the recorded queue-storage run:
 
-- `queue_lanes = 41`
-- `ready = 0`
-- `done = 0`
-- `leases = 376`
+- `lane_state = 41`
+- `ready_entries = 0`
+- `terminal_entries = 0`
+- `active_leases = 376`
 - `attempt_state = 0`
 - `total = 417`
 

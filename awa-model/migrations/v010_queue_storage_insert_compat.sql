@@ -431,5 +431,5 @@ END;
 $$ LANGUAGE plpgsql VOLATILE;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (10, 'Compatibility insert function for queue storage')
+VALUES (10, 'Queue storage compatibility layer and active backend selection')
 ON CONFLICT (version) DO NOTHING;
