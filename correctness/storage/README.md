@@ -18,6 +18,7 @@ It uses the naming set discussed for the redesign:
 - `waiting_segments` / `waiting_segment_cursor`
 - `lease_segments` / `lease_segment_cursor`
 - `dlq_segments` / `dlq_segment_cursor`
+- `terminal_segments` / `terminal_segment_cursor`
 
 What it models:
 
@@ -37,7 +38,7 @@ What it models:
 - `retry_from_dlq` round trip back to `ready_entries` with `run_lease` reset to 0
 - admin purge of DLQ rows
 - stale completion rejection via per-worker lease snapshots
-- segment rotation and prune safety for ready, deferred, waiting, lease, **and dlq** segment families
+- segment rotation and prune safety for ready, deferred, waiting, lease, dlq, **and terminal** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019)
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the `active_leases` level (not
@@ -57,6 +58,9 @@ Key safety checks include:
   terminal family at a time)
 - pruned DLQ segments hold no live DLQ rows (mirror of the other family
   prune-safety invariants)
+- pruned terminal segments hold no live terminal rows; terminal rotation
+  is deadlock-free and respects the same open/sealed/pruned lifecycle as
+  the other families
 
 What it intentionally does not model:
 
@@ -78,12 +82,13 @@ Run it with:
 The checked-in configs are intentionally small so TLC completes quickly in CI-like
 environments:
 
-- `AwaSegmentedStorage.cfg`: 1 job, 1 worker — ~79k distinct states, ~2s
-- `AwaSegmentedStorageInterleavings.cfg`: 1 job, 2 workers — ~170k distinct states, ~5s
+- `AwaSegmentedStorage.cfg`: 1 job, 1 worker — ~324k distinct states, ~10s
+- `AwaSegmentedStorageInterleavings.cfg`: 1 job, 2 workers — ~688k distinct states, ~24s
 
 That is enough to exercise waiting/resume, stale completion rejection, retry,
-rescue (including short-job rescue), DLQ round-trip, and queue-family prune
-safety, but not multi-job fairness or priority-aging liveness.
+rescue (including short-job rescue), DLQ round-trip, terminal-family rotation
+and prune, and queue-family prune safety, but not multi-job fairness or
+priority-aging liveness.
 
 ## DLQ coverage
 
@@ -105,6 +110,25 @@ new DLQ transition is reached:
 path (short jobs, no `attempt_state`) is reachable — the previous spec's
 `FreshHeartbeatRequiresAttemptState` subset constraint had silently excluded
 that path from exploration.
+
+## Terminal family coverage
+
+The terminal family mirrors the DLQ family's segment lifecycle. From the
+same `-coverage 1` run:
+
+| Action | States |
+|---|---:|
+| `FastComplete` (now tags `terminalSegmentOf`) | 55,296 |
+| `StatefulComplete` (now tags `terminalSegmentOf`) | 110,592 |
+| `CancelWaitingToTerminal` (now tags `terminalSegmentOf`) | 36,864 |
+| `MoveFailedToDlq` (now clears `terminalSegmentOf`) | 18,432 |
+| `RotateTerminalSegments` | 158,720 |
+| `PruneTerminalSegment` | 158,720 |
+
+This removes the previous gap where `terminal_entries` was the only
+"monotonic-growing" set in the spec — it now shares the rotate/prune
+reclaim story with the other families, matching the ADR-019 retention
+model.
 
 ## Mapping to Rust code
 
