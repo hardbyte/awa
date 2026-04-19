@@ -99,6 +99,31 @@ impl Worker for NoopWorker {
     }
 }
 
+/// Worker that signals completion through a channel before returning
+/// `Completed`. Used by `scenario_pickup_latency` to measure insert →
+/// handler-entry latency without polling DB state after the fact — the
+/// DB-observation path races with the queue_storage rotator's
+/// `prune_oldest`, which can TRUNCATE a completed row out of
+/// `done_entries` before the waiter sees it.
+struct SignallingWorker {
+    tx: tokio::sync::mpsc::UnboundedSender<i64>,
+}
+
+#[async_trait]
+impl Worker for SignallingWorker {
+    fn kind(&self) -> &'static str {
+        "bench_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        // Emit before returning Completed. The channel is unbounded so the
+        // send never blocks the handler, and the receiver guarantees the
+        // latency measurement includes dispatch + first executor tick.
+        let _ = self.tx.send(ctx.job.id);
+        Ok(JobResult::Completed)
+    }
+}
+
 struct ChaosWorker {
     job_duration: Duration,
 }
@@ -129,44 +154,106 @@ async fn create_pool(max_connections: u32) -> PgPool {
         .expect("Failed to connect to database")
 }
 
-async fn clean_queue(pool: &PgPool, queue_name: &str) {
-    sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
-        .bind(queue_name)
-        .execute(pool)
+/// Clear queue state by calling `QueueStorage::reset` — that wipes
+/// `ready_entries`, `deferred_jobs`, `leases`, `done_entries`, and
+/// `dlq_entries` in one shot. The old `DELETE FROM awa.jobs WHERE queue=$1`
+/// only drove the view's per-row INSTEAD OF DELETE trigger, which covered
+/// `ready_entries` but left completed-row history in `done_entries` — fine
+/// for the old canonical schema, misleading for vacuum-aware benches.
+async fn clean_queue(pool: &PgPool, store: &QueueStorage) {
+    store
+        .reset(pool)
         .await
-        .expect("Failed to clean jobs");
-    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = $1")
-        .bind(queue_name)
-        .execute(pool)
-        .await
-        .expect("Failed to clean queue_meta");
+        .expect("Failed to reset queue_storage state");
 }
 
-async fn count_by_state(pool: &PgPool, queue_name: &str) -> HashMap<String, i64> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT state::text, count(*)::bigint FROM awa.jobs WHERE queue = $1 GROUP BY state",
-    )
+/// Snapshot state counts directly from the queue_storage tables. Used only
+/// for diagnostics when `wait_for_completion` times out, so schema-named
+/// SQL here keeps the failure message pointed at the actual subsystem
+/// instead of the unioned `awa.jobs` compat view.
+async fn count_by_state(
+    pool: &PgPool,
+    store: &QueueStorage,
+    queue_name: &str,
+) -> HashMap<String, i64> {
+    let schema = store.schema();
+    let mut counts = HashMap::new();
+
+    let ready: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1"
+    ))
+    .bind(queue_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if ready > 0 {
+        counts.insert("available".into(), ready);
+    }
+
+    let running: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1"
+    ))
+    .bind(queue_name)
+    .fetch_one(pool)
+    .await
+    .unwrap_or(0);
+    if running > 0 {
+        counts.insert("running".into(), running);
+    }
+
+    let done_rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        "SELECT state::text, count(*)::bigint FROM {schema}.done_entries
+         WHERE queue = $1 GROUP BY state"
+    ))
     .bind(queue_name)
     .fetch_all(pool)
     .await
-    .expect("Failed to query state counts");
-    rows.into_iter().collect()
+    .unwrap_or_default();
+    for (state, n) in done_rows {
+        counts.insert(state, n);
+    }
+
+    counts
 }
 
-async fn wait_for_completion(pool: &PgPool, queue_name: &str, expected: i64, timeout: Duration) {
+/// Wait until at least `expected` rows for `queue_name` show up as
+/// `completed` in `{schema}.done_entries`. Queries the queue_storage
+/// table directly rather than the `awa.jobs` compat view so the bench
+/// is measuring the new subsystem end-to-end and isn't gated by the
+/// view's UNION ALL across ready/deferred/leases/done/dlq.
+///
+/// NOTE: `done_entries` is partitioned by `ready_slot`; the queue rotator
+/// drops the oldest partition every `queue_slot_count * queue_rotate_ms`
+/// milliseconds (default: 16 × 1000ms = 16s). This waiter is therefore
+/// safe for drain-style workloads where completion is expected in bulk
+/// and within one rotation window — `scenario_worker_throughput` fits
+/// that mould at the sizes we benchmark. For single-job per-iteration
+/// observation use the `SignallingWorker` + channel pattern in
+/// `scenario_pickup_latency`, which doesn't depend on row retention.
+async fn wait_for_completion(
+    pool: &PgPool,
+    store: &QueueStorage,
+    queue_name: &str,
+    expected: i64,
+    timeout: Duration,
+) {
+    let schema = store.schema();
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries
+         WHERE queue = $1 AND state = 'completed'"
+    );
     let start = Instant::now();
     loop {
-        let completed: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'completed'")
-                .bind(queue_name)
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let completed: i64 = sqlx::query_scalar(&sql)
+            .bind(queue_name)
+            .fetch_one(pool)
+            .await
+            .unwrap();
         if completed >= expected {
             return;
         }
         if start.elapsed() > timeout {
-            let counts = count_by_state(pool, queue_name).await;
+            let counts = count_by_state(pool, store, queue_name).await;
             panic!(
                 "Timeout after {:?}: {}/{} completed, state counts: {:?}",
                 timeout, completed, expected, counts
@@ -255,16 +342,16 @@ struct BenchmarkResult {
 /// Scenario 1: Enqueue throughput — insert N jobs as fast as possible.
 async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    let (_store, _config) = prepare_queue_storage(&pool).await;
+    let (store, _config) = prepare_queue_storage(&pool).await;
     let queue = "awa_enqueue_bench";
-    clean_queue(&pool, queue).await;
+    // Already reset inside prepare_queue_storage — skip redundant clean.
 
     let start = Instant::now();
     enqueue_batch(&pool, queue, job_count, true).await;
     let elapsed = start.elapsed();
 
     let jobs_per_sec = job_count as f64 / elapsed.as_secs_f64();
-    clean_queue(&pool, queue).await;
+    clean_queue(&pool, &store).await;
 
     BenchmarkResult {
         system: "awa".into(),
@@ -280,9 +367,8 @@ async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
 /// Scenario 2: Worker throughput — enqueue N jobs, then drain with workers.
 async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    let (_store, config) = prepare_queue_storage(&pool).await;
+    let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_worker_bench";
-    clean_queue(&pool, queue).await;
 
     // Pre-enqueue all jobs
     enqueue_batch(&pool, queue, job_count, true).await;
@@ -292,13 +378,13 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
     let start = Instant::now();
     client.start().await.expect("Failed to start client");
 
-    wait_for_completion(&pool, queue, job_count, Duration::from_secs(120)).await;
+    wait_for_completion(&pool, &store, queue, job_count, Duration::from_secs(120)).await;
     let elapsed = start.elapsed();
 
     client.shutdown(Duration::from_secs(5)).await;
 
     let jobs_per_sec = job_count as f64 / elapsed.as_secs_f64();
-    clean_queue(&pool, queue).await;
+    clean_queue(&pool, &store).await;
 
     BenchmarkResult {
         system: "awa".into(),
@@ -315,23 +401,45 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
 }
 
 /// Scenario 3: Pickup latency — enqueue one job at a time to an idle queue.
+///
+/// Uses a `SignallingWorker` that sends its job id through a channel from
+/// inside `perform()`. The bench records `insert_time → channel.recv` as
+/// the pickup latency. Earlier revisions observed completion via
+/// `load_job` / `done_entries`, which races the queue_storage rotator's
+/// `prune_oldest` (every `queue_slot_count * queue_rotate_ms`, default
+/// 16s): a completed row can be TRUNCATEd out of its partition before
+/// the waiter sees it, and the whole iteration looks like a timeout.
+/// The channel path doesn't touch DB state after the handler returns, so
+/// it's robust against rotation timing.
 async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    let (_store, config) = prepare_queue_storage(&pool).await;
+    let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_latency_bench";
-    clean_queue(&pool, queue).await;
 
-    let client = build_client(pool.clone(), queue, worker_count, config);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<i64>();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: worker_count,
+                poll_interval: Duration::from_millis(50),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(config, queue_rotate_interval(), lease_rotate_interval())
+        .register_worker(SignallingWorker { tx })
+        .build()
+        .expect("Failed to build pickup-latency client");
     client.start().await.expect("Failed to start client");
 
-    // Let the client stabilise
+    // Let the client stabilise (first dispatcher poll, leader election).
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let mut latencies_us: Vec<u64> = Vec::with_capacity(iterations as usize);
 
     for i in 0..iterations {
         let insert_time = Instant::now();
-        insert_with(
+        let job = insert_with(
             &pool,
             &BenchJob { seq: i },
             InsertOpts {
@@ -342,8 +450,17 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
         .await
         .unwrap();
 
-        // Wait for completion
-        wait_for_completion(&pool, queue, i + 1, Duration::from_secs(10)).await;
+        // Channel receives the handler's job id as soon as the worker
+        // picks it up; this is what we actually want to measure.
+        let received = tokio::time::timeout(Duration::from_secs(10), rx.recv())
+            .await
+            .unwrap_or_else(|_| panic!("Timed out waiting for job {} handler", job.id));
+        let got = received.expect("SignallingWorker channel closed");
+        assert_eq!(
+            got, job.id,
+            "SignallingWorker reported unexpected job id (got {got}, expected {})",
+            job.id
+        );
         latencies_us.push(insert_time.elapsed().as_micros() as u64);
     }
 
@@ -356,7 +473,7 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
     let p99 = latencies_us[(len as f64 * 0.99) as usize];
     let mean = latencies_us.iter().sum::<u64>() as f64 / len as f64;
 
-    clean_queue(&pool, queue).await;
+    clean_queue(&pool, &store).await;
 
     BenchmarkResult {
         system: "awa".into(),
