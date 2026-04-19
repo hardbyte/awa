@@ -2062,16 +2062,16 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             schema = store.schema()
         );
 
-        let (scheduled, available, running, completed, retryable, failed, cancelled, waiting_external): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = sqlx::query_as(&sql).fetch_one(pool).await?;
+        let (
+            scheduled,
+            available,
+            running,
+            completed,
+            retryable,
+            failed,
+            cancelled,
+            waiting_external,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&sql).fetch_one(pool).await?;
 
         return Ok(HashMap::from([
             (JobState::Scheduled, scheduled),
@@ -2302,7 +2302,10 @@ pub async fn distinct_kinds(pool: &PgPool) -> Result<Vec<String>, AwaError> {
              ORDER BY kind",
             queue_storage_current_jobs_cte(store.schema())
         );
-        return sqlx::query_scalar(&sql).fetch_all(pool).await.map_err(AwaError::from);
+        return sqlx::query_scalar(&sql)
+            .fetch_all(pool)
+            .await
+            .map_err(AwaError::from);
     }
 
     let rows = sqlx::query_scalar::<_, String>(
@@ -2326,7 +2329,10 @@ pub async fn distinct_queues(pool: &PgPool) -> Result<Vec<String>, AwaError> {
              ORDER BY queue",
             queue_storage_current_jobs_cte(store.schema())
         );
-        return sqlx::query_scalar(&sql).fetch_all(pool).await.map_err(AwaError::from);
+        return sqlx::query_scalar(&sql)
+            .fetch_all(pool)
+            .await
+            .map_err(AwaError::from);
     }
 
     let rows = sqlx::query_scalar::<_, String>(
