@@ -148,25 +148,37 @@ If long-running jobs are expected, remember:
 
 If a job really needs `20m`, set a longer deadline for that queue.
 
-## Dead Tuples Growing On `awa.jobs_hot`
+## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means
 
-If queue throughput starts to sag while `awa.jobs_hot` keeps accumulating dead
-tuples, the usual cause is not duplicate dispatch or a broken worker. The more
-common pattern is:
+If queue throughput starts to sag while lease tables keep accumulating dead
+tuples, the usual cause is not duplicate dispatch. The more common pattern is:
 
 - workers are still claiming and completing jobs
-- the maintenance leader is still running cleanup
+- the maintenance leader is still rotating and pruning
 - one or more long-lived transactions on the primary are holding an old
-  snapshot open
-- vacuum cannot reclaim dead rows aggressively enough because the MVCC horizon
-  is pinned
+  snapshot open or touching older segments
+- prune cannot truncate old lease or terminal segments aggressively enough
+  because the MVCC horizon is pinned or a reader still holds a lockable view of
+  the segment
 
 This is the same general failure mode described in PlanetScale's "Keeping a
 Postgres queue healthy" post.
 
+### Find The Active Queue-Storage Schema
+
+```sql
+SELECT
+    backend,
+    schema_name,
+    updated_at
+FROM awa.runtime_storage_backends;
+```
+
 ### Inspect Table Churn
+
+Replace `<schema>` with the active `schema_name` from the previous query.
 
 ```sql
 SELECT
@@ -178,16 +190,29 @@ SELECT
     last_vacuum,
     last_autovacuum
 FROM pg_stat_user_tables
-WHERE schemaname = 'awa'
-  AND relname IN ('jobs_hot', 'scheduled_jobs')
-ORDER BY relname;
+WHERE schemaname = '<schema>'
+  AND (
+      relname = 'attempt_state'
+      OR relname = 'deferred_jobs'
+      OR relname = 'dlq_entries'
+      OR relname LIKE 'ready_entries%'
+      OR relname LIKE 'done_entries%'
+      OR relname LIKE 'leases%'
+  )
+ORDER BY n_dead_tup DESC, relname;
 ```
 
 Interpretation:
 
-- rising `n_dead_tup` on `jobs_hot` with steady worker activity means churn is happening
-- `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up
-- `scheduled_jobs` is usually not the problem here; `jobs_hot` is the churn table
+- `ready_entries%` should usually stay at or near zero dead tuples
+- `leases%` can rise within the current rotation window, but should fall again
+  after prune
+- `attempt_state` should roughly match live long-running attempts, not total
+  queue depth, and should return close to zero after drain
+- `autovacuum_count` staying flat for a long time can indicate vacuum is not
+  keeping up on churn-heavy lease partitions
+- persistent dead tuples across many `leases%` tables usually means prune is
+  blocked or the maintenance leader is unhealthy
 
 ### Inspect Long Transactions
 
@@ -218,8 +243,9 @@ Pay particular attention to:
 - terminate or fix the long-lived transaction that is pinning the horizon
 - move analytical reads to a replica
 - shorten transaction scope in admin or reporting code
-- reduce terminal-row retention if the table is much larger than needed
-- review autovacuum settings if high churn is expected continuously
+- confirm one maintenance leader is healthy; rotation and prune are leader-owned
+- reduce terminal-row retention if the terminal history is much larger than needed
+- review autovacuum settings if lease churn is expected continuously
 
 If you want to reproduce the behavior locally before changing settings, run the
 MVCC benchmark documented in `docs/benchmarking.md`.

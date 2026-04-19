@@ -8,16 +8,25 @@ The Rust runtime owns all queue machinery -- polling, heartbeating, crash recove
 
 ## Queue storage status
 
-The queue storage engine is in transition.
+Queue storage is the intended worker engine for the redesign branch.
 
-ADR-019 is now the source of truth for storage internals:
+ADR-019 is the source of truth for storage internals:
 
 - [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
 
-This architecture overview is still useful for runtime boundaries and
-subsystems, but sections below that mention `awa.jobs_hot`,
-`awa.scheduled_jobs`, or the old mutable-row hot path describe the canonical
-engine and need a full rewrite for queue storage.
+This overview is still useful for runtime boundaries and subsystems, but parts
+of the deeper storage walkthrough still describe the historical canonical
+engine. When this document and ADR-019 disagree, ADR-019 wins.
+
+### Queue storage at a glance
+
+- queue plane: append-only `ready_entries`, `deferred_jobs`,
+  `terminal_entries`, and `dlq_entries`
+- execution plane: narrow `active_leases` plus optional per-attempt
+  `attempt_state`
+- control plane: `lane_state` plus ready/lease segment cursor tables
+- maintenance leader: promotion, rescue, rotation, prune, DLQ retention, and
+  queue-health publication
 
 ## Control-plane descriptors
 

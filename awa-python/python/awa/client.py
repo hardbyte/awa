@@ -541,6 +541,11 @@ class AsyncClient:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        queue_storage_schema: str | None = None,
+        queue_storage_queue_slot_count: int = 16,
+        queue_storage_lease_slot_count: int = 8,
+        queue_storage_queue_rotate_interval_ms: int = 1000,
+        queue_storage_lease_rotate_interval_ms: int = 50,
     ) -> None:
         """Start the worker runtime.
 
@@ -549,6 +554,11 @@ class AsyncClient:
         leader deletes it from ``awa.queue_descriptors`` /
         ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
         disable retention (useful if you manage the catalog externally).
+
+        Set ``queue_storage_schema`` to run this worker against the queue
+        storage engine. All workers on the same database should agree on the
+        active storage engine; mixed canonical and queue-storage fleets are
+        not supported during normal operation.
         """
         return await self._raw.start(
             queues,
@@ -565,6 +575,11 @@ class AsyncClient:
             heartbeat_staleness_ms=heartbeat_staleness_ms,
             deadline_rescue_interval_ms=deadline_rescue_interval_ms,
             callback_rescue_interval_ms=callback_rescue_interval_ms,
+            queue_storage_schema=queue_storage_schema,
+            queue_storage_queue_slot_count=queue_storage_queue_slot_count,
+            queue_storage_lease_slot_count=queue_storage_lease_slot_count,
+            queue_storage_queue_rotate_interval_ms=queue_storage_queue_rotate_interval_ms,
+            queue_storage_lease_rotate_interval_ms=queue_storage_lease_rotate_interval_ms,
         )
 
 

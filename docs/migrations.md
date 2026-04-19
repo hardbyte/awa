@@ -1,6 +1,7 @@
 # Migration Guide
 
-This guide covers fresh installs, upgrades, external migration tooling, and rollback strategy.
+This guide covers fresh installs, upgrades, queue-storage cutover, external
+migration tooling, and rollback strategy.
 
 ## Migration Model
 
@@ -13,7 +14,9 @@ Current guarantees from the migration layer:
 - rerunning migrations is safe
 - older pre-0.4 version numbering is normalized during upgrade
 
-The additive-only policy is what makes rolling upgrades practical.
+The additive-only policy still matters, but it is not the whole story anymore:
+switching the active worker engine to queue storage is an operational cutover,
+not a mixed-engine rolling upgrade.
 
 ## Fresh Install
 
@@ -51,6 +54,67 @@ The normal upgrade order is:
 
 Because migrations are additive-only, old workers should continue to function during the rollout as long as your application-level payload compatibility still holds.
 
+## Queue Storage Cutover
+
+Schema migrations remain additive, but selecting queue storage as the active
+worker engine changes where new jobs are written and where workers claim from.
+Treat that as a storage cutover, not as a rolling mixed-engine deployment.
+
+Rules:
+
+- do not run canonical workers and queue-storage workers against the same
+  database at the same time
+- drain or stop the old worker fleet before starting the new one
+- producers and admin surfaces can keep using the compatibility SQL/API layer,
+  but workers should use one engine only
+- `awa.runtime_storage_backends` is the database-level selector for the active
+  queue-storage schema
+
+Recommended cutover:
+
+1. Apply the schema with `awa migrate`.
+2. Drain and stop the existing worker fleet completely.
+3. Start the replacement fleet with queue storage enabled.
+4. Verify the selected backend schema and queue health.
+5. Resume normal traffic and monitor lease rotation / prune.
+
+Rust workers enable queue storage explicitly in code:
+
+```rust
+use awa::QueueStorageConfig;
+use std::time::Duration;
+
+let client = awa::Client::builder(pool.clone())
+    .queue("default", awa::QueueConfig::default())
+    .queue_storage(
+        QueueStorageConfig {
+            schema: "awa_qs".to_string(),
+            ..Default::default()
+        },
+        Duration::from_secs(1),
+        Duration::from_millis(50),
+    )
+    .build()?;
+```
+
+Python workers do the same at `start()` time:
+
+```python
+await client.start(
+    [("default", 4)],
+    queue_storage_schema="awa_qs",
+    queue_storage_queue_rotate_interval_ms=1000,
+    queue_storage_lease_rotate_interval_ms=50,
+)
+```
+
+Confirm the active backend from SQL:
+
+```sql
+SELECT backend, schema_name, updated_at
+FROM awa.runtime_storage_backends;
+```
+
 ## External Migration Tooling
 
 If you manage SQL with Flyway, Liquibase, dbmate, or a homegrown process, extract the bundled SQL:
@@ -86,6 +150,7 @@ Relevant behavior:
 - pre-0.4 legacy version rows are normalized automatically during upgrade
 - schema versions increase monotonically as new migrations are added; use `awa migrate` rather than depending on a specific numeric version in application code
 - `v005` switches admin metadata maintenance from row-level to statement-level triggers
+- `v010` / `v011` add the queue-storage compatibility layer and active-backend selector
 - `SchemaNotMigrated` means your application expects a newer schema than the database currently has
 - there are no bundled down migrations
 
@@ -102,7 +167,23 @@ If a release has to be reverted but the Awa schema migration already ran:
 
 That is the expected path because the migrations are additive-only.
 
-### 2. Database Rollback
+### 2. Storage-Engine Rollback
+
+Rolling back from queue storage to canonical workers on the same live database
+is not supported.
+
+Canonical workers do not claim from queue-storage segments, and queue-storage
+workers update the database-level active backend selector when they install.
+
+If a release must be backed out after the database has been cut over to queue
+storage:
+
+- keep the database on queue storage and roll back only application code, or
+- restore a database backup/snapshot taken before the cutover
+
+Do not treat mixed canonical + queue-storage worker fleets as a rollback plan.
+
+### 3. Database Rollback
 
 Awa does not ship reverse SQL. If you need to undo the schema itself, use your normal database rollback controls:
 
@@ -113,7 +194,10 @@ Do not expect `awa migrate` to downgrade the schema.
 
 ## Breaking Changes
 
-If Awa ever needs a non-additive schema change, the intended contract is a major-version upgrade with a stop-the-world procedure documented explicitly for that release.
+Queue storage is the current example of a larger storage transition: the SQL
+migrations are additive, but the worker cutover itself is operationally
+stop-the-world. Future non-additive changes would need the same level of
+explicit release documentation.
 
 ## Recommended Production Flow
 
@@ -121,7 +205,7 @@ If Awa ever needs a non-additive schema change, the intended contract is a major
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Roll out workers
+# 2. Roll out one worker engine
 # 3. Verify runtime health / queue stats
 awa --database-url "$DATABASE_URL" queue stats
 ```

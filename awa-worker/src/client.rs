@@ -443,11 +443,11 @@ impl ClientBuilder {
         self
     }
 
-    /// Enable the segmented queue storage backend.
+    /// Enable the segmented queue storage backend for this runtime.
     ///
-    /// This currently targets the immediate/completed hot path used by runtime
-    /// throughput benchmarks. Advanced lifecycle transitions still use the
-    /// canonical storage engine.
+    /// All workers against the same database should agree on the active
+    /// storage engine. Canonical tables remain as migration compatibility,
+    /// not as a second supported worker runtime.
     pub fn queue_storage(
         mut self,
         config: QueueStorageConfig,

@@ -1,9 +1,8 @@
 """Tests for the Dead Letter Queue Python bindings on queue_storage.
 
-The Python client does not yet expose the full worker-side queue_storage
-configuration, so these tests bootstrap a dedicated queue_storage schema and
-materialize failed rows directly inside that schema before exercising the
-public DLQ APIs.
+These tests exercise the public DLQ APIs directly, so they bootstrap a
+dedicated queue_storage schema and materialize failed rows inside that schema
+before exercising list/retry/purge behavior.
 """
 
 import os
