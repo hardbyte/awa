@@ -97,6 +97,13 @@ Each adapter:
 - Outputs JSON results to stdout, logs to stderr
 - Manages its own schema migration and cleanup
 
+The Awa adapters (`awa` and `awa-python`) now benchmark the queue-storage
+engine rather than the legacy canonical worker path. They also accept:
+
+- `QUEUE_STORAGE_SCHEMA` (default `awa_exp`)
+- `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` (defaults `16` / `8`)
+- `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` (defaults `1000` / `50`)
+
 `awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
 `procrastinate`, River, and Oban run in Docker containers with `--network host`
 to connect to the shared Postgres.
