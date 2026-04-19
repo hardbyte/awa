@@ -144,35 +144,78 @@ async fn clean_queue(pool: &PgPool, queue_name: &str) {
         .expect("Failed to clean queue_meta");
 }
 
-async fn count_by_state(pool: &PgPool, queue_name: &str) -> HashMap<String, i64> {
-    let rows: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT state::text, count(*)::bigint FROM awa.jobs WHERE queue = $1 GROUP BY state",
-    )
+async fn count_by_state(
+    store: &QueueStorage,
+    pool: &PgPool,
+    queue_name: &str,
+) -> HashMap<String, i64> {
+    let schema = store.schema();
+    let rows: Vec<(String, i64)> = sqlx::query_as(&format!(
+        r#"
+        SELECT state, sum(count)::bigint AS count
+        FROM (
+            SELECT 'available'::text AS state, count(*)::bigint AS count
+            FROM {schema}.ready_entries
+            WHERE queue = $1
+
+            UNION ALL
+
+            SELECT state::text AS state, count(*)::bigint AS count
+            FROM {schema}.leases
+            WHERE queue = $1
+            GROUP BY state
+
+            UNION ALL
+
+            SELECT state::text AS state, count(*)::bigint AS count
+            FROM {schema}.deferred_jobs
+            WHERE queue = $1
+            GROUP BY state
+
+            UNION ALL
+
+            SELECT state::text AS state, count(*)::bigint AS count
+            FROM {schema}.done_entries
+            WHERE queue = $1
+            GROUP BY state
+
+            UNION ALL
+
+            SELECT 'dlq'::text AS state, count(*)::bigint AS count
+            FROM {schema}.dlq_entries
+            WHERE queue = $1
+        ) counts
+        GROUP BY state
+        "#,
+    ))
     .bind(queue_name)
     .fetch_all(pool)
     .await
-    .expect("Failed to query state counts");
+    .expect("Failed to query queue_storage state counts");
     rows.into_iter().collect()
 }
 
-async fn wait_for_completion(pool: &PgPool, queue_name: &str, expected: i64, timeout: Duration) {
+async fn wait_for_completion(
+    store: &QueueStorage,
+    pool: &PgPool,
+    queue_name: &str,
+    expected: i64,
+    timeout: Duration,
+) {
     let start = Instant::now();
     loop {
-        let completed: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND state = 'completed'",
-        )
-        .bind(queue_name)
-        .fetch_one(pool)
-        .await
-        .unwrap();
-        if completed >= expected {
+        let counts = store
+            .queue_counts(pool, queue_name)
+            .await
+            .expect("Failed to query queue_storage queue counts");
+        if counts.completed >= expected {
             return;
         }
         if start.elapsed() > timeout {
-            let counts = count_by_state(pool, queue_name).await;
+            let state_counts = count_by_state(store, pool, queue_name).await;
             panic!(
                 "Timeout after {:?}: {}/{} completed, state counts: {:?}",
-                timeout, completed, expected, counts
+                timeout, counts.completed, expected, state_counts
             );
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -283,7 +326,7 @@ async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
 /// Scenario 2: Worker throughput — enqueue N jobs, then drain with workers.
 async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    let (_store, config) = prepare_queue_storage(&pool).await;
+    let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_worker_bench";
     clean_queue(&pool, queue).await;
 
@@ -295,7 +338,7 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
     let start = Instant::now();
     client.start().await.expect("Failed to start client");
 
-    wait_for_completion(&pool, queue, job_count, Duration::from_secs(120)).await;
+    wait_for_completion(&store, &pool, queue, job_count, Duration::from_secs(120)).await;
     let elapsed = start.elapsed();
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -320,7 +363,7 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
 /// Scenario 3: Pickup latency — enqueue one job at a time to an idle queue.
 async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    let (_store, config) = prepare_queue_storage(&pool).await;
+    let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_latency_bench";
     clean_queue(&pool, queue).await;
 
@@ -345,8 +388,7 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
         .await
         .unwrap();
 
-        // Wait for completion
-        wait_for_completion(&pool, queue, i + 1, Duration::from_secs(10)).await;
+        wait_for_completion(&store, &pool, queue, i + 1, Duration::from_secs(10)).await;
         latencies_us.push(insert_time.elapsed().as_micros() as u64);
     }
 
