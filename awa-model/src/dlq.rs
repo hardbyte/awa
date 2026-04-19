@@ -240,12 +240,14 @@ pub async fn list_dlq(pool: &PgPool, filter: &ListDlqFilter) -> Result<Vec<DlqRo
           AND ($2::text IS NULL OR queue = $2)
           AND ($3::text IS NULL OR payload -> 'tags' ? $3)
           AND (
-              $4::bigint IS NULL
+              ($4::bigint IS NULL AND $5::timestamptz IS NULL)
+              OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
+              OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
               OR (
-                  $5::timestamptz IS NULL
-                  AND job_id < $4
+                  $4::bigint IS NOT NULL
+                  AND $5::timestamptz IS NOT NULL
+                  AND (dlq_at, job_id) < ($5, $4)
               )
-              OR (dlq_at, job_id) < ($5, $4)
           )
         ORDER BY dlq_at DESC, job_id DESC
         LIMIT $6
@@ -396,12 +398,14 @@ pub async fn purge_dlq(
           AND ($2::text IS NULL OR queue = $2)
           AND ($3::text IS NULL OR payload -> 'tags' ? $3)
           AND (
-              $4::bigint IS NULL
+              ($4::bigint IS NULL AND $5::timestamptz IS NULL)
+              OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
+              OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
               OR (
-                  $5::timestamptz IS NULL
-                  AND job_id < $4
+                  $4::bigint IS NOT NULL
+                  AND $5::timestamptz IS NOT NULL
+                  AND (dlq_at, job_id) < ($5, $4)
               )
-              OR (dlq_at, job_id) < ($5, $4)
           )
         "#,
         store.schema()

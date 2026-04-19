@@ -34,6 +34,12 @@ This ADR uses the following storage vocabulary:
 - Control plane: `lane_state`, `ready_segments`, `ready_segment_cursor`,
   `lease_segments`, `lease_segment_cursor`
 
+Current physical table names still use a few older labels:
+
+- `terminal_entries` maps to `{schema}.done_entries`
+- `active_leases` maps to `{schema}.leases`
+- `lane_state` maps to `{schema}.queue_lanes`
+
 ### Physical layout
 
 1. `ready_entries`

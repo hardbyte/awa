@@ -1097,7 +1097,7 @@ async fn complete_job_queue_storage(
                     pool,
                     job.id,
                     job.run_lease,
-                    &reason,
+                    reason,
                     progress_snapshot.clone(),
                 )
                 .await?

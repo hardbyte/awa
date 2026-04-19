@@ -11,16 +11,28 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+RUNTIME_START_KWARGS = {
+    "leader_election_interval_ms": 100,
+    "queue_storage_queue_rotate_interval_ms": 60_000,
+}
 
 
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await c.install_queue_storage(reset=True)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'dispatch_%'")
+    await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'dispatch_%'")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        try:
+            await c.shutdown()
+        except Exception:
+            pass
+        await c.close()
 
 
 @dataclass
@@ -55,18 +67,13 @@ async def test_worker_dispatch_completes_jobs(client):
         )
 
     # Start workers and let them run briefly
-    await client.start([(queue, 5)])
+    await client.start([(queue, 5)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)  # Give workers time to process
     await client.shutdown()
 
     # Verify all jobs completed
-    tx = await client.transaction()
-    row = await tx.fetch_one(
-        "SELECT count(*)::bigint AS cnt FROM awa.jobs WHERE queue = $1 AND state::text = 'completed'",
-        queue,
-    )
-    await tx.commit()
-    assert row["cnt"] == 5, f"Expected 5 completed, got {row['cnt']}"
+    jobs = await client.list_jobs(queue=queue, state="completed")
+    assert len(jobs) == 5, f"Expected 5 completed, got {len(jobs)}"
 
 
 @pytest.mark.asyncio
@@ -83,7 +90,7 @@ async def test_worker_dispatch_retries_on_error(client):
         queue=queue,
     )
 
-    await client.start([(queue, 2)])
+    await client.start([(queue, 2)], poll_interval_ms=50, **RUNTIME_START_KWARGS)
     await asyncio.sleep(0.5)
     await client.shutdown()
 
@@ -116,7 +123,7 @@ async def test_worker_dispatch_handles_cancel(client):
         queue=queue,
     )
 
-    await client.start([(queue, 2)])
+    await client.start([(queue, 2)], poll_interval_ms=50, **RUNTIME_START_KWARGS)
     await asyncio.sleep(0.5)
     await client.shutdown()
 
@@ -138,7 +145,7 @@ async def test_worker_dispatch_shutdown_is_clean(client):
     async def handle(job):
         return None
 
-    await client.start([(queue, 2)])
+    await client.start([(queue, 2)], poll_interval_ms=50, **RUNTIME_START_KWARGS)
     await asyncio.sleep(0.1)
     await client.shutdown()  # Should not raise
 
@@ -149,7 +156,7 @@ async def test_worker_dispatch_requires_registered_workers(client):
     with pytest.raises(
         awa.AwaError, match="register at least one worker before starting the runtime"
     ):
-        await client.start([("dispatch_missing_worker", 1)])
+        await client.start([("dispatch_missing_worker", 1)], **RUNTIME_START_KWARGS)
 
 
 @pytest.mark.asyncio
@@ -172,7 +179,7 @@ async def test_worker_dispatch_shutdown_signals_cancellation(client):
         queue=queue,
     )
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.wait_for(started.wait(), timeout=1.0)
     await client.shutdown(timeout_ms=500)
     await asyncio.wait_for(observed.wait(), timeout=1.0)
@@ -188,7 +195,7 @@ async def test_worker_dispatch_health_check(client):
         await asyncio.sleep(0.05)
         return None
 
-    await client.start([(queue, 2)])
+    await client.start([(queue, 2)], **RUNTIME_START_KWARGS)
     health = await client.health_check()
     await client.shutdown()
 
@@ -208,7 +215,7 @@ async def test_worker_dispatch_validates_registered_queue(client):
         return None
 
     with pytest.raises(ValueError):
-        await client.start([("different_queue", 1)])
+        await client.start([("different_queue", 1)], **RUNTIME_START_KWARGS)
 
 
 @pytest.mark.asyncio

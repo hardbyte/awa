@@ -308,11 +308,18 @@ class AsyncClient:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
     ) -> int:
         """Bulk-delete DLQ rows matching the filter."""
         return await self._raw.purge_dlq(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind,
+            queue=queue,
+            tag=tag,
+            before_id=before_id,
+            before_dlq_at=before_dlq_at,
+            allow_all=allow_all,
         )
 
     async def health_check(self) -> HealthCheck:
@@ -889,9 +896,16 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: dt.datetime | None = None,
         allow_all: bool = False,
     ) -> int:
         """Bulk-delete DLQ rows matching the filter."""
         return self._raw.purge_dlq_sync(
-            kind=kind, queue=queue, tag=tag, allow_all=allow_all
+            kind=kind,
+            queue=queue,
+            tag=tag,
+            before_id=before_id,
+            before_dlq_at=before_dlq_at,
+            allow_all=allow_all,
         )

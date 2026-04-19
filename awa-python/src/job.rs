@@ -1,4 +1,4 @@
-use awa_model::{JobRow, JobState};
+use awa_model::{JobRow, JobState, QueueStorage};
 use awa_worker::context::ProgressState;
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
@@ -280,23 +280,35 @@ impl PyJob {
                 }
             };
 
-            let result = sqlx::query(
-                r#"
-                UPDATE awa.jobs_hot
-                SET progress = $2
-                WHERE id = $1 AND state = 'running' AND run_lease = $3
-                "#,
-            )
-            .bind(job_id)
-            .bind(&snapshot)
-            .bind(run_lease)
-            .execute(&pool)
-            .await
-            .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+            if let Some(schema) = QueueStorage::active_schema(&pool)
+                .await
+                .map_err(map_awa_error)?
+            {
+                let store =
+                    QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
+                store
+                    .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                    .await
+                    .map_err(map_awa_error)?;
+            } else {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE awa.jobs_hot
+                    SET progress = $2
+                    WHERE id = $1 AND state = 'running' AND run_lease = $3
+                    "#,
+                )
+                .bind(job_id)
+                .bind(&snapshot)
+                .bind(run_lease)
+                .execute(&pool)
+                .await
+                .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
 
-            if result.rows_affected() == 0 {
-                // Job was rescued/cancelled — not an error for the caller
-                return Ok(());
+                if result.rows_affected() == 0 {
+                    // Job was rescued/cancelled — not an error for the caller
+                    return Ok(());
+                }
             }
 
             let mut guard = buffer.lock().expect("progress lock poisoned");
@@ -332,22 +344,34 @@ impl PyJob {
                     }
                 };
 
-                let result = sqlx::query(
-                    r#"
-                    UPDATE awa.jobs_hot
-                    SET progress = $2
-                    WHERE id = $1 AND state = 'running' AND run_lease = $3
-                    "#,
-                )
-                .bind(job_id)
-                .bind(&snapshot)
-                .bind(run_lease)
-                .execute(&pool)
-                .await
-                .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+                if let Some(schema) = QueueStorage::active_schema(&pool)
+                    .await
+                    .map_err(map_awa_error)?
+                {
+                    let store =
+                        QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
+                    store
+                        .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                        .await
+                        .map_err(map_awa_error)?;
+                } else {
+                    let result = sqlx::query(
+                        r#"
+                        UPDATE awa.jobs_hot
+                        SET progress = $2
+                        WHERE id = $1 AND state = 'running' AND run_lease = $3
+                        "#,
+                    )
+                    .bind(job_id)
+                    .bind(&snapshot)
+                    .bind(run_lease)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
 
-                if result.rows_affected() == 0 {
-                    return Ok(());
+                    if result.rows_affected() == 0 {
+                        return Ok(());
+                    }
                 }
 
                 let mut guard = buffer.lock().expect("progress lock poisoned");

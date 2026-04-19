@@ -21,13 +21,16 @@ async def client():
     """Create a client and run migrations."""
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    # Clean up jobs from previous tests
-    # We use a raw transaction for this
     tx = await c.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute("DROP SCHEMA IF EXISTS awa_exp CASCADE")
     await tx.execute("DELETE FROM awa.jobs")
     await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        await c.close()
 
 
 # -- Test job types --

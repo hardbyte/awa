@@ -57,6 +57,17 @@ def _move_ready_to_failed_done(client: awa.Client, job_id: int) -> None:
                 'available'::awa.job_state
             )
             FROM moved
+        ),
+        lane_fix AS (
+            UPDATE {SCHEMA}.queue_lanes AS lanes
+            SET available_count = GREATEST(0, lanes.available_count - delta.moved_count)
+            FROM (
+                SELECT queue, priority, count(*)::bigint AS moved_count
+                FROM moved
+                GROUP BY queue, priority
+            ) AS delta
+            WHERE lanes.queue = delta.queue
+              AND lanes.priority = delta.priority
         )
         INSERT INTO {SCHEMA}.done_entries (
             ready_slot,
@@ -141,6 +152,17 @@ async def _move_ready_to_failed_done_async(client: awa.AsyncClient, job_id: int)
                     'available'::awa.job_state
                 )
                 FROM moved
+            ),
+            lane_fix AS (
+                UPDATE {SCHEMA}.queue_lanes AS lanes
+                SET available_count = GREATEST(0, lanes.available_count - delta.moved_count)
+                FROM (
+                    SELECT queue, priority, count(*)::bigint AS moved_count
+                    FROM moved
+                    GROUP BY queue, priority
+                ) AS delta
+                WHERE lanes.queue = delta.queue
+                  AND lanes.priority = delta.priority
             )
             INSERT INTO {SCHEMA}.done_entries (
                 ready_slot,
@@ -293,6 +315,34 @@ def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
     purged = sync_client.purge_dlq(allow_all=True)
     assert purged == 1
     assert sync_client.dlq_depth(queue="pydlq_purge_all") == 0
+
+
+def test_list_and_purge_with_before_dlq_at_only(sync_client):
+    queue = "pydlq_before_cursor"
+    older = sync_client.insert(DlqPyJob(value="older"), queue=queue)
+    newer = sync_client.insert(DlqPyJob(value="newer"), queue=queue)
+    _move_ready_to_failed_done(sync_client, older.id)
+    _move_ready_to_failed_done(sync_client, newer.id)
+    sync_client.move_failed_to_dlq(older.id, "older")
+    sync_client.move_failed_to_dlq(newer.id, "newer")
+
+    tx = sync_client.transaction()
+    tx.execute(
+        f"UPDATE {SCHEMA}.dlq_entries SET dlq_at = now() - interval '1 day' WHERE job_id = $1",
+        older.id,
+    )
+    tx.commit()
+
+    listed = sync_client.list_dlq(queue=queue)
+    assert [entry.job.id for entry in listed] == [newer.id, older.id]
+
+    paged = sync_client.list_dlq(queue=queue, before_dlq_at=listed[0].dlq_at)
+    assert [entry.job.id for entry in paged] == [older.id]
+
+    purged = sync_client.purge_dlq(queue=queue, before_dlq_at=listed[0].dlq_at)
+    assert purged == 1
+    remaining = sync_client.list_dlq(queue=queue)
+    assert [entry.job.id for entry in remaining] == [newer.id]
 
 
 def test_retry_from_dlq_surfaces_unique_conflict(sync_client):

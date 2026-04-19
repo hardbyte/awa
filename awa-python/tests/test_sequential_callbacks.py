@@ -16,16 +16,25 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+RUNTIME_START_KWARGS = {
+    "leader_election_interval_ms": 100,
+    "queue_storage_queue_rotate_interval_ms": 60_000,
+}
 
 
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'seq_%'")
-    await tx.commit()
-    return c
+    await c.install_queue_storage(reset=True)
+    try:
+        yield c
+    finally:
+        try:
+            await c.shutdown()
+        except Exception:
+            pass
+        await c.close()
 
 
 @dataclass
@@ -50,7 +59,7 @@ async def test_resume_external_transitions_to_running(client):
 
     await client.insert(SeqTask(order_id=1), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -75,7 +84,7 @@ async def test_resume_external_stores_payload_in_metadata(client):
 
     job = await client.insert(SeqTask(order_id=2), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -102,7 +111,7 @@ async def test_resume_then_stale_callback_rejected(client):
 
     job = await client.insert(SeqTask(order_id=3), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -137,7 +146,7 @@ async def test_resume_external_without_payload(client):
 
     job = await client.insert(SeqTask(order_id=4), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -182,7 +191,7 @@ async def test_resume_after_complete_fails(client):
 
     await client.insert(SeqTask(order_id=5), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -208,7 +217,7 @@ async def test_double_resume_fails(client):
 
     await client.insert(SeqTask(order_id=6), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -237,7 +246,7 @@ async def test_resume_external_sync(client):
 
     await client.insert(SeqTask(order_id=7), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -262,7 +271,7 @@ async def test_heartbeat_during_wait(client):
 
     await client.insert(SeqTask(order_id=8), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -289,7 +298,7 @@ async def test_heartbeat_after_resume_fails(client):
 
     await client.insert(SeqTask(order_id=9), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -336,7 +345,7 @@ async def test_wait_for_callback_happy_path(client):
 
     job = await client.insert(SeqTask(order_id=10), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
 
     # Wait for the handler to register the callback and enter waiting
     for _ in range(20):
@@ -386,7 +395,7 @@ async def test_wait_for_callback_two_sequential(client):
 
     job = await client.insert(SeqTask(order_id=11), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
 
     # Wait for first callback registration
     for _ in range(20):

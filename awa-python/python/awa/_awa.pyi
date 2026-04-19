@@ -399,6 +399,8 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
         allow_all: bool = False,
     ) -> int: ...
     def purge_dlq_sync(
@@ -407,6 +409,8 @@ class Client:
         kind: str | None = None,
         queue: str | None = None,
         tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
         allow_all: bool = False,
     ) -> int: ...
     async def health_check(self) -> HealthCheck: ...

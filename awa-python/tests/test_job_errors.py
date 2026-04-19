@@ -15,6 +15,11 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+RUNTIME_START_KWARGS = {
+    "poll_interval_ms": 10,
+    "leader_election_interval_ms": 100,
+    "queue_storage_queue_rotate_interval_ms": 60_000,
+}
 
 
 @dataclass
@@ -26,13 +31,22 @@ class ErrorTestJob:
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    return c
+    await c.install_queue_storage(reset=True)
+    try:
+        yield c
+    finally:
+        try:
+            await c.shutdown()
+        except Exception:
+            pass
+        await c.close()
 
 
 @pytest.fixture
 def sync_client():
     c = awa.Client(DATABASE_URL)
     c.migrate()
+    c.install_queue_storage()
     return c
 
 
@@ -62,7 +76,7 @@ async def test_completed_job_has_empty_errors(client):
         return None
 
     job = await client.insert(ErrorTestJob(action="succeed"), queue="err_completed")
-    await client.start([("err_completed", 1)], poll_interval_ms=10)
+    await client.start([("err_completed", 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1)
     await client.shutdown()
 
@@ -88,7 +102,7 @@ async def test_terminal_error_appears_in_errors(client):
         queue="err_terminal",
         max_attempts=5,  # lots of retries — but terminal skips them
     )
-    await client.start([("err_terminal", 1)], poll_interval_ms=10)
+    await client.start([("err_terminal", 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(2)
     await client.shutdown()
 
@@ -126,8 +140,8 @@ async def test_multiple_retries_accumulate_errors(client):
     )
     await client.start(
         [("err_multi", 1)],
-        poll_interval_ms=10,
         promote_interval_ms=100,
+        **RUNTIME_START_KWARGS,
     )
     # Wait for all 3 attempts to run
     for _ in range(60):
@@ -166,7 +180,7 @@ async def test_error_entry_shape(client):
         queue="err_shape",
         max_attempts=1,
     )
-    await client.start([("err_shape", 1)], poll_interval_ms=10)
+    await client.start([("err_shape", 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(2)
     await client.shutdown()
 
@@ -205,7 +219,7 @@ async def test_sync_client_exposes_errors(client, sync_client):
         queue="err_sync",
         max_attempts=1,
     )
-    await client.start([("err_sync", 1)], poll_interval_ms=10)
+    await client.start([("err_sync", 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(2)
     await client.shutdown()
 

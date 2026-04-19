@@ -32,7 +32,15 @@ class DescriptorTestJob:
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    return c
+    await c.install_queue_storage(reset=True)
+    try:
+        yield c
+    finally:
+        try:
+            await c.shutdown()
+        except Exception:
+            pass
+        await c.close()
 
 
 def _sync_url() -> str:
@@ -189,6 +197,7 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
 
     # Second client, same fields → same hash (stable JSON canonicalization).
     client2 = awa.AsyncClient(DATABASE_URL)
+    await client2.install_queue_storage(reset=False)
     client2.queue_descriptor(
         queue,
         display_name="Version 1",
@@ -211,6 +220,7 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
 
     # Third declaration, changed field → different hash.
     client3 = awa.AsyncClient(DATABASE_URL)
+    await client3.install_queue_storage(reset=False)
     client3.queue_descriptor(
         queue,
         display_name="Version 2",  # changed
@@ -300,6 +310,7 @@ async def test_last_seen_at_bumps_on_restart(client):
     await asyncio.sleep(1.2)
 
     client2 = awa.AsyncClient(DATABASE_URL)
+    await client2.install_queue_storage(reset=False)
     client2.queue_descriptor(queue, display_name="Liveness test")
 
     @client2.task(DescriptorTestJob, queue=queue)

@@ -315,6 +315,47 @@ impl Clone for WorkerEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeLifecycle {
+    Idle,
+    InstallingQueueStorage,
+    Running,
+}
+
+fn set_runtime_lifecycle(lifecycle: &Mutex<RuntimeLifecycle>, state: RuntimeLifecycle) {
+    *lifecycle.lock().expect("runtime lifecycle mutex poisoned") = state;
+}
+
+fn begin_queue_storage_install(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
+    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    match *guard {
+        RuntimeLifecycle::Idle => {
+            *guard = RuntimeLifecycle::InstallingQueueStorage;
+            Ok(())
+        }
+        RuntimeLifecycle::InstallingQueueStorage => {
+            Err(state_error("queue storage installation is already in progress"))
+        }
+        RuntimeLifecycle::Running => Err(state_error(
+            "cannot install queue storage while the worker runtime is running",
+        )),
+    }
+}
+
+fn begin_runtime_start(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
+    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    match *guard {
+        RuntimeLifecycle::Idle => {
+            *guard = RuntimeLifecycle::Running;
+            Ok(())
+        }
+        RuntimeLifecycle::InstallingQueueStorage => Err(state_error(
+            "cannot start the worker runtime while queue storage installation is in progress",
+        )),
+        RuntimeLifecycle::Running => Err(state_error("worker runtime is already running")),
+    }
+}
+
 /// The main Python client.
 #[pyclass(name = "Client")]
 pub struct PyClient {
@@ -323,6 +364,7 @@ pub struct PyClient {
     periodic_jobs: Arc<Mutex<Vec<PeriodicJob>>>,
     queue_descriptors: Arc<Mutex<HashMap<String, QueueDescriptor>>>,
     job_kind_descriptors: Arc<Mutex<HashMap<String, JobKindDescriptor>>>,
+    lifecycle: Arc<Mutex<RuntimeLifecycle>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
 }
 
@@ -356,6 +398,7 @@ impl PyClient {
             periodic_jobs: Arc::new(Mutex::new(Vec::new())),
             queue_descriptors: Arc::new(Mutex::new(HashMap::new())),
             job_kind_descriptors: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: Arc::new(Mutex::new(RuntimeLifecycle::Idle)),
             runtime: Arc::new(Mutex::new(None)),
         })
     }
@@ -472,31 +515,33 @@ impl PyClient {
         lease_slot_count: u32,
         reset: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
-        if self.runtime.lock().expect("runtime mutex poisoned").is_some() {
-            return Err(state_error(
-                "cannot install queue storage while the worker runtime is running",
-            ));
-        }
+        begin_queue_storage_install(&self.lifecycle)?;
         let pool = self.pool.clone();
+        let lifecycle = self.lifecycle.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let store = QueueStorage::new(QueueStorageConfig {
-                schema,
-                queue_slot_count: queue_slot_count as usize,
-                lease_slot_count: lease_slot_count as usize,
-            })
-            .map_err(map_awa_error)?;
-            if reset {
-                let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
-                sqlx::query(&drop_sql)
-                    .execute(&pool)
-                    .await
-                    .map_err(map_sqlx_error)?;
+            let result = async {
+                let store = QueueStorage::new(QueueStorageConfig {
+                    schema,
+                    queue_slot_count: queue_slot_count as usize,
+                    lease_slot_count: lease_slot_count as usize,
+                })
+                .map_err(map_awa_error)?;
+                if reset {
+                    let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
+                    sqlx::query(&drop_sql)
+                        .execute(&pool)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                }
+                store.install(&pool).await.map_err(map_awa_error)?;
+                if reset {
+                    store.reset(&pool).await.map_err(map_awa_error)?;
+                }
+                Ok(())
             }
-            store.install(&pool).await.map_err(map_awa_error)?;
-            if reset {
-                store.reset(&pool).await.map_err(map_awa_error)?;
-            }
-            Ok(())
+            .await;
+            set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+            result
         })
     }
 
@@ -636,12 +681,13 @@ impl PyClient {
         // Mutation after start() is a footgun: the runtime only reads
         // queue_descriptors during startup, so the late call would
         // silently have no effect. Fail loudly instead.
-        if self
-            .runtime
-            .lock()
-            .expect("runtime mutex poisoned")
-            .is_some()
-        {
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .expect("runtime lifecycle mutex poisoned"),
+            RuntimeLifecycle::Idle
+        ) {
             return Err(state_error(
                 "queue_descriptor() must be called before start()",
             ));
@@ -679,12 +725,13 @@ impl PyClient {
         tags: Option<Vec<String>>,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        if self
-            .runtime
-            .lock()
-            .expect("runtime mutex poisoned")
-            .is_some()
-        {
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .expect("runtime lifecycle mutex poisoned"),
+            RuntimeLifecycle::Idle
+        ) {
             return Err(state_error(
                 "job_kind_descriptor() must be called before start()",
             ));
@@ -1158,19 +1205,22 @@ impl PyClient {
     ///
     /// Requires at least one of `kind`, `queue`, or `tag` unless
     /// `allow_all=True`.
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
     fn purge_dlq<'py>(
         &self,
         py: Python<'py>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let queue_attr = queue.clone();
-            let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
+            let filter =
+                crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
             let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
@@ -1229,13 +1279,6 @@ impl PyClient {
         queue_storage_queue_rotate_interval_ms: u64,
         queue_storage_lease_rotate_interval_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        {
-            let guard = self.runtime.lock().expect("runtime mutex poisoned");
-            if guard.is_some() {
-                return Err(state_error("worker runtime is already running"));
-            }
-        }
-
         let entries: Vec<_> = self
             .workers
             .read()
@@ -1394,15 +1437,24 @@ impl PyClient {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
 
-        let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
+        begin_runtime_start(&self.lifecycle)?;
+        let runtime = match builder.build() {
+            Ok(runtime) => Arc::new(runtime),
+            Err(err) => {
+                set_runtime_lifecycle(&self.lifecycle, RuntimeLifecycle::Idle);
+                return Err(state_error(err.to_string()));
+            }
+        };
         let runtime_clone = runtime.clone();
         let runtime_store = self.runtime.clone();
+        let lifecycle = self.lifecycle.clone();
         // Store the runtime BEFORE starting so shutdown() can find it
         // even if called concurrently. If start() fails, remove it.
         *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = runtime_clone.start().await {
                 runtime_store.lock().expect("runtime mutex poisoned").take();
+                set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
                 return Err(map_awa_error(e));
             }
             Ok(())
@@ -1412,10 +1464,12 @@ impl PyClient {
     #[pyo3(signature = (timeout_ms=2000))]
     fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").take();
+        let lifecycle = self.lifecycle.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
+            set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
             Ok(())
         })
     }
@@ -1853,14 +1907,11 @@ impl PyClient {
         lease_slot_count: u32,
         reset: bool,
     ) -> PyResult<()> {
-        if self.runtime.lock().expect("runtime mutex poisoned").is_some() {
-            return Err(state_error(
-                "cannot install queue storage while the worker runtime is running",
-            ));
-        }
+        begin_queue_storage_install(&self.lifecycle)?;
         let pool = self.pool.clone();
+        let lifecycle = self.lifecycle.clone();
         py.detach(|| {
-            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+            let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let store = QueueStorage::new(QueueStorageConfig {
                     schema,
                     queue_slot_count: queue_slot_count as usize,
@@ -1879,7 +1930,9 @@ impl PyClient {
                     store.reset(&pool).await.map_err(map_awa_error)?;
                 }
                 Ok(())
-            })
+            });
+            set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+            result
         })
     }
 
@@ -2303,18 +2356,20 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
     fn purge_dlq_sync(
         &self,
         py: Python<'_>,
         kind: Option<String>,
         queue: Option<String>,
         tag: Option<String>,
+        before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
         allow_all: bool,
     ) -> PyResult<u64> {
         let pool = self.pool.clone();
         let queue_attr = queue.clone();
-        let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
+        let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
                 let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)

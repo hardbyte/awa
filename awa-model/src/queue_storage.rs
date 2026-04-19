@@ -2718,7 +2718,7 @@ impl QueueStorage {
             let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
             let deferred_rows: Vec<_> = deferred_rows
                 .into_iter()
-                .zip(ids.into_iter())
+                .zip(ids)
                 .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
                 .collect();
             total += self
@@ -3624,7 +3624,7 @@ impl QueueStorage {
 
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
-        self.notify_queues_tx(&mut tx, queues.into_iter()).await?;
+        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(ids)
     }
@@ -5543,12 +5543,14 @@ impl QueueStorage {
               AND ($2::text IS NULL OR queue = $2)
               AND ($3::text IS NULL OR payload -> 'tags' ? $3)
               AND (
-                  $4::bigint IS NULL
+                  ($4::bigint IS NULL AND $5::timestamptz IS NULL)
+                  OR ($4::bigint IS NOT NULL AND $5::timestamptz IS NULL AND job_id < $4)
+                  OR ($4::bigint IS NULL AND $5::timestamptz IS NOT NULL AND dlq_at < $5)
                   OR (
-                      $5::timestamptz IS NULL
-                      AND job_id < $4
+                      $4::bigint IS NOT NULL
+                      AND $5::timestamptz IS NOT NULL
+                      AND (dlq_at, job_id) < ($5, $4)
                   )
-                  OR (dlq_at, job_id) < ($5, $4)
               )
             RETURNING
                 job_id,
@@ -5606,7 +5608,7 @@ impl QueueStorage {
         let revived = ready_rows.len() as u64;
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Failed))
             .await?;
-        self.notify_queues_tx(&mut tx, queues.into_iter()).await?;
+        self.notify_queues_tx(&mut tx, queues).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(revived)
     }

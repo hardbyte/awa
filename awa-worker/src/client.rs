@@ -41,6 +41,8 @@ pub enum BuildError {
     InvalidWeight,
     #[error("cleanup_batch_size must be > 0")]
     InvalidBatchSize,
+    #[error("dlq_cleanup_batch_size must be > 0")]
+    InvalidDlqBatchSize,
     #[error("invalid queue storage config: {0}")]
     InvalidQueueStorage(String),
 }
@@ -522,6 +524,11 @@ impl ClientBuilder {
         if let Some(bs) = self.cleanup_batch_size {
             if bs <= 0 {
                 return Err(BuildError::InvalidBatchSize);
+            }
+        }
+        if let Some(bs) = self.dlq_cleanup_batch_size {
+            if bs <= 0 {
+                return Err(BuildError::InvalidDlqBatchSize);
             }
         }
 
@@ -1074,17 +1081,31 @@ impl Client {
         let maintenance_alive = self.maintenance_alive.load(Ordering::SeqCst);
         let shutting_down = self.dispatch_cancel.is_cancelled();
         let leader = self.leader.load(Ordering::SeqCst);
-        let available_rows = sqlx::query_as::<_, (String, i64)>(
-            r#"
-            SELECT queue, count(*)::bigint AS available
-            FROM awa.jobs_hot
-            WHERE state = 'available'
-            GROUP BY queue
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .unwrap_or_default();
+        let available_rows = if let Some(store) = self.storage.queue_storage_store() {
+            sqlx::query_as::<_, (String, i64)>(&format!(
+                r#"
+                SELECT queue, COALESCE(sum(available_count), 0)::bigint AS available
+                FROM {}.queue_lanes
+                GROUP BY queue
+                "#,
+                store.schema()
+            ))
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default()
+        } else {
+            sqlx::query_as::<_, (String, i64)>(
+                r#"
+                SELECT queue, count(*)::bigint AS available
+                FROM awa.jobs_hot
+                WHERE state = 'available'
+                GROUP BY queue
+                "#,
+            )
+            .fetch_all(&self.pool)
+            .await
+            .unwrap_or_default()
+        };
         let available_by_queue: HashMap<_, _> = available_rows.into_iter().collect();
         let queues = self
             .queues
@@ -1581,6 +1602,51 @@ mod tests {
             result.is_ok(),
             "descriptor for registered kind should build"
         );
+    }
+
+    #[tokio::test]
+    async fn dlq_cleanup_batch_size_must_be_positive() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .dlq_cleanup_batch_size(0)
+            .build();
+
+        assert!(matches!(result, Err(BuildError::InvalidDlqBatchSize)));
+    }
+
+    #[tokio::test]
+    async fn health_check_reads_available_from_active_queue_storage() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("migrations should succeed");
+        drop_queue_storage_schema(&pool, "awa_exp").await;
+
+        let queue = "health_queue_storage";
+        let client = Client::builder(pool.clone())
+            .queue(queue, QueueConfig::default())
+            .build()
+            .expect("queue-storage health client should build");
+
+        let store = client
+            .storage
+            .queue_storage_store()
+            .expect("client should default to queue storage");
+        store
+            .install(&pool)
+            .await
+            .expect("queue storage install should succeed");
+
+        insert_available_job(&pool, "cutover_short_job", queue).await;
+
+        let health = client.health_check().await;
+        let queue_health = health
+            .queues
+            .get(queue)
+            .expect("queue should appear in health");
+        assert_eq!(queue_health.available, 1);
     }
 
     #[derive(Clone, serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]

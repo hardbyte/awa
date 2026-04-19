@@ -131,7 +131,9 @@ export function QueuesPage() {
   }
 
   const dlqByQueue = new Map<string, number>(
-    (dlqDepthQuery.data?.by_queue ?? []).map(({ queue, count }) => [queue, count]),
+    (dlqDepthQuery.data?.by_queue ?? []).map(
+      ({ queue, count }): [string, number] => [queue, count],
+    ),
   );
 
   return (
