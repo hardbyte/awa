@@ -51,6 +51,12 @@ async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
             .await
             .expect("failed to clean queue meta");
 
+        sqlx::query("DELETE FROM awa.queue_descriptors WHERE queue = ANY($1)")
+            .bind(queues)
+            .execute(pool)
+            .await
+            .expect("failed to clean queue descriptors");
+
         sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = ANY($1)")
             .bind(queues)
             .execute(pool)
@@ -65,6 +71,12 @@ async fn clean_jobs(pool: &sqlx::PgPool, queues: &[&str], kinds: &[&str]) {
     }
 
     if !kinds.is_empty() {
+        sqlx::query("DELETE FROM awa.job_kind_descriptors WHERE kind = ANY($1)")
+            .bind(kinds)
+            .execute(pool)
+            .await
+            .expect("failed to clean kind descriptors");
+
         sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
             .bind(kinds)
             .execute(pool)
@@ -467,6 +479,463 @@ async fn test_queues_endpoint_surfaces_total_queued_and_retryable_counts() {
             .and_then(Value::as_f64)
             .unwrap_or(0.0)
             > 0.0
+    );
+}
+
+#[tokio::test]
+async fn test_queues_endpoint_surfaces_descriptors_for_declared_empty_queue() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_queue_descriptor_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new()
+                .display_name("Billing")
+                .description("Invoice and payment processing")
+                .owner("finance-platform")
+                .docs_url("https://example.test/billing")
+                .tag("critical"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("descriptor sync should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, "/api/queues").await;
+    let queue_stats = payload
+        .as_array()
+        .expect("queues payload should be an array")
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue.as_str()))
+        .expect("declared queue should be present");
+
+    assert_eq!(
+        queue_stats.get("display_name").and_then(Value::as_str),
+        Some("Billing")
+    );
+    assert_eq!(
+        queue_stats.get("description").and_then(Value::as_str),
+        Some("Invoice and payment processing")
+    );
+    assert_eq!(
+        queue_stats.get("owner").and_then(Value::as_str),
+        Some("finance-platform")
+    );
+    assert_eq!(
+        queue_stats.get("docs_url").and_then(Value::as_str),
+        Some("https://example.test/billing")
+    );
+    assert_eq!(
+        queue_stats.get("total_queued").and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        queue_stats
+            .get("tags")
+            .and_then(Value::as_array)
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        queue_stats.get("descriptor_stale").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert!(queue_stats
+        .get("descriptor_last_seen_at")
+        .and_then(Value::as_str)
+        .is_some());
+
+    let detail = get_json(&app, &format!("/api/queues/{queue}")).await;
+    assert_eq!(
+        detail.get("queue").and_then(Value::as_str),
+        Some(queue.as_str())
+    );
+    assert_eq!(
+        detail.get("display_name").and_then(Value::as_str),
+        Some("Billing")
+    );
+}
+
+#[tokio::test]
+async fn test_kinds_endpoint_surfaces_descriptors_for_declared_empty_kind() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let kind = format!("api_kind_descriptor_{suffix}");
+    clean_jobs(&pool, &[], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new()
+                .display_name("Reconcile invoice")
+                .description("Reconcile invoice state against PSP settlement events")
+                .owner("finance-platform")
+                .docs_url("https://example.test/reconcile")
+                .tag("billing"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("descriptor sync should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+    let payload = get_json(&app, "/api/kinds").await;
+    let kind_overview = payload
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind.as_str()))
+        .expect("declared kind should be present");
+
+    assert_eq!(
+        kind_overview.get("display_name").and_then(Value::as_str),
+        Some("Reconcile invoice")
+    );
+    assert_eq!(
+        kind_overview.get("job_count").and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        kind_overview.get("queue_count").and_then(Value::as_i64),
+        Some(0)
+    );
+    assert_eq!(
+        kind_overview
+            .get("descriptor_stale")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+#[tokio::test]
+async fn test_jobs_endpoint_includes_queue_and_kind_descriptors() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_job_desc_queue_{suffix}");
+    let kind = format!("api_job_desc_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new()
+                .display_name("Billing")
+                .description("Invoice and payment processing"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("queue descriptor sync should succeed");
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new()
+                .display_name("Reconcile invoice")
+                .description("Reconcile invoice state against PSP settlement events"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("kind descriptor sync should succeed");
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES ($1, $2, '{}'::jsonb, 'available', now())
+        "#,
+    )
+    .bind(&kind)
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("fixture insert should succeed");
+
+    sqlx::query("SELECT awa.rebuild_admin_metadata()")
+        .execute(&pool)
+        .await
+        .expect("admin metadata rebuild should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, &format!("/api/jobs?queue={queue}")).await;
+    let job = payload
+        .as_array()
+        .expect("jobs payload should be an array")
+        .first()
+        .expect("job should be present");
+
+    assert_eq!(
+        job.get("queue_descriptor")
+            .and_then(|value| value.get("display_name"))
+            .and_then(Value::as_str),
+        Some("Billing")
+    );
+    assert_eq!(
+        job.get("kind_descriptor")
+            .and_then(|value| value.get("display_name"))
+            .and_then(Value::as_str),
+        Some("Reconcile invoice")
+    );
+}
+
+#[tokio::test]
+async fn test_jobs_endpoint_keeps_legacy_rows_without_descriptors() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_legacy_queue_{suffix}");
+    let kind = format!("api_legacy_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.jobs (kind, queue, args, state, run_at)
+        VALUES ($1, $2, '{}'::jsonb, 'available', now())
+        "#,
+    )
+    .bind(&kind)
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("fixture insert should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let payload = get_json(&app, &format!("/api/jobs?queue={queue}")).await;
+    let job = payload
+        .as_array()
+        .expect("jobs payload should be an array")
+        .first()
+        .expect("job should be present");
+
+    assert_eq!(job.get("queue_descriptor").and_then(Value::as_object), None);
+    assert_eq!(job.get("kind_descriptor").and_then(Value::as_object), None);
+}
+
+#[tokio::test]
+async fn test_descriptor_endpoints_surface_stale_status() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_stale_queue_{suffix}");
+    let kind = format!("api_stale_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new().display_name("Stale queue"),
+        }],
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("queue descriptor sync should succeed");
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new().display_name("Stale kind"),
+        }],
+        Duration::from_secs(1),
+    )
+    .await
+    .expect("kind descriptor sync should succeed");
+
+    sqlx::query(
+        "UPDATE awa.queue_descriptors SET last_seen_at = now() - interval '5 minutes' WHERE queue = $1",
+    )
+    .bind(&queue)
+    .execute(&pool)
+    .await
+    .expect("queue descriptor age update should succeed");
+
+    sqlx::query(
+        "UPDATE awa.job_kind_descriptors SET last_seen_at = now() - interval '5 minutes' WHERE kind = $1",
+    )
+    .bind(&kind)
+    .execute(&pool)
+    .await
+    .expect("kind descriptor age update should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let queues = get_json(&app, "/api/queues").await;
+    let queue_overview = queues
+        .as_array()
+        .expect("queues payload should be an array")
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue.as_str()))
+        .expect("declared queue should be present");
+    assert_eq!(
+        queue_overview
+            .get("descriptor_stale")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let kinds = get_json(&app, "/api/kinds").await;
+    let kind_overview = kinds
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind.as_str()))
+        .expect("declared kind should be present");
+    assert_eq!(
+        kind_overview
+            .get("descriptor_stale")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+}
+
+#[tokio::test]
+async fn test_descriptor_endpoints_surface_drift_status() {
+    let _guard = test_lock().lock().await;
+    let pool = setup_pool().await;
+    let suffix = Uuid::new_v4().simple().to_string();
+    let queue = format!("api_drift_queue_{suffix}");
+    let kind = format!("api_drift_kind_{suffix}");
+    clean_jobs(&pool, &[queue.as_str()], &[kind.as_str()]).await;
+
+    awa_model::admin::sync_queue_descriptors(
+        &pool,
+        &[awa_model::admin::NamedQueueDescriptor {
+            queue: queue.clone(),
+            descriptor: awa_model::QueueDescriptor::new().display_name("Drift queue"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("queue descriptor sync should succeed");
+
+    awa_model::admin::sync_job_kind_descriptors(
+        &pool,
+        &[awa_model::admin::NamedJobKindDescriptor {
+            kind: kind.clone(),
+            descriptor: awa_model::JobKindDescriptor::new().display_name("Drift kind"),
+        }],
+        Duration::from_secs(10),
+    )
+    .await
+    .expect("kind descriptor sync should succeed");
+
+    let queue_hash_a = awa_model::QueueDescriptor::new()
+        .display_name("Queue A")
+        .descriptor_hash();
+    let queue_hash_b = awa_model::QueueDescriptor::new()
+        .display_name("Queue B")
+        .descriptor_hash();
+    let kind_hash_a = awa_model::JobKindDescriptor::new()
+        .display_name("Kind A")
+        .descriptor_hash();
+    let kind_hash_b = awa_model::JobKindDescriptor::new()
+        .display_name("Kind B")
+        .descriptor_hash();
+
+    for (instance_id, queue_hash, kind_hash) in [
+        (Uuid::new_v4(), queue_hash_a.as_str(), kind_hash_a.as_str()),
+        (Uuid::new_v4(), queue_hash_b.as_str(), kind_hash_b.as_str()),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO awa.runtime_instances (
+                instance_id,
+                hostname,
+                pid,
+                version,
+                started_at,
+                last_seen_at,
+                snapshot_interval_ms,
+                healthy,
+                postgres_connected,
+                poll_loop_alive,
+                heartbeat_alive,
+                maintenance_alive,
+                shutting_down,
+                leader,
+                global_max_workers,
+                queues,
+                queue_descriptor_hashes,
+                job_kind_descriptor_hashes
+            )
+            VALUES (
+                $1, 'test-host', 1234, 'test', now(), now(), 1000,
+                true, true, true, true, true, false, false, NULL,
+                '[]'::jsonb,
+                jsonb_build_object($2, $3),
+                jsonb_build_object($4, $5)
+            )
+            ON CONFLICT (instance_id) DO UPDATE SET
+                last_seen_at = now(),
+                queue_descriptor_hashes = EXCLUDED.queue_descriptor_hashes,
+                job_kind_descriptor_hashes = EXCLUDED.job_kind_descriptor_hashes
+            "#,
+        )
+        .bind(instance_id)
+        .bind(&queue)
+        .bind(queue_hash)
+        .bind(&kind)
+        .bind(kind_hash)
+        .execute(&pool)
+        .await
+        .expect("runtime snapshot insert should succeed");
+    }
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let queues = get_json(&app, "/api/queues").await;
+    let queue_overview = queues
+        .as_array()
+        .expect("queues payload should be an array")
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue.as_str()))
+        .expect("declared queue should be present");
+    assert_eq!(
+        queue_overview
+            .get("descriptor_mismatch")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+
+    let kinds = get_json(&app, "/api/kinds").await;
+    let kind_overview = kinds
+        .as_array()
+        .expect("kinds payload should be an array")
+        .iter()
+        .find(|entry| entry.get("kind").and_then(Value::as_str) == Some(kind.as_str()))
+        .expect("declared kind should be present");
+    assert_eq!(
+        kind_overview
+            .get("descriptor_mismatch")
+            .and_then(Value::as_bool),
+        Some(true)
     );
 }
 

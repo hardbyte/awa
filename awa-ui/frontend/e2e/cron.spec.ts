@@ -1,4 +1,34 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Page, type Response } from "@playwright/test";
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function isCronListResponse(response: Response): boolean {
+  const url = new URL(response.url());
+  return response.ok() && response.request().method() === "GET" && url.pathname === "/api/cron";
+}
+
+function cronPanelId(name: string): string {
+  return `cron-panel-${name.replace(/[^a-zA-Z0-9_-]/g, "-")}`;
+}
+
+async function loadCronPage(page: Page) {
+  const [cronResponse] = await Promise.all([
+    page.waitForResponse(isCronListResponse),
+    page.goto("/cron"),
+  ]);
+  return (await cronResponse.json()) as Array<{
+    name: string;
+    next_fire_at: string | null;
+  }>;
+}
+
+function firstCronSummary(page: Page, name: string) {
+  return page.getByRole("button", {
+    name: new RegExp(`\\b${escapeRegex(name)}\\b`),
+  });
+}
 
 test.describe("Cron page", () => {
   test("navigate to /cron, heading visible", async ({ page }) => {
@@ -9,62 +39,43 @@ test.describe("Cron page", () => {
   });
 
   test("cron list renders or shows empty state", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
-      page.goto("/cron"),
-    ]);
+    const cronJobs = await loadCronPage(page);
 
-    // Either cron entries exist or the empty state shows
-    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
-    const emptyMessage = page.getByText("No cron schedules found.");
+    if (cronJobs.length === 0) {
+      await expect(page.getByText("No cron schedules found.")).toBeVisible();
+      return;
+    }
 
-    const hasEntries = await triggerBtn.isVisible().catch(() => false);
-    const emptyVisible = await emptyMessage.isVisible().catch(() => false);
-    expect(hasEntries || emptyVisible).toBeTruthy();
+    await expect(firstCronSummary(page, cronJobs[0].name)).toBeVisible();
+    await expect(page.getByRole("button", { name: "Trigger now" }).first()).toBeVisible();
   });
 
   test("clicking cron row toggles expand/collapse", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
-      page.goto("/cron"),
-    ]);
-
-    // Check if there are any cron entries
-    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
-    const hasEntries = await triggerBtn.isVisible().catch(() => false);
-    if (!hasEntries) {
+    const cronJobs = await loadCronPage(page);
+    if (cronJobs.length === 0) {
       test.skip();
       return;
     }
 
-    // The first cron entry is a clickable row that expands
-    // The expanded section shows Kind, Queue, Priority, Max attempts
-    const kindLabel = page.getByText("Kind", { exact: true }).first();
-    await expect(kindLabel).not.toBeVisible();
+    const firstCron = cronJobs[0];
+    const summary = firstCronSummary(page, firstCron.name);
+    const panel = page.locator(`#${cronPanelId(firstCron.name)}`);
 
-    // Click the cron row (the summary area, not the button)
-    const firstEntry = page.locator(".rounded-lg.border").first();
-    const summaryRow = firstEntry.locator(".cursor-pointer").first();
-    await summaryRow.click();
+    await expect(panel).toHaveCount(0);
+    await summary.click();
 
-    // Expanded detail should now be visible with Kind/Queue/Priority fields
-    await expect(firstEntry.getByText("Kind", { exact: true })).toBeVisible();
-    await expect(firstEntry.getByText("Queue", { exact: true })).toBeVisible();
-    await expect(firstEntry.getByText("Priority", { exact: true })).toBeVisible();
-    await expect(firstEntry.getByText("Max attempts", { exact: true })).toBeVisible();
+    await expect(panel).toBeVisible();
+    await expect(panel.getByText("Kind", { exact: true })).toBeVisible();
+    await expect(panel.getByText("Queue", { exact: true })).toBeVisible();
+    await expect(panel.getByText("Priority", { exact: true })).toBeVisible();
+    await expect(panel.getByText("Max attempts", { exact: true })).toBeVisible();
 
-    // Click again to collapse
-    await summaryRow.click();
-    await expect(firstEntry.getByText("Max attempts", { exact: true })).not.toBeVisible();
+    await summary.click();
+    await expect(panel).toHaveCount(0);
   });
 
   test("cron API response includes next_fire_at", async ({ page }) => {
-    const [cronResponse] = await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
-      page.goto("/cron"),
-    ]);
-
-    const cronJobs = await cronResponse.json();
+    const cronJobs = await loadCronPage(page);
     if (!Array.isArray(cronJobs) || cronJobs.length === 0) {
       test.skip();
       return;
@@ -83,68 +94,47 @@ test.describe("Cron page", () => {
   });
 
   test("cron summary row shows next fire time", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
-      page.goto("/cron"),
-    ]);
-
-    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
-    const hasEntries = await triggerBtn.isVisible().catch(() => false);
-    if (!hasEntries) {
+    const cronJobs = await loadCronPage(page);
+    if (cronJobs.length === 0) {
       test.skip();
       return;
     }
 
-    // The summary row should show "in Xm" or "in Xh" for the next fire
-    const firstEntry = page.locator(".rounded-lg.border").first();
-    const nextFireText = firstEntry.locator(".text-success").first();
-    await expect(nextFireText).toBeVisible();
-    const text = await nextFireText.textContent();
-    expect(text).toMatch(/^in \d+[smhd]$/);
+    await expect(firstCronSummary(page, cronJobs[0].name)).toContainText(
+      /in \d+[smhd]|overdue/,
+    );
   });
 
   test("expanded cron detail shows Next fire with timezone", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
-      page.goto("/cron"),
-    ]);
-
-    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
-    const hasEntries = await triggerBtn.isVisible().catch(() => false);
-    if (!hasEntries) {
+    const cronJobs = await loadCronPage(page);
+    if (cronJobs.length === 0) {
       test.skip();
       return;
     }
 
-    // Expand the first cron entry
-    const firstEntry = page.locator(".rounded-lg.border").first();
-    const summaryRow = firstEntry.locator(".cursor-pointer").first();
-    await summaryRow.click();
-
-    // Expanded detail should show "Next fire" label
-    await expect(firstEntry.getByText("Next fire")).toBeVisible();
+    const firstCron = cronJobs[0];
+    const summary = firstCronSummary(page, firstCron.name);
+    const panel = page.locator(`#${cronPanelId(firstCron.name)}`);
+    await summary.click();
+    await expect(panel.getByText("Next fire")).toBeVisible();
   });
 
   test("trigger now button creates a job", async ({ page }) => {
-    await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/cron") && r.ok()),
-      page.goto("/cron"),
-    ]);
-
-    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
-    const hasEntries = await triggerBtn.isVisible().catch(() => false);
-    if (!hasEntries) {
+    const cronJobs = await loadCronPage(page);
+    if (cronJobs.length === 0) {
       test.skip();
       return;
     }
 
-    // Click "Trigger now" and verify the API response
+    const triggerBtn = page.getByRole("button", { name: "Trigger now" }).first();
+    const firstCron = cronJobs[0];
+
     const [triggerResponse] = await Promise.all([
       page.waitForResponse(
         (r) =>
-          r.url().includes("/api/cron/") &&
-          r.url().includes("/trigger") &&
-          r.request().method() === "POST"
+          r.ok() &&
+          r.request().method() === "POST" &&
+          new URL(r.url()).pathname === `/api/cron/${firstCron.name}/trigger`
       ),
       triggerBtn.click(),
     ]);

@@ -6,7 +6,8 @@ use crate::heartbeat::HeartbeatService;
 use crate::maintenance::{MaintenanceService, RetentionPolicy};
 use crate::runtime::{InFlightMap, InFlightRegistry};
 use awa_model::admin::{
-    self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
+    self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
+    QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput,
 };
 use awa_model::{JobArgs, PeriodicJob};
@@ -29,6 +30,8 @@ use uuid::Uuid;
 pub enum BuildError {
     #[error("at least one queue must be configured")]
     NoQueuesConfigured,
+    #[error("queue descriptor declared for unknown queue '{queue}'")]
+    QueueDescriptorWithoutQueue { queue: String },
     #[error("sum of min_workers ({total_min}) exceeds global_max_workers ({global_max})")]
     MinWorkersExceedGlobal { total_min: u32, global_max: u32 },
     #[error("rate_limit max_rate must be > 0.0")]
@@ -78,6 +81,8 @@ pub enum QueueCapacity {
 pub struct ClientBuilder {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
+    queue_descriptors: HashMap<String, QueueDescriptor>,
+    job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
@@ -93,6 +98,7 @@ pub struct ClientBuilder {
     leader_check_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
+    descriptor_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
@@ -105,6 +111,8 @@ impl ClientBuilder {
         Self {
             pool,
             queues: Vec::new(),
+            queue_descriptors: HashMap::new(),
+            job_kind_descriptors: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
             state: HashMap::new(),
@@ -120,6 +128,7 @@ impl ClientBuilder {
             leader_check_interval: None,
             completed_retention: None,
             failed_retention: None,
+            descriptor_retention: None,
             cleanup_batch_size: None,
             cleanup_interval: None,
             queue_retention_overrides: HashMap::new(),
@@ -131,6 +140,42 @@ impl ClientBuilder {
     /// Add a queue with its configuration.
     pub fn queue(mut self, name: impl Into<String>, config: QueueConfig) -> Self {
         self.queues.push((name.into(), config));
+        self
+    }
+
+    /// Attach descriptive metadata (display name, description, owner,
+    /// docs URL, tags, extra JSON) to a queue so it appears labelled in
+    /// the admin API and UI. The queue must also be declared via
+    /// [`queue`]; otherwise [`build`] fails with
+    /// [`BuildError::QueueDescriptorWithoutQueue`].
+    ///
+    /// [`queue`]: ClientBuilder::queue
+    /// [`build`]: ClientBuilder::build
+    pub fn queue_descriptor(
+        mut self,
+        name: impl Into<String>,
+        descriptor: QueueDescriptor,
+    ) -> Self {
+        self.queue_descriptors.insert(name.into(), descriptor);
+        self
+    }
+
+    /// Attach descriptive metadata to a typed job kind. The kind string is
+    /// taken from [`JobArgs::kind`] on `T`.
+    pub fn job_kind_descriptor<T: JobArgs>(mut self, descriptor: JobKindDescriptor) -> Self {
+        self.job_kind_descriptors
+            .insert(T::kind().to_string(), descriptor);
+        self
+    }
+
+    /// Attach descriptive metadata to a job kind by string name. Useful
+    /// when the kind is known dynamically (e.g. from language bridges).
+    pub fn job_kind_descriptor_kind(
+        mut self,
+        kind: impl Into<String>,
+        descriptor: JobKindDescriptor,
+    ) -> Self {
+        self.job_kind_descriptors.insert(kind.into(), descriptor);
         self
     }
 
@@ -320,6 +365,15 @@ impl ClientBuilder {
         self
     }
 
+    /// How long a descriptor catalog row can go un-refreshed before the
+    /// maintenance leader deletes it (default: 30 days). Pass
+    /// `Duration::ZERO` to disable — the catalog will then accumulate
+    /// rows indefinitely. See [`MaintenanceService::descriptor_retention`].
+    pub fn descriptor_retention(mut self, retention: Duration) -> Self {
+        self.descriptor_retention = Some(retention);
+        self
+    }
+
     /// Set the maximum number of jobs to delete per cleanup pass (default: 1000).
     pub fn cleanup_batch_size(mut self, batch_size: i64) -> Self {
         self.cleanup_batch_size = Some(batch_size);
@@ -363,6 +417,14 @@ impl ClientBuilder {
     pub fn build(self) -> Result<Client, BuildError> {
         if self.queues.is_empty() {
             return Err(BuildError::NoQueuesConfigured);
+        }
+
+        for queue in self.queue_descriptors.keys() {
+            if !self.queues.iter().any(|(name, _)| name == queue) {
+                return Err(BuildError::QueueDescriptorWithoutQueue {
+                    queue: queue.clone(),
+                });
+            }
         }
 
         // Validate rate limits and weights
@@ -437,6 +499,8 @@ impl ClientBuilder {
         Ok(Client {
             pool: self.pool,
             queues: self.queues,
+            queue_descriptors: self.queue_descriptors,
+            job_kind_descriptors: self.job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
             state: Arc::new(self.state),
@@ -464,6 +528,7 @@ impl ClientBuilder {
             leader_check_interval: self.leader_check_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
+            descriptor_retention: self.descriptor_retention,
             cleanup_batch_size: self.cleanup_batch_size,
             cleanup_interval: self.cleanup_interval,
             queue_retention_overrides: self.queue_retention_overrides,
@@ -514,6 +579,8 @@ where
 pub struct Client {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
+    queue_descriptors: HashMap<String, QueueDescriptor>,
+    job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
@@ -547,6 +614,7 @@ pub struct Client {
     leader_check_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
+    descriptor_retention: Option<Duration>,
     cleanup_batch_size: Option<i64>,
     cleanup_interval: Option<Duration>,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
@@ -564,6 +632,9 @@ pub struct Client {
 struct RuntimeReporterState {
     pool: PgPool,
     queues: Vec<(String, QueueConfig)>,
+    queue_descriptors: HashMap<String, QueueDescriptor>,
+    job_kind_descriptors: HashMap<String, JobKindDescriptor>,
+    worker_kinds: Vec<String>,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     dispatcher_alive: Arc<HashMap<String, Arc<AtomicBool>>>,
     heartbeat_alive: Arc<AtomicBool>,
@@ -578,6 +649,7 @@ struct RuntimeReporterState {
     pid: i32,
     version: &'static str,
     snapshot_interval: Duration,
+    metrics: crate::metrics::AwaMetrics,
 }
 
 impl Client {
@@ -586,10 +658,49 @@ impl Client {
         ClientBuilder::new(pool)
     }
 
+    fn declared_queue_descriptors(&self) -> Vec<NamedQueueDescriptor> {
+        self.queues
+            .iter()
+            .map(|(queue, _)| NamedQueueDescriptor {
+                queue: queue.clone(),
+                descriptor: self
+                    .queue_descriptors
+                    .get(queue)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    fn declared_job_kind_descriptors(&self) -> Vec<NamedJobKindDescriptor> {
+        let mut kinds: Vec<String> = self.workers.keys().cloned().collect();
+        for kind in self.job_kind_descriptors.keys() {
+            if !kinds.iter().any(|existing| existing == kind) {
+                kinds.push(kind.clone());
+            }
+        }
+        kinds.sort();
+
+        kinds
+            .into_iter()
+            .map(|kind| NamedJobKindDescriptor {
+                descriptor: self
+                    .job_kind_descriptors
+                    .get(&kind)
+                    .cloned()
+                    .unwrap_or_default(),
+                kind,
+            })
+            .collect()
+    }
+
     fn runtime_reporter_state(&self) -> RuntimeReporterState {
         RuntimeReporterState {
             pool: self.pool.clone(),
             queues: self.queues.clone(),
+            queue_descriptors: self.queue_descriptors.clone(),
+            job_kind_descriptors: self.job_kind_descriptors.clone(),
+            worker_kinds: self.workers.keys().cloned().collect(),
             queue_in_flight: self.queue_in_flight.clone(),
             dispatcher_alive: self.dispatcher_alive.clone(),
             heartbeat_alive: self.heartbeat_alive.clone(),
@@ -604,6 +715,7 @@ impl Client {
             pid: self.runtime_pid,
             version: self.runtime_version,
             snapshot_interval: self.runtime_snapshot_interval,
+            metrics: self.metrics.clone(),
         }
     }
 
@@ -619,6 +731,19 @@ impl Client {
             workers = self.workers.len(),
             "Starting Awa worker runtime"
         );
+
+        admin::sync_queue_descriptors(
+            &self.pool,
+            &self.declared_queue_descriptors(),
+            self.runtime_snapshot_interval,
+        )
+        .await?;
+        admin::sync_job_kind_descriptors(
+            &self.pool,
+            &self.declared_job_kind_descriptors(),
+            self.runtime_snapshot_interval,
+        )
+        .await?;
 
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
@@ -691,6 +816,9 @@ impl Client {
         }
         if let Some(retention) = self.failed_retention {
             maintenance = maintenance.failed_retention(retention);
+        }
+        if let Some(retention) = self.descriptor_retention {
+            maintenance = maintenance.descriptor_retention(retention);
         }
         if let Some(batch_size) = self.cleanup_batch_size {
             maintenance = maintenance.cleanup_batch_size(batch_size);
@@ -902,6 +1030,57 @@ impl Client {
 }
 
 impl RuntimeReporterState {
+    fn queue_descriptor_hashes(&self) -> HashMap<String, String> {
+        self.declared_queue_descriptors()
+            .into_iter()
+            .map(|named| (named.queue, named.descriptor.descriptor_hash()))
+            .collect()
+    }
+
+    fn job_kind_descriptor_hashes(&self) -> HashMap<String, String> {
+        self.declared_job_kind_descriptors()
+            .into_iter()
+            .map(|named| (named.kind, named.descriptor.descriptor_hash()))
+            .collect()
+    }
+
+    fn declared_queue_descriptors(&self) -> Vec<NamedQueueDescriptor> {
+        self.queues
+            .iter()
+            .map(|(queue, _)| NamedQueueDescriptor {
+                queue: queue.clone(),
+                descriptor: self
+                    .queue_descriptors
+                    .get(queue)
+                    .cloned()
+                    .unwrap_or_default(),
+            })
+            .collect()
+    }
+
+    fn declared_job_kind_descriptors(&self) -> Vec<NamedJobKindDescriptor> {
+        let mut kinds = self.worker_kinds.clone();
+        for kind in self.job_kind_descriptors.keys() {
+            if !kinds.iter().any(|existing| existing == kind) {
+                kinds.push(kind.clone());
+            }
+        }
+        kinds.sort();
+        kinds.dedup();
+
+        kinds
+            .into_iter()
+            .map(|kind| NamedJobKindDescriptor {
+                descriptor: self
+                    .job_kind_descriptors
+                    .get(&kind)
+                    .cloned()
+                    .unwrap_or_default(),
+                kind,
+            })
+            .collect()
+    }
+
     fn queue_snapshot(&self, queue: &str, config: &QueueConfig) -> QueueRuntimeSnapshot {
         let in_flight = self
             .queue_in_flight
@@ -986,10 +1165,53 @@ impl RuntimeReporterState {
             leader,
             global_max_workers: self.global_max_workers,
             queues,
+            queue_descriptor_hashes: self.queue_descriptor_hashes(),
+            job_kind_descriptor_hashes: self.job_kind_descriptor_hashes(),
         }
     }
 
     async fn publish_snapshot(&self) {
+        let queue_descriptors = self.declared_queue_descriptors();
+        let kind_descriptors = self.declared_job_kind_descriptors();
+
+        if let Err(err) =
+            admin::sync_queue_descriptors(&self.pool, &queue_descriptors, self.snapshot_interval)
+                .await
+        {
+            warn!(error = %err, "Failed to sync queue descriptors");
+        }
+        if let Err(err) =
+            admin::sync_job_kind_descriptors(&self.pool, &kind_descriptors, self.snapshot_interval)
+                .await
+        {
+            warn!(error = %err, "Failed to sync job kind descriptors");
+        }
+
+        // Emit OTel info gauges for every declared descriptor. One series per
+        // descriptor, value=1, with all descriptor fields as attributes. Panels
+        // lift descriptor fields into existing metrics via a Prometheus label
+        // join: `awa_job_completed_total * on(awa_job_queue) group_left(awa_queue_display_name) awa_queue_info`.
+        for named in &queue_descriptors {
+            self.metrics.record_queue_info(
+                &named.queue,
+                named.descriptor.display_name.as_deref(),
+                named.descriptor.description.as_deref(),
+                named.descriptor.owner.as_deref(),
+                named.descriptor.docs_url.as_deref(),
+                &named.descriptor.tags,
+            );
+        }
+        for named in &kind_descriptors {
+            self.metrics.record_job_kind_info(
+                &named.kind,
+                named.descriptor.display_name.as_deref(),
+                named.descriptor.description.as_deref(),
+                named.descriptor.owner.as_deref(),
+                named.descriptor.docs_url.as_deref(),
+                &named.descriptor.tags,
+            );
+        }
+
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
@@ -1011,5 +1233,57 @@ impl RuntimeReporterState {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+
+    fn lazy_pool() -> PgPool {
+        PgPoolOptions::new()
+            .connect_lazy("postgres://postgres:test@localhost/awa_test")
+            .expect("lazy pool should build")
+    }
+
+    #[tokio::test]
+    async fn queue_descriptor_requires_declared_queue() {
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
+            .build();
+
+        assert!(matches!(
+            result,
+            Err(BuildError::QueueDescriptorWithoutQueue { queue }) if queue == "billing"
+        ));
+    }
+
+    #[tokio::test]
+    async fn queue_descriptor_allows_declared_queue() {
+        let result = Client::builder(lazy_pool())
+            .queue("billing", QueueConfig::default())
+            .queue_descriptor("billing", QueueDescriptor::new().display_name("Billing"))
+            .build();
+
+        assert!(result.is_ok(), "descriptor for declared queue should build");
+    }
+
+    #[tokio::test]
+    async fn job_kind_descriptor_allows_registered_kind() {
+        #[derive(serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
+        struct TestJob;
+
+        let result = Client::builder(lazy_pool())
+            .queue("default", QueueConfig::default())
+            .register::<TestJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+            .job_kind_descriptor::<TestJob>(JobKindDescriptor::new().display_name("Test job"))
+            .build();
+
+        assert!(
+            result.is_ok(),
+            "descriptor for registered kind should build"
+        );
     }
 }

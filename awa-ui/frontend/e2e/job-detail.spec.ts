@@ -41,6 +41,55 @@ test.describe("Job detail page", () => {
     await expect(page.getByText("e2e_test")).toBeVisible();
   });
 
+  test("job detail shows queue and kind descriptors when available", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
+      page.goto("/jobs?q=queue%3Ae2e_test"),
+    ]);
+
+    const jobTable = page.getByRole("grid", { name: "Jobs" });
+    await jobTable.getByRole("row").nth(1).click();
+    await page.waitForURL(/\/jobs\/\d+/);
+    await page.waitForResponse((r) =>
+      /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
+    );
+
+    await expect(page.getByRole("heading", { name: /E2E Job/ })).toBeVisible();
+    await expect(page.getByText("e2e_job").first()).toBeVisible();
+    await expect(page.getByRole("link", { name: "E2E Queue" })).toBeVisible();
+    await expect(page.getByText("End-to-end job kind used for UI coverage")).toBeVisible();
+  });
+
+  test("legacy job detail still renders raw names without descriptors", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          r.url().includes("/api/jobs") &&
+          r.url().includes("queue=legacy_queue") &&
+          r.ok()
+      ),
+      page.goto("/jobs?q=queue%3Alegacy_queue"),
+    ]);
+
+    const jobTable = page.getByRole("grid", { name: "Jobs" });
+    await jobTable.getByRole("row").nth(1).click();
+    await page.waitForURL(/\/jobs\/\d+/);
+    await page.waitForResponse((r) =>
+      /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
+    );
+
+    await expect(page.getByRole("heading", { name: /legacy_job/ })).toBeVisible();
+    await expect(page.getByText("legacy_queue")).toBeVisible();
+
+    // Legacy jobs have no descriptor, so descriptor-derived affordances
+    // must not render: no display-name heading for the descriptor-backed
+    // E2E queue, no kind description paragraph.
+    await expect(page.getByRole("heading", { name: /E2E Queue/ })).toHaveCount(0);
+    await expect(
+      page.getByText("End-to-end job kind used for UI coverage"),
+    ).toHaveCount(0);
+  });
+
   test("arguments section shows JSON", async ({ page }) => {
     await Promise.all([
       page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
@@ -179,13 +228,13 @@ test.describe("Job detail page", () => {
       /\/api\/jobs\/\d+$/.test(r.url()) && r.ok()
     );
 
-    // Queue link in the description list
-    const queueLink = page.getByRole("link", { name: "e2e_test" });
+    // Queue link in the description list uses the display name when a descriptor exists
+    const queueLink = page.getByRole("link", { name: "E2E Queue" });
     await expect(queueLink).toBeVisible();
     await queueLink.click();
 
-    // Queue detail page redirects to /jobs with queue filter
-    await page.waitForURL(/\/jobs/);
+    await page.waitForURL(/\/queues\/e2e_test/);
+    await expect(page.getByRole("heading", { name: "E2E Queue" })).toBeVisible();
   });
 
   test("copy arguments button is visible", async ({ page }) => {

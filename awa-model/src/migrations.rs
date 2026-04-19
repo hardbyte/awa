@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 7;
+pub const CURRENT_VERSION: i32 = 9;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -34,6 +34,9 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Backoff interval creation avoids scientific-notation parse failures",
         &[V7_UP],
     ),
+    // v008 is reserved for the dead-letter-queue migration on a parallel
+    // branch; leave the slot open so both PRs can land without renumbering.
+    (9, "Queue and job-kind descriptor catalogs", &[V9_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -43,6 +46,7 @@ const V4_UP: &str = include_str!("../migrations/v004_admin_metadata.sql");
 const V5_UP: &str = include_str!("../migrations/v005_admin_metadata_stmt_triggers.sql");
 const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.sql");
 const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
+const V9_UP: &str = include_str!("../migrations/v009_descriptors.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
@@ -295,7 +299,8 @@ mod tests {
     fn migration_sql_range_subset() {
         let subset = migration_sql_range(2, CURRENT_VERSION);
         assert!(subset.iter().all(|(v, _, _)| *v > 2));
-        assert_eq!(subset.len(), (CURRENT_VERSION - 2) as usize);
+        let expected = MIGRATIONS.iter().filter(|&&(v, _, _)| v > 2).count();
+        assert_eq!(subset.len(), expected);
     }
 
     #[test]

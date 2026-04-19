@@ -10,10 +10,18 @@ pub mod unique;
 
 // Re-exports for ergonomics
 pub use admin::{
-    CallbackConfig, DefaultAction, ListJobsFilter, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
-    QueueRuntimeSnapshot, QueueRuntimeSummary, QueueStats, RateLimitSnapshot, ResolveOutcome,
-    RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket,
+    CallbackConfig, DefaultAction, JobKindDescriptor, JobKindOverview, ListJobsFilter,
+    QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
+    QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome, RuntimeInstance,
+    RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket,
 };
+
+/// Deprecated alias preserved for one release so existing downstream code
+/// compiling against `awa_model::QueueStats` keeps building. New callers
+/// should use [`QueueOverview`] directly — the renamed type carries
+/// additional descriptor fields this alias predates.
+#[deprecated(since = "0.5.4", note = "use `QueueOverview` instead")]
+pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, PeriodicJob, PeriodicJobBuilder};
 pub use error::AwaError;
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};

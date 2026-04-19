@@ -5,7 +5,7 @@ use crate::transaction::{
     insert_raw_job, parse_run_at, parse_unique_opts, PySyncTransaction, PyTransaction,
 };
 use crate::worker::PythonWorker;
-use awa_model::admin::ListJobsFilter;
+use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
 use awa_model::{InsertOpts, InsertParams, JobState, PeriodicJob};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -23,6 +23,68 @@ fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     }
 
     Ok(Duration::from_secs_f64(timeout_seconds))
+}
+
+fn build_queue_descriptor(
+    py: Python<'_>,
+    display_name: Option<String>,
+    description: Option<String>,
+    owner: Option<String>,
+    docs_url: Option<String>,
+    tags: Option<Vec<String>>,
+    extra: Option<Py<PyAny>>,
+) -> PyResult<QueueDescriptor> {
+    let mut descriptor = QueueDescriptor::new();
+    if let Some(value) = display_name {
+        descriptor = descriptor.display_name(value);
+    }
+    if let Some(value) = description {
+        descriptor = descriptor.description(value);
+    }
+    if let Some(value) = owner {
+        descriptor = descriptor.owner(value);
+    }
+    if let Some(value) = docs_url {
+        descriptor = descriptor.docs_url(value);
+    }
+    if let Some(value) = tags {
+        descriptor = descriptor.tags(value);
+    }
+    if let Some(value) = extra {
+        descriptor = descriptor.extra(py_to_json(py, value.bind(py))?);
+    }
+    Ok(descriptor)
+}
+
+fn build_job_kind_descriptor(
+    py: Python<'_>,
+    display_name: Option<String>,
+    description: Option<String>,
+    owner: Option<String>,
+    docs_url: Option<String>,
+    tags: Option<Vec<String>>,
+    extra: Option<Py<PyAny>>,
+) -> PyResult<JobKindDescriptor> {
+    let mut descriptor = JobKindDescriptor::new();
+    if let Some(value) = display_name {
+        descriptor = descriptor.display_name(value);
+    }
+    if let Some(value) = description {
+        descriptor = descriptor.description(value);
+    }
+    if let Some(value) = owner {
+        descriptor = descriptor.owner(value);
+    }
+    if let Some(value) = docs_url {
+        descriptor = descriptor.docs_url(value);
+    }
+    if let Some(value) = tags {
+        descriptor = descriptor.tags(value);
+    }
+    if let Some(value) = extra {
+        descriptor = descriptor.extra(py_to_json(py, value.bind(py))?);
+    }
+    Ok(descriptor)
 }
 
 /// Python result types for worker handlers.
@@ -256,6 +318,8 @@ pub struct PyClient {
     pool: PgPool,
     workers: Arc<RwLock<HashMap<String, WorkerEntry>>>,
     periodic_jobs: Arc<Mutex<Vec<PeriodicJob>>>,
+    queue_descriptors: Arc<Mutex<HashMap<String, QueueDescriptor>>>,
+    job_kind_descriptors: Arc<Mutex<HashMap<String, JobKindDescriptor>>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
 }
 
@@ -287,6 +351,8 @@ impl PyClient {
             pool,
             workers: Arc::new(RwLock::new(HashMap::new())),
             periodic_jobs: Arc::new(Mutex::new(Vec::new())),
+            queue_descriptors: Arc::new(Mutex::new(HashMap::new())),
+            job_kind_descriptors: Arc::new(Mutex::new(HashMap::new())),
             runtime: Arc::new(Mutex::new(None)),
         })
     }
@@ -503,6 +569,108 @@ impl PyClient {
         Ok(())
     }
 
+    // Backs AsyncClient.queue_descriptor(). User-facing docs live on the
+    // Python wrapper; the bridge only stashes the descriptor for use at
+    // start() time.
+    #[pyo3(signature = (
+        queue,
+        *,
+        display_name=None,
+        description=None,
+        owner=None,
+        docs_url=None,
+        tags=None,
+        extra=None,
+    ))]
+    fn queue_descriptor(
+        &self,
+        py: Python<'_>,
+        queue: String,
+        display_name: Option<String>,
+        description: Option<String>,
+        owner: Option<String>,
+        docs_url: Option<String>,
+        tags: Option<Vec<String>>,
+        extra: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        // Mutation after start() is a footgun: the runtime only reads
+        // queue_descriptors during startup, so the late call would
+        // silently have no effect. Fail loudly instead.
+        if self
+            .runtime
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_some()
+        {
+            return Err(state_error(
+                "queue_descriptor() must be called before start()",
+            ));
+        }
+        let descriptor = build_queue_descriptor(
+            py,
+            display_name,
+            description,
+            owner,
+            docs_url,
+            tags,
+            extra,
+        )?;
+        self.queue_descriptors
+            .lock()
+            .expect("queue_descriptors mutex poisoned")
+            .insert(queue, descriptor);
+        Ok(())
+    }
+
+    // Backs AsyncClient.job_kind_descriptor(). See the Python wrapper for
+    // user-facing semantics.
+    #[pyo3(signature = (
+        kind,
+        *,
+        display_name=None,
+        description=None,
+        owner=None,
+        docs_url=None,
+        tags=None,
+        extra=None,
+    ))]
+    fn job_kind_descriptor(
+        &self,
+        py: Python<'_>,
+        kind: String,
+        display_name: Option<String>,
+        description: Option<String>,
+        owner: Option<String>,
+        docs_url: Option<String>,
+        tags: Option<Vec<String>>,
+        extra: Option<Py<PyAny>>,
+    ) -> PyResult<()> {
+        if self
+            .runtime
+            .lock()
+            .expect("runtime mutex poisoned")
+            .is_some()
+        {
+            return Err(state_error(
+                "job_kind_descriptor() must be called before start()",
+            ));
+        }
+        let descriptor = build_job_kind_descriptor(
+            py,
+            display_name,
+            description,
+            owner,
+            docs_url,
+            tags,
+            extra,
+        )?;
+        self.job_kind_descriptors
+            .lock()
+            .expect("job_kind_descriptors mutex poisoned")
+            .insert(kind, descriptor);
+        Ok(())
+    }
+
     fn retry<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -666,7 +834,7 @@ impl PyClient {
     fn queue_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let stats = awa_model::admin::queue_stats(&pool)
+            let stats = awa_model::admin::queue_overviews(&pool)
                 .await
                 .map_err(map_awa_error)?;
             Python::attach(|py| {
@@ -759,7 +927,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -769,6 +937,7 @@ impl PyClient {
         global_max_workers: Option<u32>,
         completed_retention_hours: Option<f64>,
         failed_retention_hours: Option<f64>,
+        descriptor_retention_days: Option<f64>,
         cleanup_batch_size: Option<i64>,
         leader_election_interval_ms: Option<u64>,
         heartbeat_interval_ms: Option<u64>,
@@ -834,6 +1003,14 @@ impl PyClient {
             }
             builder = builder.failed_retention(Duration::from_secs_f64(hours * 3600.0));
         }
+        if let Some(days) = descriptor_retention_days {
+            if !days.is_finite() || days < 0.0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "descriptor_retention_days must be a non-negative finite number (0 disables)",
+                ));
+            }
+            builder = builder.descriptor_retention(Duration::from_secs_f64(days * 86400.0));
+        }
         if let Some(batch_size) = cleanup_batch_size {
             if batch_size <= 0 {
                 return Err(pyo3::exceptions::PyValueError::new_err(
@@ -883,6 +1060,26 @@ impl PyClient {
             .clone();
         for job in periodic_jobs {
             builder = builder.periodic(job);
+        }
+
+        // Attach descriptors. Using `job_kind_descriptor_kind` (by name) keeps
+        // the Python surface symmetric with `queue_descriptor` and sidesteps
+        // the typed T::kind() path, which requires Rust-side generics.
+        let queue_descriptors = self
+            .queue_descriptors
+            .lock()
+            .expect("queue_descriptors mutex poisoned")
+            .clone();
+        for (queue, descriptor) in queue_descriptors {
+            builder = builder.queue_descriptor(queue, descriptor);
+        }
+        let job_kind_descriptors = self
+            .job_kind_descriptors
+            .lock()
+            .expect("job_kind_descriptors mutex poisoned")
+            .clone();
+        for (kind, descriptor) in job_kind_descriptors {
+            builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
 
         let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
@@ -1494,7 +1691,7 @@ impl PyClient {
         let pool = self.pool.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
-                let stats = awa_model::admin::queue_stats(&pool)
+                let stats = awa_model::admin::queue_overviews(&pool)
                     .await
                     .map_err(map_awa_error)?;
                 Ok(stats

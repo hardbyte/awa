@@ -31,9 +31,58 @@ export default async function globalSetup() {
   const user = pgUrl.username;
 
   const sql = `
-    -- Clean up any previous E2E data
-    DELETE FROM awa.jobs WHERE queue = 'e2e_test';
-    DELETE FROM awa.queue_meta WHERE queue = 'e2e_test';
+    -- Clean up any previous E2E data. Also strip runtime-snapshot hash
+    -- entries for these queues/kinds — otherwise hashes left over from a
+    -- previous run can resurface as spurious 'drift' or 'stale' badges on
+    -- the next Playwright run, purely as test-order noise.
+    DELETE FROM awa.jobs WHERE queue IN ('e2e_test', 'legacy_queue');
+    DELETE FROM awa.queue_meta WHERE queue IN ('e2e_test', 'legacy_queue');
+    DELETE FROM awa.queue_descriptors WHERE queue IN ('e2e_test', 'legacy_queue');
+    DELETE FROM awa.job_kind_descriptors WHERE kind IN ('e2e_job', 'legacy_job');
+    UPDATE awa.runtime_instances SET
+      queue_descriptor_hashes    = queue_descriptor_hashes    - ARRAY['e2e_test', 'legacy_queue'],
+      job_kind_descriptor_hashes = job_kind_descriptor_hashes - ARRAY['e2e_job', 'legacy_job']
+    WHERE queue_descriptor_hashes    ?| ARRAY['e2e_test', 'legacy_queue']
+       OR job_kind_descriptor_hashes ?| ARRAY['e2e_job', 'legacy_job'];
+
+    -- Descriptor-backed queue and kind used by the new UI surfaces
+    INSERT INTO awa.queue_descriptors (
+      queue, display_name, description, owner, docs_url, tags, extra,
+      descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at
+    )
+    VALUES (
+      'e2e_test',
+      'E2E Queue',
+      'End-to-end queue used for UI coverage',
+      'qa-platform',
+      'https://example.test/queues/e2e',
+      ARRAY['e2e', 'critical'],
+      '{"source":"playwright"}'::jsonb,
+      'seeded-e2e-queue',
+      10000,
+      now(),
+      now(),
+      now()
+    );
+
+    INSERT INTO awa.job_kind_descriptors (
+      kind, display_name, description, owner, docs_url, tags, extra,
+      descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at
+    )
+    VALUES (
+      'e2e_job',
+      'E2E Job',
+      'End-to-end job kind used for UI coverage',
+      'qa-platform',
+      'https://example.test/kinds/e2e-job',
+      ARRAY['e2e'],
+      '{"source":"playwright"}'::jsonb,
+      'seeded-e2e-kind',
+      10000,
+      now(),
+      now(),
+      now()
+    );
 
     -- Available jobs
     INSERT INTO awa.jobs (kind, queue, state, args, priority, max_attempts, tags)
@@ -59,6 +108,10 @@ export default async function globalSetup() {
     -- Cancelled job
     INSERT INTO awa.jobs (kind, queue, state, args, priority, attempt, max_attempts, tags, finalized_at)
     VALUES ('e2e_job', 'e2e_test', 'cancelled', '{"test": true}', 2, 1, 5, '{e2e}', now());
+
+    -- Legacy queue/kind with no descriptors to validate backwards compatibility
+    INSERT INTO awa.jobs (kind, queue, state, args, priority, max_attempts, tags)
+    VALUES ('legacy_job', 'legacy_queue', 'available', '{"legacy": true}', 2, 3, '{legacy}');
 
     -- Flush dirty admin metadata so queue_stats cache is fresh for E2E tests
     -- (awa serve does not run a maintenance leader)

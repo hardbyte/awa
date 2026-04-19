@@ -33,6 +33,24 @@ function hasMetadata(job: JobRow): boolean {
   );
 }
 
+// Treat empty display_name the same as missing — the contract is
+// "display name if set, otherwise the raw key". `??` alone would let
+// `display_name: ""` render a blank label.
+function descriptorLabel(
+  displayName: string | null | undefined,
+  fallback: string,
+): string {
+  return displayName?.trim() ? displayName : fallback;
+}
+
+function jobKindLabel(job: JobRow): string {
+  return descriptorLabel(job.kind_descriptor?.display_name, job.kind);
+}
+
+function queueLabel(job: JobRow): string {
+  return descriptorLabel(job.queue_descriptor?.display_name, job.queue);
+}
+
 export function JobDetailPage() {
   const { id } = useParams({ strict: false });
   const jobId = Number(id);
@@ -100,10 +118,19 @@ export function JobDetailPage() {
 
       <div className="flex flex-wrap items-center gap-4">
         <Heading level={2}>
-          Job #{job.id} &mdash; {job.kind}
+          Job #{job.id} &mdash; {jobKindLabel(job)}
         </Heading>
+        {job.kind_descriptor?.display_name?.trim() && (
+          <code className="rounded bg-muted px-1.5 py-0.5 text-sm">{job.kind}</code>
+        )}
         <StateBadge state={job.state} />
       </div>
+
+      {job.kind_descriptor?.description?.trim() && (
+        <p className="max-w-3xl text-sm text-muted-fg">
+          {job.kind_descriptor.description}
+        </p>
+      )}
 
       {/* Actions */}
       <div className="flex gap-2">
@@ -139,8 +166,19 @@ export function JobDetailPage() {
             params={{ name: job.queue }}
             className="text-primary no-underline hover:underline"
           >
-            {job.queue}
+            {queueLabel(job)}
           </Link>
+          {job.queue_descriptor?.display_name?.trim() && (
+            <span className="ml-2 text-xs text-muted-fg">{job.queue}</span>
+          )}
+        </DescriptionDetails>
+
+        <DescriptionTerm>Kind</DescriptionTerm>
+        <DescriptionDetails>
+          {jobKindLabel(job)}
+          {job.kind_descriptor?.display_name?.trim() && (
+            <span className="ml-2 text-xs text-muted-fg">{job.kind}</span>
+          )}
         </DescriptionDetails>
 
         <DescriptionTerm>Priority</DescriptionTerm>
@@ -190,6 +228,29 @@ export function JobDetailPage() {
                   </Badge>
                 ))}
               </div>
+            </DescriptionDetails>
+          </>
+        )}
+
+        {job.kind_descriptor?.owner && (
+          <>
+            <DescriptionTerm>Owner</DescriptionTerm>
+            <DescriptionDetails>{job.kind_descriptor.owner}</DescriptionDetails>
+          </>
+        )}
+
+        {job.kind_descriptor?.docs_url && (
+          <>
+            <DescriptionTerm>Docs</DescriptionTerm>
+            <DescriptionDetails>
+              <a
+                href={job.kind_descriptor.docs_url}
+                target="_blank"
+                rel="noreferrer"
+                className="text-primary no-underline hover:underline"
+              >
+                {job.kind_descriptor.docs_url}
+              </a>
             </DescriptionDetails>
           </>
         )}

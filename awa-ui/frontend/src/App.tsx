@@ -10,6 +10,7 @@ import { Shell } from "./components/Shell";
 import { DashboardPage } from "./routes/index";
 import { JobsPage } from "./routes/jobs";
 import { JobDetailPage } from "./routes/job-detail";
+import { KindsPage } from "./routes/kinds";
 import { QueuesPage } from "./routes/queues";
 import { QueueDetailPage } from "./routes/queue-detail";
 import { CronPage } from "./routes/cron";
@@ -38,6 +39,12 @@ const jobDetailRoute = createRoute({
   getParentRoute: () => rootRoute,
   path: "/jobs/$id",
   component: JobDetailPage,
+});
+
+const kindsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: "/kinds",
+  component: KindsPage,
 });
 
 const queuesRoute = createRoute({
@@ -74,6 +81,7 @@ const routeTree = rootRoute.addChildren([
   dashboardRoute,
   jobsRoute,
   jobDetailRoute,
+  kindsRoute,
   queuesRoute,
   queueDetailRoute,
   runtimeRoute,

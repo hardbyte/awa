@@ -64,6 +64,10 @@ pub struct MaintenanceService {
     /// Interval for priority aging — jobs waiting longer than this have their
     /// priority improved by one level per interval elapsed (default: 60s).
     priority_aging_interval: Duration,
+    /// How long a descriptor catalog row can sit without being refreshed
+    /// before the maintenance leader deletes it. Zero disables cleanup.
+    /// Default: 30 days.
+    descriptor_retention: Duration,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -105,6 +109,7 @@ impl MaintenanceService {
             dirty_key_recompute_interval: Duration::from_secs(2),
             metadata_reconciliation_interval: Duration::from_secs(60),
             priority_aging_interval: Duration::from_secs(60),
+            descriptor_retention: Duration::from_secs(30 * 86400), // 30d
         }
     }
 
@@ -114,6 +119,19 @@ impl MaintenanceService {
     /// a priority-4 job waiting 180s is treated as priority-1.
     pub fn priority_aging_interval(mut self, interval: Duration) -> Self {
         self.priority_aging_interval = interval;
+        self
+    }
+
+    /// How long a descriptor catalog row can go without being re-synced
+    /// before the maintenance leader deletes it (default: 30 days). Set
+    /// to `Duration::ZERO` to disable — useful if you maintain the catalog
+    /// externally or want to keep historical descriptors forever.
+    ///
+    /// Descriptors carry no FK from jobs, so deletion is safe: a later
+    /// worker restart that re-declares the same queue or kind will
+    /// recreate the row from its declaration on the next snapshot tick.
+    pub fn descriptor_retention(mut self, retention: Duration) -> Self {
+        self.descriptor_retention = retention;
         self
     }
 
@@ -301,6 +319,7 @@ impl MaintenanceService {
                     _ = cleanup_timer.tick() => {
                         self.cleanup_completed().await;
                         self.cleanup_stale_runtime_snapshots().await;
+                        self.cleanup_stale_descriptors().await;
                     }
                     _ = cron_sync_timer.tick() => {
                         self.sync_periodic_jobs_to_db().await;
@@ -986,6 +1005,30 @@ impl MaintenanceService {
         }
     }
 
+    /// Delete catalog rows whose last_seen_at is older than
+    /// `descriptor_retention`. Runs alongside the existing cleanup cycle.
+    /// When retention is zero this is a no-op, so this stays cheap for
+    /// operators who don't want descriptor GC.
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup_stale_descriptors")]
+    async fn cleanup_stale_descriptors(&self) {
+        if self.descriptor_retention.is_zero() {
+            return;
+        }
+        let max_age = chrono::TimeDelta::from_std(self.descriptor_retention)
+            .unwrap_or_else(|_| chrono::TimeDelta::try_days(30).unwrap());
+        for table in ["awa.queue_descriptors", "awa.job_kind_descriptors"] {
+            match awa_model::admin::cleanup_stale_descriptors(&self.pool, table, max_age).await {
+                Ok(deleted) if deleted > 0 => {
+                    tracing::info!(table, deleted, "Cleaned up stale descriptor rows");
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::warn!(table, error = %err, "Failed to clean up stale descriptors");
+                }
+            }
+        }
+    }
+
     /// Drain dirty keys and recompute exact cached rows for recently-touched
     /// queues and kinds. This is the primary cache update mechanism — called
     /// every ~2s to keep dashboard counters fresh.
@@ -1014,7 +1057,7 @@ impl MaintenanceService {
     /// Publish queue depth and lag as OTel gauge metrics.
     #[tracing::instrument(skip(self), name = "maintenance.queue_stats")]
     async fn publish_queue_health_metrics(&self) {
-        let stats = match awa_model::admin::queue_stats(&self.pool).await {
+        let stats = match awa_model::admin::queue_overviews(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
                 tracing::warn!(error = %err, "Failed to query queue stats for metrics");

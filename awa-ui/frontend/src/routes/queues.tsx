@@ -29,6 +29,7 @@ import {
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
 import { usePollInterval } from "@/hooks/use-poll-interval";
+import { timeAgo } from "@/lib/time";
 
 export function QueuesPage() {
   const queryClient = useQueryClient();
@@ -107,6 +108,20 @@ export function QueuesPage() {
     return `${runtime.healthy_instances}/${runtime.live_instances || runtime.instance_count}`;
   }
 
+  function queueLabel(q: QueueStats): string {
+    // Treat empty display_name as missing — `??` alone would let
+    // `display_name: ""` render a blank label.
+    return q.display_name?.trim() ? q.display_name : q.queue;
+  }
+
+  function descriptorSyncLabel(q: QueueStats): string {
+    if (q.descriptor_mismatch) return "Descriptor drift across live runtimes";
+    if (!q.descriptor_last_seen_at) return "Descriptor not declared";
+    return q.descriptor_stale
+      ? `Descriptor stale · seen ${timeAgo(q.descriptor_last_seen_at)}`
+      : `Descriptor seen ${timeAgo(q.descriptor_last_seen_at)}`;
+  }
+
   return (
     <div className="space-y-4">
       <Heading level={2}>Queues</Heading>
@@ -119,19 +134,38 @@ export function QueuesPage() {
             return (
               <div key={q.queue} className="rounded-lg border p-4">
               <div className="flex items-center justify-between">
-                <Link
-                  to="/queues/$name"
-                  params={{ name: q.queue }}
-                  className="font-medium text-primary no-underline hover:underline"
-                >
-                  {q.queue}
-                </Link>
-                {q.paused ? (
-                  <Badge intent="warning">Paused</Badge>
-                ) : (
-                  <Badge intent="success">Active</Badge>
-                )}
+                <div>
+                  <Link
+                    to="/queues/$name"
+                    params={{ name: q.queue }}
+                    className="font-medium text-primary no-underline hover:underline"
+                  >
+                    {queueLabel(q)}
+                  </Link>
+                  {q.display_name?.trim() && (
+                    <div className="text-xs text-muted-fg">{q.queue}</div>
+                  )}
+                  <div className="mt-1 text-xs text-muted-fg">
+                    {descriptorSyncLabel(q)}
+                  </div>
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  {q.paused ? (
+                    <Badge intent="warning">Paused</Badge>
+                  ) : (
+                    <Badge intent="success">Active</Badge>
+                  )}
+                  {q.descriptor_stale && (
+                    <Badge intent="warning">Descriptor stale</Badge>
+                  )}
+                  {q.descriptor_mismatch && (
+                    <Badge intent="danger">Descriptor drift</Badge>
+                  )}
+                </div>
               </div>
+              {q.description && (
+                <p className="mt-2 text-sm text-muted-fg">{q.description}</p>
+              )}
               <div className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                 <span className="text-muted-fg">Total queued</span>
                 <span>{q.total_queued.toLocaleString()}</span>
@@ -229,13 +263,26 @@ export function QueuesPage() {
               return (
                 <TableRow key={q.queue} id={q.queue}>
                   <TableCell className="font-medium">
-                    <Link
-                      to="/queues/$name"
-                      params={{ name: q.queue }}
-                      className="text-primary no-underline hover:underline"
-                    >
-                      {q.queue}
-                    </Link>
+                    <div>
+                      <Link
+                        to="/queues/$name"
+                        params={{ name: q.queue }}
+                        className="text-primary no-underline hover:underline"
+                      >
+                        {queueLabel(q)}
+                      </Link>
+                      {q.display_name && (
+                        <div className="text-xs font-normal text-muted-fg">{q.queue}</div>
+                      )}
+                      {q.description && (
+                        <div className="mt-1 text-xs font-normal text-muted-fg">
+                          {q.description}
+                        </div>
+                      )}
+                      <div className="mt-1 text-xs font-normal text-muted-fg">
+                        {descriptorSyncLabel(q)}
+                      </div>
+                    </div>
                   </TableCell>
                   <TableCell>{q.total_queued.toLocaleString()}</TableCell>
                   <TableCell>{q.scheduled.toLocaleString()}</TableCell>
@@ -290,11 +337,19 @@ export function QueuesPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    {q.paused ? (
-                      <Badge intent="warning">Paused</Badge>
-                    ) : (
-                      <Badge intent="success">Active</Badge>
-                    )}
+                    <div className="flex flex-wrap gap-1">
+                      {q.paused ? (
+                        <Badge intent="warning">Paused</Badge>
+                      ) : (
+                        <Badge intent="success">Active</Badge>
+                      )}
+                      {q.descriptor_stale && (
+                        <Badge intent="warning">Descriptor stale</Badge>
+                      )}
+                      {q.descriptor_mismatch && (
+                        <Badge intent="danger">Descriptor drift</Badge>
+                      )}
+                    </div>
                   </TableCell>
                   <TableCell>
                     <div className="flex gap-1">

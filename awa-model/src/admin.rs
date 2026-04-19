@@ -477,10 +477,357 @@ where
     Ok(result.rows_affected())
 }
 
-/// Queue statistics.
-#[derive(Debug, Clone, Serialize)]
-pub struct QueueStats {
+/// Code-declared, operator-facing descriptor for a queue.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QueueDescriptor {
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub docs_url: Option<String>,
+    pub tags: Vec<String>,
+    pub extra: serde_json::Value,
+}
+
+impl Default for QueueDescriptor {
+    fn default() -> Self {
+        Self {
+            display_name: None,
+            description: None,
+            owner: None,
+            docs_url: None,
+            tags: Vec::new(),
+            extra: serde_json::json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NamedQueueDescriptor {
     pub queue: String,
+    #[serde(flatten)]
+    pub descriptor: QueueDescriptor,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct JobKindDescriptor {
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub docs_url: Option<String>,
+    pub tags: Vec<String>,
+    pub extra: serde_json::Value,
+}
+
+impl Default for JobKindDescriptor {
+    fn default() -> Self {
+        Self {
+            display_name: None,
+            description: None,
+            owner: None,
+            docs_url: None,
+            tags: Vec::new(),
+            extra: serde_json::json!({}),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct NamedJobKindDescriptor {
+    pub kind: String,
+    #[serde(flatten)]
+    pub descriptor: JobKindDescriptor,
+}
+
+/// Columns bound per descriptor row. Must match the order used in
+/// [`build_descriptor_upsert`] and the bind loop below.
+const DESCRIPTOR_PARAMS_PER_ROW: u32 = 9;
+
+/// Postgres caps bound parameters at 65535 per statement. 9 params × 7000 rows
+/// = 63k, so chunk below that with a comfortable margin.
+const DESCRIPTOR_BATCH_SIZE: usize = 5000;
+
+/// Build a batched INSERT ... VALUES (...), (...), ... ON CONFLICT upsert for
+/// a descriptor catalog. `table` is `awa.queue_descriptors` or
+/// `awa.job_kind_descriptors`; `pk` is `queue` or `kind`.
+fn build_descriptor_upsert(table: &str, pk: &str, count: usize) -> String {
+    let mut query = format!(
+        "INSERT INTO {table} (\
+             {pk}, display_name, description, owner, docs_url, tags, extra, \
+             descriptor_hash, sync_interval_ms, created_at, updated_at, last_seen_at\
+         ) VALUES "
+    );
+    let mut param_index = 1u32;
+    for i in 0..count {
+        if i > 0 {
+            query.push_str(", ");
+        }
+        query.push_str(&format!(
+            "(${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, ${}, now(), now(), now())",
+            param_index,
+            param_index + 1,
+            param_index + 2,
+            param_index + 3,
+            param_index + 4,
+            param_index + 5,
+            param_index + 6,
+            param_index + 7,
+            param_index + 8,
+        ));
+        param_index += DESCRIPTOR_PARAMS_PER_ROW;
+    }
+    // updated_at only advances when the hash changes — so an untouched
+    // descriptor keeps its original `updated_at` timestamp across ticks
+    // but still gets a fresh `last_seen_at` for liveness.
+    query.push_str(&format!(
+        " ON CONFLICT ({pk}) DO UPDATE SET \
+             display_name = EXCLUDED.display_name, \
+             description = EXCLUDED.description, \
+             owner = EXCLUDED.owner, \
+             docs_url = EXCLUDED.docs_url, \
+             tags = EXCLUDED.tags, \
+             extra = EXCLUDED.extra, \
+             descriptor_hash = EXCLUDED.descriptor_hash, \
+             sync_interval_ms = EXCLUDED.sync_interval_ms, \
+             updated_at = CASE \
+                 WHEN {table}.descriptor_hash IS DISTINCT FROM EXCLUDED.descriptor_hash \
+                 THEN now() ELSE {table}.updated_at \
+             END, \
+             last_seen_at = now()"
+    ));
+    query
+}
+
+/// Upsert queue descriptors declared by the worker runtime.
+///
+/// Descriptor rows are part of the control-plane catalog and intentionally
+/// separate from mutable queue runtime state in `awa.queue_meta`.
+///
+/// Descriptors are upserted in batched multi-row statements — one round-trip
+/// per [`DESCRIPTOR_BATCH_SIZE`] descriptors rather than one per descriptor.
+/// For typical fleets (≤100 queues / ≤500 kinds) that collapses to a single
+/// round-trip per sync call.
+pub async fn sync_queue_descriptors(
+    pool: &PgPool,
+    descriptors: &[NamedQueueDescriptor],
+    sync_interval: std::time::Duration,
+) -> Result<(), AwaError> {
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+    let sync_interval_ms = sync_interval.as_millis() as i64;
+
+    for chunk in descriptors.chunks(DESCRIPTOR_BATCH_SIZE) {
+        let hashes: Vec<String> = chunk
+            .iter()
+            .map(|named| named.descriptor.descriptor_hash())
+            .collect();
+        let sql = build_descriptor_upsert("awa.queue_descriptors", "queue", chunk.len());
+        let mut query = sqlx::query(&sql);
+        for (named, hash) in chunk.iter().zip(hashes.iter()) {
+            query = query
+                .bind(&named.queue)
+                .bind(named.descriptor.display_name.as_deref())
+                .bind(named.descriptor.description.as_deref())
+                .bind(named.descriptor.owner.as_deref())
+                .bind(named.descriptor.docs_url.as_deref())
+                .bind(&named.descriptor.tags)
+                .bind(&named.descriptor.extra)
+                .bind(hash.as_str())
+                .bind(sync_interval_ms);
+        }
+        query.execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+/// Upsert job-kind descriptors declared by the worker runtime. Batched the
+/// same way as [`sync_queue_descriptors`].
+pub async fn sync_job_kind_descriptors(
+    pool: &PgPool,
+    descriptors: &[NamedJobKindDescriptor],
+    sync_interval: std::time::Duration,
+) -> Result<(), AwaError> {
+    if descriptors.is_empty() {
+        return Ok(());
+    }
+    let sync_interval_ms = sync_interval.as_millis() as i64;
+
+    for chunk in descriptors.chunks(DESCRIPTOR_BATCH_SIZE) {
+        let hashes: Vec<String> = chunk
+            .iter()
+            .map(|named| named.descriptor.descriptor_hash())
+            .collect();
+        let sql = build_descriptor_upsert("awa.job_kind_descriptors", "kind", chunk.len());
+        let mut query = sqlx::query(&sql);
+        for (named, hash) in chunk.iter().zip(hashes.iter()) {
+            query = query
+                .bind(&named.kind)
+                .bind(named.descriptor.display_name.as_deref())
+                .bind(named.descriptor.description.as_deref())
+                .bind(named.descriptor.owner.as_deref())
+                .bind(named.descriptor.docs_url.as_deref())
+                .bind(&named.descriptor.tags)
+                .bind(&named.descriptor.extra)
+                .bind(hash.as_str())
+                .bind(sync_interval_ms);
+        }
+        query.execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+impl QueueDescriptor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    pub fn docs_url(mut self, docs_url: impl Into<String>) -> Self {
+        self.docs_url = Some(docs_url.into());
+        self
+    }
+
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    pub fn extra(mut self, extra: serde_json::Value) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn descriptor_hash(&self) -> String {
+        let payload = serde_json::json!({
+            "display_name": self.display_name,
+            "description": self.description,
+            "owner": self.owner,
+            "docs_url": self.docs_url,
+            "tags": self.tags,
+            "extra": canonicalize_json(&self.extra),
+        });
+        let encoded = serde_json::to_vec(&payload)
+            .expect("queue descriptor JSON serialization should not fail");
+        hex::encode(blake3::hash(&encoded).as_bytes())
+    }
+}
+
+impl JobKindDescriptor {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn display_name(mut self, display_name: impl Into<String>) -> Self {
+        self.display_name = Some(display_name.into());
+        self
+    }
+
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    pub fn owner(mut self, owner: impl Into<String>) -> Self {
+        self.owner = Some(owner.into());
+        self
+    }
+
+    pub fn docs_url(mut self, docs_url: impl Into<String>) -> Self {
+        self.docs_url = Some(docs_url.into());
+        self
+    }
+
+    pub fn tags<I, S>(mut self, tags: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tags = tags.into_iter().map(Into::into).collect();
+        self
+    }
+
+    pub fn tag(mut self, tag: impl Into<String>) -> Self {
+        self.tags.push(tag.into());
+        self
+    }
+
+    pub fn extra(mut self, extra: serde_json::Value) -> Self {
+        self.extra = extra;
+        self
+    }
+
+    pub fn descriptor_hash(&self) -> String {
+        let payload = serde_json::json!({
+            "display_name": self.display_name,
+            "description": self.description,
+            "owner": self.owner,
+            "docs_url": self.docs_url,
+            "tags": self.tags,
+            "extra": canonicalize_json(&self.extra),
+        });
+        let encoded = serde_json::to_vec(&payload)
+            .expect("job kind descriptor JSON serialization should not fail");
+        hex::encode(blake3::hash(&encoded).as_bytes())
+    }
+}
+
+fn canonicalize_json(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut keys: Vec<_> = map.keys().cloned().collect();
+            keys.sort();
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for key in keys {
+                if let Some(child) = map.get(&key) {
+                    out.insert(key, canonicalize_json(child));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => {
+            serde_json::Value::Array(values.iter().map(canonicalize_json).collect())
+        }
+        _ => value.clone(),
+    }
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct QueueOverview {
+    pub queue: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub docs_url: Option<String>,
+    pub tags: Vec<String>,
+    pub extra: serde_json::Value,
+    pub descriptor_last_seen_at: Option<DateTime<Utc>>,
+    pub descriptor_stale: bool,
+    pub descriptor_mismatch: bool,
     /// All non-terminal jobs for the queue, including running and waiting_external.
     pub total_queued: i64,
     pub scheduled: i64,
@@ -492,6 +839,23 @@ pub struct QueueStats {
     pub completed_last_hour: i64,
     pub lag_seconds: Option<f64>,
     pub paused: bool,
+}
+
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JobKindOverview {
+    pub kind: String,
+    pub display_name: Option<String>,
+    pub description: Option<String>,
+    pub owner: Option<String>,
+    pub docs_url: Option<String>,
+    pub tags: Vec<String>,
+    pub extra: serde_json::Value,
+    pub descriptor_last_seen_at: Option<DateTime<Utc>>,
+    pub descriptor_stale: bool,
+    pub descriptor_mismatch: bool,
+    pub job_count: i64,
+    pub queue_count: i64,
+    pub completed_last_hour: i64,
 }
 
 /// Snapshot of a per-queue rate limit configuration.
@@ -550,6 +914,8 @@ pub struct RuntimeSnapshotInput {
     pub leader: bool,
     pub global_max_workers: Option<u32>,
     pub queues: Vec<QueueRuntimeSnapshot>,
+    pub queue_descriptor_hashes: HashMap<String, String>,
+    pub job_kind_descriptor_hashes: HashMap<String, String>,
 }
 
 /// A worker runtime instance as exposed through the admin API.
@@ -675,10 +1041,12 @@ where
             shutting_down,
             leader,
             global_max_workers,
-            queues
+            queues,
+            queue_descriptor_hashes,
+            job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15
+            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
@@ -695,7 +1063,9 @@ where
             shutting_down = EXCLUDED.shutting_down,
             leader = EXCLUDED.leader,
             global_max_workers = EXCLUDED.global_max_workers,
-            queues = EXCLUDED.queues
+            queues = EXCLUDED.queues,
+            queue_descriptor_hashes = EXCLUDED.queue_descriptor_hashes,
+            job_kind_descriptor_hashes = EXCLUDED.job_kind_descriptor_hashes
         "#,
     )
     .bind(snapshot.instance_id)
@@ -713,6 +1083,8 @@ where
     .bind(snapshot.leader)
     .bind(snapshot.global_max_workers.map(|v| v as i32))
     .bind(Json(&snapshot.queues))
+    .bind(Json(&snapshot.queue_descriptor_hashes))
+    .bind(Json(&snapshot.job_kind_descriptor_hashes))
     .execute(executor)
     .await?;
 
@@ -735,6 +1107,38 @@ where
     .execute(executor)
     .await?;
 
+    Ok(result.rows_affected())
+}
+
+/// Delete descriptor rows whose `last_seen_at` is older than `max_age`.
+///
+/// Intended to run on the maintenance leader's cleanup cycle — a descriptor
+/// whose declaring code has been retired would otherwise linger in the
+/// catalog forever, showing as permanently stale. Descriptors are
+/// best-effort (no FK from `awa.jobs*`), so deletion is safe: if a worker
+/// later re-declares the same queue / kind, the next sync recreates the
+/// row from the declaration.
+///
+/// `table` must be `awa.queue_descriptors` or `awa.job_kind_descriptors`;
+/// the caller is expected to dispatch both in turn.
+pub async fn cleanup_stale_descriptors<'e, E>(
+    executor: E,
+    table: &str,
+    max_age: Duration,
+) -> Result<u64, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    if !matches!(table, "awa.queue_descriptors" | "awa.job_kind_descriptors") {
+        return Err(AwaError::Validation(format!(
+            "cleanup_stale_descriptors: unknown table {table:?}"
+        )));
+    }
+    let seconds = max(max_age.num_seconds(), 1);
+    // Table name is an authenticated literal from the match above — safe
+    // to interpolate into the statement.
+    let sql = format!("DELETE FROM {table} WHERE last_seen_at < now() - make_interval(secs => $1)");
+    let result = sqlx::query(&sql).bind(seconds).execute(executor).await?;
     Ok(result.rows_affected())
 }
 
@@ -876,7 +1280,7 @@ where
     Ok(summaries)
 }
 
-/// Get statistics for all queues.
+/// Get queue overviews for all known queues.
 ///
 /// Hybrid read: per-state counts come from the `queue_state_counts`
 /// cache table (eventually consistent, ~2s lag), while `lag_seconds`
@@ -888,28 +1292,41 @@ where
 ///
 /// For exact cached counts in tests without a running maintenance
 /// leader, call `flush_dirty_admin_metadata()` first.
-pub async fn queue_stats<'e, E>(executor: E) -> Result<Vec<QueueStats>, AwaError>
+pub async fn queue_overviews<'e, E>(executor: E) -> Result<Vec<QueueOverview>, AwaError>
 where
     E: PgExecutor<'e>,
 {
-    let rows = sqlx::query_as::<
-        _,
-        (
-            String,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            Option<f64>,
-            bool,
-        ),
-    >(
+    let rows = sqlx::query_as::<_, QueueOverview>(
         r#"
-        WITH available_lag AS (
+        WITH all_queues AS (
+            -- Union every source of queue-name knowledge so /queues never
+            -- hides a queue that exists *somewhere* in the system:
+            --   - queue_state_counts: has observed jobs
+            --   - queue_descriptors:   declared by worker code
+            --   - queue_meta:          pause state recorded by an operator
+            --   - runtime_instances:   registered by a currently-running worker
+            SELECT queue FROM awa.queue_state_counts
+            UNION
+            SELECT queue FROM awa.queue_descriptors
+            UNION
+            SELECT queue FROM awa.queue_meta
+            UNION
+            SELECT DISTINCT descriptor.key AS queue
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.queue_descriptor_hashes) AS descriptor(key, value)
+        ),
+        live_queue_descriptor_variants AS (
+            SELECT
+                descriptor.key AS queue,
+                count(DISTINCT descriptor.value)::bigint AS descriptor_variant_count
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.queue_descriptor_hashes) AS descriptor(key, value)
+            WHERE runtime.last_seen_at + make_interval(
+                secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+            ) >= now()
+            GROUP BY descriptor.key
+        ),
+        available_lag AS (
             SELECT
                 queue,
                 EXTRACT(EPOCH FROM (now() - min(run_at)))::float8 AS lag_seconds
@@ -927,54 +1344,174 @@ where
             GROUP BY queue
         )
         SELECT
-            qs.queue,
-            qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external AS total_queued,
-            qs.scheduled,
-            qs.available,
-            qs.retryable,
-            qs.running,
-            qs.failed,
-            qs.waiting_external,
+            q.queue,
+            qd.display_name,
+            qd.description,
+            qd.owner,
+            qd.docs_url,
+            COALESCE(qd.tags, ARRAY[]::text[]) AS tags,
+            COALESCE(qd.extra, '{}'::jsonb) AS extra,
+            qd.last_seen_at AS descriptor_last_seen_at,
+            CASE
+                WHEN qd.last_seen_at IS NULL THEN FALSE
+                ELSE qd.last_seen_at + make_interval(
+                    secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
+                ) < now()
+            END AS descriptor_stale,
+            COALESCE(qdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
+            COALESCE(qs.scheduled + qs.available + qs.running + qs.retryable + qs.waiting_external, 0) AS total_queued,
+            COALESCE(qs.scheduled, 0) AS scheduled,
+            COALESCE(qs.available, 0) AS available,
+            COALESCE(qs.retryable, 0) AS retryable,
+            COALESCE(qs.running, 0) AS running,
+            COALESCE(qs.failed, 0) AS failed,
+            COALESCE(qs.waiting_external, 0) AS waiting_external,
             COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
             al.lag_seconds,
             COALESCE(qm.paused, FALSE) AS paused
-        FROM awa.queue_state_counts qs
-        LEFT JOIN available_lag al ON al.queue = qs.queue
-        LEFT JOIN completed_recent cr ON cr.queue = qs.queue
-        LEFT JOIN awa.queue_meta qm ON qm.queue = qs.queue
-        ORDER BY qs.queue
+        FROM all_queues q
+        LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue
+        LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
+        LEFT JOIN live_queue_descriptor_variants qdv ON qdv.queue = q.queue
+        LEFT JOIN available_lag al ON al.queue = q.queue
+        LEFT JOIN completed_recent cr ON cr.queue = q.queue
+        LEFT JOIN awa.queue_meta qm ON qm.queue = q.queue
+        ORDER BY q.queue
         "#,
     )
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows)
+}
+
+/// Get one queue overview by name.
+pub async fn queue_overview<'e, E>(
+    executor: E,
+    queue: &str,
+) -> Result<Option<QueueOverview>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = queue_overviews(executor).await?;
+    Ok(rows.into_iter().find(|row| row.queue == queue))
+}
+
+pub async fn queue_descriptors_for_names<'e, E>(
+    executor: E,
+    queues: &[String],
+) -> Result<HashMap<String, QueueDescriptor>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    if queues.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+            serde_json::Value,
+        ),
+    >(
+        r#"
+        SELECT
+            queue,
+            display_name,
+            description,
+            owner,
+            docs_url,
+            tags,
+            extra
+        FROM awa.queue_descriptors
+        WHERE queue = ANY($1)
+        "#,
+    )
+    .bind(queues)
     .fetch_all(executor)
     .await?;
 
     Ok(rows
         .into_iter()
         .map(
-            |(
-                queue,
-                total_queued,
-                scheduled,
-                available,
-                retryable,
-                running,
-                failed,
-                waiting_external,
-                completed_last_hour,
-                lag_seconds,
-                paused,
-            )| QueueStats {
-                queue,
-                total_queued,
-                scheduled,
-                available,
-                retryable,
-                running,
-                failed,
-                waiting_external,
-                completed_last_hour,
-                lag_seconds,
-                paused,
+            |(queue, display_name, description, owner, docs_url, tags, extra)| {
+                (
+                    queue,
+                    QueueDescriptor {
+                        display_name,
+                        description,
+                        owner,
+                        docs_url,
+                        tags,
+                        extra,
+                    },
+                )
+            },
+        )
+        .collect())
+}
+
+pub async fn job_kind_descriptors_for_names<'e, E>(
+    executor: E,
+    kinds: &[String],
+) -> Result<HashMap<String, JobKindDescriptor>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    if kinds.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let rows = sqlx::query_as::<
+        _,
+        (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Vec<String>,
+            serde_json::Value,
+        ),
+    >(
+        r#"
+        SELECT
+            kind,
+            display_name,
+            description,
+            owner,
+            docs_url,
+            tags,
+            extra
+        FROM awa.job_kind_descriptors
+        WHERE kind = ANY($1)
+        "#,
+    )
+    .bind(kinds)
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(
+            |(kind, display_name, description, owner, docs_url, tags, extra)| {
+                (
+                    kind,
+                    JobKindDescriptor {
+                        display_name,
+                        description,
+                        owner,
+                        docs_url,
+                        tags,
+                        extra,
+                    },
+                )
             },
         )
         .collect())
@@ -1216,6 +1753,107 @@ where
     .await?;
 
     Ok(rows.into_iter().collect())
+}
+
+/// Get job-kind overviews for all known kinds.
+pub async fn job_kind_overviews<'e, E>(executor: E) -> Result<Vec<JobKindOverview>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = sqlx::query_as::<_, JobKindOverview>(
+        r#"
+        WITH all_kinds AS (
+            -- Union every source of kind-name knowledge so /kinds never
+            -- hides a kind that exists *somewhere* in the system:
+            --   - job_kind_catalog: has observed jobs
+            --   - job_kind_descriptors: declared by worker code
+            --   - runtime_instances: reported by a currently-running worker
+            SELECT kind FROM awa.job_kind_catalog WHERE ref_count > 0
+            UNION
+            SELECT kind FROM awa.job_kind_descriptors
+            UNION
+            SELECT DISTINCT descriptor.key AS kind
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.job_kind_descriptor_hashes) AS descriptor(key, value)
+        ),
+        live_kind_descriptor_variants AS (
+            SELECT
+                descriptor.key AS kind,
+                count(DISTINCT descriptor.value)::bigint AS descriptor_variant_count
+            FROM awa.runtime_instances runtime
+            CROSS JOIN LATERAL jsonb_each_text(runtime.job_kind_descriptor_hashes) AS descriptor(key, value)
+            WHERE runtime.last_seen_at + make_interval(
+                secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+            ) >= now()
+            GROUP BY descriptor.key
+        ),
+        completed_recent AS (
+            SELECT
+                kind,
+                count(*)::bigint AS completed_last_hour
+            FROM awa.jobs_hot
+            WHERE state = 'completed'
+              AND finalized_at > now() - interval '1 hour'
+            GROUP BY kind
+        ),
+        queue_counts AS (
+            -- Restrict the per-kind queue fan-out to `jobs_hot` rather than
+            -- the full `awa.jobs` view. jobs_hot is bounded by retention
+            -- (default 24h completed / 72h failed) so the scan cost is
+            -- tied to in-flight volume, not historical volume. The
+            -- semantic this produces — "queues this kind is currently
+            -- active on" — is the one admin surfaces actually care about;
+            -- a kind that hasn't enqueued in 3 months shouldn't be
+            -- counted as still spanning N queues.
+            SELECT
+                kind,
+                count(DISTINCT queue)::bigint AS queue_count
+            FROM awa.jobs_hot
+            GROUP BY kind
+        )
+        SELECT
+            k.kind,
+            kd.display_name,
+            kd.description,
+            kd.owner,
+            kd.docs_url,
+            COALESCE(kd.tags, ARRAY[]::text[]) AS tags,
+            COALESCE(kd.extra, '{}'::jsonb) AS extra,
+            kd.last_seen_at AS descriptor_last_seen_at,
+            CASE
+                WHEN kd.last_seen_at IS NULL THEN FALSE
+                ELSE kd.last_seen_at + make_interval(
+                    secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
+                ) < now()
+            END AS descriptor_stale,
+            COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
+            COALESCE(kc.ref_count, 0) AS job_count,
+            COALESCE(qc.queue_count, 0) AS queue_count,
+            COALESCE(cr.completed_last_hour, 0) AS completed_last_hour
+        FROM all_kinds k
+        LEFT JOIN awa.job_kind_catalog kc ON kc.kind = k.kind
+        LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
+        LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
+        LEFT JOIN queue_counts qc ON qc.kind = k.kind
+        LEFT JOIN completed_recent cr ON cr.kind = k.kind
+        ORDER BY k.kind
+        "#,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows)
+}
+
+pub async fn job_kind_overview<'e, E>(
+    executor: E,
+    kind: &str,
+) -> Result<Option<JobKindOverview>, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let rows = job_kind_overviews(executor).await?;
+    Ok(rows.into_iter().find(|row| row.kind == kind))
 }
 
 /// Return all distinct job kinds.

@@ -1,6 +1,7 @@
 use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeSet, HashMap};
 
 use awa_model::admin;
 use awa_model::job::{JobRow, JobState};
@@ -18,10 +19,16 @@ pub struct JobResponse {
     /// maintenance leader. Read from `metadata._awa_original_priority`.
     /// Equals `priority` when the job has not been aged.
     pub original_priority: i16,
+    pub queue_descriptor: Option<admin::QueueDescriptor>,
+    pub kind_descriptor: Option<admin::JobKindDescriptor>,
 }
 
 impl JobResponse {
-    fn from_row(row: JobRow) -> Self {
+    fn from_row(
+        row: JobRow,
+        queue_descriptors: &HashMap<String, admin::QueueDescriptor>,
+        kind_descriptors: &HashMap<String, admin::JobKindDescriptor>,
+    ) -> Self {
         let original_priority = row
             .metadata
             .get("_awa_original_priority")
@@ -29,13 +36,37 @@ impl JobResponse {
             .map(|v| v as i16)
             .unwrap_or(row.priority);
         Self {
+            queue_descriptor: queue_descriptors.get(&row.queue).cloned(),
+            kind_descriptor: kind_descriptors.get(&row.kind).cloned(),
             row,
             original_priority,
         }
     }
 
-    fn from_rows(rows: Vec<JobRow>) -> Vec<Self> {
-        rows.into_iter().map(Self::from_row).collect()
+    async fn from_rows(
+        pool: &sqlx::PgPool,
+        rows: Vec<JobRow>,
+    ) -> Result<Vec<Self>, awa_model::AwaError> {
+        let queue_names: Vec<String> = rows
+            .iter()
+            .map(|row| row.queue.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let kind_names: Vec<String> = rows
+            .iter()
+            .map(|row| row.kind.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+
+        let queue_descriptors = admin::queue_descriptors_for_names(pool, &queue_names).await?;
+        let kind_descriptors = admin::job_kind_descriptors_for_names(pool, &kind_names).await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|row| Self::from_row(row, &queue_descriptors, &kind_descriptors))
+            .collect())
     }
 }
 
@@ -62,7 +93,7 @@ pub async fn list_jobs(
         limit: params.limit,
     };
     let jobs = admin::list_jobs(&state.pool, &filter).await?;
-    Ok(Json(JobResponse::from_rows(jobs)))
+    Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
 }
 
 pub async fn get_job(
@@ -70,7 +101,8 @@ pub async fn get_job(
     Path(job_id): Path<i64>,
 ) -> Result<Json<JobResponse>, ApiError> {
     let job = admin::get_job(&state.pool, job_id).await?;
-    Ok(Json(JobResponse::from_row(job)))
+    let mut rows = JobResponse::from_rows(&state.pool, vec![job]).await?;
+    Ok(Json(rows.remove(0)))
 }
 
 pub async fn retry_job(
@@ -79,7 +111,16 @@ pub async fn retry_job(
 ) -> Result<Json<Option<JobResponse>>, ApiError> {
     state.require_writable()?;
     let job = admin::retry(&state.pool, job_id).await?;
-    Ok(Json(job.map(JobResponse::from_row)))
+    if job.is_some() {
+        state.invalidate_dashboard_caches();
+    }
+    match job {
+        Some(job) => {
+            let mut rows = JobResponse::from_rows(&state.pool, vec![job]).await?;
+            Ok(Json(Some(rows.remove(0))))
+        }
+        None => Ok(Json(None)),
+    }
 }
 
 pub async fn cancel_job(
@@ -88,7 +129,16 @@ pub async fn cancel_job(
 ) -> Result<Json<Option<JobResponse>>, ApiError> {
     state.require_writable()?;
     let job = admin::cancel(&state.pool, job_id).await?;
-    Ok(Json(job.map(JobResponse::from_row)))
+    if job.is_some() {
+        state.invalidate_dashboard_caches();
+    }
+    match job {
+        Some(job) => {
+            let mut rows = JobResponse::from_rows(&state.pool, vec![job]).await?;
+            Ok(Json(Some(rows.remove(0))))
+        }
+        None => Ok(Json(None)),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -102,7 +152,10 @@ pub async fn bulk_retry(
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
     let jobs = admin::bulk_retry(&state.pool, &payload.ids).await?;
-    Ok(Json(JobResponse::from_rows(jobs)))
+    if !jobs.is_empty() {
+        state.invalidate_dashboard_caches();
+    }
+    Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
 }
 
 pub async fn bulk_cancel(
@@ -111,5 +164,8 @@ pub async fn bulk_cancel(
 ) -> Result<Json<Vec<JobResponse>>, ApiError> {
     state.require_writable()?;
     let jobs = admin::bulk_cancel(&state.pool, &payload.ids).await?;
-    Ok(Json(JobResponse::from_rows(jobs)))
+    if !jobs.is_empty() {
+        state.invalidate_dashboard_caches();
+    }
+    Ok(Json(JobResponse::from_rows(&state.pool, jobs).await?))
 }

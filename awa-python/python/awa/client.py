@@ -328,6 +328,89 @@ class AsyncClient:
             metadata=metadata,
         )
 
+    def queue_descriptor(
+        self,
+        queue: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        owner: str | None = None,
+        docs_url: str | None = None,
+        tags: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach descriptive metadata to a queue.
+
+        The display name, description, owner, docs URL, tags, and any extra
+        JSON you provide show up on the admin UI's queue views and in the
+        admin API. This is how operators understand what a queue is for
+        without reading the worker source.
+
+        Call before :py:meth:`start`. The queue must also appear in the
+        ``queues=`` argument of :py:meth:`start` — you can't describe a
+        queue this client doesn't run.
+
+        Example::
+
+            client.queue_descriptor(
+                "email",
+                display_name="Outbound email",
+                owner="growth@company.com",
+                docs_url="https://runbook/email",
+                tags=["user-facing"],
+            )
+        """
+        return self._raw.queue_descriptor(
+            queue,
+            display_name=display_name,
+            description=description,
+            owner=owner,
+            docs_url=docs_url,
+            tags=tags,
+            extra=extra,
+        )
+
+    def job_kind_descriptor(
+        self,
+        kind: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        owner: str | None = None,
+        docs_url: str | None = None,
+        tags: list[str] | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        """Attach descriptive metadata to a job kind.
+
+        Same shape as :py:meth:`queue_descriptor`, but for a job kind (the
+        string ``@client.task(...)`` publishes — by default the snake_cased
+        class name of the args type).
+
+        Call before :py:meth:`start`. The kind must be registered with
+        :py:meth:`task` or referenced from a periodic schedule.
+
+        Example::
+
+            @client.task(SendEmail, queue="email")
+            async def send(job): ...
+
+            client.job_kind_descriptor(
+                "send_email",
+                display_name="Send user email",
+                description="Renders a template and hands off to SES.",
+            )
+        """
+        return self._raw.job_kind_descriptor(
+            kind,
+            display_name=display_name,
+            description=description,
+            owner=owner,
+            docs_url=docs_url,
+            tags=tags,
+            extra=extra,
+        )
+
     async def start(
         self,
         queues: list[tuple[str, int]] | list[dict[str, Any]] | None = None,
@@ -336,6 +419,7 @@ class AsyncClient:
         global_max_workers: int | None = None,
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
+        descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,
@@ -345,13 +429,21 @@ class AsyncClient:
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
     ) -> None:
-        """Start the worker runtime."""
+        """Start the worker runtime.
+
+        ``descriptor_retention_days`` controls how long a declared queue
+        or job-kind descriptor can sit un-refreshed before the maintenance
+        leader deletes it from ``awa.queue_descriptors`` /
+        ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
+        disable retention (useful if you manage the catalog externally).
+        """
         return await self._raw.start(
             queues,
             poll_interval_ms=poll_interval_ms,
             global_max_workers=global_max_workers,
             completed_retention_hours=completed_retention_hours,
             failed_retention_hours=failed_retention_hours,
+            descriptor_retention_days=descriptor_retention_days,
             cleanup_batch_size=cleanup_batch_size,
             leader_election_interval_ms=leader_election_interval_ms,
             heartbeat_interval_ms=heartbeat_interval_ms,

@@ -13,25 +13,155 @@
   "editable": true,
   "graphTooltip": 1,
   "links": [],
+  "templating": {
+    "list": [
+      {
+        "name": "awa_ui_url",
+        "label": "awa-ui base URL",
+        "description": "Base URL of the awa-ui admin site. Queue/kind panel cells link here for drill-down (awa-ui is richer for transactional admin than this dashboard).",
+        "type": "textbox",
+        "query": "http://localhost:3000",
+        "current": { "value": "http://localhost:3000", "text": "http://localhost:3000" },
+        "hide": 0
+      }
+    ]
+  },
   "panels": [
     {
-      "title": "Queue Depth by State",
-      "description": "Current job counts per queue, pivoted by state. Eventually consistent (~2s). Sortable — click column headers.",
+      "id": 100,
+      "type": "stat",
+      "title": "Total Backlog",
+      "description": "Jobs not yet finished: available + retryable + running. Click to drill into the queue breakdown on awa-ui.",
+      "gridPos": { "h": 4, "w": 5, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "yellow", "value": 1000 },
+            { "color": "red", "value": 10000 }
+          ]},
+          "links": [
+            { "title": "Open awa-ui → queues", "url": "${awa_ui_url}/queues", "targetBlank": true }
+          ]
+        }
+      },
+      "targets": [
+        { "rawSql": "SELECT COALESCE(sum(available + retryable + running), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "id": 101,
+      "type": "stat",
+      "title": "Completions / minute",
+      "description": "Jobs completed in the last minute, across all queues. Steady-state floor for capacity planning.",
+      "gridPos": { "h": 4, "w": 5, "x": 5, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [ { "color": "blue", "value": null } ] }
+        }
+      },
+      "targets": [
+        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'completed' AND finalized_at > now() - interval '1 minute'", "format": "table", "refId": "A" }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "id": 102,
+      "type": "stat",
+      "title": "Failed (last hour)",
+      "description": "Jobs finalised as 'failed' in the last hour — jumps on a sustained problem.",
+      "gridPos": { "h": 4, "w": 5, "x": 10, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 1 },
+            { "color": "red", "value": 20 }
+          ]},
+          "links": [
+            { "title": "Open awa-ui → failed jobs", "url": "${awa_ui_url}/jobs?state=failed", "targetBlank": true }
+          ]
+        }
+      },
+      "targets": [
+        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.jobs_hot WHERE state = 'failed' AND finalized_at > now() - interval '1 hour'", "format": "table", "refId": "A" }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "id": 103,
+      "type": "stat",
+      "title": "Paused queues",
+      "description": "Queues an operator has paused. Non-zero means producer traffic is still piling up somewhere.",
+      "gridPos": { "h": 4, "w": 5, "x": 15, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "red", "value": 1 }
+          ]},
+          "links": [
+            { "title": "Open awa-ui → queues", "url": "${awa_ui_url}/queues", "targetBlank": true }
+          ]
+        }
+      },
+      "targets": [
+        { "rawSql": "SELECT count(*)::bigint AS value FROM awa.queue_meta WHERE paused = true", "format": "table", "refId": "A" }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "id": 104,
+      "type": "stat",
+      "title": "Stale / drifted descriptors",
+      "description": "Count of queue + kind descriptors currently flagged as stale (no live runtime refreshing) or drifted (live runtimes reporting different hashes). Non-zero for long periods suggests a rollout is stuck or a retired queue needs its row deleted.",
+      "gridPos": { "h": 4, "w": 4, "x": 20, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "thresholds": { "mode": "absolute", "steps": [
+            { "color": "green", "value": null },
+            { "color": "orange", "value": 1 },
+            { "color": "red", "value": 5 }
+          ]}
+        }
+      },
+      "targets": [
+        {
+          "rawSql": "WITH live AS (SELECT * FROM awa.runtime_instances WHERE last_seen_at + make_interval(secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)) >= now()), qv AS (SELECT d.key AS q, count(DISTINCT d.value) n FROM live r CROSS JOIN LATERAL jsonb_each_text(r.queue_descriptor_hashes) AS d(key, value) GROUP BY d.key), kv AS (SELECT d.key AS k, count(DISTINCT d.value) n FROM live r CROSS JOIN LATERAL jsonb_each_text(r.job_kind_descriptor_hashes) AS d(key, value) GROUP BY d.key) SELECT (SELECT count(*) FROM awa.queue_descriptors qd LEFT JOIN qv ON qv.q = qd.queue WHERE qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() OR COALESCE(qv.n, 0) > 1) + (SELECT count(*) FROM awa.job_kind_descriptors kd LEFT JOIN kv ON kv.k = kd.kind WHERE kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() OR COALESCE(kv.n, 0) > 1) AS value",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "datasource": { "uid": "${DS_POSTGRES}" }
+    },
+    {
+      "id": 110,
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "title": "Queue Depth by State",
+      "description": "Current jobs by queue, one row per queue with per-state counts. Eventually consistent (~2s lag against the jobs table). The queue name column is a direct link into awa-ui's queue detail page.",
+      "gridPos": { "h": 8, "w": 16, "x": 0, "y": 4 },
       "fieldConfig": {
         "defaults": { "unit": "short", "custom": { "align": "right" } },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
-          { "matcher": { "id": "byName", "options": "available" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "running" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "blue", "mode": "fixed" } }] },
-          { "matcher": { "id": "byName", "options": "failed" }, "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
+          { "matcher": { "id": "byName", "options": "queue" },        "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 170 }, { "id": "links", "value": [{ "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__value.text}", "targetBlank": true }]}] },
+          { "matcher": { "id": "byName", "options": "display_name" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 180 }] },
+          { "matcher": { "id": "byName", "options": "owner" },        "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 160 }] },
+          { "matcher": { "id": "byName", "options": "available" },    "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "green",  "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "running" },      "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "blue",   "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "failed" },       "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "red",    "mode": "fixed" } }] },
+          { "matcher": { "id": "byName", "options": "retryable" },    "properties": [{ "id": "custom.cellOptions", "value": { "type": "color-text" } }, { "id": "color", "value": { "fixedColor": "orange", "mode": "fixed" } }] }
         ]
       },
       "options": { "sortBy": [{ "displayName": "available", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, available, running, completed, failed, scheduled, retryable, waiting_external AS waiting_ext, cancelled FROM awa.queue_state_counts ORDER BY available DESC",
+          "rawSql": "WITH q AS (SELECT queue FROM awa.queue_state_counts UNION SELECT queue FROM awa.queue_descriptors) SELECT q.queue, qd.display_name, qd.owner, COALESCE(qs.available, 0) AS available, COALESCE(qs.running, 0) AS running, COALESCE(qs.completed, 0) AS completed, COALESCE(qs.failed, 0) AS failed, COALESCE(qs.scheduled, 0) AS scheduled, COALESCE(qs.retryable, 0) AS retryable, COALESCE(qs.waiting_external, 0) AS waiting_ext FROM q LEFT JOIN awa.queue_state_counts qs ON qs.queue = q.queue LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue ORDER BY COALESCE(qs.available, 0) DESC, q.queue",
           "format": "table",
           "refId": "A"
         }
@@ -39,26 +169,28 @@
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
-      "title": "Queue Lag (oldest pending job)",
-      "description": "Age of the oldest available job per queue — sorted by lag descending",
+      "id": 111,
       "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "title": "Queue Lag (oldest available job)",
+      "description": "Age of the oldest 'available' job per queue — the #1 alerting signal. Empty table = every queue is caught up. Queue name links to awa-ui for pause/drain.",
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 4 },
       "fieldConfig": {
-        "defaults": { "custom": { "align": "right" } },
+        "defaults": { "custom": { "align": "right" }, "noValue": "\u2713 all queues caught up" },
         "overrides": [
-          { "matcher": { "id": "byName", "options": "queue" }, "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 200 }] },
-          { "matcher": { "id": "byName", "options": "lag" }, "properties": [
+          { "matcher": { "id": "byName", "options": "queue" },        "properties": [{ "id": "custom.align", "value": "left" }, { "id": "custom.width", "value": 160 }, { "id": "links", "value": [{ "title": "Open queue in awa-ui", "url": "${awa_ui_url}/queues/${__value.text}", "targetBlank": true }]}] },
+          { "matcher": { "id": "byName", "options": "display_name" }, "properties": [{ "id": "custom.align", "value": "left" }] },
+          { "matcher": { "id": "byName", "options": "lag_s" }, "properties": [
             { "id": "unit", "value": "s" },
-            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }] } },
+            { "id": "thresholds", "value": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 60 }, { "color": "red", "value": 300 }]}},
             { "id": "custom.cellOptions", "value": { "type": "color-text" } }
           ]},
           { "matcher": { "id": "byName", "options": "pending" }, "properties": [{ "id": "unit", "value": "short" }] }
         ]
       },
-      "options": { "sortBy": [{ "displayName": "lag", "desc": true }] },
+      "options": { "sortBy": [{ "displayName": "lag_s", "desc": true }] },
       "targets": [
         {
-          "rawSql": "SELECT queue, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(run_at)))::float AS lag FROM awa.jobs_hot WHERE state = 'available' GROUP BY queue ORDER BY lag DESC LIMIT 20",
+          "rawSql": "SELECT j.queue, qd.display_name, count(*)::bigint AS pending, EXTRACT(EPOCH FROM (now() - min(j.run_at)))::float8 AS lag_s FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state = 'available' GROUP BY j.queue, qd.display_name ORDER BY lag_s DESC NULLS LAST LIMIT 20",
           "format": "table",
           "refId": "A"
         }
@@ -66,166 +198,148 @@
       "datasource": { "uid": "${DS_POSTGRES}" }
     },
     {
-      "title": "Completed / Failed (last hour)",
-      "description": "Jobs finalized in the last hour, by queue",
-      "type": "timeseries",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
-      "fieldConfig": {
-        "defaults": { "unit": "short", "custom": { "drawStyle": "bars", "fillOpacity": 80, "stacking": { "mode": "normal" } } },
-        "overrides": [
-          { "matcher": { "id": "byRegexp", "options": ".*completed.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
-          { "matcher": { "id": "byRegexp", "options": ".*failed.*" }, "properties": [{ "id": "color", "value": { "fixedColor": "red", "mode": "fixed" } }] }
-        ]
-      },
-      "targets": [
+      "collapsed": true,
+      "id": 200,
+      "title": "Diagnostic",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 12 },
+      "panels": [
         {
-          "rawSql": "SELECT date_trunc('minute', finalized_at) AS time, queue || ' ' || state::text AS metric, count(*)::bigint AS value FROM awa.jobs_hot WHERE state IN ('completed', 'failed') AND finalized_at > now() - interval '1 hour' GROUP BY 1, 2 ORDER BY 1",
-          "format": "time_series",
-          "refId": "A"
-        }
-      ],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Failed Jobs (recent)",
-      "description": "Most recent failed jobs with error details",
-      "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
-      "fieldConfig": {
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "finalized_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
-          { "matcher": { "id": "byName", "options": "id" }, "properties": [{ "id": "custom.width", "value": 80 }] },
-          { "matcher": { "id": "byName", "options": "attempt" }, "properties": [{ "id": "custom.width", "value": 60 }] }
-        ]
-      },
-      "targets": [
+          "id": 201,
+          "type": "timeseries",
+          "title": "Throughput (completed vs failed, 1m rate)",
+          "description": "Per-queue completion and failure rate. A healthy system has completion \u226b failure.",
+          "gridPos": { "h": 8, "w": 12, "x": 0, "y": 13 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "cps",
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 5 }
+            },
+            "overrides": [
+              { "matcher": { "id": "byRegexp", "options": "completed" }, "properties": [{ "id": "color", "value": { "fixedColor": "green", "mode": "fixed" } }] },
+              { "matcher": { "id": "byRegexp", "options": "failed" },    "properties": [{ "id": "color", "value": { "fixedColor": "red",   "mode": "fixed" } }] }
+            ]
+          },
+          "targets": [
+            {
+              "rawSql": "SELECT date_trunc('minute', finalized_at) AS time, (COALESCE(qd.display_name, j.queue) || ' · ' || j.state::text) AS metric, count(*)::bigint AS value FROM awa.jobs_hot j LEFT JOIN awa.queue_descriptors qd ON qd.queue = j.queue WHERE j.state IN ('completed', 'failed') AND finalized_at > now() - interval '1 hour' GROUP BY 1, 2 ORDER BY 1",
+              "format": "time_series",
+              "refId": "A"
+            }
+          ],
+          "datasource": { "uid": "${DS_POSTGRES}" }
+        },
         {
-          "rawSql": "SELECT id, kind, queue, attempt, max_attempts, finalized_at, errors[array_upper(errors, 1)]->>'error' AS last_error FROM awa.jobs_hot WHERE state = 'failed' ORDER BY finalized_at DESC LIMIT 20",
-          "format": "table",
-          "refId": "A"
+          "id": 202,
+          "type": "table",
+          "title": "Descriptor Health",
+          "description": "Only shown when non-empty — stale = no live runtime refreshing, drift = live runtimes disagreeing on descriptor hash. Click target → awa-ui for /queues/<queue> or /kinds.",
+          "gridPos": { "h": 8, "w": 12, "x": 12, "y": 13 },
+          "fieldConfig": {
+            "defaults": { "custom": { "align": "left" } },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "status" }, "properties": [
+                { "id": "custom.cellOptions", "value": { "type": "color-text" } },
+                { "id": "mappings", "value": [{ "type": "value", "options": {
+                  "stale": { "text": "stale", "color": "orange" },
+                  "drift": { "text": "drift", "color": "red" },
+                  "stale+drift": { "text": "stale+drift", "color": "red" }
+                }}]}
+              ]},
+              { "matcher": { "id": "byName", "options": "last_seen_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
+              { "matcher": { "id": "byName", "options": "target" }, "properties": [
+                { "id": "links", "value": [
+                  { "title": "Drill into awa-ui", "url": "${awa_ui_url}/queues/${__data.fields.target}", "targetBlank": true }
+                ]}
+              ]}
+            ]
+          },
+          "options": { "sortBy": [{ "displayName": "status", "desc": true }] },
+          "targets": [
+            {
+              "rawSql": "WITH live AS (SELECT * FROM awa.runtime_instances WHERE last_seen_at + make_interval(secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)) >= now()), qv AS (SELECT d.key AS q, count(DISTINCT d.value) n FROM live r CROSS JOIN LATERAL jsonb_each_text(r.queue_descriptor_hashes) AS d(key, value) GROUP BY d.key), kv AS (SELECT d.key AS k, count(DISTINCT d.value) n FROM live r CROSS JOIN LATERAL jsonb_each_text(r.job_kind_descriptor_hashes) AS d(key, value) GROUP BY d.key) SELECT 'queue' AS target_type, qd.queue AS target, qd.owner, qd.last_seen_at, (CASE WHEN qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN 'stale' ELSE '' END || CASE WHEN COALESCE(qv.n, 0) > 1 THEN CASE WHEN qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN '+drift' ELSE 'drift' END ELSE '' END) AS status FROM awa.queue_descriptors qd LEFT JOIN qv ON qv.q = qd.queue WHERE qd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() OR COALESCE(qv.n, 0) > 1 UNION ALL SELECT 'kind' AS target_type, kd.kind AS target, kd.owner, kd.last_seen_at, (CASE WHEN kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN 'stale' ELSE '' END || CASE WHEN COALESCE(kv.n, 0) > 1 THEN CASE WHEN kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() THEN '+drift' ELSE 'drift' END ELSE '' END) AS status FROM awa.job_kind_descriptors kd LEFT JOIN kv ON kv.k = kd.kind WHERE kd.last_seen_at + make_interval(secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)) < now() OR COALESCE(kv.n, 0) > 1 ORDER BY status DESC, target_type, target",
+              "format": "table",
+              "refId": "A"
+            }
+          ],
+          "datasource": { "uid": "${DS_POSTGRES}" }
         }
-      ],
-      "datasource": { "uid": "${DS_POSTGRES}" }
+      ]
     },
     {
-      "title": "Cron Schedules",
-      "description": "Registered cron schedules with last enqueue time",
-      "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
-      "fieldConfig": {
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "last_enqueued_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
-          { "matcher": { "id": "byName", "options": "age" }, "properties": [{ "id": "unit", "value": "s" }] }
-        ]
-      },
-      "targets": [
+      "collapsed": true,
+      "id": 300,
+      "title": "Catalog references · drill into awa-ui for the rich views",
+      "type": "row",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 13 },
+      "panels": [
         {
-          "rawSql": "SELECT name, cron_expr, timezone, kind, queue, last_enqueued_at, EXTRACT(EPOCH FROM (now() - last_enqueued_at))::float AS age FROM awa.cron_jobs ORDER BY name",
-          "format": "table",
-          "refId": "A"
-        }
-      ],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Runtime Instances",
-      "description": "Connected worker instances and their health",
-      "type": "table",
-      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
-      "fieldConfig": {
-        "overrides": [
-          { "matcher": { "id": "byName", "options": "last_seen_at" }, "properties": [{ "id": "unit", "value": "dateTimeAsIso" }] },
-          { "matcher": { "id": "byName", "options": "healthy" }, "properties": [
-            { "id": "custom.cellOptions", "value": { "type": "color-text" } },
-            { "id": "mappings", "value": [
-              { "type": "value", "options": { "true": { "text": "Healthy", "color": "green" }, "false": { "text": "Unhealthy", "color": "red" } } }
-            ]}
-          ]}
-        ]
-      },
-      "targets": [
+          "id": 301,
+          "type": "stat",
+          "title": "Declared queues",
+          "description": "Count of queues in awa.queue_descriptors. Click through to awa-ui's /queues page for the full table, with pause/resume/drain actions this dashboard intentionally doesn't duplicate.",
+          "gridPos": { "h": 4, "w": 6, "x": 0, "y": 14 },
+          "fieldConfig": { "defaults": {
+            "unit": "short",
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }]},
+            "links": [{ "title": "Open /queues in awa-ui", "url": "${awa_ui_url}/queues", "targetBlank": true }]
+          }},
+          "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.queue_descriptors", "format": "table", "refId": "A" }],
+          "datasource": { "uid": "${DS_POSTGRES}" }
+        },
         {
-          "rawSql": "SELECT hostname, version, healthy, leader, poll_loop_alive, heartbeat_alive, maintenance_alive, shutting_down, last_seen_at, jsonb_array_length(queues) AS queue_count FROM awa.runtime_instances WHERE last_seen_at > now() - interval '5 minutes' ORDER BY hostname",
-          "format": "table",
-          "refId": "A"
+          "id": 302,
+          "type": "stat",
+          "title": "Declared job kinds",
+          "gridPos": { "h": 4, "w": 6, "x": 6, "y": 14 },
+          "fieldConfig": { "defaults": {
+            "unit": "short",
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }]},
+            "links": [{ "title": "Open /kinds in awa-ui", "url": "${awa_ui_url}/kinds", "targetBlank": true }]
+          }},
+          "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.job_kind_descriptors", "format": "table", "refId": "A" }],
+          "datasource": { "uid": "${DS_POSTGRES}" }
+        },
+        {
+          "id": 303,
+          "type": "stat",
+          "title": "Live runtime instances",
+          "description": "Runtimes whose last_seen_at is within 3\u00d7 their snapshot interval. Click through to awa-ui's /runtime page for per-instance detail.",
+          "gridPos": { "h": 4, "w": 6, "x": 12, "y": 14 },
+          "fieldConfig": { "defaults": {
+            "unit": "short",
+            "thresholds": { "mode": "absolute", "steps": [
+              { "color": "red",   "value": null },
+              { "color": "green", "value": 1 }
+            ]},
+            "links": [{ "title": "Open /runtime in awa-ui", "url": "${awa_ui_url}/runtime", "targetBlank": true }]
+          }},
+          "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.runtime_instances WHERE last_seen_at + make_interval(secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)) >= now()", "format": "table", "refId": "A" }],
+          "datasource": { "uid": "${DS_POSTGRES}" }
+        },
+        {
+          "id": 304,
+          "type": "stat",
+          "title": "Cron schedules",
+          "gridPos": { "h": 4, "w": 6, "x": 18, "y": 14 },
+          "fieldConfig": { "defaults": {
+            "unit": "short",
+            "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }]},
+            "links": [{ "title": "Open /cron in awa-ui", "url": "${awa_ui_url}/cron", "targetBlank": true }]
+          }},
+          "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.cron_jobs", "format": "table", "refId": "A" }],
+          "datasource": { "uid": "${DS_POSTGRES}" }
         }
-      ],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Total Available",
-      "description": "Eventually consistent (~2s)",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 24 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "yellow", "value": 100 }, { "color": "red", "value": 1000 }] }
-        }
-      },
-      "targets": [{ "rawSql": "SELECT COALESCE(sum(available), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Total Running",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 4, "y": 24 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "blue", "value": null }] }
-        }
-      },
-      "targets": [{ "rawSql": "SELECT COALESCE(sum(running), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Total Failed",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 8, "y": 24 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 10 }] }
-        }
-      },
-      "targets": [{ "rawSql": "SELECT COALESCE(sum(failed), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Total Scheduled",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 12, "y": 24 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "purple", "value": null }] }
-        }
-      },
-      "targets": [{ "rawSql": "SELECT COALESCE(sum(scheduled), 0)::bigint AS value FROM awa.queue_state_counts", "format": "table", "refId": "A" }],
-      "datasource": { "uid": "${DS_POSTGRES}" }
-    },
-    {
-      "title": "Paused Queues",
-      "type": "stat",
-      "gridPos": { "h": 4, "w": 4, "x": 16, "y": 24 },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "thresholds": { "mode": "absolute", "steps": [{ "color": "green", "value": null }, { "color": "red", "value": 1 }] }
-        }
-      },
-      "targets": [{ "rawSql": "SELECT count(*)::bigint AS value FROM awa.queue_meta WHERE paused = true", "format": "table", "refId": "A" }],
-      "datasource": { "uid": "${DS_POSTGRES}" }
+      ]
     }
   ],
   "schemaVersion": 39,
   "tags": ["awa", "job-queue", "postgres"],
-  "time": { "from": "now-1h", "to": "now" },
+  "time": { "from": "now-5m", "to": "now" },
   "timepicker": {},
   "timezone": "",
   "title": "Awa Job Queue (Postgres)",
   "uid": "awa-postgres",
-  "version": 2,
+  "version": 3,
   "refresh": "30s"
 }

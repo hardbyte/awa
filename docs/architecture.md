@@ -6,6 +6,43 @@ Awa (Maori: river) is a Postgres-native background job queue providing durable, 
 
 The Rust runtime owns all queue machinery -- polling, heartbeating, crash recovery, and dispatch. Python workers are callbacks invoked by this runtime via PyO3, inheriting Rust-grade reliability without reimplementing queue internals.
 
+## Control-plane descriptors
+
+Awa keeps two operator-facing descriptor catalogs, distinct from per-job payload metadata:
+
+- `awa.queue_descriptors` — labels and ownership for queues
+- `awa.job_kind_descriptors` — labels and ownership for job kinds
+
+Descriptors are **code-declared by whichever runtime is hosting the workers** — either the Rust `ClientBuilder` or the Python `AsyncClient`. Both use the same catalog tables and the same hashing, so a mixed Rust + Python fleet produces consistent descriptors. See [Configuration → Queue and job-kind descriptors](configuration.md#queue-and-job-kind-descriptors) for the declaration surface in each language.
+
+At startup and on every runtime snapshot tick, each worker upserts the descriptors it declares and refreshes a `last_seen_at` plus a BLAKE3 `descriptor_hash` over canonicalized (sorted-key) JSON of the descriptor fields. The admin API and UI render friendly names, descriptions, tags, docs links, and owner fields from the catalog, and derive two health signals from the snapshot stream:
+
+- **stale** — no live runtime has refreshed the descriptor within its expected snapshot window, so whatever is in the catalog is out-of-date with production
+- **drift** — two or more live runtimes are reporting different descriptor hashes for the same queue or kind (typical during a rolling deploy where old and new code disagree on ownership or docs URL)
+
+The source-of-truth split matters because the three concerns have different lifecycles and writers:
+
+- **descriptor payloads** — owned by application code; live in the dedicated catalog tables
+- **descriptor liveness and drift** — derived at read time from per-runtime hash snapshots in `awa.runtime_instances`, so they don't need their own writer path
+- **mutable queue control state** (pause/resume, paused_by, …) — owned by operators; stays in `awa.queue_meta`, which is also on the dispatcher hot path and therefore kept narrow
+
+Declared-but-empty queues and kinds still appear in the admin surfaces because the catalog is authoritative; before descriptors existed, listings were driven by `queue_state_counts`, so an idle-but-declared queue would disappear from the UI.
+
+### Catalog retention
+
+The maintenance leader also garbage-collects the catalog: descriptor rows whose `last_seen_at` is older than the configured `descriptor_retention` (default 30 days) are deleted on the normal cleanup cycle. This keeps long-running fleets from accumulating descriptors for retired queues and kinds — a worker rollout that stops declaring `legacy_thing` drops that row within 30 days instead of showing it as permanently stale forever. The retention is tunable via `ClientBuilder::descriptor_retention` (Rust) or `AsyncClient.start(..., descriptor_retention_days=...)` (Python); passing `Duration::ZERO` / `0` disables cleanup for operators who manage the catalog externally. Runtime liveness rows in `awa.runtime_instances` are unrelated and already garbage-collected at a shorter 24h horizon — a stale k8s pod name can only contribute to drift detection for ~30s after the pod dies, and drops out of the table entirely within a day.
+
+### Performance profile
+
+The descriptor surface is deliberately off the hot path:
+
+- **Dispatcher, claim query, completion batcher, heartbeat, maintenance rescue** — none of these touch `awa.queue_descriptors`, `awa.job_kind_descriptors`, or the descriptor-hash columns on `awa.runtime_instances`. The claim query still hits `awa.jobs_hot` + `awa.queue_meta` only, so latency on the job lifecycle is unchanged.
+- **Startup and steady-state sync** — `ClientBuilder::build()` / `AsyncClient.start()` and every `runtime_snapshot_interval` tick (default 10 s) call `sync_queue_descriptors` / `sync_job_kind_descriptors`. Both are batched: all declared descriptors go into a single multi-row `INSERT ... ON CONFLICT` statement (chunked at 5000 rows to stay well under Postgres' 65k-parameter limit). Measured end-to-end against a local Postgres: ~2 ms / 10 descriptors, ~4.5 ms / 100, ~8 ms / 500, ~24 ms / 2000. That's a single round-trip per call at realistic fleet sizes and the per-descriptor cost drops sharply with batch size (from ~200 µs at n=10 to ~12 µs at n=2000 as the fixed round-trip overhead amortises). Sync runs on a separate pool connection from the dispatcher, so it cannot starve job processing.
+- **BLAKE3 hash cost** — hashes are computed per descriptor on each tick from the canonicalized JSON body. For a ~200 byte descriptor this is well under 1 µs; the total hash work per tick stays in the low-microsecond range even for hundreds of descriptors.
+- **Read side** — `admin::queue_overviews` and `admin::job_kind_overviews` grew a CTE that scans `runtime_instances` and `CROSS JOIN LATERAL jsonb_each_text(...)` on the per-runtime hash columns. Measured at 0.2 ms against 100 queues + 34 live-runtime rows (buffer-cache resident). The computation is O(live_runtimes × declared_descriptors_per_runtime), so very large fleets (≥1000 runtimes × ≥500 descriptors) will want a materialised view here, but the read path already sits behind the `/api/queues` cache layer so this is bounded by TTL rather than polling frequency.
+- **Storage** — each descriptor row is ~200 bytes; 100 queues + 500 kinds = ~120 KB. Per runtime row, the two new JSONB hash columns are ~100 bytes per declared descriptor (64-char hex + key), so a runtime declaring 600 descriptors carries ~60 KB of hash snapshot. A 100-worker fleet publishing 600 descriptors each is ~6 MB of `runtime_instances` payload.
+- **Migration cost** — `v009_descriptors` creates two tables (with `CHECK` constraints: non-empty names, 200-char name limits, 2000-char description limit, 2048-char docs URL, ≤20 tags, positive `sync_interval_ms`, ≤128-char descriptor hash) and adds two JSONB columns (`NOT NULL DEFAULT '{}'::jsonb`) to `awa.runtime_instances`. On Postgres 11+ the `ADD COLUMN` with a constant default is metadata-only — no table rewrite — so it's instant even on large `runtime_instances` tables.
+
 ## Crate Structure
 
 ```

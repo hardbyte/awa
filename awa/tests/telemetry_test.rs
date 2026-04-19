@@ -222,6 +222,12 @@ fn build_otlp_meter_provider(endpoint: &str, service_name: &str) -> SdkMeterProv
 
 async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: i64) {
     let start = std::time::Instant::now();
+    // 60s is tight when a rescue + retry path depends on the promote timer,
+    // dispatcher claim, worker sleep, and completion flush all completing
+    // for 2–4 jobs in sequence. 120s keeps the test deterministic on loaded
+    // CI runners without masking a genuine regression (steady-state the
+    // wait resolves in single-digit seconds).
+    let timeout = Duration::from_secs(120);
     loop {
         let count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM awa.jobs WHERE queue = $1 AND state = $2::awa.job_state",
@@ -236,8 +242,19 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
             return;
         }
 
-        if start.elapsed() > Duration::from_secs(60) {
-            panic!("Timed out waiting for {min} {state} jobs in queue {queue}; only {count} found");
+        if start.elapsed() > timeout {
+            let breakdown: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT state::text, COUNT(*)::bigint \
+                 FROM awa.jobs WHERE queue = $1 GROUP BY state ORDER BY state",
+            )
+            .bind(queue)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+            panic!(
+                "Timed out waiting for {min} {state} jobs in queue {queue}; \
+                 only {count} found. Full state breakdown: {breakdown:?}"
+            );
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -489,7 +506,8 @@ async fn test_otlp_metrics_reach_prometheus() {
     // 2. Set as global meter provider so AwaMetrics::from_global() uses it.
     global::set_meter_provider(meter_provider.clone());
 
-    // 3. Build + start Client with a worker.
+    // 3. Build + start Client with a worker. Declare a queue and kind
+    // descriptor so the awa.queue.info / awa.job_kind.info gauges fire.
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -499,8 +517,21 @@ async fn test_otlp_metrics_reach_prometheus() {
                 ..Default::default()
             },
         )
+        .queue_descriptor(
+            queue,
+            awa::QueueDescriptor::new()
+                .display_name("Telemetry OTLP queue")
+                .owner("otlp-test")
+                .tag("telemetry-test"),
+        )
         .register::<TelemetryJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+        .job_kind_descriptor::<TelemetryJob>(
+            awa::JobKindDescriptor::new()
+                .display_name("Telemetry job")
+                .owner("otlp-test"),
+        )
         .queue_stats_interval(Duration::from_secs(2))
+        .runtime_snapshot_interval(Duration::from_secs(1))
         .build()
         .expect("Failed to build client");
 
@@ -612,6 +643,37 @@ async fn test_otlp_metrics_reach_prometheus() {
     assert!(
         wait_duration_count >= 1.0,
         "Expected awa.job.wait_duration count >= 1, got {wait_duration_count}"
+    );
+
+    // Descriptor info gauges. These are the label-join targets for any
+    // panel that wants to surface display_name / owner alongside raw queue
+    // and kind names. Each gauge should be 1.
+    let queue_info = wait_for_metric(&http, "awa_queue_info", 1.0, timeout).await;
+    eprintln!("  awa.queue.info = {queue_info}");
+    assert!(
+        queue_info >= 1.0,
+        "Expected awa.queue.info >= 1, got {queue_info}"
+    );
+
+    let kind_info = wait_for_metric(&http, "awa_job_kind_info", 1.0, timeout).await;
+    eprintln!("  awa.job_kind.info = {kind_info}");
+    assert!(
+        kind_info >= 1.0,
+        "Expected awa.job_kind.info >= 1, got {kind_info}"
+    );
+
+    // The info gauges carry descriptor attributes; verify by querying with
+    // a label filter so we know the owner made it through the exporter.
+    let queue_info_labeled = wait_for_metric(
+        &http,
+        "awa_queue_info{awa_queue_owner=\"otlp-test\"}",
+        1.0,
+        timeout,
+    )
+    .await;
+    assert!(
+        queue_info_labeled >= 1.0,
+        "Expected awa_queue_info{{awa_queue_owner=\"otlp-test\"}} >= 1, got {queue_info_labeled}"
     );
 
     // Clean up.

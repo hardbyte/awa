@@ -1106,7 +1106,7 @@ async fn t27_admin_ops_under_load() {
     awa_model::admin::flush_dirty_admin_metadata(&pool)
         .await
         .unwrap();
-    let stats = awa_model::admin::queue_stats(&pool).await.unwrap();
+    let stats = awa_model::admin::queue_overviews(&pool).await.unwrap();
     let stat = stats.iter().find(|s| s.queue == queue);
     assert!(stat.is_some(), "Queue should appear in stats");
 

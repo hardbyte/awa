@@ -1,4 +1,9 @@
-import { test, expect } from "@playwright/test";
+import { test, expect, type Response } from "@playwright/test";
+
+function isQueuesListResponse(response: Response): boolean {
+  const url = new URL(response.url());
+  return response.ok() && response.request().method() === "GET" && url.pathname === "/api/queues";
+}
 
 test.describe("Jobs page", () => {
   test("navigate to /jobs, heading visible", async ({ page }) => {
@@ -35,6 +40,21 @@ test.describe("Jobs page", () => {
     // Should have data rows
     const rows = jobTable.getByRole("row");
     await expect(rows).not.toHaveCount(1);
+  });
+
+  test("descriptor-backed and legacy labels both render in jobs table", async ({ page }) => {
+    await Promise.all([
+      page.waitForResponse((r) => r.url().includes("/api/jobs") && r.ok()),
+      page.goto("/jobs"),
+    ]);
+
+    const jobTable = page.getByRole("grid", { name: "Jobs" });
+    await expect(jobTable.getByText("E2E Job").first()).toBeVisible();
+    await expect(jobTable.getByText("e2e_job").first()).toBeVisible();
+    await expect(jobTable.getByText("E2E Queue").first()).toBeVisible();
+    await expect(jobTable.getByText("e2e_test").first()).toBeVisible();
+    await expect(jobTable.getByText("legacy_job").first()).toBeVisible();
+    await expect(jobTable.getByText("legacy_queue").first()).toBeVisible();
   });
 
   test("URL-driven state: navigate to /jobs?state=failed, failed pill active", async ({
@@ -368,7 +388,7 @@ test.describe("Pagination", () => {
 test.describe("Queue context banner", () => {
   test("banner appears when filtering by a single queue", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
         (r) =>
           r.url().includes("/api/jobs") &&
@@ -396,7 +416,7 @@ test.describe("Queue context banner", () => {
 
   test("banner shows Pause button for active queue", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
         (r) =>
           r.url().includes("/api/jobs") &&
@@ -424,7 +444,7 @@ test.describe("Queue context banner", () => {
 
   test("Drain button shows confirmation dialog", async ({ page }) => {
     await Promise.all([
-      page.waitForResponse((r) => r.url().includes("/api/queues") && r.ok()),
+      page.waitForResponse(isQueuesListResponse),
       page.waitForResponse(
         (r) =>
           r.url().includes("/api/jobs") &&

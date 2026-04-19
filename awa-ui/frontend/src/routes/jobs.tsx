@@ -71,6 +71,20 @@ function timeColumnLabel(state: string): string {
   return "Created";
 }
 
+// Treat empty display_name as missing — `??` alone would let
+// `display_name: ""` render a blank label.
+function jobKindLabel(job: JobRow): string {
+  return job.kind_descriptor?.display_name?.trim()
+    ? job.kind_descriptor.display_name
+    : job.kind;
+}
+
+function queueLabel(job: JobRow): string {
+  return job.queue_descriptor?.display_name?.trim()
+    ? job.queue_descriptor.display_name
+    : job.queue;
+}
+
 function useJobFilters() {
   const searchParams = useSearch({ strict: false }) as Record<
     string,
@@ -159,6 +173,9 @@ export function JobsPage() {
   const queueStats = activeQueue
     ? queuesQuery.data?.find((q) => q.queue === activeQueue)
     : undefined;
+  const activeQueueLabel = queueStats?.display_name?.trim()
+    ? queueStats.display_name
+    : activeQueue;
 
   const pauseQueueMutation = useMutation({
     mutationFn: () => pauseQueue(activeQueue!, "ui"),
@@ -247,8 +264,11 @@ export function JobsPage() {
     <div className="space-y-4">
       <div className="flex flex-wrap items-center gap-4">
         <Heading level={2}>
-          {activeQueue ? `Queue: ${activeQueue}` : "Jobs"}
+          {activeQueue ? `Queue: ${activeQueueLabel}` : "Jobs"}
         </Heading>
+        {activeQueue && queueStats?.display_name && (
+          <span className="text-sm text-muted-fg">{queueStats.queue}</span>
+        )}
         {total !== undefined && !activeQueue && (
           <span className="text-sm text-muted-fg">
             {total.toLocaleString()} total
@@ -263,6 +283,9 @@ export function JobsPage() {
             <Badge intent="warning">Paused</Badge>
           ) : (
             <Badge intent="success">Active</Badge>
+          )}
+          {queueStats.description && (
+            <span className="text-sm text-muted-fg">{queueStats.description}</span>
           )}
           <span className="text-sm text-muted-fg">
             {queueStats.available} available &middot;{" "}
@@ -407,7 +430,7 @@ export function JobsPage() {
               >
                 <div className="flex items-center gap-2">
                   <span className="font-medium">
-                    {job.kind}
+                    {jobKindLabel(job)}
                     <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
                   </span>
                   <StateBadge state={job.state} />
@@ -421,10 +444,16 @@ export function JobsPage() {
                   )}
                 </div>
                 <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-muted-fg">
-                  <span>{job.queue}</span>
+                  <span>{queueLabel(job)}</span>
+                  {job.queue_descriptor?.display_name && <span>{job.queue}</span>}
                   <span>{job.attempt}/{job.max_attempts}</span>
                   <span>{contextualTime(job)}</span>
                 </div>
+                {job.kind_descriptor?.description && (
+                  <p className="mt-1 text-xs text-muted-fg">
+                    {job.kind_descriptor.description}
+                  </p>
+                )}
                 {job.tags.length > 0 && (
                   <div className="mt-1.5 flex flex-wrap gap-1">
                     {job.tags.slice(0, 3).map((t) => (
@@ -494,13 +523,26 @@ export function JobsPage() {
               className="cursor-pointer"
             >
               <TableCell className="font-medium">
-                {job.kind}
+                <div>
+                  <div>{jobKindLabel(job)}
                 <span className="ml-1.5 text-xs text-muted-fg/50">#{job.id}</span>
+                  </div>
+                  {job.kind_descriptor?.display_name && (
+                    <div className="text-xs font-normal text-muted-fg">{job.kind}</div>
+                  )}
+                </div>
               </TableCell>
               <TableCell>
                 <StateBadge state={job.state} />
               </TableCell>
-              <TableCell className="text-muted-fg">{job.queue}</TableCell>
+              <TableCell className="text-muted-fg">
+                <div>
+                  <div>{queueLabel(job)}</div>
+                  {job.queue_descriptor?.display_name && (
+                    <div className="text-xs">{job.queue}</div>
+                  )}
+                </div>
+              </TableCell>
               <TableCell>
                 {job.priority !== 2 ? (
                   <Badge intent={job.priority === 1 ? "danger" : "secondary"} className="text-[10px]">

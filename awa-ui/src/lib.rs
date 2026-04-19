@@ -70,12 +70,15 @@ pub async fn router_with(
             "/queues/runtime",
             get(handlers::runtime::list_queue_runtime),
         )
+        .route("/queues/{queue}", get(handlers::queues::get_queue))
         .route("/queues/{queue}/pause", post(handlers::queues::pause_queue))
         .route(
             "/queues/{queue}/resume",
             post(handlers::queues::resume_queue),
         )
         .route("/queues/{queue}/drain", post(handlers::queues::drain_queue))
+        // Kinds
+        .route("/kinds", get(handlers::kinds::list_kinds))
         // Cron
         .route("/cron", get(handlers::cron::list_cron_jobs))
         .route(

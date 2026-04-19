@@ -29,10 +29,24 @@ export interface JobRow {
   // Computed by the API — the priority assigned at enqueue time,
   // before maintenance-based aging.
   original_priority: number;
+  queue_descriptor: DescriptorFields | null;
+  kind_descriptor: DescriptorFields | null;
 }
 
-export interface QueueStats {
+export interface DescriptorFields {
+  display_name: string | null;
+  description: string | null;
+  owner: string | null;
+  docs_url: string | null;
+  tags: string[];
+  extra: unknown;
+}
+
+export interface QueueOverview extends DescriptorFields {
   queue: string;
+  descriptor_last_seen_at: string | null;
+  descriptor_stale: boolean;
+  descriptor_mismatch: boolean;
   total_queued: number;
   scheduled: number;
   available: number;
@@ -43,6 +57,18 @@ export interface QueueStats {
   completed_last_hour: number;
   lag_seconds: number | null;
   paused: boolean;
+}
+
+export type QueueStats = QueueOverview;
+
+export interface JobKindOverview extends DescriptorFields {
+  kind: string;
+  descriptor_last_seen_at: string | null;
+  descriptor_stale: boolean;
+  descriptor_mismatch: boolean;
+  job_count: number;
+  queue_count: number;
+  completed_last_hour: number;
 }
 
 export interface RateLimitSnapshot {
@@ -199,8 +225,16 @@ export function bulkCancel(ids: number[]): Promise<JobRow[]> {
 }
 
 // Queues
-export function fetchQueues(): Promise<QueueStats[]> {
+export function fetchQueues(): Promise<QueueOverview[]> {
   return apiFetch("/queues");
+}
+
+export function fetchQueue(queue: string): Promise<QueueOverview> {
+  return apiFetch(`/queues/${encodeURIComponent(queue)}`);
+}
+
+export function fetchKinds(): Promise<JobKindOverview[]> {
+  return apiFetch("/kinds");
 }
 
 export function fetchQueueRuntime(): Promise<QueueRuntimeSummary[]> {
