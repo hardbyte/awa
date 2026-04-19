@@ -96,6 +96,13 @@ prototype-era names.
   preserve counts across terminal-segment prune.
 - Completion must not update `lane_state` on every terminal transition; the
   hot path only mutates claim/enqueue control state.
+- The only hot counters that belong in `lane_state` are the ones dispatch
+  directly needs to claim more work. Reintroducing per-completion `running` or
+  `completed` counter updates on a single busy lane collapsed the 5k runtime
+  throughput benchmark from about `9.5k/s` to about `0.6k/s` locally.
+- `running` is derived from `active_leases`; terminal counts are derived from
+  live `terminal_entries` plus a prune-time rollup, not from a hot completion
+  counter.
 - Ready and lease segment cursor tables tell dispatch and maintenance which
   physical segment is active, claimable, or prunable.
 - Rotation state for queue and lease segments is owned by the maintenance
@@ -148,6 +155,8 @@ The leader-elected maintenance service owns:
 - DLQ retention cleanup
 
 All prune paths remain best-effort and use short lock timeouts.
+Claims take a shared lock on the lease segment cursor, and prune rechecks
+liveness only after it owns the segment locks needed for `TRUNCATE`.
 
 ## Implementation
 
@@ -186,21 +195,22 @@ Latest local full-runtime benchmark runs on this branch:
 
 | Runtime path | Throughput | Pickup p50 | Pickup p95 | Pickup p99 | Exact final dead |
 |---|---:|---:|---:|---:|---:|
-| canonical runtime | `9607/s` | `5.825 ms` | `64.574 ms` | `223.503 ms` | not sampled |
-| queue storage runtime | `9508/s` | `4.021 ms` | `39.679 ms` | `49.768 ms` | `196` |
+| canonical runtime | `9686/s` | `4.995 ms` | `38.998 ms` | `217.352 ms` | not sampled |
+| queue storage runtime | `9537/s` | `3.671 ms` | `22.013 ms` | `87.738 ms` | `417` |
 
 Latest exact dead-tuple breakdown for the queue storage run
 (using current prototype table names):
 
-- `queue_lanes = 57`
+- `queue_lanes = 41`
 - `ready = 0`
 - `done = 0`
-- `leases = 139`
+- `leases = 376`
 - `attempt_state = 0`
-- `total = 196`
+- `total = 417`
 
 These numbers matter more than the earlier storage-only spike because they come
 through the real dispatcher, executor, callback, maintenance, and DLQ paths.
+Recorded commands and raw output live in `docs/adr/bench/019-queue-storage-validation-2026-04-19.md`.
 
 ## Consequences
 

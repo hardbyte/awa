@@ -1367,6 +1367,9 @@ impl MaintenanceService {
     /// every ~2s to keep dashboard counters fresh.
     #[tracing::instrument(skip(self), name = "maintenance.recompute_dirty_metadata")]
     async fn recompute_dirty_admin_metadata(&self) {
+        if self.storage.queue_storage().is_some() {
+            return;
+        }
         match awa_model::admin::recompute_dirty_admin_metadata(&self.pool).await {
             Ok(count) if count > 0 => {
                 tracing::debug!(count, "Recomputed dirty admin metadata keys");
@@ -1382,6 +1385,9 @@ impl MaintenanceService {
     /// Safety net for any drift — runs infrequently (~60s).
     #[tracing::instrument(skip(self), name = "maintenance.refresh_admin_metadata")]
     async fn refresh_admin_metadata(&self) {
+        if self.storage.queue_storage().is_some() {
+            return;
+        }
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
             tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
@@ -1432,112 +1438,126 @@ impl MaintenanceService {
         runtime: &crate::storage::QueueStorageRuntime,
     ) {
         let schema = runtime.store.schema();
-        let queues: Vec<String> = match sqlx::query_scalar(&format!(
-            r#"
-            SELECT DISTINCT queue
-            FROM (
-                SELECT queue FROM awa.queue_meta
-                UNION
-                SELECT queue FROM {schema}.ready_entries
-                UNION
-                SELECT queue FROM {schema}.leases
-                UNION
-                SELECT queue FROM {schema}.deferred_jobs
-                UNION
-                SELECT queue FROM {schema}.done_entries
-            ) queues
-            ORDER BY queue
+        let rows: Vec<(String, i64, i64, i64, i64, i64, i64, i64, Option<f64>)> =
+            match sqlx::query_as(&format!(
+                r#"
+            WITH queues AS (
+                SELECT DISTINCT queue
+                FROM (
+                    SELECT queue FROM awa.queue_meta
+                    UNION ALL
+                    SELECT queue FROM {schema}.ready_entries
+                    UNION ALL
+                    SELECT queue FROM {schema}.leases
+                    UNION ALL
+                    SELECT queue FROM {schema}.deferred_jobs
+                    UNION ALL
+                    SELECT queue FROM {schema}.done_entries
+                    UNION ALL
+                    SELECT queue FROM {schema}.dlq_entries
+                ) queues
+            ),
+            ready AS (
+                SELECT
+                    queue,
+                    count(*)::bigint AS available,
+                    EXTRACT(EPOCH FROM clock_timestamp() - min(created_at))::double precision
+                        AS lag_seconds
+                FROM {schema}.ready_entries
+                GROUP BY queue
+            ),
+            leases AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                    count(*) FILTER (WHERE state = 'waiting_external')::bigint
+                        AS waiting_external
+                FROM {schema}.leases
+                GROUP BY queue
+            ),
+            deferred AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
+                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+                FROM {schema}.deferred_jobs
+                GROUP BY queue
+            ),
+            terminal AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'failed')::bigint AS failed_done
+                FROM {schema}.done_entries
+                GROUP BY queue
+            ),
+            dlq AS (
+                SELECT
+                    queue,
+                    count(*)::bigint AS failed_dlq
+                FROM {schema}.dlq_entries
+                GROUP BY queue
+            )
+            SELECT
+                queues.queue,
+                COALESCE(ready.available, 0)::bigint AS available,
+                COALESCE(leases.running, 0)::bigint AS running,
+                COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
+                COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
+                COALESCE(deferred.retryable, 0)::bigint AS retryable,
+                COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
+                COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
+                ready.lag_seconds
+            FROM queues
+            LEFT JOIN ready
+              ON ready.queue = queues.queue
+            LEFT JOIN leases
+              ON leases.queue = queues.queue
+            LEFT JOIN deferred
+              ON deferred.queue = queues.queue
+            LEFT JOIN terminal
+              ON terminal.queue = queues.queue
+            LEFT JOIN dlq
+              ON dlq.queue = queues.queue
+            ORDER BY queues.queue
             "#
-        ))
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(queues) => queues,
-            Err(err) => {
-                tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
-                return;
-            }
-        };
-
-        for queue in &queues {
-            let available: i64 = match sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1"
             ))
-            .bind(queue)
-            .fetch_one(&self.pool)
+            .fetch_all(&self.pool)
             .await
             {
-                Ok(count) => count,
+                Ok(rows) => rows,
                 Err(err) => {
-                    tracing::warn!(queue, error = %err, "Failed to count ready queue depth");
-                    continue;
+                    tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
+                    return;
                 }
             };
-            let running: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1 AND state = 'running'"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-            let waiting_external: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1 AND state = 'waiting_external'"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-            let scheduled: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE queue = $1 AND state = 'scheduled'"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-            let retryable: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE queue = $1 AND state = 'retryable'"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-            let failed_done: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1 AND state = 'failed'"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-            let failed_dlq: i64 = sqlx::query_scalar(&format!(
-                "SELECT count(*)::bigint FROM {schema}.dlq_entries WHERE queue = $1"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(0);
-            let lag_seconds: Option<f64> = sqlx::query_scalar(&format!(
-                "SELECT EXTRACT(EPOCH FROM clock_timestamp() - min(created_at))::double precision FROM {schema}.ready_entries WHERE queue = $1"
-            ))
-            .bind(queue)
-            .fetch_one(&self.pool)
-            .await
-            .unwrap_or(None);
 
+        for (
+            queue,
+            available,
+            running,
+            waiting_external,
+            scheduled,
+            retryable,
+            failed_done,
+            failed_dlq,
+            lag_seconds,
+        ) in rows
+        {
             self.metrics
-                .record_queue_depth(queue, "available", available);
-            self.metrics.record_queue_depth(queue, "running", running);
+                .record_queue_depth(&queue, "available", available);
+            self.metrics.record_queue_depth(&queue, "running", running);
             self.metrics
-                .record_queue_depth(queue, "failed", failed_done + failed_dlq);
+                .record_queue_depth(&queue, "failed", failed_done + failed_dlq);
             self.metrics
-                .record_queue_depth(queue, "scheduled", scheduled);
+                .record_queue_depth(&queue, "scheduled", scheduled);
             self.metrics
-                .record_queue_depth(queue, "retryable", retryable);
+                .record_queue_depth(&queue, "retryable", retryable);
             self.metrics
-                .record_queue_depth(queue, "waiting_external", waiting_external);
-            self.metrics.record_dlq_depth(queue, failed_dlq);
+                .record_queue_depth(&queue, "waiting_external", waiting_external);
+            self.metrics.record_dlq_depth(&queue, failed_dlq);
 
             if let Some(lag_seconds) = lag_seconds {
-                self.metrics.record_queue_lag(queue, lag_seconds);
+                self.metrics.record_queue_lag(&queue, lag_seconds);
             }
         }
     }
