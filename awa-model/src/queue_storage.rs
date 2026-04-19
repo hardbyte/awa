@@ -3159,10 +3159,12 @@ impl QueueStorage {
         })
     }
 
-    pub async fn retry_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+    async fn retry_job_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-
         let deleted_waiting: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -3193,7 +3195,7 @@ impl QueueStorage {
 
         if !deleted_waiting.is_empty() {
             let waiting = self
-                .hydrate_deleted_leases_tx(&mut tx, deleted_waiting)
+                .hydrate_deleted_leases_tx(tx, deleted_waiting)
                 .await?
                 .into_iter()
                 .next()
@@ -3209,17 +3211,12 @@ impl QueueStorage {
                 attempted_at: None,
                 ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
             };
-            self.insert_existing_ready_rows_tx(
-                &mut tx,
-                vec![ready_row.clone()],
-                Some(waiting.state),
-            )
-            .await?;
-            self.adjust_lane_counts(&mut tx, &waiting.queue, waiting.priority, 0, 0, 0)
+            self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(waiting.state))
                 .await?;
-            self.notify_queues_tx(&mut tx, std::iter::once(waiting.queue.clone()))
+            self.adjust_lane_counts(tx, &waiting.queue, waiting.priority, 0, 0, 0)
                 .await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
+            self.notify_queues_tx(tx, std::iter::once(waiting.queue.clone()))
+                .await?;
             return Ok(Some(
                 ReadyJobRow {
                     job_id: ready_row.job_id,
@@ -3296,17 +3293,12 @@ impl QueueStorage {
                 unique_states: terminal.unique_states,
                 payload: terminal.payload,
             };
-            self.insert_existing_ready_rows_tx(
-                &mut tx,
-                vec![ready_row.clone()],
-                Some(terminal.state),
-            )
-            .await?;
-            self.adjust_lane_counts(&mut tx, &terminal.queue, terminal.priority, 0, 0, 0)
+            self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(terminal.state))
                 .await?;
-            self.notify_queues_tx(&mut tx, std::iter::once(terminal.queue.clone()))
+            self.adjust_lane_counts(tx, &terminal.queue, terminal.priority, 0, 0, 0)
                 .await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
+            self.notify_queues_tx(tx, std::iter::once(terminal.queue.clone()))
+                .await?;
             return Ok(Some(
                 ReadyJobRow {
                     job_id: ready_row.job_id,
@@ -3327,14 +3319,42 @@ impl QueueStorage {
             ));
         }
 
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(None)
     }
 
-    pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
+    pub async fn retry_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let row = self.retry_job_tx(&mut tx, job_id).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(row)
+    }
 
+    pub async fn retry_jobs_by_ids(
+        &self,
+        pool: &PgPool,
+        ids: &[i64],
+    ) -> Result<Vec<JobRow>, AwaError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for job_id in ids {
+            if let Some(row) = self.retry_job_tx(&mut tx, *job_id).await? {
+                rows.push(row);
+            }
+        }
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows)
+    }
+
+    async fn cancel_job_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let schema = self.schema();
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.ready_entries
@@ -3384,15 +3404,10 @@ impl QueueStorage {
                 ready
                     .clone()
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
-            self.insert_done_rows_tx(
-                &mut tx,
-                std::slice::from_ref(&done),
-                Some(JobState::Available),
-            )
-            .await?;
-            self.adjust_lane_counts(&mut tx, &ready.queue, ready.priority, -1, 0, 0)
+            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
+            self.adjust_lane_counts(tx, &ready.queue, ready.priority, -1, 0, 0)
+                .await?;
             return Ok(Some(done.into_job_row()?));
         }
 
@@ -3426,7 +3441,7 @@ impl QueueStorage {
 
         if !deleted_lease.is_empty() {
             let lease = self
-                .hydrate_deleted_leases_tx(&mut tx, deleted_lease)
+                .hydrate_deleted_leases_tx(tx, deleted_lease)
                 .await?
                 .into_iter()
                 .next()
@@ -3436,11 +3451,10 @@ impl QueueStorage {
             let done = lease
                 .clone()
                 .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
-            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(lease.state))
+            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
                 .await?;
-            self.adjust_lane_counts(&mut tx, &lease.queue, lease.priority, 0, 0, 0)
+            self.adjust_lane_counts(tx, &lease.queue, lease.priority, 0, 0, 0)
                 .await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Some(done.into_job_row()?));
         }
 
@@ -3474,8 +3488,8 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if let Some(deferred) = deferred {
-            let (ready_slot, ready_generation) = self.current_queue_ring(&mut tx).await?;
-            self.ensure_lane(&mut tx, &deferred.queue, deferred.priority)
+            let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
+            self.ensure_lane(tx, &deferred.queue, deferred.priority)
                 .await?;
             let done = DoneJobRow {
                 ready_slot,
@@ -3498,16 +3512,41 @@ impl QueueStorage {
                 unique_states: deferred.unique_states,
                 payload: deferred.payload,
             };
-            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(deferred.state))
+            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
                 .await?;
-            self.adjust_lane_counts(&mut tx, &done.queue, done.priority, 0, 0, 0)
+            self.adjust_lane_counts(tx, &done.queue, done.priority, 0, 0, 0)
                 .await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Some(done.into_job_row()?));
         }
 
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(None)
+    }
+
+    pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let row = self.cancel_job_tx(&mut tx, job_id).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(row)
+    }
+
+    pub async fn cancel_jobs_by_ids(
+        &self,
+        pool: &PgPool,
+        ids: &[i64],
+    ) -> Result<Vec<JobRow>, AwaError> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for job_id in ids {
+            if let Some(row) = self.cancel_job_tx(&mut tx, *job_id).await? {
+                rows.push(row);
+            }
+        }
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(rows)
     }
 
     pub async fn age_waiting_priorities(

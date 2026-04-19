@@ -583,13 +583,7 @@ pub async fn retry_failed_by_kind(pool: &PgPool, kind: &str) -> Result<Vec<JobRo
             schema = store.schema()
         );
         let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(kind).fetch_all(pool).await?;
-        let mut rows = Vec::new();
-        for job_id in ids {
-            if let Some(row) = store.retry_job(pool, job_id).await? {
-                rows.push(row);
-            }
-        }
-        return Ok(rows);
+        return store.retry_jobs_by_ids(pool, &ids).await;
     }
 
     let rows = sqlx::query_as::<_, JobRow>(
@@ -622,13 +616,7 @@ pub async fn retry_failed_by_queue(pool: &PgPool, queue: &str) -> Result<Vec<Job
             schema = store.schema()
         );
         let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(queue).fetch_all(pool).await?;
-        let mut rows = Vec::new();
-        for job_id in ids {
-            if let Some(row) = store.retry_job(pool, job_id).await? {
-                rows.push(row);
-            }
-        }
-        return Ok(rows);
+        return store.retry_jobs_by_ids(pool, &ids).await;
     }
 
     let rows = sqlx::query_as::<_, JobRow>(
@@ -711,13 +699,10 @@ pub async fn drain_queue(pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
             queue_storage_current_jobs_cte(store.schema())
         );
         let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(queue).fetch_all(pool).await?;
-        let mut cancelled = 0u64;
-        for job_id in ids {
-            if store.cancel_job(pool, job_id).await?.is_some() {
-                cancelled += 1;
-            }
-        }
-        return Ok(cancelled);
+        return store
+            .cancel_jobs_by_ids(pool, &ids)
+            .await
+            .map(|rows| rows.len() as u64);
     }
 
     let result = sqlx::query(
@@ -2487,13 +2472,7 @@ pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
 /// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.
 pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
-        let mut rows = Vec::new();
-        for job_id in ids {
-            if let Some(row) = store.retry_job(pool, *job_id).await? {
-                rows.push(row);
-            }
-        }
-        return Ok(rows);
+        return store.retry_jobs_by_ids(pool, ids).await;
     }
 
     let rows = sqlx::query_as::<_, JobRow>(
@@ -2518,13 +2497,7 @@ pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaEr
 /// Cancel multiple jobs by ID. Only cancels non-terminal jobs.
 pub async fn bulk_cancel(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
     if let Some(store) = active_queue_storage(pool).await? {
-        let mut rows = Vec::new();
-        for job_id in ids {
-            if let Some(row) = store.cancel_job(pool, *job_id).await? {
-                rows.push(row);
-            }
-        }
-        return Ok(rows);
+        return store.cancel_jobs_by_ids(pool, ids).await;
     }
 
     let rows = sqlx::query_as::<_, JobRow>(

@@ -319,6 +319,17 @@ fn failed_unique_insert_opts(queue: &str) -> InsertOpts {
     }
 }
 
+fn available_unique_insert_opts(queue: &str) -> InsertOpts {
+    InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(awa::UniqueOpts {
+            states: 1 << JobState::Available.bit_position(),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct RetryJob {
     id: i64,
@@ -1575,6 +1586,148 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
         dlq_entry.is_some(),
         "DLQ row should survive the failed retry"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_admin_bulk_retry_atomic";
+    let schema = "awa_qs_admin_bulk_retry_atomic";
+    let store = create_store(&pool, schema).await;
+    let opts = available_unique_insert_opts(queue);
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        TerminalFailureWorker,
+    );
+    client
+        .start()
+        .await
+        .expect("Failed to start bulk-retry atomicity client");
+
+    let first_id = enqueue_job(&pool, &store, &DlqJob { id: 91 }, opts.clone()).await;
+    let first_failed = wait_for_job_state(
+        &store,
+        &pool,
+        first_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(first_failed.state, JobState::Failed);
+
+    let second_id = enqueue_job(&pool, &store, &DlqJob { id: 91 }, opts).await;
+    let second_failed = wait_for_job_state(
+        &store,
+        &pool,
+        second_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(second_failed.state, JobState::Failed);
+    client.shutdown(Duration::from_secs(5)).await;
+
+    let retry_err = admin::bulk_retry(&pool, &[first_id, second_id])
+        .await
+        .expect_err("bulk_retry must fail atomically on unique conflict");
+    assert!(matches!(retry_err, AwaError::UniqueConflict { .. }));
+
+    let first_after = store
+        .load_job(&pool, first_id)
+        .await
+        .expect("Failed to reload first failed job")
+        .expect("First failed job missing after retry rollback");
+    let second_after = store
+        .load_job(&pool, second_id)
+        .await
+        .expect("Failed to reload second failed job")
+        .expect("Second failed job missing after retry rollback");
+    assert_eq!(first_after.state, JobState::Failed);
+    assert_eq!(second_after.state, JobState::Failed);
+    assert_eq!(failed_done_count(&pool, &store, queue).await, 2);
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("Failed to sample queue counts after retry rollback")
+            .available,
+        0
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conflict() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_admin_retry_kind_atomic";
+    let schema = "awa_qs_admin_retry_kind_atomic";
+    let store = create_store(&pool, schema).await;
+    let opts = available_unique_insert_opts(queue);
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        },
+        TerminalFailureWorker,
+    );
+    client
+        .start()
+        .await
+        .expect("Failed to start retry-by-kind atomicity client");
+
+    let first_id = enqueue_job(&pool, &store, &DlqJob { id: 92 }, opts.clone()).await;
+    let first_failed = wait_for_job_state(
+        &store,
+        &pool,
+        first_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(first_failed.state, JobState::Failed);
+
+    let second_id = enqueue_job(&pool, &store, &DlqJob { id: 92 }, opts).await;
+    let second_failed = wait_for_job_state(
+        &store,
+        &pool,
+        second_id,
+        &[JobState::Failed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(second_failed.state, JobState::Failed);
+    client.shutdown(Duration::from_secs(5)).await;
+
+    let retry_err = admin::retry_failed_by_kind(&pool, TerminalFailureWorker.kind())
+        .await
+        .expect_err("retry_failed_by_kind must fail atomically on unique conflict");
+    assert!(matches!(retry_err, AwaError::UniqueConflict { .. }));
+
+    let first_after = store
+        .load_job(&pool, first_id)
+        .await
+        .expect("Failed to reload first failed job")
+        .expect("First failed job missing after retry rollback");
+    let second_after = store
+        .load_job(&pool, second_id)
+        .await
+        .expect("Failed to reload second failed job")
+        .expect("Second failed job missing after retry rollback");
+    assert_eq!(first_after.state, JobState::Failed);
+    assert_eq!(second_after.state, JobState::Failed);
+    assert_eq!(failed_done_count(&pool, &store, queue).await, 2);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
