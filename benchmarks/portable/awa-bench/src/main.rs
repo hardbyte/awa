@@ -303,7 +303,6 @@ async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
     let pool = create_pool(20).await;
     let (_store, _config) = prepare_queue_storage(&pool).await;
     let queue = "awa_enqueue_bench";
-    clean_queue(&pool, queue).await;
 
     let start = Instant::now();
     enqueue_batch(&pool, queue, job_count, true).await;
@@ -328,7 +327,6 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
     let pool = create_pool(20).await;
     let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_worker_bench";
-    clean_queue(&pool, queue).await;
 
     // Pre-enqueue all jobs
     enqueue_batch(&pool, queue, job_count, true).await;
@@ -365,7 +363,6 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
     let pool = create_pool(20).await;
     let (store, config) = prepare_queue_storage(&pool).await;
     let queue = "awa_latency_bench";
-    clean_queue(&pool, queue).await;
 
     let client = build_client(pool.clone(), queue, worker_count, config);
     client.start().await.expect("Failed to start client");
@@ -388,6 +385,9 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
         .await
         .unwrap();
 
+        // Observe cumulative completed count instead of polling one job row.
+        // Queue-storage prune can rotate completed rows away, but queue_counts()
+        // preserves the terminal rollup.
         wait_for_completion(&store, &pool, queue, i + 1, Duration::from_secs(10)).await;
         latencies_us.push(insert_time.elapsed().as_micros() as u64);
     }

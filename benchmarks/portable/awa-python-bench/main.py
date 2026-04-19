@@ -216,22 +216,6 @@ async def wait_for_completion(
         await asyncio.sleep(0.05)
 
 
-async def wait_for_job_completion(
-    c: awa.AsyncClient, queue: str, job_id: int, timeout_secs: float, schema: str
-) -> None:
-    deadline = asyncio.get_running_loop().time() + timeout_secs
-    while True:
-        job = await c.get_job(job_id)
-        if job.state == awa.JobState.Completed:
-            return
-        if asyncio.get_running_loop().time() >= deadline:
-            counts = await count_by_state(c, queue, schema)
-            raise TimeoutError(
-                f"Timeout waiting for job {job_id} completion on {queue}: {counts}"
-            )
-        await asyncio.sleep(0.025)
-
-
 async def enqueue_batch(c: awa.AsyncClient, queue: str, count: int) -> None:
     batch_size = 500
     for batch_start in range(0, count, batch_size):
@@ -326,6 +310,9 @@ async def scenario_pickup_latency(iterations: int, worker_count: int) -> dict:
     for i in range(iterations):
         start = asyncio.get_running_loop().time()
         await c.insert(BenchJob(seq=i), queue=queue)
+        # Queue-storage prune can rotate individual completed rows away;
+        # waiting on the cumulative completion count keeps the benchmark
+        # semantics stable while avoiding per-job races.
         await wait_for_completion(c, queue, i + 1, 10, schema)
         latencies_us.append(
             round((asyncio.get_running_loop().time() - start) * 1_000_000)
