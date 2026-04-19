@@ -1402,7 +1402,7 @@ async fn test_e19_wait_for_callback_happy_path() {
         let progress = Arc::new(std::sync::Mutex::new(
             awa_worker::context::ProgressState::new(claimed.progress.clone()),
         ));
-        let ctx = JobContext::new(claimed, cancel, state, pool, progress);
+        let ctx = JobContext::new_for_testing(claimed, cancel, state, pool, progress);
         worker.perform(&ctx).await
     });
 
@@ -1502,7 +1502,7 @@ async fn test_e19b_wait_for_callback_handles_early_resume() {
         let progress = Arc::new(std::sync::Mutex::new(
             awa_worker::context::ProgressState::new(claimed.progress.clone()),
         ));
-        let ctx = JobContext::new(claimed, cancel, state, pool, progress);
+        let ctx = JobContext::new_for_testing(claimed, cancel, state, pool, progress);
         worker.perform(&ctx).await
     });
 
@@ -1597,7 +1597,7 @@ async fn test_e19c_wait_for_callback_rejects_stale_token() {
         let progress = Arc::new(std::sync::Mutex::new(
             awa_worker::context::ProgressState::new(claimed.progress.clone()),
         ));
-        let ctx = JobContext::new(claimed, cancel, state, pool, progress);
+        let ctx = JobContext::new_for_testing(claimed, cancel, state, pool, progress);
         worker.perform(&ctx).await
     });
 

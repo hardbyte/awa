@@ -1,8 +1,8 @@
-//! Benchmark and smoke tests for the experimental vacuum-aware storage engine.
+//! Benchmark and smoke tests for the experimental queue storage storage engine.
 
 mod bench_output;
 
-use awa::model::{AwaError, PruneOutcome, RotateOutcome, VacuumAwareConfig, VacuumAwareStore};
+use awa::model::{AwaError, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome};
 use bench_output::{BenchLatency, BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use serde::Serialize;
 use sqlx::postgres::PgPoolOptions;
@@ -43,7 +43,7 @@ fn env_string(name: &str, default: &str) -> String {
 }
 
 #[derive(Debug, Clone, Serialize)]
-struct VacuumAwareSample {
+struct QueueStorageSample {
     second: u64,
     seeded_total: u64,
     completed_total: u64,
@@ -64,7 +64,7 @@ struct VacuumAwareSample {
 }
 
 #[derive(Debug, Clone)]
-struct VacuumAwareSnapshot {
+struct QueueStorageSnapshot {
     available: i64,
     running: i64,
     completed: i64,
@@ -102,12 +102,12 @@ async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
         .await;
 }
 
-async fn recreate_store_schema(pool: &sqlx::PgPool, store: &VacuumAwareStore) {
+async fn recreate_store_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
     sqlx::query(&drop_sql)
         .execute(pool)
         .await
-        .expect("Failed to drop experimental vacuum-aware schema");
+        .expect("Failed to drop experimental queue storage schema");
 }
 
 async fn sample_dead_tuples(
@@ -160,7 +160,7 @@ async fn sample_pgstattuple_dead_tuples(
 
 async fn sample_exact_dead_tuples(
     pool: &sqlx::PgPool,
-    store: &VacuumAwareStore,
+    store: &QueueStorage,
 ) -> Option<ExactDeadTuples> {
     Some(ExactDeadTuples {
         queue_lanes: sample_pgstattuple_dead_tuples(pool, store.schema(), "queue_lanes").await?,
@@ -172,9 +172,9 @@ async fn sample_exact_dead_tuples(
 
 async fn sample_snapshot(
     pool: &sqlx::PgPool,
-    store: &VacuumAwareStore,
+    store: &QueueStorage,
     queue: &str,
-) -> VacuumAwareSnapshot {
+) -> QueueStorageSnapshot {
     let mut conn = pool
         .acquire()
         .await
@@ -197,7 +197,7 @@ async fn sample_snapshot(
     let done_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "done_entries_%").await;
     let leases_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "leases_%").await;
 
-    VacuumAwareSnapshot {
+    QueueStorageSnapshot {
         available: counts.available,
         running: counts.running,
         completed: counts.completed,
@@ -230,7 +230,7 @@ async fn wait_or_stop(duration: Duration, stop: &mut tokio::sync::watch::Receive
 
 async fn producer_loop(
     pool: sqlx::PgPool,
-    store: Arc<VacuumAwareStore>,
+    store: Arc<QueueStorage>,
     queue: String,
     priority: i16,
     jobs_per_sec: u64,
@@ -269,7 +269,7 @@ async fn producer_loop(
 
 async fn consumer_loop(
     pool: sqlx::PgPool,
-    store: Arc<VacuumAwareStore>,
+    store: Arc<QueueStorage>,
     queue: String,
     batch_size: i64,
     claim_latencies_ms: Arc<Mutex<Vec<f64>>>,
@@ -314,7 +314,7 @@ async fn consumer_loop(
 
 async fn maintenance_loop(
     pool: sqlx::PgPool,
-    store: Arc<VacuumAwareStore>,
+    store: Arc<QueueStorage>,
     queue_rotate_interval: Duration,
     lease_rotate_interval: Duration,
     vacuum_interval: Option<Duration>,
@@ -480,7 +480,7 @@ async fn overlap_reader(
     }
 }
 
-fn average_completed_rate(samples: &[VacuumAwareSample]) -> f64 {
+fn average_completed_rate(samples: &[QueueStorageSample]) -> f64 {
     if samples.is_empty() {
         0.0
     } else {
@@ -493,10 +493,10 @@ fn average_completed_rate(samples: &[VacuumAwareSample]) -> f64 {
 }
 
 #[tokio::test]
-async fn test_vacuum_aware_round_trip_smoke() {
+async fn test_queue_storage_round_trip_smoke() {
     let pool = pool_with(12).await;
-    let store = VacuumAwareStore::new(VacuumAwareConfig::default())
-        .expect("Failed to construct vacuum-aware store");
+    let store = QueueStorage::new(QueueStorageConfig::default())
+        .expect("Failed to construct queue storage store");
     recreate_store_schema(&pool, &store).await;
     store.install(&pool).await.expect("Failed to install store");
     store.reset(&pool).await.expect("Failed to reset store");
@@ -572,7 +572,7 @@ async fn test_vacuum_aware_round_trip_smoke() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
 #[ignore]
-async fn test_vacuum_aware_storage_benchmark() {
+async fn test_queue_storage_storage_benchmark() {
     let max_conns = env_u32("AWA_VA_POOL_MAX", 24);
     let pool = pool_with(max_conns).await;
     ensure_pgstattuple(&pool).await;
@@ -580,20 +580,20 @@ async fn test_vacuum_aware_storage_benchmark() {
     let queue_slot_count = env_u32("AWA_VA_QUEUE_SLOT_COUNT", env_u32("AWA_VA_SLOT_COUNT", 16));
     let lease_slot_count = env_u32("AWA_VA_LEASE_SLOT_COUNT", 8);
     let store = Arc::new(
-        VacuumAwareStore::new(VacuumAwareConfig {
+        QueueStorage::new(QueueStorageConfig {
             queue_slot_count: queue_slot_count as usize,
             lease_slot_count: lease_slot_count as usize,
             ..Default::default()
         })
-        .expect("Failed to construct vacuum-aware benchmark store"),
+        .expect("Failed to construct queue storage benchmark store"),
     );
     recreate_store_schema(&pool, &store).await;
     store
         .install(&pool)
         .await
-        .expect("Failed to install vacuum-aware store");
+        .expect("Failed to install queue storage store");
 
-    let queue = env_string("AWA_VA_QUEUE", "bench_vacuum_aware");
+    let queue = env_string("AWA_VA_QUEUE", "bench_queue_storage");
     let priority = env_u32("AWA_VA_PRIORITY", 2) as i16;
     let producer_rate = env_u64("AWA_VA_ENQUEUE_RATE", 4_000);
     let producer_tick_ms = env_u64("AWA_VA_PRODUCER_TICK_MS", 50);
@@ -621,7 +621,7 @@ async fn test_vacuum_aware_storage_benchmark() {
     store
         .reset(&pool)
         .await
-        .expect("Failed to reset vacuum-aware benchmark store");
+        .expect("Failed to reset queue storage benchmark store");
 
     let seeded = Arc::new(AtomicU64::new(0));
     let completed = Arc::new(AtomicU64::new(0));
@@ -693,7 +693,7 @@ async fn test_vacuum_aware_storage_benchmark() {
         let completed_delta = completed_total.saturating_sub(previous_completed);
         previous_completed = completed_total;
 
-        let sample = VacuumAwareSample {
+        let sample = QueueStorageSample {
             second,
             seeded_total: seeded.load(Ordering::Relaxed),
             completed_total,
@@ -722,7 +722,7 @@ async fn test_vacuum_aware_storage_benchmark() {
         };
 
         println!(
-            "[vacuum-aware] second={:>2} seeded={} completed={} (+{}) available={} running={} dead(q_lanes/ready/done/leases)={}/{}/{}/{} queue_prune_ok={} queue_prune_blocked={} lease_prune_ok={} lease_prune_blocked={}",
+            "[queue storage] second={:>2} seeded={} completed={} (+{}) available={} running={} dead(q_lanes/ready/done/leases)={}/{}/{}/{} queue_prune_ok={} queue_prune_blocked={} lease_prune_ok={} lease_prune_blocked={}",
             sample.second,
             sample.seeded_total,
             sample.completed_total,
@@ -798,7 +798,7 @@ async fn test_vacuum_aware_storage_benchmark() {
     let p99 = percentile(&claim_latencies, 0.99);
 
     println!(
-        "[vacuum-aware] baseline={baseline_rate:.0}/s overlap={overlap_rate:.0}/s cooldown={cooldown_rate:.0}/s max_dead={} final_dead={} queue_prune_ok={} queue_prune_blocked={} queue_rotate_ok={} queue_rotate_skipped_busy={} lease_prune_ok={} lease_prune_blocked={} lease_rotate_ok={} lease_rotate_skipped_busy={}",
+        "[queue storage] baseline={baseline_rate:.0}/s overlap={overlap_rate:.0}/s cooldown={cooldown_rate:.0}/s max_dead={} final_dead={} queue_prune_ok={} queue_prune_blocked={} queue_rotate_ok={} queue_rotate_skipped_busy={} lease_prune_ok={} lease_prune_blocked={} lease_rotate_ok={} lease_rotate_skipped_busy={}",
         max_total_dead_tup,
         final_total_dead_tup,
         maintenance_counters.queue_prune_ok.load(Ordering::Relaxed),
@@ -817,14 +817,14 @@ async fn test_vacuum_aware_storage_benchmark() {
             .load(Ordering::Relaxed),
     );
     println!(
-        "[vacuum-aware] claim_latency_ms p50={:.3} p95={:.3} p99={:.3}",
+        "[queue storage] claim_latency_ms p50={:.3} p95={:.3} p99={:.3}",
         p50.unwrap_or(0.0),
         p95.unwrap_or(0.0),
         p99.unwrap_or(0.0),
     );
     if let Some(exact) = final_exact_dead {
         println!(
-            "[vacuum-aware] exact_dead_tuples queue_lanes={} ready={} done={} leases={} total={}",
+            "[queue storage] exact_dead_tuples queue_lanes={} ready={} done={} leases={} total={}",
             exact.queue_lanes,
             exact.ready,
             exact.done,
@@ -832,7 +832,7 @@ async fn test_vacuum_aware_storage_benchmark() {
             exact.queue_lanes + exact.ready + exact.done + exact.leases,
         );
     } else {
-        println!("[vacuum-aware] exact_dead_tuples unavailable");
+        println!("[queue storage] exact_dead_tuples unavailable");
     }
 
     let mut outcomes = HashMap::new();
@@ -842,7 +842,7 @@ async fn test_vacuum_aware_storage_benchmark() {
 
     BenchmarkResult {
         schema_version: SCHEMA_VERSION,
-        scenario: format!("vacuum_aware_{}", reader_mode),
+        scenario: format!("queue_storage_{}", reader_mode),
         language: "rust".to_string(),
         seeded: seeded.load(Ordering::Relaxed),
         metrics: BenchMetrics {
@@ -857,7 +857,7 @@ async fn test_vacuum_aware_storage_benchmark() {
         },
         outcomes,
         metadata: Some(serde_json::json!({
-            "profile": "vacuum_aware_storage",
+            "profile": "queue_storage_storage",
             "queue": queue,
             "priority": priority,
             "queue_slot_count": store.queue_slot_count(),
@@ -905,6 +905,6 @@ async fn test_vacuum_aware_storage_benchmark() {
 #[allow(dead_code)]
 fn _assert_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
-    assert_send_sync::<VacuumAwareStore>();
+    assert_send_sync::<QueueStorage>();
     assert_send_sync::<AwaError>();
 }

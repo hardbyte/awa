@@ -1,4 +1,5 @@
 pub use crate::runtime::ProgressState;
+use crate::storage::RuntimeStorage;
 use awa_model::{AwaError, CallbackConfig, JobRow};
 use sqlx::PgPool;
 use std::any::Any;
@@ -50,16 +51,19 @@ pub struct JobContext {
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
     /// Database pool for callback registration and progress flush.
     pool: PgPool,
+    /// Active runtime storage backend.
+    storage: RuntimeStorage,
     /// Shared progress buffer — written by handler, read by heartbeat service.
     progress: Arc<std::sync::Mutex<ProgressState>>,
 }
 
 impl JobContext {
-    pub fn new(
+    pub(crate) fn new(
         job: JobRow,
         cancelled: Arc<AtomicBool>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
         pool: PgPool,
+        storage: RuntimeStorage,
         progress: Arc<std::sync::Mutex<ProgressState>>,
     ) -> Self {
         Self {
@@ -67,8 +71,27 @@ impl JobContext {
             cancelled,
             state,
             pool,
+            storage,
             progress,
         }
+    }
+
+    #[doc(hidden)]
+    pub fn new_for_testing(
+        job: JobRow,
+        cancelled: Arc<AtomicBool>,
+        state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
+        pool: PgPool,
+        progress: Arc<std::sync::Mutex<ProgressState>>,
+    ) -> Self {
+        Self::new(
+            job,
+            cancelled,
+            state,
+            pool,
+            RuntimeStorage::Canonical,
+            progress,
+        )
     }
 
     /// Check if this job's execution has been cancelled (shutdown or deadline).
@@ -123,13 +146,23 @@ impl JobContext {
     /// Returns a `CallbackGuard` whose `id` should be included in the URL or
     /// payload sent to the external system.
     pub async fn register_callback(&self, timeout: Duration) -> Result<CallbackGuard, AwaError> {
-        let callback_id = awa_model::admin::register_callback(
-            &self.pool,
-            self.job.id,
-            self.job.run_lease,
-            timeout,
-        )
-        .await?;
+        let callback_id = match &self.storage {
+            RuntimeStorage::Canonical => {
+                awa_model::admin::register_callback(
+                    &self.pool,
+                    self.job.id,
+                    self.job.run_lease,
+                    timeout,
+                )
+                .await?
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime
+                    .store
+                    .register_callback(&self.pool, self.job.id, self.job.run_lease, timeout)
+                    .await?
+            }
+        };
         Ok(CallbackGuard::new(callback_id))
     }
 
@@ -141,14 +174,30 @@ impl JobContext {
         timeout: Duration,
         config: &CallbackConfig,
     ) -> Result<CallbackGuard, AwaError> {
-        let callback_id = awa_model::admin::register_callback_with_config(
-            &self.pool,
-            self.job.id,
-            self.job.run_lease,
-            timeout,
-            config,
-        )
-        .await?;
+        let callback_id = match &self.storage {
+            RuntimeStorage::Canonical => {
+                awa_model::admin::register_callback_with_config(
+                    &self.pool,
+                    self.job.id,
+                    self.job.run_lease,
+                    timeout,
+                    config,
+                )
+                .await?
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime
+                    .store
+                    .register_callback_with_config(
+                        &self.pool,
+                        self.job.id,
+                        self.job.run_lease,
+                        timeout,
+                        config,
+                    )
+                    .await?
+            }
+        };
         Ok(CallbackGuard::new(callback_id))
     }
 
@@ -177,17 +226,45 @@ impl JobContext {
         &self,
         guard: CallbackGuard,
     ) -> Result<serde_json::Value, AwaError> {
-        use awa_model::admin::{check_callback_state, enter_callback_wait, CallbackPollResult};
+        use awa_model::admin::CallbackPollResult;
 
         let callback_id = guard.id();
 
-        // Transition to waiting_external
-        let entered =
-            enter_callback_wait(&self.pool, self.job.id, self.job.run_lease, callback_id).await?;
+        let entered = match &self.storage {
+            RuntimeStorage::Canonical => {
+                awa_model::admin::enter_callback_wait(
+                    &self.pool,
+                    self.job.id,
+                    self.job.run_lease,
+                    callback_id,
+                )
+                .await?
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime
+                    .store
+                    .enter_callback_wait(&self.pool, self.job.id, self.job.run_lease, callback_id)
+                    .await?
+            }
+        };
+
+        let check_state = || async {
+            match &self.storage {
+                RuntimeStorage::Canonical => {
+                    awa_model::admin::check_callback_state(&self.pool, self.job.id, callback_id)
+                        .await
+                }
+                RuntimeStorage::QueueStorage(runtime) => {
+                    runtime
+                        .store
+                        .check_callback_state(&self.pool, self.job.id, callback_id)
+                        .await
+                }
+            }
+        };
 
         if !entered {
-            // The UPDATE didn't match — check for early-resume race.
-            match check_callback_state(&self.pool, self.job.id, callback_id).await? {
+            match check_state().await? {
                 CallbackPollResult::Resolved(payload) => return Ok(payload),
                 CallbackPollResult::Pending => { /* Already in waiting_external */ }
                 CallbackPollResult::Stale {
@@ -212,8 +289,6 @@ impl JobContext {
             }
         }
 
-        // Poll DB until the callback is resolved (state changes from waiting_external).
-        // resume_external sets state to 'running' and stores payload in metadata.
         loop {
             if self.is_cancelled() {
                 return Err(AwaError::Validation(
@@ -221,7 +296,7 @@ impl JobContext {
                 ));
             }
 
-            match check_callback_state(&self.pool, self.job.id, callback_id).await? {
+            match check_state().await? {
                 CallbackPollResult::Resolved(payload) => return Ok(payload),
                 CallbackPollResult::Pending => {
                     tokio::time::sleep(Duration::from_millis(200)).await;
@@ -288,22 +363,36 @@ impl JobContext {
             }
         };
 
-        let result = sqlx::query(
-            r#"
-            UPDATE awa.jobs_hot
-            SET progress = $2
-            WHERE id = $1 AND state = 'running' AND run_lease = $3
-            "#,
-        )
-        .bind(self.job.id)
-        .bind(&snapshot)
-        .bind(self.job.run_lease)
-        .execute(&self.pool)
-        .await?;
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE awa.jobs_hot
+                    SET progress = $2
+                    WHERE id = $1 AND state = 'running' AND run_lease = $3
+                    "#,
+                )
+                .bind(self.job.id)
+                .bind(&snapshot)
+                .bind(self.job.run_lease)
+                .execute(&self.pool)
+                .await?;
 
-        if result.rows_affected() == 0 {
-            // Job was rescued/cancelled — not an error for the caller
-            return Ok(());
+                if result.rows_affected() == 0 {
+                    return Ok(());
+                }
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime
+                    .store
+                    .flush_progress(
+                        &self.pool,
+                        self.job.id,
+                        self.job.run_lease,
+                        snapshot.clone(),
+                    )
+                    .await?;
+            }
         }
 
         let mut guard = self.progress.lock().expect("progress lock poisoned");
