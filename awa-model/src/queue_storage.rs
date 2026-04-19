@@ -270,6 +270,58 @@ impl ReadyJobRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+struct ReadyTransitionRow {
+    ready_slot: i32,
+    ready_generation: i64,
+    job_id: i64,
+    kind: String,
+    queue: String,
+    args: serde_json::Value,
+    priority: i16,
+    attempt: i16,
+    run_lease: i64,
+    max_attempts: i16,
+    lane_seq: i64,
+    run_at: DateTime<Utc>,
+    attempted_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+    payload: serde_json::Value,
+}
+
+impl ReadyTransitionRow {
+    fn into_done_row(
+        self,
+        state: JobState,
+        finalized_at: DateTime<Utc>,
+        payload: serde_json::Value,
+    ) -> DoneJobRow {
+        DoneJobRow {
+            ready_slot: self.ready_slot,
+            ready_generation: self.ready_generation,
+            job_id: self.job_id,
+            kind: self.kind,
+            queue: self.queue,
+            args: self.args,
+            state,
+            priority: self.priority,
+            attempt: self.attempt,
+            run_lease: self.run_lease,
+            max_attempts: self.max_attempts,
+            lane_seq: self.lane_seq,
+            run_at: self.run_at,
+            attempted_at: self.attempted_at,
+            finalized_at,
+            created_at: self.created_at,
+            unique_key: self.unique_key,
+            unique_states: self.unique_states,
+            payload,
+        }
+    }
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
 struct ReadyJobLeaseRow {
     job_id: i64,
     kind: String,
@@ -280,6 +332,8 @@ struct ReadyJobLeaseRow {
     run_lease: i64,
     max_attempts: i16,
     run_at: DateTime<Utc>,
+    heartbeat_at: Option<DateTime<Utc>>,
+    deadline_at: Option<DateTime<Utc>>,
     attempted_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     unique_key: Option<Vec<u8>>,
@@ -288,14 +342,8 @@ struct ReadyJobLeaseRow {
 }
 
 impl ReadyJobLeaseRow {
-    fn into_job_row(self, deadline_duration: Duration) -> Result<JobRow, AwaError> {
+    fn into_job_row(self) -> Result<JobRow, AwaError> {
         let payload = RuntimePayload::from_json(self.payload)?;
-        let deadline_delta = chrono::Duration::from_std(deadline_duration).map_err(|err| {
-            AwaError::Validation(format!(
-                "invalid queue storage deadline duration for claimed job {}: {err}",
-                self.job_id
-            ))
-        })?;
 
         Ok(JobRow {
             id: self.job_id,
@@ -308,8 +356,8 @@ impl ReadyJobLeaseRow {
             run_lease: self.run_lease,
             max_attempts: self.max_attempts,
             run_at: self.run_at,
-            heartbeat_at: self.attempted_at,
-            deadline_at: self.attempted_at.map(|ts| ts + deadline_delta),
+            heartbeat_at: self.heartbeat_at,
+            deadline_at: self.deadline_at,
             attempted_at: self.attempted_at,
             finalized_at: None,
             created_at: self.created_at,
@@ -576,6 +624,54 @@ struct ExistingReadyRow {
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
+struct DeletedLeaseRow {
+    ready_slot: i32,
+    ready_generation: i64,
+    job_id: i64,
+    queue: String,
+    state: JobState,
+    priority: i16,
+    attempt: i16,
+    run_lease: i64,
+    max_attempts: i16,
+    lane_seq: i64,
+    heartbeat_at: Option<DateTime<Utc>>,
+    deadline_at: Option<DateTime<Utc>>,
+    attempted_at: Option<DateTime<Utc>>,
+    callback_id: Option<Uuid>,
+    callback_timeout_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct ReadySnapshotRow {
+    ready_slot: i32,
+    ready_generation: i64,
+    job_id: i64,
+    kind: String,
+    queue: String,
+    args: serde_json::Value,
+    priority: i16,
+    lane_seq: i64,
+    run_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
+    payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct AttemptStateRow {
+    job_id: i64,
+    run_lease: i64,
+    progress: Option<serde_json::Value>,
+    callback_filter: Option<String>,
+    callback_on_complete: Option<String>,
+    callback_on_fail: Option<String>,
+    callback_transform: Option<String>,
+    callback_result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone)]
 struct LeaseTransitionRow {
     ready_slot: i32,
     ready_generation: i64,
@@ -590,12 +686,17 @@ struct LeaseTransitionRow {
     max_attempts: i16,
     lane_seq: i64,
     run_at: DateTime<Utc>,
+    heartbeat_at: Option<DateTime<Utc>>,
+    deadline_at: Option<DateTime<Utc>>,
     attempted_at: Option<DateTime<Utc>>,
+    callback_id: Option<Uuid>,
+    callback_timeout_at: Option<DateTime<Utc>>,
     finalized_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+    progress: Option<serde_json::Value>,
 }
 
 impl LeaseTransitionRow {
@@ -734,11 +835,17 @@ struct LeaseJobRow {
     callback_on_fail: Option<String>,
     callback_transform: Option<String>,
     payload: serde_json::Value,
+    progress: Option<serde_json::Value>,
+    callback_result: Option<serde_json::Value>,
 }
 
 impl LeaseJobRow {
     fn into_job_row(self) -> Result<JobRow, AwaError> {
-        let payload = RuntimePayload::from_json(self.payload)?;
+        let payload = QueueStorage::materialize_runtime_payload(
+            self.payload,
+            self.progress,
+            self.callback_result,
+        )?;
         Ok(JobRow {
             id: self.job_id,
             kind: self.kind,
@@ -833,7 +940,8 @@ impl DeferredJobRow {
 /// - append-only completion segments keyed back to the queue segment
 /// - a separate, faster rotating lease ring so delete churn is bounded by the
 ///   lease cycle rather than by queue retention
-/// - hot mutable state restricted to queue cursors and counters
+/// - hot mutable state restricted to queue cursors, narrow leases, and
+///   optional per-attempt runtime state only when needed
 ///
 #[derive(Debug)]
 pub struct QueueStorage {
@@ -895,6 +1003,10 @@ impl QueueStorage {
         format!("leases_{slot}")
     }
 
+    pub fn attempt_state_relname(&self) -> &'static str {
+        "attempt_state"
+    }
+
     pub async fn active_schema(pool: &PgPool) -> Result<Option<String>, AwaError> {
         sqlx::query_scalar(
             "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
@@ -902,6 +1014,32 @@ impl QueueStorage {
         .fetch_optional(pool)
         .await
         .map_err(map_sqlx_error)
+    }
+
+    fn materialize_runtime_payload(
+        payload: serde_json::Value,
+        progress: Option<serde_json::Value>,
+        callback_result: Option<serde_json::Value>,
+    ) -> Result<RuntimePayload, AwaError> {
+        let mut payload = RuntimePayload::from_json(payload)?;
+        if let Some(progress) = progress {
+            payload.set_progress(Some(progress));
+        }
+        if let Some(callback_result) = callback_result {
+            payload.insert_callback_result(Some(callback_result));
+        }
+        Ok(payload)
+    }
+
+    fn payload_with_attempt_state(
+        payload: serde_json::Value,
+        progress: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, AwaError> {
+        let mut payload = RuntimePayload::from_json(payload)?;
+        if let Some(progress) = progress {
+            payload.set_progress(Some(progress));
+        }
+        Ok(payload.into_json())
     }
 
     fn payload_from_parts(
@@ -1117,32 +1255,40 @@ impl QueueStorage {
                 ready_slot        INT NOT NULL,
                 ready_generation  BIGINT NOT NULL,
                 job_id            BIGINT NOT NULL,
-                kind              TEXT NOT NULL,
                 queue             TEXT NOT NULL,
-                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 state             awa.job_state NOT NULL DEFAULT 'running',
                 priority          SMALLINT NOT NULL,
                 attempt           SMALLINT NOT NULL DEFAULT 1,
                 run_lease         BIGINT NOT NULL DEFAULT 1,
                 max_attempts      SMALLINT NOT NULL DEFAULT 25,
                 lane_seq          BIGINT NOT NULL,
-                run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 heartbeat_at      TIMESTAMPTZ,
                 deadline_at       TIMESTAMPTZ,
                 attempted_at      TIMESTAMPTZ,
-                finalized_at      TIMESTAMPTZ,
-                created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                unique_key        BYTEA,
-                unique_states     TEXT,
                 callback_id       UUID,
                 callback_timeout_at TIMESTAMPTZ,
-                callback_filter   TEXT,
-                callback_on_complete TEXT,
-                callback_on_fail  TEXT,
-                callback_transform TEXT,
-                payload           JSONB NOT NULL DEFAULT '{{}}'::jsonb,
                 PRIMARY KEY (lease_slot, queue, priority, lane_seq)
             ) PARTITION BY LIST (lease_slot)
+            "#
+        ))
+        .execute(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS {schema}.attempt_state (
+                job_id              BIGINT NOT NULL,
+                run_lease           BIGINT NOT NULL,
+                progress            JSONB,
+                callback_filter     TEXT,
+                callback_on_complete TEXT,
+                callback_on_fail    TEXT,
+                callback_transform  TEXT,
+                callback_result     JSONB,
+                updated_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (job_id, run_lease)
+            )
             "#
         ))
         .execute(pool)
@@ -2022,21 +2168,22 @@ impl QueueStorage {
         running_delta: i64,
         completed_delta: i64,
     ) -> Result<(), AwaError> {
+        let _ = (running_delta, completed_delta);
+        if available_delta == 0 {
+            return Ok(());
+        }
+
         let schema = self.schema();
         sqlx::query(&format!(
             r#"
             UPDATE {schema}.queue_lanes
-            SET available_count = GREATEST(0, available_count + $3),
-                running_count = GREATEST(0, running_count + $4),
-                completed_count = GREATEST(0, completed_count + $5)
+            SET available_count = GREATEST(0, available_count + $3)
             WHERE queue = $1 AND priority = $2
             "#
         ))
         .bind(queue)
         .bind(priority)
         .bind(available_delta)
-        .bind(running_delta)
-        .bind(completed_delta)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -2209,116 +2356,106 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let lane: Option<(i16, i64, i64, i64)> = sqlx::query_as(&format!(
-            r#"
-            SELECT priority, claim_seq, next_seq, available_count
-            FROM {schema}.queue_lanes
-            WHERE queue = $1
-              AND NOT EXISTS (
-                  SELECT 1 FROM awa.queue_meta
-                  WHERE queue = $1 AND paused = TRUE
-              )
-              AND claim_seq < next_seq
-              AND available_count > 0
-            ORDER BY priority ASC
-            LIMIT 1
-            FOR UPDATE
-            "#
-        ))
-        .bind(queue)
-        .fetch_optional(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let Some((priority, claim_seq, next_seq, available_count)) = lane else {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(Vec::new());
-        };
-
-        let reserve = (next_seq - claim_seq).min(available_count).min(max_batch);
-        if reserve <= 0 {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(Vec::new());
-        }
-
-        let start_seq = claim_seq;
-        let end_seq = claim_seq + reserve;
-
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.queue_lanes
-            SET claim_seq = $3,
-                available_count = available_count - $4,
-                running_count = running_count + $4
-            WHERE queue = $1 AND priority = $2
-            "#
-        ))
-        .bind(queue)
-        .bind(priority)
-        .bind(end_seq)
-        .bind(reserve)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let lease_ring = self.current_lease_ring(&mut tx).await?;
-
         let claimed: Vec<ClaimedEntry> = sqlx::query_as(&format!(
             r#"
-            INSERT INTO {schema}.leases (
-                lease_slot,
-                lease_generation,
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                run_at,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+            WITH lane AS (
+                SELECT priority, claim_seq, available_count
+                FROM {schema}.queue_lanes
+                WHERE queue = $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM awa.queue_meta
+                      WHERE queue = $1 AND paused = TRUE
+                  )
+                  AND claim_seq < next_seq
+                  AND available_count > 0
+                ORDER BY priority ASC
+                LIMIT 1
+                FOR UPDATE
+            ),
+            lease_ring AS (
+                SELECT current_slot AS lease_slot, generation AS lease_generation
+                FROM {schema}.lease_ring_state
+                WHERE singleton = TRUE
+            ),
+            selected AS (
+                SELECT
+                    ready.ready_slot,
+                    ready.ready_generation,
+                    ready.job_id,
+                    ready.queue,
+                    ready.priority,
+                    ready.attempt,
+                    ready.run_lease,
+                    ready.max_attempts,
+                    ready.lane_seq
+                FROM {schema}.ready_entries AS ready
+                JOIN lane
+                  ON lane.priority = ready.priority
+                WHERE ready.queue = $1
+                  AND ready.lane_seq >= lane.claim_seq
+                ORDER BY ready.lane_seq ASC
+                LIMIT COALESCE((SELECT LEAST(available_count, $2) FROM lane), 0)
+            ),
+            advanced AS (
+                UPDATE {schema}.queue_lanes AS lanes
+                SET claim_seq = COALESCE(
+                        (SELECT max(lane_seq) + 1 FROM selected),
+                        lanes.claim_seq
+                    ),
+                    available_count = GREATEST(
+                        0,
+                        lanes.available_count - (SELECT count(*)::bigint FROM selected)
+                    )
+                WHERE lanes.queue = $1
+                  AND lanes.priority = (SELECT priority FROM lane)
+                RETURNING lanes.priority
+            ),
+            claimed AS (
+                INSERT INTO {schema}.leases (
+                    lease_slot,
+                    lease_generation,
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at
+                )
+                SELECT
+                    lease_ring.lease_slot,
+                    lease_ring.lease_generation,
+                    selected.ready_slot,
+                    selected.ready_generation,
+                    selected.job_id,
+                    selected.queue,
+                    'running'::awa.job_state,
+                    selected.priority,
+                    selected.attempt + 1,
+                    selected.run_lease + 1,
+                    selected.max_attempts,
+                    selected.lane_seq,
+                    clock_timestamp(),
+                    clock_timestamp(),
+                    clock_timestamp()
+                FROM selected
+                CROSS JOIN lease_ring
+                RETURNING
+                    queue,
+                    priority,
+                    lane_seq,
+                    ready_slot,
+                    ready_generation,
+                    lease_slot,
+                    lease_generation
             )
             SELECT
-                $1,
-                $2,
-                ready.ready_slot,
-                ready.ready_generation,
-                ready.job_id,
-                ready.kind,
-                ready.queue,
-                ready.args,
-                'running'::awa.job_state,
-                ready.priority,
-                ready.attempt + 1,
-                ready.run_lease + 1,
-                ready.max_attempts,
-                ready.lane_seq,
-                clock_timestamp(),
-                clock_timestamp(),
-                clock_timestamp(),
-                clock_timestamp(),
-                ready.created_at,
-                ready.unique_key,
-                ready.unique_states,
-                ready.payload
-            FROM {schema}.ready_entries AS ready
-            WHERE ready.queue = $3
-              AND ready.priority = $4
-              AND ready.lane_seq >= $5
-              AND ready.lane_seq < $6
-            ORDER BY ready.lane_seq ASC
-            RETURNING
                 queue,
                 priority,
                 lane_seq,
@@ -2326,24 +2463,15 @@ impl QueueStorage {
                 ready_generation,
                 lease_slot,
                 lease_generation
+            FROM claimed
+            ORDER BY lane_seq ASC
             "#
         ))
-        .bind(lease_ring.0)
-        .bind(lease_ring.1)
         .bind(queue)
-        .bind(priority)
-        .bind(start_seq)
-        .bind(end_seq)
+        .bind(max_batch)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-
-        if claimed.len() as i64 != reserve {
-            return Err(AwaError::Validation(format!(
-                "queue storage claim reservation mismatch: reserved {reserve}, claimed {}",
-                claimed.len()
-            )));
-        }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(claimed)
@@ -2363,149 +2491,149 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let lane: Option<(i16, i64, i64, i64)> = sqlx::query_as(&format!(
-            r#"
-            SELECT priority, claim_seq, next_seq, available_count
-            FROM {schema}.queue_lanes
-            WHERE queue = $1
-              AND NOT EXISTS (
-                  SELECT 1 FROM awa.queue_meta
-                  WHERE queue = $1 AND paused = TRUE
-              )
-              AND claim_seq < next_seq
-              AND available_count > 0
-            ORDER BY priority ASC
-            LIMIT 1
-            FOR UPDATE
-            "#
-        ))
-        .bind(queue)
-        .fetch_optional(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let Some((priority, claim_seq, next_seq, available_count)) = lane else {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(Vec::new());
-        };
-
-        let reserve = (next_seq - claim_seq).min(available_count).min(max_batch);
-        if reserve <= 0 {
-            tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(Vec::new());
-        }
-
-        let start_seq = claim_seq;
-        let end_seq = claim_seq + reserve;
-
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.queue_lanes
-            SET claim_seq = $3,
-                available_count = available_count - $4,
-                running_count = running_count + $4
-            WHERE queue = $1 AND priority = $2
-            "#
-        ))
-        .bind(queue)
-        .bind(priority)
-        .bind(end_seq)
-        .bind(reserve)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let lease_ring = self.current_lease_ring(&mut tx).await?;
-
         let claimed: Vec<ReadyJobLeaseRow> = sqlx::query_as(&format!(
             r#"
-            INSERT INTO {schema}.leases (
-                lease_slot,
-                lease_generation,
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                run_at,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+            WITH lane AS (
+                SELECT priority, claim_seq, available_count
+                FROM {schema}.queue_lanes
+                WHERE queue = $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM awa.queue_meta
+                      WHERE queue = $1 AND paused = TRUE
+                  )
+                  AND claim_seq < next_seq
+                  AND available_count > 0
+                ORDER BY priority ASC
+                LIMIT 1
+                FOR UPDATE
+            ),
+            lease_ring AS (
+                SELECT current_slot AS lease_slot, generation AS lease_generation
+                FROM {schema}.lease_ring_state
+                WHERE singleton = TRUE
+            ),
+            selected AS (
+                SELECT
+                    ready.ready_slot,
+                    ready.ready_generation,
+                    ready.job_id,
+                    ready.kind,
+                    ready.queue,
+                    ready.args,
+                    ready.priority,
+                    ready.attempt,
+                    ready.run_lease,
+                    ready.max_attempts,
+                    ready.lane_seq,
+                    ready.run_at,
+                    ready.created_at,
+                    ready.unique_key,
+                    ready.unique_states,
+                    ready.payload
+                FROM {schema}.ready_entries AS ready
+                JOIN lane
+                  ON lane.priority = ready.priority
+                WHERE ready.queue = $1
+                  AND ready.lane_seq >= lane.claim_seq
+                ORDER BY ready.lane_seq ASC
+                LIMIT COALESCE((SELECT LEAST(available_count, $2) FROM lane), 0)
+            ),
+            advanced AS (
+                UPDATE {schema}.queue_lanes AS lanes
+                SET claim_seq = COALESCE(
+                        (SELECT max(lane_seq) + 1 FROM selected),
+                        lanes.claim_seq
+                    ),
+                    available_count = GREATEST(
+                        0,
+                        lanes.available_count - (SELECT count(*)::bigint FROM selected)
+                    )
+                WHERE lanes.queue = $1
+                  AND lanes.priority = (SELECT priority FROM lane)
+                RETURNING lanes.priority
+            ),
+            claimed AS (
+                INSERT INTO {schema}.leases (
+                    lease_slot,
+                    lease_generation,
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at
+                )
+                SELECT
+                    lease_ring.lease_slot,
+                    lease_ring.lease_generation,
+                    selected.ready_slot,
+                    selected.ready_generation,
+                    selected.job_id,
+                    selected.queue,
+                    'running'::awa.job_state,
+                    selected.priority,
+                    selected.attempt + 1,
+                    selected.run_lease + 1,
+                    selected.max_attempts,
+                    selected.lane_seq,
+                    clock_timestamp(),
+                    clock_timestamp() + make_interval(secs => $3),
+                    clock_timestamp()
+                FROM selected
+                CROSS JOIN lease_ring
+                RETURNING
+                    ready_slot,
+                    ready_generation,
+                    queue,
+                    priority,
+                    lane_seq,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at
             )
             SELECT
-                $1,
-                $2,
-                ready.ready_slot,
-                ready.ready_generation,
-                ready.job_id,
-                ready.kind,
-                ready.queue,
-                ready.args,
-                'running'::awa.job_state,
-                ready.priority,
-                ready.attempt + 1,
-                ready.run_lease + 1,
-                ready.max_attempts,
-                ready.lane_seq,
-                clock_timestamp(),
-                clock_timestamp(),
-                clock_timestamp() + make_interval(secs => $7),
-                clock_timestamp(),
-                ready.created_at,
-                ready.unique_key,
-                ready.unique_states,
-                ready.payload
-            FROM {schema}.ready_entries AS ready
-            WHERE ready.queue = $3
-              AND ready.priority = $4
-              AND ready.lane_seq >= $5
-              AND ready.lane_seq < $6
-            ORDER BY ready.lane_seq ASC
-            RETURNING
-                job_id,
-                kind,
-                queue,
-                args,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                run_at,
-                attempted_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                selected.job_id,
+                selected.kind,
+                selected.queue,
+                selected.args,
+                selected.priority,
+                claimed.attempt,
+                claimed.run_lease,
+                claimed.max_attempts,
+                selected.run_at,
+                claimed.heartbeat_at,
+                claimed.deadline_at,
+                claimed.attempted_at,
+                selected.created_at,
+                selected.unique_key,
+                selected.unique_states,
+                selected.payload
+            FROM claimed
+            JOIN selected
+              ON selected.ready_slot = claimed.ready_slot
+             AND selected.ready_generation = claimed.ready_generation
+             AND selected.queue = claimed.queue
+             AND selected.priority = claimed.priority
+             AND selected.lane_seq = claimed.lane_seq
+            ORDER BY selected.lane_seq ASC
             "#
         ))
-        .bind(lease_ring.0)
-        .bind(lease_ring.1)
         .bind(queue)
-        .bind(priority)
-        .bind(start_seq)
-        .bind(end_seq)
+        .bind(max_batch)
         .bind(deadline_duration.as_secs_f64())
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-
-        if claimed.len() as i64 != reserve {
-            return Err(AwaError::Validation(format!(
-                "queue storage runtime claim reservation mismatch: reserved {reserve}, claimed {}",
-                claimed.len()
-            )));
-        }
 
         for row in &claimed {
             self.sync_unique_claim(
@@ -2523,7 +2651,7 @@ impl QueueStorage {
 
         claimed
             .into_iter()
-            .map(|row| row.into_job_row(deadline_duration))
+            .map(ReadyJobLeaseRow::into_job_row)
             .collect()
     }
 
@@ -2544,7 +2672,7 @@ impl QueueStorage {
         let priorities: Vec<i16> = claimed.iter().map(|entry| entry.priority).collect();
         let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.lane_seq).collect();
 
-        let moved: Vec<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH completed(lease_slot, queue, priority, lane_seq) AS (
                 SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[])
@@ -2559,22 +2687,18 @@ impl QueueStorage {
                 leases.ready_slot,
                 leases.ready_generation,
                 leases.job_id,
-                leases.kind,
                 leases.queue,
-                leases.args,
                 leases.state,
                 leases.priority,
                 leases.attempt,
                 leases.run_lease,
                 leases.max_attempts,
                 leases.lane_seq,
-                leases.run_at,
+                leases.heartbeat_at,
+                leases.deadline_at,
                 leases.attempted_at,
-                leases.finalized_at,
-                leases.created_at,
-                leases.unique_key,
-                leases.unique_states
-                ,leases.payload
+                leases.callback_id,
+                leases.callback_timeout_at
             "#
         ))
         .bind(&lease_slots)
@@ -2585,15 +2709,21 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if moved.is_empty() {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(0);
         }
 
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
         for entry in moved.iter().cloned() {
-            let mut payload = RuntimePayload::from_json(entry.payload.clone())?;
+            let mut payload =
+                RuntimePayload::from_json(Self::payload_with_attempt_state(
+                    entry.payload.clone(),
+                    entry.progress.clone(),
+                )?)?;
             payload.set_progress(None);
             done_rows.push(entry.into_done_row(
                 JobState::Completed,
@@ -2604,39 +2734,6 @@ impl QueueStorage {
 
         self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
             .await?;
-
-        let mut per_lane: BTreeMap<(String, i16), i64> = BTreeMap::new();
-        for entry in &moved {
-            *per_lane
-                .entry((entry.queue.clone(), entry.priority))
-                .or_insert(0) += 1;
-            self.sync_unique_claim(
-                &mut tx,
-                entry.job_id,
-                &entry.unique_key,
-                entry.unique_states.as_deref(),
-                Some(JobState::Running),
-                Some(JobState::Completed),
-            )
-            .await?;
-        }
-
-        for ((queue, priority), count) in per_lane {
-            sqlx::query(&format!(
-                r#"
-                UPDATE {schema}.queue_lanes
-                SET running_count = GREATEST(0, running_count - $3),
-                    completed_count = completed_count + $3
-                WHERE queue = $1 AND priority = $2
-                "#
-            ))
-            .bind(&queue)
-            .bind(priority)
-            .bind(count)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(moved.len())
@@ -2660,7 +2757,7 @@ impl QueueStorage {
             .map(|(_, run_lease)| *run_lease)
             .collect();
 
-        let moved: Vec<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH completed(job_id, run_lease) AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
@@ -2673,22 +2770,18 @@ impl QueueStorage {
                 leases.ready_slot,
                 leases.ready_generation,
                 leases.job_id,
-                leases.kind,
                 leases.queue,
-                leases.args,
                 leases.state,
                 leases.priority,
                 leases.attempt,
                 leases.run_lease,
                 leases.max_attempts,
                 leases.lane_seq,
-                leases.run_at,
+                leases.heartbeat_at,
+                leases.deadline_at,
                 leases.attempted_at,
-                leases.finalized_at,
-                leases.created_at,
-                leases.unique_key,
-                leases.unique_states
-                ,leases.payload
+                leases.callback_id,
+                leases.callback_timeout_at
             "#
         ))
         .bind(&job_ids)
@@ -2697,15 +2790,21 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if moved.is_empty() {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
         for entry in moved.iter().cloned() {
-            let mut payload = RuntimePayload::from_json(entry.payload.clone())?;
+            let mut payload =
+                RuntimePayload::from_json(Self::payload_with_attempt_state(
+                    entry.payload.clone(),
+                    entry.progress.clone(),
+                )?)?;
             payload.set_progress(None);
             done_rows.push(entry.into_done_row(
                 JobState::Completed,
@@ -2716,39 +2815,6 @@ impl QueueStorage {
 
         self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
             .await?;
-
-        let mut per_lane: BTreeMap<(String, i16), i64> = BTreeMap::new();
-        for entry in &moved {
-            *per_lane
-                .entry((entry.queue.clone(), entry.priority))
-                .or_insert(0) += 1;
-            self.sync_unique_claim(
-                &mut tx,
-                entry.job_id,
-                &entry.unique_key,
-                entry.unique_states.as_deref(),
-                Some(JobState::Running),
-                Some(JobState::Completed),
-            )
-            .await?;
-        }
-
-        for ((queue, priority), count) in per_lane {
-            sqlx::query(&format!(
-                r#"
-                UPDATE {schema}.queue_lanes
-                SET running_count = GREATEST(0, running_count - $3),
-                    completed_count = completed_count + $3
-                WHERE queue = $1 AND priority = $2
-                "#
-            ))
-            .bind(&queue)
-            .bind(priority)
-            .bind(count)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-        }
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(moved
@@ -2763,8 +2829,23 @@ impl QueueStorage {
             r#"
             SELECT
                 COALESCE(sum(available_count), 0)::bigint AS available,
-                COALESCE(sum(running_count), 0)::bigint AS running,
-                COALESCE(sum(completed_count), 0)::bigint AS completed
+                COALESCE(
+                    (
+                        SELECT count(*)::bigint
+                        FROM {schema}.leases
+                        WHERE queue = $1
+                          AND state = 'running'
+                    ),
+                    0
+                ) AS running,
+                COALESCE(
+                    (
+                        SELECT count(*)::bigint
+                        FROM {schema}.done_entries
+                        WHERE queue = $1
+                    ),
+                    0
+                ) + COALESCE(sum(completed_count), 0)::bigint AS completed
             FROM {schema}.queue_lanes
             WHERE queue = $1
             "#
@@ -2782,6 +2863,465 @@ impl QueueStorage {
         })
     }
 
+    pub async fn retry_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let deleted_waiting: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.leases
+            WHERE job_id = $1
+              AND state = 'waiting_external'
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                heartbeat_at,
+                deadline_at,
+                attempted_at,
+                callback_id,
+                callback_timeout_at
+            "#
+        ))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if !deleted_waiting.is_empty() {
+            let waiting = self
+                .hydrate_deleted_leases_tx(&mut tx, deleted_waiting)
+                .await?
+                .into_iter()
+                .next()
+                .expect("deleted waiting lease");
+            let ready_payload =
+                Self::payload_with_attempt_state(waiting.payload.clone(), waiting.progress.clone())?;
+            let ready_row = ExistingReadyRow {
+                attempt: 0,
+                run_lease: 0,
+                run_at: Utc::now(),
+                attempted_at: None,
+                ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
+            };
+            self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(waiting.state))
+                .await?;
+            self.adjust_lane_counts(&mut tx, &waiting.queue, waiting.priority, 0, -1, 0)
+                .await?;
+            self.notify_queues_tx(&mut tx, std::iter::once(waiting.queue.clone()))
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Some(
+                ReadyJobRow {
+                    job_id: ready_row.job_id,
+                    kind: ready_row.kind,
+                    queue: ready_row.queue,
+                    args: ready_row.args,
+                    priority: ready_row.priority,
+                    attempt: ready_row.attempt,
+                    run_lease: ready_row.run_lease,
+                    max_attempts: ready_row.max_attempts,
+                    run_at: ready_row.run_at,
+                    attempted_at: ready_row.attempted_at,
+                    created_at: ready_row.created_at,
+                    unique_key: ready_row.unique_key,
+                    unique_states: ready_row.unique_states,
+                    payload: ready_row.payload,
+                }
+                .into_job_row()?,
+            ));
+        }
+
+        let terminal: Option<DoneJobRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.done_entries
+            WHERE (job_id, finalized_at) IN (
+                SELECT job_id, finalized_at
+                FROM {schema}.done_entries
+                WHERE job_id = $1
+                  AND state IN ('failed', 'cancelled')
+                ORDER BY finalized_at DESC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            "#
+        ))
+        .bind(job_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if let Some(terminal) = terminal {
+            let ready_row = ExistingReadyRow {
+                job_id: terminal.job_id,
+                kind: terminal.kind,
+                queue: terminal.queue.clone(),
+                args: terminal.args,
+                priority: terminal.priority,
+                attempt: 0,
+                run_lease: 0,
+                max_attempts: terminal.max_attempts,
+                run_at: Utc::now(),
+                attempted_at: None,
+                created_at: terminal.created_at,
+                unique_key: terminal.unique_key,
+                unique_states: terminal.unique_states,
+                payload: terminal.payload,
+            };
+            self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(terminal.state))
+                .await?;
+            self.adjust_lane_counts(&mut tx, &terminal.queue, terminal.priority, 0, 0, -1)
+                .await?;
+            self.notify_queues_tx(&mut tx, std::iter::once(terminal.queue.clone()))
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Some(
+                ReadyJobRow {
+                    job_id: ready_row.job_id,
+                    kind: ready_row.kind,
+                    queue: ready_row.queue,
+                    args: ready_row.args,
+                    priority: ready_row.priority,
+                    attempt: ready_row.attempt,
+                    run_lease: ready_row.run_lease,
+                    max_attempts: ready_row.max_attempts,
+                    run_at: ready_row.run_at,
+                    attempted_at: ready_row.attempted_at,
+                    created_at: ready_row.created_at,
+                    unique_key: ready_row.unique_key,
+                    unique_states: ready_row.unique_states,
+                    payload: ready_row.payload,
+                }
+                .into_job_row()?,
+            ));
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(None)
+    }
+
+    pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let ready: Option<ReadyTransitionRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.ready_entries
+            WHERE (ready_slot, queue, priority, lane_seq) IN (
+                SELECT
+                    ready.ready_slot,
+                    ready.queue,
+                    ready.priority,
+                    ready.lane_seq
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_lanes AS lanes
+                  ON lanes.queue = ready.queue
+                 AND lanes.priority = ready.priority
+                WHERE ready.job_id = $1
+                  AND ready.lane_seq >= lanes.claim_seq
+                ORDER BY ready.lane_seq DESC
+                LIMIT 1
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                run_at,
+                attempted_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            "#
+        ))
+        .bind(job_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if let Some(ready) = ready {
+            let done = ready
+                .clone()
+                .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
+            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(JobState::Available))
+                .await?;
+            self.adjust_lane_counts(&mut tx, &ready.queue, ready.priority, -1, 0, 1)
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Some(done.into_job_row()?));
+        }
+
+        let deleted_lease: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.leases
+            WHERE job_id = $1
+              AND state IN ('running', 'waiting_external')
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                heartbeat_at,
+                deadline_at,
+                attempted_at,
+                callback_id,
+                callback_timeout_at
+            "#
+        ))
+        .bind(job_id)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if !deleted_lease.is_empty() {
+            let lease = self
+                .hydrate_deleted_leases_tx(&mut tx, deleted_lease)
+                .await?
+                .into_iter()
+                .next()
+                .expect("deleted running lease");
+            let done_payload =
+                Self::payload_with_attempt_state(lease.payload.clone(), lease.progress.clone())?;
+            let done = lease
+                .clone()
+                .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
+            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(lease.state))
+                .await?;
+            self.adjust_lane_counts(&mut tx, &lease.queue, lease.priority, 0, -1, 1)
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Some(done.into_job_row()?));
+        }
+
+        let deferred: Option<DeferredJobRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.deferred_jobs
+            WHERE job_id = $1
+              AND state IN ('scheduled', 'retryable')
+            RETURNING
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            "#
+        ))
+        .bind(job_id)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if let Some(deferred) = deferred {
+            let (ready_slot, ready_generation) = self.current_queue_ring(&mut tx).await?;
+            self.ensure_lane(&mut tx, &deferred.queue, deferred.priority).await?;
+            let done = DoneJobRow {
+                ready_slot,
+                ready_generation,
+                job_id: deferred.job_id,
+                kind: deferred.kind,
+                queue: deferred.queue.clone(),
+                args: deferred.args,
+                state: JobState::Cancelled,
+                priority: deferred.priority,
+                attempt: deferred.attempt,
+                run_lease: deferred.run_lease,
+                max_attempts: deferred.max_attempts,
+                lane_seq: -deferred.job_id,
+                run_at: deferred.run_at,
+                attempted_at: deferred.attempted_at,
+                finalized_at: Utc::now(),
+                created_at: deferred.created_at,
+                unique_key: deferred.unique_key,
+                unique_states: deferred.unique_states,
+                payload: deferred.payload,
+            };
+            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(deferred.state))
+                .await?;
+            self.adjust_lane_counts(&mut tx, &done.queue, done.priority, 0, 0, 1)
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Some(done.into_job_row()?));
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(None)
+    }
+
+    pub async fn age_waiting_priorities(
+        &self,
+        pool: &PgPool,
+        aging_interval: Duration,
+        limit: i64,
+    ) -> Result<Vec<i64>, AwaError> {
+        if limit <= 0 {
+            return Ok(Vec::new());
+        }
+
+        let cutoff = Utc::now()
+            - TimeDelta::from_std(aging_interval)
+                .map_err(|err| AwaError::Validation(format!("invalid aging interval: {err}")))?;
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let moved: Vec<ReadyTransitionRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.ready_entries
+            WHERE (ready_slot, queue, priority, lane_seq) IN (
+                SELECT
+                    ready.ready_slot,
+                    ready.queue,
+                    ready.priority,
+                    ready.lane_seq
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_lanes AS lanes
+                  ON lanes.queue = ready.queue
+                 AND lanes.priority = ready.priority
+                WHERE ready.lane_seq >= lanes.claim_seq
+                  AND ready.priority > 1
+                  AND ready.run_at <= $1
+                ORDER BY ready.run_at ASC, ready.lane_seq ASC
+                LIMIT $2
+                FOR UPDATE SKIP LOCKED
+            )
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                run_at,
+                attempted_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            "#
+        ))
+        .bind(cutoff)
+        .bind(limit)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if moved.is_empty() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(Vec::new());
+        }
+
+        let mut ids = Vec::with_capacity(moved.len());
+        let mut queues = BTreeSet::new();
+        let mut old_lane_counts: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        let mut ready_rows = Vec::with_capacity(moved.len());
+
+        for row in moved {
+            ids.push(row.job_id);
+            queues.insert(row.queue.clone());
+            *old_lane_counts
+                .entry((row.queue.clone(), row.priority))
+                .or_default() += 1;
+
+            let mut payload = RuntimePayload::from_json(row.payload)?;
+            let metadata = payload
+                .metadata
+                .as_object_mut()
+                .ok_or_else(|| {
+                    AwaError::Validation(
+                        "queue storage payload metadata must be a JSON object".to_string(),
+                    )
+                })?;
+            metadata
+                .entry("_awa_original_priority".to_string())
+                .or_insert_with(|| serde_json::Value::from(i64::from(row.priority)));
+
+            ready_rows.push(ExistingReadyRow {
+                job_id: row.job_id,
+                kind: row.kind,
+                queue: row.queue,
+                args: row.args,
+                priority: row.priority - 1,
+                attempt: row.attempt,
+                run_lease: row.run_lease,
+                max_attempts: row.max_attempts,
+                run_at: row.run_at,
+                attempted_at: row.attempted_at,
+                created_at: row.created_at,
+                unique_key: row.unique_key,
+                unique_states: row.unique_states,
+                payload: payload.into_json(),
+            });
+        }
+
+        for ((queue, priority), count) in old_lane_counts {
+            self.adjust_lane_counts(&mut tx, &queue, priority, -count, 0, 0)
+                .await?;
+        }
+
+        self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
+            .await?;
+        self.notify_queues_tx(&mut tx, queues.into_iter()).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(ids)
+    }
+
     fn with_progress(
         payload: serde_json::Value,
         progress: Option<serde_json::Value>,
@@ -2791,27 +3331,75 @@ impl QueueStorage {
         Ok(payload.into_json())
     }
 
-    async fn take_callback_payload(
+    async fn take_callback_result(
         &self,
         pool: &PgPool,
         job_id: i64,
-        payload: serde_json::Value,
+        run_lease: i64,
     ) -> Result<serde_json::Value, AwaError> {
-        let mut payload = RuntimePayload::from_json(payload)?;
-        let result = payload
-            .take_callback_result()
-            .unwrap_or(serde_json::Value::Null);
-
-        sqlx::query(&format!(
-            "UPDATE {} SET payload = $2 WHERE job_id = $1",
-            self.leases_table()
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut row: Option<AttemptStateRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                job_id,
+                run_lease,
+                progress,
+                callback_filter,
+                callback_on_complete,
+                callback_on_fail,
+                callback_transform,
+                callback_result
+            FROM {}
+            WHERE job_id = $1
+              AND run_lease = $2
+            FOR UPDATE
+            "#,
+            self.attempt_state_table()
         ))
         .bind(job_id)
-        .bind(payload.into_json())
-        .execute(pool)
+        .bind(run_lease)
+        .fetch_optional(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
+        let Some(mut row) = row.take() else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(serde_json::Value::Null);
+        };
+
+        let result = row
+            .callback_result
+            .take()
+            .unwrap_or(serde_json::Value::Null);
+
+        if row.progress.is_none()
+            && row.callback_filter.is_none()
+            && row.callback_on_complete.is_none()
+            && row.callback_on_fail.is_none()
+            && row.callback_transform.is_none()
+        {
+            sqlx::query(&format!(
+                "DELETE FROM {} WHERE job_id = $1 AND run_lease = $2",
+                self.attempt_state_table()
+            ))
+            .bind(job_id)
+            .bind(run_lease)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        } else {
+            sqlx::query(&format!(
+                "UPDATE {} SET callback_result = NULL, updated_at = clock_timestamp() WHERE job_id = $1 AND run_lease = $2",
+                self.attempt_state_table()
+            ))
+            .bind(job_id)
+            .bind(run_lease)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result)
     }
 
@@ -2843,6 +3431,157 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
         }
         Ok(())
+    }
+
+    async fn hydrate_deleted_leases_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deleted: Vec<DeletedLeaseRow>,
+    ) -> Result<Vec<LeaseTransitionRow>, AwaError> {
+        if deleted.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = self.schema();
+        let ready_slots: Vec<i32> = deleted.iter().map(|row| row.ready_slot).collect();
+        let ready_generations: Vec<i64> = deleted.iter().map(|row| row.ready_generation).collect();
+        let queues: Vec<String> = deleted.iter().map(|row| row.queue.clone()).collect();
+        let priorities: Vec<i16> = deleted.iter().map(|row| row.priority).collect();
+        let lane_seqs: Vec<i64> = deleted.iter().map(|row| row.lane_seq).collect();
+        let job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
+        let run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
+
+        let ready_rows: Vec<ReadySnapshotRow> = sqlx::query_as(&format!(
+            r#"
+            WITH refs(ready_slot, ready_generation, queue, priority, lane_seq) AS (
+                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[])
+            )
+            SELECT
+                ready.ready_slot,
+                ready.ready_generation,
+                ready.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                ready.priority,
+                ready.lane_seq,
+                ready.run_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                ready.payload
+            FROM refs
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = refs.ready_slot
+             AND ready.ready_generation = refs.ready_generation
+             AND ready.queue = refs.queue
+             AND ready.priority = refs.priority
+             AND ready.lane_seq = refs.lane_seq
+            "#
+        ))
+        .bind(&ready_slots)
+        .bind(&ready_generations)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&lane_seqs)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let attempt_rows: Vec<AttemptStateRow> = sqlx::query_as(&format!(
+            r#"
+            WITH refs(job_id, run_lease) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            )
+            DELETE FROM {schema}.attempt_state AS attempt
+            USING refs
+            WHERE attempt.job_id = refs.job_id
+              AND attempt.run_lease = refs.run_lease
+            RETURNING
+                attempt.job_id,
+                attempt.run_lease,
+                attempt.progress,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                attempt.callback_result
+            "#
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let ready_map: BTreeMap<(i32, i64, String, i16, i64), ReadySnapshotRow> = ready_rows
+            .into_iter()
+            .map(|row| {
+                (
+                    (
+                        row.ready_slot,
+                        row.ready_generation,
+                        row.queue.clone(),
+                        row.priority,
+                        row.lane_seq,
+                    ),
+                    row,
+                )
+            })
+            .collect();
+
+        let attempt_map: BTreeMap<(i64, i64), AttemptStateRow> = attempt_rows
+            .into_iter()
+            .map(|row| ((row.job_id, row.run_lease), row))
+            .collect();
+
+        let mut hydrated = Vec::with_capacity(deleted.len());
+        for deleted_row in deleted {
+            let ready = ready_map
+                .get(&(
+                    deleted_row.ready_slot,
+                    deleted_row.ready_generation,
+                    deleted_row.queue.clone(),
+                    deleted_row.priority,
+                    deleted_row.lane_seq,
+                ))
+                .ok_or_else(|| {
+                    AwaError::Validation(format!(
+                        "queue storage ready row missing for deleted lease job {} run_lease {}",
+                        deleted_row.job_id, deleted_row.run_lease
+                    ))
+                })?;
+            let attempt = attempt_map.get(&(deleted_row.job_id, deleted_row.run_lease));
+
+            hydrated.push(LeaseTransitionRow {
+                ready_slot: deleted_row.ready_slot,
+                ready_generation: deleted_row.ready_generation,
+                job_id: deleted_row.job_id,
+                kind: ready.kind.clone(),
+                queue: ready.queue.clone(),
+                args: ready.args.clone(),
+                state: deleted_row.state,
+                priority: deleted_row.priority,
+                attempt: deleted_row.attempt,
+                run_lease: deleted_row.run_lease,
+                max_attempts: deleted_row.max_attempts,
+                lane_seq: deleted_row.lane_seq,
+                run_at: ready.run_at,
+                heartbeat_at: deleted_row.heartbeat_at,
+                deadline_at: deleted_row.deadline_at,
+                attempted_at: deleted_row.attempted_at,
+                callback_id: deleted_row.callback_id,
+                callback_timeout_at: deleted_row.callback_timeout_at,
+                finalized_at: None,
+                created_at: ready.created_at,
+                unique_key: ready.unique_key.clone(),
+                unique_states: ready.unique_states.clone(),
+                payload: ready.payload.clone(),
+                progress: attempt.and_then(|row| row.progress.clone()),
+            });
+        }
+
+        Ok(hydrated)
     }
 
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
@@ -2913,36 +3652,47 @@ impl QueueStorage {
         let lease_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                run_at,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                callback_id,
-                callback_timeout_at,
-                callback_filter,
-                callback_on_complete,
-                callback_on_fail,
-                callback_transform,
-                payload
-            FROM {schema}.leases
-            WHERE job_id = $1
-            ORDER BY run_lease DESC
+                lease.ready_slot,
+                lease.ready_generation,
+                lease.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                lease.state,
+                lease.priority,
+                lease.attempt,
+                lease.run_lease,
+                lease.max_attempts,
+                lease.lane_seq,
+                ready.run_at,
+                lease.heartbeat_at,
+                lease.deadline_at,
+                lease.attempted_at,
+                NULL::timestamptz AS finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                lease.callback_id,
+                lease.callback_timeout_at,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                ready.payload,
+                attempt.progress,
+                attempt.callback_result
+            FROM {schema}.leases AS lease
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = lease.ready_slot
+             AND ready.ready_generation = lease.ready_generation
+             AND ready.queue = lease.queue
+             AND ready.priority = lease.priority
+             AND ready.lane_seq = lease.lane_seq
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = lease.job_id
+             AND attempt.run_lease = lease.run_lease
+            WHERE lease.job_id = $1
+            ORDER BY lease.run_lease DESC
             "#,
         ))
         .bind(job_id)
@@ -3040,15 +3790,12 @@ impl QueueStorage {
         timeout: Duration,
     ) -> Result<Uuid, AwaError> {
         let callback_id = Uuid::new_v4();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let updated = sqlx::query(&format!(
             r#"
             UPDATE {}
             SET callback_id = $2,
-                callback_timeout_at = clock_timestamp() + make_interval(secs => $3),
-                callback_filter = NULL,
-                callback_on_complete = NULL,
-                callback_on_fail = NULL,
-                callback_transform = NULL
+                callback_timeout_at = clock_timestamp() + make_interval(secs => $3)
             WHERE job_id = $1
               AND state = 'running'
               AND run_lease = $4
@@ -3059,13 +3806,55 @@ impl QueueStorage {
         .bind(callback_id)
         .bind(timeout.as_secs_f64())
         .bind(run_lease)
-        .execute(pool)
+        .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
         if updated.rows_affected() == 0 {
+            tx.rollback().await.map_err(map_sqlx_error)?;
             return Err(AwaError::Validation("job is not in running state".into()));
         }
+
+        sqlx::query(&format!(
+            r#"
+            UPDATE {}
+            SET callback_filter = NULL,
+                callback_on_complete = NULL,
+                callback_on_fail = NULL,
+                callback_transform = NULL,
+                updated_at = clock_timestamp()
+            WHERE job_id = $1
+              AND run_lease = $2
+            "#,
+            self.attempt_state_table()
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            DELETE FROM {}
+            WHERE job_id = $1
+              AND run_lease = $2
+              AND progress IS NULL
+              AND callback_result IS NULL
+              AND callback_filter IS NULL
+              AND callback_on_complete IS NULL
+              AND callback_on_fail IS NULL
+              AND callback_transform IS NULL
+            "#,
+            self.attempt_state_table()
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(callback_id)
     }
 
@@ -3077,6 +3866,10 @@ impl QueueStorage {
         timeout: Duration,
         config: &CallbackConfig,
     ) -> Result<Uuid, AwaError> {
+        if config.is_empty() {
+            return self.register_callback(pool, job_id, run_lease, timeout).await;
+        }
+
         #[cfg(feature = "cel")]
         {
             for (name, expr) in [
@@ -3115,15 +3908,12 @@ impl QueueStorage {
         }
 
         let callback_id = Uuid::new_v4();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let updated = sqlx::query(&format!(
             r#"
             UPDATE {}
             SET callback_id = $2,
-                callback_timeout_at = clock_timestamp() + make_interval(secs => $3),
-                callback_filter = $5,
-                callback_on_complete = $6,
-                callback_on_fail = $7,
-                callback_transform = $8
+                callback_timeout_at = clock_timestamp() + make_interval(secs => $3)
             WHERE job_id = $1
               AND state = 'running'
               AND run_lease = $4
@@ -3134,17 +3924,48 @@ impl QueueStorage {
         .bind(callback_id)
         .bind(timeout.as_secs_f64())
         .bind(run_lease)
-        .bind(&config.filter)
-        .bind(&config.on_complete)
-        .bind(&config.on_fail)
-        .bind(&config.transform)
-        .execute(pool)
+        .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
         if updated.rows_affected() == 0 {
+            tx.rollback().await.map_err(map_sqlx_error)?;
             return Err(AwaError::Validation("job is not in running state".into()));
         }
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {} (
+                job_id,
+                run_lease,
+                callback_filter,
+                callback_on_complete,
+                callback_on_fail,
+                callback_transform,
+                updated_at
+            )
+            VALUES ($1, $2, $3, $4, $5, $6, clock_timestamp())
+            ON CONFLICT (job_id, run_lease)
+            DO UPDATE SET
+                callback_filter = EXCLUDED.callback_filter,
+                callback_on_complete = EXCLUDED.callback_on_complete,
+                callback_on_fail = EXCLUDED.callback_on_fail,
+                callback_transform = EXCLUDED.callback_transform,
+                updated_at = clock_timestamp()
+            "#,
+            self.attempt_state_table()
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .bind(&config.filter)
+        .bind(&config.on_complete)
+        .bind(&config.on_fail)
+        .bind(&config.transform)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(callback_id)
     }
 
@@ -3154,15 +3975,12 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
     ) -> Result<bool, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let result = sqlx::query(&format!(
             r#"
             UPDATE {}
             SET callback_id = NULL,
-                callback_timeout_at = NULL,
-                callback_filter = NULL,
-                callback_on_complete = NULL,
-                callback_on_fail = NULL,
-                callback_transform = NULL
+                callback_timeout_at = NULL
             WHERE job_id = $1
               AND callback_id IS NOT NULL
               AND state = 'running'
@@ -3172,10 +3990,55 @@ impl QueueStorage {
         ))
         .bind(job_id)
         .bind(run_lease)
-        .execute(pool)
+        .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-        Ok(result.rows_affected() > 0)
+        if result.rows_affected() == 0 {
+            tx.rollback().await.map_err(map_sqlx_error)?;
+            return Ok(false);
+        }
+
+        sqlx::query(&format!(
+            r#"
+            UPDATE {}
+            SET callback_filter = NULL,
+                callback_on_complete = NULL,
+                callback_on_fail = NULL,
+                callback_transform = NULL,
+                updated_at = clock_timestamp()
+            WHERE job_id = $1
+              AND run_lease = $2
+            "#,
+            self.attempt_state_table()
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            DELETE FROM {}
+            WHERE job_id = $1
+              AND run_lease = $2
+              AND progress IS NULL
+              AND callback_result IS NULL
+              AND callback_filter IS NULL
+              AND callback_on_complete IS NULL
+              AND callback_on_fail IS NULL
+              AND callback_transform IS NULL
+            "#,
+            self.attempt_state_table()
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(true)
     }
 
     pub async fn enter_callback_wait(
@@ -3213,41 +4076,46 @@ impl QueueStorage {
         job_id: i64,
         callback_id: Uuid,
     ) -> Result<CallbackPollResult, AwaError> {
-        let row: Option<(JobState, Option<Uuid>, serde_json::Value)> = sqlx::query_as(&format!(
-            "SELECT state, callback_id, payload FROM {} WHERE job_id = $1 ORDER BY run_lease DESC LIMIT 1",
-            self.leases_table()
-        ))
+        let row: Option<(JobState, Option<Uuid>, i64, Option<serde_json::Value>)> =
+            sqlx::query_as(&format!(
+                r#"
+                SELECT
+                    lease.state,
+                    lease.callback_id,
+                    lease.run_lease,
+                    attempt.callback_result
+                FROM {} AS lease
+                LEFT JOIN {} AS attempt
+                  ON attempt.job_id = lease.job_id
+                 AND attempt.run_lease = lease.run_lease
+                WHERE lease.job_id = $1
+                ORDER BY lease.run_lease DESC
+                LIMIT 1
+                "#,
+                self.leases_table(),
+                self.attempt_state_table()
+            ))
         .bind(job_id)
         .fetch_optional(pool)
         .await
         .map_err(map_sqlx_error)?;
 
         match row {
-            Some((JobState::Running, None, payload)) => {
-                let payload = RuntimePayload::from_json(payload)?;
-                if payload.metadata.get("_awa_callback_result").is_some() {
-                    let result = self
-                        .take_callback_payload(pool, job_id, payload.into_json())
-                        .await?;
-                    Ok(CallbackPollResult::Resolved(result))
-                } else {
-                    Ok(CallbackPollResult::UnexpectedState {
-                        token: callback_id,
-                        state: JobState::Running,
-                    })
-                }
+            Some((JobState::Running, None, run_lease, Some(_))) => {
+                let result = self.take_callback_result(pool, job_id, run_lease).await?;
+                Ok(CallbackPollResult::Resolved(result))
             }
-            Some((state, Some(current_callback_id), _)) if current_callback_id != callback_id => {
+            Some((state, Some(current_callback_id), _, _)) if current_callback_id != callback_id => {
                 Ok(CallbackPollResult::Stale {
                     token: callback_id,
                     current: current_callback_id,
                     state,
                 })
             }
-            Some((JobState::WaitingExternal, Some(current), _)) if current == callback_id => {
+            Some((JobState::WaitingExternal, Some(current), _, _)) if current == callback_id => {
                 Ok(CallbackPollResult::Pending)
             }
-            Some((state, _, _)) => Ok(CallbackPollResult::UnexpectedState {
+            Some((state, _, _, _)) => Ok(CallbackPollResult::UnexpectedState {
                 token: callback_id,
                 state,
             }),
@@ -3264,6 +4132,72 @@ impl QueueStorage {
         }
     }
 
+    pub async fn callback_job(
+        &self,
+        pool: &PgPool,
+        callback_id: Uuid,
+        run_lease: Option<i64>,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let row: Option<LeaseJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                lease.ready_slot,
+                lease.ready_generation,
+                lease.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                lease.state,
+                lease.priority,
+                lease.attempt,
+                lease.run_lease,
+                lease.max_attempts,
+                lease.lane_seq,
+                ready.run_at,
+                lease.heartbeat_at,
+                lease.deadline_at,
+                lease.attempted_at,
+                NULL::timestamptz AS finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                lease.callback_id,
+                lease.callback_timeout_at,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                ready.payload,
+                attempt.progress,
+                attempt.callback_result
+            FROM {} AS lease
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = lease.ready_slot
+             AND ready.ready_generation = lease.ready_generation
+             AND ready.queue = lease.queue
+             AND ready.priority = lease.priority
+             AND ready.lane_seq = lease.lane_seq
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = lease.job_id
+             AND attempt.run_lease = lease.run_lease
+            WHERE lease.callback_id = $1
+              AND lease.state IN ('waiting_external', 'running')
+              AND ($2::bigint IS NULL OR lease.run_lease = $2)
+            ORDER BY lease.run_lease DESC
+            LIMIT 1
+            "#,
+            self.leases_table(),
+            schema = self.schema()
+        ))
+        .bind(callback_id)
+        .bind(run_lease)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        row.map(LeaseJobRow::into_job_row).transpose()
+    }
+
     pub async fn complete_external(
         &self,
         pool: &PgPool,
@@ -3273,74 +4207,78 @@ impl QueueStorage {
         resume: bool,
     ) -> Result<JobRow, AwaError> {
         if resume {
-            let row: Option<LeaseJobRow> = sqlx::query_as(&format!(
+            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+            let resumed: Option<(i64, i64)> = sqlx::query_as(&format!(
                 r#"
                 UPDATE {}
                 SET state = 'running',
                     callback_id = NULL,
                     callback_timeout_at = NULL,
-                    callback_filter = NULL,
-                    callback_on_complete = NULL,
-                    callback_on_fail = NULL,
-                    callback_transform = NULL,
-                    heartbeat_at = clock_timestamp(),
-                    payload = jsonb_set(
-                        payload,
-                        '{{metadata,_awa_callback_result}}',
-                        to_jsonb($3::jsonb),
-                        true
-                    )
+                    heartbeat_at = clock_timestamp()
                 WHERE callback_id = $1
                   AND state IN ('waiting_external', 'running')
                   AND ($2::bigint IS NULL OR run_lease = $2)
-                RETURNING
-                    ready_slot,
-                    ready_generation,
-                    job_id,
-                    kind,
-                    queue,
-                    args,
-                    state,
-                    priority,
-                    attempt,
-                    run_lease,
-                    max_attempts,
-                    lane_seq,
-                    run_at,
-                    heartbeat_at,
-                    deadline_at,
-                    attempted_at,
-                    finalized_at,
-                    created_at,
-                    unique_key,
-                    unique_states,
-                    callback_id,
-                    callback_timeout_at,
-                    callback_filter,
-                    callback_on_complete,
-                    callback_on_fail,
-                    callback_transform,
-                    payload
+                RETURNING job_id, run_lease
                 "#,
                 self.leases_table()
             ))
             .bind(callback_id)
             .bind(run_lease)
-            .bind(payload.unwrap_or(serde_json::Value::Null))
-            .fetch_optional(pool)
+            .fetch_optional(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
-            return row.map(LeaseJobRow::into_job_row).transpose()?.ok_or(
-                AwaError::CallbackNotFound {
+            let Some((job_id, run_lease)) = resumed else {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                return Err(AwaError::CallbackNotFound {
                     callback_id: callback_id.to_string(),
-                },
-            );
+                });
+            };
+
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {} (
+                    job_id,
+                    run_lease,
+                    callback_filter,
+                    callback_on_complete,
+                    callback_on_fail,
+                    callback_transform,
+                    callback_result,
+                    updated_at
+                )
+                VALUES ($1, $2, NULL, NULL, NULL, NULL, $3, clock_timestamp())
+                ON CONFLICT (job_id, run_lease)
+                DO UPDATE SET
+                    callback_filter = NULL,
+                    callback_on_complete = NULL,
+                    callback_on_fail = NULL,
+                    callback_transform = NULL,
+                    callback_result = EXCLUDED.callback_result,
+                    updated_at = clock_timestamp()
+                "#,
+                self.attempt_state_table()
+            ))
+            .bind(job_id)
+            .bind(run_lease)
+            .bind(payload.unwrap_or(serde_json::Value::Null))
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            tx.commit().await.map_err(map_sqlx_error)?;
+
+            return self
+                .load_job(pool, job_id)
+                .await?
+                .ok_or(AwaError::CallbackNotFound {
+                    callback_id: callback_id.to_string(),
+                });
         }
 
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE callback_id = $1
@@ -3350,38 +4288,41 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Err(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             });
-        };
+        }
 
-        let mut payload = RuntimePayload::from_json(moved.payload.clone())?;
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted callback lease");
+
+        let mut payload =
+            RuntimePayload::from_json(Self::payload_with_attempt_state(
+                moved.payload.clone(),
+                moved.progress.clone(),
+            )?)?;
         payload.set_progress(None);
         let done_row =
             moved
@@ -3402,9 +4343,25 @@ impl QueueStorage {
         error: &str,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
+        self.fail_external_with_error_entry(
+            pool,
+            callback_id,
+            serde_json::json!({ "error": error }),
+            run_lease,
+        )
+        .await
+    }
+
+    pub async fn fail_external_with_error_entry(
+        &self,
+        pool: &PgPool,
+        callback_id: Uuid,
+        error_entry: serde_json::Value,
+        run_lease: Option<i64>,
+    ) -> Result<JobRow, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE callback_id = $1
@@ -3414,39 +4371,58 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Err(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             });
-        };
+        }
 
-        let mut payload = RuntimePayload::from_json(moved.payload.clone())?;
-        payload.push_error(lifecycle_error(error, moved.attempt, true));
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted callback lease");
+
+        let mut payload =
+            RuntimePayload::from_json(Self::payload_with_attempt_state(
+                moved.payload.clone(),
+                moved.progress.clone(),
+            )?)?;
+        let mut error_entry = match error_entry {
+            serde_json::Value::Object(map) => serde_json::Value::Object(map),
+            other => serde_json::json!({ "error": other }),
+        };
+        let error_obj = error_entry
+            .as_object_mut()
+            .ok_or_else(|| AwaError::Validation("callback error entry must be an object".into()))?;
+        error_obj
+            .entry("attempt".to_string())
+            .or_insert_with(|| serde_json::Value::from(i64::from(moved.attempt)));
+        error_obj
+            .entry("at".to_string())
+            .or_insert_with(|| serde_json::Value::String(Utc::now().to_rfc3339()));
+        error_obj
+            .entry("terminal".to_string())
+            .or_insert(serde_json::Value::Bool(true));
+        payload.push_error(error_entry);
         let done_row =
             moved
                 .clone()
@@ -3467,7 +4443,7 @@ impl QueueStorage {
     ) -> Result<JobRow, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE callback_id = $1
@@ -3477,43 +4453,45 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Err(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             });
-        };
+        }
+
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted callback lease");
+
+        let ready_payload =
+            Self::payload_with_attempt_state(moved.payload.clone(), moved.progress.clone())?;
 
         let ready_row = ExistingReadyRow {
             attempt: 0,
             run_at: Utc::now(),
             ..moved
                 .clone()
-                .into_ready_row(Utc::now(), moved.payload.clone())
+                .into_ready_row(Utc::now(), ready_payload)
         };
         self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(moved.state))
             .await?;
@@ -3547,40 +4525,13 @@ impl QueueStorage {
         callback_id: Uuid,
         timeout: Duration,
     ) -> Result<JobRow, AwaError> {
-        let row: Option<LeaseJobRow> = sqlx::query_as(&format!(
+        let updated: Option<(i64, i64)> = sqlx::query_as(&format!(
             r#"
             UPDATE {}
             SET callback_timeout_at = clock_timestamp() + make_interval(secs => $2)
             WHERE callback_id = $1
               AND state = 'waiting_external'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                run_at,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                callback_id,
-                callback_timeout_at,
-                callback_filter,
-                callback_on_complete,
-                callback_on_fail,
-                callback_transform,
-                payload
+            RETURNING job_id, run_lease
             "#,
             self.leases_table()
         ))
@@ -3590,8 +4541,14 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        row.map(LeaseJobRow::into_job_row)
-            .transpose()?
+        let Some((job_id, _run_lease)) = updated else {
+            return Err(AwaError::CallbackNotFound {
+                callback_id: callback_id.to_string(),
+            });
+        };
+
+        self.load_job(pool, job_id)
+            .await?
             .ok_or(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             })
@@ -3606,12 +4563,18 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         sqlx::query(&format!(
             r#"
-            UPDATE {}
-            SET payload = jsonb_set(payload, '{{progress}}', to_jsonb($3::jsonb), true)
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state IN ('running', 'waiting_external')
+            INSERT INTO {} (job_id, run_lease, progress, updated_at)
+            SELECT lease.job_id, lease.run_lease, $3, clock_timestamp()
+            FROM {} AS lease
+            WHERE lease.job_id = $1
+              AND lease.run_lease = $2
+              AND lease.state IN ('running', 'waiting_external')
+            ON CONFLICT (job_id, run_lease)
+            DO UPDATE SET
+                progress = EXCLUDED.progress,
+                updated_at = clock_timestamp()
             "#,
+            self.attempt_state_table(),
             self.leases_table()
         ))
         .bind(job_id)
@@ -3668,35 +4631,45 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        let schema = self.schema();
         let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _, _)| *job_id).collect();
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
         let progress: Vec<serde_json::Value> =
             jobs.iter().map(|(_, _, value)| value.clone()).collect();
-        let result = sqlx::query(&format!(
+        let updated: i64 = sqlx::query_scalar(&format!(
             r#"
             WITH inflight AS (
                 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[]) AS v(job_id, run_lease, progress)
+            ),
+            updated AS (
+                UPDATE {} AS lease
+                SET heartbeat_at = clock_timestamp()
+                FROM inflight
+                WHERE lease.job_id = inflight.job_id
+                  AND lease.run_lease = inflight.run_lease
+                  AND lease.state = 'running'
+                RETURNING lease.job_id, lease.run_lease, inflight.progress
+            ),
+            upsert_attempt AS (
+                INSERT INTO {schema}.attempt_state (job_id, run_lease, progress, updated_at)
+                SELECT job_id, run_lease, progress, clock_timestamp()
+                FROM updated
+                ON CONFLICT (job_id, run_lease)
+                DO UPDATE SET
+                    progress = EXCLUDED.progress,
+                    updated_at = clock_timestamp()
             )
-            UPDATE {}
-            SET heartbeat_at = clock_timestamp(),
-                payload = jsonb_set(payload, '{{progress}}', to_jsonb(inflight.progress), true)
-            FROM inflight
-            WHERE {}.job_id = inflight.job_id
-              AND {}.run_lease = inflight.run_lease
-              AND {}.state = 'running'
+            SELECT count(*)::bigint FROM updated
             "#,
-            self.leases_table(),
-            self.leases_table(),
-            self.leases_table(),
             self.leases_table()
         ))
         .bind(&job_ids)
         .bind(&run_leases)
         .bind(&progress)
-        .execute(pool)
+        .fetch_one(pool)
         .await
         .map_err(map_sqlx_error)?;
-        Ok(result.rows_affected() as usize)
+        Ok(updated as usize)
     }
 
     pub async fn retry_after(
@@ -3709,7 +4682,7 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id = $1
@@ -3719,36 +4692,35 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(job_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        };
+        }
 
-        let payload = Self::with_progress(moved.payload.clone(), progress)?;
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted running lease");
+
+        let payload = Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let deferred = moved.clone().into_deferred_row(
             JobState::Retryable,
             Utc::now()
@@ -3776,7 +4748,7 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id = $1
@@ -3786,36 +4758,35 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(job_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        };
+        }
 
-        let payload = Self::with_progress(moved.payload.clone(), progress)?;
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted running lease");
+
+        let payload = Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let mut deferred = moved.clone().into_deferred_row(
             JobState::Scheduled,
             Utc::now()
@@ -3843,7 +4814,7 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id = $1
@@ -3853,36 +4824,35 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(job_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        };
+        }
 
-        let payload = Self::with_progress(moved.payload.clone(), progress)?;
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted running lease");
+
+        let payload = Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let done = moved
             .clone()
             .into_done_row(JobState::Cancelled, Utc::now(), payload);
@@ -3904,7 +4874,7 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id = $1
@@ -3914,37 +4884,38 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(job_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        };
+        }
 
-        let mut payload =
-            RuntimePayload::from_json(Self::with_progress(moved.payload.clone(), progress)?)?;
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted running lease");
+
+        let mut payload = RuntimePayload::from_json(Self::with_progress(
+            moved.payload.clone(),
+            progress.or(moved.progress.clone()),
+        )?)?;
         payload.push_error(lifecycle_error(error, moved.attempt, true));
         let done = moved
             .clone()
@@ -3968,7 +4939,7 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id = $1
@@ -3978,39 +4949,40 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(job_id)
         .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        };
+        }
+
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted running lease");
 
         let finalized_at = Utc::now();
         let dlq_at = finalized_at;
-        let mut payload =
-            RuntimePayload::from_json(Self::with_progress(moved.payload.clone(), progress)?)?;
+        let mut payload = RuntimePayload::from_json(Self::with_progress(
+            moved.payload.clone(),
+            progress.or(moved.progress.clone()),
+        )?)?;
         payload.push_error(lifecycle_error(error, moved.attempt, true));
         let dlq_row = moved.clone().into_dlq_row(
             finalized_at,
@@ -4174,22 +5146,19 @@ impl QueueStorage {
         ))
     }
 
-    pub async fn fail_retryable(
+    pub async fn discard_failed_by_kind(
         &self,
         pool: &PgPool,
-        job_id: i64,
-        run_lease: i64,
-        error: &str,
-        progress: Option<serde_json::Value>,
-    ) -> Result<Option<JobRow>, AwaError> {
+        kind: &str,
+    ) -> Result<u64, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Option<LeaseTransitionRow> = sqlx::query_as(&format!(
+
+        let deleted_done: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
+            DELETE FROM {schema}.done_entries
+            WHERE kind = $1
+              AND state = 'failed'
             RETURNING
                 ready_slot,
                 ready_generation,
@@ -4212,19 +5181,132 @@ impl QueueStorage {
                 payload
             "#
         ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_optional(tx.as_mut())
+        .bind(kind)
+        .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let Some(moved) = moved else {
+        let deleted_dlq: Vec<DlqJobRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.dlq_entries
+            WHERE kind = $1
+            RETURNING
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload,
+                dlq_reason,
+                dlq_at,
+                original_run_lease
+            "#
+        ))
+        .bind(kind)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let mut deleted_counts_by_lane = BTreeMap::<(String, i16), i64>::new();
+
+        for row in &deleted_done {
+            self.sync_unique_claim(
+                &mut tx,
+                row.job_id,
+                &row.unique_key,
+                row.unique_states.as_deref(),
+                Some(row.state),
+                None,
+            )
+            .await?;
+            *deleted_counts_by_lane
+                .entry((row.queue.clone(), row.priority))
+                .or_default() += 1;
+        }
+
+        for row in &deleted_dlq {
+            self.sync_unique_claim(
+                &mut tx,
+                row.job_id,
+                &row.unique_key,
+                row.unique_states.as_deref(),
+                Some(row.state),
+                None,
+            )
+            .await?;
+        }
+
+        for ((queue, priority), count) in deleted_counts_by_lane {
+            self.adjust_lane_counts(&mut tx, &queue, priority, 0, 0, -count)
+                .await?;
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok((deleted_done.len() + deleted_dlq.len()) as u64)
+    }
+
+    pub async fn fail_retryable(
+        &self,
+        pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        error: &str,
+        progress: Option<serde_json::Value>,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.leases
+            WHERE job_id = $1
+              AND run_lease = $2
+              AND state = 'running'
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                heartbeat_at,
+                deadline_at,
+                attempted_at,
+                callback_id,
+                callback_timeout_at
+            "#
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        };
+        }
 
-        let mut payload =
-            RuntimePayload::from_json(Self::with_progress(moved.payload.clone(), progress)?)?;
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = moved.into_iter().next().expect("deleted running lease");
+
+        let mut payload = RuntimePayload::from_json(Self::with_progress(
+            moved.payload.clone(),
+            progress.or(moved.progress.clone()),
+        )?)?;
         let exhausted = moved.attempt >= moved.max_attempts;
         payload.push_error(lifecycle_error(error, moved.attempt, exhausted));
 
@@ -4266,7 +5348,7 @@ impl QueueStorage {
         let cutoff = Utc::now()
             - TimeDelta::from_std(staleness)
                 .map_err(|err| AwaError::Validation(format!("invalid staleness: {err}")))?;
-        let moved: Vec<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id IN (
@@ -4282,22 +5364,18 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .bind(cutoff)
@@ -4305,14 +5383,19 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if moved.is_empty() {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
-            let mut payload = RuntimePayload::from_json(row.payload.clone())?;
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                row.payload.clone(),
+                row.progress.clone(),
+            )?)?;
             payload.push_error(lifecycle_error(
                 "heartbeat stale: worker presumed dead",
                 row.attempt,
@@ -4338,7 +5421,7 @@ impl QueueStorage {
     pub async fn rescue_expired_deadlines(&self, pool: &PgPool) -> Result<Vec<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Vec<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id IN (
@@ -4355,36 +5438,37 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        if moved.is_empty() {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
-            let mut payload = RuntimePayload::from_json(row.payload.clone())?;
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                row.payload.clone(),
+                row.progress.clone(),
+            )?)?;
             payload.push_error(lifecycle_error(
                 "hard deadline exceeded",
                 row.attempt,
@@ -4410,7 +5494,7 @@ impl QueueStorage {
     pub async fn rescue_expired_callbacks(&self, pool: &PgPool) -> Result<Vec<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let moved: Vec<LeaseTransitionRow> = sqlx::query_as(&format!(
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
             WHERE job_id IN (
@@ -4427,36 +5511,37 @@ impl QueueStorage {
                 ready_slot,
                 ready_generation,
                 job_id,
-                kind,
                 queue,
-                args,
                 state,
                 priority,
                 attempt,
                 run_lease,
                 max_attempts,
                 lane_seq,
-                run_at,
+                heartbeat_at,
+                deadline_at,
                 attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
+                callback_id,
+                callback_timeout_at
             "#
         ))
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        if moved.is_empty() {
+        if deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
+        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
-            let mut payload = RuntimePayload::from_json(row.payload.clone())?;
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                row.payload.clone(),
+                row.progress.clone(),
+            )?)?;
             let exhausted = row.attempt >= row.max_attempts;
             payload.push_error(lifecycle_error(
                 "callback timed out",
@@ -4798,6 +5883,25 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+        sqlx::query(&format!(
+            r#"
+            WITH pruned AS (
+                SELECT queue, priority, count(*)::bigint AS terminal_count
+                FROM {}
+                GROUP BY queue, priority
+            )
+            UPDATE {schema}.queue_lanes AS lanes
+            SET completed_count = lanes.completed_count + pruned.terminal_count
+            FROM pruned
+            WHERE lanes.queue = pruned.queue
+              AND lanes.priority = pruned.priority
+            "#,
+            done_child_name(schema, slot as usize),
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         let truncate = sqlx::query(&format!(
             "TRUNCATE TABLE {}, {}",
             ready_child_name(schema, slot as usize),
@@ -4902,5 +6006,9 @@ impl QueueStorage {
 
     fn leases_table(&self) -> String {
         format!("{}.{}", self.schema(), self.leases_relname())
+    }
+
+    fn attempt_state_table(&self) -> String {
+        format!("{}.{}", self.schema(), self.attempt_state_relname())
     }
 }

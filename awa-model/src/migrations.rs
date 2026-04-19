@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 10;
+pub const CURRENT_VERSION: i32 = 14;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -42,6 +42,26 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Storage transition metadata and canonical compat routing",
         &[V10_UP],
     ),
+    (
+        11,
+        "Compatibility insert function for queue storage",
+        &[V11_UP],
+    ),
+    (
+        12,
+        "Queue storage compatibility view for awa.jobs",
+        &[V12_UP],
+    ),
+    (
+        13,
+        "Canonical RETURNING fix for queue storage insert compatibility",
+        &[V13_UP],
+    ),
+    (
+        14,
+        "Queue storage compatibility view updated for narrow active leases",
+        &[V14_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -53,6 +73,34 @@ const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.s
 const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
 const V9_UP: &str = include_str!("../migrations/v009_descriptors.sql");
 const V10_UP: &str = include_str!("../migrations/v010_storage_transition_prep.sql");
+const V11_UP: &str = concat!(
+    include_str!("../migrations/v010_queue_storage_insert_compat.sql"),
+    "\n",
+    "INSERT INTO awa.schema_version (version, description)\n",
+    "VALUES (11, 'Compatibility insert function for queue storage')\n",
+    "ON CONFLICT (version) DO NOTHING;\n",
+);
+const V12_UP: &str = concat!(
+    include_str!("../migrations/v011_queue_storage_jobs_view_compat.sql"),
+    "\n",
+    "INSERT INTO awa.schema_version (version, description)\n",
+    "VALUES (12, 'Queue storage compatibility view for awa.jobs')\n",
+    "ON CONFLICT (version) DO NOTHING;\n",
+);
+const V13_UP: &str = concat!(
+    include_str!("../migrations/v010_queue_storage_insert_compat.sql"),
+    "\n",
+    "INSERT INTO awa.schema_version (version, description)\n",
+    "VALUES (13, 'Canonical RETURNING fix for queue storage insert compatibility')\n",
+    "ON CONFLICT (version) DO NOTHING;\n",
+);
+const V14_UP: &str = concat!(
+    include_str!("../migrations/v011_queue_storage_jobs_view_compat.sql"),
+    "\n",
+    "INSERT INTO awa.schema_version (version, description)\n",
+    "VALUES (14, 'Queue storage compatibility view updated for narrow active leases')\n",
+    "ON CONFLICT (version) DO NOTHING;\n",
+);
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

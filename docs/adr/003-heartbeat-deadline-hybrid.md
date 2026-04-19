@@ -8,8 +8,8 @@ Accepted
 
 ADR-019 changes where the mutable runtime fields live. In the canonical engine
 the heartbeat and deadline timestamps sit on `awa.jobs_hot`; in the queue
-storage redesign they move to the lease/runtime sidecar. The recovery policy in
-this ADR remains unchanged.
+storage redesign they move to the `active_leases` and `attempt_state` tables. The
+recovery policy in this ADR remains unchanged.
 
 ## Context
 

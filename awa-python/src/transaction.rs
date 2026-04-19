@@ -414,7 +414,19 @@ where
     sqlx::query_as::<_, JobRow>(
         r#"
         SELECT *
-        FROM awa.insert_job_compat($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::bit(8))
+        FROM awa.insert_job_compat(
+            $1,
+            $2,
+            $3,
+            $4,
+            $5,
+            $6,
+            $7,
+            $8,
+            $9,
+            $10,
+            $11::bit(8)
+        )
         "#,
     )
     .bind(kind)

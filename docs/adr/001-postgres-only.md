@@ -7,8 +7,9 @@ Accepted
 ## Note
 
 ADR-019 changes Awa's primary physical storage layout from the canonical
-`jobs_hot` / `scheduled_jobs` split to queue segments plus a lease/runtime
-sidecar. The decision in this ADR still stands: Awa remains Postgres-only, and
+`jobs_hot` / `scheduled_jobs` split to queue segments plus `active_leases`,
+`attempt_state`, and `lane_state`. The decision in this ADR still stands: Awa remains
+Postgres-only, and
 the redesign continues to lean on Postgres-native primitives rather than a
 pluggable storage abstraction.
 
