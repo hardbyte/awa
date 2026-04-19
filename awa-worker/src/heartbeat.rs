@@ -1,4 +1,5 @@
 use crate::runtime::{InFlightMap, RunLease};
+use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use sqlx::PgPool;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -9,6 +10,7 @@ use tracing::{debug, warn};
 /// for all in-flight jobs, and flushes pending progress updates.
 pub struct HeartbeatService {
     pool: PgPool,
+    storage: RuntimeStorage,
     in_flight: InFlightMap,
     interval: std::time::Duration,
     batch_size: usize,
@@ -20,6 +22,7 @@ pub struct HeartbeatService {
 impl HeartbeatService {
     pub(crate) fn new(
         pool: PgPool,
+        storage: RuntimeStorage,
         in_flight: InFlightMap,
         interval: std::time::Duration,
         alive: Arc<AtomicBool>,
@@ -28,6 +31,7 @@ impl HeartbeatService {
     ) -> Self {
         Self {
             pool,
+            storage,
             in_flight,
             interval,
             batch_size: 500,
@@ -87,8 +91,23 @@ impl HeartbeatService {
             .filter(|key| !progress_keys.contains(key))
             .copied()
             .collect();
+        match &self.storage {
+            RuntimeStorage::Canonical => {
+                self.heartbeat_once_canonical(&heartbeat_only, &pending_progress)
+                    .await;
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                self.heartbeat_once_queue_storage(runtime, &heartbeat_only, &pending_progress)
+                    .await;
+            }
+        }
+    }
 
-        // Tier 1: heartbeat-only jobs (unchanged query)
+    async fn heartbeat_once_canonical(
+        &self,
+        heartbeat_only: &[(i64, RunLease)],
+        pending_progress: &[(i64, i64, u64, serde_json::Value)],
+    ) {
         for chunk in heartbeat_only.chunks(self.batch_size) {
             let job_ids: Vec<i64> = chunk.iter().map(|(job_id, _)| *job_id).collect();
             let run_leases: Vec<i64> = chunk.iter().map(|(_, run_lease)| *run_lease).collect();
@@ -132,7 +151,6 @@ impl HeartbeatService {
             }
         }
 
-        // Tier 2: jobs with pending progress (heartbeat + progress flush)
         if !pending_progress.is_empty() {
             for chunk in pending_progress.chunks(self.batch_size) {
                 let job_ids: Vec<i64> = chunk.iter().map(|(id, _, _, _)| *id).collect();
@@ -175,7 +193,6 @@ impl HeartbeatService {
                             updated = result.rows_affected(),
                             "Heartbeat+progress batch sent"
                         );
-                        // Acknowledge successful flush
                         let acked: Vec<(i64, i64, u64)> = chunk
                             .iter()
                             .map(|(id, lease, gen, _)| (*id, *lease, *gen))
@@ -184,7 +201,60 @@ impl HeartbeatService {
                     }
                     Err(err) => {
                         warn!(error = %err, "Failed to send heartbeat+progress batch");
-                        // Clear in-flight snapshots so they can be retried next cycle
+                        let failed: Vec<(i64, i64, u64)> = chunk
+                            .iter()
+                            .map(|(id, lease, gen, _)| (*id, *lease, *gen))
+                            .collect();
+                        self.in_flight.clear_in_flight_progress(&failed);
+                    }
+                }
+            }
+        }
+    }
+
+    async fn heartbeat_once_queue_storage(
+        &self,
+        runtime: &QueueStorageRuntime,
+        heartbeat_only: &[(i64, RunLease)],
+        pending_progress: &[(i64, i64, u64, serde_json::Value)],
+    ) {
+        for chunk in heartbeat_only.chunks(self.batch_size) {
+            match runtime.store.heartbeat_batch(&self.pool, chunk).await {
+                Ok(updated) => {
+                    self.metrics.heartbeat_batches.add(1, &[]);
+                    debug!(count = chunk.len(), updated, "Heartbeat batch sent");
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to send heartbeat batch");
+                }
+            }
+        }
+
+        if !pending_progress.is_empty() {
+            for chunk in pending_progress.chunks(self.batch_size) {
+                let heartbeat_batch: Vec<(i64, i64, serde_json::Value)> = chunk
+                    .iter()
+                    .map(|(id, lease, _, progress)| (*id, *lease, progress.clone()))
+                    .collect();
+                match runtime
+                    .store
+                    .heartbeat_progress_batch(&self.pool, &heartbeat_batch)
+                    .await
+                {
+                    Ok(updated) => {
+                        self.metrics.heartbeat_batches.add(1, &[]);
+                        debug!(
+                            count = chunk.len(),
+                            updated, "Heartbeat+progress batch sent"
+                        );
+                        let acked: Vec<(i64, i64, u64)> = chunk
+                            .iter()
+                            .map(|(id, lease, gen, _)| (*id, *lease, *gen))
+                            .collect();
+                        self.in_flight.ack_progress(&acked);
+                    }
+                    Err(err) => {
+                        warn!(error = %err, "Failed to send heartbeat+progress batch");
                         let failed: Vec<(i64, i64, u64)> = chunk
                             .iter()
                             .map(|(id, lease, gen, _)| (*id, *lease, *gen))

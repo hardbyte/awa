@@ -105,7 +105,7 @@ impl TestClient {
         let progress = Arc::new(std::sync::Mutex::new(ProgressState::new(
             job.progress.clone(),
         )));
-        let ctx = JobContext::new(
+        let ctx = JobContext::new_for_testing(
             job.clone(),
             cancel,
             state,

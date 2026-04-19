@@ -10,7 +10,7 @@
 mod bench_output;
 
 use awa::model::{
-    insert_many, insert_many_copy_from_pool, migrations, VacuumAwareConfig, VacuumAwareStore,
+    insert_many, insert_many_copy_from_pool, migrations, QueueStorage, QueueStorageConfig,
 };
 use awa::{
     Client, InsertOpts, InsertParams, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker,
@@ -47,12 +47,12 @@ async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
         .await;
 }
 
-async fn recreate_vacuum_aware_schema(pool: &sqlx::PgPool, store: &VacuumAwareStore) {
+async fn recreate_queue_storage_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
     sqlx::query(&drop_sql)
         .execute(pool)
         .await
-        .expect("Failed to drop vacuum-aware benchmark schema");
+        .expect("Failed to drop queue storage benchmark schema");
 }
 
 async fn sample_pgstattuple_dead_tuples(
@@ -517,12 +517,12 @@ async fn test_throughput_rust_workers() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-async fn test_throughput_rust_workers_vacuum_aware() {
+async fn test_throughput_rust_workers_queue_storage() {
     let pool = setup(20).await;
     ensure_pgstattuple(&pool).await;
     reset_runtime_state(&pool).await;
 
-    let queue = "bench_throughput_vacuum_aware";
+    let queue = "bench_throughput_queue_storage";
     let total_jobs: i64 = env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 10_000);
     let batch_size = env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500);
     let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
@@ -530,22 +530,22 @@ async fn test_throughput_rust_workers_vacuum_aware() {
     let queue_rotate_ms = env_i64("AWA_VA_RUNTIME_QUEUE_ROTATE_MS", 1_000);
     let lease_rotate_ms = env_i64("AWA_VA_RUNTIME_LEASE_ROTATE_MS", 50);
 
-    let store_config = VacuumAwareConfig {
+    let store_config = QueueStorageConfig {
         queue_slot_count,
         lease_slot_count,
         ..Default::default()
     };
     let store =
-        VacuumAwareStore::new(store_config.clone()).expect("Failed to build vacuum-aware store");
-    recreate_vacuum_aware_schema(&pool, &store).await;
+        QueueStorage::new(store_config.clone()).expect("Failed to build queue storage store");
+    recreate_queue_storage_schema(&pool, &store).await;
     store
         .install(&pool)
         .await
-        .expect("Failed to install vacuum-aware store");
+        .expect("Failed to install queue storage store");
     store
         .reset(&pool)
         .await
-        .expect("Failed to reset vacuum-aware store");
+        .expect("Failed to reset queue storage store");
 
     let client = Client::builder(pool.clone())
         .queue(
@@ -556,19 +556,19 @@ async fn test_throughput_rust_workers_vacuum_aware() {
                 ..QueueConfig::default()
             },
         )
-        .experimental_vacuum_aware_storage(
+        .queue_storage(
             store_config,
             Duration::from_millis(queue_rotate_ms as u64),
             Duration::from_millis(lease_rotate_ms as u64),
         )
         .register_worker(BenchWorker)
         .build()
-        .expect("Failed to build vacuum-aware client");
+        .expect("Failed to build queue storage client");
 
     client
         .start()
         .await
-        .expect("Failed to start vacuum-aware client");
+        .expect("Failed to start queue storage client");
 
     let insert_start = Instant::now();
     for batch_start in (0..total_jobs).step_by(batch_size) {
@@ -589,7 +589,7 @@ async fn test_throughput_rust_workers_vacuum_aware() {
         store
             .enqueue_params_batch(&pool, &params)
             .await
-            .expect("Failed to enqueue vacuum-aware runtime batch");
+            .expect("Failed to enqueue queue storage runtime batch");
     }
     let insert_elapsed = insert_start.elapsed();
     println!(
@@ -609,7 +609,7 @@ async fn test_throughput_rust_workers_vacuum_aware() {
             let counts = store
                 .queue_counts(&pool, queue)
                 .await
-                .expect("Failed to sample vacuum-aware queue counts");
+                .expect("Failed to sample queue storage queue counts");
             panic!(
                 "Vacuum-aware timeout after 30s: completed={}/{} available={} running={}",
                 counts.completed, total_jobs, counts.available, counts.running
@@ -620,7 +620,7 @@ async fn test_throughput_rust_workers_vacuum_aware() {
         let counts = store
             .queue_counts(&pool, queue)
             .await
-            .expect("Failed to sample vacuum-aware queue counts");
+            .expect("Failed to sample queue storage queue counts");
 
         if counts.completed == total_jobs {
             let processing_elapsed = processing_start.elapsed();
@@ -782,10 +782,10 @@ async fn test_pickup_latency_listen_notify() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
-async fn test_pickup_latency_listen_notify_vacuum_aware() {
+async fn test_pickup_latency_listen_notify_queue_storage() {
     let pool = setup(10).await;
-    let queue = "bench_latency_vacuum_aware";
-    let store_config = VacuumAwareConfig {
+    let queue = "bench_latency_queue_storage";
+    let store_config = QueueStorageConfig {
         queue_slot_count: env_usize("AWA_VA_LATENCY_QUEUE_SLOTS", 16),
         lease_slot_count: env_usize("AWA_VA_LATENCY_LEASE_SLOTS", 4),
         ..Default::default()
@@ -793,16 +793,16 @@ async fn test_pickup_latency_listen_notify_vacuum_aware() {
     let queue_rotate_ms = env_i64("AWA_VA_LATENCY_QUEUE_ROTATE_MS", 1_000);
     let lease_rotate_ms = env_i64("AWA_VA_LATENCY_LEASE_ROTATE_MS", 50);
     let store =
-        VacuumAwareStore::new(store_config.clone()).expect("Failed to build vacuum-aware store");
-    recreate_vacuum_aware_schema(&pool, &store).await;
+        QueueStorage::new(store_config.clone()).expect("Failed to build queue storage store");
+    recreate_queue_storage_schema(&pool, &store).await;
     store
         .install(&pool)
         .await
-        .expect("Failed to install vacuum-aware latency store");
+        .expect("Failed to install queue storage latency store");
     store
         .reset(&pool)
         .await
-        .expect("Failed to reset vacuum-aware latency store");
+        .expect("Failed to reset queue storage latency store");
 
     let (pickup_tx, mut pickup_rx) = tokio::sync::mpsc::unbounded_channel::<std::time::Instant>();
 
@@ -831,19 +831,19 @@ async fn test_pickup_latency_listen_notify_vacuum_aware() {
                 ..QueueConfig::default()
             },
         )
-        .experimental_vacuum_aware_storage(
+        .queue_storage(
             store_config,
             Duration::from_millis(queue_rotate_ms as u64),
             Duration::from_millis(lease_rotate_ms as u64),
         )
         .register_worker(LatencyWorker { tx: pickup_tx })
         .build()
-        .expect("Failed to build vacuum-aware client");
+        .expect("Failed to build queue storage client");
 
     client
         .start()
         .await
-        .expect("Failed to start vacuum-aware client");
+        .expect("Failed to start queue storage client");
 
     tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -864,11 +864,11 @@ async fn test_pickup_latency_listen_notify_vacuum_aware() {
         store
             .enqueue_params_batch(&pool, &params)
             .await
-            .expect("Failed to enqueue vacuum-aware latency job");
+            .expect("Failed to enqueue queue storage latency job");
 
         let pickup_time = tokio::time::timeout(Duration::from_secs(5), pickup_rx.recv())
             .await
-            .expect("Timeout waiting for vacuum-aware job pickup")
+            .expect("Timeout waiting for queue storage job pickup")
             .expect("Vacuum-aware pickup channel closed unexpectedly");
 
         latencies.push(pickup_time.duration_since(insert_time));

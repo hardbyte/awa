@@ -181,7 +181,7 @@ impl CompletionWorker {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(AwaError::Database),
-            RuntimeStorage::VacuumAware(runtime) => {
+            RuntimeStorage::QueueStorage(runtime) => {
                 runtime
                     .store
                     .complete_job_batch_by_id(

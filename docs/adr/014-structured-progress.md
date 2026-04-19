@@ -4,6 +4,13 @@
 
 Accepted
 
+## Note
+
+ADR-019 changes the physical storage of progress. The user-facing progress
+model in this ADR stays the same, but queue storage persists progress inside
+the lease/runtime payload rather than dedicated `progress` columns on
+`jobs_hot` and `scheduled_jobs`.
+
 ## Context
 
 Long-running handlers had no way to report progress or update checkpoint

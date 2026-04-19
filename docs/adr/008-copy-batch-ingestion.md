@@ -18,6 +18,11 @@ The original COPY design predated later architectural changes:
 - uniqueness is enforced through `awa.job_unique_claims`
 - callers may invoke COPY multiple times inside one outer transaction
 
+ADR-019 supersedes the hot/deferred physical layout as Awa's primary storage
+engine. The staging-table decision in this ADR still stands, but backend-aware
+routing now needs to target the active storage engine rather than assuming the
+canonical tables are the hot path forever.
+
 ## Decision
 
 Implement batch ingestion via a staging-table approach:

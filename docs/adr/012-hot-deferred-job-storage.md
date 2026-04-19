@@ -2,7 +2,14 @@
 
 ## Status
 
-Accepted
+Superseded by ADR-019
+
+## Note
+
+This ADR remains the historical explanation for the canonical hot/deferred
+split. ADR-019 replaces it as the primary storage direction for the queue
+storage engine by moving from mutable state rows to append-only queue segments
+plus a narrow lease/runtime sidecar.
 
 ## Context
 

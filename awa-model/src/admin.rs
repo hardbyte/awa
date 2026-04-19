@@ -1,5 +1,7 @@
+use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
+use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -34,6 +36,8 @@ pub struct JobDump {
     pub job: JobRow,
     pub summary: JobDumpSummary,
     pub timeline: Vec<JobTimelineEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq: Option<DlqMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,7 +198,7 @@ fn build_job_timeline(job: &JobRow) -> Vec<JobTimelineEvent> {
     events
 }
 
-fn build_job_dump(job: JobRow) -> JobDump {
+fn build_job_dump(job: JobRow, dlq: Option<DlqMetadata>) -> JobDump {
     let latest_error = job
         .errors
         .as_ref()
@@ -202,11 +206,12 @@ fn build_job_dump(job: JobRow) -> JobDump {
         .cloned();
     let summary = JobDumpSummary {
         original_priority: original_priority(&job),
-        can_retry: matches!(
-            job.state,
-            JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
-        ),
-        can_cancel: !job.state.is_terminal(),
+        can_retry: dlq.is_none()
+            && matches!(
+                job.state,
+                JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
+            ),
+        can_cancel: dlq.is_none() && !job.state.is_terminal(),
         error_count: job.errors.as_ref().map(|errors| errors.len()).unwrap_or(0),
         latest_error,
     };
@@ -215,6 +220,7 @@ fn build_job_dump(job: JobRow) -> JobDump {
         job,
         summary,
         timeline,
+        dlq,
     }
 }
 
@@ -238,6 +244,13 @@ fn callback_dump(job: &JobRow) -> Option<CallbackDump> {
     } else {
         Some(callback)
     }
+}
+
+async fn active_queue_storage(pool: &PgPool) -> Result<Option<QueueStorage>, AwaError> {
+    QueueStorage::active_schema(pool)
+        .await?
+        .map(QueueStorage::from_existing_schema)
+        .transpose()
 }
 
 /// Retry a single failed, cancelled, or waiting_external job.
@@ -1612,25 +1625,31 @@ where
 }
 
 /// Get a single job by ID.
-pub async fn get_job<'e, E>(executor: E, job_id: i64) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn get_job(pool: &PgPool, job_id: i64) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let row = store.load_job(pool, job_id).await?;
+        return row.ok_or(AwaError::JobNotFound { id: job_id });
+    }
+
     let row = sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
         .bind(job_id)
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?;
 
     row.ok_or(AwaError::JobNotFound { id: job_id })
 }
 
 /// Build a read-only inspection snapshot for one job.
-pub async fn dump_job<'e, E>(executor: E, job_id: i64) -> Result<JobDump, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let job = get_job(executor, job_id).await?;
-    Ok(build_job_dump(job))
+pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
+    let job = get_job(pool, job_id).await?;
+    let dlq = if active_queue_storage(pool).await?.is_some() {
+        crate::dlq::get_dlq_job(pool, job_id)
+            .await?
+            .map(|row| row.metadata())
+    } else {
+        None
+    };
+    Ok(build_job_dump(job, dlq))
 }
 
 /// Build a read-only inspection snapshot for one attempt.
@@ -1638,15 +1657,12 @@ where
 /// Awa does not currently persist a standalone runs table. The current attempt
 /// is inspected from the live job row. Historical attempts are reconstructed
 /// from the structured `errors[]` history.
-pub async fn dump_run<'e, E>(
-    executor: E,
+pub async fn dump_run(
+    pool: &PgPool,
     job_id: i64,
     attempt: Option<i16>,
-) -> Result<RunDump, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let job = get_job(executor, job_id).await?;
+) -> Result<RunDump, AwaError> {
+    let job = get_job(pool, job_id).await?;
     let selected_attempt = attempt.unwrap_or(job.attempt);
 
     if selected_attempt < 0 {
@@ -2081,15 +2097,18 @@ where
 /// about the callback.
 ///
 /// Returns the generated callback UUID on success.
-pub async fn register_callback<'e, E>(
-    executor: E,
+pub async fn register_callback(
+    pool: &PgPool,
     job_id: i64,
     run_lease: i64,
     timeout: std::time::Duration,
-) -> Result<Uuid, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<Uuid, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .register_callback(pool, job_id, run_lease, timeout)
+            .await;
+    }
+
     let callback_id = Uuid::new_v4();
     let timeout_secs = timeout.as_secs_f64();
     let result = sqlx::query(
@@ -2106,7 +2125,7 @@ where
     .bind(callback_id)
     .bind(timeout_secs)
     .bind(run_lease)
-    .execute(executor)
+    .execute(pool)
     .await?;
     if result.rows_affected() == 0 {
         return Err(AwaError::Validation("job is not in running state".into()));
@@ -2124,16 +2143,13 @@ where
 /// callback payload stored in metadata under `_awa_callback_result`. The
 /// handler can then read the result and continue processing (sequential
 /// callback pattern from ADR-016).
-pub async fn complete_external<'e, E>(
-    executor: E,
+pub async fn complete_external(
+    pool: &PgPool,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    complete_external_inner(executor, callback_id, payload, run_lease, false).await
+) -> Result<JobRow, AwaError> {
+    complete_external_inner(pool, callback_id, payload, run_lease, false).await
 }
 
 /// Complete a waiting job and resume the handler with the callback payload.
@@ -2141,28 +2157,28 @@ where
 /// Like `complete_external`, but the job transitions to `running` instead of
 /// `completed`, allowing the handler to continue with sequential callbacks.
 /// The payload is stored in `metadata._awa_callback_result`.
-pub async fn resume_external<'e, E>(
-    executor: E,
+pub async fn resume_external(
+    pool: &PgPool,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    complete_external_inner(executor, callback_id, payload, run_lease, true).await
+) -> Result<JobRow, AwaError> {
+    complete_external_inner(pool, callback_id, payload, run_lease, true).await
 }
 
-async fn complete_external_inner<'e, E>(
-    executor: E,
+async fn complete_external_inner(
+    pool: &PgPool,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
     resume: bool,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .complete_external(pool, callback_id, payload, run_lease, resume)
+            .await;
+    }
+
     let row = if resume {
         // Resume: transition to running, store payload, refresh heartbeat.
         // The handler is still alive and polling — it will detect the state change.
@@ -2187,7 +2203,7 @@ where
         .bind(callback_id)
         .bind(run_lease)
         .bind(&payload_json)
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?
     } else {
         // Complete: terminal state, clear everything.
@@ -2212,7 +2228,7 @@ where
         )
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?
     };
 
@@ -2224,15 +2240,18 @@ where
 /// Fail a waiting job via external callback.
 ///
 /// Records the error and transitions to `failed`.
-pub async fn fail_external<'e, E>(
-    executor: E,
+pub async fn fail_external(
+    pool: &PgPool,
     callback_id: Uuid,
     error: &str,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .fail_external(pool, callback_id, error, run_lease)
+            .await;
+    }
+
     let row = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -2259,7 +2278,7 @@ where
     .bind(callback_id)
     .bind(error)
     .bind(run_lease)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2276,14 +2295,15 @@ where
 /// terminal transitions, retry puts the job back to `available`. Allowing
 /// retry from `running` would risk concurrent dispatch if the original
 /// handler hasn't finished yet.
-pub async fn retry_external<'e, E>(
-    executor: E,
+pub async fn retry_external(
+    pool: &PgPool,
     callback_id: Uuid,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.retry_external(pool, callback_id, run_lease).await;
+    }
+
     let row = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -2306,7 +2326,7 @@ where
     )
     .bind(callback_id)
     .bind(run_lease)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2322,14 +2342,15 @@ where
 ///
 /// Returns the updated job row, or `CallbackNotFound` if the callback ID
 /// doesn't match a waiting job.
-pub async fn heartbeat_callback<'e, E>(
-    executor: E,
+pub async fn heartbeat_callback(
+    pool: &PgPool,
     callback_id: Uuid,
     timeout: std::time::Duration,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.heartbeat_callback(pool, callback_id, timeout).await;
+    }
+
     let timeout_secs = timeout.as_secs_f64();
     let row = sqlx::query_as::<_, JobRow>(
         r#"
@@ -2341,7 +2362,7 @@ where
     )
     .bind(callback_id)
     .bind(timeout_secs)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2354,14 +2375,11 @@ where
 /// Best-effort cleanup: returns `Ok(true)` if a row was updated,
 /// `Ok(false)` if no match (already resolved, rescued, or wrong lease).
 /// Callers should not treat `false` as an error.
-pub async fn cancel_callback<'e, E>(
-    executor: E,
-    job_id: i64,
-    run_lease: i64,
-) -> Result<bool, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Result<bool, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.cancel_callback(pool, job_id, run_lease).await;
+    }
+
     let result = sqlx::query(
         r#"
         UPDATE awa.jobs
@@ -2376,7 +2394,7 @@ where
     )
     .bind(job_id)
     .bind(run_lease)
-    .execute(executor)
+    .execute(pool)
     .await?;
 
     Ok(result.rows_affected() > 0)
@@ -2417,6 +2435,12 @@ pub async fn enter_callback_wait(
     run_lease: i64,
     callback_id: Uuid,
 ) -> Result<bool, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .enter_callback_wait(pool, job_id, run_lease, callback_id)
+            .await;
+    }
+
     let result = sqlx::query(
         r#"
         UPDATE awa.jobs
@@ -2445,6 +2469,10 @@ pub async fn check_callback_state(
     job_id: i64,
     callback_id: Uuid,
 ) -> Result<CallbackPollResult, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.check_callback_state(pool, job_id, callback_id).await;
+    }
+
     let row: Option<(JobState, Option<Uuid>, serde_json::Value)> =
         sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
             .bind(job_id)
@@ -2567,16 +2595,13 @@ impl ResolveOutcome {
 ///
 /// When the `cel` feature is disabled and any expression is non-None,
 /// returns `AwaError::Validation`.
-pub async fn register_callback_with_config<'e, E>(
-    executor: E,
+pub async fn register_callback_with_config(
+    pool: &PgPool,
     job_id: i64,
     run_lease: i64,
     timeout: std::time::Duration,
     config: &CallbackConfig,
-) -> Result<Uuid, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<Uuid, AwaError> {
     // Validate CEL expressions at registration time: compile + check references
     #[cfg(feature = "cel")]
     {
@@ -2620,6 +2645,12 @@ where
         }
     }
 
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .register_callback_with_config(pool, job_id, run_lease, timeout, config)
+            .await;
+    }
+
     let callback_id = Uuid::new_v4();
     let timeout_secs = timeout.as_secs_f64();
 
@@ -2641,7 +2672,7 @@ where
     .bind(&config.on_fail)
     .bind(&config.transform)
     .bind(run_lease)
-    .execute(executor)
+    .execute(pool)
     .await?;
 
     if result.rows_affected() == 0 {
