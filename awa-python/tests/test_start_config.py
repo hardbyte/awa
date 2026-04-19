@@ -246,3 +246,49 @@ async def test_per_queue_retention_in_dict_config(client):
         ]
     )
     await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_queue_storage_start_selects_runtime_backend(client):
+    """start() can explicitly run the Python worker on queue storage."""
+    queue = "cfg_queue_storage_runtime"
+    schema = "awa_py_cfg_runtime"
+    seen = asyncio.Event()
+
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    await tx.commit()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    try:
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_schema=schema,
+            queue_storage_queue_rotate_interval_ms=1000,
+            queue_storage_lease_rotate_interval_ms=50,
+        )
+        job = await client.insert(ConfigTestJob(value="queue-storage"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=2.0)
+        await client.shutdown()
+
+        fetched = await client.get_job(job.id)
+        assert fetched.state == awa.JobState.Completed
+
+        tx = await client.transaction()
+        backend = await tx.fetch_one(
+            "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+        )
+        await tx.commit()
+        assert backend["schema_name"] == schema
+    finally:
+        await client.shutdown()
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await tx.commit()

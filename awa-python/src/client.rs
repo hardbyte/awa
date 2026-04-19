@@ -1173,7 +1173,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=50))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -1192,6 +1192,11 @@ impl PyClient {
         heartbeat_staleness_ms: Option<u64>,
         deadline_rescue_interval_ms: Option<u64>,
         callback_rescue_interval_ms: Option<u64>,
+        queue_storage_schema: Option<String>,
+        queue_storage_queue_slot_count: u32,
+        queue_storage_lease_slot_count: u32,
+        queue_storage_queue_rotate_interval_ms: u64,
+        queue_storage_lease_rotate_interval_ms: u64,
     ) -> PyResult<Bound<'py, PyAny>> {
         {
             let guard = self.runtime.lock().expect("runtime mutex poisoned");
@@ -1292,6 +1297,38 @@ impl PyClient {
         }
         if let Some(ms) = callback_rescue_interval_ms {
             builder = builder.callback_rescue_interval(Duration::from_millis(ms));
+        }
+        if let Some(schema) = queue_storage_schema {
+            if queue_storage_queue_slot_count == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "queue_storage_queue_slot_count must be > 0",
+                ));
+            }
+            if queue_storage_lease_slot_count == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "queue_storage_lease_slot_count must be > 0",
+                ));
+            }
+            if queue_storage_queue_rotate_interval_ms == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "queue_storage_queue_rotate_interval_ms must be > 0",
+                ));
+            }
+            if queue_storage_lease_rotate_interval_ms == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "queue_storage_lease_rotate_interval_ms must be > 0",
+                ));
+            }
+
+            builder = builder.queue_storage(
+                QueueStorageConfig {
+                    schema,
+                    queue_slot_count: queue_storage_queue_slot_count as usize,
+                    lease_slot_count: queue_storage_lease_slot_count as usize,
+                },
+                Duration::from_millis(queue_storage_queue_rotate_interval_ms),
+                Duration::from_millis(queue_storage_lease_rotate_interval_ms),
+            );
         }
 
         for entry in &entries {

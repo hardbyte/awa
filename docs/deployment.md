@@ -23,6 +23,23 @@ In production, treat these as separate concerns:
 
 `awa serve` is an operator UI and admin API. It is not the worker runtime.
 
+## Storage Engine Rollout
+
+Treat the worker storage engine as a database-wide choice.
+
+- queue storage is the intended worker engine
+- canonical tables remain for compatibility and migration, not as a peer worker
+  runtime
+- mixed canonical and queue-storage worker fleets on the same database are not
+  supported
+
+When cutting over a database to queue storage:
+
+1. apply schema migrations first
+2. drain and stop the existing workers
+3. start only queue-storage workers
+4. verify `awa.runtime_storage_backends` and queue health before scaling out
+
 ## Connection Pool Sizing
 
 Practical starting point, based on the current runtime internals:
@@ -53,20 +70,23 @@ The Python client defaults to `max_connections=10`. `awa serve` defaults to a po
 
 ## PostgreSQL Workload Discipline
 
-Awa is tolerant of large deferred frontiers because it separates
-`awa.jobs_hot` from `awa.scheduled_jobs`, but it is still a high-churn Postgres
-workload. Operationally, the main pitfall is long-lived read transactions on
-the primary: a `REPEATABLE READ` or otherwise old snapshot can pin the MVCC
-horizon while workers continue to update and delete hot rows.
+Queue storage keeps the main ready path append-only, but Awa is still a
+high-churn Postgres workload. The main operational pitfall is no longer one
+giant mutable queue heap; it is long-lived readers or stale transactions that
+block lease or segment prune while the maintenance leader keeps rotating
+forward.
 
 Recommended practice:
 
 - keep analytical reads and admin transactions short on the primary
 - run long-lived reporting queries against a replica when possible
 - avoid leaving sessions `idle in transaction`
-- monitor `pg_stat_activity` and `pg_stat_user_tables` for long transactions
-  and rising `n_dead_tup` on `awa.jobs_hot`
-- tune autovacuum for the database if the queue is expected to churn heavily
+- monitor `pg_stat_activity` for long transactions
+- monitor `pg_stat_user_tables` on the active queue-storage schema; `ready`
+  segments should stay near zero dead tuples, lease segments may spike within
+  the rotation window but should collapse after prune, and `attempt_state`
+  should roughly track live long-running attempts
+- tune autovacuum for the database if the lease tables churn heavily
 
 The nightly MVCC benchmark exists to catch changes that make this failure mode
 worse, but it is not a substitute for keeping the primary free of stale
@@ -183,7 +203,12 @@ For smooth rollouts:
 3. Let old pods drain with `shutdown(...)`.
 4. Keep `terminationGracePeriodSeconds` slightly above that drain timeout.
 
-Because the schema migrations are additive-only, rolling upgrades are the normal path.
+Code-only releases can roll normally because the schema migrations are
+additive-only.
+
+Storage-engine cutovers are different: drain the old fleet completely, then
+start the queue-storage fleet. Do not run both worker engines during the same
+rollout window.
 
 ## Queue Isolation Patterns
 
