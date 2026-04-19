@@ -11,6 +11,7 @@ CREATE DATABASE awa_python_bench;
 CREATE DATABASE procrastinate_bench;
 CREATE DATABASE river_bench;
 CREATE DATABASE oban_bench;
+CREATE DATABASE pgque_bench;
 
 \connect awa_bench
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
@@ -28,4 +29,7 @@ CREATE EXTENSION IF NOT EXISTS pgstattuple;
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
 
 \connect oban_bench
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+\connect pgque_bench
 CREATE EXTENSION IF NOT EXISTS pgstattuple;

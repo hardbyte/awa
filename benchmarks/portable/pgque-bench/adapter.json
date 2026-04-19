@@ -1,0 +1,17 @@
+{
+  "system": "pgque",
+  "display_name": "PgQue (Python)",
+  "db_name": "pgque_bench",
+  "event_tables": [
+    "pgque.queue",
+    "pgque.consumer",
+    "pgque.subscription",
+    "pgque.tick",
+    "pgque.event_template",
+    "pgque.retry_queue",
+    "pgque.dead_letter",
+    "pgque.config"
+  ],
+  "event_indexes": [],
+  "extensions": []
+}

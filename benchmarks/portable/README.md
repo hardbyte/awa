@@ -1,14 +1,16 @@
 # Portable Cross-System Benchmarks
 
 Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
-Procrastinate (Python), River (Go), and Oban (Elixir) running against a shared
-Postgres instance.
+Procrastinate (Python), River (Go), Oban (Elixir), and PgQue (SQL/PL-pgSQL)
+running against a shared Postgres instance.
 
 ## Prerequisites
 
 - Docker and Docker Compose
 - Rust toolchain (for the Awa adapter)
 - No Go or Elixir installation required — River and Oban build inside Docker
+- Initialize git submodules so the PgQue adapter can install its SQL:
+  `git submodule update --init --recursive`
 
 ## Quick Start
 
@@ -66,7 +68,7 @@ benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
 ├── isolated.py            # Repeats one-system-per-run isolated benchmarks
 ├── docker-compose.yml     # Shared Postgres service (PG17 by default, PG18 via --pg-image)
-├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench
+├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench
 ├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
 │   ├── Dockerfile
@@ -88,6 +90,12 @@ benchmarks/portable/
 │   ├── config/
 │   ├── lib/
 │   └── priv/repo/migrations/
+├── pgque-bench/           # PgQue (SQL/PL-pgSQL) adapter (Docker, Python driver)
+│   ├── Dockerfile
+│   ├── adapter.json
+│   ├── main.py
+│   ├── pyproject.toml
+│   └── vendor/pgque/      # Git submodule pinned to upstream NikolayS/pgque
 └── results/               # JSON output from benchmark runs
 ```
 
@@ -192,6 +200,7 @@ Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
 | procrastinate | ✓ | ✓ |
 | river | ✓ | ✓ |
 | oban | ✓ | ✓ |
+| pgque | — | ✓ |
 
 `awa-docker` is excluded by default from the long-horizon runner because its
 line on any multi-hour dead-tuple / latency plot is the awa-native line —
