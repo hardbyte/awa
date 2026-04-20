@@ -195,6 +195,10 @@ def _base_env(manifest: AdapterManifest, overrides: dict[str, str]) -> dict[str,
         "JOB_PAYLOAD_BYTES": "256",
         "JOB_WORK_MS": "1",
         "SAMPLE_EVERY_S": "10",
+        # 0-indexed replica id. Defaults to 0 for single-replica runs
+        # (the only mode today); the multi-replica spawner (follow-up
+        # commit for #174) supplies distinct ids per subprocess.
+        "BENCH_INSTANCE_ID": "0",
     }
     env.update(
         {

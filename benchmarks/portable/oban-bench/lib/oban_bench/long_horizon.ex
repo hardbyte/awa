@@ -236,7 +236,22 @@ defmodule ObanBench.LongHorizon do
     end
   end
 
+  # Read BENCH_INSTANCE_ID (0 if unset or malformed). Stamped onto every
+  # descriptor + sample record so the harness attributes samples to the
+  # right replica without per-subprocess state.
+  defp instance_id do
+    case System.get_env("BENCH_INSTANCE_ID") do
+      nil -> 0
+      raw ->
+        case Integer.parse(raw) do
+          {n, ""} -> n
+          _ -> 0
+        end
+    end
+  end
+
   defp emit(record) do
+    record = Map.put_new(record, :instance_id, instance_id())
     IO.puts(Jason.encode!(record))
   end
 

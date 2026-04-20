@@ -414,6 +414,10 @@ class MetricsDaemon(threading.Thread):
         s = Sample(
             run_id=self.run_id,
             system=self.system,
+            # Cluster-scoped (pgstattuple, table sizes, etc.) — not per-
+            # replica. Always 0; analysis code treats instance_id=0 on
+            # a cluster subject_kind as "fleet-wide".
+            instance_id=0,
             elapsed_s=elapsed_s,
             sampled_at=sampled_at,
             phase_label=label,
@@ -485,9 +489,16 @@ def parse_adapter_record(
     sampled_at = rec.get("t") or now_iso()
     # Prefer harness clock for elapsed_s even if adapter supplies its own.
     elapsed_s = round(time.time() - bench_start, 3)
+    # instance_id defaults to 0 so legacy adapters that haven't been
+    # updated to report it still produce well-formed samples.
+    try:
+        instance_id = int(rec.get("instance_id", 0))
+    except (TypeError, ValueError):
+        instance_id = 0
     return Sample(
         run_id=run_id,
         system=system,
+        instance_id=instance_id,
         elapsed_s=elapsed_s,
         sampled_at=sampled_at,
         phase_label=label,
