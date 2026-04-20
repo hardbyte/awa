@@ -21,6 +21,9 @@ class PhaseType(str, Enum):
     RECOVERY = "recovery"
     ACTIVE_READERS = "active-readers"
     HIGH_LOAD = "high-load"
+    # Destructive / lifecycle phases. See UNIFIED_DRIVER_DESIGN.md §2.
+    KILL_WORKER = "kill-worker"
+    START_WORKER = "start-worker"
 
 
 # Matplotlib-compatible colour tints. Tuned for the dark "neutral gray" base
@@ -32,9 +35,14 @@ PHASE_TINTS: dict[PhaseType, tuple[str, float]] = {
     PhaseType.RECOVERY:        ("#DCDCDC", 0.30),
     PhaseType.ACTIVE_READERS:  ("#E0B66C", 0.30),
     PhaseType.HIGH_LOAD:       ("#A378C8", 0.30),
+    # Destructive: kill is scream-red, start is calm-green.
+    PhaseType.KILL_WORKER:     ("#C04A4A", 0.35),
+    PhaseType.START_WORKER:    ("#6CAF6C", 0.25),
 }
 
 # Whether samples in this phase type feed into summary.json (warmup excluded).
+# Destructive phases are *included* — the whole point is to capture the system
+# behaviour during and after the destructive action.
 PHASE_INCLUDED_IN_SUMMARY: dict[PhaseType, bool] = {
     PhaseType.WARMUP:          False,
     PhaseType.CLEAN:           True,
@@ -42,6 +50,8 @@ PHASE_INCLUDED_IN_SUMMARY: dict[PhaseType, bool] = {
     PhaseType.RECOVERY:        True,
     PhaseType.ACTIVE_READERS:  True,
     PhaseType.HIGH_LOAD:       True,
+    PhaseType.KILL_WORKER:     True,
+    PhaseType.START_WORKER:    True,
 }
 
 
@@ -50,6 +60,12 @@ class Phase:
     label: str
     type: PhaseType
     duration_s: int
+    # Type-specific parameters parsed from the spec's optional parenthesised
+    # clause. For `kill-worker(instance=0)`, params == {"instance": "0"}.
+    # Frozen dict-of-str-to-str: enough for every destructive phase type in
+    # §2 of the design. A richer schema (ints, lists) can be layered on in
+    # a future iteration; today instance indexing is the only consumer.
+    params: tuple[tuple[str, str], ...] = ()
 
     def describe(self) -> str:
         minutes = self.duration_s / 60
@@ -58,6 +74,24 @@ class Phase:
         else:
             pretty = f"{self.duration_s}s"
         return f"{self.label} · {pretty}"
+
+    def param(self, name: str, default: str | None = None) -> str | None:
+        for k, v in self.params:
+            if k == name:
+                return v
+        return default
+
+    def int_param(self, name: str, default: int) -> int:
+        raw = self.param(name)
+        if raw is None:
+            return default
+        try:
+            return int(raw)
+        except ValueError as exc:
+            raise ValueError(
+                f"phase {self.label!r}: param {name!r} must be an integer, "
+                f"got {raw!r}"
+            ) from exc
 
 
 _LABEL_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_]*$")
@@ -75,31 +109,75 @@ def parse_duration(text: str) -> int:
     return int(text)
 
 
+_TYPE_WITH_PARAMS_RE = re.compile(
+    r"^(?P<type>[a-z][a-z0-9-]*)"  # type name, kebab-case
+    r"(?:\((?P<params>[^)]*)\))?$"  # optional `(k=v,k=v)` params
+)
+
+
+def _parse_type_and_params(type_str: str) -> tuple[str, tuple[tuple[str, str], ...]]:
+    """Split `kill-worker(instance=0,signal=term)` into ("kill-worker",
+    (("instance","0"),("signal","term"))). Legacy `idle-in-tx` parses to
+    ("idle-in-tx", ()).
+    """
+    m = _TYPE_WITH_PARAMS_RE.match(type_str.strip())
+    if not m:
+        raise ValueError(
+            f"Bad phase type spec {type_str!r}; expected "
+            "<type> or <type>(key=value[,key=value])"
+        )
+    raw_params = m.group("params") or ""
+    params: list[tuple[str, str]] = []
+    if raw_params:
+        for kv in raw_params.split(","):
+            if "=" not in kv:
+                raise ValueError(
+                    f"Bad param in phase type {type_str!r}: expected k=v, got {kv!r}"
+                )
+            k, v = kv.split("=", 1)
+            k = k.strip()
+            v = v.strip()
+            if not k:
+                raise ValueError(f"Bad param in phase type {type_str!r}: empty key")
+            params.append((k, v))
+    return m.group("type"), tuple(params)
+
+
 def parse_phase_spec(spec: str) -> Phase:
-    """Parse a single --phase argument: label=type:duration."""
+    """Parse a single --phase argument: label=type[(k=v,...)]:duration.
+
+    Examples:
+        warmup_1=warmup:10m            — no params
+        kill=kill-worker(instance=0):60s — instance selector for the
+                                           destructive action
+    """
     if "=" not in spec or ":" not in spec:
         raise ValueError(
             f"Bad --phase spec {spec!r}; expected label=type:duration, "
             f"e.g. idle_1=idle-in-tx:60m"
         )
     label, rest = spec.split("=", 1)
+    # Duration is always the last `:`-separated segment. We rsplit on `:`
+    # so `kill-worker(instance=0):60s` — whose params section never
+    # contains `:` — splits cleanly at the duration boundary.
     type_str, duration_str = rest.rsplit(":", 1)
     label = label.strip()
     if not _LABEL_RE.match(label):
         raise ValueError(
             f"Bad phase label {label!r}: must match [A-Za-z][A-Za-z0-9_]*"
         )
+    type_name, params = _parse_type_and_params(type_str)
     try:
-        phase_type = PhaseType(type_str.strip())
+        phase_type = PhaseType(type_name)
     except ValueError as exc:
         raise ValueError(
-            f"Unknown phase type {type_str!r}. "
+            f"Unknown phase type {type_name!r}. "
             f"Known: {', '.join(t.value for t in PhaseType)}"
         ) from exc
     duration_s = parse_duration(duration_str)
     if duration_s <= 0:
         raise ValueError(f"Phase duration must be positive, got {duration_s}s")
-    return Phase(label=label, type=phase_type, duration_s=duration_s)
+    return Phase(label=label, type=phase_type, duration_s=duration_s, params=params)
 
 
 # Named scenarios desugar into explicit phase lists.
@@ -133,6 +211,21 @@ SCENARIOS: dict[str, list[str]] = {
     "soak": [
         "warmup=warmup:10m",
         "clean_1=clean:6h",
+    ],
+    # Replaces the legacy chaos.py `scenario_crash_recovery`. Harsh kill
+    # of replica 0, then restart and measure recovery. Pass/fail answers
+    # (`jobs_lost`, `recovery_time`) are derived from the shared raw.csv
+    # time series — see UNIFIED_DRIVER_DESIGN.md §5.
+    #
+    # Meaningful only with `--replicas >=2`; the kill of replica 0 lets
+    # replica 1 carry the load through the kill phase. Single-replica
+    # runs technically work but the "recovery" phase simply measures
+    # time-to-empty after restart.
+    "crash_recovery": [
+        "warmup=warmup:30s",
+        "baseline=clean:60s",
+        "kill=kill-worker(instance=0):60s",
+        "restart=start-worker(instance=0):60s",
     ],
 }
 
@@ -236,6 +329,12 @@ def default_registry() -> HookRegistry:
     registry.register(PhaseType.HIGH_LOAD,
                       enter=hooks.enter_high_load,
                       exit=hooks.exit_high_load)
+    # Destructive phase types act on the replica pool via
+    # state["replica_pool"] — see hooks.enter_kill_worker / enter_start_worker.
+    registry.register(PhaseType.KILL_WORKER,
+                      enter=hooks.enter_kill_worker)
+    registry.register(PhaseType.START_WORKER,
+                      enter=hooks.enter_start_worker)
     # warmup, clean, recovery — no extra runtime action; the adapter's
     # steady workload carries the load.
     return registry

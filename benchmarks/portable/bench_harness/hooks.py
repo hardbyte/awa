@@ -181,3 +181,48 @@ def exit_high_load(runtime: PhaseRuntime) -> None:
         return
     with Path(control_file).open("w") as fh:
         fh.write(base)
+
+
+# ─── kill-worker / start-worker ──────────────────────────────────────────
+#
+# Destructive / lifecycle phase types. Both act on the replica pool stashed
+# on `runtime.state["replica_pool"]` by `orchestrator.run_one_system`. The
+# `instance` param (default 0) selects which replica; phase parsing lets
+# a scenario write `kill=kill-worker(instance=2):60s`.
+#
+# Neither has an exit hook — the enter-side action is the whole story.
+# Restart-on-exit would conflate "kill" with "kill then restart" and make
+# the named-scenario composition (crash_recovery, rolling-replace) harder
+# to reason about. Scenarios that need restart follow a kill-worker phase
+# with a start-worker phase.
+#
+# A ValueError from the pool (out-of-range instance_id, already running for
+# start-worker, etc.) propagates up through the phase loop as a hard abort;
+# that's appropriate — a scenario targeting a non-existent replica is
+# misconfigured, not a chaos data point.
+
+
+def enter_kill_worker(runtime: PhaseRuntime) -> None:
+    pool = runtime.state.get("replica_pool")
+    if pool is None:
+        # Importing the type here would create a circular phases→replica_pool
+        # dependency; duck-type instead.
+        raise RuntimeError(
+            "kill-worker requires state['replica_pool']. "
+            "The orchestrator sets this in run_one_system; running a "
+            "kill-worker phase outside that context is a misconfiguration."
+        )
+    instance = runtime.phase.int_param("instance", default=0)
+    pool.kill_worker(instance)
+
+
+def enter_start_worker(runtime: PhaseRuntime) -> None:
+    pool = runtime.state.get("replica_pool")
+    if pool is None:
+        raise RuntimeError(
+            "start-worker requires state['replica_pool']. "
+            "The orchestrator sets this in run_one_system; running a "
+            "start-worker phase outside that context is a misconfiguration."
+        )
+    instance = runtime.phase.int_param("instance", default=0)
+    pool.start_worker(instance)
