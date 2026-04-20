@@ -622,3 +622,127 @@ def test_pool_stop_all_is_idempotent():
     pool.stop_all()
     assert pool.slot(0).state is ReplicaState.KILLED
     assert pool.slot(1).state is ReplicaState.STOPPED
+
+
+# ── kill-worker / start-worker parsing + hooks ──────────────────────────
+
+
+from bench_harness.hooks import enter_kill_worker, enter_start_worker
+from bench_harness.phases import Phase, PhaseRuntime, PhaseType
+
+
+def test_parse_phase_spec_accepts_params():
+    p = parse_phase_spec("kill=kill-worker(instance=2):60s")
+    assert p.label == "kill"
+    assert p.type is PhaseType.KILL_WORKER
+    assert p.duration_s == 60
+    assert p.int_param("instance", 0) == 2
+
+
+def test_parse_phase_spec_no_params_defaults_empty():
+    p = parse_phase_spec("warmup_1=warmup:10m")
+    assert p.params == ()
+    # Default is honoured when param missing.
+    assert p.int_param("instance", 5) == 5
+
+
+def test_parse_phase_spec_multiple_params():
+    p = parse_phase_spec("r=kill-worker(instance=1,reason=crash):30s")
+    assert p.int_param("instance", 0) == 1
+    assert p.param("reason") == "crash"
+
+
+def test_parse_phase_spec_rejects_bad_param():
+    with pytest.raises(ValueError, match="expected k=v"):
+        parse_phase_spec("bad=kill-worker(instance):30s")
+
+
+def test_parse_phase_spec_int_param_rejects_non_integer():
+    p = parse_phase_spec("k=kill-worker(instance=not-int):30s")
+    with pytest.raises(ValueError, match="must be an integer"):
+        p.int_param("instance", 0)
+
+
+def test_kill_worker_default_instance_is_zero():
+    # Covers the "no params" default via the int_param helper.
+    p = parse_phase_spec("k=kill-worker:30s")
+    assert p.int_param("instance", 0) == 0
+
+
+def test_start_worker_phase_type_present():
+    p = parse_phase_spec("r=start-worker(instance=0):30s")
+    assert p.type is PhaseType.START_WORKER
+
+
+def test_crash_recovery_scenario_resolves():
+    phases = resolve_scenario("crash_recovery", None)
+    types = [p.type for p in phases]
+    # Must start with warmup (the first-phase-must-be-warmup check), and
+    # pair kill with start in order — otherwise replica 0 is dead going
+    # into the following scenario.
+    assert types[0] is PhaseType.WARMUP
+    assert PhaseType.KILL_WORKER in types
+    assert PhaseType.START_WORKER in types
+    kill_idx = types.index(PhaseType.KILL_WORKER)
+    start_idx = types.index(PhaseType.START_WORKER)
+    assert start_idx > kill_idx, "start-worker must come after kill-worker"
+    # Kill phase targets the same replica the start phase brings back.
+    kill_phase = phases[kill_idx]
+    start_phase = phases[start_idx]
+    assert kill_phase.int_param("instance", 0) == start_phase.int_param(
+        "instance", 0
+    )
+
+
+def test_kill_worker_hook_calls_pool_kill():
+    pool = MagicMock()
+    phase = Phase(
+        label="kill",
+        type=PhaseType.KILL_WORKER,
+        duration_s=60,
+        params=(("instance", "2"),),
+    )
+    runtime = PhaseRuntime(
+        database_url="", phase=phase, state={"replica_pool": pool}
+    )
+    enter_kill_worker(runtime)
+    pool.kill_worker.assert_called_once_with(2)
+
+
+def test_start_worker_hook_calls_pool_start():
+    pool = MagicMock()
+    phase = Phase(
+        label="restart",
+        type=PhaseType.START_WORKER,
+        duration_s=60,
+        params=(("instance", "1"),),
+    )
+    runtime = PhaseRuntime(
+        database_url="", phase=phase, state={"replica_pool": pool}
+    )
+    enter_start_worker(runtime)
+    pool.start_worker.assert_called_once_with(1)
+
+
+def test_kill_worker_hook_without_pool_errors():
+    phase = Phase(
+        label="kill",
+        type=PhaseType.KILL_WORKER,
+        duration_s=60,
+        params=(),
+    )
+    runtime = PhaseRuntime(database_url="", phase=phase, state={})
+    with pytest.raises(RuntimeError, match="kill-worker requires state"):
+        enter_kill_worker(runtime)
+
+
+def test_start_worker_hook_without_pool_errors():
+    phase = Phase(
+        label="restart",
+        type=PhaseType.START_WORKER,
+        duration_s=60,
+        params=(),
+    )
+    runtime = PhaseRuntime(database_url="", phase=phase, state={})
+    with pytest.raises(RuntimeError, match="start-worker requires state"):
+        enter_start_worker(runtime)
