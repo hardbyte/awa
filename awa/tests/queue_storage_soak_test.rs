@@ -1126,6 +1126,226 @@ async fn test_queue_storage_transition_soak_finalize_path() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
+async fn test_queue_storage_transition_survives_target_restart() {
+    let _guard = QUEUE_STORAGE_SOAK_LOCK.lock().await;
+    let pool = setup_pool(20).await;
+
+    let queue = format!(
+        "qs_transition_restart_{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let schema = format!(
+        "awa_qs_transition_restart_{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let queue_slot_count = env_usize("AWA_QS_TRANSITION_RESTART_QUEUE_SLOTS", 16);
+    let lease_slot_count = env_usize("AWA_QS_TRANSITION_RESTART_LEASE_SLOTS", 4);
+    let max_workers = env_u32("AWA_QS_TRANSITION_RESTART_MAX_WORKERS", 8);
+    let target_rate = env_u64("AWA_QS_TRANSITION_RESTART_RATE", 200);
+    let total_duration_secs = env_u64("AWA_QS_TRANSITION_RESTART_DURATION_SECS", 6);
+    let batch_size = env_usize("AWA_QS_TRANSITION_RESTART_BATCH_SIZE", 50);
+
+    let store = prepare_transition_store(&pool, &schema, queue_slot_count, lease_slot_count).await;
+    let auto_state = Arc::new(MixedWorkloadState::default());
+    let target_a_state = Arc::new(MixedWorkloadState::default());
+    let target_b_state = Arc::new(MixedWorkloadState::default());
+
+    let auto_client = build_transition_client(
+        &pool,
+        &queue,
+        &schema,
+        max_workers,
+        queue_slot_count,
+        lease_slot_count,
+        awa::worker::TransitionWorkerRole::Auto,
+        MixedWorkloadWorker {
+            state: auto_state.clone(),
+        },
+    );
+    let target_a = build_transition_client(
+        &pool,
+        &queue,
+        &schema,
+        max_workers,
+        queue_slot_count,
+        lease_slot_count,
+        awa::worker::TransitionWorkerRole::QueueStorageTarget,
+        MixedWorkloadWorker {
+            state: target_a_state.clone(),
+        },
+    );
+
+    auto_client
+        .start()
+        .await
+        .expect("Failed to start transition restart auto client");
+    target_a
+        .start()
+        .await
+        .expect("Failed to start transition restart target A");
+    let mut replacement_target: Option<Client> = None;
+
+    wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+        report.status.state == "prepared"
+            && report.can_enter_mixed_transition
+            && report
+                .live_runtime_capability_counts
+                .get("queue_storage")
+                .copied()
+                .unwrap_or(0)
+                >= 2
+    })
+    .await;
+
+    storage::enter_mixed_transition(&pool)
+        .await
+        .expect("Failed to enter mixed transition for target restart soak");
+
+    wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+        report.status.state == "mixed_transition"
+            && report.status.active_engine == "queue_storage"
+            && report
+                .live_runtime_capability_counts
+                .get("canonical_drain_only")
+                .copied()
+                .unwrap_or(0)
+                >= 1
+    })
+    .await;
+
+    let pattern = transition_mode_cycle();
+    let started = Instant::now();
+    let restart_at = started + Duration::from_secs(total_duration_secs / 2);
+    let finish_at = started + Duration::from_secs(total_duration_secs);
+    let mut restarted = false;
+    let mut seq = 0_i64;
+    let mut seeded_total = 0_u64;
+    let mut seeded_queue_storage = 0_u64;
+
+    while Instant::now() < finish_at {
+        let desired_seeded = (started.elapsed().as_secs_f64() * target_rate as f64).floor() as u64;
+        while seeded_total < desired_seeded {
+            let remaining = (desired_seeded - seeded_total) as usize;
+            let count = remaining.min(batch_size);
+            let params: Vec<_> = (0..count)
+                .map(|offset| {
+                    let mode = pattern[(seq as usize + offset) % pattern.len()];
+                    insert_params_for_mode(&queue, seq + offset as i64, mode)
+                })
+                .collect();
+            let inserted = insert::insert_many(&pool, &params)
+                .await
+                .expect("Failed to enqueue transition restart batch");
+            seeded_total += inserted.len() as u64;
+            seeded_queue_storage += inserted.len() as u64;
+            seq += inserted.len() as i64;
+        }
+
+        if !restarted && Instant::now() >= restart_at {
+            target_a.shutdown(Duration::from_secs(5)).await;
+            clear_runtime_capability(&pool, "queue_storage").await;
+
+            let target_b = build_transition_client(
+                &pool,
+                &queue,
+                &schema,
+                max_workers,
+                queue_slot_count,
+                lease_slot_count,
+                awa::worker::TransitionWorkerRole::QueueStorageTarget,
+                MixedWorkloadWorker {
+                    state: target_b_state.clone(),
+                },
+            );
+            target_b
+                .start()
+                .await
+                .expect("Failed to start transition restart target B");
+
+            wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+                report.status.state == "mixed_transition"
+                    && report
+                        .live_runtime_capability_counts
+                        .get("queue_storage")
+                        .copied()
+                        .unwrap_or(0)
+                        >= 1
+            })
+            .await;
+
+            replacement_target = Some(target_b);
+            restarted = true;
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    wait_for_status_report(&pool, Duration::from_secs(60), |report| {
+        report.status.state == "mixed_transition" && report.canonical_live_backlog == 0
+    })
+    .await;
+
+    auto_client.shutdown(Duration::from_secs(5)).await;
+    clear_runtime_capability(&pool, "canonical_drain_only").await;
+
+    wait_for_status_report(&pool, Duration::from_secs(10), |report| report.can_finalize).await;
+    storage::finalize(&pool)
+        .await
+        .expect("Failed to finalize transition restart soak");
+
+    let drain_timeout = Duration::from_secs(env_u64(
+        "AWA_QS_TRANSITION_RESTART_DRAIN_TIMEOUT_SECS",
+        120,
+    ));
+    let drain_started = Instant::now();
+    loop {
+        let done = queue_storage_done_count(&pool, &store, &queue).await;
+        if done as u64 == seeded_queue_storage {
+            break;
+        }
+        assert!(
+            drain_started.elapsed() <= drain_timeout,
+            "Timed out draining transition restart soak queue {}; done={} seeded_queue_storage={}",
+            queue,
+            done,
+            seeded_queue_storage
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    if let Some(target_b) = replacement_target {
+        target_b.shutdown(Duration::from_secs(5)).await;
+    }
+    clear_runtime_capability(&pool, "queue_storage").await;
+    let final_report = storage::status_report(&pool)
+        .await
+        .expect("Failed to fetch final transition restart report");
+    let done = queue_storage_done_count(&pool, &store, &queue).await;
+
+    println!(
+        "[queue-storage-transition-restart] summary seeded_total={} state={} target_a_handlers={} target_b_handlers={} queue_storage_done={}",
+        seeded_total,
+        final_report.status.state,
+        target_a_state.handler_count.load(Ordering::Relaxed),
+        target_b_state.handler_count.load(Ordering::Relaxed),
+        done,
+    );
+
+    assert!(restarted, "target runtime was not restarted");
+    assert_eq!(final_report.status.state, "active");
+    assert_eq!(done as u64, seeded_queue_storage);
+    assert!(
+        target_a_state.handler_count.load(Ordering::Relaxed) > 0,
+        "target A never processed queue-storage work"
+    );
+    assert!(
+        target_b_state.handler_count.load(Ordering::Relaxed) > 0,
+        "target B never processed queue-storage work after restart"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
 async fn test_queue_storage_terminal_failure_burst() {
     let _guard = QUEUE_STORAGE_SOAK_LOCK.lock().await;
     let pool = setup_pool(20).await;
