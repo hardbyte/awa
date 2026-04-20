@@ -45,6 +45,7 @@ from .phases import (
     resolve_scenario,
 )
 from .plots import render_all
+from .report import write_interactive_report
 from .replica_pool import ReplicaPool
 from .sample import Sample
 from .versions import capture_adapter_revision
@@ -761,6 +762,14 @@ def drive(
         phases=phases,
         out_dir=run_dir / "plots",
         system_meta=system_meta,
+    )
+    write_interactive_report(
+        run_dir=run_dir,
+        raw_csv=raw_csv,
+        summary=summary,
+        manifest=manifest,
+        phases=phases,
+        systems=systems,
     )
 
     print(f"\n[harness] results at: {run_dir}", file=sys.stderr)
