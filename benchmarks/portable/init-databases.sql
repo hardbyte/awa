@@ -12,6 +12,7 @@ CREATE DATABASE procrastinate_bench;
 CREATE DATABASE river_bench;
 CREATE DATABASE oban_bench;
 CREATE DATABASE pgque_bench;
+CREATE DATABASE pgboss_bench;
 
 \connect awa_bench
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
@@ -32,4 +33,7 @@ CREATE EXTENSION IF NOT EXISTS pgstattuple;
 CREATE EXTENSION IF NOT EXISTS pgstattuple;
 
 \connect pgque_bench
+CREATE EXTENSION IF NOT EXISTS pgstattuple;
+
+\connect pgboss_bench
 CREATE EXTENSION IF NOT EXISTS pgstattuple;

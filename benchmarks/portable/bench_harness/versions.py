@@ -22,6 +22,7 @@ results directory.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -125,11 +126,27 @@ def _oban_revision() -> dict[str, Any]:
     }
 
 
+def _pgboss_revision() -> dict[str, Any]:
+    path = SCRIPT_DIR / "pgboss-bench" / "package.json"
+    try:
+        data = json.loads(path.read_text())
+    except OSError:
+        data = {}
+    except Exception:
+        data = {}
+    return {
+        "source": "pgboss-bench/package.json",
+        "library": "pg-boss",
+        "pinned_version": ((data.get("dependencies") or {}).get("pg-boss")),
+    }
+
+
 _CAPTURE: dict[str, Any] = {
     "awa": _awa_repo_revision,
     "awa-docker": _awa_repo_revision,
     "awa-python": _awa_repo_revision,
     "pgque": _pgque_submodule_revision,
+    "pgboss": _pgboss_revision,
     "procrastinate": _procrastinate_revision,
     "river": _river_revision,
     "oban": _oban_revision,

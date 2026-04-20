@@ -291,7 +291,7 @@ def test_versions_known_systems_return_dicts():
     # Every registered adapter must get *some* dict back — the harness is
     # the authoritative source on what was compared, so silently returning
     # nothing would be a reporting regression.
-    for system in ("awa", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque"):
+    for system in ("awa", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque", "pgboss"):
         rev = capture_adapter_revision(system)
         assert isinstance(rev, dict)
         assert "source" in rev
@@ -315,6 +315,7 @@ def test_versions_upstream_pins_resolve():
     assert capture_adapter_revision("procrastinate").get("pinned_version")
     assert capture_adapter_revision("river").get("pinned_version")
     assert capture_adapter_revision("oban").get("pinned_version_constraint")
+    assert capture_adapter_revision("pgboss").get("pinned_version")
 
 
 def test_readme_includes_versions_table(tmp_path: Path):
@@ -351,6 +352,13 @@ def test_readme_includes_versions_table(tmp_path: Path):
                 "pgque_submodule_describe": "alpha3-5-g3b75f58",
             },
         },
+        "pgboss": {
+            "revision": {
+                "source": "pgboss-bench/package.json",
+                "library": "pg-boss",
+                "pinned_version": "12.15.0",
+            },
+        },
     }
     out = tmp_path / "README.md"
     write_run_readme(out, scenario="custom", phases=phases, adapters=adapters)
@@ -359,6 +367,7 @@ def test_readme_includes_versions_table(tmp_path: Path):
     assert "abc1234" in body  # awa SHA
     assert "procrastinate" in body and "3.7.3" in body  # pinned upstream
     assert "3b75f58" in body  # pgque submodule short SHA
+    assert "pg-boss" in body and "12.15.0" in body
 
 
 def test_readme_omits_section_when_no_adapters(tmp_path: Path):
