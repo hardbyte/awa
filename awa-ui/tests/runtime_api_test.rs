@@ -1,6 +1,6 @@
 use awa_model::admin::{
     self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
-    RuntimeOverview, RuntimeSnapshotInput,
+    RuntimeOverview, RuntimeSnapshotInput, StorageCapability,
 };
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
@@ -32,7 +32,7 @@ async fn seed_runtime_snapshot(pool: &sqlx::PgPool, queue: &str, hostname: &str)
             hostname: Some(hostname.to_string()),
             pid: 1234,
             version: "0.4.0-test".to_string(),
-            storage_capability: "canonical".to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: Utc::now(),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -122,6 +122,7 @@ async fn test_get_runtime_endpoint_returns_runtime_overview() {
         .find(|instance| instance.instance_id == instance_id)
         .expect("seeded runtime instance should be present");
     assert_eq!(instance.hostname.as_deref(), Some("runtime-api-worker"));
+    assert_eq!(instance.storage_capability, StorageCapability::Canonical);
     assert!(instance.leader);
     assert!(instance.maintenance_alive);
     assert!(instance
@@ -142,7 +143,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
             hostname: Some("stale-worker".to_string()),
             pid: 4001,
             version: "0.4.0-test".to_string(),
-            storage_capability: "canonical".to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: Utc::now() - Duration::minutes(30),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -171,7 +172,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
             hostname: Some("live-worker".to_string()),
             pid: 4002,
             version: "0.4.0-test".to_string(),
-            storage_capability: "canonical".to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: Utc::now() - Duration::minutes(5),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -229,6 +230,10 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
     assert_eq!(queue_instances[0].instance_id, live_id);
     assert!(!queue_instances[0].stale);
     assert!(queue_instances[0].leader);
+    assert_eq!(
+        queue_instances[0].storage_capability,
+        StorageCapability::Canonical
+    );
 
     let stale = queue_instances
         .iter()
@@ -308,7 +313,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             hostname: Some("worker-a".to_string()),
             pid: 5001,
             version: "0.4.0-test".to_string(),
-            storage_capability: "canonical".to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: Utc::now() - Duration::minutes(2),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -338,7 +343,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             hostname: Some("worker-b".to_string()),
             pid: 5002,
             version: "0.4.0-test".to_string(),
-            storage_capability: "canonical".to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: Utc::now() - Duration::minutes(1),
             snapshot_interval_ms: 10_000,
             healthy: false,
@@ -368,7 +373,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             hostname: Some("worker-stale".to_string()),
             pid: 5003,
             version: "0.4.0-test".to_string(),
-            storage_capability: "canonical".to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: Utc::now() - Duration::minutes(20),
             snapshot_interval_ms: 10_000,
             healthy: true,

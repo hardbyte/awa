@@ -14,7 +14,7 @@ pub use admin::{
     CallbackConfig, DefaultAction, JobKindDescriptor, JobKindOverview, ListJobsFilter,
     QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
     QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome, RuntimeInstance,
-    RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket,
+    RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket, StorageCapability,
 };
 
 /// Deprecated alias preserved for one release so existing downstream code

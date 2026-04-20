@@ -1,6 +1,21 @@
 ALTER TABLE awa.runtime_instances
 ADD COLUMN IF NOT EXISTS storage_capability TEXT NOT NULL DEFAULT 'canonical';
 
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM pg_constraint
+        WHERE conname = 'chk_awa_runtime_instances_storage_capability'
+          AND conrelid = 'awa.runtime_instances'::regclass
+    ) THEN
+        ALTER TABLE awa.runtime_instances
+        ADD CONSTRAINT chk_awa_runtime_instances_storage_capability
+        CHECK (storage_capability IN ('canonical', 'canonical_drain_only', 'queue_storage'));
+    END IF;
+END;
+$$;
+
 CREATE TABLE IF NOT EXISTS awa.storage_transition_state (
     singleton        BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
     current_engine   TEXT        NOT NULL CHECK (btrim(current_engine) <> ''),
@@ -131,7 +146,10 @@ BEGIN
         END,
         details = COALESCE(p_details, '{}'::jsonb),
         entered_at = CASE
-            WHEN sts.state = 'prepared' AND sts.prepared_engine = target_engine THEN sts.entered_at
+            WHEN sts.state = 'prepared'
+             AND sts.prepared_engine = target_engine
+             AND sts.details = COALESCE(p_details, '{}'::jsonb)
+                THEN sts.entered_at
             ELSE now()
         END,
         updated_at = now(),
@@ -174,7 +192,10 @@ BEGIN
             ELSE sts.transition_epoch
         END,
         details = '{}'::jsonb,
-        entered_at = now(),
+        entered_at = CASE
+            WHEN sts.state = 'canonical' THEN sts.entered_at
+            ELSE now()
+        END,
         updated_at = now(),
         finalized_at = NULL
     WHERE sts.singleton
@@ -208,7 +229,7 @@ DECLARE
 BEGIN
     active_engine := awa.active_storage_engine();
 
-    IF active_engine <> 'canonical' THEN
+    IF active_engine IS DISTINCT FROM 'canonical' THEN
         RAISE EXCEPTION 'storage engine "%" is not writable in this release', active_engine
             USING ERRCODE = '55000';
     END IF;
