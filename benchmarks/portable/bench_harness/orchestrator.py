@@ -525,6 +525,13 @@ def run_one_system(
     )
     pool.start_all()
     _check_cross_replica_drift(pool)
+    runtime_descriptor = pool.descriptor or {}
+    runtime_event_tables = list(
+        runtime_descriptor.get("event_tables") or manifest.event_tables
+    )
+    runtime_event_indexes = list(
+        runtime_descriptor.get("event_indexes") or manifest.event_indexes
+    )
 
     # Register the metrics daemon now so it covers all phases including warmup.
     daemon = MetricsDaemon(
@@ -532,8 +539,8 @@ def run_one_system(
         system=system,
         database_url=pg_url(manifest.db_name),
         targets=PollTargets(
-            event_tables=manifest.event_tables,
-            event_indexes=manifest.event_indexes,
+            event_tables=runtime_event_tables,
+            event_indexes=runtime_event_indexes,
         ),
         output_queue=out_queue,
         bench_start=bench_start,
@@ -549,7 +556,7 @@ def run_one_system(
         "high_load_multiplier": float(high_load_multiplier),
         # Exposed so the active-readers hook can scan this system's hot
         # table instead of the catalog. See hooks.enter_active_readers.
-        "event_tables": list(manifest.event_tables),
+        "event_tables": runtime_event_tables,
         # Destructive / lifecycle phases (kill-worker, stop-worker,
         # rolling-replace — landing in #174 step 4+) act on this.
         # Pre-existing phase hooks ignore it.

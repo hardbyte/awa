@@ -219,7 +219,13 @@ async def scenario_long_horizon() -> None:
         }
     )
 
-    latencies_ms: collections.deque[tuple[float, float]] = collections.deque(
+    producer_latencies_ms: collections.deque[tuple[float, float]] = collections.deque(
+        maxlen=32768
+    )
+    subscriber_latencies_ms: collections.deque[tuple[float, float]] = collections.deque(
+        maxlen=32768
+    )
+    end_to_end_latencies_ms: collections.deque[tuple[float, float]] = collections.deque(
         maxlen=32768
     )
     enqueued = 0
@@ -275,11 +281,15 @@ async def scenario_long_horizon() -> None:
                     "padding": payload_padding,
                 }
             )
+            insert_started = time.monotonic()
             try:
                 async with producer_conn.cursor() as cur:
                     await cur.execute(
                         "SELECT pgque.send(%s, %s::text)", (QUEUE_NAME, payload)
                     )
+                producer_latencies_ms.append(
+                    ((time.monotonic()), max(0.0, (time.monotonic() - insert_started) * 1000.0))
+                )
                 enqueued += 1
                 seq += 1
             except Exception as exc:
@@ -332,12 +342,20 @@ async def scenario_long_horizon() -> None:
                 now = _dt.datetime.now(_dt.timezone.utc)
                 if ev_time.tzinfo is None:
                     ev_time = ev_time.replace(tzinfo=_dt.timezone.utc)
-                latency_ms = max(0.0, (now - ev_time).total_seconds() * 1000.0)
+                subscriber_latency_ms = max(0.0, (now - ev_time).total_seconds() * 1000.0)
             except Exception:
-                latency_ms = 0.0
-            latencies_ms.append((time.monotonic(), latency_ms))
+                subscriber_latency_ms = 0.0
+            subscriber_latencies_ms.append((time.monotonic(), subscriber_latency_ms))
             if work_ms:
                 await asyncio.sleep(work_ms / 1000.0)
+            try:
+                finished = _dt.datetime.now(_dt.timezone.utc)
+                end_to_end_latency_ms = max(
+                    0.0, (finished - ev_time).total_seconds() * 1000.0
+                )
+            except Exception:
+                end_to_end_latency_ms = subscriber_latency_ms
+            end_to_end_latencies_ms.append((time.monotonic(), end_to_end_latency_ms))
             completed += 1
 
     async def consumer_task() -> None:
@@ -445,12 +463,29 @@ async def scenario_long_horizon() -> None:
             enq_rate = (enqueued - last_enq) / dt
             cmp_rate = (completed - last_cmp) / dt
             last_enq, last_cmp = enqueued, completed
-            p50, p95, p99 = _percentiles(latencies_ms, window_s=30.0, now=loop.time())
+            producer_p50, producer_p95, producer_p99 = _percentiles(
+                producer_latencies_ms, window_s=30.0, now=loop.time()
+            )
+            subscriber_p50, subscriber_p95, subscriber_p99 = _percentiles(
+                subscriber_latencies_ms, window_s=30.0, now=loop.time()
+            )
+            end_to_end_p50, end_to_end_p95, end_to_end_p99 = _percentiles(
+                end_to_end_latencies_ms, window_s=30.0, now=loop.time()
+            )
             ts = _now_iso()
             for metric, value, window_s in [
-                ("claim_p50_ms", p50, 30.0),
-                ("claim_p95_ms", p95, 30.0),
-                ("claim_p99_ms", p99, 30.0),
+                ("producer_p50_ms", producer_p50, 30.0),
+                ("producer_p95_ms", producer_p95, 30.0),
+                ("producer_p99_ms", producer_p99, 30.0),
+                ("subscriber_p50_ms", subscriber_p50, 30.0),
+                ("subscriber_p95_ms", subscriber_p95, 30.0),
+                ("subscriber_p99_ms", subscriber_p99, 30.0),
+                ("end_to_end_p50_ms", end_to_end_p50, 30.0),
+                ("end_to_end_p95_ms", end_to_end_p95, 30.0),
+                ("end_to_end_p99_ms", end_to_end_p99, 30.0),
+                ("claim_p50_ms", subscriber_p50, 30.0),
+                ("claim_p95_ms", subscriber_p95, 30.0),
+                ("claim_p99_ms", subscriber_p99, 30.0),
                 ("enqueue_rate", enq_rate, float(sample_every_s)),
                 ("completion_rate", cmp_rate, float(sample_every_s)),
                 ("queue_depth", float(queue_depth), 0.0),

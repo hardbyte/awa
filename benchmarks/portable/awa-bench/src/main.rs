@@ -19,13 +19,14 @@ mod long_horizon;
 use async_trait::async_trait;
 use awa_macros::JobArgs;
 use awa_model::{
-    insert_many, insert_many_copy, insert_with, migrations, InsertOpts, QueueStorage,
-    QueueStorageConfig,
+    insert, migrations, InsertOpts, QueueStorage, QueueStorageConfig,
 };
-use awa_worker::{Client, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa_worker::{
+    Client, JobContext, JobError, JobResult, QueueConfig, TransitionWorkerRole, Worker,
+};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
-use sqlx::{Acquire, PgPool};
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -222,48 +223,29 @@ async fn wait_for_completion(
     }
 }
 
-async fn enqueue_batch(pool: &PgPool, queue_name: &str, count: i64, use_copy: bool) {
+async fn enqueue_batch(
+    store: &QueueStorage,
+    pool: &PgPool,
+    queue_name: &str,
+    count: i64,
+    _use_copy: bool,
+) {
     let batch_size = 500;
-    if use_copy {
-        // Reuse one DB session across COPY batches so the temp staging table is
-        // reused as intended by the COPY design, instead of reacquiring an
-        // arbitrary pooled session on every chunk.
-        let mut conn = pool.acquire().await.unwrap();
-        for batch_start in (0..count).step_by(batch_size as usize) {
-            let batch_end = (batch_start + batch_size).min(count);
-            let params: Vec<_> = (batch_start..batch_end)
-                .map(|i| {
-                    awa_model::insert::params_with(
-                        &BenchJob { seq: i },
-                        InsertOpts {
-                            queue: queue_name.into(),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-                })
-                .collect();
-            let mut tx = conn.begin().await.unwrap();
-            insert_many_copy(&mut tx, &params).await.unwrap();
-            tx.commit().await.unwrap();
-        }
-    } else {
-        for batch_start in (0..count).step_by(batch_size as usize) {
-            let batch_end = (batch_start + batch_size).min(count);
-            let params: Vec<_> = (batch_start..batch_end)
-                .map(|i| {
-                    awa_model::insert::params_with(
-                        &BenchJob { seq: i },
-                        InsertOpts {
-                            queue: queue_name.into(),
-                            ..Default::default()
-                        },
-                    )
-                    .unwrap()
-                })
-                .collect();
-            insert_many(pool, &params).await.unwrap();
-        }
+    for batch_start in (0..count).step_by(batch_size as usize) {
+        let batch_end = (batch_start + batch_size).min(count);
+        let params: Vec<_> = (batch_start..batch_end)
+            .map(|i| {
+                insert::params_with(
+                    &BenchJob { seq: i },
+                    InsertOpts {
+                        queue: queue_name.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+        store.enqueue_params_batch(pool, &params).await.unwrap();
     }
 }
 
@@ -283,6 +265,7 @@ fn build_client(
             },
         )
         .queue_storage(storage, queue_rotate_interval(), lease_rotate_interval())
+        .transition_role(TransitionWorkerRole::QueueStorageTarget)
         .register_worker(NoopWorker)
         .build()
         .expect("Failed to build client")
@@ -301,11 +284,11 @@ struct BenchmarkResult {
 /// Scenario 1: Enqueue throughput — insert N jobs as fast as possible.
 async fn scenario_enqueue_throughput(job_count: i64) -> BenchmarkResult {
     let pool = create_pool(20).await;
-    let (_store, _config) = prepare_queue_storage(&pool).await;
+    let (store, _config) = prepare_queue_storage(&pool).await;
     let queue = "awa_enqueue_bench";
 
     let start = Instant::now();
-    enqueue_batch(&pool, queue, job_count, true).await;
+    enqueue_batch(&store, &pool, queue, job_count, true).await;
     let elapsed = start.elapsed();
 
     let jobs_per_sec = job_count as f64 / elapsed.as_secs_f64();
@@ -329,7 +312,7 @@ async fn scenario_worker_throughput(job_count: i64, worker_count: u32) -> Benchm
     let queue = "awa_worker_bench";
 
     // Pre-enqueue all jobs
-    enqueue_batch(&pool, queue, job_count, true).await;
+    enqueue_batch(&store, &pool, queue, job_count, true).await;
 
     // Start workers and measure drain time
     let client = build_client(pool.clone(), queue, worker_count, config);
@@ -374,16 +357,15 @@ async fn scenario_pickup_latency(iterations: i64, worker_count: u32) -> Benchmar
 
     for i in 0..iterations {
         let insert_time = Instant::now();
-        insert_with(
-            &pool,
+        let params = [insert::params_with(
             &BenchJob { seq: i },
             InsertOpts {
                 queue: queue.into(),
                 ..Default::default()
             },
         )
-        .await
-        .unwrap();
+        .unwrap()];
+        store.enqueue_params_batch(&pool, &params).await.unwrap();
 
         // Observe cumulative completed count instead of polling one job row.
         // Queue-storage prune can rotate completed rows away, but queue_counts()
