@@ -100,6 +100,8 @@ force the state machine forward on a build that cannot drive it.
 Canonical-only behaviour:
 
 - `storage status` reports the singleton row in `awa.storage_transition_state`
+- `storage status` also reports canonical live backlog, live runtime capability counts,
+  and blocker lists for `enter-mixed-transition` / `finalize`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
 - `storage abort` clears a prepared engine selection; it is also the
