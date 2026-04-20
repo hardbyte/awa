@@ -506,6 +506,12 @@ def run_one_system(
     overrides["PRODUCER_RATE_CONTROL_FILE_CONTAINER"] = "/control/producer_rate.txt"
 
     bench_start = time.time()
+    # Stamp the tracker to the first phase before tailers start ingesting.
+    # Without this, early samples land under the *previous* system's final
+    # phase (or "pre-run" for the first system), skewing per-phase aggregates
+    # — especially visible with --replicas N where pool.start_all() takes
+    # longer. tracker.set is called again at each phase boundary below.
+    tracker.set(phases[0].label, phases[0].type.value)
     pool = build_replica_pool(
         system,
         entry,
