@@ -131,11 +131,17 @@ async fn install_queue_storage_backend(pool: &PgPool, schema: &str) {
 }
 
 async fn prepare_queue_storage_schema(pool: &PgPool, schema: &str) {
-    install_queue_storage_backend(pool, schema).await;
-    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .execute(pool)
         .await
-        .expect("queue storage backend activation should clear cleanly");
+        .expect("queue storage test schema should drop cleanly");
+
+    let store =
+        QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
+    store
+        .prepare_schema(pool)
+        .await
+        .expect("queue storage schema preparation should succeed");
 }
 
 async fn active_queue_storage_schema(pool: &PgPool) -> Option<String> {
@@ -143,6 +149,14 @@ async fn active_queue_storage_schema(pool: &PgPool) -> Option<String> {
         .fetch_one(pool)
         .await
         .expect("active queue storage schema query should succeed")
+}
+
+async fn relation_exists(pool: &PgPool, qualified_relname: &str) -> bool {
+    sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+        .bind(qualified_relname)
+        .fetch_one(pool)
+        .await
+        .expect("relation existence query should succeed")
 }
 
 async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
@@ -588,6 +602,37 @@ async fn test_storage_prepare_keeps_canonical_routing() {
     assert_eq!(aborted.state, "canonical");
     assert_eq!(aborted.active_engine, "canonical");
     assert_eq!(aborted.prepared_engine, None);
+}
+
+#[tokio::test]
+async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    prepare_queue_storage_schema(&pool, "awa_queue_storage_prepared").await;
+
+    assert_eq!(
+        active_queue_storage_schema(&pool).await,
+        None,
+        "schema preparation alone must not activate queue storage routing"
+    );
+
+    let status = storage::status(&pool).await.unwrap();
+    assert_eq!(status.current_engine, "canonical");
+    assert_eq!(status.active_engine, "canonical");
+    assert_eq!(status.state, "canonical");
+
+    assert!(
+        relation_exists(&pool, "awa_queue_storage_prepared.ready_entries").await,
+        "prepared queue-storage schema should materialize ready_entries"
+    );
+    assert!(
+        relation_exists(&pool, "awa_queue_storage_prepared.leases").await,
+        "prepared queue-storage schema should materialize leases"
+    );
 }
 
 #[tokio::test]

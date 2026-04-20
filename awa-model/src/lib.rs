@@ -7,8 +7,8 @@ pub mod insert;
 pub mod job;
 pub mod kind;
 pub mod migrations;
-pub mod storage;
 pub mod queue_storage;
+pub mod storage;
 pub mod unique;
 
 // Re-exports for ergonomics
@@ -30,11 +30,11 @@ pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::AwaError;
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
-pub use storage::StorageStatus;
 pub use queue_storage::{
     ClaimedEntry, ClaimedRuntimeJob, PruneOutcome, QueueCounts, QueueStorage, QueueStorageConfig,
     RotateOutcome,
 };
+pub use storage::StorageStatus;
 
 // Re-export the derive macro
 pub use awa_macros::JobArgs;

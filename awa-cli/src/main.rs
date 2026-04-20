@@ -242,6 +242,18 @@ enum StorageCommands {
         #[arg(long)]
         details: Option<String>,
     },
+    /// Materialize the queue-storage schema without activating routing
+    PrepareQueueStorageSchema {
+        #[arg(long, default_value = "awa_exp")]
+        schema: String,
+        #[arg(long, default_value_t = 16)]
+        queue_slot_count: u32,
+        #[arg(long, default_value_t = 8)]
+        lease_slot_count: u32,
+        /// Drop and recreate the target schema before preparing it
+        #[arg(long)]
+        reset: bool,
+    },
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
     /// Enter mixed transition and begin routing new writes to the prepared engine
@@ -679,6 +691,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         };
                         let status = awa_model::storage::prepare(&pool, &engine, details).await?;
                         println!("{}", serde_json::to_string_pretty(&status)?);
+                    }
+                    StorageCommands::PrepareQueueStorageSchema {
+                        schema,
+                        queue_slot_count,
+                        lease_slot_count,
+                        reset,
+                    } => {
+                        let store = awa_model::QueueStorage::new(awa_model::QueueStorageConfig {
+                            schema: schema.clone(),
+                            queue_slot_count: queue_slot_count as usize,
+                            lease_slot_count: lease_slot_count as usize,
+                        })?;
+                        if reset {
+                            sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                                .execute(&pool)
+                                .await?;
+                        }
+                        store.prepare_schema(&pool).await?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "schema": schema,
+                                "queue_slot_count": queue_slot_count,
+                                "lease_slot_count": lease_slot_count,
+                                "routing_changed": false,
+                            }))?
+                        );
                     }
                     StorageCommands::Abort => {
                         let status = awa_model::storage::abort(&pool).await?;

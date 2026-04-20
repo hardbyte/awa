@@ -71,6 +71,7 @@ New operator surfaces:
 ```bash
 awa --database-url "$DATABASE_URL" storage status
 awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
 awa --database-url "$DATABASE_URL" storage abort
 ```
 
@@ -91,6 +92,10 @@ These functions are one-shot operational commands. They are not schema-migration
 DDL and should be run deliberately by an operator or rollout tool, not embedded
 into the extracted migration SQL itself.
 
+`storage prepare-queue-storage-schema` is also an operational command, but it
+only materializes the queue-storage schema. It does **not** change
+`awa.storage_transition_state` and it does **not** activate routing.
+
 On the `0.5.x` prep release these SQL identities existed as stubs. On this
 `0.6` branch they are implemented:
 
@@ -102,6 +107,8 @@ Current behavior:
 - `storage status` reports the singleton row in `awa.storage_transition_state`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
+- `storage prepare-queue-storage-schema` creates the target queue-storage
+  schema ahead of time without changing routing
 - `storage abort` returns routing to canonical and clears a prepared or mixed-transition
   rollout before final activation
 - `storage enter-mixed-transition` requires prepared queue-storage metadata,
