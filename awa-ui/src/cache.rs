@@ -22,6 +22,7 @@ pub struct DashboardCache {
     pub queues: Cache<(), Vec<admin::QueueOverview>>,
     pub runtime: Cache<(), admin::RuntimeOverview>,
     pub queue_runtime: Cache<(), Vec<admin::QueueRuntimeSummary>>,
+    pub storage: Cache<(), awa_model::storage::StorageStatusReport>,
 }
 
 fn build_cache<V: Clone + Send + Sync + 'static>(ttl: Duration) -> Cache<(), V> {
@@ -35,6 +36,7 @@ impl DashboardCache {
             queues: build_cache(ttl),
             runtime: build_cache(ttl),
             queue_runtime: build_cache(ttl),
+            storage: build_cache(ttl),
         }
     }
 }

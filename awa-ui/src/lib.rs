@@ -93,6 +93,7 @@ pub async fn router_with(
         .route("/capabilities", get(handlers::stats::get_capabilities))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime))
+        .route("/storage", get(handlers::runtime::get_storage))
         // Callbacks (for HTTP workers and external systems)
         .route(
             "/callbacks/{callback_id}/complete",
