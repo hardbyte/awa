@@ -12,10 +12,69 @@ use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::OnceCell;
 
-fn database_url() -> String {
+static SCALE_TEST_DB_INIT: OnceCell<()> = OnceCell::const_new();
+
+fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
+
+fn replace_database_name(url: &str, database_name: &str) -> String {
+    let (without_query, query_suffix) = match url.split_once('?') {
+        Some((prefix, query)) => (prefix, Some(query)),
+        None => (url, None),
+    };
+    let (base, _) = without_query
+        .rsplit_once('/')
+        .expect("database URL should include a database name");
+    let mut out = format!("{base}/{database_name}");
+    if let Some(query) = query_suffix {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+fn database_name(url: &str) -> String {
+    let without_query = url.split_once('?').map(|(prefix, _)| prefix).unwrap_or(url);
+    without_query
+        .rsplit_once('/')
+        .map(|(_, database_name)| database_name.to_string())
+        .expect("database URL should include a database name")
+}
+
+fn validate_database_name(database_name: &str) {
+    assert!(
+        !database_name.is_empty()
+            && database_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "scale test database names must use only [A-Za-z0-9_]"
+    );
+}
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL_SCALE_TEST")
+        .unwrap_or_else(|_| replace_database_name(&base_database_url(), "awa_test_scale"))
+}
+
+async fn ensure_database_exists(url: &str) {
+    let database_name = database_name(url);
+    validate_database_name(&database_name);
+    let admin_url = replace_database_name(url, "postgres");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("Failed to connect to admin database for scale tests");
+    let create_sql = format!("CREATE DATABASE {database_name}");
+    match sqlx::query(&create_sql).execute(&admin_pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+        Err(err) => panic!("Failed to create scale test database {database_name}: {err}"),
+    }
 }
 
 async fn pool() -> sqlx::PgPool {
@@ -27,8 +86,18 @@ async fn pool() -> sqlx::PgPool {
 }
 
 async fn setup() -> sqlx::PgPool {
+    let url = database_url();
+    SCALE_TEST_DB_INIT
+        .get_or_init(|| async {
+            ensure_database_exists(&url).await;
+        })
+        .await;
     let pool = pool().await;
     migrations::run(&pool).await.expect("Failed to migrate");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear queue storage activation for scale tests");
     pool
 }
 
