@@ -185,9 +185,33 @@ def compute_summary(
                 metric="completion_rate",
                 subject_kind="adapter",
             )
+            producer_p99 = _phase_metric_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="producer_p99_ms",
+                subject_kind="adapter",
+            )
+            subscriber_p99 = _phase_metric_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="subscriber_p99_ms",
+                subject_kind="adapter",
+            )
+            end_to_end_p99 = _phase_metric_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="end_to_end_p99_ms",
+                subject_kind="adapter",
+            )
             phase_block["peak_dead_tup"] = _peak(dead_tup)
             phase_block["median_dead_tup"] = _median(dead_tup)
             phase_block["median_claim_p99_ms"] = _median(claim_p99)
+            phase_block["median_producer_p99_ms"] = _median(producer_p99)
+            phase_block["median_subscriber_p99_ms"] = _median(subscriber_p99)
+            phase_block["median_end_to_end_p99_ms"] = _median(end_to_end_p99)
             phase_block["median_throughput_per_s"] = _median(throughput)
             phase_block["autovacuum_count_delta"] = _autovacuum_count_delta(
                 rows,

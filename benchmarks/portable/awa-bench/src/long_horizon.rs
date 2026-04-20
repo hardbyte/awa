@@ -8,8 +8,10 @@
 
 use async_trait::async_trait;
 use awa_macros::JobArgs;
-use awa_model::{insert_with, migrations, InsertOpts};
-use awa_worker::{Client, JobContext, JobError, JobResult, QueueConfig, Worker};
+use awa_model::{insert, QueueStorage};
+use awa_worker::{
+    Client, JobContext, JobError, JobResult, QueueConfig, TransitionWorkerRole, Worker,
+};
 use hdrhistogram::Histogram;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -24,6 +26,9 @@ use tokio::time::{interval_at, MissedTickBehavior};
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 pub struct LongHorizonJob {
     pub seq: i64,
+    /// Wall-clock producer timestamp in unix milliseconds. Used for
+    /// subscriber and end-to-end latency.
+    pub produced_at_ms: i64,
     /// Arbitrary filler so jobs approximate the declared payload size.
     pub padding: String,
 }
@@ -77,7 +82,8 @@ impl LatencyWindow {
 
 struct LongHorizonWorker {
     work_ms: u64,
-    latencies: Arc<Mutex<LatencyWindow>>,
+    subscriber_latencies: Arc<Mutex<LatencyWindow>>,
+    end_to_end_latencies: Arc<Mutex<LatencyWindow>>,
     completed_counter: Arc<AtomicU64>,
 }
 
@@ -88,15 +94,21 @@ impl Worker for LongHorizonWorker {
     }
 
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
-        // Pickup latency: harness cares about "claim" latency — the time from
-        // insert to when the worker began executing this job. Use the job's
-        // created_at as the zero point.
-        let now = chrono::Utc::now();
-        let claim_latency_ms = (now - ctx.job.created_at).num_milliseconds().max(0) as f64;
-        self.latencies.lock().await.record(claim_latency_ms);
+        let args: LongHorizonJob = serde_json::from_value(ctx.job.args.clone())
+            .map_err(|err| JobError::Terminal(format!("failed to deserialize args: {err}")))?;
+        let subscriber_latency_ms = (now_epoch_ms() - args.produced_at_ms).max(0) as f64;
+        self.subscriber_latencies
+            .lock()
+            .await
+            .record(subscriber_latency_ms);
         if self.work_ms > 0 {
             tokio::time::sleep(Duration::from_millis(self.work_ms)).await;
         }
+        let end_to_end_latency_ms = (now_epoch_ms() - args.produced_at_ms).max(0) as f64;
+        self.end_to_end_latencies
+            .lock()
+            .await
+            .record(end_to_end_latency_ms);
         self.completed_counter.fetch_add(1, Ordering::Relaxed);
         Ok(JobResult::Completed)
     }
@@ -142,6 +154,13 @@ fn now_iso_ms() -> String {
     dt.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string()
 }
 
+fn now_epoch_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+
 fn emit(record: serde_json::Value) {
     // Single println per sample: tailer is line-buffered.
     println!("{}", record);
@@ -151,17 +170,42 @@ fn instance_id() -> u32 {
     env_u32("BENCH_INSTANCE_ID", 0)
 }
 
-fn emit_descriptor(db_name: &str) {
+fn queue_storage_event_tables(schema: &str, queue_slot_count: usize, lease_slot_count: usize) -> Vec<String> {
+    let mut tables = vec![
+        format!("{schema}.queue_ring_state"),
+        format!("{schema}.queue_ring_slots"),
+        format!("{schema}.lease_ring_state"),
+        format!("{schema}.lease_ring_slots"),
+        format!("{schema}.queue_lanes"),
+        format!("{schema}.leases"),
+        format!("{schema}.attempt_state"),
+        format!("{schema}.ready_entries"),
+        format!("{schema}.done_entries"),
+        format!("{schema}.deferred_jobs"),
+        format!("{schema}.dlq_entries"),
+    ];
+    for slot in 0..queue_slot_count {
+        tables.push(format!("{schema}.ready_entries_{slot}"));
+        tables.push(format!("{schema}.done_entries_{slot}"));
+    }
+    for slot in 0..lease_slot_count {
+        tables.push(format!("{schema}.leases_{slot}"));
+    }
+    tables
+}
+
+fn emit_descriptor(db_name: &str, store: &QueueStorage) {
+    let event_tables = queue_storage_event_tables(
+        store.schema(),
+        store.queue_slot_count(),
+        store.lease_slot_count(),
+    );
     emit(json!({
         "kind": "descriptor",
         "system": "awa",
         "instance_id": instance_id(),
-        "event_tables": [
-            "awa.jobs_hot",
-            "awa.scheduled_jobs",
-            "awa.jobs_dlq",
-            "awa.job_unique_claims"
-        ],
+        "event_tables": event_tables,
+        "event_indexes": [],
         "extensions": [],
         "version": env!("CARGO_PKG_VERSION"),
         "schema_version": env_string("AWA_SCHEMA_VERSION", "current"),
@@ -191,17 +235,17 @@ pub async fn run() {
         .connect(&database_url)
         .await
         .expect("Failed to connect to database");
-    migrations::run(&pool)
-        .await
-        .expect("Failed to run migrations");
-    emit_descriptor(&db_name);
+    let (store, storage) = super::prepare_queue_storage(&pool).await;
+    emit_descriptor(&db_name, &store);
 
     let queue_name = "awa_longhorizon_bench";
     // No clean here — the bench harness starts from a fresh PG, so existing
     // rows are not an issue. For --fast we do see stale rows across runs;
     // that's acceptable for dev iteration.
 
-    let latencies = Arc::new(Mutex::new(LatencyWindow::new()));
+    let producer_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
+    let subscriber_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
+    let end_to_end_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
     let completed = Arc::new(AtomicU64::new(0));
     let enqueued = Arc::new(AtomicU64::new(0));
     let queue_depth = Arc::new(AtomicU64::new(0));
@@ -209,9 +253,14 @@ pub async fn run() {
 
     let worker = LongHorizonWorker {
         work_ms,
-        latencies: Arc::clone(&latencies),
+        subscriber_latencies: Arc::clone(&subscriber_latencies),
+        end_to_end_latencies: Arc::clone(&end_to_end_latencies),
         completed_counter: Arc::clone(&completed),
     };
+
+    let client_storage = storage.clone();
+    let producer_store = QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig");
+    let depth_store = QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig");
 
     let client = Client::builder(pool.clone())
         .queue(
@@ -222,6 +271,12 @@ pub async fn run() {
                 ..QueueConfig::default()
             },
         )
+        .queue_storage(
+            client_storage,
+            super::queue_rotate_interval(),
+            super::lease_rotate_interval(),
+        )
+        .transition_role(TransitionWorkerRole::QueueStorageTarget)
         .register_worker(worker)
         .build()
         .expect("Failed to build client");
@@ -235,6 +290,7 @@ pub async fn run() {
     let producer_enqueued = Arc::clone(&enqueued);
     let producer_queue_depth = Arc::clone(&queue_depth);
     let producer_target_rate_metric = Arc::clone(&producer_target_rate);
+    let producer_latencies_window = Arc::clone(&producer_latencies);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_handle = tokio::spawn(async move {
         let mut seq: i64 = 0;
@@ -259,21 +315,28 @@ pub async fn run() {
                 next_tick = std::cmp::max(next_tick + period, tokio::time::Instant::now());
                 tokio::time::sleep_until(next_tick).await;
             }
+            let produced_at_ms = now_epoch_ms();
             let args = LongHorizonJob {
                 seq,
+                produced_at_ms,
                 padding: padding.clone(),
             };
-            let res = insert_with(
-                &producer_pool,
+            let params = [insert::params_with(
                 &args,
-                InsertOpts {
+                awa_model::InsertOpts {
                     queue: queue_name.into(),
                     ..Default::default()
                 },
             )
-            .await;
+            .expect("failed to build queue storage params")];
+            let insert_start = Instant::now();
+            let res = producer_store.enqueue_params_batch(&producer_pool, &params).await;
             match res {
                 Ok(_) => {
+                    producer_latencies_window
+                        .lock()
+                        .await
+                        .record(insert_start.elapsed().as_secs_f64() * 1_000.0);
                     producer_enqueued.fetch_add(1, Ordering::Relaxed);
                     seq += 1;
                 }
@@ -291,15 +354,13 @@ pub async fn run() {
         let queue_depth = Arc::clone(&queue_depth);
         tokio::spawn(async move {
             while !depth_shutdown.load(Ordering::Relaxed) {
-                let row: Result<(i64,), _> = sqlx::query_as(
-                    "SELECT count(*) FROM awa.jobs_hot \
-                     WHERE queue = $1 AND state = 'available'",
-                )
-                .bind(queue_name)
-                .fetch_one(&depth_pool)
-                .await;
-                if let Ok((n,)) = row {
-                    queue_depth.store(n as u64, Ordering::Relaxed);
+                match depth_store.queue_counts(&depth_pool, queue_name).await {
+                    Ok(counts) => {
+                        queue_depth.store(counts.available as u64, Ordering::Relaxed);
+                    }
+                    Err(err) => {
+                        eprintln!("[awa] queue depth poll failed: {err}");
+                    }
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -311,7 +372,9 @@ pub async fn run() {
     let sample_enqueued = Arc::clone(&enqueued);
     let sample_completed = Arc::clone(&completed);
     let sample_depth = Arc::clone(&queue_depth);
-    let sample_latencies = Arc::clone(&latencies);
+    let sample_producer_latencies = Arc::clone(&producer_latencies);
+    let sample_subscriber_latencies = Arc::clone(&subscriber_latencies);
+    let sample_end_to_end_latencies = Arc::clone(&end_to_end_latencies);
     let sample_target_rate = Arc::clone(&producer_target_rate);
     let sample_handle = tokio::spawn(async move {
         // Align first tick to the next wall-clock `sample_every_s` boundary.
@@ -346,8 +409,22 @@ pub async fn run() {
             last_completed = cmp;
 
             let window = Duration::from_secs(30);
-            let (p50, p95, p99) = {
-                let mut guard = sample_latencies.lock().await;
+            let (producer_p50, producer_p95, producer_p99) = {
+                let mut guard = sample_producer_latencies.lock().await;
+                guard
+                    .snapshot(window)
+                    .map(|(a, b, c, _)| (a, b, c))
+                    .unwrap_or((0.0, 0.0, 0.0))
+            };
+            let (subscriber_p50, subscriber_p95, subscriber_p99) = {
+                let mut guard = sample_subscriber_latencies.lock().await;
+                guard
+                    .snapshot(window)
+                    .map(|(a, b, c, _)| (a, b, c))
+                    .unwrap_or((0.0, 0.0, 0.0))
+            };
+            let (end_to_end_p50, end_to_end_p95, end_to_end_p99) = {
+                let mut guard = sample_end_to_end_latencies.lock().await;
                 guard
                     .snapshot(window)
                     .map(|(a, b, c, _)| (a, b, c))
@@ -358,9 +435,18 @@ pub async fn run() {
             let ts = now_iso_ms();
 
             for (metric, value, window_s) in [
-                ("claim_p50_ms", p50, 30.0),
-                ("claim_p95_ms", p95, 30.0),
-                ("claim_p99_ms", p99, 30.0),
+                ("producer_p50_ms", producer_p50, 30.0),
+                ("producer_p95_ms", producer_p95, 30.0),
+                ("producer_p99_ms", producer_p99, 30.0),
+                ("subscriber_p50_ms", subscriber_p50, 30.0),
+                ("subscriber_p95_ms", subscriber_p95, 30.0),
+                ("subscriber_p99_ms", subscriber_p99, 30.0),
+                ("end_to_end_p50_ms", end_to_end_p50, 30.0),
+                ("end_to_end_p95_ms", end_to_end_p95, 30.0),
+                ("end_to_end_p99_ms", end_to_end_p99, 30.0),
+                ("claim_p50_ms", subscriber_p50, 30.0),
+                ("claim_p95_ms", subscriber_p95, 30.0),
+                ("claim_p99_ms", subscriber_p99, 30.0),
                 ("enqueue_rate", enq_rate, sample_every_s as f64),
                 ("completion_rate", cmp_rate, sample_every_s as f64),
                 ("queue_depth", depth, 0.0),
