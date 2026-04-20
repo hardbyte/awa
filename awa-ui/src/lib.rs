@@ -102,6 +102,7 @@ pub async fn router_with(
         .route("/dlq/bulk-move", post(handlers::dlq::bulk_move_failed))
         // Runtime
         .route("/runtime", get(handlers::runtime::get_runtime))
+        .route("/storage", get(handlers::runtime::get_storage))
         // Callbacks (for HTTP workers and external systems)
         .route(
             "/callbacks/{callback_id}/complete",
