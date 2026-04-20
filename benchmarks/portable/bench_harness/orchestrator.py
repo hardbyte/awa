@@ -814,8 +814,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sample-every",
         type=int,
-        default=10,
-        help="Sample cadence in seconds (default 10).",
+        default=5,
+        help="Sample cadence in seconds (default 5).",
     )
     parser.add_argument(
         "--producer-rate",
