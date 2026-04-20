@@ -1156,8 +1156,8 @@ impl QueueStorage {
         Ok(())
     }
 
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.install")]
-    pub async fn install(&self, pool: &PgPool) -> Result<(), AwaError> {
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.prepare_schema")]
+    pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
         let mut install_lock_conn = pool.acquire().await.map_err(map_sqlx_error)?;
@@ -1907,23 +1907,6 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
-            // Mark queue storage active only after the full schema, partitions,
-            // indexes, and helper functions are in place. Other sessions route
-            // inserts through this registry, so activating early can expose a
-            // partially-installed backend.
-            sqlx::query(
-                r#"
-            INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
-            VALUES ('queue_storage', $1, now())
-            ON CONFLICT (backend)
-            DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
-            "#,
-            )
-            .bind(schema)
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
             Ok(())
         }
         .await;
@@ -1941,6 +1924,47 @@ impl QueueStorage {
             (Ok(()), Err(err)) => Err(err),
             (Err(err), Err(_)) => Err(err),
         }
+    }
+
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.activate_backend")]
+    pub async fn activate_backend(&self, pool: &PgPool) -> Result<(), AwaError> {
+        sqlx::query(
+            r#"
+            CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
+                backend     TEXT PRIMARY KEY,
+                schema_name TEXT NOT NULL,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            "#,
+        )
+        .execute(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Mark queue storage active only after the full schema, partitions,
+        // indexes, and helper functions are in place. Other sessions route
+        // inserts through this registry, so activating early can expose a
+        // partially-installed backend.
+        sqlx::query(
+            r#"
+            INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+            VALUES ('queue_storage', $1, now())
+            ON CONFLICT (backend)
+            DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
+            "#,
+        )
+        .bind(self.schema())
+        .execute(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.install")]
+    pub async fn install(&self, pool: &PgPool) -> Result<(), AwaError> {
+        self.prepare_schema(pool).await?;
+        self.activate_backend(pool).await
     }
 
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {

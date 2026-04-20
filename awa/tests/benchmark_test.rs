@@ -56,6 +56,113 @@ async fn recreate_queue_storage_schema(pool: &sqlx::PgPool, store: &QueueStorage
         .expect("Failed to drop queue storage benchmark schema");
 }
 
+async fn reset_storage_transition_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to reset storage transition state");
+
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to clear active queue storage backend");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(pool)
+        .await
+        .expect("Failed to clear runtime snapshots");
+}
+
+async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid::Uuid {
+    let instance_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id,
+            hostname,
+            pid,
+            version,
+            storage_capability,
+            started_at,
+            last_seen_at,
+            snapshot_interval_ms,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            maintenance_alive,
+            shutting_down,
+            leader,
+            global_max_workers,
+            queues,
+            queue_descriptor_hashes,
+            job_kind_descriptor_hashes
+        )
+        VALUES (
+            $1,
+            'benchmark-runtime',
+            1,
+            'test',
+            $2,
+            now(),
+            now(),
+            10000,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            FALSE,
+            TRUE,
+            NULL,
+            '[]'::jsonb,
+            '{}'::jsonb,
+            '{}'::jsonb
+        )
+        "#,
+    )
+    .bind(instance_id)
+    .bind(capability)
+    .execute(pool)
+    .await
+    .expect("Failed to insert benchmark runtime instance");
+    instance_id
+}
+
+async fn activate_queue_storage_transition(pool: &sqlx::PgPool, schema: &str) {
+    reset_storage_transition_state(pool).await;
+    sqlx::query("SELECT * FROM awa.storage_prepare('queue_storage', $1)")
+        .bind(serde_json::json!({ "schema": schema }))
+        .execute(pool)
+        .await
+        .expect("Failed to prepare queue storage transition");
+    let gate_runtime = insert_runtime_instance(pool, "queue_storage").await;
+    sqlx::query("SELECT * FROM awa.storage_enter_mixed_transition()")
+        .execute(pool)
+        .await
+        .expect("Failed to enter mixed transition");
+    sqlx::query("SELECT * FROM awa.storage_finalize()")
+        .execute(pool)
+        .await
+        .expect("Failed to finalize queue storage transition");
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id = $1")
+        .bind(gate_runtime)
+        .execute(pool)
+        .await
+        .expect("Failed to remove benchmark gate runtime");
+}
+
 async fn sample_pgstattuple_dead_tuples(
     pool: &sqlx::PgPool,
     schema: &str,
@@ -86,10 +193,7 @@ async fn sample_pgstattuple_dead_tuples(
 
 /// Clean only jobs and queue_meta for a specific queue.
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
-    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        .execute(pool)
-        .await
-        .expect("Failed to clear active queue storage backend");
+    reset_storage_transition_state(pool).await;
     sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
         .bind(queue)
         .execute(pool)
@@ -109,10 +213,7 @@ async fn reset_runtime_state(pool: &sqlx::PgPool) {
     .execute(pool)
     .await
     .expect("Failed to reset runtime benchmark state");
-    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        .execute(pool)
-        .await
-        .expect("Failed to clear active queue storage backend");
+    reset_storage_transition_state(pool).await;
 }
 
 #[derive(Debug, Clone)]
@@ -561,6 +662,7 @@ async fn test_throughput_rust_workers_queue_storage() {
         .reset(&pool)
         .await
         .expect("Failed to reset queue storage store");
+    activate_queue_storage_transition(&pool, store.schema()).await;
 
     let client = Client::builder(pool.clone())
         .queue(
@@ -822,6 +924,7 @@ async fn test_pickup_latency_listen_notify_queue_storage() {
         .reset(&pool)
         .await
         .expect("Failed to reset queue storage latency store");
+    activate_queue_storage_transition(&pool, store.schema()).await;
 
     let (pickup_tx, mut pickup_rx) = tokio::sync::mpsc::unbounded_channel::<std::time::Instant>();
 

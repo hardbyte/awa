@@ -23,6 +23,247 @@ END;
 $$ LANGUAGE plpgsql STABLE
 SET search_path = pg_catalog, awa, public;
 
+CREATE OR REPLACE FUNCTION awa.canonical_live_backlog()
+RETURNS BIGINT
+LANGUAGE sql
+STABLE
+SET search_path = pg_catalog, awa
+AS $$
+    SELECT
+        COALESCE((
+            SELECT count(*)::bigint
+            FROM awa.jobs_hot
+            WHERE state NOT IN ('completed', 'failed', 'cancelled')
+        ), 0)
+        +
+        COALESCE((
+            SELECT count(*)::bigint
+            FROM awa.scheduled_jobs
+        ), 0)
+$$;
+
+CREATE OR REPLACE FUNCTION awa.storage_abort()
+RETURNS TABLE (
+    current_engine TEXT,
+    active_engine TEXT,
+    prepared_engine TEXT,
+    state TEXT,
+    transition_epoch BIGINT,
+    details JSONB,
+    entered_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    finalized_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SET search_path = pg_catalog, awa, public
+AS $$
+BEGIN
+    DELETE FROM awa.runtime_storage_backends
+    WHERE backend = 'queue_storage';
+
+    UPDATE awa.storage_transition_state AS sts
+    SET
+        prepared_engine = NULL,
+        state = 'canonical',
+        transition_epoch = CASE
+            WHEN sts.state IN ('prepared', 'mixed_transition') THEN sts.transition_epoch + 1
+            ELSE sts.transition_epoch
+        END,
+        details = '{}'::jsonb,
+        entered_at = CASE
+            WHEN sts.state = 'canonical' THEN sts.entered_at
+            ELSE now()
+        END,
+        updated_at = now(),
+        finalized_at = NULL
+    WHERE sts.singleton
+      AND sts.state IN ('canonical', 'prepared', 'mixed_transition');
+
+    RETURN QUERY
+    SELECT * FROM awa.storage_status();
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION awa.storage_enter_mixed_transition()
+RETURNS TABLE (
+    current_engine TEXT,
+    active_engine TEXT,
+    prepared_engine TEXT,
+    state TEXT,
+    transition_epoch BIGINT,
+    details JSONB,
+    entered_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    finalized_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SET search_path = pg_catalog, awa, public
+AS $$
+DECLARE
+    v_prepared_engine TEXT;
+    v_state TEXT;
+    v_details JSONB;
+    v_schema TEXT;
+    v_live_canonical_count BIGINT;
+    v_live_queue_storage_count BIGINT;
+BEGIN
+    SELECT sts.prepared_engine, sts.state, sts.details
+    INTO v_prepared_engine, v_state, v_details
+    FROM awa.storage_transition_state AS sts
+    WHERE sts.singleton
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'storage transition state row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF v_state <> 'prepared' THEN
+        RAISE EXCEPTION 'storage enter-mixed-transition is only allowed from prepared state'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF v_prepared_engine IS DISTINCT FROM 'queue_storage' THEN
+        RAISE EXCEPTION 'prepared engine "%" is not supported by this release', v_prepared_engine
+            USING ERRCODE = '22023';
+    END IF;
+
+    v_schema := COALESCE(NULLIF(v_details->>'schema', ''), 'awa_exp');
+
+    IF to_regclass(format('%I.%I', v_schema, 'queue_ring_state')) IS NULL
+        OR to_regclass(format('%I.%I', v_schema, 'ready_entries')) IS NULL
+        OR to_regclass(format('%I.%I', v_schema, 'leases')) IS NULL
+    THEN
+        RAISE EXCEPTION 'queue storage schema "%" is not prepared', v_schema
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT count(*)::bigint
+    INTO v_live_canonical_count
+    FROM awa.runtime_instances AS runtime
+    WHERE runtime.storage_capability = 'canonical'
+      AND runtime.last_seen_at + make_interval(
+            secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+          ) >= now();
+
+    IF v_live_canonical_count > 0 THEN
+        RAISE EXCEPTION 'cannot enter mixed transition while % canonical-only runtime(s) are still live', v_live_canonical_count
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT count(*)::bigint
+    INTO v_live_queue_storage_count
+    FROM awa.runtime_instances AS runtime
+    WHERE runtime.storage_capability = 'queue_storage'
+      AND runtime.last_seen_at + make_interval(
+            secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+          ) >= now();
+
+    IF v_live_queue_storage_count = 0 THEN
+        RAISE EXCEPTION 'cannot enter mixed transition without a live queue-storage-capable runtime'
+            USING ERRCODE = '55000';
+    END IF;
+
+    INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+    VALUES ('queue_storage', v_schema, now())
+    ON CONFLICT (backend)
+    DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at;
+
+    UPDATE awa.storage_transition_state AS sts
+    SET
+        state = 'mixed_transition',
+        transition_epoch = sts.transition_epoch + 1,
+        entered_at = now(),
+        updated_at = now(),
+        finalized_at = NULL
+    WHERE sts.singleton
+      AND sts.state = 'prepared';
+
+    RETURN QUERY
+    SELECT * FROM awa.storage_status();
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION awa.storage_finalize()
+RETURNS TABLE (
+    current_engine TEXT,
+    active_engine TEXT,
+    prepared_engine TEXT,
+    state TEXT,
+    transition_epoch BIGINT,
+    details JSONB,
+    entered_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    finalized_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SET search_path = pg_catalog, awa, public
+AS $$
+DECLARE
+    v_prepared_engine TEXT;
+    v_state TEXT;
+    v_backlog BIGINT;
+    v_live_drain_count BIGINT;
+BEGIN
+    SELECT sts.prepared_engine, sts.state
+    INTO v_prepared_engine, v_state
+    FROM awa.storage_transition_state AS sts
+    WHERE sts.singleton
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'storage transition state row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF v_state <> 'mixed_transition' THEN
+        RAISE EXCEPTION 'storage finalize is only allowed from mixed_transition state'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF v_prepared_engine IS DISTINCT FROM 'queue_storage' THEN
+        RAISE EXCEPTION 'prepared engine "%" is not supported by this release', v_prepared_engine
+            USING ERRCODE = '22023';
+    END IF;
+
+    SELECT awa.canonical_live_backlog()
+    INTO v_backlog;
+
+    IF v_backlog > 0 THEN
+        RAISE EXCEPTION 'cannot finalize while canonical live backlog is %', v_backlog
+            USING ERRCODE = '55000';
+    END IF;
+
+    SELECT count(*)::bigint
+    INTO v_live_drain_count
+    FROM awa.runtime_instances AS runtime
+    WHERE runtime.storage_capability IN ('canonical', 'canonical_drain_only')
+      AND runtime.last_seen_at + make_interval(
+            secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+          ) >= now();
+
+    IF v_live_drain_count > 0 THEN
+        RAISE EXCEPTION 'cannot finalize while % canonical or drain-only runtime(s) are still live', v_live_drain_count
+            USING ERRCODE = '55000';
+    END IF;
+
+    UPDATE awa.storage_transition_state AS sts
+    SET
+        current_engine = sts.prepared_engine,
+        prepared_engine = NULL,
+        state = 'active',
+        transition_epoch = sts.transition_epoch + 1,
+        entered_at = now(),
+        updated_at = now(),
+        finalized_at = now()
+    WHERE sts.singleton
+      AND sts.state = 'mixed_transition';
+
+    RETURN QUERY
+    SELECT * FROM awa.storage_status();
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_kind TEXT,
     p_queue TEXT DEFAULT 'default',

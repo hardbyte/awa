@@ -12,6 +12,7 @@ use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 /// Serialize all migration tests to prevent parallel schema drops.
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
@@ -47,13 +48,6 @@ fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
         awa::AwaError::Database(sqlx::Error::Database(db_err)) => {
             db_err.code().map(|code| code.to_string())
         }
-        _ => None,
-    }
-}
-
-fn sqlstate_from_sqlx_error(err: &sqlx::Error) -> Option<String> {
-    match err {
-        sqlx::Error::Database(db_err) => db_err.code().map(|code| code.to_string()),
         _ => None,
     }
 }
@@ -128,12 +122,78 @@ async fn install_queue_storage_backend(pool: &PgPool, schema: &str) {
         .await
         .expect("queue storage test schema should drop cleanly");
 
-    let store = QueueStorage::from_existing_schema(schema)
-        .expect("queue storage schema should validate");
+    let store =
+        QueueStorage::from_existing_schema(schema).expect("queue storage schema should validate");
     store
         .install(pool)
         .await
         .expect("queue storage install should succeed");
+}
+
+async fn prepare_queue_storage_schema(pool: &PgPool, schema: &str) {
+    install_queue_storage_backend(pool, schema).await;
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("queue storage backend activation should clear cleanly");
+}
+
+async fn active_queue_storage_schema(pool: &PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+        .fetch_one(pool)
+        .await
+        .expect("active queue storage schema query should succeed")
+}
+
+async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id,
+            hostname,
+            pid,
+            version,
+            started_at,
+            last_seen_at,
+            snapshot_interval_ms,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            maintenance_alive,
+            shutting_down,
+            leader,
+            global_max_workers,
+            queues,
+            storage_capability
+        )
+        VALUES (
+            $1, 'test-host', 4242, '0.6.0-test',
+            now() - interval '1 minute',
+            now(),
+            10000,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            FALSE,
+            TRUE,
+            NULL,
+            '[]'::jsonb,
+            $2
+        )
+        ON CONFLICT (instance_id)
+        DO UPDATE SET
+            last_seen_at = EXCLUDED.last_seen_at,
+            storage_capability = EXCLUDED.storage_capability
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(capability)
+    .execute(pool)
+    .await
+    .expect("runtime instance insert should succeed");
 }
 
 // ── Fresh install ────────────────────────────────────────────────
@@ -615,6 +675,13 @@ async fn test_storage_abort_from_mixed_transition_returns_to_canonical() {
     .await
     .unwrap();
 
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at) VALUES ('queue_storage', 'awa_queue_storage', now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
     let before = storage::status(&pool).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     let after = storage::abort(&pool).await.unwrap();
@@ -624,44 +691,123 @@ async fn test_storage_abort_from_mixed_transition_returns_to_canonical() {
     assert_eq!(after.prepared_engine, None);
     assert_eq!(after.transition_epoch, before.transition_epoch + 1);
     assert!(after.entered_at > before.entered_at);
+    assert_eq!(active_queue_storage_schema(&pool).await, None);
 }
 
 #[tokio::test]
-async fn test_storage_enter_mixed_transition_stub_requires_0_6() {
+async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_runtime() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, "awa_enter_mixed").await;
 
-    let err = sqlx::query("SELECT * FROM awa.storage_enter_mixed_transition()")
+    let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(err.to_string().contains("prepared state"), "got {err}");
+
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({"schema": "awa_enter_mixed"}),
+    )
+    .await
+    .unwrap();
+
+    let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("queue-storage-capable runtime"),
+        "got {err}"
+    );
+
+    insert_runtime_instance(&pool, "canonical").await;
+    let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("canonical-only runtime"),
+        "got {err}"
+    );
+
+    sqlx::query("DELETE FROM awa.runtime_instances")
         .execute(&pool)
         .await
-        .unwrap_err();
-    assert_eq!(sqlstate_from_sqlx_error(&err).as_deref(), Some("55000"));
-    assert!(
-        err.to_string().contains("requires 0.6"),
-        "expected 0.6 guard error, got {err}"
+        .unwrap();
+    insert_runtime_instance(&pool, "queue_storage").await;
+
+    let status = storage::enter_mixed_transition(&pool).await.unwrap();
+    assert_eq!(status.state, "mixed_transition");
+    assert_eq!(status.current_engine, "canonical");
+    assert_eq!(status.active_engine, "queue_storage");
+    assert_eq!(status.prepared_engine.as_deref(), Some("queue_storage"));
+    assert_eq!(
+        active_queue_storage_schema(&pool).await,
+        Some("awa_enter_mixed".to_string())
     );
 }
 
 #[tokio::test]
-async fn test_storage_finalize_stub_requires_0_6() {
+async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;
+    let schema = "awa_finalize_transition";
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, schema).await;
 
-    let err = sqlx::query("SELECT * FROM awa.storage_finalize()")
+    let err = storage::finalize(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(err.to_string().contains("mixed_transition"), "got {err}");
+
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({ "schema": schema }),
+    )
+    .await
+    .unwrap();
+    insert_runtime_instance(&pool, "queue_storage").await;
+    storage::enter_mixed_transition(&pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs_hot (kind, queue, args, state, priority) VALUES ('finalize_backlog_job', 'finalize_queue', '{}'::jsonb, 'available', 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = storage::finalize(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("canonical live backlog"),
+        "got {err}"
+    );
+
+    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = 'finalize_queue'")
         .execute(&pool)
         .await
-        .unwrap_err();
-    assert_eq!(sqlstate_from_sqlx_error(&err).as_deref(), Some("55000"));
-    assert!(
-        err.to_string().contains("requires 0.6"),
-        "expected 0.6 guard error, got {err}"
-    );
+        .unwrap();
+    insert_runtime_instance(&pool, "canonical_drain_only").await;
+
+    let err = storage::finalize(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(err.to_string().contains("drain-only runtime"), "got {err}");
+
+    sqlx::query(
+        "DELETE FROM awa.runtime_instances WHERE storage_capability = 'canonical_drain_only'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let status = storage::finalize(&pool).await.unwrap();
+    assert_eq!(status.state, "active");
+    assert_eq!(status.current_engine, "queue_storage");
+    assert_eq!(status.active_engine, "queue_storage");
+    assert_eq!(status.prepared_engine, None);
+    assert!(status.finalized_at.is_some());
 }
 
 #[tokio::test]

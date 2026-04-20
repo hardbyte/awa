@@ -4,7 +4,7 @@
 //! queue_storage backend enabled.
 
 use awa::model::{
-    admin, insert, migrations, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig,
+    admin, insert, migrations, storage, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig,
     RotateOutcome,
 };
 use awa::{
@@ -86,6 +86,17 @@ async fn ensure_database_exists(url: &str) {
 async fn setup_pool(max_connections: u32) -> sqlx::PgPool {
     let url = database_url();
     ensure_database_exists(&url).await;
+    let reset_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("Failed to connect to database for queue_storage schema reset");
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS awa CASCADE")
+        .execute(&reset_pool)
+        .await
+        .expect("Failed to drop awa schema for queue_storage tests");
+    reset_pool.close().await;
+
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
@@ -129,6 +140,84 @@ async fn reset_shared_awa_state(pool: &sqlx::PgPool) {
     .expect("Failed to reset shared awa state for queue_storage tests");
 }
 
+async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid::Uuid {
+    let instance_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id,
+            hostname,
+            pid,
+            version,
+            storage_capability,
+            started_at,
+            last_seen_at,
+            snapshot_interval_ms,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            maintenance_alive,
+            shutting_down,
+            leader,
+            global_max_workers,
+            queues,
+            queue_descriptor_hashes,
+            job_kind_descriptor_hashes
+        )
+        VALUES (
+            $1,
+            'queue-storage-test',
+            1,
+            'test',
+            $2,
+            now(),
+            now(),
+            10000,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            FALSE,
+            TRUE,
+            NULL,
+            '[]'::jsonb,
+            '{}'::jsonb,
+            '{}'::jsonb
+        )
+        "#,
+    )
+    .bind(instance_id)
+    .bind(capability)
+    .execute(pool)
+    .await
+    .expect("Failed to insert runtime instance");
+    instance_id
+}
+
+async fn activate_queue_storage_transition(pool: &sqlx::PgPool, schema: &str) {
+    storage::prepare(
+        pool,
+        "queue_storage",
+        serde_json::json!({ "schema": schema }),
+    )
+    .await
+    .expect("Failed to prepare queue storage transition");
+    let gate_runtime = insert_runtime_instance(pool, "queue_storage").await;
+    storage::enter_mixed_transition(pool)
+        .await
+        .expect("Failed to enter mixed transition for queue_storage tests");
+    storage::finalize(pool)
+        .await
+        .expect("Failed to finalize queue storage transition for queue_storage tests");
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id = $1")
+        .bind(gate_runtime)
+        .execute(pool)
+        .await
+        .expect("Failed to remove queue storage gate runtime");
+}
+
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     let store = QueueStorage::new(QueueStorageConfig {
         schema: schema.to_string(),
@@ -140,6 +229,7 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     reset_shared_awa_state(pool).await;
     store.install(pool).await.expect("Failed to install store");
     store.reset(pool).await.expect("Failed to reset store");
+    activate_queue_storage_transition(pool, schema).await;
     store
 }
 
@@ -1334,6 +1424,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     recreate_store_schema(&pool, &store).await;
     store.install(&pool).await.expect("Failed to install store");
     store.reset(&pool).await.expect("Failed to reset store");
+    activate_queue_storage_transition(&pool, schema).await;
 
     let release = Arc::new(tokio::sync::Notify::new());
     let client = queue_storage_client(

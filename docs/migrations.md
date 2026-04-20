@@ -91,20 +91,23 @@ These functions are one-shot operational commands. They are not schema-migration
 DDL and should be run deliberately by an operator or rollout tool, not embedded
 into the extracted migration SQL itself.
 
-Reserved for `0.6`, but intentionally claimed now as SQL identities:
+On the `0.5.x` prep release these SQL identities existed as stubs. On this
+`0.6` branch they are implemented:
 
 - `awa.storage_enter_mixed_transition()`
 - `awa.storage_finalize()`
-
-Those functions currently fail with `55000` and a clear “requires 0.6” error.
 
 Current behavior:
 
 - `storage status` reports the singleton row in `awa.storage_transition_state`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
-- `storage abort` clears a prepared engine selection and is also the forward-compatible
-  operator primitive for aborting a later `mixed_transition` rollout before final activation
+- `storage abort` returns routing to canonical and clears a prepared or mixed-transition
+  rollout before final activation
+- `storage enter-mixed-transition` requires prepared queue-storage metadata,
+  a prepared queue-storage schema, and no live canonical-only runtimes
+- `storage finalize` requires zero canonical live backlog and no live
+  canonical / drain-only runtimes
 - workers continue to run the canonical engine before and after `prepare`
 
 This is intentional. The `0.5.x` prep release is only adding the reusable

@@ -244,6 +244,10 @@ enum StorageCommands {
     },
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
+    /// Enter mixed transition and begin routing new writes to the prepared engine
+    EnterMixedTransition,
+    /// Finalize the storage transition once drain and capability gates pass
+    Finalize,
 }
 
 #[derive(Subcommand)]
@@ -678,6 +682,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                     StorageCommands::Abort => {
                         let status = awa_model::storage::abort(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    }
+                    StorageCommands::EnterMixedTransition => {
+                        let status = awa_model::storage::enter_mixed_transition(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    }
+                    StorageCommands::Finalize => {
+                        let status = awa_model::storage::finalize(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&status)?);
                     }
                 },

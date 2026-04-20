@@ -11,7 +11,7 @@ use awa_model::admin::{
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeSnapshotInput, StorageCapability,
 };
-use awa_model::{JobArgs, PeriodicJob, QueueStorageConfig};
+use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueStorageConfig};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use sqlx::PgPool;
@@ -623,6 +623,7 @@ impl ClientBuilder {
             dlq_policy,
             dlq_retention: self.dlq_retention,
             dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
+            effective_storage: Arc::new(RwLock::new(self.storage.clone())),
             storage: self.storage,
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
@@ -714,6 +715,7 @@ pub struct Client {
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
     storage: RuntimeStorage,
+    effective_storage: Arc<RwLock<RuntimeStorage>>,
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
     runtime_instance_id: Uuid,
@@ -744,6 +746,8 @@ struct RuntimeReporterState {
     pid: i32,
     version: &'static str,
     snapshot_interval: Duration,
+    effective_storage: Arc<RwLock<RuntimeStorage>>,
+    queue_storage_capable: bool,
     metrics: crate::metrics::AwaMetrics,
 }
 
@@ -751,6 +755,63 @@ impl Client {
     /// Create a new builder.
     pub fn builder(pool: PgPool) -> ClientBuilder {
         ClientBuilder::new(pool)
+    }
+
+    fn expected_queue_storage_schema(
+        status: &transition::StorageStatus,
+    ) -> Result<Option<String>, awa_model::AwaError> {
+        let prepared_schema = || {
+            status
+                .details
+                .get("schema")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("awa_exp")
+                .to_string()
+        };
+
+        match status.state.as_str() {
+            "prepared" if status.prepared_engine.as_deref() == Some("queue_storage") => {
+                Ok(Some(prepared_schema()))
+            }
+            "mixed_transition" | "active" if status.active_engine == "queue_storage" => {
+                Ok(Some(prepared_schema()))
+            }
+            "canonical" if status.prepared_engine.as_deref() == Some("queue_storage") => {
+                Ok(Some(prepared_schema()))
+            }
+            "mixed_transition" | "active" => Err(awa_model::AwaError::Validation(format!(
+                "unsupported active storage engine '{}'",
+                status.active_engine
+            ))),
+            _ => Ok(None),
+        }
+    }
+
+    async fn resolve_effective_storage(&self) -> Result<RuntimeStorage, awa_model::AwaError> {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return Ok(RuntimeStorage::Canonical);
+        };
+
+        let status = transition::status(&self.pool).await?;
+        let expected_schema = Self::expected_queue_storage_schema(&status)?;
+        if let Some(schema) = expected_schema.as_deref() {
+            if runtime.store.schema() != schema {
+                return Err(awa_model::AwaError::Validation(format!(
+                    "queue storage runtime configured for schema '{}' but transition state requires '{}'",
+                    runtime.store.schema(),
+                    schema
+                )));
+            }
+            runtime.store.prepare_schema(&self.pool).await?;
+        }
+
+        if matches!(status.state.as_str(), "mixed_transition" | "active")
+            && status.active_engine == "queue_storage"
+        {
+            Ok(RuntimeStorage::QueueStorage(runtime.clone()))
+        } else {
+            Ok(RuntimeStorage::Canonical)
+        }
     }
 
     fn declared_queue_descriptors(&self) -> Vec<NamedQueueDescriptor> {
@@ -810,6 +871,8 @@ impl Client {
             pid: self.runtime_pid,
             version: self.runtime_version,
             snapshot_interval: self.runtime_snapshot_interval,
+            effective_storage: self.effective_storage.clone(),
+            queue_storage_capable: self.storage.queue_storage().is_some(),
             metrics: self.metrics.clone(),
         }
     }
@@ -827,6 +890,12 @@ impl Client {
             "Starting Awa worker runtime"
         );
 
+        let effective_storage = self.resolve_effective_storage().await?;
+        {
+            let mut guard = self.effective_storage.write().await;
+            *guard = effective_storage.clone();
+        }
+
         admin::sync_queue_descriptors(
             &self.pool,
             &self.declared_queue_descriptors(),
@@ -840,17 +909,13 @@ impl Client {
         )
         .await?;
 
-        if let Some(store) = self.storage.queue_storage_store() {
-            store.install(&self.pool).await?;
-        }
-
         // Completion batcher stays alive during drain so tasks can release
         // only after their completion has been acknowledged.
         let (completion_batcher, completion_handle) = CompletionBatcher::new(
             self.pool.clone(),
             self.service_cancel.clone(),
             self.metrics.clone(),
-            self.storage.clone(),
+            effective_storage.clone(),
         );
 
         // Create executor with metrics
@@ -863,7 +928,7 @@ impl Client {
             self.state.clone(),
             self.metrics.clone(),
             completion_handle,
-            self.storage.clone(),
+            effective_storage.clone(),
             self.dlq_policy.clone(),
         ));
 
@@ -894,7 +959,7 @@ impl Client {
             self.service_cancel.clone(),
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
-            self.storage.clone(),
+            effective_storage.clone(),
         )
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
@@ -977,7 +1042,7 @@ impl Client {
                     self.dispatch_cancel.clone(),
                     self.job_set.clone(),
                     concurrency,
-                    self.storage.clone(),
+                    effective_storage.clone(),
                 )
             } else {
                 // Hard-reserved mode (default)
@@ -991,7 +1056,7 @@ impl Client {
                     alive,
                     self.dispatch_cancel.clone(),
                     self.job_set.clone(),
-                    self.storage.clone(),
+                    effective_storage.clone(),
                 )
             };
             dispatcher_handles.push(tokio::spawn(async move {
@@ -1081,7 +1146,8 @@ impl Client {
         let maintenance_alive = self.maintenance_alive.load(Ordering::SeqCst);
         let shutting_down = self.dispatch_cancel.is_cancelled();
         let leader = self.leader.load(Ordering::SeqCst);
-        let available_rows = if let Some(store) = self.storage.queue_storage_store() {
+        let effective_storage = self.effective_storage.read().await.clone();
+        let available_rows = if let Some(store) = effective_storage.queue_storage_store() {
             sqlx::query_as::<_, (String, i64)>(&format!(
                 r#"
                 SELECT queue, COALESCE(sum(available_count), 0)::bigint AS available
@@ -1157,6 +1223,34 @@ impl Client {
 }
 
 impl RuntimeReporterState {
+    async fn storage_capability(&self) -> StorageCapability {
+        if !self.queue_storage_capable {
+            return StorageCapability::Canonical;
+        }
+
+        let effective_storage = self.effective_storage.read().await.clone();
+        if matches!(effective_storage, RuntimeStorage::QueueStorage(_)) {
+            return StorageCapability::QueueStorage;
+        }
+
+        match transition::status(&self.pool).await {
+            Ok(status)
+                if matches!(status.state.as_str(), "mixed_transition" | "active")
+                    && status.active_engine == "queue_storage" =>
+            {
+                StorageCapability::CanonicalDrainOnly
+            }
+            Ok(_) => StorageCapability::QueueStorage,
+            Err(err) => {
+                warn!(
+                    error = %err,
+                    "Failed to resolve storage transition status for runtime snapshot"
+                );
+                StorageCapability::QueueStorage
+            }
+        }
+    }
+
     fn queue_descriptor_hashes(&self) -> HashMap<String, String> {
         self.declared_queue_descriptors()
             .into_iter()
@@ -1270,6 +1364,7 @@ impl RuntimeReporterState {
             && heartbeat_alive
             && maintenance_alive
             && !shutting_down;
+        let storage_capability = self.storage_capability().await;
         let queues = self
             .queues
             .iter()
@@ -1281,7 +1376,7 @@ impl RuntimeReporterState {
             hostname: self.hostname.clone(),
             pid: self.pid,
             version: self.version.to_string(),
-            storage_capability: StorageCapability::Canonical,
+            storage_capability,
             started_at: self.started_at,
             snapshot_interval_ms: self.snapshot_interval.as_millis() as i64,
             healthy,
@@ -1367,7 +1462,7 @@ impl RuntimeReporterState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use awa_model::{migrations, JobArgs, QueueStorageConfig};
+    use awa_model::{migrations, storage, JobArgs, QueueStorage, QueueStorageConfig};
     use sqlx::postgres::PgPoolOptions;
     use sqlx::PgPool;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -1503,11 +1598,105 @@ mod tests {
         .expect("Failed to insert job")
     }
 
+    async fn insert_canonical_available_job(pool: &PgPool, kind: &str, queue: &str) -> i64 {
+        sqlx::query_scalar(
+            r#"
+            INSERT INTO awa.jobs_hot (
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                max_attempts,
+                run_at,
+                metadata,
+                tags
+            )
+            VALUES (
+                $1,
+                $2,
+                '{}'::jsonb,
+                'available'::awa.job_state,
+                2,
+                25,
+                clock_timestamp(),
+                '{}'::jsonb,
+                '{}'::text[]
+            )
+            RETURNING id
+            "#,
+        )
+        .bind(kind)
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to insert canonical job")
+    }
+
     async fn active_queue_storage_schema(pool: &PgPool) -> Option<String> {
         sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
             .fetch_one(pool)
             .await
             .expect("Failed to fetch active queue storage schema")
+    }
+
+    async fn wait_for_runtime_capability(
+        pool: &PgPool,
+        instance_id: Uuid,
+        capability: StorageCapability,
+        timeout: Duration,
+    ) {
+        let start = Instant::now();
+        loop {
+            let current: Option<String> = sqlx::query_scalar(
+                "SELECT storage_capability FROM awa.runtime_instances WHERE instance_id = $1",
+            )
+            .bind(instance_id)
+            .fetch_optional(pool)
+            .await
+            .expect("Failed to fetch runtime storage capability");
+            if current.as_deref() == Some(capability.as_str()) {
+                return;
+            }
+            assert!(
+                start.elapsed() <= timeout,
+                "Timed out waiting for runtime {instance_id} to report capability {}; last={current:?}",
+                capability.as_str()
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    async fn expire_runtime_instance(pool: &PgPool, instance_id: Uuid) {
+        sqlx::query(
+            "UPDATE awa.runtime_instances SET last_seen_at = now() - interval '1 hour' WHERE instance_id = $1",
+        )
+        .bind(instance_id)
+        .execute(pool)
+        .await
+        .expect("Failed to expire runtime instance");
+    }
+
+    async fn prepare_queue_storage_transition(pool: &PgPool, schema: &str) -> QueueStorage {
+        let store = QueueStorage::new(QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        })
+        .expect("Failed to build queue storage store");
+        drop_queue_storage_schema(pool, schema).await;
+        store
+            .prepare_schema(pool)
+            .await
+            .expect("Failed to prepare queue storage schema");
+        storage::prepare(
+            pool,
+            "queue_storage",
+            serde_json::json!({ "schema": schema }),
+        )
+        .await
+        .expect("Failed to prepare queue storage transition");
+        store
     }
 
     async fn wait_for_state(pool: &PgPool, job_id: i64, state: &str, timeout: Duration) {
@@ -1765,12 +1954,118 @@ mod tests {
         long_release.notify_waiters();
         wait_for_state(&pool, long_id, "completed", Duration::from_secs(5)).await;
         canonical_client.shutdown(Duration::from_secs(5)).await;
+        expire_runtime_instance(&pool, canonical_client.runtime_instance_id).await;
+
+        let _store = prepare_queue_storage_transition(&pool, queue_storage_schema).await;
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            None,
+            "prepare alone must not activate queue storage routing"
+        );
 
         let store_config = QueueStorageConfig {
             schema: queue_storage_schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
         };
+        let drain_only_client = {
+            let queue_storage_short_seen = queue_storage_short_seen.clone();
+            Client::builder(pool.clone())
+                .queue(
+                    "cutover",
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config.clone(),
+                    Duration::from_millis(1_000),
+                    Duration::from_millis(50),
+                )
+                .register::<CutoverShortJob, _, _>(move |_args, _ctx| {
+                    let queue_storage_short_seen = queue_storage_short_seen.clone();
+                    async move {
+                        queue_storage_short_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(JobResult::Completed)
+                    }
+                })
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .deadline_rescue_interval(Duration::from_millis(100))
+                .callback_rescue_interval(Duration::from_millis(100))
+                .runtime_snapshot_interval(Duration::from_millis(100))
+                .build()
+                .expect("Failed to build queue storage client")
+        };
+
+        drain_only_client
+            .start()
+            .await
+            .expect("Failed to start queue storage client");
+        wait_for_runtime_capability(
+            &pool,
+            drain_only_client.runtime_instance_id,
+            StorageCapability::QueueStorage,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            None,
+            "prepared queue storage runtime must stay canonical until mixed transition"
+        );
+
+        let prepared_short_id =
+            insert_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover").await;
+        let queue_storage_start = Instant::now();
+        while queue_storage_short_seen.load(Ordering::SeqCst) == 0 {
+            assert!(
+                queue_storage_start.elapsed() <= Duration::from_secs(5),
+                "queue-storage-capable runtime failed to process canonical work before mixed transition"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for_state(
+            &pool,
+            prepared_short_id,
+            "completed",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        storage::enter_mixed_transition(&pool)
+            .await
+            .expect("enter_mixed_transition should succeed once only 0.6 workers remain");
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            Some(queue_storage_schema.to_string()),
+            "mixed transition should activate queue storage routing"
+        );
+        wait_for_runtime_capability(
+            &pool,
+            drain_only_client.runtime_instance_id,
+            StorageCapability::CanonicalDrainOnly,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let canonical_drain_id =
+            insert_canonical_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover")
+                .await;
+        wait_for_state(
+            &pool,
+            canonical_drain_id,
+            "completed",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        drain_only_client.shutdown(Duration::from_secs(5)).await;
+
         let queue_storage_client = {
             let queue_storage_short_seen = queue_storage_short_seen.clone();
             Client::builder(pool.clone())
@@ -1800,24 +2095,28 @@ mod tests {
                 .heartbeat_rescue_interval(Duration::from_millis(100))
                 .deadline_rescue_interval(Duration::from_millis(100))
                 .callback_rescue_interval(Duration::from_millis(100))
+                .runtime_snapshot_interval(Duration::from_millis(100))
                 .build()
-                .expect("Failed to build queue storage client")
+                .expect("Failed to build post-transition queue storage client")
         };
 
         queue_storage_client
             .start()
             .await
-            .expect("Failed to start queue storage client");
-        assert_eq!(
-            active_queue_storage_schema(&pool).await,
-            Some(queue_storage_schema.to_string()),
-            "queue storage activation should happen only when the new runtime starts"
-        );
+            .expect("Failed to start post-transition queue storage client");
+        wait_for_runtime_capability(
+            &pool,
+            queue_storage_client.runtime_instance_id,
+            StorageCapability::QueueStorage,
+            Duration::from_secs(5),
+        )
+        .await;
 
+        let before_queue_storage = queue_storage_short_seen.load(Ordering::SeqCst);
         let queue_storage_job_id =
             insert_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover").await;
         let queue_storage_start = Instant::now();
-        while queue_storage_short_seen.load(Ordering::SeqCst) == 0 {
+        while queue_storage_short_seen.load(Ordering::SeqCst) == before_queue_storage {
             assert!(
                 queue_storage_start.elapsed() <= Duration::from_secs(5),
                 "queue storage runtime failed to process new work after cutover"

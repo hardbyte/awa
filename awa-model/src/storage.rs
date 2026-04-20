@@ -51,3 +51,23 @@ where
         .await
         .map_err(AwaError::from)
 }
+
+pub async fn enter_mixed_transition<'e, E>(executor: E) -> Result<StorageStatus, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as::<_, StorageStatus>("SELECT * FROM awa.storage_enter_mixed_transition()")
+        .fetch_one(executor)
+        .await
+        .map_err(AwaError::from)
+}
+
+pub async fn finalize<'e, E>(executor: E) -> Result<StorageStatus, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as::<_, StorageStatus>("SELECT * FROM awa.storage_finalize()")
+        .fetch_one(executor)
+        .await
+        .map_err(AwaError::from)
+}
