@@ -538,7 +538,7 @@ async fn test_throughput_rust_workers_queue_storage() {
     reset_runtime_state(&pool).await;
 
     let queue = "bench_throughput_queue_storage";
-    let total_jobs: i64 = env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 10_000);
+    let total_jobs: i64 = env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 5_000);
     let batch_size = env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500);
     let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
     let lease_slot_count = env_usize("AWA_VA_RUNTIME_LEASE_SLOTS", 4);

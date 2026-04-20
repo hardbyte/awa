@@ -185,7 +185,7 @@ class Transaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def insert_many(
@@ -198,7 +198,7 @@ class Transaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     async def commit(self) -> None: ...
     async def rollback(self) -> None: ...
@@ -225,7 +225,7 @@ class SyncTransaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     def insert_many(
@@ -238,7 +238,7 @@ class SyncTransaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...
@@ -265,7 +265,7 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def migrate(self) -> None: ...
@@ -424,7 +424,7 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def periodic(
         self,
@@ -504,7 +504,7 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     def close_sync(self) -> None: ...
@@ -559,7 +559,7 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     # External callback completion (sync)
     def complete_external_sync(

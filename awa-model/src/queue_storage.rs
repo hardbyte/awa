@@ -1267,8 +1267,7 @@ impl QueueStorage {
                 next_seq        BIGINT NOT NULL DEFAULT 1,
                 claim_seq       BIGINT NOT NULL DEFAULT 1,
                 available_count BIGINT NOT NULL DEFAULT 0,
-                running_count   BIGINT NOT NULL DEFAULT 0,
-                completed_count BIGINT NOT NULL DEFAULT 0,
+                pruned_completed_count BIGINT NOT NULL DEFAULT 0,
                 PRIMARY KEY (queue, priority)
             )
             "#
@@ -2499,8 +2498,7 @@ impl QueueStorage {
         queue: &str,
         priority: i16,
         available_delta: i64,
-        running_delta: i64,
-        completed_delta: i64,
+        pruned_completed_delta: i64,
     ) -> Result<(), AwaError> {
         self.adjust_lane_counts_batch(
             tx,
@@ -2508,8 +2506,7 @@ impl QueueStorage {
                 queue.to_string(),
                 priority,
                 available_delta,
-                running_delta,
-                completed_delta,
+                pruned_completed_delta,
             )],
         )
         .await
@@ -2521,19 +2518,16 @@ impl QueueStorage {
         deltas: I,
     ) -> Result<(), AwaError>
     where
-        I: IntoIterator<Item = (String, i16, i64, i64, i64)>,
+        I: IntoIterator<Item = (String, i16, i64, i64)>,
     {
-        let mut grouped: BTreeMap<(String, i16), (i64, i64, i64)> = BTreeMap::new();
-        for (queue, priority, available_delta, running_delta, completed_delta) in deltas {
-            if available_delta == 0 && running_delta == 0 && completed_delta == 0 {
+        let mut grouped: BTreeMap<(String, i16), (i64, i64)> = BTreeMap::new();
+        for (queue, priority, available_delta, pruned_completed_delta) in deltas {
+            if available_delta == 0 && pruned_completed_delta == 0 {
                 continue;
             }
-            let entry = grouped
-                .entry((queue, priority))
-                .or_insert((0_i64, 0_i64, 0_i64));
+            let entry = grouped.entry((queue, priority)).or_insert((0_i64, 0_i64));
             entry.0 += available_delta;
-            entry.1 += running_delta;
-            entry.2 += completed_delta;
+            entry.1 += pruned_completed_delta;
         }
 
         if grouped.is_empty() {
@@ -2544,33 +2538,32 @@ impl QueueStorage {
         let mut queues = Vec::with_capacity(grouped.len());
         let mut priorities = Vec::with_capacity(grouped.len());
         let mut available_deltas = Vec::with_capacity(grouped.len());
-        let mut running_deltas = Vec::with_capacity(grouped.len());
-        let mut completed_deltas = Vec::with_capacity(grouped.len());
+        let mut pruned_completed_deltas = Vec::with_capacity(grouped.len());
 
-        for ((queue, priority), (available_delta, running_delta, completed_delta)) in grouped {
+        for ((queue, priority), (available_delta, pruned_completed_delta)) in grouped {
             queues.push(queue);
             priorities.push(priority);
             available_deltas.push(available_delta);
-            running_deltas.push(running_delta);
-            completed_deltas.push(completed_delta);
+            pruned_completed_deltas.push(pruned_completed_delta);
         }
 
         sqlx::query(&format!(
             r#"
-            WITH deltas(queue, priority, available_delta, running_delta, completed_delta) AS (
+            WITH deltas(queue, priority, available_delta, pruned_completed_delta) AS (
                 SELECT *
                 FROM unnest(
                     $1::text[],
                     $2::smallint[],
                     $3::bigint[],
-                    $4::bigint[],
-                    $5::bigint[]
+                    $4::bigint[]
                 )
             )
             UPDATE {schema}.queue_lanes
             SET available_count = GREATEST(0, queue_lanes.available_count + deltas.available_delta),
-                running_count = GREATEST(0, queue_lanes.running_count + deltas.running_delta),
-                completed_count = GREATEST(0, queue_lanes.completed_count + deltas.completed_delta)
+                pruned_completed_count = GREATEST(
+                    0,
+                    queue_lanes.pruned_completed_count + deltas.pruned_completed_delta
+                )
             FROM deltas
             WHERE queue_lanes.queue = deltas.queue
               AND queue_lanes.priority = deltas.priority
@@ -2579,8 +2572,7 @@ impl QueueStorage {
         .bind(&queues)
         .bind(&priorities)
         .bind(&available_deltas)
-        .bind(&running_deltas)
-        .bind(&completed_deltas)
+        .bind(&pruned_completed_deltas)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -3122,7 +3114,7 @@ impl QueueStorage {
             WITH lane_counts AS (
                 SELECT
                     COALESCE(sum(available_count), 0)::bigint AS available,
-                    COALESCE(sum(completed_count), 0)::bigint AS pruned_completed
+                    COALESCE(sum(pruned_completed_count), 0)::bigint AS pruned_completed
                 FROM {schema}.queue_lanes
                 WHERE queue = $1
             ),
@@ -3213,7 +3205,7 @@ impl QueueStorage {
             };
             self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(waiting.state))
                 .await?;
-            self.adjust_lane_counts(tx, &waiting.queue, waiting.priority, 0, 0, 0)
+            self.adjust_lane_counts(tx, &waiting.queue, waiting.priority, 0, 0)
                 .await?;
             self.notify_queues_tx(tx, std::iter::once(waiting.queue.clone()))
                 .await?;
@@ -3295,7 +3287,7 @@ impl QueueStorage {
             };
             self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(terminal.state))
                 .await?;
-            self.adjust_lane_counts(tx, &terminal.queue, terminal.priority, 0, 0, 0)
+            self.adjust_lane_counts(tx, &terminal.queue, terminal.priority, 0, 0)
                 .await?;
             self.notify_queues_tx(tx, std::iter::once(terminal.queue.clone()))
                 .await?;
@@ -3406,7 +3398,7 @@ impl QueueStorage {
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
-            self.adjust_lane_counts(tx, &ready.queue, ready.priority, -1, 0, 0)
+            self.adjust_lane_counts(tx, &ready.queue, ready.priority, -1, 0)
                 .await?;
             return Ok(Some(done.into_job_row()?));
         }
@@ -3453,7 +3445,7 @@ impl QueueStorage {
                 .into_done_row(JobState::Cancelled, Utc::now(), done_payload);
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(lease.state))
                 .await?;
-            self.adjust_lane_counts(tx, &lease.queue, lease.priority, 0, 0, 0)
+            self.adjust_lane_counts(tx, &lease.queue, lease.priority, 0, 0)
                 .await?;
             return Ok(Some(done.into_job_row()?));
         }
@@ -3514,7 +3506,7 @@ impl QueueStorage {
             };
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
                 .await?;
-            self.adjust_lane_counts(tx, &done.queue, done.priority, 0, 0, 0)
+            self.adjust_lane_counts(tx, &done.queue, done.priority, 0, 0)
                 .await?;
             return Ok(Some(done.into_job_row()?));
         }
@@ -3657,7 +3649,7 @@ impl QueueStorage {
         }
 
         for ((queue, priority), count) in old_lane_counts {
-            self.adjust_lane_counts(&mut tx, &queue, priority, -count, 0, 0)
+            self.adjust_lane_counts(&mut tx, &queue, priority, -count, 0)
                 .await?;
         }
 
@@ -4676,7 +4668,7 @@ impl QueueStorage {
                 .into_done_row(JobState::Completed, Utc::now(), payload.into_json());
         self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done_row), Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         done_row.into_job_row()
@@ -4774,7 +4766,7 @@ impl QueueStorage {
                 .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
         self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done_row), Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         done_row.into_job_row()
@@ -4838,7 +4830,7 @@ impl QueueStorage {
         };
         self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         self.notify_queues_tx(&mut tx, std::iter::once(moved.queue.clone()))
             .await?;
@@ -5075,7 +5067,7 @@ impl QueueStorage {
         );
         self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(deferred.into_job_row()?))
@@ -5143,7 +5135,7 @@ impl QueueStorage {
         deferred.attempt = deferred.attempt.saturating_sub(1);
         self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(deferred.into_job_row()?))
@@ -5212,7 +5204,7 @@ impl QueueStorage {
                 .into_done_row(JobState::Cancelled, Utc::now(), payload.into_json());
         self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(done.into_job_row()?))
@@ -5276,7 +5268,7 @@ impl QueueStorage {
             .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
         self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(done.into_job_row()?))
@@ -5346,7 +5338,7 @@ impl QueueStorage {
         );
         self.insert_dlq_rows_tx(&mut tx, std::slice::from_ref(&dlq_row), Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(dlq_row.into_job_row()?))
@@ -5409,7 +5401,7 @@ impl QueueStorage {
             .into_dlq_row(dlq_reason.to_string(), Utc::now());
         self.insert_dlq_rows_tx(&mut tx, std::slice::from_ref(&dlq_row), Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(dlq_row.into_job_row()?))
@@ -5809,7 +5801,7 @@ impl QueueStorage {
                     .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
             self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
                 .await?;
-            self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+            self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
                 .await?;
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Some(done.into_job_row()?));
@@ -5824,7 +5816,7 @@ impl QueueStorage {
         );
         self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
             .await?;
-        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0, 0)
+        self.adjust_lane_counts(&mut tx, &moved.queue, moved.priority, 0, 0)
             .await?;
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(deferred.into_job_row()?))
@@ -5903,7 +5895,7 @@ impl QueueStorage {
             );
             self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
                 .await?;
-            self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0, 0)
+            self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0)
                 .await?;
             rescued.push(deferred.into_job_row()?);
         }
@@ -5977,7 +5969,7 @@ impl QueueStorage {
             );
             self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
                 .await?;
-            self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0, 0)
+            self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0)
                 .await?;
             rescued.push(deferred.into_job_row()?);
         }
@@ -6049,7 +6041,7 @@ impl QueueStorage {
                         .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
                 self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(row.state))
                     .await?;
-                self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0, 0)
+                self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0)
                     .await?;
                 rescued.push(done.into_job_row()?);
             } else {
@@ -6062,7 +6054,7 @@ impl QueueStorage {
                 );
                 self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
                     .await?;
-                self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0, 0)
+                self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0)
                     .await?;
                 rescued.push(deferred.into_job_row()?);
             }
@@ -6413,7 +6405,7 @@ impl QueueStorage {
                 &mut tx,
                 pruned_terminal_counts
                     .into_iter()
-                    .map(|(queue, priority, count)| (queue, priority, 0, 0, count)),
+                    .map(|(queue, priority, count)| (queue, priority, 0, count)),
             )
             .await?;
         }

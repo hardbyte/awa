@@ -156,6 +156,58 @@ Both surfaces must be called before `start()` / `build()`. Declaring a descripto
 
 All intervals have `_ms` suffixed kwargs in Python (e.g. `heartbeat_interval_ms=15000`).
 
+## Queue storage tuning
+
+Queue storage is the runtime engine in `0.6`, and most deployments can keep
+the defaults. The main knobs are there for large fleets, very bursty queues, or
+operators who want to trade off retention-window size against rotation churn.
+
+### Rust
+
+```rust
+let client = Client::builder(pool.clone())
+    .queue("email", QueueConfig::default())
+    .queue_storage(
+        QueueStorageConfig {
+            queue_slot_count: 16,
+            lease_slot_count: 8,
+            ..Default::default()
+        },
+        Duration::from_millis(1_000),
+        Duration::from_millis(50),
+    )
+    .build()?;
+```
+
+### Python
+
+```python
+await client.start(
+    [("email", 8)],
+    queue_storage_schema="awa_exp",
+    queue_storage_queue_slot_count=16,
+    queue_storage_lease_slot_count=8,
+    queue_storage_queue_rotate_interval_ms=1000,
+    queue_storage_lease_rotate_interval_ms=50,
+)
+```
+
+### What the knobs mean
+
+| Knob | Default | What it controls |
+|---|---|---|
+| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
+| `lease_slot_count` | `8` | Number of rotating lease partitions |
+| `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
+| `lease_rotate_interval` | `50ms` | How often lease segments rotate |
+
+Use the defaults unless you have a reason not to:
+
+- Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers or retention keep old segments live.
+- Increase `lease_slot_count` if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.
+- Increase rotation intervals to reduce partition churn and metadata activity.
+- Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
+
 ## Dead Letter Queue
 
 Queue-storage deployments can route terminal failures into the DLQ instead of

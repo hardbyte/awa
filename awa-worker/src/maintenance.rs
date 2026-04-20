@@ -741,7 +741,7 @@ impl MaintenanceService {
     /// report it accurately.
     #[tracing::instrument(skip(self), name = "maintenance.priority_aging")]
     async fn age_waiting_priorities(&self) {
-        let aging_secs = self.priority_aging_interval.as_secs() as f64;
+        let aging_secs = self.priority_aging_interval.as_secs_f64();
         if aging_secs <= 0.0 {
             return;
         }
@@ -1071,8 +1071,10 @@ impl MaintenanceService {
         let override_queues: Vec<String> = self.queue_retention_overrides.keys().cloned().collect();
 
         // Global pass: delete jobs in queues that do NOT have overrides
-        let completed_retention = format!("{} seconds", self.completed_retention.as_secs());
-        let failed_retention = format!("{} seconds", self.failed_retention.as_secs());
+        let completed_retention_secs =
+            i64::try_from(self.completed_retention.as_secs()).unwrap_or(i64::MAX);
+        let failed_retention_secs =
+            i64::try_from(self.failed_retention.as_secs()).unwrap_or(i64::MAX);
 
         let global_result = if override_queues.is_empty() {
             sqlx::query(
@@ -1080,14 +1082,14 @@ impl MaintenanceService {
                 DELETE FROM awa.jobs_hot
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
-                    WHERE (state = 'completed' AND finalized_at < now() - $1::interval)
-                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval)
+                    WHERE (state = 'completed' AND finalized_at < now() - make_interval(secs => $1::bigint))
+                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - make_interval(secs => $2::bigint))
                     LIMIT $3
                 )
                 "#,
             )
-            .bind(&completed_retention)
-            .bind(&failed_retention)
+            .bind(completed_retention_secs)
+            .bind(failed_retention_secs)
             .bind(self.cleanup_batch_size)
             .execute(&self.pool)
             .await
@@ -1097,15 +1099,15 @@ impl MaintenanceService {
                 DELETE FROM awa.jobs_hot
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
-                    WHERE ((state = 'completed' AND finalized_at < now() - $1::interval)
-                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval))
+                    WHERE ((state = 'completed' AND finalized_at < now() - make_interval(secs => $1::bigint))
+                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - make_interval(secs => $2::bigint)))
                       AND queue != ALL($4::text[])
                     LIMIT $3
                 )
                 "#,
             )
-            .bind(&completed_retention)
-            .bind(&failed_retention)
+            .bind(completed_retention_secs)
+            .bind(failed_retention_secs)
             .bind(self.cleanup_batch_size)
             .bind(&override_queues)
             .execute(&self.pool)
@@ -1124,8 +1126,9 @@ impl MaintenanceService {
 
         // Per-queue override passes
         for (queue_name, policy) in &self.queue_retention_overrides {
-            let queue_completed = format!("{} seconds", policy.completed.as_secs());
-            let queue_failed = format!("{} seconds", policy.failed.as_secs());
+            let queue_completed_secs =
+                i64::try_from(policy.completed.as_secs()).unwrap_or(i64::MAX);
+            let queue_failed_secs = i64::try_from(policy.failed.as_secs()).unwrap_or(i64::MAX);
 
             match sqlx::query(
                 r#"
@@ -1133,14 +1136,14 @@ impl MaintenanceService {
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
                     WHERE queue = $4
-                      AND ((state = 'completed' AND finalized_at < now() - $1::interval)
-                        OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval))
+                      AND ((state = 'completed' AND finalized_at < now() - make_interval(secs => $1::bigint))
+                        OR (state IN ('failed', 'cancelled') AND finalized_at < now() - make_interval(secs => $2::bigint)))
                     LIMIT $3
                 )
                 "#,
             )
-            .bind(&queue_completed)
-            .bind(&queue_failed)
+            .bind(queue_completed_secs)
+            .bind(queue_failed_secs)
             .bind(self.cleanup_batch_size)
             .bind(queue_name)
             .execute(&self.pool)
@@ -1183,7 +1186,7 @@ impl MaintenanceService {
             .filter(|(_, policy)| policy.dlq.is_some())
             .map(|(queue, _)| queue.as_str())
             .collect();
-        let retention_secs = format!("{} seconds", self.dlq_retention.as_secs());
+        let retention_secs = i64::try_from(self.dlq_retention.as_secs()).unwrap_or(i64::MAX);
 
         let global_result = if override_queues.is_empty() {
             sqlx::query(&format!(
@@ -1191,12 +1194,12 @@ impl MaintenanceService {
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
-                    WHERE dlq_at < now() - $1::interval
+                    WHERE dlq_at < now() - make_interval(secs => $1::bigint)
                     LIMIT $2
                 )
                 "#
             ))
-            .bind(&retention_secs)
+            .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .execute(&self.pool)
             .await
@@ -1206,13 +1209,13 @@ impl MaintenanceService {
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
-                    WHERE dlq_at < now() - $1::interval
+                    WHERE dlq_at < now() - make_interval(secs => $1::bigint)
                       AND queue != ALL($3::text[])
                     LIMIT $2
                 )
                 "#
             ))
-            .bind(&retention_secs)
+            .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(&override_queues)
             .execute(&self.pool)
@@ -1233,19 +1236,19 @@ impl MaintenanceService {
             let Some(retention) = policy.dlq else {
                 continue;
             };
-            let retention_secs = format!("{} seconds", retention.as_secs());
+            let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
             match sqlx::query(&format!(
                 r#"
                 DELETE FROM {schema}.dlq_entries
                 WHERE job_id IN (
                     SELECT job_id FROM {schema}.dlq_entries
                     WHERE queue = $3
-                      AND dlq_at < now() - $1::interval
+                      AND dlq_at < now() - make_interval(secs => $1::bigint)
                     LIMIT $2
                 )
                 "#
             ))
-            .bind(&retention_secs)
+            .bind(retention_secs)
             .bind(self.dlq_cleanup_batch_size)
             .bind(queue)
             .execute(&self.pool)

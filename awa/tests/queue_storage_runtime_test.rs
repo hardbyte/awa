@@ -518,6 +518,268 @@ async fn test_queue_storage_runtime_retry_after() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_late_completion_after_retry_after_is_noop() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_guard_late_complete_retry";
+    let schema = "awa_qs_guard_late_complete_retry";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 101 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim guard retry job");
+    assert_eq!(claimed.len(), 1);
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+
+    let retried = store
+        .retry_after(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            Duration::from_secs(5),
+            None,
+        )
+        .await
+        .expect("Failed to move running job to retryable")
+        .expect("Expected running job to move to retryable");
+    assert_eq!(retried.state, JobState::Retryable);
+
+    let completed = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&claimed))
+        .await
+        .expect("Failed to attempt stale completion after retry");
+    assert!(
+        completed.is_empty(),
+        "late completion should be ignored once the lease has been retried"
+    );
+
+    let current = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load retried guard job")
+        .expect("Expected retried job to exist");
+    assert_eq!(current.state, JobState::Retryable);
+    assert_eq!(current.attempt, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_late_completion_cannot_finalize_reclaimed_running_attempt() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_guard_reclaimed_running";
+    let schema = "awa_qs_guard_reclaimed_running";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 102 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let first_claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim first running attempt");
+    let first_claim = first_claim
+        .into_iter()
+        .next()
+        .expect("missing first claimed job");
+
+    store
+        .retry_after(
+            &pool,
+            job_id,
+            first_claim.job.run_lease,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .expect("Failed to move first lease to retryable")
+        .expect("Expected running job to move to retryable");
+
+    let promoted = store
+        .promote_due(&pool, JobState::Retryable, 1)
+        .await
+        .expect("Failed to promote retryable job");
+    assert_eq!(promoted, 1);
+
+    let second_claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim reclaimed running attempt");
+    let second_claim = second_claim
+        .into_iter()
+        .next()
+        .expect("missing reclaimed running attempt");
+    assert!(
+        second_claim.job.run_lease > first_claim.job.run_lease,
+        "reclaimed attempt should use a new run_lease"
+    );
+
+    let completed = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&first_claim))
+        .await
+        .expect("Failed to attempt stale completion against reclaimed attempt");
+    assert!(
+        completed.is_empty(),
+        "stale completion must not finalize a newer running attempt"
+    );
+
+    let current = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load reclaimed running job")
+        .expect("Expected reclaimed running job to exist");
+    assert_eq!(current.state, JobState::Running);
+    assert_eq!(current.attempt, 2);
+    assert_eq!(current.run_lease, second_claim.job.run_lease);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_late_completion_after_cancel_is_noop() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_guard_late_cancel";
+    let schema = "awa_qs_guard_late_cancel";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 103 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim guard cancel job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+
+    let cancelled = store
+        .cancel_running(&pool, job_id, claimed.job.run_lease, "test cancel", None)
+        .await
+        .expect("Failed to cancel running job")
+        .expect("Expected running job to be cancelled");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+
+    let completed = store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&claimed))
+        .await
+        .expect("Failed to attempt stale completion after cancel");
+    assert!(
+        completed.is_empty(),
+        "late completion should be ignored after cancel"
+    );
+
+    let current = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load cancelled guard job")
+        .expect("Expected cancelled job to exist");
+    assert_eq!(current.state, JobState::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_register_callback_rejects_stale_lease() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_guard_callback_lease";
+    let schema = "awa_qs_guard_callback_lease";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CallbackJob { id: 104 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let first_claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim callback guard job");
+    let first_claim = first_claim
+        .into_iter()
+        .next()
+        .expect("missing callback guard claim");
+
+    store
+        .retry_after(
+            &pool,
+            job_id,
+            first_claim.job.run_lease,
+            Duration::ZERO,
+            None,
+        )
+        .await
+        .expect("Failed to retry callback guard job")
+        .expect("Expected running callback guard job to move to retryable");
+    let promoted = store
+        .promote_due(&pool, JobState::Retryable, 1)
+        .await
+        .expect("Failed to promote callback guard retryable");
+    assert_eq!(promoted, 1);
+
+    let second_claim = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to reclaim callback guard job");
+    let second_claim = second_claim
+        .into_iter()
+        .next()
+        .expect("missing reclaimed callback guard job");
+
+    let err = store
+        .register_callback(
+            &pool,
+            job_id,
+            first_claim.job.run_lease,
+            Duration::from_secs(3600),
+        )
+        .await
+        .unwrap_err();
+    match err {
+        AwaError::Validation(msg) => {
+            assert!(msg.contains("job is not in running state"));
+        }
+        other => panic!("Expected Validation error, got: {other:?}"),
+    }
+
+    let callback_id = store
+        .register_callback(
+            &pool,
+            job_id,
+            second_claim.job.run_lease,
+            Duration::from_secs(3600),
+        )
+        .await
+        .expect("Failed to register callback for current lease");
+    assert!(!callback_id.is_nil());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;

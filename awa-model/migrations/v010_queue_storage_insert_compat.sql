@@ -1,3 +1,7 @@
+-- NOTE: v010 and v011 are bundled into migration version 11 in
+-- `awa-model/src/migrations.rs`. Keep the schema_version insert in both files
+-- at 11 unless the bundled migration is renumbered there as well.
+
 CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
     backend     TEXT PRIMARY KEY,
     schema_name TEXT NOT NULL,
@@ -83,6 +87,7 @@ DECLARE
         WHEN p_unique_states IS NULL THEN NULL
         ELSE p_unique_states::TEXT
     END;
+    v_old_search_path TEXT;
 BEGIN
     IF length(p_kind) > 200 THEN
         RAISE EXCEPTION 'job kind length must be <= 200 characters'
@@ -236,10 +241,10 @@ BEGIN
             USING ERRCODE = '22023';
     END IF;
 
-    EXECUTE format(
-        'SELECT nextval(%L::regclass)::bigint',
-        v_schema || '.job_id_seq'
-    )
+    v_old_search_path := current_setting('search_path');
+    PERFORM set_config('search_path', format('%I,awa,public', v_schema), true);
+
+    SELECT nextval(format('%I.job_id_seq', v_schema)::regclass)::bigint
     INTO v_job_id;
 
     IF p_unique_key IS NOT NULL
@@ -262,58 +267,42 @@ BEGIN
     );
 
     IF v_state = 'available'::awa.job_state THEN
-        EXECUTE format(
-            'INSERT INTO %I.queue_lanes (queue, priority)
-             VALUES ($1, $2)
-             ON CONFLICT (queue, priority) DO NOTHING',
-            v_schema
-        )
-        USING v_queue, v_priority;
+        INSERT INTO queue_lanes (queue, priority)
+        VALUES (v_queue, v_priority)
+        ON CONFLICT (queue, priority) DO NOTHING;
 
-        EXECUTE format(
-            'UPDATE %I.queue_lanes
-             SET next_seq = next_seq + 1,
-                 available_count = available_count + 1
-             WHERE queue = $1 AND priority = $2
-             RETURNING next_seq - 1',
-            v_schema
-        )
-        INTO v_lane_seq
-        USING v_queue, v_priority;
+        UPDATE queue_lanes
+        SET next_seq = next_seq + 1,
+            available_count = available_count + 1
+        WHERE queue = v_queue
+          AND priority = v_priority
+        RETURNING next_seq - 1
+        INTO v_lane_seq;
 
-        EXECUTE format(
-            'SELECT current_slot, generation
-             FROM %I.queue_ring_state
-             WHERE singleton = TRUE',
-            v_schema
-        )
-        INTO v_ready_slot, v_ready_generation;
+        SELECT current_slot, generation
+        INTO v_ready_slot, v_ready_generation
+        FROM queue_ring_state
+        WHERE singleton = TRUE;
 
-        EXECUTE format(
-            'INSERT INTO %I.ready_entries (
-                 ready_slot,
-                 ready_generation,
-                 job_id,
-                 kind,
-                 queue,
-                 args,
-                 priority,
-                 attempt,
-                 run_lease,
-                 max_attempts,
-                 lane_seq,
-                 run_at,
-                 attempted_at,
-                 created_at,
-                 unique_key,
-                 unique_states,
-                 payload
-             ) VALUES (
-                 $1, $2, $3, $4, $5, $6, $7, 0, 0, $8, $9, $10, NULL, $11, $12, $13, $14
-             )',
-            v_schema
-        )
-        USING
+        INSERT INTO ready_entries (
+            ready_slot,
+            ready_generation,
+            job_id,
+            kind,
+            queue,
+            args,
+            priority,
+            attempt,
+            run_lease,
+            max_attempts,
+            lane_seq,
+            run_at,
+            attempted_at,
+            created_at,
+            unique_key,
+            unique_states,
+            payload
+        ) VALUES (
             v_ready_slot,
             v_ready_generation,
             v_job_id,
@@ -321,15 +310,20 @@ BEGIN
             v_queue,
             v_args,
             v_priority,
+            0,
+            0,
             v_max_attempts,
             v_lane_seq,
             v_run_at,
+            NULL,
             v_created_at,
             p_unique_key,
             v_unique_states_text,
-            v_payload;
+            v_payload
+        );
 
         PERFORM pg_notify('awa:' || v_queue, '');
+        PERFORM set_config('search_path', v_old_search_path, true);
 
         RETURN QUERY
         SELECT
@@ -362,42 +356,43 @@ BEGIN
         RETURN;
     END IF;
 
-    EXECUTE format(
-        'INSERT INTO %I.deferred_jobs (
-             job_id,
-             kind,
-             queue,
-             args,
-             state,
-             priority,
-             attempt,
-             run_lease,
-             max_attempts,
-             run_at,
-             attempted_at,
-             finalized_at,
-             created_at,
-             unique_key,
-             unique_states,
-             payload
-         ) VALUES (
-             $1, $2, $3, $4, $5, $6, 0, 0, $7, $8, NULL, NULL, $9, $10, $11, $12
-         )',
-        v_schema
-    )
-    USING
+    INSERT INTO deferred_jobs (
+        job_id,
+        kind,
+        queue,
+        args,
+        state,
+        priority,
+        attempt,
+        run_lease,
+        max_attempts,
+        run_at,
+        attempted_at,
+        finalized_at,
+        created_at,
+        unique_key,
+        unique_states,
+        payload
+    ) VALUES (
         v_job_id,
         p_kind,
         v_queue,
         v_args,
         v_state,
         v_priority,
+        0,
+        0,
         v_max_attempts,
         v_run_at,
+        NULL,
+        NULL,
         v_created_at,
         p_unique_key,
         v_unique_states_text,
-        v_payload;
+        v_payload
+    );
+
+    PERFORM set_config('search_path', v_old_search_path, true);
 
     RETURN QUERY
     SELECT
@@ -431,5 +426,5 @@ END;
 $$ LANGUAGE plpgsql VOLATILE;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (10, 'Queue storage compatibility layer and active backend selection')
+VALUES (11, 'Queue storage compatibility layer and active backend selection')
 ON CONFLICT (version) DO NOTHING;

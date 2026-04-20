@@ -213,6 +213,10 @@ impl CompletionWorker {
         debug!(shard = self.shard_id, "Completion batcher shard stopped");
     }
 
+    #[tracing::instrument(
+        skip(self, pending),
+        fields(shard = self.shard_id, batch_size = pending.len())
+    )]
     async fn flush(&self, pending: &mut Vec<CompletionRequest>) {
         if pending.is_empty() {
             return;

@@ -1,3 +1,7 @@
+-- NOTE: v010 and v011 are bundled into migration version 11 in
+-- `awa-model/src/migrations.rs`. Keep the schema_version insert in this file
+-- at 11 unless the bundled migration is renumbered there as well.
+
 CREATE OR REPLACE FUNCTION awa.queue_storage_payload_tags(p_payload JSONB)
 RETURNS TEXT[] AS $$
     SELECT ARRAY(
@@ -754,6 +758,7 @@ CREATE TRIGGER trg_awa_jobs_view_delete
     FOR EACH ROW
     EXECUTE FUNCTION awa.write_jobs_view();
 
+-- Bundled with v010 as schema version 11 on purpose.
 INSERT INTO awa.schema_version (version, description)
-VALUES (10, 'Queue storage compatibility layer and active backend selection')
+VALUES (11, 'Queue storage compatibility layer and active backend selection')
 ON CONFLICT (version) DO NOTHING;

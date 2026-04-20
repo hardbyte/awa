@@ -194,7 +194,7 @@ enum DlqCommands {
         #[arg(long)]
         all: bool,
     },
-    /// Move existing failed jobs (in jobs_hot) into the DLQ
+    /// Move existing failed terminal rows into the DLQ
     Move {
         #[arg(long)]
         kind: Option<String>,

@@ -1,4 +1,10 @@
-//! Benchmark and smoke tests for the experimental queue storage storage engine.
+//! Benchmark and smoke tests for the queue storage engine.
+//!
+//! `test_queue_storage_storage_benchmark` is intentionally a smoke benchmark:
+//! it emits raw overlap/rotation/prune data for ADR validation, but it is not
+//! the source of truth for release claims. Throughput/latency thresholds live
+//! in `benchmark_test.rs`, and the reproducible validation output is checked in
+//! under `docs/adr/bench/`.
 
 mod bench_output;
 

@@ -53,6 +53,7 @@ async fn setup_pool() -> sqlx::PgPool {
         .await
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
+    reset_runtime_backend(&pool).await;
     pool
 }
 
@@ -67,6 +68,154 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue meta");
+}
+
+async fn reset_runtime_backend(pool: &sqlx::PgPool) {
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to reset active runtime backend");
+}
+
+async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+        .fetch_one(pool)
+        .await
+        .expect("Failed to resolve active queue storage schema")
+}
+
+async fn backdate_callback_timeouts_for_queue(pool: &sqlx::PgPool, queue: &str) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.leases \
+             SET callback_timeout_at = now() - interval '1 second' \
+             WHERE queue = $1 AND state = 'waiting_external'"
+        ))
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage callback_timeout_at");
+        return;
+    }
+
+    sqlx::query(
+        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'waiting_external'",
+    )
+    .bind(queue)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate callback_timeout_at");
+}
+
+async fn backdate_callback_timeouts_by_ids(pool: &sqlx::PgPool, job_ids: &[i64]) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.leases \
+             SET callback_timeout_at = now() - interval '1 second' \
+             WHERE job_id = ANY($1) AND state = 'waiting_external'"
+        ))
+        .bind(job_ids)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage callback timeouts");
+        return;
+    }
+
+    sqlx::query(
+        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' WHERE id = ANY($1)",
+    )
+    .bind(job_ids)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate callback timeouts");
+}
+
+async fn backdate_retryable_run_at_for_queue(pool: &sqlx::PgPool, queue: &str) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.deferred_jobs \
+             SET run_at = now() - interval '1 second' \
+             WHERE queue = $1 AND state = 'retryable'"
+        ))
+        .bind(queue)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage retryable jobs");
+        return;
+    }
+
+    sqlx::query(
+        "UPDATE awa.jobs SET run_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'retryable'",
+    )
+    .bind(queue)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate retryable run_at");
+}
+
+async fn backdate_scheduled_run_at_by_ids(pool: &sqlx::PgPool, job_ids: &[i64]) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.deferred_jobs \
+             SET run_at = now() - interval '1 second' \
+             WHERE job_id = ANY($1) AND state = 'scheduled'"
+        ))
+        .bind(job_ids)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage scheduled jobs");
+        return;
+    }
+
+    sqlx::query("UPDATE awa.jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)")
+        .bind(job_ids)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate scheduled jobs");
+}
+
+async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.leases \
+             SET deadline_at = now() - interval '1 second' \
+             WHERE job_id = $1 AND state = 'running'"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage deadline rescue job");
+        return;
+    }
+
+    sqlx::query("UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate deadline rescue job");
+}
+
+async fn backdate_running_heartbeat(pool: &sqlx::PgPool, job_id: i64) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.leases \
+             SET heartbeat_at = now() - interval '5 minutes' \
+             WHERE job_id = $1 AND state = 'running'"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage heartbeat rescue job");
+        return;
+    }
+
+    sqlx::query("UPDATE awa.jobs SET heartbeat_at = now() - interval '5 minutes' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate heartbeat rescue job");
 }
 
 // ── Job type ─────────────────────────────────────────────────────────
@@ -765,14 +914,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
     // waiting_external to drain first, then backdate run_at for every
     // retryable row (both the original retry_once jobs and the callback
     // rescues).
-    sqlx::query(
-        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
-         WHERE queue = $1 AND state = 'waiting_external'",
-    )
-    .bind(queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate callback_timeout_at");
+    backdate_callback_timeouts_for_queue(&pool, queue).await;
 
     // Retryable jumps from 2 to 4 once both callback rescues land. No row
     // leaves retryable until run_at is backdated (below), so the count is
@@ -780,14 +922,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
     // pass is done.
     wait_for_job_count(&pool, queue, "retryable", 4).await;
 
-    sqlx::query(
-        "UPDATE awa.jobs SET run_at = now() - interval '1 second' \
-         WHERE queue = $1 AND state = 'retryable'",
-    )
-    .bind(queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate retryable run_at");
+    backdate_retryable_run_at_for_queue(&pool, queue).await;
 
     // 5. Wait for terminal states: 7 completed (3 + 2 callback + 2 retry) + 2 failed.
     let expected_completed = 7_i64;
@@ -1172,13 +1307,7 @@ async fn dashboard_panels_have_observed_data() {
     // Let the queue depth gauge capture retryable/waiting_external/scheduled.
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    sqlx::query(
-        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' WHERE id = ANY($1)",
-    )
-    .bind(&callback_job_ids)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate callback timeouts");
+    backdate_callback_timeouts_by_ids(&pool, &callback_job_ids).await;
 
     // Wait for the callback rescue to land — waiting_external drains and
     // retryable count jumps from 2 to 4. Then backdate run_at for ALL
@@ -1188,36 +1317,17 @@ async fn dashboard_panels_have_observed_data() {
     // and stall the test (see maintenance.rs:560-561).
     wait_for_job_count(&pool, queue, "retryable", 4).await;
 
-    sqlx::query(
-        "UPDATE awa.jobs SET run_at = now() - interval '1 second' \
-         WHERE queue = $1 AND state = 'retryable'",
-    )
-    .bind(queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate retryable jobs");
+    backdate_retryable_run_at_for_queue(&pool, queue).await;
     // Silence the unused-binding warning — IDs are only needed for the
     // callback backdate above; the run_at backdate intentionally targets
     // the queue-wide set so it covers the rescued rows.
     let _ = &retry_job_ids;
 
-    sqlx::query("UPDATE awa.jobs SET run_at = now() - interval '1 second' WHERE id = ANY($1)")
-        .bind(&scheduled_job_ids)
-        .execute(&pool)
-        .await
-        .expect("Failed to backdate scheduled jobs");
+    backdate_scheduled_run_at_by_ids(&pool, &scheduled_job_ids).await;
 
-    sqlx::query("UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1")
-        .bind(deadline_job.id)
-        .execute(&pool)
-        .await
-        .expect("Failed to backdate deadline rescue job");
+    backdate_running_deadline(&pool, deadline_job.id).await;
 
-    sqlx::query("UPDATE awa.jobs SET heartbeat_at = now() - interval '5 minutes' WHERE id = $1")
-        .bind(heartbeat_job.id)
-        .execute(&pool)
-        .await
-        .expect("Failed to backdate heartbeat rescue job");
+    backdate_running_heartbeat(&pool, heartbeat_job.id).await;
 
     wait_for_job_count(&pool, queue, "completed", 6).await;
     wait_for_job_count(&pool, queue, "failed", 2).await;
