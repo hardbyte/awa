@@ -28,6 +28,19 @@ fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     Ok(Duration::from_secs_f64(timeout_seconds))
 }
 
+fn parse_transition_worker_role(
+    value: Option<&str>,
+) -> PyResult<awa_worker::TransitionWorkerRole> {
+    match value.unwrap_or("auto") {
+        "auto" => Ok(awa_worker::TransitionWorkerRole::Auto),
+        "canonical_drain" => Ok(awa_worker::TransitionWorkerRole::CanonicalDrain),
+        "queue_storage_target" => Ok(awa_worker::TransitionWorkerRole::QueueStorageTarget),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "storage_transition_role must be one of 'auto', 'canonical_drain', or 'queue_storage_target' (got '{other}')"
+        ))),
+    }
+}
+
 fn build_queue_descriptor(
     py: Python<'_>,
     display_name: Option<String>,
@@ -1254,7 +1267,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=50))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=50, storage_transition_role=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -1278,6 +1291,7 @@ impl PyClient {
         queue_storage_lease_slot_count: u32,
         queue_storage_queue_rotate_interval_ms: u64,
         queue_storage_lease_rotate_interval_ms: u64,
+        storage_transition_role: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let entries: Vec<_> = self
             .workers
@@ -1402,6 +1416,9 @@ impl PyClient {
             Duration::from_millis(queue_storage_queue_rotate_interval_ms),
             Duration::from_millis(queue_storage_lease_rotate_interval_ms),
         );
+        builder = builder.transition_role(parse_transition_worker_role(
+            storage_transition_role.as_deref(),
+        )?);
 
         for entry in &entries {
             builder = builder.register_worker(PythonWorker::from_entry(entry));

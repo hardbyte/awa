@@ -82,6 +82,25 @@ pub enum QueueCapacity {
     },
 }
 
+/// Temporary execution role used during a storage transition.
+///
+/// This is not intended as a long-term “run either backend forever” feature.
+/// It exists so a `0.6` rollout can keep some runtimes draining canonical
+/// backlog while other runtimes are already prepared to execute queue-storage
+/// work as soon as routing flips.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TransitionWorkerRole {
+    /// Follow `awa.storage_status()`:
+    /// canonical in `canonical` / `prepared`,
+    /// queue storage in `mixed_transition` / `active`.
+    #[default]
+    Auto,
+    /// Stay on canonical execution even after routing flips.
+    CanonicalDrain,
+    /// Run queue storage immediately, even before routing flips.
+    QueueStorageTarget,
+}
+
 /// Builder for the Awa worker client.
 pub struct ClientBuilder {
     pool: PgPool,
@@ -114,6 +133,7 @@ pub struct ClientBuilder {
     dlq_cleanup_batch_size: Option<i64>,
     dlq_overrides: HashMap<String, bool>,
     storage: RuntimeStorage,
+    transition_role: TransitionWorkerRole,
     storage_error: Option<BuildError>,
 }
 
@@ -162,6 +182,7 @@ impl ClientBuilder {
             dlq_cleanup_batch_size: None,
             dlq_overrides: HashMap::new(),
             storage,
+            transition_role: TransitionWorkerRole::Auto,
             storage_error,
         }
     }
@@ -481,6 +502,12 @@ impl ClientBuilder {
         self
     }
 
+    /// Choose how this runtime participates in a storage transition.
+    pub fn transition_role(mut self, role: TransitionWorkerRole) -> Self {
+        self.transition_role = role;
+        self
+    }
+
     /// Register a periodic (cron) job schedule.
     ///
     /// The schedule is synced to the database by the leader and evaluated
@@ -625,6 +652,7 @@ impl ClientBuilder {
             dlq_cleanup_batch_size: self.dlq_cleanup_batch_size,
             effective_storage: Arc::new(RwLock::new(self.storage.clone())),
             storage: self.storage,
+            transition_role: self.transition_role,
             global_max_workers: self.global_max_workers,
             runtime_snapshot_interval: self.runtime_snapshot_interval,
             runtime_instance_id: Uuid::new_v4(),
@@ -715,6 +743,7 @@ pub struct Client {
     dlq_retention: Option<Duration>,
     dlq_cleanup_batch_size: Option<i64>,
     storage: RuntimeStorage,
+    transition_role: TransitionWorkerRole,
     effective_storage: Arc<RwLock<RuntimeStorage>>,
     global_max_workers: Option<u32>,
     runtime_snapshot_interval: Duration,
@@ -802,15 +831,27 @@ impl Client {
                     schema
                 )));
             }
-            runtime.store.prepare_schema(&self.pool).await?;
         }
 
-        if matches!(status.state.as_str(), "mixed_transition" | "active")
-            && status.active_engine == "queue_storage"
-        {
-            Ok(RuntimeStorage::QueueStorage(runtime.clone()))
-        } else {
-            Ok(RuntimeStorage::Canonical)
+        match self.transition_role {
+            TransitionWorkerRole::CanonicalDrain => Ok(RuntimeStorage::Canonical),
+            TransitionWorkerRole::QueueStorageTarget => {
+                runtime.store.prepare_schema(&self.pool).await?;
+                Ok(RuntimeStorage::QueueStorage(runtime.clone()))
+            }
+            TransitionWorkerRole::Auto => {
+                if expected_schema.is_some() {
+                    runtime.store.prepare_schema(&self.pool).await?;
+                }
+
+                if matches!(status.state.as_str(), "mixed_transition" | "active")
+                    && status.active_engine == "queue_storage"
+                {
+                    Ok(RuntimeStorage::QueueStorage(runtime.clone()))
+                } else {
+                    Ok(RuntimeStorage::Canonical)
+                }
+            }
         }
     }
 
@@ -2132,5 +2173,197 @@ mod tests {
         .await;
 
         queue_storage_client.shutdown(Duration::from_secs(5)).await;
+    }
+
+    #[tokio::test]
+    async fn queue_storage_target_started_before_mixed_transition_processes_new_work_immediately() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(8).await;
+        let queue_storage_schema = "awa_cutover_target_runtime";
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("fresh 0.6 schema install should succeed");
+        drop_queue_storage_schema(&pool, queue_storage_schema).await;
+
+        let canonical_seen = Arc::new(AtomicUsize::new(0));
+        let queue_storage_seen = Arc::new(AtomicUsize::new(0));
+        let store_config = QueueStorageConfig {
+            schema: queue_storage_schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+        };
+
+        prepare_queue_storage_transition(&pool, queue_storage_schema).await;
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            None,
+            "prepare should not activate queue storage routing"
+        );
+
+        let auto_client = {
+            let canonical_seen = canonical_seen.clone();
+            Client::builder(pool.clone())
+                .queue(
+                    "cutover",
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config.clone(),
+                    Duration::from_millis(1_000),
+                    Duration::from_millis(50),
+                )
+                .register::<CutoverShortJob, _, _>(move |_args, _ctx| {
+                    let canonical_seen = canonical_seen.clone();
+                    async move {
+                        canonical_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(JobResult::Completed)
+                    }
+                })
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .deadline_rescue_interval(Duration::from_millis(100))
+                .callback_rescue_interval(Duration::from_millis(100))
+                .runtime_snapshot_interval(Duration::from_millis(100))
+                .build()
+                .expect("Failed to build auto cutover client")
+        };
+        auto_client
+            .start()
+            .await
+            .expect("Failed to start auto cutover client");
+
+        let target_client = {
+            let queue_storage_seen = queue_storage_seen.clone();
+            Client::builder(pool.clone())
+                .queue(
+                    "cutover",
+                    QueueConfig {
+                        max_workers: 2,
+                        poll_interval: Duration::from_millis(25),
+                        ..QueueConfig::default()
+                    },
+                )
+                .queue_storage(
+                    store_config.clone(),
+                    Duration::from_millis(1_000),
+                    Duration::from_millis(50),
+                )
+                .transition_role(TransitionWorkerRole::QueueStorageTarget)
+                .register::<CutoverShortJob, _, _>(move |_args, _ctx| {
+                    let queue_storage_seen = queue_storage_seen.clone();
+                    async move {
+                        queue_storage_seen.fetch_add(1, Ordering::SeqCst);
+                        Ok(JobResult::Completed)
+                    }
+                })
+                .promote_interval(Duration::from_millis(25))
+                .leader_election_interval(Duration::from_millis(100))
+                .leader_check_interval(Duration::from_millis(50))
+                .heartbeat_rescue_interval(Duration::from_millis(100))
+                .deadline_rescue_interval(Duration::from_millis(100))
+                .callback_rescue_interval(Duration::from_millis(100))
+                .runtime_snapshot_interval(Duration::from_millis(100))
+                .build()
+                .expect("Failed to build queue-storage target client")
+        };
+        target_client
+            .start()
+            .await
+            .expect("Failed to start queue-storage target client");
+
+        wait_for_runtime_capability(
+            &pool,
+            auto_client.runtime_instance_id,
+            StorageCapability::QueueStorage,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_runtime_capability(
+            &pool,
+            target_client.runtime_instance_id,
+            StorageCapability::QueueStorage,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let canonical_job_id =
+            insert_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover").await;
+        let canonical_start = Instant::now();
+        while canonical_seen.load(Ordering::SeqCst) == 0 {
+            assert!(
+                canonical_start.elapsed() <= Duration::from_secs(5),
+                "auto client failed to process canonical work before mixed transition"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for_state(&pool, canonical_job_id, "completed", Duration::from_secs(5)).await;
+        assert_eq!(
+            queue_storage_seen.load(Ordering::SeqCst),
+            0,
+            "queue-storage target should stay idle before routing flips"
+        );
+
+        storage::enter_mixed_transition(&pool)
+            .await
+            .expect("enter_mixed_transition should succeed with prepared 0.6 fleet");
+        wait_for_runtime_capability(
+            &pool,
+            auto_client.runtime_instance_id,
+            StorageCapability::CanonicalDrainOnly,
+            Duration::from_secs(5),
+        )
+        .await;
+        wait_for_runtime_capability(
+            &pool,
+            target_client.runtime_instance_id,
+            StorageCapability::QueueStorage,
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(
+            active_queue_storage_schema(&pool).await,
+            Some(queue_storage_schema.to_string()),
+            "mixed transition should activate queue storage routing"
+        );
+
+        let before_queue_storage = queue_storage_seen.load(Ordering::SeqCst);
+        let queue_storage_job_id =
+            insert_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover").await;
+        let queue_storage_start = Instant::now();
+        while queue_storage_seen.load(Ordering::SeqCst) == before_queue_storage {
+            assert!(
+                queue_storage_start.elapsed() <= Duration::from_secs(5),
+                "queue-storage target failed to process new work after routing flip"
+            );
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        wait_for_queue_storage_done(
+            &pool,
+            queue_storage_schema,
+            queue_storage_job_id,
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let canonical_drain_id =
+            insert_canonical_available_job(&pool, <CutoverShortJob as JobArgs>::kind(), "cutover")
+                .await;
+        wait_for_state(
+            &pool,
+            canonical_drain_id,
+            "completed",
+            Duration::from_secs(5),
+        )
+        .await;
+
+        target_client.shutdown(Duration::from_secs(5)).await;
+        auto_client.shutdown(Duration::from_secs(5)).await;
     }
 }

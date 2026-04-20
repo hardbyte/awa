@@ -181,6 +181,19 @@ upgrade. The intended operator sequence has two phases.
    routing flip. This is the gate that prevents canonical-only workers from
    surviving into `mixed_transition`.
 
+   In `0.6`, the intended worker roles are:
+
+   - the default `auto` role, which stays canonical before the routing flip
+     and becomes `canonical_drain_only` once mixed transition starts
+   - an explicit queue-storage target role, which prepares the queue-storage
+     executor before the routing flip so new work can start executing
+     immediately after `enter-mixed-transition`
+
+   Current APIs:
+
+   - Rust: `Client::builder(...).transition_role(TransitionWorkerRole::QueueStorageTarget)`
+   - Python: `AsyncClient.start(..., storage_transition_role="queue_storage_target")`
+
 5. Planned `0.6` behavior is then:
 
    - `awa storage enter-mixed-transition` flips new writes and cron enqueues to

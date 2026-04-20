@@ -12,7 +12,7 @@ or migration from the 0.4.x ``_sync`` pattern.
 from __future__ import annotations
 
 import datetime as dt
-from typing import Any, Awaitable, Callable, TypeVar
+from typing import Any, Awaitable, Callable, Literal, TypeVar
 
 from awa._awa import (
     CallbackToken,
@@ -134,7 +134,13 @@ class AsyncClient:
         lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
         reset: bool = False,
     ) -> None:
-        """Install or select a queue-storage backend schema for this database."""
+        """Install and activate a queue-storage backend schema.
+
+        This is a low-level helper for tests and explicit queue-storage-only
+        setups. It prepares the schema and selects it as the active backend
+        immediately. For the staged `0.5 -> 0.6` storage transition, use the
+        dedicated storage-transition commands instead.
+        """
         return await self._raw.install_queue_storage(
             schema=schema,
             queue_slot_count=queue_slot_count,
@@ -563,6 +569,9 @@ class AsyncClient:
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 50,
+        storage_transition_role: Literal[
+            "auto", "canonical_drain", "queue_storage_target"
+        ] = "auto",
     ) -> None:
         """Start the worker runtime.
 
@@ -572,11 +581,21 @@ class AsyncClient:
         ``awa.job_kind_descriptors``. Defaults to 30 days; pass ``0`` to
         disable retention (useful if you manage the catalog externally).
 
-        Workers run against the queue-storage engine by default. Set
-        ``queue_storage_schema`` to override the schema name; all workers on
-        the same database should agree on that active queue-storage schema.
-        Mixed canonical and queue-storage fleets are not supported during
-        normal operation.
+        Workers are queue-storage-capable by default, but during a storage
+        transition ``storage_transition_role`` controls how this runtime
+        participates:
+
+        - ``"auto"`` follows ``awa.storage_status()`` and stays canonical
+          until queue-storage routing becomes active
+        - ``"canonical_drain"`` keeps draining canonical backlog even after
+          the routing flip
+        - ``"queue_storage_target"`` prepares and runs the queue-storage
+          executor immediately so new work can start executing as soon as the
+          cluster enters mixed transition
+
+        Set ``queue_storage_schema`` to override the schema name; all workers
+        participating in the same storage transition should agree on that
+        target schema.
         """
         return await self._raw.start(
             queues,
@@ -598,6 +617,7 @@ class AsyncClient:
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,
             queue_storage_queue_rotate_interval_ms=queue_storage_queue_rotate_interval_ms,
             queue_storage_lease_rotate_interval_ms=queue_storage_lease_rotate_interval_ms,
+            storage_transition_role=storage_transition_role,
         )
 
 
@@ -690,7 +710,13 @@ class Client:
         lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
         reset: bool = False,
     ) -> None:
-        """Install or select a queue-storage backend schema for this database."""
+        """Install and activate a queue-storage backend schema.
+
+        This is a low-level helper for tests and explicit queue-storage-only
+        setups. It prepares the schema and selects it as the active backend
+        immediately. For the staged `0.5 -> 0.6` storage transition, use the
+        dedicated storage-transition commands instead.
+        """
         return self._raw.install_queue_storage_sync(
             schema=schema,
             queue_slot_count=queue_slot_count,

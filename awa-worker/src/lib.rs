@@ -14,7 +14,10 @@ mod storage;
 
 // Re-exports
 pub use awa_model::{CallbackConfig, PeriodicJob, PeriodicJobBuilder};
-pub use client::{BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, QueueHealth};
+pub use client::{
+    BuildError, Client, ClientBuilder, HealthCheck, QueueCapacity, QueueHealth,
+    TransitionWorkerRole,
+};
 pub use context::{CallbackGuard, CallbackToken, JobContext};
 pub use dispatcher::{QueueConfig, RateLimit};
 pub use events::{JobEvent, UntypedJobEvent};

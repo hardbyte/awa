@@ -16,13 +16,32 @@ DATABASE_URL = os.environ.get(
 )
 
 
+async def wait_for_job_state(
+    client: awa.AsyncClient,
+    job_id: int,
+    expected_state: awa.JobState,
+    timeout: float = 2.0,
+) -> awa.Job:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        job = await client.get_job(job_id)
+        if job.state == expected_state:
+            return job
+        await asyncio.sleep(0.05)
+    return await client.get_job(job_id)
+
+
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
+    tx = await c.transaction()
+    await tx.execute("DROP SCHEMA IF EXISTS awa CASCADE")
+    await tx.execute("DROP SCHEMA IF EXISTS awa_exp CASCADE")
+    await tx.commit()
     await c.migrate()
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-    await tx.execute("DROP SCHEMA IF EXISTS awa_exp CASCADE")
+    await tx.execute("DELETE FROM awa.runtime_instances")
     await tx.commit()
     try:
         yield c
@@ -256,14 +275,10 @@ async def test_per_queue_retention_in_dict_config(client):
 
 
 @pytest.mark.asyncio
-async def test_default_start_uses_queue_storage_backend(client):
-    """start() uses queue storage by default and records the active schema."""
-    queue = "cfg_default_queue_storage_runtime"
+async def test_default_start_stays_canonical_until_transition_active(client):
+    """Auto role stays on canonical until the transition becomes active."""
+    queue = "cfg_default_canonical_runtime"
     seen = asyncio.Event()
-
-    tx = await client.transaction()
-    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-    await tx.commit()
 
     @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
@@ -272,68 +287,129 @@ async def test_default_start_uses_queue_storage_backend(client):
 
     try:
         await client.start([(queue, 1)], poll_interval_ms=25)
-        job = await client.insert(ConfigTestJob(value="default-queue-storage"), queue=queue)
+        job = await client.insert(ConfigTestJob(value="default-canonical"), queue=queue)
         await asyncio.wait_for(seen.wait(), timeout=2.0)
-        await client.shutdown()
-
-        fetched = await client.get_job(job.id)
+        fetched = await wait_for_job_state(client, job.id, awa.JobState.Completed)
         assert fetched.state == awa.JobState.Completed
 
         tx = await client.transaction()
-        backend = await tx.fetch_one(
-            "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+        status = await tx.fetch_one(
+            """
+            SELECT
+                awa.active_queue_storage_schema() AS active_schema,
+                (SELECT state FROM awa.storage_status()) AS state,
+                (SELECT active_engine FROM awa.storage_status()) AS active_engine
+            """
         )
         await tx.commit()
-        assert backend["schema_name"] == "awa_exp"
+        assert status["active_schema"] is None
+        assert status["state"] == "canonical"
+        assert status["active_engine"] == "canonical"
     finally:
         await client.shutdown()
-        tx = await client.transaction()
-        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        await tx.commit()
 
 
 @pytest.mark.asyncio
-async def test_queue_storage_start_selects_runtime_backend(client):
-    """start() can explicitly run the Python worker on queue storage."""
-    queue = "cfg_queue_storage_runtime"
-    schema = "awa_py_cfg_runtime"
-    seen = asyncio.Event()
-
-    tx = await client.transaction()
-    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
-    await tx.commit()
+async def test_invalid_storage_transition_role_raises(client):
+    """Unknown storage_transition_role values should be rejected early."""
+    queue = "cfg_bad_transition_role"
 
     @client.task(ConfigTestJob, queue=queue)
     async def handle(job):
-        seen.set()
+        return None
+
+    with pytest.raises(ValueError, match="storage_transition_role must be one of"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            storage_transition_role="queue-storage-now",
+        )
+
+
+@pytest.mark.asyncio
+async def test_queue_storage_target_role_executes_after_mixed_transition(client):
+    """A queue-storage target worker can start before the routing flip and pick up new work immediately."""
+    queue = "cfg_queue_storage_target"
+    schema = "awa_py_cfg_target"
+    auto_count = 0
+    target_count = 0
+    auto_seen = asyncio.Event()
+    target_seen = asyncio.Event()
+    target_client = awa.AsyncClient(DATABASE_URL)
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle_auto(job):
+        nonlocal auto_count
+        auto_count += 1
+        auto_seen.set()
+        return None
+
+    @target_client.task(ConfigTestJob, queue=queue)
+    async def handle_target(job):
+        nonlocal target_count
+        target_count += 1
+        target_seen.set()
         return None
 
     try:
+        await target_client.migrate()
+        await target_client.install_queue_storage(schema=schema, reset=True)
+
+        tx = await client.transaction()
+        await tx.execute("SELECT * FROM awa.storage_abort()")
+        await tx.execute(
+            "SELECT * FROM awa.storage_prepare('queue_storage', jsonb_build_object('schema', $1::text))",
+            schema,
+        )
+        await tx.commit()
+
         await client.start(
             [(queue, 1)],
             poll_interval_ms=25,
             queue_storage_schema=schema,
-            queue_storage_queue_rotate_interval_ms=1000,
-            queue_storage_lease_rotate_interval_ms=50,
         )
-        job = await client.insert(ConfigTestJob(value="queue-storage"), queue=queue)
-        await asyncio.wait_for(seen.wait(), timeout=2.0)
-        await client.shutdown()
+        await target_client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_schema=schema,
+            storage_transition_role="queue_storage_target",
+        )
 
-        fetched = await client.get_job(job.id)
+        preflip_job = await client.insert(ConfigTestJob(value="before-flip"), queue=queue)
+        await asyncio.wait_for(auto_seen.wait(), timeout=2.0)
+        fetched = await wait_for_job_state(client, preflip_job.id, awa.JobState.Completed)
         assert fetched.state == awa.JobState.Completed
+        assert auto_count == 1
+        assert target_count == 0
 
         tx = await client.transaction()
-        backend = await tx.fetch_one(
-            "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+        await tx.execute("SELECT * FROM awa.storage_enter_mixed_transition()")
+        status = await tx.fetch_one(
+            """
+            SELECT
+                (SELECT state FROM awa.storage_status()) AS state,
+                (SELECT active_engine FROM awa.storage_status()) AS active_engine,
+                awa.active_queue_storage_schema() AS active_schema
+            """
         )
         await tx.commit()
-        assert backend["schema_name"] == schema
+        assert status["state"] == "mixed_transition"
+        assert status["active_engine"] == "queue_storage"
+        assert status["active_schema"] == schema
+
+        postflip_job = await client.insert(ConfigTestJob(value="after-flip"), queue=queue)
+        await asyncio.wait_for(target_seen.wait(), timeout=2.0)
+        fetched = await wait_for_job_state(client, postflip_job.id, awa.JobState.Completed)
+        assert fetched.state == awa.JobState.Completed
+        assert auto_count == 1
+        assert target_count == 1
     finally:
+        await target_client.shutdown()
+        await target_client.close()
         await client.shutdown()
         tx = await client.transaction()
-        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.execute("SELECT * FROM awa.storage_abort()")
+        await tx.execute("DELETE FROM awa.runtime_instances")
         await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         await tx.commit()
 
