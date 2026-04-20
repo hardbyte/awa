@@ -351,10 +351,14 @@ export function RuntimePage() {
                     </div>
                   );
                 }
+                // The "no live workers" problem is already surfaced by the
+                // Attention card above; this empty state only talks about
+                // the Live/All filter.
+                const hasStale = staleInstances.length > 0;
                 return (
                   <div className="p-6 text-center text-sm text-muted-fg">
-                    {lifecycle === "live"
-                      ? "No live worker instances. Switch to All to include recently stopped instances."
+                    {lifecycle === "live" && hasStale
+                      ? `Switch to All to include ${staleInstances.length} recently stopped instance${staleInstances.length === 1 ? "" : "s"}.`
                       : "No worker instances recorded."}
                   </div>
                 );
