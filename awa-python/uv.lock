@@ -88,7 +88,7 @@ wheels = [
 
 [[package]]
 name = "awa-pg"
-version = "0.5.5a0"
+version = "0.5.5"
 source = { editable = "." }
 
 [package.dev-dependencies]

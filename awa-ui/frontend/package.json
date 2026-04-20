@@ -1,7 +1,7 @@
 {
   "name": "awa-ui-frontend",
   "private": true,
-  "version": "0.5.5-alpha.0",
+  "version": "0.5.5",
   "type": "module",
   "scripts": {
     "dev": "vite",
