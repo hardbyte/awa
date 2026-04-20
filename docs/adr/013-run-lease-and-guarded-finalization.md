@@ -69,3 +69,17 @@ This keeps shutdown drain, heartbeat, and stale-completion safety aligned.
 admin retry can reset or decrement it. `run_lease` is monotonic and only
 advances on a new running claim, which makes it suitable as the durable attempt
 identity.
+
+## Relationship to ADR-019
+
+The `run_lease` guard decision carries into queue storage unchanged. Under
+ADR-019, `run_lease` becomes the second component of the composite key
+`(job_id, run_lease)` identifying `{schema}.active_leases` and
+`{schema}.attempt_state` rows. Every heartbeat, flush-progress,
+register-callback, complete, and rescue path still matches on both columns;
+stale completions are rejected because the UPDATE matches zero rows when
+the lease row has been deleted or replaced. The `AwaSegmentedStorageRaces`
+TLA+ model checks that stale `run_lease` commits cannot land a lease in a
+retired segment, and `AwaSegmentedStorageTrace` replays concrete test
+sequences to validate the guard end-to-end. See
+[ADR-019](019-queue-storage-redesign.md).

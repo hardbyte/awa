@@ -1,7 +1,8 @@
-# ADR 009: Python Synchronous API Support
+# ADR-009: Python Synchronous API Support
 
-**Status:** Accepted
-**Date:** 2026-03-18
+## Status
+
+Accepted
 
 ## Context
 

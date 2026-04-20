@@ -68,3 +68,10 @@ Build-time validation rejects `max_rate <= 0.0`.
 
 - **Per-worker, not global:** Each worker instance has its own token bucket. With N workers, the effective global rate is `N * max_rate`. This is acceptable for most use cases; global rate limiting would require distributed coordination (Redis, advisory locks).
 - **Approximate under low poll intervals:** The bucket refills on each poll. If `poll_interval` is longer than `1/max_rate`, tokens accumulate between polls and dispatch in bursts equal to the burst size. This is by design — the burst parameter controls this behavior.
+
+## Relationship to ADR-019
+
+Rate limiting sits above the storage engine: token consumption happens in
+the dispatcher before the claim query fires, and composes identically with
+canonical and queue-storage backends. The per-worker token bucket is
+storage-plane-agnostic. See [ADR-019](019-queue-storage-redesign.md).

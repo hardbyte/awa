@@ -351,9 +351,14 @@ full details.
 - [013: Durable run leases and guarded finalization](https://github.com/hardbyte/awa/blob/main/docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
 - [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
-- [016: Sequential callbacks and callback heartbeats](https://github.com/hardbyte/awa/blob/main/docs/adr/016-enhanced-external-wait.md)
+- [016: Shared insert preparation and tokio-postgres adapter](https://github.com/hardbyte/awa/blob/main/docs/adr/016-bridge-adapters.md)
 - [017: Python insert-only transaction bridging](https://github.com/hardbyte/awa/blob/main/docs/adr/017-python-transaction-bridging.md)
 - [018: HTTP Worker for serverless job dispatch](https://github.com/hardbyte/awa/blob/main/docs/adr/018-http-worker.md)
+- [019: Queue Storage Engine](https://github.com/hardbyte/awa/blob/main/docs/adr/019-queue-storage-redesign.md)
+- [020: Dead Letter Queue](https://github.com/hardbyte/awa/blob/main/docs/adr/020-dead-letter-queue.md)
+- [021: Sequential callbacks and callback heartbeats](https://github.com/hardbyte/awa/blob/main/docs/adr/021-enhanced-external-wait.md)
+
+See [docs/adr/README.md](https://github.com/hardbyte/awa/blob/main/docs/adr/README.md) for the index with status and supersession.
 
 </details>
 

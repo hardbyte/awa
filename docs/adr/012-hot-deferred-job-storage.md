@@ -4,13 +4,6 @@
 
 Superseded by ADR-019
 
-## Note
-
-This ADR remains the historical explanation for the canonical hot/deferred
-split. ADR-019 replaces it as the primary storage direction for the queue
-storage engine by moving from mutable state rows to append-only queue segments,
-`active_leases`, `attempt_state`, and control-plane `lane_state`.
-
 ## Context
 
 The original schema stored every job lifecycle state in one `awa.jobs` table.
@@ -89,3 +82,14 @@ partitioning. State transitions would cause frequent row movement under
 state-based partitioning, while range partitioning would still leave hot and
 cold workloads intertwined. The manual split gives clearer operational control
 and simpler hot-path query tuning.
+
+## Relationship to ADR-019
+
+This ADR remains the historical explanation for the canonical hot/deferred
+split. ADR-019 replaces it as the primary storage direction for the queue
+storage engine: mutable state rows become append-only queue segments,
+`active_leases` hold the narrow dispatch/rescue fields, `attempt_state` holds
+optional per-attempt mutable data, and `lane_state` + segment cursors make
+up the control plane. The uniqueness decision in this ADR (claims in
+`awa.job_unique_claims`) carries through unchanged. See
+[ADR-019](019-queue-storage-redesign.md).

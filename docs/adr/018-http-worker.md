@@ -17,7 +17,7 @@ The callback infrastructure already supports everything needed:
 - `register_callback` + `waiting_external` parks the job
 - `complete_external` / `fail_external` resolves it
 - `heartbeat_callback` keeps long-running functions alive
-- `resume_external` enables multi-step flows (ADR-016)
+- `resume_external` enables multi-step flows (ADR-021)
 - Callback timeout rescue handles crashed/abandoned functions
 
 What's missing is a `Worker` implementation that automates the HTTP dispatch and callback plumbing.

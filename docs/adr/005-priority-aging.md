@@ -4,14 +4,6 @@
 
 Accepted
 
-## Note
-
-The starvation-prevention policy in this ADR still applies under ADR-019. The
-implementation detail changes: the canonical engine ages rows in place on
-`awa.jobs_hot`, while the queue storage engine must age work by moving entries
-between `lane_state`-tracked segments rather than rewriting a single hot heap
-row.
-
 ## Context
 
 Awa supports four priority levels (1 = highest, 4 = lowest) per job. Priority
@@ -120,3 +112,14 @@ This was moved to the maintenance task because:
 - **Leader dependency.** Aging only runs on the maintenance leader. If leader
   election stalls, aging stops. This is the same dependency as rescue and
   promotion — acceptable given the advisory-lock-based leader model.
+
+## Relationship to ADR-019
+
+The starvation-prevention policy in this ADR still applies. The
+implementation detail changes under queue storage: the canonical engine
+aged rows in place on `awa.jobs_hot` with an `UPDATE ... SET priority =
+priority - 1`, while the queue storage engine ages work by rewriting
+entries through lane-local `laneSeq` advancement rather than mutating a
+single hot heap row. The dispatch ordering (`priority ASC, run_at ASC`)
+and the aging-interval contract are unchanged — see
+[ADR-019](019-queue-storage-redesign.md).

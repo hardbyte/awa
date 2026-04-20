@@ -111,3 +111,13 @@ pub enum QueueCapacity {
 - **Complexity:** The OverflowPool adds ~100 lines of synchronized state. The demand-tracking mechanism requires understanding to reason about correctness.
 - **Per-instance only:** The overflow pool is local to a single worker process. Multiple worker instances each have their own pool — there is no cross-instance coordination. This is the same limitation as hard-reserved mode.
 - **Convergence lag:** After a new queue becomes active, it takes a few poll cycles for the demand signal to propagate and for the incumbents' holdings to drain to their fair share. This is acceptable — convergence happens within seconds.
+
+## Relationship to ADR-019
+
+Permit pre-acquisition is storage-plane-agnostic: it runs in the worker
+dispatcher before any claim SQL, so the weighted-concurrency decision
+carries through unchanged under queue storage. The claim query that
+consumes the pre-acquired permit targets `{schema}.ready_entries` +
+`{schema}.active_leases` instead of `awa.jobs_hot`, but the permit
+semantics and the permit-before-claim invariant are identical. See
+[ADR-019](019-queue-storage-redesign.md).

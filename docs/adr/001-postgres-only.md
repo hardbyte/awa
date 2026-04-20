@@ -4,15 +4,6 @@
 
 Accepted
 
-## Note
-
-ADR-019 changes Awa's primary physical storage layout from the canonical
-`jobs_hot` / `scheduled_jobs` split to queue segments plus `active_leases`,
-`attempt_state`, and `lane_state`. The decision in this ADR still stands: Awa remains
-Postgres-only, and
-the redesign continues to lean on Postgres-native primitives rather than a
-pluggable storage abstraction.
-
 ## Context
 
 When designing a background job queue, one of the first architectural decisions is whether to support multiple storage backends (e.g., Postgres + Redis + MySQL) or commit to a single backend. Existing Rust job queues like `fang` take the multi-backend approach, abstracting over storage via traits. Systems like River (Go), Oban (Elixir), and GoodJob (Ruby) take the opposite approach -- they are Postgres-only and leverage that commitment for deeper feature integration.
@@ -91,3 +82,16 @@ Backoff calculation (`awa.backoff_duration`) and uniqueness bitmask checks (`awa
 - **Postgres-only:** Teams using MySQL, SQLite, or CockroachDB cannot use Awa.
 - **Scale ceiling:** Postgres is not a message broker. For extremely high throughput (millions of jobs/second), a dedicated system like Kafka may be more appropriate. Awa targets the common case: thousands to tens of thousands of jobs per second, which Postgres handles comfortably with `SKIP LOCKED`.
 - **Insert-only polyglot contract:** Non-Rust, non-Python producers can enqueue jobs via raw `INSERT` statements (the schema is the contract), but they cannot run workers. This is an acceptable trade-off -- River, Oban, and GoodJob all have the same constraint.
+
+## Relationship to ADR-019
+
+ADR-019 changed Awa's primary physical storage layout from the canonical
+`jobs_hot` / `scheduled_jobs` split (described in this ADR's examples) to
+queue segments plus `active_leases`, `attempt_state`, and `lane_state`. The
+decision in this ADR still stands: Awa remains Postgres-only, and the
+redesign continues to lean on Postgres-native primitives (`FOR UPDATE SKIP
+LOCKED`, advisory locks, `LISTEN/NOTIFY`, `FOR SHARE` row locks across the
+segmented ring state) rather than a pluggable storage abstraction. The
+partial-index examples in this ADR reflect the pre-ADR-019 schema; the
+current hot-path indexes live on `ready_entries`, `active_leases`, and
+`deferred_jobs` — see [ADR-019](019-queue-storage-redesign.md).

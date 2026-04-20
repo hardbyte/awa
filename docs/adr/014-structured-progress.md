@@ -4,13 +4,6 @@
 
 Accepted
 
-## Note
-
-ADR-019 changes the physical storage of progress. The user-facing progress
-model in this ADR stays the same, but queue storage persists progress inside
-`attempt_state` and `active_leases` rather than dedicated `progress` columns
-on `jobs_hot` and `scheduled_jobs`.
-
 ## Context
 
 Long-running handlers had no way to report progress or update checkpoint
@@ -112,3 +105,15 @@ entire progress JSON is written as a unit on flush.
 - **Write progress on every `set_progress` call.** Too many round-trips
   for high-frequency updates. The buffered approach coalesces writes
   naturally.
+
+## Relationship to ADR-019
+
+ADR-019 moved progress storage off the `jobs_hot` / `scheduled_jobs`
+`progress` columns described here and onto `{schema}.attempt_state`
+(keyed by `(job_id, run_lease)`) plus the deferred / terminal payload
+for persisted snapshots. The user-facing progress model — `set_progress`,
+`update_metadata`, `flush_progress`, generation-based buffering, lifecycle
+semantics — is unchanged. Short jobs now complete without ever allocating
+an `attempt_state` row, so the buffered approach matters even more: only
+long-running or callback-heavy jobs pay the upsert cost. See
+[ADR-019](019-queue-storage-redesign.md).

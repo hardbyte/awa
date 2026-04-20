@@ -1,4 +1,4 @@
-# ADR-016: Sequential Callbacks and Callback Heartbeats
+# ADR-021: Sequential Callbacks and Callback Heartbeats
 
 ## Status
 
@@ -15,11 +15,6 @@ Production integrations revealed three recurring patterns the current design doe
 2. **Callback heartbeats** — long-running external processes (document generation, ML training, manual review queues) need to signal "still working" without completing. Today the callback timeout fires and the job gets rescued.
 
 3. **Timeout visibility** — when a callback times out, the lifecycle hook system can react (via `Retried` events), but the external system has no way to know the callback expired.
-
-ADR-019 later changed the physical storage of callback timeout and heartbeat
-fields by moving them onto queue-storage execution leases. That storage change
-does not alter the user-facing semantics in this ADR: sequential waits,
-callback heartbeats, and timeout handling remain the contract.
 
 ## Decision
 
@@ -106,14 +101,15 @@ await client.complete_external(callback_id, payload={"model_url": "s3://..."})
 awa::admin::heartbeat_callback(&pool, callback_id).await?;
 ```
 
-**Implementation:** Single SQL update:
+**Implementation:** Single SQL update against the active lease row (ADR-019
+moved `callback_timeout_at` onto `{schema}.active_leases`):
 ```sql
-UPDATE awa.jobs
+UPDATE {schema}.active_leases
 SET callback_timeout_at = now() + make_interval(secs => $2)
 WHERE callback_id = $1 AND state = 'waiting_external'
 ```
 
-No schema changes — reuses existing `callback_timeout_at` column.
+No schema changes — reuses the existing `callback_timeout_at` column.
 
 ## Consequences
 
@@ -158,3 +154,14 @@ No schema changes — reuses existing `callback_timeout_at` column.
 | Restate awakeables | `ctx.awakeable().promise` | `job.wait_for_callback(token)` |
 | Step Functions task tokens | `.waitForTaskToken` with heartbeat | `register_callback` + `heartbeat_callback` |
 | Inngest wait-for-event | `step.waitForEvent()` | `wait_for_callback()` per step |
+
+## Relationship to ADR-019
+
+ADR-019 moved callback state from the canonical `awa.jobs` row onto the
+queue-storage execution lease (`{schema}.active_leases`): the
+`callback_id`, `callback_timeout_at`, and `heartbeat_at` columns now live
+on the lease row keyed by `(job_id, run_lease)`. User-facing semantics
+are unchanged — sequential waits, callback heartbeats, and timeout
+handling remain exactly as described here. The SQL examples in the
+Implementation section above have been updated to target
+`active_leases`.

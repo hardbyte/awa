@@ -2638,7 +2638,7 @@ pub async fn register_callback(
 /// When `resume` is `true`, the job transitions back to `running` with the
 /// callback payload stored in metadata under `_awa_callback_result`. The
 /// handler can then read the result and continue processing (sequential
-/// callback pattern from ADR-016).
+/// callback pattern from ADR-021).
 pub async fn complete_external(
     pool: &PgPool,
     callback_id: Uuid,
