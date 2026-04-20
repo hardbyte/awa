@@ -100,6 +100,11 @@ export interface RuntimeInstance {
   hostname: string | null;
   pid: number;
   version: string;
+  /**
+   * Worker's storage capability — populated by schema v10+. On earlier
+   * deployments the field is absent; treat as "canonical" when reading.
+   */
+  storage_capability?: string | null;
   started_at: string;
   last_seen_at: string;
   snapshot_interval_ms: number;

@@ -1,8 +1,22 @@
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { fetchStats, fetchQueues, fetchJobs, fetchRuntime } from "@/lib/api";
-import type { StateCounts, QueueStats, JobRow, RuntimeOverview } from "@/lib/api";
+import {
+  fetchStats,
+  fetchQueues,
+  fetchJobs,
+  fetchRuntime,
+  fetchTimeseries,
+} from "@/lib/api";
+import type {
+  StateCounts,
+  QueueStats,
+  JobRow,
+  RuntimeOverview,
+  TimeseriesBucket,
+} from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
+import { Sparkline } from "@/components/Sparkline";
 import { Heading } from "@/components/ui/heading";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -40,6 +54,48 @@ export function DashboardPage() {
     queryFn: fetchStats,
     refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
+
+  // Timeseries powers the inline sparklines on the state counter cards.
+  // Returns an empty array on pre-v10 deployments / seed-free databases, in
+  // which case Sparkline renders an empty slot of its reserved size so the
+  // card layout doesn't jump.
+  const timeseriesQuery = useQuery<TimeseriesBucket[]>({
+    queryKey: ["stats", "timeseries", 60],
+    queryFn: () => fetchTimeseries(60),
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
+  });
+
+  /** Pivot the flat timeseries response into a per-state numeric series
+   * suitable for <Sparkline data={...} />. Missing buckets are filled as 0. */
+  const seriesByState = useMemo(() => {
+    const buckets = timeseriesQuery.data ?? [];
+    const byBucket = new Map<string, Map<string, number>>();
+    const ordered: string[] = [];
+    for (const point of buckets) {
+      if (!byBucket.has(point.bucket)) {
+        byBucket.set(point.bucket, new Map());
+        ordered.push(point.bucket);
+      }
+      byBucket.get(point.bucket)!.set(point.state, point.count);
+    }
+    ordered.sort();
+    const result: Record<string, number[]> = {};
+    for (const bucket of ordered) {
+      const stateMap = byBucket.get(bucket)!;
+      for (const state of stateMap.keys()) {
+        if (!result[state]) result[state] = [];
+      }
+    }
+    for (const bucket of ordered) {
+      const stateMap = byBucket.get(bucket)!;
+      for (const state of Object.keys(result)) {
+        const series = result[state];
+        if (series) series.push(stateMap.get(state) ?? 0);
+      }
+    }
+    return result;
+  }, [timeseriesQuery.data]);
 
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
@@ -88,6 +144,7 @@ export function DashboardPage() {
         {COUNTER_KEYS.map((key) => {
           const count = statsQuery.data?.[key];
           const bg = STATE_CARD_BG[key] ?? "";
+          const series = seriesByState[key] ?? [];
           return (
             <Link
               key={key}
@@ -106,8 +163,15 @@ export function DashboardPage() {
                       (count ?? 0).toLocaleString()
                     )}
                   </div>
-                  <div className="mt-1.5">
+                  <div className="mt-1.5 flex items-center justify-center gap-2">
                     <StateBadge state={key} />
+                    <Sparkline
+                      data={series}
+                      width={48}
+                      height={14}
+                      className="text-primary/70"
+                      label={`${key} trend over the last hour`}
+                    />
                   </div>
                 </CardContent>
               </Card>

@@ -53,9 +53,14 @@ Because migrations are additive-only, old workers should continue to function du
 
 ## Storage Transition Preparation
 
-This release introduces a generic storage-transition framework that future
-storage-engine upgrades can build on. The important point for operators is that
-it does **not** change the current execution engine.
+Awa ships a generic storage-transition framework that schema migrations,
+operator tooling, and future storage-engine upgrades share. The framework is
+intentionally storage-engine neutral: the first user is the planned
+`canonical -> queue_storage` migration, but the same tables and helpers can
+drive any later engine transition without a second ad-hoc path.
+
+In a canonical deployment the framework is dormant — the routing seam and
+capability metadata are present, but worker execution remains canonical.
 
 New surfaces:
 
@@ -82,30 +87,32 @@ These functions are one-shot operational commands. They are not schema-migration
 DDL and should be run deliberately by an operator or rollout tool, not embedded
 into the extracted migration SQL itself.
 
-Reserved for `0.6`, but intentionally claimed now as SQL identities:
+Reserved SQL identities for a later engine release that finalises the
+transition:
 
 - `awa.storage_enter_mixed_transition()`
 - `awa.storage_finalize()`
 
-Those functions currently fail with `55000` and a clear “requires 0.6” error.
+On a canonical-only deployment these raise `55000` with a clear
+"requires a later engine release" error, so operators cannot accidentally
+force the state machine forward on a build that cannot drive it.
 
-Current behavior:
+Canonical-only behaviour:
 
 - `storage status` reports the singleton row in `awa.storage_transition_state`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
-- `storage abort` clears a prepared engine selection and is also the forward-compatible
-  operator primitive for aborting a later `mixed_transition` rollout before final activation
+- `storage abort` clears a prepared engine selection; it is also the
+  forward-compatible primitive for aborting a `mixed_transition` rollout
+  before final activation on a release that supports it
 - workers continue to run the canonical engine before and after `prepare`
 
-This is intentional. The `0.5.x` prep release is only adding the reusable
-tables, status APIs, capability metadata, and compat-routing seam needed for a
-later engine migration. It is not activating queue storage.
+### `0.5.x` -> `0.6` Queue-Storage Rollout
 
-### Preview: `0.5.x` -> `0.6` Queue-Storage Rollout
-
-This release is laying the protocol surface for the planned `0.6` storage-engine
-upgrade. The intended operator sequence has two phases.
+The first use of the transition framework is the `0.5.x` -> `0.6` move from
+canonical storage to queue storage. The sequence has two phases: first bring
+the whole fleet to a `0.5.x` release that has this framework (without
+activating anything), then roll out `0.6` which completes the transition.
 
 #### Phase 1: last `0.5.x` release everywhere
 

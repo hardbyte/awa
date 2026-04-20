@@ -241,19 +241,12 @@ export function QueuesPage() {
         <Table aria-label="Queues" className="hidden sm:table">
           <TableHeader>
             <TableColumn isRowHeader>Queue</TableColumn>
-            <TableColumn>Total queued</TableColumn>
-            <TableColumn>Scheduled</TableColumn>
-            <TableColumn>Available</TableColumn>
-            <TableColumn>Retryable</TableColumn>
-            <TableColumn>Running</TableColumn>
-            <TableColumn>Failed</TableColumn>
-            <TableColumn>Waiting</TableColumn>
-            <TableColumn>Completed/hr</TableColumn>
-            <TableColumn>Lag (s)</TableColumn>
-            <TableColumn>Mode</TableColumn>
+            <TableColumn className="text-right">Queued</TableColumn>
+            <TableColumn className="text-right">Running</TableColumn>
+            <TableColumn className="text-right">Retry</TableColumn>
+            <TableColumn className="text-right">Failed</TableColumn>
+            <TableColumn className="text-right">Rate/hr</TableColumn>
             <TableColumn>Capacity</TableColumn>
-            <TableColumn>Rate limit</TableColumn>
-            <TableColumn>Runtime</TableColumn>
             <TableColumn>Status</TableColumn>
             <TableColumn>Actions</TableColumn>
           </TableHeader>
@@ -263,7 +256,7 @@ export function QueuesPage() {
               return (
                 <TableRow key={q.queue} id={q.queue}>
                   <TableCell className="font-medium">
-                    <div>
+                    <div className="min-w-0">
                       <Link
                         to="/queues/$name"
                         params={{ name: q.queue }}
@@ -275,64 +268,77 @@ export function QueuesPage() {
                         <div className="text-xs font-normal text-muted-fg">{q.queue}</div>
                       )}
                       {q.description && (
-                        <div className="mt-1 text-xs font-normal text-muted-fg">
+                        <div
+                          className="mt-0.5 truncate text-xs font-normal text-muted-fg"
+                          title={q.description}
+                        >
                           {q.description}
                         </div>
                       )}
-                      <div className="mt-1 text-xs font-normal text-muted-fg">
-                        {descriptorSyncLabel(q)}
-                      </div>
+                      {q.waiting_external > 0 && (
+                        <div className="mt-0.5 text-xs text-muted-fg">
+                          {q.waiting_external.toLocaleString()} waiting · lag{" "}
+                          <LagValue seconds={q.lag_seconds} />
+                        </div>
+                      )}
                     </div>
                   </TableCell>
-                  <TableCell>{q.total_queued.toLocaleString()}</TableCell>
-                  <TableCell>{q.scheduled.toLocaleString()}</TableCell>
-                  <TableCell>{q.available.toLocaleString()}</TableCell>
-                  <TableCell>{q.retryable.toLocaleString()}</TableCell>
-                  <TableCell>{q.running.toLocaleString()}</TableCell>
-                  <TableCell>
-                    <span className={q.failed > 0 ? "text-danger" : ""}>
-                      {q.failed.toLocaleString()}
-                    </span>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.total_queued === 0 ? "text-muted-fg/60" : ""
+                    }`}
+                  >
+                    {q.total_queued.toLocaleString()}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.running === 0 ? "text-muted-fg/60" : ""
+                    }`}
+                  >
+                    {q.running.toLocaleString()}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.retryable === 0 ? "text-muted-fg/60" : "text-warning-fg"
+                    }`}
+                  >
+                    {q.retryable.toLocaleString()}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.failed === 0 ? "text-muted-fg/60" : "text-danger"
+                    }`}
+                  >
+                    {q.failed.toLocaleString()}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-fg">
+                    {q.completed_last_hour.toLocaleString()}
                   </TableCell>
                   <TableCell>
-                    {q.waiting_external > 0 ? q.waiting_external.toLocaleString() : "-"}
-                  </TableCell>
-                  <TableCell>{q.completed_last_hour}</TableCell>
-                  <TableCell>
-                    <LagValue seconds={q.lag_seconds} />
-                  </TableCell>
-                  <TableCell>
-                    {runtime?.config ? (
-                      <Badge
-                        intent={
-                          runtime.config.mode === "weighted" ? "secondary" : "outline"
-                        }
-                      >
-                        {runtime.config.mode === "weighted" ? "Weighted" : "Reserved"}
-                      </Badge>
-                    ) : (
-                      "—"
-                    )}
-                  </TableCell>
-                  <TableCell>{capacityLabel(runtime)}</TableCell>
-                  <TableCell>{rateLimitLabel(runtime)}</TableCell>
-                  <TableCell>
-                    <div className="text-sm">
-                      {runtime ? (
-                        <>
-                          <div>{runtimeHealthLabel(runtime)} healthy</div>
+                    <div className="flex flex-col gap-0.5 text-sm">
+                      <div>
+                        {runtime?.config ? (
+                          <span className="text-muted-fg">
+                            {runtime.config.mode === "weighted" ? "Weighted" : "Reserved"} ·{" "}
+                            <span className="text-fg">{capacityLabel(runtime)}</span>
+                          </span>
+                        ) : (
+                          <span className="text-muted-fg">—</span>
+                        )}
+                      </div>
+                      {rateLimitLabel(runtime) !== "—" && (
+                        <div className="text-xs text-muted-fg">
+                          rate {rateLimitLabel(runtime)}
+                        </div>
+                      )}
+                      {runtime && (
+                        <div className="text-xs text-muted-fg">
                           {runtime.config_mismatch ? (
-                            <div className="text-warning-fg">Config mismatch</div>
+                            <span className="text-warning-fg">Config mismatch</span>
                           ) : (
-                            <div className="text-muted-fg">
-                              {runtime.stale_instances > 0
-                                ? `${runtime.stale_instances} stale`
-                                : `${runtime.instance_count} nodes`}
-                            </div>
+                            `${runtimeHealthLabel(runtime)} healthy`
                           )}
-                        </>
-                      ) : (
-                        <span className="text-muted-fg">—</span>
+                        </div>
                       )}
                     </div>
                   </TableCell>
@@ -344,10 +350,10 @@ export function QueuesPage() {
                         <Badge intent="success">Active</Badge>
                       )}
                       {q.descriptor_stale && (
-                        <Badge intent="warning">Descriptor stale</Badge>
+                        <Badge intent="warning">Stale desc</Badge>
                       )}
                       {q.descriptor_mismatch && (
-                        <Badge intent="danger">Descriptor drift</Badge>
+                        <Badge intent="danger">Drift</Badge>
                       )}
                     </div>
                   </TableCell>

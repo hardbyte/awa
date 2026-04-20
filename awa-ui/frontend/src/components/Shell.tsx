@@ -1,19 +1,22 @@
 import { Outlet, useRouterState } from "@tanstack/react-router";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
-import { fetchCapabilities } from "@/lib/api";
+import { fetchCapabilities, fetchRuntime, type RuntimeOverview } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
-  NavbarProvider,
-  Navbar,
-  NavbarSection,
-  NavbarItem,
-  NavbarLabel,
-  NavbarSpacer,
-  NavbarMobile,
-  NavbarTrigger,
-  NavbarStart,
-} from "@/components/ui/navbar";
+  Sidebar,
+  SidebarContent,
+  SidebarFooter,
+  SidebarHeader,
+  SidebarInset,
+  SidebarItem,
+  SidebarLabel,
+  SidebarProvider,
+  SidebarRail,
+  SidebarSection,
+  SidebarTrigger,
+} from "@/components/ui/sidebar";
+import { usePollInterval } from "@/hooks/use-poll-interval";
 
 /**
  * Koru-river logo — a Maori koru (unfurling fern spiral) with
@@ -164,6 +167,63 @@ function RefreshControl() {
   );
 }
 
+/**
+ * Aggregate a cluster-wide storage-capability label from live runtime
+ * instances. Reads `storage_capability` on each instance; if the field
+ * is absent (pre-v10 schema) every instance falls through as "canonical",
+ * so the chip stays informative on deployments that haven't yet applied
+ * the storage-transition-prep migration.
+ */
+function summariseCapabilities(runtime: RuntimeOverview | undefined): {
+  label: string;
+  hint: string;
+} | null {
+  if (!runtime) return null;
+  const live = runtime.instances.filter((instance) => !instance.stale);
+  if (live.length === 0) return null;
+
+  const capabilities = new Set(
+    live.map((instance) => instance.storage_capability ?? "canonical")
+  );
+  const ordered = Array.from(capabilities).sort();
+  const count = live.length;
+  if (ordered.length === 1 && ordered[0]) {
+    return {
+      label: ordered[0].replace(/_/g, " "),
+      hint: `${count} live ${count === 1 ? "worker" : "workers"}`,
+    };
+  }
+  return {
+    label: "mixed",
+    hint: ordered.join(" · "),
+  };
+}
+
+/** Cluster status chip — health pulse + storage-capability summary. */
+function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }) {
+  const summary = summariseCapabilities(runtime);
+  if (!summary) {
+    return (
+      <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-fg">
+        <span className="size-2 rounded-full bg-muted-fg/40" />
+        <span>No live workers</span>
+      </div>
+    );
+  }
+  return (
+    <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs">
+      <span className="relative flex size-2">
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-primary opacity-60" />
+        <span className="relative inline-flex size-2 rounded-full bg-primary" />
+      </span>
+      <span className="flex flex-col">
+        <span className="font-medium capitalize text-fg">{summary.label}</span>
+        <span className="text-muted-fg">{summary.hint}</span>
+      </span>
+    </div>
+  );
+}
+
 const NAV_ITEMS = [
   { to: "/", label: "Dashboard" },
   { to: "/jobs", label: "Jobs" },
@@ -176,6 +236,8 @@ const NAV_ITEMS = [
 export function Shell() {
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;
+  const poll = usePollInterval();
+
   // Show the banner only once we've confirmed read-only (not while loading)
   const capabilitiesQuery = useQuery({
     queryKey: ["capabilities"],
@@ -184,63 +246,77 @@ export function Shell() {
   });
   const showReadOnlyBanner = capabilitiesQuery.isSuccess && capabilitiesQuery.data.read_only;
 
+  // Cluster status for the sidebar footer; poll-aligned with other pages.
+  // On pre-v10 deployments `storage_capability` is absent per instance; the
+  // aggregator treats that as canonical so the chip still renders.
+  const runtimeQuery = useQuery({
+    queryKey: ["runtime"],
+    queryFn: fetchRuntime,
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
+  });
+
   function isActive(to: string): boolean {
     if (to === "/") return currentPath === "/";
     return currentPath.startsWith(to);
   }
 
+  // Breadcrumb: derive a simple current-page label from the active nav item.
+  const activeNav = NAV_ITEMS.find((item) => isActive(item.to));
+  const currentLabel = activeNav?.label ?? "AWA";
+
   return (
-    <NavbarProvider>
-      <Navbar isSticky>
-        <NavbarStart>
-          <a href="/" className="flex items-center gap-2 no-underline">
+    <SidebarProvider>
+      <Sidebar>
+        <SidebarHeader>
+          <a href="/" className="flex items-center gap-2 px-2 py-1 no-underline">
             <KoruLogo className="size-7 text-primary" />
-            <span className="text-lg font-semibold tracking-tight text-fg">
+            <span className="text-base font-semibold tracking-tight text-fg">
               AWA
             </span>
           </a>
-        </NavbarStart>
+        </SidebarHeader>
+        <SidebarContent>
+          <SidebarSection title="Navigation">
+            {NAV_ITEMS.map((item) => (
+              <SidebarItem
+                key={item.to}
+                href={item.to}
+                isCurrent={isActive(item.to)}
+              >
+                <SidebarLabel>{item.label}</SidebarLabel>
+              </SidebarItem>
+            ))}
+          </SidebarSection>
+        </SidebarContent>
+        <SidebarFooter>
+          <ClusterStatusChip runtime={runtimeQuery.data} />
+        </SidebarFooter>
+        <SidebarRail />
+      </Sidebar>
 
-        <NavbarSection className="ml-6">
-          {NAV_ITEMS.map((item) => (
-            <NavbarItem
-              key={item.to}
-              href={item.to}
-              isCurrent={isActive(item.to)}
-            >
-              <NavbarLabel>{item.label}</NavbarLabel>
-            </NavbarItem>
-          ))}
-        </NavbarSection>
-
-        <NavbarSpacer />
-
-        <div className="flex items-center gap-2">
-          <RefreshControl />
-          <ThemeToggle />
-        </div>
-      </Navbar>
-
-      <NavbarMobile>
-        <NavbarTrigger />
-        <a href="/" className="flex items-center gap-2 no-underline">
-          <KoruLogo className="size-6 text-primary" />
-          <span className="text-base font-semibold text-fg">AWA</span>
-        </a>
-        <div className="ml-auto flex items-center gap-2">
-          <RefreshControl />
-          <ThemeToggle />
-        </div>
-      </NavbarMobile>
-
-      <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
-        {showReadOnlyBanner && (
-          <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-fg">
-            Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
+      <SidebarInset>
+        {/* Topbar: mobile trigger, breadcrumb, global actions */}
+        <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-bg/70 px-4 py-2.5 backdrop-blur sm:px-6">
+          <SidebarTrigger className="-ml-1" />
+          <div className="flex flex-1 items-center gap-2 text-sm text-muted-fg">
+            <span className="text-fg">{currentLabel}</span>
           </div>
-        )}
-        <Outlet />
-      </main>
-    </NavbarProvider>
+          <div className="flex items-center gap-1">
+            <RefreshControl />
+            <ThemeToggle />
+          </div>
+        </header>
+
+        <main className="mx-auto w-full max-w-7xl px-4 py-6 sm:px-6 lg:px-8">
+          {showReadOnlyBanner && (
+            <div className="mb-6 rounded-lg border border-warning/40 bg-warning/10 px-4 py-3 text-sm text-warning-fg">
+              Connected to a read-only database. Dashboard queries work, but admin actions are disabled.
+            </div>
+          )}
+          <Outlet />
+        </main>
+      </SidebarInset>
+    </SidebarProvider>
   );
 }

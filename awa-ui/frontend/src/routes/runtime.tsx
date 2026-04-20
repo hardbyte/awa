@@ -59,9 +59,17 @@ export function RuntimePage() {
   const degradedInstances =
     allInstances.filter((instance) => !instance.stale && !instance.healthy);
   const mismatchQueues = queues.filter((queue) => queue.config_mismatch);
+  // Stale instances alone don't warrant attention — they're expected during
+  // rolling deploys and pod reschedules, and the runtime-instances GC ages
+  // them out on the normal cleanup cycle. Surface them in the Cluster
+  // Summary stats and the Live/All filter below instead. The actionable
+  // conditions are: zero live workers (no one is processing jobs), leader
+  // drift (maintenance not running on exactly one node), degraded instances
+  // (alive but with an unhealthy loop), and queue config mismatch.
+  const hasLiveInstances = runtime ? runtime.live_instances > 0 : true;
   const hasAttention =
+    !hasLiveInstances ||
     (runtime?.leader_instances ?? 0) !== 1 ||
-    staleInstances.length > 0 ||
     degradedInstances.length > 0 ||
     mismatchQueues.length > 0;
 
@@ -132,6 +140,18 @@ export function RuntimePage() {
             description="These states usually need an operator decision rather than passive observation"
           />
           <CardContent className="space-y-3">
+            {!hasLiveInstances && (
+              <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm">
+                <div className="font-medium text-danger-subtle-fg">
+                  No live worker instances
+                </div>
+                <div className="mt-1 text-danger-subtle-fg/80">
+                  No instance has reported a snapshot within the live window, so
+                  no one is claiming or executing jobs right now. Check that
+                  your worker fleet is running and connected to this database.
+                </div>
+              </div>
+            )}
             {(runtime?.leader_instances ?? 0) !== 1 && (
               <div className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-3 text-sm">
                 <div className="font-medium text-warning-subtle-fg">
@@ -152,16 +172,6 @@ export function RuntimePage() {
                     .slice(0, 3)
                     .map((instance) => instanceLabel(instance))
                     .join(", ")}
-                </div>
-              </div>
-            )}
-            {staleInstances.length > 0 && (
-              <div className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-3 text-sm">
-                <div className="font-medium text-warning-subtle-fg">
-                  {staleInstances.length} stale instance{staleInstances.length === 1 ? "" : "s"}
-                </div>
-                <div className="mt-1 text-warning-subtle-fg/80">
-                  Snapshot age exceeded the stale window. Instance may have crashed or lost database connectivity.
                 </div>
               </div>
             )}
@@ -329,11 +339,19 @@ export function RuntimePage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      {instance.leader ? (
-                        <Badge intent="primary">Leader</Badge>
-                      ) : (
-                        <span className="text-sm text-muted-fg">Worker</span>
-                      )}
+                      <div className="flex flex-col gap-0.5">
+                        {instance.leader ? (
+                          <Badge intent="primary" className="w-fit">Leader</Badge>
+                        ) : (
+                          <span className="text-sm text-muted-fg">Worker</span>
+                        )}
+                        {instance.storage_capability &&
+                          instance.storage_capability !== "canonical" && (
+                            <span className="text-xs capitalize text-muted-fg">
+                              {instance.storage_capability.replace(/_/g, " ")}
+                            </span>
+                          )}
+                      </div>
                     </TableCell>
                     <TableCell>
                       <div>{timeAgo(instance.last_seen_at)}</div>
@@ -348,10 +366,21 @@ export function RuntimePage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div>{instance.queues.length}</div>
-                      <div className="text-xs text-muted-fg">{queueListLabel(instance)}</div>
-                      <div className="text-xs text-muted-fg">
-                        global {instance.global_max_workers ?? "—"}
+                      <div className="max-w-[12rem]">
+                        <div className="flex items-baseline gap-1.5">
+                          <span className="tabular-nums">{instance.queues.length}</span>
+                          {instance.global_max_workers !== null && (
+                            <span className="text-xs text-muted-fg">
+                              / {instance.global_max_workers} global
+                            </span>
+                          )}
+                        </div>
+                        <div
+                          className="truncate text-xs text-muted-fg"
+                          title={queueListLabel(instance)}
+                        >
+                          {queueListLabel(instance)}
+                        </div>
                       </div>
                     </TableCell>
                   </TableRow>
