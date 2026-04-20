@@ -497,6 +497,7 @@ fn build_client(
         .expect("Failed to build queue_storage soak client")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_transition_client(
     pool: &sqlx::PgPool,
     queue: &str,
