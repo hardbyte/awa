@@ -45,11 +45,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
     (
         11,
         "Queue storage compatibility layer and active backend selection",
-        // v010 and v011 were split during review, but they remain one
-        // queue-storage migration version on purpose. The prep-release storage
-        // transition metadata is v010 on main, so the queue-storage
-        // compatibility layer lands here as bundled v011.
-        &[V11_UP, V12_UP],
+        &[V11_UP],
     ),
 ];
 
@@ -62,8 +58,7 @@ const V6_UP: &str = include_str!("../migrations/v006_remove_hot_table_triggers.s
 const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
 const V9_UP: &str = include_str!("../migrations/v009_descriptors.sql");
 const V10_UP: &str = include_str!("../migrations/v010_storage_transition_prep.sql");
-const V11_UP: &str = include_str!("../migrations/v010_queue_storage_insert_compat.sql");
-const V12_UP: &str = include_str!("../migrations/v011_queue_storage_jobs_view_compat.sql");
+const V11_UP: &str = include_str!("../migrations/v011_queue_storage_compat.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
