@@ -1,8 +1,8 @@
 # Portable Cross-System Benchmarks
 
 Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
-Procrastinate (Python), River (Go), Oban (Elixir), PgQue (SQL/PL-pgSQL), and
-pg-boss (Node.js) running against a shared Postgres instance.
+Procrastinate (Python), River (Go), Oban (Elixir), PgQue (SQL/PL-pgSQL),
+PGMQ, and pg-boss (Node.js) running against a shared Postgres instance.
 
 ## Prerequisites
 
@@ -68,7 +68,7 @@ benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
 ├── isolated.py            # Repeats one-system-per-run isolated benchmarks
 ├── docker-compose.yml     # Shared Postgres service (PG17 by default, PG18 via --pg-image)
-├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench, pgboss_bench
+├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench, pgmq_bench, pgboss_bench
 ├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
 │   ├── Dockerfile
@@ -96,6 +96,11 @@ benchmarks/portable/
 │   ├── main.py
 │   ├── pyproject.toml
 │   └── vendor/pgque/      # Git submodule pinned to upstream NikolayS/pgque
+├── pgmq-bench/            # PGMQ adapter (Docker, Python driver)
+│   ├── Dockerfile
+│   ├── adapter.json
+│   ├── main.py
+│   └── pyproject.toml
 ├── pgboss-bench/          # pg-boss adapter (Docker, Node.js)
 │   ├── Dockerfile
 │   ├── adapter.json
@@ -206,6 +211,7 @@ Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
 | river | ✓ | ✓ |
 | oban | ✓ | ✓ |
 | pgque | — | ✓ |
+| pgmq | — | opt-in only |
 | pgboss | — | ✓ |
 
 `awa-docker` is excluded by default from the long-horizon runner because its
@@ -214,6 +220,15 @@ same Rust binary, same SQL, same DB-observable behaviour. Keeping it in the
 default would double the runtime and clutter plots with an overlapping
 series. Run it explicitly via `--systems awa-docker` if you're validating
 Docker packaging under long-horizon pressure.
+
+`pgmq` is also opt-in because it requires a pgmq-enabled Postgres image rather
+than the stock pinned `postgres:17.2-alpine` image. Use:
+
+```bash
+uv run python benchmarks/portable/long_horizon.py \
+  --systems pgmq \
+  --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0
+```
 
 ### Reproducibility
 
