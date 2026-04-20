@@ -1,4 +1,4 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { Outlet, useRouterState, useNavigate } from "@tanstack/react-router";
 import {
   Link as AriaLink,
@@ -199,6 +199,22 @@ function summariseCluster(runtime: RuntimeOverview | undefined): {
   };
 }
 
+const SIDEBAR_OPEN_KEY = "sidebar-open";
+
+// Persists the desktop sidebar's open/collapsed state so refreshes keep
+// the user's choice. Matches the localStorage pattern used by useTheme.
+function useSidebarOpenState(): [boolean, (value: boolean) => void] {
+  const [open, setOpen] = useState<boolean>(() => {
+    if (typeof window === "undefined") return true;
+    const stored = window.localStorage.getItem(SIDEBAR_OPEN_KEY);
+    return stored === null ? true : stored === "true";
+  });
+  useEffect(() => {
+    window.localStorage.setItem(SIDEBAR_OPEN_KEY, String(open));
+  }, [open]);
+  return [open, setOpen];
+}
+
 // Closes the mobile sidebar sheet on route change. No-op on desktop.
 function CloseMobileOnNavigate({ path }: { path: string }) {
   const { isMobile, isOpenOnMobile, setIsOpenOnMobile } = useSidebar();
@@ -350,9 +366,13 @@ export function Shell() {
     return currentPath.startsWith(to);
   }
 
+  const [sidebarOpen, setSidebarOpen] = useSidebarOpenState();
+
   return (
     <AriaRouterProvider navigate={ariaNavigate}>
     <SidebarProvider
+      isOpen={sidebarOpen}
+      onOpenChange={setSidebarOpen}
       style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}
     >
       <Sidebar collapsible="dock">

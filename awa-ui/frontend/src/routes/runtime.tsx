@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link, useNavigate } from "@tanstack/react-router";
+import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
   fetchQueueRuntime,
   fetchRuntime,
@@ -48,7 +48,19 @@ type LifecycleFilter = "live" | "all";
 export function RuntimePage() {
   const poll = usePollInterval();
   const navigate = useNavigate();
-  const [lifecycle, setLifecycle] = useState<LifecycleFilter>("live");
+  const search = useSearch({ strict: false }) as { lifecycle?: string };
+  const lifecycle: LifecycleFilter =
+    search.lifecycle === "all" ? "all" : "live";
+  const setLifecycle = (next: LifecycleFilter) => {
+    void navigate({
+      to: "/runtime",
+      search: (prev: Record<string, unknown>) => ({
+        ...prev,
+        lifecycle: next === "live" ? undefined : next,
+      }),
+      replace: true,
+    });
+  };
   const [showStopped, setShowStopped] = useState(false);
 
   const runtimeQuery = useQuery<RuntimeOverview>({
