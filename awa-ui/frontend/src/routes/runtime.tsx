@@ -1,5 +1,6 @@
+import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { fetchQueueRuntime, fetchRuntime } from "@/lib/api";
 import type { QueueRuntimeSummary, RuntimeOverview } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
@@ -30,8 +31,13 @@ import {
   ShutdownBadge,
 } from "@/components/RuntimeDisplay";
 
+type LifecycleFilter = "live" | "all";
+
 export function RuntimePage() {
   const poll = usePollInterval();
+  const navigate = useNavigate();
+  const [lifecycle, setLifecycle] = useState<LifecycleFilter>("live");
+  const [showStopped, setShowStopped] = useState(false);
 
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
@@ -47,15 +53,32 @@ export function RuntimePage() {
 
   const runtime = runtimeQuery.data;
   const queues = queueRuntimeQuery.data ?? [];
-  const staleInstances = runtime?.instances.filter((instance) => instance.stale) ?? [];
+  const allInstances = runtime?.instances ?? [];
+  const staleInstances = allInstances.filter((instance) => instance.stale);
+  const liveInstances = allInstances.filter((instance) => !instance.stale);
   const degradedInstances =
-    runtime?.instances.filter((instance) => !instance.stale && !instance.healthy) ?? [];
+    allInstances.filter((instance) => !instance.stale && !instance.healthy);
   const mismatchQueues = queues.filter((queue) => queue.config_mismatch);
   const hasAttention =
     (runtime?.leader_instances ?? 0) !== 1 ||
     staleInstances.length > 0 ||
     degradedInstances.length > 0 ||
     mismatchQueues.length > 0;
+
+  // Live filter: hide stale instances unless explicitly expanded or mode=all.
+  const visibleInstances =
+    lifecycle === "all" || showStopped
+      ? allInstances
+      : liveInstances;
+  const hiddenStoppedCount =
+    lifecycle === "all" || showStopped ? 0 : staleInstances.length;
+
+  const navigateToInstance = (instanceId: string) => {
+    void navigate({
+      to: "/runtime/$instanceId",
+      params: { instanceId },
+    });
+  };
 
   return (
     <div className="space-y-6">
@@ -168,13 +191,63 @@ export function RuntimePage() {
         <CardHeader
           title="Instances"
           description="Per-worker loop health and leadership status"
-        />
+        >
+          <CardAction>
+            <div
+              role="tablist"
+              aria-label="Instance lifecycle filter"
+              className="inline-flex rounded-md border p-0.5 text-xs"
+            >
+              <button
+                type="button"
+                role="tab"
+                aria-selected={lifecycle === "live"}
+                onClick={() => {
+                  setLifecycle("live");
+                  setShowStopped(false);
+                }}
+                className={`rounded px-2.5 py-1 transition ${
+                  lifecycle === "live"
+                    ? "bg-primary-subtle text-primary-subtle-fg"
+                    : "text-muted-fg hover:text-fg"
+                }`}
+              >
+                Live {liveInstances.length > 0 && (
+                  <span className="ml-1 tabular-nums">{liveInstances.length}</span>
+                )}
+              </button>
+              <button
+                type="button"
+                role="tab"
+                aria-selected={lifecycle === "all"}
+                onClick={() => {
+                  setLifecycle("all");
+                  setShowStopped(false);
+                }}
+                className={`rounded px-2.5 py-1 transition ${
+                  lifecycle === "all"
+                    ? "bg-primary-subtle text-primary-subtle-fg"
+                    : "text-muted-fg hover:text-fg"
+                }`}
+              >
+                All {allInstances.length > 0 && (
+                  <span className="ml-1 tabular-nums">{allInstances.length}</span>
+                )}
+              </button>
+            </div>
+          </CardAction>
+        </CardHeader>
         <CardContent>
-          {runtime && runtime.instances.length > 0 ? (
+          {runtime && visibleInstances.length > 0 ? (
             <>
             <div className="space-y-3 sm:hidden">
-              {runtime.instances.map((instance) => (
-                <div key={instance.instance_id} className="rounded-lg border p-4">
+              {visibleInstances.map((instance) => (
+                <button
+                  key={instance.instance_id}
+                  type="button"
+                  onClick={() => navigateToInstance(instance.instance_id)}
+                  className="block w-full rounded-lg border p-4 text-left transition hover:bg-secondary/40"
+                >
                   <div className="flex items-start justify-between gap-3">
                     <div>
                       <div className="font-medium">{instanceLabel(instance)}</div>
@@ -211,16 +284,7 @@ export function RuntimePage() {
                     <span className="text-muted-fg">Queues</span>
                     <span>{queueListLabel(instance)}</span>
                   </div>
-                  <div className="mt-3">
-                    <Link
-                      to="/runtime/$instanceId"
-                      params={{ instanceId: instance.instance_id }}
-                      className="text-sm text-primary no-underline hover:underline"
-                    >
-                      View instance details
-                    </Link>
-                  </div>
-                </div>
+                </button>
               ))}
             </div>
             <Table aria-label="Runtime instances" className="hidden sm:table">
@@ -232,11 +296,15 @@ export function RuntimePage() {
                 <TableColumn>Snapshot</TableColumn>
                 <TableColumn>Started</TableColumn>
                 <TableColumn>Queues</TableColumn>
-                <TableColumn>Details</TableColumn>
               </TableHeader>
               <TableBody>
-                {runtime.instances.map((instance) => (
-                    <TableRow key={instance.instance_id} id={instance.instance_id}>
+                {visibleInstances.map((instance) => (
+                    <TableRow
+                      key={instance.instance_id}
+                      id={instance.instance_id}
+                      onAction={() => navigateToInstance(instance.instance_id)}
+                      className="cursor-pointer"
+                    >
                       <TableCell className="font-medium">
                         <div>{instanceLabel(instance)}</div>
                         <div className="text-xs text-muted-fg">
@@ -286,24 +354,44 @@ export function RuntimePage() {
                         global {instance.global_max_workers ?? "—"}
                       </div>
                     </TableCell>
-                    <TableCell>
-                      <Link
-                        to="/runtime/$instanceId"
-                        params={{ instanceId: instance.instance_id }}
-                        className="text-primary no-underline hover:underline"
-                      >
-                        View details
-                      </Link>
-                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>
             </Table>
+            {hiddenStoppedCount > 0 && (
+              <div className="mt-3 flex items-center justify-between rounded-md border border-dashed bg-secondary/30 px-4 py-2 text-sm text-muted-fg">
+                <span>
+                  {hiddenStoppedCount} recently stopped instance
+                  {hiddenStoppedCount === 1 ? "" : "s"} hidden
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setShowStopped(true)}
+                  className="text-primary no-underline hover:underline"
+                >
+                  Show all
+                </button>
+              </div>
+            )}
             </>
           ) : runtimeQuery.isLoading ? (
             <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
           ) : runtimeQuery.isError ? (
             <p className="py-4 text-sm text-danger">Failed to load runtime snapshots.</p>
+          ) : runtime && allInstances.length > 0 && lifecycle === "live" ? (
+            <div className="flex flex-col items-start gap-2 py-4 text-sm text-muted-fg">
+              <p>
+                No live instances. {staleInstances.length} stopped instance
+                {staleInstances.length === 1 ? " is" : "s are"} hidden.
+              </p>
+              <button
+                type="button"
+                onClick={() => setLifecycle("all")}
+                className="text-primary no-underline hover:underline"
+              >
+                Show all
+              </button>
+            </div>
           ) : (
             <p className="py-4 text-sm text-muted-fg">
               No runtime snapshots yet. Start a worker to populate this view.
