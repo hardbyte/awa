@@ -8,17 +8,40 @@
 
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
 use awa::{InsertOpts, InsertParams, UniqueOpts};
-use sqlx::postgres::PgPoolOptions;
-use sqlx::PgPool;
+use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::{Connection, PgPool};
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
 /// Serialize all migration tests to prevent parallel schema drops.
 static TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+const MIGRATION_TEST_LOCK_KEY: i64 = 0x6177616d69677231;
 
 fn test_mutex() -> &'static Mutex<()> {
     TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+struct MigrationTestGuard {
+    _local: tokio::sync::MutexGuard<'static, ()>,
+    _conn: PgConnection,
+}
+
+async fn acquire_migration_guard() -> MigrationTestGuard {
+    let local = test_mutex().lock().await;
+    ensure_migration_database().await;
+    let mut conn = PgConnection::connect(&migration_database_url())
+        .await
+        .expect("Failed to open migration test lock connection");
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(MIGRATION_TEST_LOCK_KEY)
+        .execute(&mut conn)
+        .await
+        .expect("Failed to acquire migration test advisory lock");
+    MigrationTestGuard {
+        _local: local,
+        _conn: conn,
+    }
 }
 
 fn database_url() -> String {
@@ -26,13 +49,56 @@ fn database_url() -> String {
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
 }
 
+fn replace_database_name(url: &str, db_name: &str) -> String {
+    let (base, query) = match url.split_once('?') {
+        Some((base, query)) => (base, Some(query)),
+        None => (url, None),
+    };
+    let (prefix, _old_db) = base
+        .rsplit_once('/')
+        .expect("DATABASE_URL must include a database name");
+    let mut out = format!("{prefix}/{db_name}");
+    if let Some(query) = query {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+fn migration_database_url() -> String {
+    replace_database_name(&database_url(), "awa_migration_test")
+}
+
+fn admin_database_url() -> String {
+    replace_database_name(&database_url(), "postgres")
+}
+
+async fn ensure_migration_database() {
+    let mut admin = PgConnection::connect(&admin_database_url())
+        .await
+        .expect("Failed to connect to admin database");
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = 'awa_migration_test')",
+    )
+    .fetch_one(&mut admin)
+    .await
+    .expect("Failed to check migration database existence");
+    if !exists {
+        sqlx::raw_sql("CREATE DATABASE awa_migration_test")
+            .execute(&mut admin)
+            .await
+            .expect("Failed to create migration test database");
+    }
+}
+
 async fn pool() -> PgPool {
+    ensure_migration_database().await;
     PgPoolOptions::new()
         .max_connections(2)
         .acquire_timeout(std::time::Duration::from_secs(5))
-        .connect(&database_url())
+        .connect(&migration_database_url())
         .await
-        .expect("Failed to connect to database — is Postgres running?")
+        .expect("Failed to connect to migration test database — is Postgres running?")
 }
 
 /// Drop and recreate the awa schema for a clean migration test.
@@ -214,7 +280,7 @@ async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
 
 #[tokio::test]
 async fn test_fresh_install_reaches_current_version() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -227,7 +293,7 @@ async fn test_fresh_install_reaches_current_version() {
 
 #[tokio::test]
 async fn test_migrations_are_idempotent() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -243,7 +309,7 @@ async fn test_migrations_are_idempotent() {
 
 #[tokio::test]
 async fn test_step_through_upgrade_preserves_data() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -363,7 +429,7 @@ async fn test_step_through_upgrade_preserves_data() {
 
 #[tokio::test]
 async fn test_migration_sql_matches_run() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
 
     reset_schema(&pool).await;
@@ -400,7 +466,7 @@ async fn test_migration_sql_matches_run() {
 
 #[tokio::test]
 async fn test_legacy_version_upgrade() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -472,7 +538,7 @@ async fn test_legacy_version_upgrade() {
 
 #[tokio::test]
 async fn test_migration_sql_range_produces_valid_schema() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -535,7 +601,7 @@ async fn test_migration_sql_range_produces_valid_schema() {
 
 #[tokio::test]
 async fn test_storage_prepare_keeps_canonical_routing() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -606,7 +672,7 @@ async fn test_storage_prepare_keeps_canonical_routing() {
 
 #[tokio::test]
 async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -637,7 +703,7 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
 
 #[tokio::test]
 async fn test_install_queue_storage_backend_activates_routing_and_state() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -702,7 +768,7 @@ async fn test_install_queue_storage_backend_activates_routing_and_state() {
 
 #[tokio::test]
 async fn test_storage_prepare_rejects_current_engine() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -720,7 +786,7 @@ async fn test_storage_prepare_rejects_current_engine() {
 
 #[tokio::test]
 async fn test_storage_prepare_same_details_is_idempotent() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -745,7 +811,7 @@ async fn test_storage_prepare_same_details_is_idempotent() {
 
 #[tokio::test]
 async fn test_storage_abort_from_canonical_is_noop() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -762,7 +828,7 @@ async fn test_storage_abort_from_canonical_is_noop() {
 
 #[tokio::test]
 async fn test_storage_abort_from_empty_mixed_transition_returns_to_canonical() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -807,7 +873,7 @@ async fn test_storage_abort_from_empty_mixed_transition_returns_to_canonical() {
 
 #[tokio::test]
 async fn test_storage_abort_from_mixed_transition_rejects_live_queue_storage_runtimes() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -850,7 +916,7 @@ async fn test_storage_abort_from_mixed_transition_rejects_live_queue_storage_run
 
 #[tokio::test]
 async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -913,7 +979,7 @@ async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
 
 #[tokio::test]
 async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_runtime() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -966,7 +1032,7 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
 
 #[tokio::test]
 async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_finalize_transition";
     reset_schema(&pool).await;
@@ -1029,7 +1095,7 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
 
 #[tokio::test]
 async fn test_storage_status_report_surfaces_enter_mixed_transition_readiness() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_status_report_enter";
     reset_schema(&pool).await;
@@ -1075,7 +1141,7 @@ async fn test_storage_status_report_surfaces_enter_mixed_transition_readiness() 
 
 #[tokio::test]
 async fn test_storage_status_report_surfaces_finalize_blockers() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_status_report_finalize";
     reset_schema(&pool).await;
@@ -1124,7 +1190,7 @@ async fn test_storage_status_report_surfaces_finalize_blockers() {
 
 #[tokio::test]
 async fn test_mixed_transition_routes_compat_producers_into_queue_storage() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_migration_mixed_transition";
     reset_schema(&pool).await;
@@ -1213,7 +1279,7 @@ async fn test_mixed_transition_routes_compat_producers_into_queue_storage() {
 
 #[tokio::test]
 async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     let schema = "awa_migration_active_queue_storage";
     reset_schema(&pool).await;
@@ -1266,7 +1332,7 @@ async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
 
 #[tokio::test]
 async fn test_insert_many_uses_insert_job_compat_after_non_canonical_activation() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -1308,7 +1374,7 @@ async fn test_insert_many_uses_insert_job_compat_after_non_canonical_activation(
 
 #[tokio::test]
 async fn test_insert_many_copy_uses_insert_job_compat_after_non_canonical_activation() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -1350,7 +1416,7 @@ async fn test_insert_many_copy_uses_insert_job_compat_after_non_canonical_activa
 
 #[tokio::test]
 async fn test_insert_many_copy_preserves_unique_skip_after_non_canonical_activation() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
@@ -1417,7 +1483,7 @@ async fn test_insert_many_copy_preserves_unique_skip_after_non_canonical_activat
 
 #[tokio::test]
 async fn test_legacy_v3_only_upgrade() {
-    let _guard = test_mutex().lock().await;
+    let _guard = acquire_migration_guard().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
