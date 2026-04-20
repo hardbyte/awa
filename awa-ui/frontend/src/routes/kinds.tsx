@@ -126,8 +126,14 @@ export function KindsPage() {
         </TableHeader>
         <TableBody
           renderEmptyState={() => (
-            <div className="p-6 text-center text-sm text-muted-fg">
-              {kindsQuery.isLoading ? "Loading job kinds…" : "No job kinds found."}
+            <div
+              className={`p-6 text-center text-sm ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {kindsQuery.isLoading
+                ? "Loading job kinds…"
+                : kindsQuery.isError
+                  ? "Failed to load job kinds."
+                  : "No job kinds found."}
             </div>
           )}
         >

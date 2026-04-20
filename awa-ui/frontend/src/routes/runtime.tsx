@@ -336,15 +336,29 @@ export function RuntimePage() {
               <TableColumn>Queues</TableColumn>
             </TableHeader>
             <TableBody
-              renderEmptyState={() => (
-                <div className="p-6 text-center text-sm text-muted-fg">
-                  {runtimeQuery.isLoading
-                    ? "Loading instances…"
-                    : lifecycle === "live"
+              renderEmptyState={() => {
+                if (runtimeQuery.isLoading) {
+                  return (
+                    <div className="p-6 text-center text-sm text-muted-fg">
+                      Loading instances…
+                    </div>
+                  );
+                }
+                if (runtimeQuery.isError) {
+                  return (
+                    <div className="p-6 text-center text-sm text-danger-fg">
+                      Failed to load runtime snapshots.
+                    </div>
+                  );
+                }
+                return (
+                  <div className="p-6 text-center text-sm text-muted-fg">
+                    {lifecycle === "live"
                       ? "No live worker instances. Switch to All to include recently stopped instances."
                       : "No worker instances recorded."}
-                </div>
-              )}
+                  </div>
+                );
+              }}
             >
               {visibleInstances.map((instance) => (
                     <TableRow

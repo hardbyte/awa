@@ -257,8 +257,14 @@ export function QueuesPage() {
         </TableHeader>
         <TableBody
           renderEmptyState={() => (
-            <div className="p-6 text-center text-sm text-muted-fg">
-              {queuesQuery.isLoading ? "Loading queues…" : "No queues found."}
+            <div
+              className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {queuesQuery.isLoading
+                ? "Loading queues…"
+                : queuesQuery.isError
+                  ? "Failed to load queues."
+                  : "No queues found."}
             </div>
           )}
         >

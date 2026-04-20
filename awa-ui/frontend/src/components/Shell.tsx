@@ -212,15 +212,25 @@ function CloseMobileOnNavigate({ path }: { path: string }) {
 function ClusterStatusChip({
   runtime,
   isPending,
+  isError,
 }: {
   runtime: RuntimeOverview | undefined;
   isPending: boolean;
+  isError: boolean;
 }) {
   if (isPending) {
     return (
       <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-fg">
         <span className="size-2 rounded-full bg-muted-fg/30" />
         <span className="invisible">loading</span>
+      </div>
+    );
+  }
+  if (isError) {
+    return (
+      <div className="flex items-center gap-2 rounded-md bg-danger-subtle/60 px-2.5 py-1.5 text-xs text-danger-subtle-fg">
+        <span className="size-2 rounded-full bg-danger" />
+        <span>Runtime API unreachable</span>
       </div>
     );
   }
@@ -374,6 +384,7 @@ export function Shell() {
             <ClusterStatusChip
               runtime={runtimeQuery.data}
               isPending={runtimeQuery.isPending}
+              isError={runtimeQuery.isError}
             />
           </div>
         </SidebarFooter>
