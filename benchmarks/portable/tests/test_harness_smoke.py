@@ -748,6 +748,26 @@ def test_crash_recovery_scenario_resolves():
     )
 
 
+def test_event_delivery_matrix_scenario_resolves_expected_shape():
+    phases = resolve_scenario("event_delivery_matrix", None)
+    assert [p.type for p in phases] == [
+        PhaseType.WARMUP,
+        PhaseType.CLEAN,
+        PhaseType.ACTIVE_READERS,
+        PhaseType.HIGH_LOAD,
+        PhaseType.CLEAN,
+    ]
+
+
+def test_fleet_steady_state_scenario_resolves_expected_shape():
+    phases = resolve_scenario("fleet_steady_state", None)
+    assert [p.type for p in phases] == [
+        PhaseType.WARMUP,
+        PhaseType.CLEAN,
+        PhaseType.ACTIVE_READERS,
+    ]
+
+
 def test_kill_worker_hook_calls_pool_kill():
     pool = MagicMock()
     phase = Phase(

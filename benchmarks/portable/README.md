@@ -173,6 +173,12 @@ short-horizon suite above cannot see.
 # Named scenario (idle_in_tx_saturation ≈ 2h40m; long_horizon ≈ 6h10m):
 uv run python benchmarks/portable/long_horizon.py --scenario idle_in_tx_saturation
 
+# Event/message delivery comparison profile:
+uv run python benchmarks/portable/long_horizon.py \
+    --scenario event_delivery_matrix \
+    --systems awa,pgque,pgboss,pgmq \
+    --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0
+
 # Custom phases (label=type:duration):
 uv run python benchmarks/portable/long_horizon.py \
     --phase warmup=warmup:10m \
@@ -190,6 +196,25 @@ Phase types: `warmup`, `clean`, `idle-in-tx`, `recovery`, `active-readers`,
 `high-load`. `warmup` samples are kept in `raw.csv` but excluded from
 `summary.json`. New phase types plug in via `bench_harness.phases` +
 `bench_harness.hooks`.
+
+### Recommended comparison scenarios
+
+- `event_delivery_matrix`
+  - Balanced event/message-queue comparison.
+  - Sequence: steady-state, active subscriber/read pressure, bursty offered
+    load, then clean tail.
+  - Best default when comparing throughput, subscriber latency, end-to-end
+    latency, and dead tuples together.
+
+- `event_delivery_burst`
+  - Backlog-growth and catch-up profile.
+  - Best when you want to see queue depth, end-to-end delivery inflation, and
+    recovery behaviour after sustained oversupply.
+
+- `fleet_steady_state`
+  - Multi-replica steady-state profile.
+  - Intended for `--replicas >= 2` so systems are compared under real replica
+    contention instead of only single-worker-process pressure.
 
 ### Outputs
 

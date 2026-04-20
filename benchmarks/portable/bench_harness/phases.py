@@ -208,6 +208,32 @@ SCENARIOS: dict[str, list[str]] = {
         "readers_1=active-readers:60m",
         "recovery_1=clean:30m",
     ],
+    # Broad, balanced event/message-delivery comparison profile.
+    # Starts at steady-state, adds subscriber/read pressure, then pushes
+    # backlog pressure with high-load before finishing in a clean tail.
+    "event_delivery_matrix": [
+        "warmup=warmup:10m",
+        "clean_1=clean:20m",
+        "readers_1=active-readers:20m",
+        "pressure_1=high-load:20m",
+        "recovery_1=clean:20m",
+    ],
+    # Message-bus burst / catch-up profile. Use to compare how systems
+    # absorb a sustained oversupply of work and how quickly they drain
+    # once offered load returns to baseline.
+    "event_delivery_burst": [
+        "warmup=warmup:10m",
+        "clean_1=clean:15m",
+        "pressure_1=high-load:45m",
+        "recovery_1=clean:30m",
+    ],
+    # Multi-replica steady-state comparison. Intended to be run with
+    # `--replicas >= 2`; the phase sequence itself is nondestructive.
+    "fleet_steady_state": [
+        "warmup=warmup:10m",
+        "clean_1=clean:30m",
+        "readers_1=active-readers:30m",
+    ],
     "soak": [
         "warmup=warmup:10m",
         "clean_1=clean:6h",
