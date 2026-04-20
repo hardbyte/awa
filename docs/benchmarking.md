@@ -155,7 +155,7 @@ mixed-workload setup:
 That soak benchmark is wired into CI as a weekly/manual run, while the shorter
 `test_mvcc_horizon_overlap_benchmark` remains the daily nightly smoke.
 
-## Cross-system visualisation: the long-horizon portable bench
+## Cross-system visualisation: the phase-driven portable bench
 
 Awa's MVCC benches above are the **awa regression detection** track: fast,
 precise, Rust harness, hard thresholds on `overlap_handler_per_s` /
@@ -163,12 +163,13 @@ precise, Rust harness, hard thresholds on `overlap_handler_per_s` /
 regressions between commits.
 
 A separate **cross-system visualisation** track lives at
-`benchmarks/portable/long_horizon.py`. It drives multi-hour scenarios
-against awa plus peer systems (awa-python, river, procrastinate, oban, and
-future pgmq / pg-boss / PgQ adapters), collects Postgres-side and
-adapter-side telemetry on a shared timebase, and produces
-publication-quality cross-system plots (dead tuples, p99 latency,
-throughput, table size, queue depth, and a faceted per-event-table view).
+`benchmarks/portable/long_horizon.py`. It drives named multi-phase scenarios
+against awa plus peer systems (awa-python, river, procrastinate, oban, PgQue,
+pgmq, pg-boss), collects Postgres-side and adapter-side telemetry on a shared
+timebase, and produces both static plots and an offline interactive HTML
+report. The shared metric set now includes producer latency, subscriber
+latency, end-to-end delivery latency, throughput, queue depth, and dead tuples
+over time.
 
 See `benchmarks/portable/README.md` for usage and
 `benchmarks/portable/CONTRIBUTING_ADAPTERS.md` for the adapter contract.
@@ -178,12 +179,32 @@ The two tracks are deliberately separate:
 | Question | Authoritative benchmark |
 |---|---|
 | Did awa regress overnight? | `test_mvcc_horizon_overlap_benchmark` (nightly) / `test_mvcc_horizon_planetscale_soak` (weekly) |
-| How does awa compare to other systems under multi-hour pressure? | `long_horizon.py`, named scenarios (`idle_in_tx_saturation`, `long_horizon`) |
+| How does awa compare to other systems under sustained pressure and event-delivery workloads? | `long_horizon.py`, named scenarios (`event_delivery_matrix`, `event_delivery_burst`, `fleet_steady_state`, `idle_in_tx_saturation`, `long_horizon`) |
 
 If the two ever diverge on workload shape or thresholds, the awa-only
 benches are canonical for awa's own numbers and the long-horizon runner
 defers. The long-horizon runner does **not** carry awa-specific regression
 gates.
+
+### Phase duration and warmup
+
+The default portable scenarios are engineering defaults, not a claim that 20
+or 30 minutes is always enough to expose every system's steady-state failure
+mode. They are long enough to compare shapes and catch obvious drift while
+still being runnable on a developer machine. For stronger pressure studies or
+publication-grade comparisons, extend the phases explicitly with repeated
+`--phase label=type:duration` arguments.
+
+`warmup` exists to absorb startup artifacts: image launch, pool warmup,
+runtime install, first-listen latency, and initial sampler skew. Warmup
+samples are preserved in `raw.csv` for diagnosis, but they are excluded from
+`summary.json` and hidden by default in the HTML report so the presentation
+starts on steady-state behavior rather than startup noise.
+
+The HTML timeline explorer supports comparing two metrics at once: a primary
+metric on the left axis and an optional comparison metric on the right axis.
+The report also includes a simple outlier panel that highlights suspicious
+adapter-metric samples from `raw.csv` before they distort the charts.
 
 Useful knobs:
 

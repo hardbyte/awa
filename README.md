@@ -51,10 +51,20 @@ harness that verifies concrete runtime-test event sequences against the spec.
 
 ## Benchmarks
 
-Local soak, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95 pickup**, **417
-dead tuples**. Enqueue: ~30k/s single-producer, ~100k/s multi-producer.
-Head-to-head comparisons against PgQue / River are not yet published. Full
-methodology and raw output in [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md)
+Local queue-storage soak, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95
+pickup**, **417 exact final dead tuples**. Enqueue: ~30k/s single-producer,
+~100k/s multi-producer.
+
+The repo also carries a phase-driven portable benchmark harness that compares
+Awa against PgQue, PGMQ, and pg-boss on a shared Postgres instance and records
+producer, subscriber, and end-to-end delivery latency alongside throughput,
+queue depth, and dead tuples over time. Current engineering runs show Awa
+ahead of PgQue on sustained throughput and subscriber/end-to-end latency in
+the event-delivery scenarios, while PgQue still keeps a lower dead-tuple
+profile.
+
+Methodology and caveats live in
+[benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md)
 and [ADR-019 validation](https://github.com/hardbyte/awa/blob/main/docs/adr/bench/019-queue-storage-validation-2026-04-19.md).
 
 ## Where Awa Fits

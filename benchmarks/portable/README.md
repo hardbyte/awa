@@ -1,7 +1,8 @@
 # Portable Cross-System Benchmarks
 
 Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
-Procrastinate (Python), River (Go), Oban (Elixir), PgQue (SQL/PL-pgSQL),
+Procrastinate (Python), River (Go), Oban (Elixir), PgQue (SQL/PL-pgSQL; the
+adapter is a thin Python driver around the native database API),
 PGMQ, and pg-boss (Node.js) running against a shared Postgres instance.
 
 ## Prerequisites
@@ -194,8 +195,8 @@ uv run python benchmarks/portable/long_horizon.py \
 
 Phase types: `warmup`, `clean`, `idle-in-tx`, `recovery`, `active-readers`,
 `high-load`. `warmup` samples are kept in `raw.csv` but excluded from
-`summary.json`. New phase types plug in via `bench_harness.phases` +
-`bench_harness.hooks`.
+`summary.json` and hidden by default in the interactive report. New phase
+types plug in via `bench_harness.phases` + `bench_harness.hooks`.
 
 ### Recommended comparison scenarios
 
@@ -216,14 +217,21 @@ Phase types: `warmup`, `clean`, `idle-in-tx`, `recovery`, `active-readers`,
   - Intended for `--replicas >= 2` so systems are compared under real replica
     contention instead of only single-worker-process pressure.
 
+The shipped scenario lengths are meant to be tractable on a developer machine.
+For deeper pressure studies, extend them with explicit `--phase` overrides
+rather than treating the defaults as "long enough" by definition.
+
 ### Outputs
 
 Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
+- `index.html` — self-contained interactive report with a two-metric timeline
+  explorer and sample-quality / outlier panel
 - `raw.csv` — tidy long-form, one row per (system, subject, metric, sample)
 - `summary.json` — per-system per-phase aggregates + recovery metrics
 - `manifest.json` — PG version, config, host info, adapter versions, CLI args
 - `plots/` — `dead_tuples`, `dead_tuples_faceted`, `claim_p99`, `throughput`,
-  `table_size`, `queue_depth` (PNG 300 DPI + SVG)
+  `producer_p99`, `subscriber_p99`, `end_to_end_p99`, `table_size`,
+  `queue_depth` (PNG 300 DPI + SVG)
 
 ### Default system matrix differs from the steady-state suite
 

@@ -67,6 +67,9 @@ What it intentionally does not model:
 - SQL planner behavior
 - MVCC horizons or autovacuum timing
 - queue priorities and fairness
+- `queue_counts()` caching details such as
+  `queue_lanes.pruned_completed_count`; Rust keeps those as cold post-prune
+  rollups rather than as part of the completion hot path
 - unique-claim key semantics; the Rust `retry_from_dlq` unique-conflict
   contract (see `awa-model/src/dlq.rs::retry_from_dlq`) is enforced at the
   SQL layer via `release_queue_storage_unique_claim` and is out of scope here

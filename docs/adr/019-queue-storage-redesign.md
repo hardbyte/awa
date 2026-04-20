@@ -92,15 +92,18 @@ The implementation and migrations use these physical names:
 7. `lane_state` and segment cursor tables
 
 - Queue-local cursor metadata lives in a tiny hot table.
-- `lane_state` owns enqueue and claim cursors plus low-churn rollups needed to
-  preserve counts across terminal-segment prune.
+- `lane_state` owns enqueue and claim cursors, `available_count`, and the cold
+  `pruned_completed_count` rollup used to preserve queue counts across
+  terminal-segment prune.
 - Completion must not update `lane_state` on every terminal transition; the
   hot path only mutates claim/enqueue control state. Per-completion
   `running` / `completed` counter updates on a single busy lane collapse
   throughput by an order of magnitude under benchmark, so `running` is
   derived from `active_leases` and terminal counts come from live
-  `terminal_entries` plus the prune-time rollup rather than from a hot
-  completion counter.
+  `terminal_entries` plus the post-prune rollup rather than from a hot
+  completion counter. The rollup is applied only after a successful prune,
+  outside the lock-holding transaction, so the prune path does not serialize
+  on the same hot `lane_state` rows as claim and enqueue.
 - Ready and lease segment cursor tables tell dispatch and maintenance which
   physical segment is active, claimable, or prunable.
 - Rotation state for queue and lease segments is owned by the maintenance
@@ -180,6 +183,15 @@ under the same workload: 9,686 jobs/s, 38.998 ms p95, dead tuples not
 sampled). The full command log, raw output, and per-table dead-tuple
 breakdown are in
 [`bench/019-queue-storage-validation-2026-04-19.md`](bench/019-queue-storage-validation-2026-04-19.md).
+
+The repo also maintains a phase-driven portable comparison harness under
+`benchmarks/portable/`. That harness records producer, subscriber, and
+end-to-end latency on a shared timebase while also sampling throughput, queue
+depth, and dead tuples over time. Current engineering runs consistently place
+Awa ahead of PgQue on subscriber and end-to-end latency and ahead on sustained
+throughput in the event-delivery scenarios, while PgQue keeps a lower
+dead-tuple profile. See [docs/benchmarking.md](../benchmarking.md) for the
+current comparison methodology and caveats.
 
 Spec-level safety is checked by the segmented-storage TLA+ family —
 `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,
