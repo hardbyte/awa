@@ -6,7 +6,8 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::{migrations, storage};
+use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage};
+use awa::{InsertOpts, InsertParams, UniqueOpts};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -48,6 +49,70 @@ fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
         }
         _ => None,
     }
+}
+
+async fn simulate_non_canonical_compat_routing(pool: &PgPool) {
+    sqlx::raw_sql(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'active',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            updated_at = now(),
+            finalized_at = now()
+        WHERE singleton;
+
+        CREATE OR REPLACE FUNCTION awa.insert_job_compat(
+            p_kind TEXT,
+            p_queue TEXT DEFAULT 'default',
+            p_args JSONB DEFAULT '{}'::jsonb,
+            p_state awa.job_state DEFAULT 'available',
+            p_priority SMALLINT DEFAULT 2,
+            p_max_attempts SMALLINT DEFAULT 25,
+            p_run_at TIMESTAMPTZ DEFAULT NULL,
+            p_metadata JSONB DEFAULT '{}'::jsonb,
+            p_tags TEXT[] DEFAULT ARRAY[]::TEXT[],
+            p_unique_key BYTEA DEFAULT NULL,
+            p_unique_states BIT(8) DEFAULT NULL
+        )
+        RETURNS awa.jobs
+        LANGUAGE sql
+        SET search_path = pg_catalog, awa
+        AS $$
+            INSERT INTO awa.jobs (
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                max_attempts,
+                run_at,
+                metadata,
+                tags,
+                unique_key,
+                unique_states
+            )
+            VALUES (
+                p_kind,
+                p_queue,
+                p_args,
+                p_state,
+                p_priority,
+                p_max_attempts,
+                p_run_at,
+                p_metadata,
+                p_tags,
+                p_unique_key,
+                p_unique_states
+            )
+            RETURNING *
+        $$;
+        "#,
+    )
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 // ── Fresh install ────────────────────────────────────────────────
@@ -597,6 +662,155 @@ async fn test_insert_job_compat_refuses_non_canonical_active_engine() {
         }
         other => panic!("expected sqlx database error, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn test_insert_many_uses_insert_job_compat_after_non_canonical_activation() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    simulate_non_canonical_compat_routing(&pool).await;
+
+    let queue = "compat_insert_many";
+    let jobs = vec![
+        InsertParams {
+            kind: "compat_batch_job".to_string(),
+            args: serde_json::json!({"seq": 1}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: "compat_batch_job".to_string(),
+            args: serde_json::json!({"seq": 2}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        },
+    ];
+
+    let inserted = insert_many(&pool, &jobs).await.unwrap();
+    assert_eq!(inserted.len(), 2);
+
+    let stored: Vec<i64> = sqlx::query_scalar(
+        "SELECT (args->>'seq')::bigint FROM awa.jobs WHERE queue = $1 ORDER BY 1",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![1, 2]);
+}
+
+#[tokio::test]
+async fn test_insert_many_copy_uses_insert_job_compat_after_non_canonical_activation() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    simulate_non_canonical_compat_routing(&pool).await;
+
+    let queue = "compat_insert_many_copy";
+    let jobs = vec![
+        InsertParams {
+            kind: "compat_copy_job".to_string(),
+            args: serde_json::json!({"seq": 10}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: "compat_copy_job".to_string(),
+            args: serde_json::json!({"seq": 11}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        },
+    ];
+
+    let inserted = insert_many_copy_from_pool(&pool, &jobs).await.unwrap();
+    assert_eq!(inserted.len(), 2);
+
+    let stored: Vec<i64> = sqlx::query_scalar(
+        "SELECT (args->>'seq')::bigint FROM awa.jobs WHERE queue = $1 ORDER BY 1",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![10, 11]);
+}
+
+#[tokio::test]
+async fn test_insert_many_copy_preserves_unique_skip_after_non_canonical_activation() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    simulate_non_canonical_compat_routing(&pool).await;
+
+    let queue = "compat_copy_unique";
+    let unique_opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts {
+            by_args: true,
+            by_queue: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let first_batch = vec![
+        InsertParams {
+            kind: "compat_unique_job".to_string(),
+            args: serde_json::json!({"id": 1}),
+            opts: unique_opts.clone(),
+        },
+        InsertParams {
+            kind: "compat_unique_job".to_string(),
+            args: serde_json::json!({"id": 2}),
+            opts: unique_opts.clone(),
+        },
+    ];
+    let first_inserted = insert_many_copy_from_pool(&pool, &first_batch)
+        .await
+        .unwrap();
+    assert_eq!(first_inserted.len(), 2);
+
+    let second_batch = vec![
+        InsertParams {
+            kind: "compat_unique_job".to_string(),
+            args: serde_json::json!({"id": 1}),
+            opts: unique_opts.clone(),
+        },
+        InsertParams {
+            kind: "compat_unique_job".to_string(),
+            args: serde_json::json!({"id": 3}),
+            opts: unique_opts,
+        },
+    ];
+    let second_inserted = insert_many_copy_from_pool(&pool, &second_batch)
+        .await
+        .unwrap();
+    assert_eq!(second_inserted.len(), 1);
+    assert_eq!(second_inserted[0].args["id"], 3);
+
+    let stored: Vec<i64> = sqlx::query_scalar(
+        "SELECT (args->>'id')::bigint FROM awa.jobs WHERE queue = $1 ORDER BY 1",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![1, 2, 3]);
 }
 
 // ── Legacy V3-only upgrade (0.3.0 exact, no V4/V5) ──────────────
