@@ -243,14 +243,14 @@ export function JobsPage() {
     });
   };
 
+  // Any change that shifts the visible result set clears bulk selection —
+  // otherwise the toolbar count reflects ids that are no longer visible.
   const setSearch = (q: string) => {
+    setSelected(new Set());
     setUrlParams({ q: q || undefined, before_id: undefined });
   };
 
-
   const setBeforeId = (id: number | undefined) => {
-    // Clear selection across page changes — rows not on the current page
-    // shouldn't keep counting toward bulk action affordances.
     setSelected(new Set());
     setUrlParams({
       before_id: id !== undefined ? String(id) : undefined,
@@ -634,12 +634,13 @@ export function JobsPage() {
           {PAGE_SIZES.map((size) => (
             <button
               key={size}
-              onClick={() =>
+              onClick={() => {
+                setSelected(new Set());
                 setUrlParams({
                   limit: size === DEFAULT_PAGE_SIZE ? undefined : String(size),
                   before_id: undefined,
-                })
-              }
+                });
+              }}
               className={[
                 "rounded px-2 py-0.5 text-sm transition-colors",
                 filters.limit === size

@@ -8,7 +8,7 @@ import { test, expect } from "@playwright/test";
  */
 test("docked sidebar stays docked across nav", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto("http://localhost:4200/");
+  await page.goto("/");
 
   // Find the desktop sidebar container (data-slot=sidebar + not inside a sheet).
   const sidebarWrapper = page.locator('div[data-slot="sidebar"][data-side="left"]').first();
@@ -38,7 +38,7 @@ test("docked sidebar stays docked across nav", async ({ page }) => {
 
 test("docked sidebar stays docked across refresh", async ({ page }) => {
   await page.setViewportSize({ width: 1280, height: 800 });
-  await page.goto("http://localhost:4200/");
+  await page.goto("/");
 
   const sidebarWrapper = page.locator('div[data-slot="sidebar"][data-side="left"]').first();
   await expect(sidebarWrapper).toHaveAttribute("data-state", "expanded");

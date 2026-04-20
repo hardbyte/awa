@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate, useSearch } from "@tanstack/react-router";
 import {
@@ -61,8 +60,6 @@ export function RuntimePage() {
       replace: true,
     });
   };
-  const [showStopped, setShowStopped] = useState(false);
-
   const runtimeQuery = useQuery<RuntimeOverview>({
     queryKey: ["runtime"],
     queryFn: fetchRuntime,
@@ -111,13 +108,11 @@ export function RuntimePage() {
       degradedInstances.length > 0 ||
       mismatchQueues.length > 0);
 
-  // Live filter: hide stale instances unless explicitly expanded or mode=all.
-  const visibleInstances =
-    lifecycle === "all" || showStopped
-      ? allInstances
-      : liveInstances;
+  // Live filter: hide stale instances unless the user explicitly asked
+  // for them via lifecycle=all in the URL.
+  const visibleInstances = lifecycle === "all" ? allInstances : liveInstances;
   const hiddenStoppedCount =
-    lifecycle === "all" || showStopped ? 0 : staleInstances.length;
+    lifecycle === "all" ? 0 : staleInstances.length;
 
   const navigateToInstance = (instanceId: string) => {
     void navigate({
@@ -194,8 +189,28 @@ export function RuntimePage() {
         </Card>
       )}
 
-      {shouldShowStorageTransitionCard(storageQuery.data) && storageQuery.data && (
-        <StorageTransitionCard report={storageQuery.data} />
+      {/* fetchStorage returns null on a 404 (backend predates /api/storage),
+          so those deployments stay quiet. Any other failure surfaces as a
+          small error card so operators don't lose rollout-readiness
+          visibility when the endpoint is broken rather than absent. */}
+      {storageQuery.isError ? (
+        <Card>
+          <CardHeader
+            title="Storage transition"
+            description="Readiness gates for rolling forward a prepared storage engine"
+          />
+          <CardContent>
+            <div className="rounded-lg border border-danger/40 bg-danger-subtle px-4 py-3 text-sm text-danger-subtle-fg">
+              Couldn't load storage transition state from /api/storage.
+              Rollout-readiness gates can't be evaluated until the endpoint
+              responds successfully.
+            </div>
+          </CardContent>
+        </Card>
+      ) : (
+        shouldShowStorageTransitionCard(storageQuery.data) && storageQuery.data && (
+          <StorageTransitionCard report={storageQuery.data} />
+        )
       )}
 
       <Card>
@@ -245,19 +260,18 @@ export function RuntimePage() {
           description="Per-worker loop health and leadership status"
         >
           <CardAction>
+            {/* Segmented toggle, not a tablist — there are no tab panels to
+                switch, just a filter for the list below. `aria-pressed` is
+                the correct semantic for a two-way button. */}
             <div
-              role="tablist"
+              role="group"
               aria-label="Instance lifecycle filter"
               className="inline-flex rounded-md border p-0.5 text-xs"
             >
               <button
                 type="button"
-                role="tab"
-                aria-selected={lifecycle === "live"}
-                onClick={() => {
-                  setLifecycle("live");
-                  setShowStopped(false);
-                }}
+                aria-pressed={lifecycle === "live"}
+                onClick={() => setLifecycle("live")}
                 className={`rounded px-2.5 py-1 transition ${
                   lifecycle === "live"
                     ? "bg-primary-subtle text-primary-subtle-fg"
@@ -270,12 +284,8 @@ export function RuntimePage() {
               </button>
               <button
                 type="button"
-                role="tab"
-                aria-selected={lifecycle === "all"}
-                onClick={() => {
-                  setLifecycle("all");
-                  setShowStopped(false);
-                }}
+                aria-pressed={lifecycle === "all"}
+                onClick={() => setLifecycle("all")}
                 className={`rounded px-2.5 py-1 transition ${
                   lifecycle === "all"
                     ? "bg-primary-subtle text-primary-subtle-fg"
@@ -471,7 +481,7 @@ export function RuntimePage() {
               </span>
               <button
                 type="button"
-                onClick={() => setShowStopped(true)}
+                onClick={() => setLifecycle("all")}
                 className="text-primary no-underline hover:underline"
               >
                 Show all
