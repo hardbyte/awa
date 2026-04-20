@@ -1,8 +1,8 @@
 # Portable Cross-System Benchmarks
 
 Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
-Procrastinate (Python), River (Go), Oban (Elixir), and PgQue (SQL/PL-pgSQL)
-running against a shared Postgres instance.
+Procrastinate (Python), River (Go), Oban (Elixir), PgQue (SQL/PL-pgSQL), and
+pg-boss (Node.js) running against a shared Postgres instance.
 
 ## Prerequisites
 
@@ -68,7 +68,7 @@ benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
 ├── isolated.py            # Repeats one-system-per-run isolated benchmarks
 ├── docker-compose.yml     # Shared Postgres service (PG17 by default, PG18 via --pg-image)
-├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench
+├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench, pgboss_bench
 ├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
 │   ├── Dockerfile
@@ -96,6 +96,11 @@ benchmarks/portable/
 │   ├── main.py
 │   ├── pyproject.toml
 │   └── vendor/pgque/      # Git submodule pinned to upstream NikolayS/pgque
+├── pgboss-bench/          # pg-boss adapter (Docker, Node.js)
+│   ├── Dockerfile
+│   ├── adapter.json
+│   ├── main.js
+│   └── package.json
 └── results/               # JSON output from benchmark runs
 ```
 
@@ -201,6 +206,7 @@ Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
 | river | ✓ | ✓ |
 | oban | ✓ | ✓ |
 | pgque | — | ✓ |
+| pgboss | — | ✓ |
 
 `awa-docker` is excluded by default from the long-horizon runner because its
 line on any multi-hour dead-tuple / latency plot is the awa-native line —

@@ -181,6 +181,15 @@ def build_pgque(skip: bool) -> None:
     )
 
 
+def build_pgboss(skip: bool) -> None:
+    _docker_build(
+        "pgboss-bench",
+        SCRIPT_DIR / "pgboss-bench" / "Dockerfile",
+        REPO_ROOT,
+        skip,
+    )
+
+
 # ─── Launch specs ────────────────────────────────────────────────────────
 
 
@@ -266,6 +275,10 @@ def launch_pgque(manifest, overrides):
     return _docker_launch("pgque-bench", manifest, overrides)
 
 
+def launch_pgboss(manifest, overrides):
+    return _docker_launch("pgboss-bench", manifest, overrides)
+
+
 # ─── Registry ────────────────────────────────────────────────────────────
 
 
@@ -312,8 +325,13 @@ ADAPTERS: dict[str, AdapterEntry] = {
         builder=build_pgque,
         launcher=launch_pgque,
     ),
+    "pgboss": AdapterEntry(
+        bench_dir=SCRIPT_DIR / "pgboss-bench",
+        builder=build_pgboss,
+        launcher=launch_pgboss,
+    ),
 }
 
 # Default --systems list for long-horizon. awa-docker is opt-in (it duplicates
 # the awa-native line in cross-system plots — same Rust, same SQL).
-DEFAULT_SYSTEMS = ["awa", "awa-python", "procrastinate", "river", "oban", "pgque"]
+DEFAULT_SYSTEMS = ["awa", "awa-python", "procrastinate", "river", "oban", "pgque", "pgboss"]
