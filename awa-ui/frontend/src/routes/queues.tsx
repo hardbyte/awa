@@ -242,21 +242,26 @@ export function QueuesPage() {
       )}
 
       {/* Desktop table layout */}
-      {queues.length > 0 ? (
-        <Table aria-label="Queues" className="hidden sm:table">
-          <TableHeader>
-            <TableColumn isRowHeader>Queue</TableColumn>
-            <TableColumn className="text-right">Queued</TableColumn>
-            <TableColumn className="text-right">Running</TableColumn>
-            <TableColumn className="text-right">Retry</TableColumn>
-            <TableColumn className="text-right">Failed</TableColumn>
-            <TableColumn className="text-right">Rate/hr</TableColumn>
-            <TableColumn>Capacity</TableColumn>
-            <TableColumn>Status</TableColumn>
-            <TableColumn>Actions</TableColumn>
-          </TableHeader>
-          <TableBody>
-            {queues.map((q) => {
+      <Table aria-label="Queues" className="hidden sm:table">
+        <TableHeader>
+          <TableColumn isRowHeader>Queue</TableColumn>
+          <TableColumn className="text-right">Queued</TableColumn>
+          <TableColumn className="text-right">Running</TableColumn>
+          <TableColumn className="text-right">Retry</TableColumn>
+          <TableColumn className="text-right">Failed</TableColumn>
+          <TableColumn className="text-right">Rate/hr</TableColumn>
+          <TableColumn>Capacity</TableColumn>
+          <TableColumn>Status</TableColumn>
+          <TableColumn>Actions</TableColumn>
+        </TableHeader>
+        <TableBody
+          renderEmptyState={() => (
+            <div className="p-6 text-center text-sm text-muted-fg">
+              {queuesQuery.isLoading ? "Loading queues…" : "No queues found."}
+            </div>
+          )}
+        >
+          {queues.map((q) => {
               const runtime = runtimeByQueue.get(q.queue);
               return (
                 <TableRow key={q.queue} id={q.queue}>
@@ -397,13 +402,8 @@ export function QueuesPage() {
                 </TableRow>
               );
             })}
-          </TableBody>
-        </Table>
-      ) : queuesQuery.isLoading ? (
-        <p className="text-sm text-muted-fg">Loading...</p>
-      ) : (
-        <p className="text-sm text-muted-fg">No queues found.</p>
-      )}
+        </TableBody>
+      </Table>
 
       <ConfirmDialog
         isOpen={drainTarget !== null}

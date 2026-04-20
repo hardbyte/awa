@@ -274,8 +274,7 @@ export function RuntimePage() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {runtime && visibleInstances.length > 0 ? (
-            <>
+          {visibleInstances.length > 0 && (
             <div className="space-y-3 sm:hidden">
               {visibleInstances.map((instance) => (
                 <button
@@ -321,18 +320,29 @@ export function RuntimePage() {
                 </button>
               ))}
             </div>
-            <Table aria-label="Runtime instances" className="hidden sm:table">
-              <TableHeader>
-                <TableColumn isRowHeader>Instance</TableColumn>
-                <TableColumn>Health</TableColumn>
-                <TableColumn>Loops</TableColumn>
-                <TableColumn>Role</TableColumn>
-                <TableColumn>Snapshot</TableColumn>
-                <TableColumn>Started</TableColumn>
-                <TableColumn>Queues</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {visibleInstances.map((instance) => (
+          )}
+          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+            <TableHeader>
+              <TableColumn isRowHeader>Instance</TableColumn>
+              <TableColumn>Health</TableColumn>
+              <TableColumn>Loops</TableColumn>
+              <TableColumn>Role</TableColumn>
+              <TableColumn>Snapshot</TableColumn>
+              <TableColumn>Started</TableColumn>
+              <TableColumn>Queues</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  {runtimeQuery.isLoading
+                    ? "Loading instances…"
+                    : lifecycle === "live"
+                      ? "No live worker instances. Switch to All to include recently stopped instances."
+                      : "No worker instances recorded."}
+                </div>
+              )}
+            >
+              {visibleInstances.map((instance) => (
                     <TableRow
                       key={instance.instance_id}
                       id={instance.instance_id}
@@ -405,46 +415,22 @@ export function RuntimePage() {
                     </TableCell>
                   </TableRow>
                 ))}
-              </TableBody>
-            </Table>
-            {hiddenStoppedCount > 0 && (
-              <div className="mt-3 flex items-center justify-between rounded-md border border-dashed bg-secondary/30 px-4 py-2 text-sm text-muted-fg">
-                <span>
-                  {hiddenStoppedCount} recently stopped instance
-                  {hiddenStoppedCount === 1 ? "" : "s"} hidden
-                </span>
-                <button
-                  type="button"
-                  onClick={() => setShowStopped(true)}
-                  className="text-primary no-underline hover:underline"
-                >
-                  Show all
-                </button>
-              </div>
-            )}
-            </>
-          ) : runtimeQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
-          ) : runtimeQuery.isError ? (
-            <p className="py-4 text-sm text-danger">Failed to load runtime snapshots.</p>
-          ) : runtime && allInstances.length > 0 && lifecycle === "live" ? (
-            <div className="flex flex-col items-start gap-2 py-4 text-sm text-muted-fg">
-              <p>
-                No live instances. {staleInstances.length} stopped instance
-                {staleInstances.length === 1 ? " is" : "s are"} hidden.
-              </p>
+            </TableBody>
+          </Table>
+          {hiddenStoppedCount > 0 && (
+            <div className="mt-3 flex items-center justify-between rounded-md border border-dashed bg-secondary/30 px-4 py-2 text-sm text-muted-fg">
+              <span>
+                {hiddenStoppedCount} recently stopped instance
+                {hiddenStoppedCount === 1 ? "" : "s"} hidden
+              </span>
               <button
                 type="button"
-                onClick={() => setLifecycle("all")}
+                onClick={() => setShowStopped(true)}
                 className="text-primary no-underline hover:underline"
               >
                 Show all
               </button>
             </div>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No runtime snapshots yet. Start a worker to populate this view.
-            </p>
           )}
         </CardContent>
       </Card>
@@ -461,8 +447,7 @@ export function RuntimePage() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {queues.length > 0 ? (
-            <>
+          {queues.length > 0 && (
             <div className="space-y-3 sm:hidden">
               {queues.map((queue) => (
                 <div key={queue.queue} className="rounded-lg border p-4">
@@ -515,18 +500,29 @@ export function RuntimePage() {
                 </div>
               ))}
             </div>
-            <Table aria-label="Queue runtime summary" className="hidden sm:table">
-              <TableHeader>
-                <TableColumn isRowHeader>Queue</TableColumn>
-                <TableColumn>Mode</TableColumn>
-                <TableColumn>Capacity</TableColumn>
-                <TableColumn>Rate limit</TableColumn>
-                <TableColumn>In flight</TableColumn>
-                <TableColumn>Nodes</TableColumn>
-                <TableColumn>Notes</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {queues.map((queue) => (
+          )}
+          <Table bleed aria-label="Queue runtime summary" className="hidden sm:table">
+            <TableHeader>
+              <TableColumn isRowHeader>Queue</TableColumn>
+              <TableColumn>Mode</TableColumn>
+              <TableColumn>Capacity</TableColumn>
+              <TableColumn>Rate limit</TableColumn>
+              <TableColumn className="text-right">In flight</TableColumn>
+              <TableColumn>Nodes</TableColumn>
+              <TableColumn>Notes</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  {queueRuntimeQuery.isLoading
+                    ? "Loading queue runtime…"
+                    : queueRuntimeQuery.isError
+                      ? "Failed to load queue runtime snapshots."
+                      : "No queue runtime snapshots yet."}
+                </div>
+              )}
+            >
+              {queues.map((queue) => (
                   <TableRow key={queue.queue} id={queue.queue}>
                     <TableCell className="font-medium">
                       <Link
@@ -556,7 +552,9 @@ export function RuntimePage() {
                       <div>{rateLimitLabel(queue.config)}</div>
                       <div className="text-xs text-muted-fg">{queueConfigDetails(queue.config)}</div>
                     </TableCell>
-                    <TableCell>{queue.total_in_flight}</TableCell>
+                    <TableCell className="text-right tabular-nums">
+                      {queue.total_in_flight}
+                    </TableCell>
                     <TableCell>
                       <div>{queue.healthy_instances}/{queue.live_instances || queue.instance_count} healthy</div>
                       <div className="text-xs text-muted-fg">
@@ -578,18 +576,8 @@ export function RuntimePage() {
                     </TableCell>
                   </TableRow>
                 ))}
-              </TableBody>
-            </Table>
-            </>
-          ) : queueRuntimeQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading queue runtime...</p>
-          ) : queueRuntimeQuery.isError ? (
-            <p className="py-4 text-sm text-danger">Failed to load queue runtime snapshots.</p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No queue runtime snapshots yet.
-            </p>
-          )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

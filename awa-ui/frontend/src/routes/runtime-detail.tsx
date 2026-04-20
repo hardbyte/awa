@@ -220,11 +220,10 @@ export function RuntimeInstancePage() {
           description="Per-queue runtime configuration and current in-flight load for this worker"
         />
         <CardContent>
-          {instance.queues.length > 0 ? (
-            <>
-              <div className="space-y-3 sm:hidden">
-                {instance.queues.map((queue) => (
-                  <div key={queue.queue} className="rounded-lg border p-4">
+          {instance.queues.length > 0 && (
+            <div className="space-y-3 sm:hidden">
+              {instance.queues.map((queue) => (
+                <div key={queue.queue} className="rounded-lg border p-4">
                     <div className="flex items-center justify-between gap-3">
                       <Link
                         to="/jobs"
@@ -258,19 +257,26 @@ export function RuntimeInstancePage() {
                     </div>
                   </div>
                 ))}
-              </div>
+            </div>
+          )}
 
-              <Table aria-label="Runtime queue assignments" className="hidden sm:table">
-                <TableHeader>
-                  <TableColumn isRowHeader>Queue</TableColumn>
-                  <TableColumn>Mode</TableColumn>
-                  <TableColumn>Capacity</TableColumn>
-                  <TableColumn>Rate limit</TableColumn>
-                  <TableColumn>In flight</TableColumn>
-                  <TableColumn>Overflow</TableColumn>
-                </TableHeader>
-                <TableBody>
-                  {instance.queues.map((queue) => (
+          <Table bleed aria-label="Runtime queue assignments" className="hidden sm:table">
+            <TableHeader>
+              <TableColumn isRowHeader>Queue</TableColumn>
+              <TableColumn>Mode</TableColumn>
+              <TableColumn>Capacity</TableColumn>
+              <TableColumn>Rate limit</TableColumn>
+              <TableColumn className="text-right">In flight</TableColumn>
+              <TableColumn className="text-right">Overflow</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  No queue snapshots recorded for this worker instance.
+                </div>
+              )}
+            >
+              {instance.queues.map((queue) => (
                     <TableRow key={queue.queue} id={queue.queue}>
                       <TableCell className="font-medium">
                         <Link
@@ -302,18 +308,16 @@ export function RuntimeInstancePage() {
                           {queueConfigDetails(queue.config)}
                         </div>
                       </TableCell>
-                      <TableCell>{queue.in_flight}</TableCell>
-                      <TableCell>{queue.overflow_held ?? "—"}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {queue.in_flight}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {queue.overflow_held ?? "—"}
+                      </TableCell>
                     </TableRow>
                   ))}
-                </TableBody>
-              </Table>
-            </>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No queue snapshots recorded for this worker instance.
-            </p>
-          )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

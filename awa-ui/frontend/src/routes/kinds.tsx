@@ -115,18 +115,23 @@ export function KindsPage() {
         </div>
       )}
 
-      {kinds.length > 0 ? (
-        <Table aria-label="Job kinds" className="hidden sm:table">
-          <TableHeader>
-            <TableColumn isRowHeader>Kind</TableColumn>
-            <TableColumn>Jobs</TableColumn>
-            <TableColumn>Queues</TableColumn>
-            <TableColumn>Completed/hr</TableColumn>
-            <TableColumn>Owner</TableColumn>
-            <TableColumn>Status</TableColumn>
-          </TableHeader>
-          <TableBody>
-            {kinds.map((kind) => (
+      <Table aria-label="Job kinds" className="hidden sm:table">
+        <TableHeader>
+          <TableColumn isRowHeader>Kind</TableColumn>
+          <TableColumn className="text-right">Jobs</TableColumn>
+          <TableColumn className="text-right">Queues</TableColumn>
+          <TableColumn className="text-right">Completed/hr</TableColumn>
+          <TableColumn>Owner</TableColumn>
+          <TableColumn>Status</TableColumn>
+        </TableHeader>
+        <TableBody
+          renderEmptyState={() => (
+            <div className="p-6 text-center text-sm text-muted-fg">
+              {kindsQuery.isLoading ? "Loading job kinds…" : "No job kinds found."}
+            </div>
+          )}
+        >
+          {kinds.map((kind) => (
               <TableRow key={kind.kind} id={kind.kind}>
                 <TableCell className="font-medium">
                   <div>
@@ -152,9 +157,15 @@ export function KindsPage() {
                     )}
                   </div>
                 </TableCell>
-                <TableCell>{kind.job_count.toLocaleString()}</TableCell>
-                <TableCell>{kind.queue_count.toLocaleString()}</TableCell>
-                <TableCell>{kind.completed_last_hour.toLocaleString()}</TableCell>
+                <TableCell className="text-right tabular-nums">
+                  {kind.job_count.toLocaleString()}
+                </TableCell>
+                <TableCell className="text-right tabular-nums">
+                  {kind.queue_count.toLocaleString()}
+                </TableCell>
+                <TableCell className="text-right tabular-nums">
+                  {kind.completed_last_hour.toLocaleString()}
+                </TableCell>
                 <TableCell>{kind.owner ?? "—"}</TableCell>
                 <TableCell>
                   <div className="flex flex-wrap gap-1">
@@ -172,13 +183,8 @@ export function KindsPage() {
                 </TableCell>
               </TableRow>
             ))}
-          </TableBody>
-        </Table>
-      ) : kindsQuery.isLoading ? (
-        <p className="text-sm text-muted-fg">Loading...</p>
-      ) : (
-        <p className="text-sm text-muted-fg">No job kinds found.</p>
-      )}
+        </TableBody>
+      </Table>
     </div>
   );
 }

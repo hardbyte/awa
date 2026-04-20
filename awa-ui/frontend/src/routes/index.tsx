@@ -301,18 +301,27 @@ export function DashboardPage() {
           )}
 
           {/* Desktop runtime table */}
-          {runtimeQuery.data && runtimeQuery.data.instances.length > 0 ? (
-            <Table aria-label="Runtime instances" className="hidden sm:table">
-              <TableHeader>
-                <TableColumn isRowHeader>Instance</TableColumn>
-                <TableColumn>Health</TableColumn>
-                <TableColumn>Loops</TableColumn>
-                <TableColumn>Role</TableColumn>
-                <TableColumn>Queues</TableColumn>
-                <TableColumn>Seen</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {runtimeQuery.data.instances.map((instance) => {
+          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+            <TableHeader>
+              <TableColumn isRowHeader>Instance</TableColumn>
+              <TableColumn>Health</TableColumn>
+              <TableColumn>Loops</TableColumn>
+              <TableColumn>Role</TableColumn>
+              <TableColumn className="text-right">Queues</TableColumn>
+              <TableColumn>Seen</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  {runtimeQuery.isLoading
+                    ? "Loading runtime…"
+                    : runtimeQuery.isError
+                      ? "Failed to load runtime data."
+                      : "No runtime snapshots yet. Start a worker to populate this view."}
+                </div>
+              )}
+            >
+              {(runtimeQuery.data?.instances ?? []).map((instance) => {
                   const label = instance.hostname ?? `pid ${instance.pid}`;
                   const healthLabel = instance.stale
                     ? "Stale"
@@ -355,24 +364,15 @@ export function DashboardPage() {
                           <span className="text-sm text-muted-fg">Worker</span>
                         )}
                       </TableCell>
-                      <TableCell>{instance.queues.length}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {instance.queues.length}
+                      </TableCell>
                       <TableCell>{timeAgo(instance.last_seen_at)}</TableCell>
                     </TableRow>
                   );
                 })}
-              </TableBody>
-            </Table>
-          ) : runtimeQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
-          ) : runtimeQuery.isError ? (
-            <p className="py-4 text-sm text-danger">
-              Failed to load runtime data.
-            </p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No runtime snapshots yet. Start a worker to populate this view.
-            </p>
-          )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
 
@@ -387,24 +387,28 @@ export function DashboardPage() {
           }
         />
         <CardContent>
-          {topQueues.length > 0 ? (
-            <>
-              <Table aria-label="Queue summary">
-                <TableHeader>
-                  <TableColumn isRowHeader>Queue</TableColumn>
-                  <TableColumn>Total queued</TableColumn>
-                  <TableColumn>Scheduled</TableColumn>
-                  <TableColumn>Available</TableColumn>
-                  <TableColumn>Retryable</TableColumn>
-                  <TableColumn>Running</TableColumn>
-                  <TableColumn>Failed</TableColumn>
-                  <TableColumn>Waiting</TableColumn>
-                  <TableColumn>Completed/hr</TableColumn>
-                  <TableColumn>Lag (s)</TableColumn>
-                  <TableColumn>Status</TableColumn>
-                </TableHeader>
-                <TableBody>
-                  {topQueues.map((q) => (
+          <Table bleed aria-label="Queue summary">
+            <TableHeader>
+              <TableColumn isRowHeader>Queue</TableColumn>
+              <TableColumn className="text-right">Total queued</TableColumn>
+              <TableColumn className="text-right">Scheduled</TableColumn>
+              <TableColumn className="text-right">Available</TableColumn>
+              <TableColumn className="text-right">Retryable</TableColumn>
+              <TableColumn className="text-right">Running</TableColumn>
+              <TableColumn className="text-right">Failed</TableColumn>
+              <TableColumn className="text-right">Waiting</TableColumn>
+              <TableColumn className="text-right">Completed/hr</TableColumn>
+              <TableColumn className="text-right">Lag (s)</TableColumn>
+              <TableColumn>Status</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  {queuesQuery.isLoading ? "Loading queues…" : "No queues found."}
+                </div>
+              )}
+            >
+              {topQueues.map((q) => (
                     <TableRow
                       key={q.queue}
                       id={q.queue}
@@ -432,23 +436,35 @@ export function DashboardPage() {
                           )}
                         </div>
                       </TableCell>
-                      <TableCell>{q.total_queued.toLocaleString()}</TableCell>
-                      <TableCell>{q.scheduled.toLocaleString()}</TableCell>
-                      <TableCell>{q.available.toLocaleString()}</TableCell>
-                      <TableCell>{q.retryable.toLocaleString()}</TableCell>
-                      <TableCell>{q.running.toLocaleString()}</TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.total_queued.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.scheduled.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.available.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.retryable.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.running.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
                         <span className={q.failed > 0 ? "text-danger" : ""}>
                           {q.failed.toLocaleString()}
                         </span>
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
                         {q.waiting_external > 0
                           ? q.waiting_external.toLocaleString()
                           : "-"}
                       </TableCell>
-                      <TableCell>{q.completed_last_hour}</TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.completed_last_hour.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
                         <LagValue seconds={q.lag_seconds} />
                       </TableCell>
                       <TableCell>
@@ -460,23 +476,17 @@ export function DashboardPage() {
                       </TableCell>
                     </TableRow>
                   ))}
-                </TableBody>
-              </Table>
-              {hasMoreQueues && (
-                <div className="px-4 py-3">
-                  <Link
-                    to="/queues"
-                    className="text-sm text-primary no-underline hover:underline"
-                  >
-                    View all {queuesQuery.data?.length} queues &rarr;
-                  </Link>
-                </div>
-              )}
-            </>
-          ) : queuesQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading queues...</p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">No queues found.</p>
+            </TableBody>
+          </Table>
+          {hasMoreQueues && topQueues.length > 0 && (
+            <div className="px-4 py-3">
+              <Link
+                to="/queues"
+                className="text-sm text-primary no-underline hover:underline"
+              >
+                View all {queuesQuery.data?.length} queues &rarr;
+              </Link>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -485,18 +495,23 @@ export function DashboardPage() {
       <Card>
         <CardHeader title="Recent Failures" />
         <CardContent>
-          {failedQuery.data && failedQuery.data.length > 0 ? (
-            <Table aria-label="Recent failures">
-              <TableHeader>
-                <TableColumn isRowHeader>ID</TableColumn>
-                <TableColumn>Kind</TableColumn>
-                <TableColumn>Queue</TableColumn>
-                <TableColumn>Attempt</TableColumn>
-                <TableColumn>Failed</TableColumn>
-                <TableColumn>Error</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {failedQuery.data.map((job) => {
+          <Table bleed aria-label="Recent failures">
+            <TableHeader>
+              <TableColumn isRowHeader>ID</TableColumn>
+              <TableColumn>Kind</TableColumn>
+              <TableColumn>Queue</TableColumn>
+              <TableColumn className="text-right">Attempt</TableColumn>
+              <TableColumn>Failed</TableColumn>
+              <TableColumn>Error</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  {failedQuery.isLoading ? "Loading failures…" : "No recent failures."}
+                </div>
+              )}
+            >
+              {(failedQuery.data ?? []).map((job) => {
                   const lastErr =
                     job.errors && job.errors.length > 0
                       ? job.errors[job.errors.length - 1]
@@ -526,7 +541,7 @@ export function DashboardPage() {
                       </TableCell>
                       <TableCell>{job.kind}</TableCell>
                       <TableCell>{job.queue}</TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
                         {job.attempt}/{job.max_attempts}
                       </TableCell>
                       <TableCell>
@@ -540,15 +555,8 @@ export function DashboardPage() {
                     </TableRow>
                   );
                 })}
-              </TableBody>
-            </Table>
-          ) : failedQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading...</p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No recent failures.
-            </p>
-          )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>
