@@ -65,6 +65,19 @@ awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
 awa --database-url "$DATABASE_URL" storage abort
 ```
 
+Equivalent SQL for extracted-migration or direct-operator workflows:
+
+```sql
+SELECT * FROM awa.storage_status();
+
+SELECT * FROM awa.storage_prepare(
+    'queue_storage',
+    '{}'::jsonb
+);
+
+SELECT * FROM awa.storage_abort();
+```
+
 Reserved for `0.6`, but intentionally claimed now as SQL identities:
 
 - `awa.storage_enter_mixed_transition()`
