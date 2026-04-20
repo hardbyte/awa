@@ -114,12 +114,15 @@ export function QueuesPage() {
     return q.display_name?.trim() ? q.display_name : q.queue;
   }
 
-  function descriptorSyncLabel(q: QueueStats): string {
+  // Only surfaces a line when the descriptor needs attention — drift, stale,
+  // or not declared. A fresh descriptor is implied by the row's presence.
+  function descriptorSyncLabel(q: QueueStats): string | null {
     if (q.descriptor_mismatch) return "Descriptor drift across live runtimes";
     if (!q.descriptor_last_seen_at) return "Descriptor not declared";
-    return q.descriptor_stale
-      ? `Descriptor stale · seen ${timeAgo(q.descriptor_last_seen_at)}`
-      : `Descriptor seen ${timeAgo(q.descriptor_last_seen_at)}`;
+    if (q.descriptor_stale) {
+      return `Descriptor stale · seen ${timeAgo(q.descriptor_last_seen_at)}`;
+    }
+    return null;
   }
 
   return (
@@ -145,9 +148,11 @@ export function QueuesPage() {
                   {q.display_name?.trim() && (
                     <div className="text-xs text-muted-fg">{q.queue}</div>
                   )}
-                  <div className="mt-1 text-xs text-muted-fg">
-                    {descriptorSyncLabel(q)}
-                  </div>
+                  {descriptorSyncLabel(q) && (
+                    <div className="mt-1 text-xs text-muted-fg">
+                      {descriptorSyncLabel(q)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {q.paused ? (

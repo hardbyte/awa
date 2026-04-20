@@ -22,12 +22,15 @@ function kindLabel(kind: JobKindOverview): string {
   return kind.display_name?.trim() ? kind.display_name : kind.kind;
 }
 
-function descriptorSyncLabel(kind: JobKindOverview): string {
+// Only surfaces a line when the descriptor needs attention — drift, stale,
+// or not declared. A fresh descriptor is implied by the row's presence.
+function descriptorSyncLabel(kind: JobKindOverview): string | null {
   if (kind.descriptor_mismatch) return "Descriptor drift across live runtimes";
   if (!kind.descriptor_last_seen_at) return "Descriptor not declared";
-  return kind.descriptor_stale
-    ? `Descriptor stale · seen ${timeAgo(kind.descriptor_last_seen_at)}`
-    : `Descriptor seen ${timeAgo(kind.descriptor_last_seen_at)}`;
+  if (kind.descriptor_stale) {
+    return `Descriptor stale · seen ${timeAgo(kind.descriptor_last_seen_at)}`;
+  }
+  return null;
 }
 
 export function KindsPage() {
@@ -61,9 +64,11 @@ export function KindsPage() {
                   {kind.display_name && (
                     <div className="text-xs text-muted-fg">{kind.kind}</div>
                   )}
-                  <div className="mt-1 text-xs text-muted-fg">
-                    {descriptorSyncLabel(kind)}
-                  </div>
+                  {descriptorSyncLabel(kind) && (
+                    <div className="mt-1 text-xs text-muted-fg">
+                      {descriptorSyncLabel(kind)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {!kind.descriptor_last_seen_at ? (
@@ -140,9 +145,11 @@ export function KindsPage() {
                         {kind.description}
                       </div>
                     )}
-                    <div className="mt-1 text-xs font-normal text-muted-fg">
-                      {descriptorSyncLabel(kind)}
-                    </div>
+                    {descriptorSyncLabel(kind) && (
+                      <div className="mt-1 text-xs font-normal text-muted-fg">
+                        {descriptorSyncLabel(kind)}
+                      </div>
+                    )}
                   </div>
                 </TableCell>
                 <TableCell>{kind.job_count.toLocaleString()}</TableCell>
