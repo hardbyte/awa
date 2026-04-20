@@ -24,7 +24,8 @@ BEGIN
 
     RETURN schema_name;
 END;
-$$ LANGUAGE plpgsql STABLE;
+$$ LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, awa, public;
 
 CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_kind TEXT,
@@ -269,20 +270,20 @@ BEGIN
     IF v_state = 'available'::awa.job_state THEN
         INSERT INTO queue_lanes (queue, priority)
         VALUES (v_queue, v_priority)
-        ON CONFLICT (queue, priority) DO NOTHING;
+        ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
 
-        UPDATE queue_lanes
-        SET next_seq = next_seq + 1,
-            available_count = available_count + 1
-        WHERE queue = v_queue
-          AND priority = v_priority
-        RETURNING next_seq - 1
+        UPDATE queue_lanes AS lanes
+        SET next_seq = lanes.next_seq + 1,
+            available_count = lanes.available_count + 1
+        WHERE lanes.queue = v_queue
+          AND lanes.priority = v_priority
+        RETURNING lanes.next_seq - 1
         INTO v_lane_seq;
 
-        SELECT current_slot, generation
+        SELECT ring.current_slot, ring.generation
         INTO v_ready_slot, v_ready_generation
-        FROM queue_ring_state
-        WHERE singleton = TRUE;
+        FROM queue_ring_state AS ring
+        WHERE ring.singleton = TRUE;
 
         INSERT INTO ready_entries (
             ready_slot,
@@ -423,7 +424,8 @@ BEGIN
         NULL::TEXT,
         NULL::JSONB;
 END;
-$$ LANGUAGE plpgsql VOLATILE;
+$$ LANGUAGE plpgsql VOLATILE
+SET search_path = pg_catalog, awa, public;
 
 INSERT INTO awa.schema_version (version, description)
 VALUES (11, 'Queue storage compatibility layer and active backend selection')

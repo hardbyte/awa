@@ -1684,6 +1684,7 @@ impl QueueStorage {
                 payload JSONB
             )
             LANGUAGE plpgsql
+            SET search_path = pg_catalog, awa, public
             AS $func$
             DECLARE
                 lane_priority SMALLINT;

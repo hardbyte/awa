@@ -54,10 +54,19 @@ Because migrations are additive-only, old workers should continue to function du
 ## Storage Transition Preparation
 
 This release introduces a generic storage-transition framework that future
-storage-engine upgrades can build on. The important point for operators is that
-it does **not** change the current execution engine.
+storage-engine upgrades can build on.
 
-New surfaces:
+The prep-release migration on `main` does **not** change the current execution
+engine. On this rebased queue-storage branch, the later compatibility migration
+builds on that foundation and also adds:
+
+- the queue-storage compatibility layer
+- the active-backend selector in `awa.runtime_storage_backends`
+- the segmented DLQ table in the active queue-storage schema (`{schema}.dlq_entries`)
+- `awa.jobs` / `awa.insert_job_compat()` routing that follows the active
+  backend when queue storage is activated
+
+New operator surfaces:
 
 ```bash
 awa --database-url "$DATABASE_URL" storage status

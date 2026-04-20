@@ -16,6 +16,11 @@ Production integrations revealed three recurring patterns the current design doe
 
 3. **Timeout visibility** — when a callback times out, the lifecycle hook system can react (via `Retried` events), but the external system has no way to know the callback expired.
 
+ADR-019 later changed the physical storage of callback timeout and heartbeat
+fields by moving them onto queue-storage execution leases. That storage change
+does not alter the user-facing semantics in this ADR: sequential waits,
+callback heartbeats, and timeout handling remain the contract.
+
 ## Decision
 
 Enhance the single-callback model with two backward-compatible additions:

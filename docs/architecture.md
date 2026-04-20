@@ -415,6 +415,14 @@ attempts are tracked in a sharded registry keyed by `(job_id, run_lease)`
 rather than a single global lock, which preserves the lease model while
 reducing executor/heartbeat contention.
 
+This also defines the crash-safety boundary for completion: a handler result is
+not considered durably applied until the completion batcher deletes the active
+lease and appends the terminal/deferred row in Postgres. If the process dies
+before that flush commits, the lease remains visible to rescue logic and the
+attempt can be retried or reclaimed. If the flush commits first, the terminal
+or deferred append is already durable and the worker can safely forget the
+attempt.
+
 ### External Callbacks and Sequential Waits
 
 External callback support has two related execution patterns:

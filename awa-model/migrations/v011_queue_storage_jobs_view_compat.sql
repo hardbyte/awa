@@ -9,7 +9,8 @@ RETURNS TEXT[] AS $$
             COALESCE(NULLIF(p_payload->'tags', 'null'::jsonb), '[]'::jsonb)
         )
     )
-$$ LANGUAGE sql IMMUTABLE;
+$$ LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog;
 
 CREATE OR REPLACE FUNCTION awa.queue_storage_payload_errors(p_payload JSONB)
 RETURNS JSONB[] AS $$
@@ -28,7 +29,8 @@ RETURNS JSONB[] AS $$
             )
         )
     END
-$$ LANGUAGE sql IMMUTABLE;
+$$ LANGUAGE sql IMMUTABLE
+SET search_path = pg_catalog;
 
 CREATE OR REPLACE FUNCTION awa.jobs_compat()
 RETURNS TABLE (
@@ -351,7 +353,8 @@ BEGIN
         v_schema
     );
 END;
-$$ LANGUAGE plpgsql STABLE;
+$$ LANGUAGE plpgsql STABLE
+SET search_path = pg_catalog, awa, public;
 
 CREATE OR REPLACE VIEW awa.jobs AS
 SELECT
@@ -401,7 +404,8 @@ BEGIN
           AND job_id = p_job_id;
     END IF;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog, awa, public;
 
 CREATE OR REPLACE FUNCTION awa.delete_job_compat(p_id BIGINT)
 RETURNS BOOLEAN AS $$
@@ -553,7 +557,8 @@ BEGIN
 
     RETURN FALSE;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog, awa, public;
 
 CREATE OR REPLACE FUNCTION awa.write_jobs_view() RETURNS trigger AS $$
 DECLARE
@@ -738,7 +743,8 @@ BEGIN
 
     RETURN NEW;
 END;
-$$ LANGUAGE plpgsql;
+$$ LANGUAGE plpgsql
+SET search_path = pg_catalog, awa, public;
 
 DROP TRIGGER IF EXISTS trg_awa_jobs_view_insert ON awa.jobs;
 CREATE TRIGGER trg_awa_jobs_view_insert
