@@ -15,8 +15,9 @@ use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
+use tokio::sync::Semaphore;
 use tracing::field::{Field, Visit};
 use tracing::Subscriber;
 use tracing_subscriber::layer::SubscriberExt;
@@ -39,6 +40,14 @@ async fn pool() -> sqlx::PgPool {
 async fn setup() -> sqlx::PgPool {
     let pool = pool().await;
     migrations::run(&pool).await.expect("Failed to migrate");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear queue storage backend");
+    sqlx::query("DROP SCHEMA IF EXISTS awa_exp CASCADE")
+        .execute(&pool)
+        .await
+        .expect("Failed to drop stale queue storage schema");
     pool
 }
 
@@ -54,6 +63,11 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue meta");
+}
+
+fn test_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
 // -- Job types for testing --
@@ -174,6 +188,10 @@ async fn wait_for_job_state(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_job_execution_emits_tracing_spans() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup().await;
     let queue = "observ_spans_test";
     clean_queue(&pool, queue).await;
@@ -273,6 +291,10 @@ async fn test_job_execution_emits_tracing_spans() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_job_execution_emits_otel_metrics() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup().await;
     let queue = "observ_metrics_test";
     clean_queue(&pool, queue).await;
@@ -465,6 +487,10 @@ async fn test_job_execution_emits_otel_metrics() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn test_failed_job_emits_failure_metrics() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup().await;
     let queue = "observ_fail_metrics_test";
     clean_queue(&pool, queue).await;

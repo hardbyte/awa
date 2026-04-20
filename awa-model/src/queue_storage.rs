@@ -1289,19 +1289,6 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            sqlx::query(
-                r#"
-            INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
-            VALUES ('queue_storage', $1, now())
-            ON CONFLICT (backend)
-            DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
-            "#,
-            )
-            .bind(schema)
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
             sqlx::query(&format!(
                 r#"
             CREATE TABLE IF NOT EXISTS {schema}.leases (
@@ -1920,6 +1907,23 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
+            // Mark queue storage active only after the full schema, partitions,
+            // indexes, and helper functions are in place. Other sessions route
+            // inserts through this registry, so activating early can expose a
+            // partially-installed backend.
+            sqlx::query(
+                r#"
+            INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
+            VALUES ('queue_storage', $1, now())
+            ON CONFLICT (backend)
+            DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
+            "#,
+            )
+            .bind(schema)
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             Ok(())
         }
         .await;
@@ -2082,6 +2086,16 @@ impl QueueStorage {
         sqlx::query_scalar(&query)
             .bind(count as i32)
             .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)
+    }
+
+    async fn current_timestamp_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    ) -> Result<DateTime<Utc>, AwaError> {
+        sqlx::query_scalar("SELECT clock_timestamp()")
+            .fetch_one(tx.as_mut())
             .await
             .map_err(map_sqlx_error)
     }
@@ -5054,16 +5068,16 @@ impl QueueStorage {
 
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted running lease");
+        let now = self.current_timestamp_tx(&mut tx).await?;
 
         let payload =
             Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let deferred = moved.clone().into_deferred_row(
             JobState::Retryable,
-            Utc::now()
-                + TimeDelta::from_std(retry_after).map_err(|err| {
-                    AwaError::Validation(format!("invalid retry_after duration: {err}"))
-                })?,
-            Some(Utc::now()),
+            now + TimeDelta::from_std(retry_after).map_err(|err| {
+                AwaError::Validation(format!("invalid retry_after duration: {err}"))
+            })?,
+            Some(now),
             payload,
         );
         self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
@@ -5121,15 +5135,14 @@ impl QueueStorage {
 
         let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted running lease");
+        let now = self.current_timestamp_tx(&mut tx).await?;
 
         let payload =
             Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
         let mut deferred = moved.clone().into_deferred_row(
             JobState::Scheduled,
-            Utc::now()
-                + TimeDelta::from_std(snooze_for).map_err(|err| {
-                    AwaError::Validation(format!("invalid snooze duration: {err}"))
-                })?,
+            now + TimeDelta::from_std(snooze_for)
+                .map_err(|err| AwaError::Validation(format!("invalid snooze duration: {err}")))?,
             None,
             payload,
         );
