@@ -84,6 +84,9 @@ export function LoopStatus({
           />
           <span className={item.healthy ? "text-muted-fg" : "text-danger-fg"}>
             {item.label}
+            <span className="sr-only">
+              {item.healthy ? " healthy" : " unhealthy"}
+            </span>
           </span>
         </span>
       ))}

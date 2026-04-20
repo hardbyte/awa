@@ -48,7 +48,17 @@ export function KindsPage() {
     <div className="space-y-4">
       <Heading level={2}>Job Kinds</Heading>
 
-      {kinds.length > 0 && (
+      {kinds.length === 0 ? (
+        <div
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+        >
+          {kindsQuery.isLoading
+            ? "Loading job kinds…"
+            : kindsQuery.isError
+              ? "Failed to load job kinds."
+              : "No job kinds found."}
+        </div>
+      ) : (
         <div className="space-y-3 sm:hidden">
           {kinds.map((kind) => (
             <div key={kind.kind} className="rounded-lg border p-4">

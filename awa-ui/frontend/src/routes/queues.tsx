@@ -131,7 +131,17 @@ export function QueuesPage() {
       <Heading level={2}>Queues</Heading>
 
       {/* Mobile card layout */}
-      {queues.length > 0 && (
+      {queues.length === 0 ? (
+        <div
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+        >
+          {queuesQuery.isLoading
+            ? "Loading queues…"
+            : queuesQuery.isError
+              ? "Failed to load queues."
+              : "No queues found."}
+        </div>
+      ) : (
         <div className="space-y-3 sm:hidden">
           {queues.map((q) => {
             const runtime = runtimeByQueue.get(q.queue);

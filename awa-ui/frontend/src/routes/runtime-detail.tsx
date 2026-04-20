@@ -220,7 +220,11 @@ export function RuntimeInstancePage() {
           description="Per-queue runtime configuration and current in-flight load for this worker"
         />
         <CardContent>
-          {instance.queues.length > 0 && (
+          {instance.queues.length === 0 ? (
+            <div className="rounded-lg border p-6 text-center text-sm text-muted-fg sm:hidden">
+              No queue snapshots recorded for this worker instance.
+            </div>
+          ) : (
             <div className="space-y-3 sm:hidden">
               {instance.queues.map((queue) => (
                 <div key={queue.queue} className="rounded-lg border p-4">

@@ -278,7 +278,19 @@ export function RuntimePage() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {visibleInstances.length > 0 && (
+          {visibleInstances.length === 0 ? (
+            <div
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {runtimeQuery.isLoading
+                ? "Loading instances…"
+                : runtimeQuery.isError
+                  ? "Failed to load runtime snapshots."
+                  : lifecycle === "live" && staleInstances.length > 0
+                    ? `Switch to All to include ${staleInstances.length} recently stopped instance${staleInstances.length === 1 ? "" : "s"}.`
+                    : "No worker instances recorded."}
+            </div>
+          ) : (
             <div className="space-y-3 sm:hidden">
               {visibleInstances.map((instance) => (
                 <button
@@ -469,7 +481,17 @@ export function RuntimePage() {
           </CardAction>
         </CardHeader>
         <CardContent>
-          {queues.length > 0 && (
+          {queues.length === 0 ? (
+            <div
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queueRuntimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {queueRuntimeQuery.isLoading
+                ? "Loading queue runtime…"
+                : queueRuntimeQuery.isError
+                  ? "Failed to load queue runtime snapshots."
+                  : "No queue runtime snapshots yet."}
+            </div>
+          ) : (
             <div className="space-y-3 sm:hidden">
               {queues.map((queue) => (
                 <div key={queue.queue} className="rounded-lg border p-4">

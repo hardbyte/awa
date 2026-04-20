@@ -1,6 +1,9 @@
 import { useEffect } from "react";
 import { Outlet, useRouterState, useNavigate } from "@tanstack/react-router";
-import { RouterProvider as AriaRouterProvider } from "react-aria-components";
+import {
+  Link as AriaLink,
+  RouterProvider as AriaRouterProvider,
+} from "react-aria-components";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { fetchCapabilities, fetchRuntime, type RuntimeOverview } from "@/lib/api";
@@ -354,15 +357,15 @@ export function Shell() {
     >
       <Sidebar collapsible="dock">
         <SidebarHeader>
-          <a
+          <AriaLink
             href="/"
-            className="flex items-center gap-2 px-2 py-1 no-underline"
+            className="flex items-center gap-2 px-2 py-1 no-underline outline-hidden focus-visible:ring-1 focus-visible:ring-primary"
           >
             <KoruLogo className="size-7 shrink-0 text-primary" />
             <span className="text-base font-semibold tracking-tight text-fg group-data-[collapsible=dock]:hidden">
               AWA
             </span>
-          </a>
+          </AriaLink>
         </SidebarHeader>
         <SidebarContent>
           <SidebarSection title="Navigation">

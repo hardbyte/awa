@@ -252,9 +252,19 @@ export function DashboardPage() {
           </div>
 
           {/* Mobile runtime cards */}
-          {runtimeQuery.data && runtimeQuery.data.instances.length > 0 && (
+          {(runtimeQuery.data?.instances.length ?? 0) === 0 ? (
+            <div
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {runtimeQuery.isLoading
+                ? "Loading runtime…"
+                : runtimeQuery.isError
+                  ? "Failed to load runtime data."
+                  : "No runtime snapshots yet. Start a worker to populate this view."}
+            </div>
+          ) : (
             <div className="space-y-2 sm:hidden">
-              {runtimeQuery.data.instances.map((instance) => {
+              {runtimeQuery.data!.instances.map((instance) => {
                 const label = instance.hostname ?? `pid ${instance.pid}`;
                 const healthLabel = instance.stale
                   ? "Stale"
