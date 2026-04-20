@@ -57,7 +57,59 @@ RETURNS TABLE (
 LANGUAGE plpgsql
 SET search_path = pg_catalog, awa, public
 AS $$
+DECLARE
+    v_state TEXT;
+    v_schema TEXT;
+    v_live_queue_storage_count BIGINT;
+    v_queue_storage_rows BIGINT := 0;
 BEGIN
+    SELECT
+        sts.state,
+        COALESCE(NULLIF(sts.details->>'schema', ''), 'awa_exp')
+    INTO v_state, v_schema
+    FROM awa.storage_transition_state AS sts
+    WHERE sts.singleton
+    FOR UPDATE;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'storage transition state row is missing'
+            USING ERRCODE = '55000';
+    END IF;
+
+    IF v_state = 'mixed_transition' THEN
+        SELECT count(*)::bigint
+        INTO v_live_queue_storage_count
+        FROM awa.runtime_instances AS runtime
+        WHERE runtime.storage_capability = 'queue_storage'
+          AND runtime.last_seen_at + make_interval(
+                secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+              ) >= now();
+
+        IF v_live_queue_storage_count > 0 THEN
+            RAISE EXCEPTION 'cannot abort mixed transition while % queue-storage runtime(s) are still live', v_live_queue_storage_count
+                USING ERRCODE = '55000';
+        END IF;
+
+        IF to_regclass(format('%I.%I', v_schema, 'ready_entries')) IS NOT NULL THEN
+            EXECUTE format(
+                'SELECT
+                    (SELECT count(*)::bigint FROM %1$I.ready_entries)
+                  + (SELECT count(*)::bigint FROM %1$I.deferred_jobs)
+                  + (SELECT count(*)::bigint FROM %1$I.leases)
+                  + (SELECT count(*)::bigint FROM %1$I.attempt_state)
+                  + (SELECT count(*)::bigint FROM %1$I.done_entries)
+                  + (SELECT count(*)::bigint FROM %1$I.dlq_entries)',
+                v_schema
+            )
+            INTO v_queue_storage_rows;
+        END IF;
+
+        IF v_queue_storage_rows > 0 THEN
+            RAISE EXCEPTION 'cannot abort mixed transition while queue storage contains % row(s)', v_queue_storage_rows
+                USING ERRCODE = '55000';
+        END IF;
+    END IF;
+
     DELETE FROM awa.runtime_storage_backends
     WHERE backend = 'queue_storage';
 

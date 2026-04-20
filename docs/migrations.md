@@ -232,10 +232,12 @@ must not enter `mixed_transition` until canonical-only workers have stopped
 heartbeating. Finalization must also wait until canonical backlog is empty.
 
 If you need to stop the rollout before final activation, `storage abort` is the
-intended primitive. It returns the singleton row to `canonical` and clears the
-prepared engine metadata. It does **not** make an already-created queue-storage
-backlog runnable by `0.5` workers. If `0.6` has already routed jobs into queue
-storage, keep `0.6` workers available until that backlog is drained.
+intended primitive. In `prepared`, it returns the singleton row to `canonical`
+and clears the prepared engine metadata. In `mixed_transition`, `0.6` now
+enforces a rollback interlock: abort is only allowed while there are **no**
+live queue-storage runtimes and **no** rows in queue-storage tables. Once
+queue-storage has started accepting work, abort is rejected instead of trying
+to paper over a partial rollback.
 
 Current `0.5.x` fail-safe behavior if someone forces the state forward without
 `0.6` support:
@@ -316,9 +318,10 @@ constraint:
 - once the cluster has entered `mixed_transition` and `0.6` has routed jobs to
   queue storage, a pure fleet downgrade back to `0.5` is not supported
 - `0.5` workers do not know how to claim queue-storage work
-- use `storage abort` only as a way to stop advancing the rollout and to return
-  new writes to canonical while `0.6` workers remain available to drain any
-  queue-storage backlog that already exists
+- `storage abort` is only a rollback path from `mixed_transition` before any
+  queue-storage runtime is live and before any queue-storage rows exist
+- once queue-storage has accepted work, keep `0.6` workers available and treat
+  the transition as one-way until finalize or full database restore
 
 ### 2. Database Rollback
 

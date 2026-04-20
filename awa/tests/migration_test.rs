@@ -761,12 +761,13 @@ async fn test_storage_abort_from_canonical_is_noop() {
 }
 
 #[tokio::test]
-async fn test_storage_abort_from_mixed_transition_returns_to_canonical() {
+async fn test_storage_abort_from_empty_mixed_transition_returns_to_canonical() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
 
     sqlx::query(
         r#"
@@ -802,6 +803,112 @@ async fn test_storage_abort_from_mixed_transition_returns_to_canonical() {
     assert_eq!(after.transition_epoch, before.transition_epoch + 1);
     assert!(after.entered_at > before.entered_at);
     assert_eq!(active_queue_storage_schema(&pool).await, None);
+}
+
+#[tokio::test]
+async fn test_storage_abort_from_mixed_transition_rejects_live_queue_storage_runtimes() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'mixed_transition',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            entered_at = now(),
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at) VALUES ('queue_storage', 'awa_queue_storage', now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    insert_runtime_instance(&pool, "queue_storage").await;
+
+    let err = storage::abort(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("queue-storage runtime"),
+        "got {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_storage_abort_from_mixed_transition_rejects_queue_storage_rows() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, "awa_queue_storage").await;
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'mixed_transition',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            entered_at = now(),
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at) VALUES ('queue_storage', 'awa_queue_storage', now())",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let _: awa::JobRow = sqlx::query_as(
+        r#"
+        SELECT *
+        FROM awa.insert_job_compat(
+            'abort_mixed_transition_test',
+            'abort_mixed_transition_queue',
+            '{}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            NULL::timestamptz,
+            '{}'::jsonb,
+            ARRAY[]::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let err = storage::abort(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("queue storage contains"),
+        "got {err}"
+    );
 }
 
 #[tokio::test]
