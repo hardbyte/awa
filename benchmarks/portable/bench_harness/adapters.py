@@ -190,6 +190,15 @@ def build_pgboss(skip: bool) -> None:
     )
 
 
+def build_pgmq(skip: bool) -> None:
+    _docker_build(
+        "pgmq-bench",
+        SCRIPT_DIR / "pgmq-bench" / "Dockerfile",
+        REPO_ROOT,
+        skip,
+    )
+
+
 # ─── Launch specs ────────────────────────────────────────────────────────
 
 
@@ -279,6 +288,10 @@ def launch_pgboss(manifest, overrides):
     return _docker_launch("pgboss-bench", manifest, overrides)
 
 
+def launch_pgmq(manifest, overrides):
+    return _docker_launch("pgmq-bench", manifest, overrides)
+
+
 # ─── Registry ────────────────────────────────────────────────────────────
 
 
@@ -324,6 +337,11 @@ ADAPTERS: dict[str, AdapterEntry] = {
         bench_dir=SCRIPT_DIR / "pgque-bench",
         builder=build_pgque,
         launcher=launch_pgque,
+    ),
+    "pgmq": AdapterEntry(
+        bench_dir=SCRIPT_DIR / "pgmq-bench",
+        builder=build_pgmq,
+        launcher=launch_pgmq,
     ),
     "pgboss": AdapterEntry(
         bench_dir=SCRIPT_DIR / "pgboss-bench",

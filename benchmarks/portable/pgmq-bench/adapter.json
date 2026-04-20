@@ -1,0 +1,13 @@
+{
+  "system": "pgmq",
+  "display_name": "PGMQ (Python)",
+  "db_name": "pgmq_bench",
+  "event_tables": [
+    "pgmq.q_long_horizon_bench",
+    "pgmq.a_long_horizon_bench"
+  ],
+  "event_indexes": [],
+  "extensions": [
+    "pgmq"
+  ]
+}
