@@ -5,7 +5,7 @@
 //! confined to the small hot tables.
 
 use async_trait::async_trait;
-use awa::model::{insert, migrations, QueueStorage, QueueStorageConfig};
+use awa::model::{insert, migrations, storage, QueueStorage, QueueStorageConfig};
 use awa::{Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -84,6 +84,17 @@ async fn ensure_database_exists(url: &str) {
 async fn setup_pool(max_connections: u32) -> sqlx::PgPool {
     let url = database_url();
     ensure_database_exists(&url).await;
+    let reset_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await
+        .expect("Failed to connect to queue_storage soak database");
+    sqlx::raw_sql("DROP SCHEMA IF EXISTS awa CASCADE")
+        .execute(&reset_pool)
+        .await
+        .expect("Failed to drop awa schema for queue_storage soak tests");
+    reset_pool.close().await;
+
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&url)
@@ -128,6 +139,36 @@ async fn create_store(
     store
 }
 
+async fn prepare_transition_store(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue_slot_count: usize,
+    lease_slot_count: usize,
+) -> QueueStorage {
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count,
+        lease_slot_count,
+    })
+    .expect("Failed to create queue_storage transition soak store");
+    recreate_store_schema(pool, &store).await;
+    storage::abort(pool)
+        .await
+        .expect("Failed to reset storage transition state for transition soak");
+    store
+        .prepare_schema(pool)
+        .await
+        .expect("Failed to prepare queue_storage schema for transition soak");
+    store
+        .reset(pool)
+        .await
+        .expect("Failed to reset queue_storage schema for transition soak");
+    storage::prepare(pool, "queue_storage", serde_json::json!({ "schema": schema }))
+        .await
+        .expect("Failed to prepare queue_storage transition");
+    store
+}
+
 fn env_u32(name: &str, default: u32) -> u32 {
     std::env::var(name)
         .ok()
@@ -162,6 +203,23 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
     .fetch_all(pool)
     .await
     .expect("Failed to fetch queue_storage soak queue counts");
+
+    rows.into_iter().collect()
+}
+
+async fn canonical_queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        r#"
+        SELECT state::text, count(*)::bigint
+        FROM awa.jobs_hot
+        WHERE queue = $1
+        GROUP BY state
+        "#,
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .expect("Failed to fetch canonical queue counts");
 
     rows.into_iter().collect()
 }
@@ -205,6 +263,18 @@ async fn dlq_depth(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i6
         .fetch_one(pool)
         .await
         .expect("Failed to count dlq rows")
+}
+
+async fn queue_storage_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'completed'",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count queue_storage done rows")
 }
 
 async fn sample_dead_tuples(
@@ -423,6 +493,50 @@ fn build_client(
         .expect("Failed to build queue_storage soak client")
 }
 
+fn build_transition_client(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    schema: &str,
+    max_workers: u32,
+    queue_slot_count: usize,
+    lease_slot_count: usize,
+    role: awa::worker::TransitionWorkerRole,
+    worker: MixedWorkloadWorker,
+) -> Client {
+    Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::from_millis(200),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count,
+                lease_slot_count,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .transition_role(role)
+        .register_worker(worker)
+        .dlq_enabled_by_default(false)
+        .heartbeat_interval(Duration::from_millis(50))
+        .promote_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(100))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .runtime_snapshot_interval(Duration::from_millis(100))
+        .build()
+        .expect("Failed to build queue_storage transition soak client")
+}
+
 fn insert_params_for_mode(queue: &str, seq: i64, mode: &str) -> awa::InsertParams {
     let max_attempts = match mode {
         "callback_timeout" | "terminal_fail" => 1,
@@ -451,6 +565,45 @@ fn mode_cycle() -> Vec<&'static str> {
     modes.extend(std::iter::repeat_n("terminal_fail", 5));
     modes.extend(std::iter::repeat_n("callback_timeout", 5));
     modes
+}
+
+fn transition_mode_cycle() -> Vec<&'static str> {
+    let mut modes = Vec::new();
+    modes.extend(std::iter::repeat_n("complete", 80));
+    modes.extend(std::iter::repeat_n("retry_once", 20));
+    modes
+}
+
+async fn wait_for_status_report<F>(
+    pool: &sqlx::PgPool,
+    timeout: Duration,
+    predicate: F,
+) -> storage::StorageStatusReport
+where
+    F: Fn(&storage::StorageStatusReport) -> bool,
+{
+    let started = Instant::now();
+    loop {
+        let report = storage::status_report(pool)
+            .await
+            .expect("Failed to fetch storage status report");
+        if predicate(&report) {
+            return report;
+        }
+        assert!(
+            started.elapsed() <= timeout,
+            "Timed out waiting for storage status report condition; last report={report:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn clear_runtime_capability(pool: &sqlx::PgPool, capability: &str) {
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE storage_capability = $1")
+        .bind(capability)
+        .execute(pool)
+        .await
+        .expect("Failed to clear runtime capability rows");
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -685,6 +838,288 @@ async fn test_queue_storage_mixed_workload_soak() {
     assert!(
         exact.total() < env_u64("AWA_QS_SOAK_MAX_EXACT_DEAD_TUPLES", 10_000) as i64,
         "queue_storage mixed soak exact dead tuples unexpectedly high: {}",
+        exact.total()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_queue_storage_transition_soak_finalize_path() {
+    let _guard = QUEUE_STORAGE_SOAK_LOCK.lock().await;
+    let pool = setup_pool(20).await;
+    ensure_pgstattuple(&pool).await;
+
+    let queue = format!("qs_transition_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let schema = format!("awa_qs_transition_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let queue_slot_count = env_usize("AWA_QS_TRANSITION_QUEUE_SLOTS", 16);
+    let lease_slot_count = env_usize("AWA_QS_TRANSITION_LEASE_SLOTS", 4);
+    let max_workers = env_u32("AWA_QS_TRANSITION_MAX_WORKERS", 16);
+    let pre_seconds = env_u64("AWA_QS_TRANSITION_PREPARED_SECS", 5);
+    let post_mixed_seconds = env_u64("AWA_QS_TRANSITION_MIXED_SECS", 5);
+    let post_finalize_seconds = env_u64("AWA_QS_TRANSITION_ACTIVE_SECS", 5);
+    let target_rate = env_u64("AWA_QS_TRANSITION_RATE", 600);
+    let batch_size = env_usize("AWA_QS_TRANSITION_BATCH_SIZE", 100);
+
+    let store = prepare_transition_store(&pool, &schema, queue_slot_count, lease_slot_count).await;
+    let auto_state = Arc::new(MixedWorkloadState::default());
+    let target_state = Arc::new(MixedWorkloadState::default());
+
+    let auto_client = build_transition_client(
+        &pool,
+        &queue,
+        &schema,
+        max_workers,
+        queue_slot_count,
+        lease_slot_count,
+        awa::worker::TransitionWorkerRole::Auto,
+        MixedWorkloadWorker {
+            state: auto_state.clone(),
+        },
+    );
+
+    let target_client = build_transition_client(
+        &pool,
+        &queue,
+        &schema,
+        max_workers,
+        queue_slot_count,
+        lease_slot_count,
+        awa::worker::TransitionWorkerRole::QueueStorageTarget,
+        MixedWorkloadWorker {
+            state: target_state.clone(),
+        },
+    );
+
+    auto_client
+        .start()
+        .await
+        .expect("Failed to start transition auto client");
+    target_client
+        .start()
+        .await
+        .expect("Failed to start transition target client");
+
+    wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+        report.status.state == "prepared"
+            && report.can_enter_mixed_transition
+            && report
+                .live_runtime_capability_counts
+                .get("queue_storage")
+                .copied()
+                .unwrap_or(0)
+                >= 2
+    })
+    .await;
+
+    let pattern = transition_mode_cycle();
+    let started = Instant::now();
+    let prepared_deadline = started + Duration::from_secs(pre_seconds);
+    let mixed_deadline = prepared_deadline + Duration::from_secs(post_mixed_seconds);
+    let active_deadline = mixed_deadline + Duration::from_secs(post_finalize_seconds);
+    let mut transition_entered = false;
+    let mut finalized = false;
+    let mut next_sample = started + Duration::from_secs(1);
+    let mut seq = 0_i64;
+    let mut seeded_total = 0_u64;
+    let mut seeded_canonical = 0_u64;
+    let mut seeded_queue_storage = 0_u64;
+    let mut peak_dead_total = 0_i64;
+    let mut peak_attempt_state = 0_i64;
+    let mut peak_canonical_backlog = 0_i64;
+
+    loop {
+        let now = Instant::now();
+        if now >= active_deadline {
+            break;
+        }
+
+        if !transition_entered && now >= prepared_deadline {
+            storage::enter_mixed_transition(&pool)
+                .await
+                .expect("Failed to enter mixed transition during transition soak");
+            transition_entered = true;
+
+            wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+                report.status.state == "mixed_transition"
+                    && report.status.active_engine == "queue_storage"
+                    && report
+                        .live_runtime_capability_counts
+                        .get("canonical_drain_only")
+                        .copied()
+                        .unwrap_or(0)
+                        >= 1
+            })
+            .await;
+        }
+
+        if transition_entered && !finalized && now >= mixed_deadline {
+            wait_for_status_report(&pool, Duration::from_secs(60), |report| {
+                report.status.state == "mixed_transition" && report.canonical_live_backlog == 0
+            })
+            .await;
+
+            auto_client.shutdown(Duration::from_secs(5)).await;
+            clear_runtime_capability(&pool, "canonical_drain_only").await;
+
+            wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+                report.status.state == "mixed_transition" && report.can_finalize
+            })
+            .await;
+
+            storage::finalize(&pool)
+                .await
+                .expect("Failed to finalize transition soak");
+            finalized = true;
+
+            wait_for_status_report(&pool, Duration::from_secs(10), |report| {
+                report.status.state == "active"
+                    && report.status.current_engine == "queue_storage"
+                    && report.status.active_engine == "queue_storage"
+            })
+            .await;
+        }
+
+        let desired_seeded = (started.elapsed().as_secs_f64() * target_rate as f64).floor() as u64;
+        while seeded_total < desired_seeded {
+            let remaining = (desired_seeded - seeded_total) as usize;
+            let count = remaining.min(batch_size);
+            let params: Vec<_> = (0..count)
+                .map(|offset| {
+                    let mode = pattern[(seq as usize + offset) % pattern.len()];
+                    insert_params_for_mode(&queue, seq + offset as i64, mode)
+                })
+                .collect();
+
+            let inserted = insert::insert_many(&pool, &params)
+                .await
+                .expect("Failed to enqueue transition soak batch via compat routing");
+            seeded_total += inserted.len() as u64;
+            if transition_entered {
+                seeded_queue_storage += inserted.len() as u64;
+            } else {
+                seeded_canonical += inserted.len() as u64;
+            }
+            seq += inserted.len() as i64;
+        }
+
+        if now >= next_sample {
+            let report = storage::status_report(&pool)
+                .await
+                .expect("Failed to fetch transition soak status report");
+            let estimated = estimated_dead_tuples(&pool, &store).await;
+            let attempt_state = attempt_state_count(&pool, &store).await;
+            let queue_storage_done = queue_storage_done_count(&pool, &store, &queue).await;
+            let canonical_counts = canonical_queue_state_counts(&pool, &queue).await;
+
+            peak_dead_total = peak_dead_total.max(estimated.total());
+            peak_attempt_state = peak_attempt_state.max(attempt_state);
+            peak_canonical_backlog = peak_canonical_backlog.max(report.canonical_live_backlog);
+
+            println!(
+                "[queue-storage-transition] second={} seeded_total={} seeded_canonical={} seeded_queue_storage={} state={} canonical_backlog={} canonical_completed={} canonical_retryable={} queue_storage_done={} dead_total={} leases_dead={} attempt_state={}",
+                started.elapsed().as_secs(),
+                seeded_total,
+                seeded_canonical,
+                seeded_queue_storage,
+                report.status.state,
+                report.canonical_live_backlog,
+                count_state(&canonical_counts, "completed"),
+                count_state(&canonical_counts, "retryable"),
+                queue_storage_done,
+                estimated.total(),
+                estimated.leases,
+                attempt_state,
+            );
+
+            next_sample += Duration::from_secs(1);
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    if !finalized {
+        wait_for_status_report(&pool, Duration::from_secs(60), |report| {
+            report.status.state == "mixed_transition" && report.canonical_live_backlog == 0
+        })
+        .await;
+        auto_client.shutdown(Duration::from_secs(5)).await;
+        clear_runtime_capability(&pool, "canonical_drain_only").await;
+        wait_for_status_report(&pool, Duration::from_secs(10), |report| report.can_finalize).await;
+        storage::finalize(&pool)
+            .await
+            .expect("Failed to finalize transition soak during tail cleanup");
+    }
+
+    let drain_timeout = Duration::from_secs(env_u64("AWA_QS_TRANSITION_DRAIN_TIMEOUT_SECS", 180));
+    let drain_started = Instant::now();
+    loop {
+        let report = storage::status_report(&pool)
+            .await
+            .expect("Failed to fetch transition soak report during drain");
+        let canonical_counts = canonical_queue_state_counts(&pool, &queue).await;
+        let queue_storage_done = queue_storage_done_count(&pool, &store, &queue).await;
+        let total_completed = count_state(&canonical_counts, "completed") + queue_storage_done;
+
+        if report.canonical_live_backlog == 0 && total_completed as u64 == seeded_total {
+            break;
+        }
+
+        assert!(
+            drain_started.elapsed() <= drain_timeout,
+            "Timed out draining transition soak queue {}; canonical_backlog={} canonical_counts={canonical_counts:?} queue_storage_done={} seeded_total={}",
+            queue,
+            report.canonical_live_backlog,
+            queue_storage_done,
+            seeded_total
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    target_client.shutdown(Duration::from_secs(5)).await;
+    clear_runtime_capability(&pool, "queue_storage").await;
+
+    let exact = exact_dead_tuples(&pool, &store).await;
+    let final_report = storage::status_report(&pool)
+        .await
+        .expect("Failed to fetch final transition soak report");
+    let final_canonical_counts = canonical_queue_state_counts(&pool, &queue).await;
+    let final_queue_storage_done = queue_storage_done_count(&pool, &store, &queue).await;
+
+    println!(
+        "[queue-storage-transition] summary seeded_total={} seeded_canonical={} seeded_queue_storage={} peak_canonical_backlog={} peak_dead_total={} peak_attempt_state={} final_state={} final_canonical_completed={} final_queue_storage_done={} exact_dead_total={} exact_dead=(queue_lanes={},ready={},done={},leases={},attempt_state={})",
+        seeded_total,
+        seeded_canonical,
+        seeded_queue_storage,
+        peak_canonical_backlog,
+        peak_dead_total,
+        peak_attempt_state,
+        final_report.status.state,
+        count_state(&final_canonical_counts, "completed"),
+        final_queue_storage_done,
+        exact.total(),
+        exact.queue_lanes,
+        exact.ready,
+        exact.done,
+        exact.leases,
+        exact.attempt_state,
+    );
+
+    assert!(transition_entered, "transition soak never entered mixed_transition");
+    assert!(finalized, "transition soak never finalized");
+    assert_eq!(final_report.status.state, "active");
+    assert_eq!(final_report.status.current_engine, "queue_storage");
+    assert_eq!(final_report.status.active_engine, "queue_storage");
+    assert_eq!(final_report.canonical_live_backlog, 0);
+    assert_eq!(
+        count_state(&final_canonical_counts, "completed") as u64,
+        seeded_canonical
+    );
+    assert_eq!(final_queue_storage_done as u64, seeded_queue_storage);
+    assert_eq!(seeded_total, seeded_canonical + seeded_queue_storage);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert!(
+        exact.total() < env_u64("AWA_QS_TRANSITION_MAX_EXACT_DEAD_TUPLES", 10_000) as i64,
+        "queue_storage transition soak exact dead tuples unexpectedly high: {}",
         exact.total()
     );
 }
