@@ -6644,9 +6644,7 @@ impl QueueStorage {
                 if !pruned_terminal_counts.is_empty() {
                     self.adjust_terminal_rollups_batch(
                         &mut tx,
-                        pruned_terminal_counts
-                            .into_iter()
-                            .map(|(queue, priority, count)| (queue, priority, count)),
+                        pruned_terminal_counts.into_iter(),
                     )
                     .await?;
                 }
