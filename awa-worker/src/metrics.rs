@@ -11,6 +11,7 @@
 //! - No unit suffix in metric names (exporters append automatically)
 
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
+use awa_model::storage::StorageStatus;
 use std::time::Duration;
 
 /// Awa worker metrics backed by OpenTelemetry.
@@ -87,6 +88,8 @@ pub struct AwaMetrics {
     pub storage_canonical_live_backlog: Gauge<i64>,
     /// Current live runtime count per reported storage capability.
     pub storage_live_runtime_capability: Gauge<i64>,
+    /// One-hot info gauge for the current storage transition state and engines.
+    pub storage_state: Gauge<i64>,
 }
 
 impl AwaMetrics {
@@ -256,6 +259,11 @@ impl AwaMetrics {
                 .i64_gauge("awa.storage.live_runtime_capability")
                 .with_description("Current live runtime count by reported storage capability")
                 .with_unit("{runtime}")
+                .build(),
+            storage_state: meter
+                .i64_gauge("awa.storage.state")
+                .with_description("Current storage transition state and engine combination (always 1)")
+                .with_unit("{state}")
                 .build(),
         }
     }
@@ -563,6 +571,28 @@ impl AwaMetrics {
             capability.to_string(),
         )];
         self.storage_live_runtime_capability.record(count, &attrs);
+    }
+
+    /// Emit the current storage transition state as a one-hot info gauge.
+    pub fn record_storage_state(&self, status: &StorageStatus) {
+        let mut attrs = vec![
+            opentelemetry::KeyValue::new("awa.storage.state", status.state.clone()),
+            opentelemetry::KeyValue::new(
+                "awa.storage.current_engine",
+                status.current_engine.clone(),
+            ),
+            opentelemetry::KeyValue::new(
+                "awa.storage.active_engine",
+                status.active_engine.clone(),
+            ),
+        ];
+        if let Some(prepared_engine) = &status.prepared_engine {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.storage.prepared_engine",
+                prepared_engine.clone(),
+            ));
+        }
+        self.storage_state.record(1, &attrs);
     }
 }
 

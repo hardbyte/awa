@@ -445,6 +445,123 @@
           "datasource": { "uid": "${DS_PROMETHEUS}" }
         }
       ]
+    },
+    {
+      "collapsed": true,
+      "id": 600,
+      "type": "row",
+      "title": "Storage transition",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "panels": [
+        {
+          "id": 601,
+          "type": "table",
+          "title": "Current storage transition state",
+          "description": "One-hot state/engine gauge exported by queue-storage-capable runtimes. Use this to distinguish steady-state canonical operation from prepared or mixed-transition rollout windows.",
+          "gridPos": { "h": 7, "w": 10, "x": 0, "y": 25 },
+          "fieldConfig": {
+            "defaults": { "custom": { "align": "left" } },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "awa_storage_state" }, "properties": [{ "id": "displayName", "value": "state" }] },
+              { "matcher": { "id": "byName", "options": "awa_storage_current_engine" }, "properties": [{ "id": "displayName", "value": "current engine" }] },
+              { "matcher": { "id": "byName", "options": "awa_storage_active_engine" }, "properties": [{ "id": "displayName", "value": "active engine" }] },
+              { "matcher": { "id": "byName", "options": "awa_storage_prepared_engine" }, "properties": [{ "id": "displayName", "value": "prepared engine" }] },
+              { "matcher": { "id": "byName", "options": "Value" }, "properties": [{ "id": "custom.hidden", "value": true }] }
+            ]
+          },
+          "transformations": [
+            { "id": "labelsToFields", "options": { "mode": "columns" } },
+            { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true }, "indexByName": {} } }
+          ],
+          "targets": [
+            { "expr": "awa_storage_state", "instant": true, "format": "table", "legendFormat": "" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 602,
+          "type": "stat",
+          "title": "Canonical live backlog",
+          "description": "Jobs still live in canonical tables. Must reach zero before finalize is safe.",
+          "gridPos": { "h": 7, "w": 4, "x": 10, "y": 25 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "green", "value": null },
+                { "color": "orange", "value": 1 }
+              ]}
+            }
+          },
+          "targets": [
+            { "expr": "max(awa_storage_canonical_live_backlog)", "legendFormat": "backlog" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 603,
+          "type": "stat",
+          "title": "Enter mixed transition",
+          "description": "1 means the fleet is ready to flip routing into queue storage. 0 means a blocker remains.",
+          "gridPos": { "h": 7, "w": 5, "x": 14, "y": 25 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Blocked" }, "1": { "text": "Ready" } } }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null },
+                { "color": "green", "value": 1 }
+              ]}
+            }
+          },
+          "targets": [
+            { "expr": "max(awa_storage_transition_ready{awa_storage_action=\"enter_mixed_transition\"})", "legendFormat": "enter-mixed-transition" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 604,
+          "type": "stat",
+          "title": "Finalize",
+          "description": "1 means canonical backlog and runtime-capability gates are clear for finalization.",
+          "gridPos": { "h": 7, "w": 5, "x": 19, "y": 25 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Blocked" }, "1": { "text": "Ready" } } }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null },
+                { "color": "green", "value": 1 }
+              ]}
+            }
+          },
+          "targets": [
+            { "expr": "max(awa_storage_transition_ready{awa_storage_action=\"finalize\"})", "legendFormat": "finalize" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 605,
+          "type": "timeseries",
+          "title": "Live runtime capability counts",
+          "description": "How many live runtimes currently report each storage capability. During mixed rollout you should see queue_storage targets before the routing flip, then canonical_drain_only fall to zero before finalize.",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+            }
+          },
+          "targets": [
+            { "expr": "awa_storage_live_runtime_capability", "legendFormat": "{{awa_storage_capability}}" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
@@ -454,6 +571,6 @@
   "timezone": "",
   "title": "Awa Job Queue",
   "uid": "awa-job-queue",
-  "version": 3,
+  "version": 4,
   "refresh": "30s"
 }

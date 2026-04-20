@@ -1528,6 +1528,7 @@ impl RuntimeReporterState {
         if self.queue_storage_capable {
             match transition::status_report(&self.pool).await {
                 Ok(report) => {
+                    self.metrics.record_storage_state(&report.status);
                     self.metrics
                         .record_storage_transition_ready(
                             "enter_mixed_transition",
