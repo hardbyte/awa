@@ -979,7 +979,8 @@ impl Client {
             *guard = effective_storage.clone();
         }
 
-        self.log_transition_startup_status(&effective_storage).await?;
+        self.log_transition_startup_status(&effective_storage)
+            .await?;
 
         admin::sync_queue_descriptors(
             &self.pool,
@@ -1529,11 +1530,10 @@ impl RuntimeReporterState {
             match transition::status_report(&self.pool).await {
                 Ok(report) => {
                     self.metrics.record_storage_state(&report.status);
-                    self.metrics
-                        .record_storage_transition_ready(
-                            "enter_mixed_transition",
-                            report.can_enter_mixed_transition,
-                        );
+                    self.metrics.record_storage_transition_ready(
+                        "enter_mixed_transition",
+                        report.can_enter_mixed_transition,
+                    );
                     self.metrics
                         .record_storage_transition_ready("finalize", report.can_finalize);
                     self.metrics
@@ -1554,10 +1554,8 @@ impl RuntimeReporterState {
                             && capability != "canonical_drain_only"
                             && capability != "queue_storage"
                         {
-                            self.metrics.record_storage_live_runtime_capability(
-                                &capability,
-                                count as i64,
-                            );
+                            self.metrics
+                                .record_storage_live_runtime_capability(&capability, count as i64);
                         }
                     }
                 }
