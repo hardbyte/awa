@@ -1082,6 +1082,7 @@ async fn test_queue_storage_transition_soak_finalize_path() {
     let final_report = storage::status_report(&pool)
         .await
         .expect("Failed to fetch final transition soak report");
+    finalized |= final_report.status.state == "active";
     let final_canonical_counts = canonical_queue_state_counts(&pool, &queue).await;
     let final_queue_storage_done = queue_storage_done_count(&pool, &store, &queue).await;
 

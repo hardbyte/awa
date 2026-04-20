@@ -19,6 +19,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn is_lock_timeout_sqlx(err: &sqlx::Error) -> bool {
+    matches!(
+        err,
+        sqlx::Error::Database(db_err) if db_err.code().as_deref() == Some("55P03")
+    )
+}
+
+fn is_lock_timeout_awa(err: &AwaError) -> bool {
+    matches!(err, AwaError::Database(db_err) if is_lock_timeout_sqlx(db_err))
+}
+
 fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
@@ -186,11 +197,7 @@ async fn recreate_store_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
         .expect("Failed to drop experimental queue storage schema");
 }
 
-async fn sample_dead_tuples(
-    conn: &mut sqlx::pool::PoolConnection<sqlx::Postgres>,
-    schema: &str,
-    relname_filter: &str,
-) -> i64 {
+async fn sample_dead_tuples(pool: &sqlx::PgPool, schema: &str, relname_filter: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(
         r#"
         SELECT COALESCE(sum(n_dead_tup), 0)::bigint
@@ -201,7 +208,7 @@ async fn sample_dead_tuples(
     )
     .bind(schema)
     .bind(relname_filter)
-    .fetch_one(conn.as_mut())
+    .fetch_one(pool)
     .await
     .expect("Failed to sample dead tuples")
 }
@@ -253,16 +260,11 @@ async fn sample_snapshot(
     store: &QueueStorage,
     queue: &str,
 ) -> QueueStorageSnapshot {
-    let mut conn = pool
-        .acquire()
-        .await
-        .expect("Failed to acquire benchmark snapshot connection");
-
     let _ = sqlx::query("SELECT pg_stat_force_next_flush()")
-        .execute(conn.as_mut())
+        .execute(pool)
         .await;
     let _ = sqlx::query("SELECT pg_stat_clear_snapshot()")
-        .execute(conn.as_mut())
+        .execute(pool)
         .await;
 
     let counts = store
@@ -270,12 +272,11 @@ async fn sample_snapshot(
         .await
         .expect("Failed to sample queue counts");
 
-    let queue_lanes_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "queue_lanes").await;
-    let ready_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "ready_entries_%").await;
-    let done_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "done_entries_%").await;
-    let leases_dead_tup = sample_dead_tuples(&mut conn, store.schema(), "leases_%").await;
-    let attempt_state_dead_tup =
-        sample_dead_tuples(&mut conn, store.schema(), "attempt_state").await;
+    let queue_lanes_dead_tup = sample_dead_tuples(pool, store.schema(), "queue_lanes").await;
+    let ready_dead_tup = sample_dead_tuples(pool, store.schema(), "ready_entries_%").await;
+    let done_dead_tup = sample_dead_tuples(pool, store.schema(), "done_entries_%").await;
+    let leases_dead_tup = sample_dead_tuples(pool, store.schema(), "leases_%").await;
+    let attempt_state_dead_tup = sample_dead_tuples(pool, store.schema(), "attempt_state").await;
 
     QueueStorageSnapshot {
         available: counts.available,
@@ -429,19 +430,23 @@ async fn maintenance_loop(
                     }
                 }
 
-                match store.prune_oldest(&pool).await.expect("Vacuum-aware prune failed") {
-                    PruneOutcome::Noop => {}
-                    PruneOutcome::Pruned { .. } => {
+                match store.prune_oldest(&pool).await {
+                    Ok(PruneOutcome::Noop) => {}
+                    Ok(PruneOutcome::Pruned { .. }) => {
                         counters.queue_prune_ok.fetch_add(1, Ordering::Relaxed);
                     }
-                    PruneOutcome::Blocked { .. } => {
+                    Ok(PruneOutcome::Blocked { .. }) => {
                         counters.queue_prune_blocked.fetch_add(1, Ordering::Relaxed);
                     }
-                    PruneOutcome::SkippedActive { .. } => {
+                    Ok(PruneOutcome::SkippedActive { .. }) => {
                         counters
                             .queue_prune_skipped_active
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    Err(err) if is_lock_timeout_awa(&err) => {
+                        counters.queue_prune_blocked.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => panic!("Vacuum-aware prune failed: {err:?}"),
                 }
             }
             _ = lease_rotate_timer.tick() => {
@@ -456,25 +461,27 @@ async fn maintenance_loop(
                     }
                 }
 
-                match store
-                    .prune_oldest_leases(&pool)
-                    .await
-                    .expect("Vacuum-aware lease prune failed")
-                {
-                    PruneOutcome::Noop => {}
-                    PruneOutcome::Pruned { .. } => {
+                match store.prune_oldest_leases(&pool).await {
+                    Ok(PruneOutcome::Noop) => {}
+                    Ok(PruneOutcome::Pruned { .. }) => {
                         counters.lease_prune_ok.fetch_add(1, Ordering::Relaxed);
                     }
-                    PruneOutcome::Blocked { .. } => {
+                    Ok(PruneOutcome::Blocked { .. }) => {
                         counters
                             .lease_prune_blocked
                             .fetch_add(1, Ordering::Relaxed);
                     }
-                    PruneOutcome::SkippedActive { .. } => {
+                    Ok(PruneOutcome::SkippedActive { .. }) => {
                         counters
                             .lease_prune_skipped_active
                             .fetch_add(1, Ordering::Relaxed);
                     }
+                    Err(err) if is_lock_timeout_awa(&err) => {
+                        counters
+                            .lease_prune_blocked
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(err) => panic!("Vacuum-aware lease prune failed: {err:?}"),
                 }
             }
             _ = async {
@@ -533,7 +540,7 @@ async fn overlap_reader(
             }
             _ => {
                 let query = format!(
-                    "SELECT COALESCE(sum(available_count + running_count + completed_count), 0)::bigint FROM {schema}.queue_lanes WHERE queue = $1"
+                    "SELECT COALESCE(sum(available_count + pruned_completed_count), 0)::bigint FROM {schema}.queue_lanes WHERE queue = $1"
                 );
                 let _: i64 = sqlx::query_scalar(&query)
                     .bind(&queue)
