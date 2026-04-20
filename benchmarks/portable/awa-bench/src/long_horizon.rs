@@ -205,10 +205,7 @@ fn queue_storage_event_tables(schema: &str, queue_slot_count: usize, lease_slot_
         format!("{schema}.lease_ring_state"),
         format!("{schema}.lease_ring_slots"),
         format!("{schema}.queue_lanes"),
-        format!("{schema}.leases"),
         format!("{schema}.attempt_state"),
-        format!("{schema}.ready_entries"),
-        format!("{schema}.done_entries"),
         format!("{schema}.deferred_jobs"),
         format!("{schema}.dlq_entries"),
     ];
@@ -253,7 +250,8 @@ pub async fn run() {
     let sample_every_s = env_u64("SAMPLE_EVERY_S", 10);
     let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 10).max(1);
     let producer_batch_max = env_u64("PRODUCER_BATCH_MAX", 128).max(1) as usize;
-    let max_connections = env_u32("MAX_CONNECTIONS", 40);
+    let default_max_connections = (worker_count.saturating_mul(2)).saturating_add(16).max(40);
+    let max_connections = env_u32("MAX_CONNECTIONS", default_max_connections);
     let db_name = database_url
         .rsplit('/')
         .next()
@@ -306,6 +304,10 @@ pub async fn run() {
             super::queue_rotate_interval(),
             super::lease_rotate_interval(),
         )
+        // The portable bench is measuring queue behavior, not the cost of
+        // refreshing runtime/admin snapshots every few seconds.
+        .queue_stats_interval(Duration::from_secs(300))
+        .runtime_snapshot_interval(Duration::from_secs(300))
         .transition_role(TransitionWorkerRole::QueueStorageTarget)
         .register_worker(worker)
         .build()

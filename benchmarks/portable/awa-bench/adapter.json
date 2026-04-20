@@ -9,10 +9,7 @@
     "awa_exp.lease_ring_state",
     "awa_exp.lease_ring_slots",
     "awa_exp.queue_lanes",
-    "awa_exp.leases",
     "awa_exp.attempt_state",
-    "awa_exp.ready_entries",
-    "awa_exp.done_entries",
     "awa_exp.deferred_jobs",
     "awa_exp.dlq_entries"
   ],
