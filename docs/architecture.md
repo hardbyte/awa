@@ -2,13 +2,44 @@
 
 ## System Overview
 
-Awa (Maori: river) is a Postgres-native background job queue providing durable, transactional job processing for Rust and Python. Postgres is the sole infrastructure dependency -- there is no Redis, RabbitMQ, or other broker. All queue state lives in Postgres, and all coordination uses Postgres primitives: `FOR UPDATE SKIP LOCKED` for dispatch, advisory locks for leader election, `LISTEN/NOTIFY` for wakeup, and transactions for atomic enqueue.
+Awa (Māori: river) is a Postgres-native background job queue providing durable, transactional job processing for Rust and Python. Postgres is the sole infrastructure dependency -- there is no Redis, RabbitMQ, or other broker. All queue state lives in Postgres, and all coordination uses Postgres primitives: `FOR UPDATE SKIP LOCKED` for dispatch, advisory locks for leader election, `LISTEN/NOTIFY` for wakeup, and transactions for atomic enqueue.
 
 The Rust runtime owns all queue machinery -- polling, heartbeating, crash recovery, and dispatch. Python workers are callbacks invoked by this runtime via PyO3, inheriting Rust-grade reliability without reimplementing queue internals.
 
 ## Storage Engine
 
-Queue storage is Awa's worker engine.
+Queue storage is Awa's worker engine. It is organised into three planes — queue
+data, execution state, and control metadata — with append-only tables on the
+queue plane and rotating segments for lease churn.
+
+```text
+              Producers (Rust, Python)
+                       │
+                       ▼
+ ┌─────────────────────────────────────────────────────────┐
+ │                    Queue plane (append-only)            │
+ │   ready_entries ──claim──► active_leases ──complete──►  │
+ │                               │                         │
+ │                               ├──retry──► deferred_jobs │
+ │                               │              │          │
+ │                               │              └─promote──┤
+ │                               ├──fail────► dlq_entries  │
+ │                               └──complete─► terminal_entries
+ └─────────────────────────┬───────────────────────────────┘
+                           │
+           ┌───────────────┼───────────────┐
+           ▼               ▼               ▼
+     Execution plane   Control plane   Maintenance leader
+     active_leases     lane_state      promote / rescue /
+     attempt_state     *_segments      rotate / prune /
+     (optional)        *_cursor        dlq retention
+```
+
+Each queue-plane family (`ready_entries`, `deferred_jobs`, `terminal_entries`,
+`dlq_entries`) rotates through segmented partitions so long-lived history does
+not sit in one mutable heap. `active_leases` is its own rotating family with a
+fast reclaim cycle. `attempt_state` is created lazily and only for jobs that
+need mutable per-attempt data (progress, callback state).
 
 ADR-019 is the source of truth for storage internals:
 
@@ -53,7 +84,22 @@ Declared-but-empty queues and kinds still appear in the admin surfaces because t
 
 ### Catalog retention
 
-The maintenance leader also garbage-collects the catalog: descriptor rows whose `last_seen_at` is older than the configured `descriptor_retention` (default 30 days) are deleted on the normal cleanup cycle. This keeps long-running fleets from accumulating descriptors for retired queues and kinds — a worker rollout that stops declaring `legacy_thing` drops that row within 30 days instead of showing it as permanently stale forever. The retention is tunable via `ClientBuilder::descriptor_retention` (Rust) or `AsyncClient.start(..., descriptor_retention_days=...)` (Python); passing `Duration::ZERO` / `0` disables cleanup for operators who manage the catalog externally. Runtime liveness rows in `awa.runtime_instances` are unrelated and already garbage-collected at a shorter 24h horizon — a stale k8s pod name can only contribute to drift detection for ~30s after the pod dies, and drops out of the table entirely within a day.
+The maintenance leader garbage-collects the catalog on the normal cleanup
+cycle: descriptor rows whose `last_seen_at` is older than the configured
+`descriptor_retention` (default 30 days) are deleted. This keeps long-running
+fleets from accumulating descriptors for retired queues and kinds — a worker
+rollout that stops declaring `legacy_thing` drops that row within 30 days
+instead of showing it as permanently stale forever.
+
+Retention is tunable via `ClientBuilder::descriptor_retention` (Rust) or
+`AsyncClient.start(..., descriptor_retention_days=...)` (Python); passing
+`Duration::ZERO` / `0` disables cleanup for operators who manage the catalog
+externally.
+
+Runtime liveness rows in `awa.runtime_instances` are unrelated and already
+garbage-collected at a shorter 24h horizon. A stale k8s pod name can only
+contribute to drift detection for ~30s after the pod dies, and drops out of
+the table entirely within a day.
 
 ### Performance profile
 
@@ -119,7 +165,12 @@ INSERT ──► scheduled ──► available ──► running ──► compl
 | `cancelled` | Cancelled by handler or admin (terminal) |
 | `waiting_external` | Parked for external callback completion or sequential resume |
 
-Terminal states (`completed`, `failed`, `cancelled`) have no further transitions. The maintenance service eventually deletes them based on configurable retention periods (default: 24h for completed, 72h for failed/cancelled).
+Terminal states (`completed`, `failed`, `cancelled`) do not transition within
+the normal dispatch lifecycle. The maintenance service eventually deletes them
+based on configurable retention periods (default: 24h for completed, 72h for
+failed/cancelled). Admin tooling can additionally move `failed` rows to the
+DLQ (via `MoveFailedToDlq`) and retry DLQ rows back into `ready_entries` with
+`attempt = 0` and `run_lease = 0` — see the Dead Letter Queue section below.
 
 The Dead Letter Queue is not a dispatchable `job_state`. On DLQ-enabled queues,
 terminal failures are materialized as separate rows in queue-storage
@@ -654,6 +705,32 @@ The `AwaMetrics` struct (in `awa-worker/src/metrics.rs`) publishes OTel metrics 
 | `awa.maintenance.rescues` | Counter | `{job}` | Number of jobs rescued by maintenance |
 
 Job-level metrics carry `awa.job.kind` and `awa.job.queue` attributes. Dispatch metrics carry `awa.job.queue`. Completion metrics carry `awa.completion.shard`. Promotion metrics carry `awa.job.state`.
+
+### Correctness (TLA+)
+
+Core safety invariants of the queue storage engine and worker runtime are
+checked with TLA+ models under [`correctness/`](../correctness/README.md).
+The segmented-storage family has four complementary specs:
+
+| Spec | Checks | Artifact |
+|---|---|---|
+| `AwaSegmentedStorage` | lifecycle transitions across ready / deferred / waiting / active_leases / attempt_state / terminal / dlq families and their rotate/prune safety; DLQ round-trip with `run_lease` reset; short-job rescue via lease-level heartbeat freshness | [spec](../correctness/storage/AwaSegmentedStorage.tla) |
+| `AwaSegmentedStorageRaces` | the claim-vs-rotate-and-prune race that would exist if the Rust `FOR SHARE` on `lease_ring_state` were removed; paired with a checked-commit variant that closes it | [spec](../correctness/storage/AwaSegmentedStorageRaces.tla) |
+| `AwaStorageLockOrder` | Postgres lock-acquisition order across claim / rotate-leases / prune-leases / rotate-ready / prune-ready; waits-for cycle detector; paired with a cycle-creating demo config to prove the checker works | [spec](../correctness/storage/AwaStorageLockOrder.tla) |
+| `AwaSegmentedStorageTrace` | trace-replay harness that feeds hand-transcribed event sequences from real queue-storage runtime tests through the base spec; single-threaded validation that every observed transition is a legal spec action | [spec](../correctness/storage/AwaSegmentedStorageTrace.tla) |
+
+Invariants covered include: no duplicate claim after rescue, stale completions
+rejected via `run_lease` guard, pruned segments empty, `attempt_state`
+existence implies active lease or waiting entry, DLQ and terminal families
+disjoint, lock-order deadlock freedom. The TLA+ action → Rust function
+mapping lives at [`correctness/storage/MAPPING.md`](../correctness/storage/MAPPING.md).
+
+The worker-lifecycle specs `AwaCore`, `AwaExtended`, `AwaBatcher`, `AwaCbk`,
+`AwaDispatchClaim`, `AwaViewTrigger`, `AwaCron` cover rescue, admin cancel,
+stale completion protection, batcher flush, three-way callback races,
+dispatcher claim, INSTEAD OF trigger concurrency, and cron double-fire
+prevention respectively. See [`correctness/README.md`](../correctness/README.md)
+for the full list and run commands.
 
 ### Queue Statistics (SQL)
 

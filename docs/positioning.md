@@ -2,15 +2,25 @@
 
 ## Short Version
 
-Awa is a Postgres-native job queue for teams that want:
+Awa's slot: more capable than a Postgres event queue, less ecosystem-bound
+than a language-specific job framework. It is a Postgres-native job queue for
+teams that want:
 
 - full job-queue behavior, not just enqueue/dequeue
-- Rust and Python worker runtimes
+- Rust and Python worker runtimes on the same queues
 - transactional enqueue on the same Postgres you already run
 - low dispatch latency without turning the main queue path into a vacuum trap
 
-That puts Awa in a specific slot: more capable than a Postgres event queue,
-less ecosystem-bound than a language-specific job framework.
+Typical scenarios where Awa fits:
+
+- **Transactional side-effects**: webhook fan-out, email, payment confirmation
+  enqueued inside the business transaction that causes them.
+- **Mixed-runtime fleets**: Rust request-path services and Python ML / ETL
+  workers sharing the same queues.
+- **Long-running jobs with checkpoints**: batch imports, data pipelines that
+  need to resume after retry without restarting from zero.
+- **External orchestration**: jobs that park mid-execution for a webhook or
+  external system to respond, then resume in the same handler.
 
 ## Best Fit
 
@@ -26,8 +36,8 @@ Awa is a strong fit when you want:
 
 ### Postgres event and message queues
 
-PgQue is the clearest reference point here, and the older PgQ lineage is still
-the useful historical backdrop.
+PgQue (lightweight Postgres pub-sub/queue library) and its PgQ historical
+lineage are the clearest reference points here.
 
 That category is a good fit when you want:
 
@@ -45,7 +55,8 @@ That category is not the right fit when you need:
 
 ### Language-specific Postgres job frameworks
 
-River and Oban Pro are the clearest references here.
+River (Go-native Postgres job queue) and Oban (Elixir Postgres job queue;
+Oban Pro is the commercial partitioned tier) are the clearest references here.
 
 That category is a good fit when you want a job framework deeply shaped around
 one host language and one surrounding ecosystem.

@@ -2,47 +2,60 @@
 
 **Postgres-native job queue for Rust and Python.**
 
-Awa (Māori: river) provides durable, transactional job enqueueing with typed
-handlers in both Rust and Python. It is a full job queue, not just a message
-stream: priorities, unique jobs, retries, cron, callbacks, DLQ, and a built-in
-UI all run on Postgres with no Redis or RabbitMQ. Segmented queue storage keeps
-queue history and execution churn off the main dispatch path.
+Awa (Māori: river) fills the gap between Postgres event queues that are too
+narrow for real job-queue behavior and language-specific job frameworks (River,
+Oban, Sidekiq) that couple you to one ecosystem. If you run Rust or Python (or
+both) on Postgres and want priorities, cron, DLQ, and transactional enqueue
+without Redis or RabbitMQ, Awa is built for you.
 
 ![AWA Web UI — Jobs (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-dark.png)
 
 ## Features
 
-- **Postgres-only** — one dependency you already have.
+### Core queue
 - **Transactional enqueue** — insert jobs inside your business transaction. Commit = visible. Rollback = gone.
-- **Cancel by unique key** — cancel scheduled jobs by their insert-time components (kind + args) without storing job IDs.
+- **Unique jobs** — declare uniqueness by kind/queue/args; cancel by unique key without storing job IDs.
+- **Priorities, retries, snoozes** — exponential backoff with jitter; priority aging for fairness.
+- **Dead Letter Queue** — first-class DLQ with per-queue opt-in, retention, and operator retry/purge.
+- **Periodic/cron jobs** — leader-elected scheduler with timezone support and atomic enqueue.
+- **Sequential callbacks** — `wait_for_callback()` / `resume_external()` for multi-step orchestration within a single handler.
+- **Webhook callbacks** — park jobs for external completion with optional CEL-expression filtering.
+
+### Runtime
 - **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
 - **Runtime-owned maintenance** — dispatch, rescue, segment rotation, and pruning run in the worker fleet; no `pg_cron` ticker required.
-- **Web UI** — dashboard, job inspector, queue management, cron controls.
-- **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
-- **Periodic/cron jobs** — leader-elected scheduler with timezone support and atomic enqueue.
-- **Storage transition prep** — explicit status/prepare/abort surfaces for future storage-engine upgrades without changing the current canonical runtime.
-- **Webhook callbacks** — park jobs for external completion with optional CEL expression filtering.
-- **Sequential callbacks** — `wait_for_callback()` suspends a handler mid-execution; `resume_external()` wakes it with a payload. Enables multi-step orchestration within a single handler.
-- **HTTP Worker** — feature-gated `Worker` that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-blake3 callback auth.
+- **Segmented queue storage** — append-only ready and terminal entries with rotating lease segments; queue history and execution churn stay off the dispatch path.
 - **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
-- **Production alerting metrics** — queue depth, lag, and wait-duration histogram via OpenTelemetry.
-- **OpenTelemetry** — 20+ built-in metrics (counters, histograms, gauges) for Prometheus/Grafana.
-- **Segmented queue storage** — append-only queue entries with rotating lease segments keep hot-path churn bounded.
-- **Rate limiting** — per-queue token bucket.
-- **Weighted concurrency** — global worker pool with per-queue guarantees.
+- **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-BLAKE3 callback auth.
+- **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.
+
+### Operations
+- **Web UI** — dashboard, job inspector, queue management, cron controls, DLQ retry/purge.
+- **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
+- **OpenTelemetry metrics** — 20+ built-in counters, histograms, and gauges for Prometheus/Grafana.
 - **Operator descriptors** — code-declared queue and job-kind names/descriptions with stale/drift visibility in the UI.
+- **Postgres-only** — one dependency you already have; no Redis, no RabbitMQ, no separate scheduler.
 
 ![AWA Web UI — Queue detail (dark mode)](https://raw.githubusercontent.com/hardbyte/awa/main/docs/images/awa-ui-queue-detail-dark.png)
 
-Current local queue-storage validation recorded `9537/s`
-runtime throughput, `3.671 ms` pickup p50, `22.013 ms` pickup p95, and `417`
-exact final dead tuples on the recorded 5k runtime run. Enqueue throughput
-still reaches ~30k/s single-producer and ~100k/s multi-producer in the local
-engineering benchmarks. See [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md)
-for methodology, caveats, and the remaining head-to-head work.
+## Correctness
 
-Core concurrency invariants (no duplicate processing after rescue, stale completions rejected, shutdown drain ordering) are checked with [TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md) covering single and multi-instance deployments.
+Core concurrency invariants — no duplicate processing after rescue, stale
+completions rejected, no claim/rotate/prune deadlock, DLQ round-trip safety,
+prune-segment emptiness, heartbeat-driven short-job rescue — are checked by
+[TLA+ models](https://github.com/hardbyte/awa/blob/main/correctness/README.md)
+covering the segmented storage engine, the lock-ordering protocol, and the
+single/multi-instance worker runtime. The storage model has a trace-replay
+harness that verifies concrete runtime-test event sequences against the spec.
+
+## Benchmarks
+
+Local soak, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95 pickup**, **417
+dead tuples**. Enqueue: ~30k/s single-producer, ~100k/s multi-producer.
+Head-to-head comparisons against PgQue / River are not yet published. Full
+methodology and raw output in [benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md)
+and [ADR-019 validation](https://github.com/hardbyte/awa/blob/main/docs/adr/bench/019-queue-storage-validation-2026-04-19.md).
 
 ## Where Awa Fits
 
@@ -60,21 +73,6 @@ See [docs/positioning.md](https://github.com/hardbyte/awa/blob/main/docs/positio
 
 ## Getting Started
 
-The quickest way to reason about Awa is:
-
-- your app inserts durable queue entries inside Postgres, often in the same
-  transaction as business data
-- workers claim runnable entries through short-lived execution leases and safely
-  rescue stale work after crashes
-- long-running attempts touch `attempt_state` only when they need mutable
-  execution data like progress or callback state
-- operators inspect and control live, terminal, and DLQ state through the CLI
-  or the built-in UI
-
-If you keep that model in mind, the APIs make more sense: enqueue work, run
-workers, then inspect the resulting job state rather than guessing what
-happened in memory.
-
 ```bash
 # 1. Install
 pip install awa-pg awa-cli     # Python
@@ -91,6 +89,13 @@ awa --database-url $DATABASE_URL storage status
 awa --database-url $DATABASE_URL job dump 123
 awa --database-url $DATABASE_URL job dump-run 123
 ```
+
+The Awa mental model: your app inserts durable queue entries inside Postgres,
+often in the same transaction as business data; workers claim runnable entries
+through short-lived execution leases and rescue stale work after crashes;
+long-running attempts touch `attempt_state` only when they need mutable data
+like progress or callback state; operators inspect live, terminal, and DLQ
+state through the CLI or the built-in UI.
 
 Language-specific guides:
 
