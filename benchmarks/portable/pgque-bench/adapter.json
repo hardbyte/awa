@@ -1,6 +1,6 @@
 {
   "system": "pgque",
-  "display_name": "PgQue (Python)",
+  "display_name": "PgQue",
   "db_name": "pgque_bench",
   "event_tables": [
     "pgque.queue",
