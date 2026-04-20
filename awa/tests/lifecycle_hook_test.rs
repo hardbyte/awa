@@ -3,7 +3,7 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::queue_storage::{QueueStorage, QueueStorageConfig};
-use awa::model::{admin, migrations};
+use awa::model::{admin, migrations, storage};
 use awa::{
     Client, JobArgs, JobError, JobEvent, JobResult, JobState, QueueConfig, UntypedJobEvent, Worker,
 };
@@ -28,6 +28,16 @@ async fn setup_pool() -> sqlx::PgPool {
     migrations::run(&pool)
         .await
         .expect("Failed to run migrations");
+
+    let schema = "awa_exp";
+    storage::abort(&pool)
+        .await
+        .expect("Failed to abort active storage backend before reset");
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("Failed to reset lifecycle queue-storage schema");
+
     QueueStorage::new(QueueStorageConfig::default())
         .expect("Failed to build queue storage")
         .install(&pool)

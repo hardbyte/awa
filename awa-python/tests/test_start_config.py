@@ -353,10 +353,10 @@ async def test_queue_storage_target_role_executes_after_mixed_transition(client)
 
     try:
         await target_client.migrate()
-        await target_client.install_queue_storage(schema=schema, reset=True)
 
         tx = await client.transaction()
         await tx.execute("SELECT * FROM awa.storage_abort()")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         await tx.execute(
             "SELECT * FROM awa.storage_prepare('queue_storage', jsonb_build_object('schema', $1::text))",
             schema,

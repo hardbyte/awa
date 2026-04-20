@@ -636,6 +636,71 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
 }
 
 #[tokio::test]
+async fn test_install_queue_storage_backend_activates_routing_and_state() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    install_queue_storage_backend(&pool, "awa_queue_storage_active").await;
+
+    assert_eq!(
+        active_queue_storage_schema(&pool).await.as_deref(),
+        Some("awa_queue_storage_active"),
+        "install helper should activate queue-storage routing immediately"
+    );
+
+    let status = storage::status(&pool).await.unwrap();
+    assert_eq!(status.current_engine, "queue_storage");
+    assert_eq!(status.active_engine, "queue_storage");
+    assert_eq!(status.prepared_engine, None);
+    assert_eq!(status.state, "active");
+    assert_eq!(
+        status.details,
+        serde_json::json!({"schema": "awa_queue_storage_active"})
+    );
+
+    let inserted: awa::JobRow = sqlx::query_as(
+        r#"
+        SELECT *
+        FROM awa.insert_job_compat(
+            'install_queue_storage_test',
+            'install_queue',
+            '{}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            NULL::timestamptz,
+            '{}'::jsonb,
+            ARRAY[]::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inserted.queue, "install_queue");
+
+    let hot_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.jobs_hot WHERE queue = 'install_queue'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(hot_count, 0, "active queue storage should bypass jobs_hot");
+
+    let queue_storage_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa_queue_storage_active.ready_entries WHERE queue = 'install_queue'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queue_storage_count, 1);
+}
+
+#[tokio::test]
 async fn test_storage_prepare_rejects_current_engine() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;

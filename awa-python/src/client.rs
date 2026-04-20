@@ -540,15 +540,19 @@ impl PyClient {
                 })
                 .map_err(map_awa_error)?;
                 if reset {
+                    awa_model::storage::abort(&pool)
+                        .await
+                        .map_err(map_awa_error)?;
                     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
                     sqlx::query(&drop_sql)
                         .execute(&pool)
                         .await
                         .map_err(map_sqlx_error)?;
-                }
-                store.install(&pool).await.map_err(map_awa_error)?;
-                if reset {
+                    store.prepare_schema(&pool).await.map_err(map_awa_error)?;
                     store.reset(&pool).await.map_err(map_awa_error)?;
+                    store.activate_backend(&pool).await.map_err(map_awa_error)?;
+                } else {
+                    store.install(&pool).await.map_err(map_awa_error)?;
                 }
                 Ok(())
             }
@@ -1936,15 +1940,19 @@ impl PyClient {
                 })
                 .map_err(map_awa_error)?;
                 if reset {
+                    awa_model::storage::abort(&pool)
+                        .await
+                        .map_err(map_awa_error)?;
                     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
                     sqlx::query(&drop_sql)
                         .execute(&pool)
                         .await
                         .map_err(map_sqlx_error)?;
-                }
-                store.install(&pool).await.map_err(map_awa_error)?;
-                if reset {
+                    store.prepare_schema(&pool).await.map_err(map_awa_error)?;
                     store.reset(&pool).await.map_err(map_awa_error)?;
+                    store.activate_backend(&pool).await.map_err(map_awa_error)?;
+                } else {
+                    store.install(&pool).await.map_err(map_awa_error)?;
                 }
                 Ok(())
             });

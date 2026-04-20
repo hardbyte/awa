@@ -227,7 +227,13 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
     .expect("Failed to create queue_storage store");
     recreate_store_schema(pool, &store).await;
     reset_shared_awa_state(pool).await;
-    store.install(pool).await.expect("Failed to install store");
+    storage::abort(pool)
+        .await
+        .expect("Failed to reset storage transition state for queue_storage tests");
+    store
+        .prepare_schema(pool)
+        .await
+        .expect("Failed to prepare store schema");
     store.reset(pool).await.expect("Failed to reset store");
     activate_queue_storage_transition(pool, schema).await;
     store
@@ -1415,16 +1421,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     let pool = setup_pool(10).await;
     let queue = "qs_prune_live_slot";
     let schema = "awa_qs_runtime_prune_live_slot";
-    let store = QueueStorage::new(QueueStorageConfig {
-        schema: schema.to_string(),
-        queue_slot_count: 4,
-        lease_slot_count: 2,
-    })
-    .expect("Failed to create queue_storage store");
-    recreate_store_schema(&pool, &store).await;
-    store.install(&pool).await.expect("Failed to install store");
-    store.reset(&pool).await.expect("Failed to reset store");
-    activate_queue_storage_transition(&pool, schema).await;
+    let store = create_store(&pool, schema).await;
 
     let release = Arc::new(tokio::sync::Notify::new());
     let client = queue_storage_client(

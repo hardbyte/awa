@@ -1941,10 +1941,15 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        let schema = self.schema();
+        let details = serde_json::json!({ "schema": schema });
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
         // Mark queue storage active only after the full schema, partitions,
-        // indexes, and helper functions are in place. Other sessions route
-        // inserts through this registry, so activating early can expose a
-        // partially-installed backend.
+        // indexes, and helper functions are in place. The explicit install
+        // helper is used by tests and queue-storage-only setups, so it must
+        // flip both the routing registry and the storage transition state.
         sqlx::query(
             r#"
             INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
@@ -1953,10 +1958,59 @@ impl QueueStorage {
             DO UPDATE SET schema_name = EXCLUDED.schema_name, updated_at = EXCLUDED.updated_at
             "#,
         )
-        .bind(self.schema())
-        .execute(pool)
+        .bind(schema)
+        .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
+        let activation_result = sqlx::query(
+            r#"
+            UPDATE awa.storage_transition_state AS sts
+            SET
+                current_engine = 'queue_storage',
+                prepared_engine = NULL,
+                state = 'active',
+                transition_epoch = CASE
+                    WHEN sts.current_engine = 'queue_storage'
+                     AND sts.prepared_engine IS NULL
+                     AND sts.state = 'active'
+                     AND sts.details = $1
+                    THEN sts.transition_epoch
+                    ELSE sts.transition_epoch + 1
+                END,
+                details = $1,
+                entered_at = CASE
+                    WHEN sts.current_engine = 'queue_storage'
+                     AND sts.prepared_engine IS NULL
+                     AND sts.state = 'active'
+                     AND sts.details = $1
+                    THEN sts.entered_at
+                    ELSE now()
+                END,
+                updated_at = now(),
+                finalized_at = CASE
+                    WHEN sts.current_engine = 'queue_storage'
+                     AND sts.prepared_engine IS NULL
+                     AND sts.state = 'active'
+                     AND sts.details = $1
+                    THEN COALESCE(sts.finalized_at, now())
+                    ELSE now()
+                END
+            WHERE sts.singleton
+            "#,
+        )
+        .bind(details)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if activation_result.rows_affected() != 1 {
+            return Err(AwaError::Validation(
+                "queue storage activation requires the storage transition state row".into(),
+            ));
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
 
         Ok(())
     }
