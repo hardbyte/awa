@@ -78,6 +78,10 @@ SELECT * FROM awa.storage_prepare(
 SELECT * FROM awa.storage_abort();
 ```
 
+These functions are one-shot operational commands. They are not schema-migration
+DDL and should be run deliberately by an operator or rollout tool, not embedded
+into the extracted migration SQL itself.
+
 Reserved for `0.6`, but intentionally claimed now as SQL identities:
 
 - `awa.storage_enter_mixed_transition()`
