@@ -54,6 +54,10 @@ async fn setup_pool() -> sqlx::PgPool {
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
     reset_runtime_backend(&pool).await;
+    sqlx::query("DROP SCHEMA IF EXISTS awa_exp CASCADE")
+        .execute(&pool)
+        .await
+        .expect("Failed to drop stale queue storage schema");
     pool
 }
 
