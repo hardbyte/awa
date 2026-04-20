@@ -2,15 +2,35 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::{admin, migrations};
+use awa::model::admin;
 use awa::{JobArgs, JobContext, JobError, JobResult, JobState, Worker};
 use awa_testing::TestClient;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::ops::Deref;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore};
 
 static PROGRESS_TEST_DB_INIT: OnceCell<()> = OnceCell::const_new();
+
+fn test_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
+}
+
+struct ProgressTestContext {
+    client: TestClient,
+    _permit: OwnedSemaphorePermit,
+}
+
+impl Deref for ProgressTestContext {
+    type Target = TestClient;
+
+    fn deref(&self) -> &Self::Target {
+        &self.client
+    }
+}
 
 fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -73,7 +93,11 @@ async fn ensure_database_exists(url: &str) {
     }
 }
 
-async fn setup() -> TestClient {
+async fn setup() -> ProgressTestContext {
+    let permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("progress test gate should be available");
     let url = database_url();
     PROGRESS_TEST_DB_INIT
         .get_or_init(|| async {
@@ -88,7 +112,10 @@ async fn setup() -> TestClient {
 
     let client = TestClient::from_pool(pool).await;
     client.migrate().await.expect("Failed to run migrations");
-    client
+    ProgressTestContext {
+        client,
+        _permit: permit,
+    }
 }
 
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
@@ -928,12 +955,8 @@ async fn test_progress_full_lifecycle() {
     use awa::{Client, QueueConfig};
     use std::sync::atomic::{AtomicI64, Ordering};
 
-    let pool = PgPoolOptions::new()
-        .max_connections(5)
-        .connect(&database_url())
-        .await
-        .expect("Failed to connect to database");
-    migrations::run(&pool).await.expect("Failed to migrate");
+    let tc = setup().await;
+    let pool = tc.pool().clone();
 
     let queue = "progress_lifecycle";
     clean_queue(&pool, queue).await;
