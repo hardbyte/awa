@@ -344,11 +344,21 @@ where
               AND (last_enqueued_at IS NOT DISTINCT FROM $3)
             RETURNING name, kind, queue, args, priority, max_attempts, tags, metadata
         )
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, tags, metadata)
-        SELECT kind, queue, args, 'available', priority, max_attempts, tags,
-               metadata || jsonb_build_object('cron_name', name, 'cron_fire_time', $2::text)
+        SELECT job.*
         FROM mark
-        RETURNING *
+        CROSS JOIN LATERAL awa.insert_job_compat(
+            mark.kind,
+            mark.queue,
+            mark.args,
+            'available'::awa.job_state,
+            mark.priority,
+            mark.max_attempts,
+            NULL,
+            mark.metadata || jsonb_build_object('cron_name', mark.name, 'cron_fire_time', $2::text),
+            mark.tags,
+            NULL,
+            NULL
+        ) AS job
         "#,
     )
     .bind(cron_name)
@@ -376,11 +386,21 @@ where
             FROM awa.cron_jobs
             WHERE name = $1
         )
-        INSERT INTO awa.jobs (kind, queue, args, state, priority, max_attempts, tags, metadata)
-        SELECT kind, queue, args, 'available', priority, max_attempts, tags,
-               metadata || jsonb_build_object('cron_name', name, 'triggered_manually', true)
+        SELECT job.*
         FROM cron
-        RETURNING *
+        CROSS JOIN LATERAL awa.insert_job_compat(
+            cron.kind,
+            cron.queue,
+            cron.args,
+            'available'::awa.job_state,
+            cron.priority,
+            cron.max_attempts,
+            NULL,
+            cron.metadata || jsonb_build_object('cron_name', cron.name, 'triggered_manually', true),
+            cron.tags,
+            NULL,
+            NULL
+        ) AS job
         "#,
     )
     .bind(name)

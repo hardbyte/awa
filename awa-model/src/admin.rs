@@ -903,6 +903,7 @@ pub struct RuntimeSnapshotInput {
     pub hostname: Option<String>,
     pub pid: i32,
     pub version: String,
+    pub storage_capability: String,
     pub started_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
     pub healthy: bool,
@@ -925,6 +926,7 @@ pub struct RuntimeInstance {
     pub hostname: Option<String>,
     pub pid: i32,
     pub version: String,
+    pub storage_capability: String,
     pub started_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
@@ -953,6 +955,7 @@ impl RuntimeInstance {
             hostname: row.hostname,
             pid: row.pid,
             version: row.version,
+            storage_capability: row.storage_capability,
             started_at: row.started_at,
             last_seen_at: row.last_seen_at,
             snapshot_interval_ms: row.snapshot_interval_ms,
@@ -1001,6 +1004,7 @@ struct RuntimeInstanceRow {
     hostname: Option<String>,
     pid: i32,
     version: String,
+    storage_capability: String,
     started_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
     snapshot_interval_ms: i64,
@@ -1030,6 +1034,7 @@ where
             hostname,
             pid,
             version,
+            storage_capability,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -1046,12 +1051,13 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+            $1, $2, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
             pid = EXCLUDED.pid,
             version = EXCLUDED.version,
+            storage_capability = EXCLUDED.storage_capability,
             started_at = EXCLUDED.started_at,
             last_seen_at = now(),
             snapshot_interval_ms = EXCLUDED.snapshot_interval_ms,
@@ -1072,6 +1078,7 @@ where
     .bind(snapshot.hostname.as_deref())
     .bind(snapshot.pid)
     .bind(&snapshot.version)
+    .bind(&snapshot.storage_capability)
     .bind(snapshot.started_at)
     .bind(snapshot.snapshot_interval_ms)
     .bind(snapshot.healthy)
@@ -1154,6 +1161,7 @@ where
             hostname,
             pid,
             version,
+            storage_capability,
             started_at,
             last_seen_at,
             snapshot_interval_ms,

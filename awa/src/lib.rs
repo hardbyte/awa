@@ -14,7 +14,7 @@ pub use awa_model::{
     self as model, admin, bridge, insert, insert_many, insert_many_copy,
     insert_many_copy_from_pool, insert_with, migrations, AwaError, CallbackConfig, DefaultAction,
     InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState, QueueDescriptor,
-    ResolveOutcome, UniqueOpts,
+    ResolveOutcome, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime

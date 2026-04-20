@@ -6,7 +6,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::migrations;
+use awa::model::{migrations, storage};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -149,6 +149,28 @@ async fn test_step_through_upgrade_preserves_data() {
     assert!(
         has_queue_state_counts,
         "queue_state_counts table should exist after V4"
+    );
+
+    let has_storage_transition_state: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'storage_transition_state')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        has_storage_transition_state,
+        "storage_transition_state should exist after V10"
+    );
+
+    let has_storage_capability: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.columns WHERE table_schema = 'awa' AND table_name = 'runtime_instances' AND column_name = 'storage_capability')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        has_storage_capability,
+        "runtime_instances.storage_capability should exist after V10"
     );
 
     let available_count: i64 = sqlx::query_scalar(
@@ -327,8 +349,90 @@ async fn test_migration_sql_range_produces_valid_schema() {
     .unwrap();
     assert!(has_admin, "V4 should be applied now");
 
+    let has_storage_transition_state: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema = 'awa' AND table_name = 'storage_transition_state')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        has_storage_transition_state,
+        "V10 should create storage_transition_state"
+    );
+
     // Full run() should still succeed (idempotent).
     migrations::run(&pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_storage_prepare_keeps_canonical_routing() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let status = storage::status(&pool).await.unwrap();
+    assert_eq!(status.current_engine, "canonical");
+    assert_eq!(status.active_engine, "canonical");
+    assert_eq!(status.state, "canonical");
+    assert_eq!(status.prepared_engine, None);
+
+    let prepared = storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({
+            "schema": "awa_queue_storage"
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(prepared.current_engine, "canonical");
+    assert_eq!(prepared.active_engine, "canonical");
+    assert_eq!(prepared.prepared_engine.as_deref(), Some("queue_storage"));
+    assert_eq!(prepared.state, "prepared");
+    assert_eq!(
+        prepared.details,
+        serde_json::json!({"schema": "awa_queue_storage"})
+    );
+
+    let inserted: awa::JobRow = sqlx::query_as(
+        r#"
+        SELECT *
+        FROM awa.insert_job_compat(
+            'storage_prepare_test',
+            'prep_queue',
+            '{}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            NULL::timestamptz,
+            '{}'::jsonb,
+            ARRAY[]::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(inserted.queue, "prep_queue");
+
+    let hot_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.jobs_hot WHERE queue = 'prep_queue'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        hot_count, 1,
+        "prepared state should still write canonical rows"
+    );
+
+    let aborted = storage::abort(&pool).await.unwrap();
+    assert_eq!(aborted.state, "canonical");
+    assert_eq!(aborted.active_engine, "canonical");
+    assert_eq!(aborted.prepared_engine, None);
 }
 
 // ── Legacy V3-only upgrade (0.3.0 exact, no V4/V5) ──────────────

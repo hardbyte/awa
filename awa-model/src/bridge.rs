@@ -45,12 +45,20 @@ pub mod tokio_pg {
     /// bit columns. `state::text AS state_str` gives us a readable string
     /// alongside the full row.
     const INSERT_SQL: &str = r#"
-    INSERT INTO awa.jobs
-        (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states)
-    VALUES
-        ($1, $2, $3, $4::text::awa.job_state, $5::smallint, $6::smallint,
-         COALESCE($7, now()), $8, $9::text[], $10, $11::text::bit(8))
-    RETURNING *, state::text AS state_str
+    SELECT *, state::text AS state_str
+    FROM awa.insert_job_compat(
+        $1,
+        $2,
+        $3,
+        $4::text::awa.job_state,
+        $5::smallint,
+        $6::smallint,
+        $7,
+        $8,
+        $9::text[],
+        $10,
+        $11::text::bit(8)
+    )
     "#;
 
     /// Insert a job with default options.

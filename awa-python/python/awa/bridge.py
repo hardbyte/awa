@@ -71,33 +71,53 @@ from awa._awa import derive_kind
 
 # $-style placeholders (asyncpg, native PostgreSQL)
 _INSERT_SQL_DOLLAR = """\
-INSERT INTO awa.jobs
-    (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
-VALUES
-    ($1, $2, $3::jsonb, $4, $5, $6, COALESCE($7, now()), $8::jsonb, $9)
-RETURNING id, kind, queue, args, state, priority, attempt, max_attempts,
-          run_at, created_at, metadata, tags
+SELECT id, kind, queue, args, state, priority, attempt, max_attempts,
+       run_at, created_at, metadata, tags
+FROM awa.insert_job_compat(
+    $1,
+    $2,
+    $3::jsonb,
+    $4::awa.job_state,
+    $5::smallint,
+    $6::smallint,
+    $7::timestamptz,
+    $8::jsonb,
+    $9::text[]
+)
 """
 
 # %s-style placeholders (psycopg3)
 _INSERT_SQL_PERCENT = """\
-INSERT INTO awa.jobs
-    (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
-VALUES
-    (%s, %s, %s::jsonb, %s, %s, %s, COALESCE(%s, now()), %s::jsonb, %s)
-RETURNING id, kind, queue, args, state, priority, attempt, max_attempts,
-          run_at, created_at, metadata, tags
+SELECT id, kind, queue, args, state, priority, attempt, max_attempts,
+       run_at, created_at, metadata, tags
+FROM awa.insert_job_compat(
+    %s,
+    %s,
+    %s::jsonb,
+    %s::awa.job_state,
+    %s::smallint,
+    %s::smallint,
+    %s::timestamptz,
+    %s::jsonb,
+    %s::text[]
+)
 """
 
 # Named parameters for SQLAlchemy.
 _INSERT_SQL_NAMED = """\
-INSERT INTO awa.jobs
-    (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags)
-VALUES
-    (:kind, :queue, :args, :state, :priority, :max_attempts,
-     COALESCE(:run_at, now()), :metadata, :tags)
-RETURNING id, kind, queue, args, state, priority, attempt, max_attempts,
-          run_at, created_at, metadata, tags
+SELECT id, kind, queue, args, state, priority, attempt, max_attempts,
+       run_at, created_at, metadata, tags
+FROM awa.insert_job_compat(
+    :kind,
+    :queue,
+    CAST(:args AS jsonb),
+    CAST(:state AS awa.job_state),
+    CAST(:priority AS smallint),
+    CAST(:max_attempts AS smallint),
+    CAST(:run_at AS timestamptz),
+    CAST(:metadata AS jsonb),
+    :tags
+)
 """
 
 

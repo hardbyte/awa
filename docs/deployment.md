@@ -18,7 +18,7 @@ That means you scale by running more worker processes, not by adding local state
 In production, treat these as separate concerns:
 
 - application worker: your Rust or Python service embedding Awa and calling `Client::start()` or `client.start()`
-- migration/admin/UI process: `awa` CLI for `migrate`, `job`, `queue`, `cron`, and `serve`
+- migration/admin/UI process: `awa` CLI for `migrate`, `storage`, `job`, `queue`, `cron`, and `serve`
 - PostgreSQL: the only required external dependency
 
 `awa serve` is an operator UI and admin API. It is not the worker runtime.

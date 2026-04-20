@@ -1154,6 +1154,7 @@ impl RuntimeReporterState {
             hostname: self.hostname.clone(),
             pid: self.pid,
             version: self.version.to_string(),
+            storage_capability: "canonical".to_string(),
             started_at: self.started_at,
             snapshot_interval_ms: self.snapshot_interval.as_millis() as i64,
             healthy,

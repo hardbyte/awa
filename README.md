@@ -16,6 +16,7 @@ Awa (Māori: river) provides durable, transactional job enqueueing with typed ha
 - **Web UI** — dashboard, job inspector, queue management, cron controls.
 - **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
 - **Periodic/cron jobs** — leader-elected scheduler with timezone support and atomic enqueue.
+- **Storage transition prep** — explicit status/prepare/abort surfaces for future storage-engine upgrades without changing the current canonical runtime.
 - **Webhook callbacks** — park jobs for external completion with optional CEL expression filtering.
 - **Sequential callbacks** — `wait_for_callback()` suspends a handler mid-execution; `resume_external()` wakes it with a payload. Enables multi-step orchestration within a single handler.
 - **HTTP Worker** — feature-gated `Worker` that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-blake3 callback auth.
@@ -56,6 +57,7 @@ awa --database-url $DATABASE_URL migrate
 
 # 4. Monitor
 awa --database-url $DATABASE_URL serve   # → http://127.0.0.1:3000
+awa --database-url $DATABASE_URL storage status
 awa --database-url $DATABASE_URL job dump 123
 awa --database-url $DATABASE_URL job dump-run 123
 ```

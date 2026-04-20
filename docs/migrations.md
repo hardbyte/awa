@@ -51,6 +51,46 @@ The normal upgrade order is:
 
 Because migrations are additive-only, old workers should continue to function during the rollout as long as your application-level payload compatibility still holds.
 
+## Storage Transition Preparation
+
+This release introduces a generic storage-transition framework that future
+storage-engine upgrades can build on. The important point for operators is that
+it does **not** change the current execution engine.
+
+New surfaces:
+
+```bash
+awa --database-url "$DATABASE_URL" storage status
+awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
+awa --database-url "$DATABASE_URL" storage abort
+```
+
+Current behavior:
+
+- `storage status` reports the singleton row in `awa.storage_transition_state`
+- `storage prepare` records a future engine and optional metadata, but keeps
+  enqueue routing and worker execution on canonical storage
+- `storage abort` clears a prepared-but-inactive future engine
+- workers continue to run the canonical engine before and after `prepare`
+
+This is intentional. The `0.5.x` prep release is only adding the reusable
+tables, status APIs, capability metadata, and compat-routing seam needed for a
+later engine migration. It is not activating queue storage.
+
+### Why This Exists
+
+If Awa needs another storage redesign in the future, the plan is to reuse the
+same framework:
+
+- `awa.storage_transition_state`
+- transition epochs
+- storage status / prepare / abort operator commands
+- runtime storage capability reporting
+- `awa.insert_job_compat()` as the write-routing seam
+
+Only the engine-specific install, backlog checks, and finalization logic should
+change between migrations.
+
 ## External Migration Tooling
 
 If you manage SQL with Flyway, Liquibase, dbmate, or a homegrown process, extract the bundled SQL:
@@ -121,8 +161,11 @@ If Awa ever needs a non-additive schema change, the intended contract is a major
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Roll out workers
-# 3. Verify runtime health / queue stats
+# 2. Optional: record and verify future storage prep state
+awa --database-url "$DATABASE_URL" storage status
+
+# 3. Roll out workers
+# 4. Verify runtime health / queue stats
 awa --database-url "$DATABASE_URL" queue stats
 ```
 
