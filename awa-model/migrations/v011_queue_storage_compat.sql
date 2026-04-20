@@ -25,45 +25,19 @@ SET search_path = pg_catalog, awa, public;
 
 CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_kind TEXT,
-    p_queue TEXT,
-    p_args JSONB,
-    p_state awa.job_state,
-    p_priority SMALLINT,
-    p_max_attempts SMALLINT,
-    p_run_at TIMESTAMPTZ,
-    p_metadata JSONB,
-    p_tags TEXT[],
-    p_unique_key BYTEA,
-    p_unique_states BIT(8)
+    p_queue TEXT DEFAULT 'default',
+    p_args JSONB DEFAULT '{}'::jsonb,
+    p_state awa.job_state DEFAULT 'available',
+    p_priority SMALLINT DEFAULT 2,
+    p_max_attempts SMALLINT DEFAULT 25,
+    p_run_at TIMESTAMPTZ DEFAULT NULL,
+    p_metadata JSONB DEFAULT '{}'::jsonb,
+    p_tags TEXT[] DEFAULT ARRAY[]::TEXT[],
+    p_unique_key BYTEA DEFAULT NULL,
+    p_unique_states BIT(8) DEFAULT NULL
 )
-RETURNS TABLE (
-    id BIGINT,
-    kind TEXT,
-    queue TEXT,
-    args JSONB,
-    state awa.job_state,
-    priority SMALLINT,
-    attempt SMALLINT,
-    run_lease BIGINT,
-    max_attempts SMALLINT,
-    run_at TIMESTAMPTZ,
-    heartbeat_at TIMESTAMPTZ,
-    deadline_at TIMESTAMPTZ,
-    attempted_at TIMESTAMPTZ,
-    finalized_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ,
-    errors JSONB[],
-    metadata JSONB,
-    tags TEXT[],
-    unique_key BYTEA,
-    callback_id UUID,
-    callback_timeout_at TIMESTAMPTZ,
-    callback_filter TEXT,
-    callback_on_complete TEXT,
-    callback_on_fail TEXT,
-    callback_transform TEXT,
-    progress JSONB
-) AS $$
+RETURNS awa.jobs
+AS $$
 DECLARE
     v_schema TEXT;
     v_queue TEXT := COALESCE(p_queue, 'default');
@@ -85,6 +59,7 @@ DECLARE
         ELSE p_unique_states::TEXT
     END;
     v_old_search_path TEXT;
+    inserted awa.jobs%ROWTYPE;
 BEGIN
     IF length(p_kind) > 200 THEN
         RAISE EXCEPTION 'job kind length must be <= 200 characters'
@@ -115,7 +90,6 @@ BEGIN
 
     IF v_schema IS NULL THEN
         IF v_state IN ('scheduled'::awa.job_state, 'retryable'::awa.job_state) THEN
-            RETURN QUERY
             INSERT INTO awa.scheduled_jobs AS jobs (
                 kind,
                 queue,
@@ -142,37 +116,10 @@ BEGIN
                 p_unique_key,
                 p_unique_states
             )
-            RETURNING
-                jobs.id,
-                jobs.kind,
-                jobs.queue,
-                jobs.args,
-                jobs.state,
-                jobs.priority,
-                jobs.attempt,
-                jobs.run_lease,
-                jobs.max_attempts,
-                jobs.run_at,
-                jobs.heartbeat_at,
-                jobs.deadline_at,
-                jobs.attempted_at,
-                jobs.finalized_at,
-                jobs.created_at,
-                jobs.errors,
-                jobs.metadata,
-                jobs.tags,
-                jobs.unique_key,
-                jobs.callback_id,
-                jobs.callback_timeout_at,
-                jobs.callback_filter,
-                jobs.callback_on_complete,
-                jobs.callback_on_fail,
-                jobs.callback_transform,
-                jobs.progress;
-            RETURN;
+            RETURNING * INTO inserted;
+            RETURN inserted;
         END IF;
 
-        RETURN QUERY
         INSERT INTO awa.jobs_hot AS jobs (
             kind,
             queue,
@@ -199,34 +146,8 @@ BEGIN
             p_unique_key,
             p_unique_states
         )
-        RETURNING
-            jobs.id,
-            jobs.kind,
-            jobs.queue,
-            jobs.args,
-            jobs.state,
-            jobs.priority,
-            jobs.attempt,
-            jobs.run_lease,
-            jobs.max_attempts,
-            jobs.run_at,
-            jobs.heartbeat_at,
-            jobs.deadline_at,
-            jobs.attempted_at,
-            jobs.finalized_at,
-            jobs.created_at,
-            jobs.errors,
-            jobs.metadata,
-            jobs.tags,
-            jobs.unique_key,
-            jobs.callback_id,
-            jobs.callback_timeout_at,
-            jobs.callback_filter,
-            jobs.callback_on_complete,
-            jobs.callback_on_fail,
-            jobs.callback_transform,
-            jobs.progress;
-        RETURN;
+        RETURNING * INTO inserted;
+        RETURN inserted;
     END IF;
 
     IF v_state NOT IN (
@@ -322,35 +243,11 @@ BEGIN
         PERFORM pg_notify('awa:' || v_queue, '');
         PERFORM set_config('search_path', v_old_search_path, true);
 
-        RETURN QUERY
-        SELECT
-            v_job_id,
-            p_kind,
-            v_queue,
-            v_args,
-            v_state,
-            v_priority,
-            0::SMALLINT,
-            0::BIGINT,
-            v_max_attempts,
-            v_run_at,
-            NULL::TIMESTAMPTZ,
-            NULL::TIMESTAMPTZ,
-            NULL::TIMESTAMPTZ,
-            NULL::TIMESTAMPTZ,
-            v_created_at,
-            ARRAY[]::JSONB[],
-            v_metadata,
-            v_tags,
-            p_unique_key,
-            NULL::UUID,
-            NULL::TIMESTAMPTZ,
-            NULL::TEXT,
-            NULL::TEXT,
-            NULL::TEXT,
-            NULL::TEXT,
-            NULL::JSONB;
-        RETURN;
+        SELECT * INTO inserted
+        FROM awa.jobs AS jobs
+        WHERE jobs.id = v_job_id;
+
+        RETURN inserted;
     END IF;
 
     INSERT INTO deferred_jobs (
@@ -391,34 +288,11 @@ BEGIN
 
     PERFORM set_config('search_path', v_old_search_path, true);
 
-    RETURN QUERY
-    SELECT
-        v_job_id,
-        p_kind,
-        v_queue,
-        v_args,
-        v_state,
-        v_priority,
-        0::SMALLINT,
-        0::BIGINT,
-        v_max_attempts,
-        v_run_at,
-        NULL::TIMESTAMPTZ,
-        NULL::TIMESTAMPTZ,
-        NULL::TIMESTAMPTZ,
-        NULL::TIMESTAMPTZ,
-        v_created_at,
-        ARRAY[]::JSONB[],
-        v_metadata,
-        v_tags,
-        p_unique_key,
-        NULL::UUID,
-        NULL::TIMESTAMPTZ,
-        NULL::TEXT,
-        NULL::TEXT,
-        NULL::TEXT,
-        NULL::TEXT,
-        NULL::JSONB;
+    SELECT * INTO inserted
+    FROM awa.jobs AS jobs
+    WHERE jobs.id = v_job_id;
+
+    RETURN inserted;
 END;
 $$ LANGUAGE plpgsql VOLATILE
 SET search_path = pg_catalog, awa, public;

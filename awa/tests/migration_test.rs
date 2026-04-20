@@ -6,7 +6,7 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
-use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage};
+use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
 use awa::{InsertOpts, InsertParams, UniqueOpts};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -120,6 +120,20 @@ async fn simulate_non_canonical_compat_routing(pool: &PgPool) {
     .execute(pool)
     .await
     .unwrap();
+}
+
+async fn install_queue_storage_backend(pool: &PgPool, schema: &str) {
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(pool)
+        .await
+        .expect("queue storage test schema should drop cleanly");
+
+    let store = QueueStorage::from_existing_schema(schema)
+        .expect("queue storage schema should validate");
+    store
+        .install(pool)
+        .await
+        .expect("queue storage install should succeed");
 }
 
 // ── Fresh install ────────────────────────────────────────────────
@@ -651,12 +665,14 @@ async fn test_storage_finalize_stub_requires_0_6() {
 }
 
 #[tokio::test]
-async fn test_mixed_transition_fails_safe_for_0_5_producers() {
+async fn test_mixed_transition_routes_compat_producers_into_queue_storage() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;
+    let schema = "awa_migration_mixed_transition";
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
+    install_queue_storage_backend(&pool, schema).await;
 
     sqlx::query(
         r#"
@@ -664,17 +680,18 @@ async fn test_mixed_transition_fails_safe_for_0_5_producers() {
         SET prepared_engine = 'queue_storage',
             state = 'mixed_transition',
             transition_epoch = transition_epoch + 1,
-            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            details = $1::jsonb,
             updated_at = now(),
             finalized_at = NULL
         WHERE singleton
         "#,
     )
+    .bind(format!(r#"{{"schema":"{schema}"}}"#))
     .execute(&pool)
     .await
     .unwrap();
 
-    let compat_err = sqlx::query_as::<_, awa::JobRow>(
+    let compat_row = sqlx::query_as::<_, awa::JobRow>(
         r#"
         SELECT *
         FROM awa.insert_job_compat(
@@ -694,13 +711,11 @@ async fn test_mixed_transition_fails_safe_for_0_5_producers() {
     )
     .fetch_one(&pool)
     .await
-    .unwrap_err();
-    assert_eq!(
-        sqlstate_from_sqlx_error(&compat_err).as_deref(),
-        Some("55000")
-    );
+    .unwrap();
+    assert_eq!(compat_row.kind, "compat_mixed_transition_test");
+    assert_eq!(compat_row.queue, "compat_mixed_transition_queue");
 
-    let batch_err = insert_many(
+    let batch_rows = insert_many(
         &pool,
         &[InsertParams {
             kind: "compat_mixed_transition_batch".to_string(),
@@ -712,13 +727,11 @@ async fn test_mixed_transition_fails_safe_for_0_5_producers() {
         }],
     )
     .await
-    .unwrap_err();
-    assert_eq!(
-        sqlstate_from_awa_error(&batch_err).as_deref(),
-        Some("55000")
-    );
+    .unwrap();
+    assert_eq!(batch_rows.len(), 1);
+    assert_eq!(batch_rows[0].kind, "compat_mixed_transition_batch");
 
-    let copy_err = insert_many_copy_from_pool(
+    let copy_rows = insert_many_copy_from_pool(
         &pool,
         &[InsertParams {
             kind: "compat_mixed_transition_copy".to_string(),
@@ -735,17 +748,20 @@ async fn test_mixed_transition_fails_safe_for_0_5_producers() {
         }],
     )
     .await
-    .unwrap_err();
-    assert_eq!(sqlstate_from_awa_error(&copy_err).as_deref(), Some("55000"));
+    .unwrap();
+    assert_eq!(copy_rows.len(), 1);
+    assert_eq!(copy_rows[0].kind, "compat_mixed_transition_copy");
 }
 
 #[tokio::test]
-async fn test_insert_job_compat_refuses_non_canonical_active_engine() {
+async fn test_insert_job_compat_routes_under_active_queue_storage_engine() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;
+    let schema = "awa_migration_active_queue_storage";
     reset_schema(&pool).await;
 
     migrations::run(&pool).await.unwrap();
+    install_queue_storage_backend(&pool, schema).await;
 
     sqlx::query(
         r#"
@@ -753,17 +769,18 @@ async fn test_insert_job_compat_refuses_non_canonical_active_engine() {
         SET prepared_engine = 'queue_storage',
             state = 'active',
             transition_epoch = transition_epoch + 1,
-            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            details = $1::jsonb,
             updated_at = now(),
             finalized_at = now()
         WHERE singleton
         "#,
     )
+    .bind(format!(r#"{{"schema":"{schema}"}}"#))
     .execute(&pool)
     .await
     .unwrap();
 
-    let err = sqlx::query_as::<_, awa::JobRow>(
+    let row = sqlx::query_as::<_, awa::JobRow>(
         r#"
         SELECT *
         FROM awa.insert_job_compat(
@@ -783,19 +800,10 @@ async fn test_insert_job_compat_refuses_non_canonical_active_engine() {
     )
     .fetch_one(&pool)
     .await
-    .unwrap_err();
-
-    match err {
-        sqlx::Error::Database(db_err) => {
-            assert_eq!(db_err.code().as_deref(), Some("55000"));
-            assert!(
-                db_err.message().contains("not writable"),
-                "expected non-writable error, got {}",
-                db_err.message()
-            );
-        }
-        other => panic!("expected sqlx database error, got {other:?}"),
-    }
+    .unwrap();
+    assert_eq!(row.kind, "compat_refusal_test");
+    assert_eq!(row.queue, "compat_refusal_queue");
+    assert_eq!(row.state, awa::JobState::Available);
 }
 
 #[tokio::test]
