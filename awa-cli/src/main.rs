@@ -681,16 +681,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 Commands::Storage { command } => match command {
                     StorageCommands::Status => {
-                        let status = awa_model::storage::status(&pool).await?;
-                        println!("{}", serde_json::to_string_pretty(&status)?);
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     StorageCommands::Prepare { engine, details } => {
                         let details = match details {
                             Some(raw) => serde_json::from_str(&raw)?,
                             None => serde_json::json!({}),
                         };
-                        let status = awa_model::storage::prepare(&pool, &engine, details).await?;
-                        println!("{}", serde_json::to_string_pretty(&status)?);
+                        awa_model::storage::prepare(&pool, &engine, details).await?;
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     StorageCommands::PrepareQueueStorageSchema {
                         schema,
@@ -720,16 +721,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                     }
                     StorageCommands::Abort => {
-                        let status = awa_model::storage::abort(&pool).await?;
-                        println!("{}", serde_json::to_string_pretty(&status)?);
+                        awa_model::storage::abort(&pool).await?;
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     StorageCommands::EnterMixedTransition => {
-                        let status = awa_model::storage::enter_mixed_transition(&pool).await?;
-                        println!("{}", serde_json::to_string_pretty(&status)?);
+                        awa_model::storage::enter_mixed_transition(&pool).await?;
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     StorageCommands::Finalize => {
-                        let status = awa_model::storage::finalize(&pool).await?;
-                        println!("{}", serde_json::to_string_pretty(&status)?);
+                        awa_model::storage::finalize(&pool).await?;
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                 },
 

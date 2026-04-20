@@ -856,6 +856,101 @@ async fn test_storage_finalize_requires_empty_backlog_and_no_drain_runtimes() {
 }
 
 #[tokio::test]
+async fn test_storage_status_report_surfaces_enter_mixed_transition_readiness() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    let schema = "awa_status_report_enter";
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, schema).await;
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({ "schema": schema }),
+    )
+    .await
+    .unwrap();
+    insert_runtime_instance(&pool, "queue_storage").await;
+
+    let report = storage::status_report(&pool).await.unwrap();
+    assert_eq!(report.status.state, "prepared");
+    assert_eq!(
+        report.prepared_queue_storage_schema.as_deref(),
+        Some(schema)
+    );
+    assert!(report.prepared_schema_ready);
+    assert_eq!(
+        report.live_runtime_capability_counts.get("queue_storage"),
+        Some(&1)
+    );
+    assert!(report.can_enter_mixed_transition);
+    assert!(report.enter_mixed_transition_blockers.is_empty());
+    assert!(!report.can_finalize);
+
+    insert_runtime_instance(&pool, "canonical").await;
+    let blocked = storage::status_report(&pool).await.unwrap();
+    assert!(!blocked.can_enter_mixed_transition);
+    assert!(
+        blocked
+            .enter_mixed_transition_blockers
+            .iter()
+            .any(|reason| reason.contains("canonical-only runtime")),
+        "{:?}",
+        blocked.enter_mixed_transition_blockers
+    );
+}
+
+#[tokio::test]
+async fn test_storage_status_report_surfaces_finalize_blockers() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    let schema = "awa_status_report_finalize";
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    prepare_queue_storage_schema(&pool, schema).await;
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({ "schema": schema }),
+    )
+    .await
+    .unwrap();
+    insert_runtime_instance(&pool, "queue_storage").await;
+    storage::enter_mixed_transition(&pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs_hot (kind, queue, args, state, priority) VALUES ('report_backlog_job', 'report_queue', '{}'::jsonb, 'available', 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    insert_runtime_instance(&pool, "canonical_drain_only").await;
+
+    let report = storage::status_report(&pool).await.unwrap();
+    assert_eq!(report.status.state, "mixed_transition");
+    assert!(!report.can_finalize);
+    assert_eq!(report.canonical_live_backlog, 1);
+    assert!(
+        report
+            .finalize_blockers
+            .iter()
+            .any(|reason| reason.contains("canonical live backlog is 1")),
+        "{:?}",
+        report.finalize_blockers
+    );
+    assert!(
+        report
+            .finalize_blockers
+            .iter()
+            .any(|reason| reason.contains("drain-only runtime")),
+        "{:?}",
+        report.finalize_blockers
+    );
+}
+
+#[tokio::test]
 async fn test_mixed_transition_routes_compat_producers_into_queue_storage() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;

@@ -105,6 +105,8 @@ On the `0.5.x` prep release these SQL identities existed as stubs. On this
 Current behavior:
 
 - `storage status` reports the singleton row in `awa.storage_transition_state`
+- `storage status` also reports canonical live backlog, live runtime capability counts,
+  and blocker lists for `enter-mixed-transition` / `finalize`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
 - `storage prepare-queue-storage-schema` creates the target queue-storage
