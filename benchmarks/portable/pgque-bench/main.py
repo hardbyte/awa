@@ -76,7 +76,19 @@ def read_producer_rate(default: int) -> int:
 # ─── output helpers ──────────────────────────────────────────────────────
 
 
+def _instance_id() -> int:
+    try:
+        return int(os.environ.get("BENCH_INSTANCE_ID", "0"))
+    except ValueError:
+        return 0
+
+
 def _emit(record: dict) -> None:
+    # Stamp the adapter's replica index onto every emission so the harness
+    # tailer can attribute samples to the right row in raw.csv without
+    # needing to track per-subprocess state. Descriptor and sample records
+    # both carry it.
+    record.setdefault("instance_id", _instance_id())
     print(json.dumps(record), flush=True)
 
 

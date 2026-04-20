@@ -147,10 +147,15 @@ fn emit(record: serde_json::Value) {
     println!("{}", record);
 }
 
+fn instance_id() -> u32 {
+    env_u32("BENCH_INSTANCE_ID", 0)
+}
+
 fn emit_descriptor(db_name: &str) {
     emit(json!({
         "kind": "descriptor",
         "system": "awa",
+        "instance_id": instance_id(),
         "event_tables": [
             "awa.jobs_hot",
             "awa.scheduled_jobs",
@@ -364,6 +369,7 @@ pub async fn run() {
                 emit(json!({
                     "t": ts,
                     "system": "awa",
+                    "instance_id": instance_id(),
                     "kind": "adapter",
                     "subject_kind": "adapter",
                     "subject": "",

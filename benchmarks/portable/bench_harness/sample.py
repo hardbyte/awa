@@ -10,6 +10,11 @@ from datetime import datetime, timezone
 class Sample:
     run_id: str
     system: str
+    # 0-indexed replica id. `0` for single-replica runs (today's default)
+    # and for cluster-scoped samples (e.g. PG-side pgstattuple metrics
+    # that aren't per-replica by definition). Multi-replica worker-scoped
+    # samples take 0..N-1.
+    instance_id: int
     elapsed_s: float
     sampled_at: str  # ISO8601 UTC
     phase_label: str
@@ -30,6 +35,7 @@ def now_iso() -> str:
 RAW_CSV_HEADER = [
     "run_id",
     "system",
+    "instance_id",
     "elapsed_s",
     "sampled_at",
     "phase_label",

@@ -444,7 +444,25 @@ func (w *LongHorizonWorker) Work(ctx context.Context, job *river.Job[LongHorizon
 	return nil
 }
 
+// instanceID reads BENCH_INSTANCE_ID (0 if unset or malformed). Stamped
+// onto every descriptor + sample record so the harness can attribute
+// samples to the right replica without per-subprocess state.
+func instanceID() int {
+	raw := os.Getenv("BENCH_INSTANCE_ID")
+	if raw == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 func emitJSONL(rec map[string]interface{}) {
+	if _, ok := rec["instance_id"]; !ok {
+		rec["instance_id"] = instanceID()
+	}
 	b, err := json.Marshal(rec)
 	if err != nil {
 		return

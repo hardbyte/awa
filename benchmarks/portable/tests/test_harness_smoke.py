@@ -74,7 +74,7 @@ def test_phase_tints_cover_all_types():
 
 def test_raw_csv_header_matches_spec():
     expected = [
-        "run_id", "system", "elapsed_s", "sampled_at",
+        "run_id", "system", "instance_id", "elapsed_s", "sampled_at",
         "phase_label", "phase_type", "subject_kind", "subject",
         "metric", "value", "window_s",
     ]
@@ -331,3 +331,53 @@ def test_readme_omits_section_when_no_adapters(tmp_path: Path):
     out = tmp_path / "README.md"
     write_run_readme(out, scenario=None, phases=phases, adapters=None)
     assert "Adapter versions" not in out.read_text()
+
+
+# ── instance_id plumbing ────────────────────────────────────────────────
+
+
+from bench_harness.metrics import parse_adapter_record
+
+
+def _dummy_phase():
+    return ("smoke", "clean")
+
+
+def test_parse_adapter_record_defaults_instance_id_to_zero():
+    line = '{"kind":"adapter","metric":"depth","value":42,"window_s":10}'
+    sample = parse_adapter_record(
+        line,
+        run_id="r1",
+        expected_system="awa",
+        bench_start=0.0,
+        get_phase=_dummy_phase,
+    )
+    assert sample is not None
+    assert sample.instance_id == 0
+
+
+def test_parse_adapter_record_honours_instance_id():
+    line = '{"kind":"adapter","metric":"depth","value":42,"window_s":10,"instance_id":2}'
+    sample = parse_adapter_record(
+        line,
+        run_id="r1",
+        expected_system="awa",
+        bench_start=0.0,
+        get_phase=_dummy_phase,
+    )
+    assert sample is not None
+    assert sample.instance_id == 2
+
+
+def test_parse_adapter_record_rejects_garbage_instance_id_silently():
+    # Malformed adapter output shouldn't poison the sample — fall back to 0.
+    line = '{"kind":"adapter","metric":"depth","value":42,"window_s":10,"instance_id":"not-a-number"}'
+    sample = parse_adapter_record(
+        line,
+        run_id="r1",
+        expected_system="awa",
+        bench_start=0.0,
+        get_phase=_dummy_phase,
+    )
+    assert sample is not None
+    assert sample.instance_id == 0
