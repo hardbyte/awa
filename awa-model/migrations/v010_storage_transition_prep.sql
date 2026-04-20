@@ -188,7 +188,7 @@ BEGIN
         prepared_engine = NULL,
         state = 'canonical',
         transition_epoch = CASE
-            WHEN sts.state = 'prepared' THEN sts.transition_epoch + 1
+            WHEN sts.state IN ('prepared', 'mixed_transition') THEN sts.transition_epoch + 1
             ELSE sts.transition_epoch
         END,
         details = '{}'::jsonb,
@@ -199,7 +199,7 @@ BEGIN
         updated_at = now(),
         finalized_at = NULL
     WHERE sts.singleton
-      AND sts.state IN ('canonical', 'prepared');
+      AND sts.state IN ('canonical', 'prepared', 'mixed_transition');
 
     RETURN QUERY
     SELECT * FROM awa.storage_status();

@@ -505,6 +505,42 @@ async fn test_storage_abort_from_canonical_is_noop() {
 }
 
 #[tokio::test]
+async fn test_storage_abort_from_mixed_transition_returns_to_canonical() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'mixed_transition',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            entered_at = now(),
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let before = storage::status(&pool).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let after = storage::abort(&pool).await.unwrap();
+
+    assert_eq!(after.state, "canonical");
+    assert_eq!(after.active_engine, "canonical");
+    assert_eq!(after.prepared_engine, None);
+    assert_eq!(after.transition_epoch, before.transition_epoch + 1);
+    assert!(after.entered_at > before.entered_at);
+}
+
+#[tokio::test]
 async fn test_insert_job_compat_refuses_non_canonical_active_engine() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;

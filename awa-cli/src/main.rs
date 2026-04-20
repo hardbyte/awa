@@ -170,7 +170,7 @@ enum StorageCommands {
         #[arg(long)]
         details: Option<String>,
     },
-    /// Abort a prepared-but-inactive storage transition
+    /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
 }
 
