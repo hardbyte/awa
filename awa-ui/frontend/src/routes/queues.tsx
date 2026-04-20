@@ -369,10 +369,10 @@ export function QueuesPage() {
                         <Badge intent="success">Active</Badge>
                       )}
                       {q.descriptor_stale && (
-                        <Badge intent="warning">Stale desc</Badge>
+                        <Badge intent="warning">Descriptor stale</Badge>
                       )}
                       {q.descriptor_mismatch && (
-                        <Badge intent="danger">Drift</Badge>
+                        <Badge intent="danger">Descriptor drift</Badge>
                       )}
                     </div>
                   </TableCell>

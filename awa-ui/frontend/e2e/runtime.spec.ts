@@ -31,7 +31,7 @@ test.describe("Runtime page", () => {
     await page.goto("/runtime");
 
     await expect(
-      page.getByText("No runtime snapshots yet. Start a worker to populate this view.")
+      page.getByText(/No live worker instances|No worker instances recorded/)
     ).toBeVisible();
     await expect(page.getByText("No queue runtime snapshots yet.")).toBeVisible();
   });

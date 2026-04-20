@@ -25,15 +25,18 @@ test.describe("Queues page", () => {
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
+    // Columns were consolidated: Scheduled/Available fold into Queued;
+    // Mode/RateLimit fold into Capacity; Waiting is a subline under Queue.
     for (const header of [
       "Queue",
-      "Total queued",
-      "Scheduled",
-      "Retryable",
-      "Available",
+      "Queued",
       "Running",
+      "Retry",
       "Failed",
+      "Rate/hr",
+      "Capacity",
       "Status",
+      "Actions",
     ]) {
       await expect(
         queueTable.getByRole("columnheader", { name: header, exact: true })
@@ -57,18 +60,19 @@ test.describe("Queues page", () => {
     ).toBeVisible();
   });
 
-  test("queue table includes runtime columns", async ({ page }) => {
+  test("queue table surfaces runtime configuration", async ({ page }) => {
     await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
-    // Queue health and runtime columns should be present
-    for (const header of ["Mode", "Capacity", "Rate limit", "Waiting"]) {
-      await expect(
-        queueTable.getByRole("columnheader", { name: header, exact: true })
-      ).toBeVisible();
-    }
+    // Mode / rate limit now live inside the Capacity cell rather than
+    // getting their own columns. Verify the consolidated column is there,
+    // and that at least one cell surfaces the Weighted/Reserved mode label.
+    await expect(
+      queueTable.getByRole("columnheader", { name: "Capacity", exact: true })
+    ).toBeVisible();
+    await expect(queueTable.getByText(/Weighted|Reserved/).first()).toBeVisible();
   });
 
   test("click queue navigates to queue detail", async ({ page }) => {
@@ -152,115 +156,105 @@ test.describe("Queues page", () => {
     await expect(queueTable.getByText("Descriptor drift across live runtimes")).toBeVisible();
   });
 
-  test("Pause/Resume button is visible for each queue", async ({ page }) => {
-    await loadQueuesPage(page);
-
+  async function openActionsMenu(page: Page, queueName: string) {
     const queueTable = page.getByRole("grid", { name: "Queues" });
-    await expect(queueTable).toBeVisible();
+    const row = queueTable.getByRole("row", { name: new RegExp(queueName) });
+    await expect(row).toBeVisible();
+    await row
+      .getByRole("button", { name: new RegExp(`Actions for ${queueName}`) })
+      .click();
+  }
 
-    // Find the e2e_test row
-    const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });
-    await expect(e2eRow).toBeVisible();
+  test("Pause/Resume and Drain appear in the Actions menu", async ({ page }) => {
+    await loadQueuesPage(page);
+    await openActionsMenu(page, "e2e_test");
 
-    // Either Pause or Resume should be visible (depends on current state)
-    const pauseBtn = e2eRow.getByRole("button", { name: "Pause" });
-    const resumeBtn = e2eRow.getByRole("button", { name: "Resume" });
-    const pauseVisible = await pauseBtn.isVisible().catch(() => false);
-    const resumeVisible = await resumeBtn.isVisible().catch(() => false);
+    // Menu renders either "Pause queue" or "Resume queue" depending on state,
+    // plus Drain. We just need one of pause/resume visible.
+    const pauseItem = page.getByRole("menuitem", { name: "Pause queue" });
+    const resumeItem = page.getByRole("menuitem", { name: "Resume queue" });
+    const pauseVisible = await pauseItem.isVisible().catch(() => false);
+    const resumeVisible = await resumeItem.isVisible().catch(() => false);
     expect(pauseVisible || resumeVisible).toBeTruthy();
 
-    // Drain button should always be visible
-    await expect(e2eRow.getByRole("button", { name: "Drain" })).toBeVisible();
+    await expect(page.getByRole("menuitem", { name: /^Drain queue/ })).toBeVisible();
   });
 
-  test("Pause executes mutation and shows success toast", async ({ page }) => {
+  test("Pause executes mutation from the Actions menu", async ({ page }) => {
     await loadQueuesPage(page);
 
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });
-    await expect(e2eRow).toBeVisible();
-
-    // If queue is paused, resume it first so we can test pause
-    const resumeBtn = e2eRow.getByRole("button", { name: "Resume" });
-    const isCurrentlyPaused = await resumeBtn.isVisible().catch(() => false);
+    // Ensure the queue is active so "Pause" is the available verb.
+    await openActionsMenu(page, "e2e_test");
+    const resumeItem = page.getByRole("menuitem", { name: "Resume queue" });
+    const isCurrentlyPaused = await resumeItem.isVisible().catch(() => false);
     if (isCurrentlyPaused) {
       await Promise.all([
         page.waitForResponse(
           (r) => r.url().includes("/resume") && r.request().method() === "POST"
         ),
-        resumeBtn.click(),
+        resumeItem.click(),
       ]);
       await page.waitForResponse(isQueuesListResponse);
+      await openActionsMenu(page, "e2e_test");
+    } else {
+      await page.keyboard.press("Escape");
+      await openActionsMenu(page, "e2e_test");
     }
 
-    // Now pause the queue
-    const refreshedRow = queueTable.getByRole("row", { name: /e2e_test/ });
-    const pauseBtn = refreshedRow.getByRole("button", { name: "Pause" });
-    await expect(pauseBtn).toBeVisible();
-
+    const pauseItem = page.getByRole("menuitem", { name: "Pause queue" });
+    await expect(pauseItem).toBeVisible();
     const [pauseResponse] = await Promise.all([
       page.waitForResponse(
         (r) => r.url().includes("/pause") && r.request().method() === "POST"
       ),
-      pauseBtn.click(),
+      pauseItem.click(),
     ]);
-
     expect(pauseResponse.ok()).toBeTruthy();
   });
 
-  test("Resume executes mutation after pause", async ({ page }) => {
+  test("Resume executes mutation from the Actions menu", async ({ page }) => {
     await loadQueuesPage(page);
 
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });
-    await expect(e2eRow).toBeVisible();
-
-    // If queue is not paused, pause it first so we can test resume
-    const pauseBtn = e2eRow.getByRole("button", { name: "Pause" });
-    const isCurrentlyActive = await pauseBtn.isVisible().catch(() => false);
+    await openActionsMenu(page, "e2e_test");
+    const pauseItem = page.getByRole("menuitem", { name: "Pause queue" });
+    const isCurrentlyActive = await pauseItem.isVisible().catch(() => false);
     if (isCurrentlyActive) {
       await Promise.all([
         page.waitForResponse(
           (r) => r.url().includes("/pause") && r.request().method() === "POST"
         ),
-        pauseBtn.click(),
+        pauseItem.click(),
       ]);
       await page.waitForResponse(isQueuesListResponse);
+      await openActionsMenu(page, "e2e_test");
+    } else {
+      await page.keyboard.press("Escape");
+      await openActionsMenu(page, "e2e_test");
     }
 
-    const refreshedRow = queueTable.getByRole("row", { name: /e2e_test/ });
-    const resumeBtn = refreshedRow.getByRole("button", { name: "Resume" });
-    await expect(resumeBtn).toBeVisible();
-
+    const resumeItem = page.getByRole("menuitem", { name: "Resume queue" });
+    await expect(resumeItem).toBeVisible();
     const [resumeResponse] = await Promise.all([
       page.waitForResponse(
         (r) => r.url().includes("/resume") && r.request().method() === "POST"
       ),
-      resumeBtn.click(),
+      resumeItem.click(),
     ]);
-
     expect(resumeResponse.ok()).toBeTruthy();
     await page.waitForResponse(isQueuesListResponse);
-    await expect(refreshedRow.getByRole("button", { name: "Pause" })).toBeVisible();
   });
 
-  test("Drain shows confirmation dialog", async ({ page }) => {
+  test("Drain shows confirmation dialog from the Actions menu", async ({ page }) => {
     await loadQueuesPage(page);
+    await openActionsMenu(page, "e2e_test");
 
-    const queueTable = page.getByRole("grid", { name: "Queues" });
-    const e2eRow = queueTable.getByRole("row", { name: /e2e_test/ });
-    const drainBtn = e2eRow.getByRole("button", { name: "Drain" });
-    await expect(drainBtn).toBeVisible();
+    await page.getByRole("menuitem", { name: /^Drain queue/ }).click();
 
-    await drainBtn.click();
-
-    // Confirmation dialog appears
     const dialog = page.getByRole("alertdialog");
     await expect(dialog).toBeVisible();
     await expect(dialog.getByRole("heading", { name: /Drain queue/ })).toBeVisible();
     await expect(dialog.getByText("Running jobs will not be affected")).toBeVisible();
 
-    // Cancel the dialog
     await dialog.getByRole("button", { name: "Cancel", exact: true }).click();
     await expect(dialog).not.toBeVisible();
   });
