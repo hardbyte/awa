@@ -74,10 +74,13 @@ export function RuntimePage() {
 
   // Optional: backends before 0.5.5-alpha return 404 for /storage, in which
   // case fetchStorage resolves to null and the card simply doesn't render.
+  // Once we've seen a null response the endpoint is known-absent for this
+  // session — stop polling so we don't hammer it with 404s every interval.
   const storageQuery = useQuery<StorageStatusReport | null>({
     queryKey: ["storage"],
     queryFn: fetchStorage,
-    refetchInterval: poll.interval,
+    refetchInterval: (query) =>
+      query.state.data === null ? false : poll.interval,
     staleTime: poll.staleTime,
     retry: false,
   });
