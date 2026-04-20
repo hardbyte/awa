@@ -6642,11 +6642,8 @@ impl QueueStorage {
         match truncate {
             Ok(_) => {
                 if !pruned_terminal_counts.is_empty() {
-                    self.adjust_terminal_rollups_batch(
-                        &mut tx,
-                        pruned_terminal_counts.into_iter(),
-                    )
-                    .await?;
+                    self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
+                        .await?;
                 }
                 tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(PruneOutcome::Pruned { slot })
