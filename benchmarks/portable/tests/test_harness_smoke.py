@@ -381,3 +381,39 @@ def test_parse_adapter_record_rejects_garbage_instance_id_silently():
     )
     assert sample is not None
     assert sample.instance_id == 0
+
+
+# ── --replicas CLI knob ─────────────────────────────────────────────────
+
+
+def test_config_replicas_defaults_to_one():
+    config = CliConfig(**_config_kwargs())
+    assert config.replicas == 1
+
+
+def test_config_replicas_accepts_positive_ints():
+    config = CliConfig(**_config_kwargs(replicas=5))
+    assert config.replicas == 5
+
+
+def test_config_rejects_zero_replicas():
+    # Zero is not "no adapter" — it's a confused CLI invocation. Fail
+    # clearly so the operator doesn't watch a no-op run complete.
+    with pytest.raises(ValidationError):
+        CliConfig(**_config_kwargs(replicas=0))
+
+
+def test_config_rejects_negative_replicas():
+    with pytest.raises(ValidationError):
+        CliConfig(**_config_kwargs(replicas=-1))
+
+
+def test_argparse_replicas_flag():
+    from bench_harness.orchestrator import build_parser
+
+    p = build_parser()
+    ns = p.parse_args(["--scenario", "idle_in_tx_saturation", "--replicas", "3"])
+    assert ns.replicas == 3
+    # Default survives when flag is absent.
+    ns = p.parse_args(["--scenario", "idle_in_tx_saturation"])
+    assert ns.replicas == 1

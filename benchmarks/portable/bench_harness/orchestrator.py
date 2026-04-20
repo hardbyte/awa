@@ -209,10 +209,35 @@ def preflight_database(manifest: AdapterManifest, *, recreate: bool = False) -> 
 
 
 @dataclass
-class RunningAdapter:
+class ReplicaHandle:
+    """One launched adapter replica: subprocess + its tailer + descriptor."""
+
+    instance_id: int
     process: subprocess.Popen
     tailer: threading.Thread
+    stop_event: threading.Event
     descriptor: dict
+
+
+@dataclass
+class RunningAdapter:
+    """A running adapter as a collection of 1..N replicas.
+
+    `descriptor` is the representative (first-received) descriptor used
+    for manifest inclusion and static-manifest cross-check. Per-replica
+    descriptors live on each `ReplicaHandle.descriptor`; they're checked
+    for agreement on static fields (event_tables, extensions) during
+    launch, with drift logged rather than fatal — the scenario may
+    intentionally mix versions in a later iteration of this work.
+    """
+
+    system: str
+    replicas: list[ReplicaHandle]
+    descriptor: dict
+
+    @property
+    def all_running(self) -> bool:
+        return all(r.process.poll() is None for r in self.replicas)
 
 
 def _tail_stdout(
@@ -255,21 +280,30 @@ def _tail_stdout(
             out_queue.put(s)
 
 
-def launch_adapter(
+def _launch_one_replica(
     system: str,
     entry: AdapterEntry,
     manifest: AdapterManifest,
     overrides: dict[str, str],
     *,
+    instance_id: int,
     run_id: str,
     bench_start: float,
     tracker: PhaseTracker,
     out_queue: "queue.Queue[Sample]",
-) -> RunningAdapter:
-    spec = entry.launcher(manifest, overrides)
+) -> ReplicaHandle:
+    """Launch one replica and wait for its startup descriptor."""
+    # Per-instance env: the only variable is BENCH_INSTANCE_ID. Copy the
+    # shared overrides first so the caller's producer-rate / worker-count
+    # values carry through; stamp the id last so it can't be overridden.
+    instance_overrides = dict(overrides)
+    instance_overrides["BENCH_INSTANCE_ID"] = str(instance_id)
+    spec = entry.launcher(manifest, instance_overrides)
     env = {**os.environ, **spec.env}
     print(
-        f"[harness] launching {system}: {' '.join(spec.argv[:2])}...", file=sys.stderr
+        f"[harness] launching {system} replica {instance_id}: "
+        f"{' '.join(spec.argv[:2])}...",
+        file=sys.stderr,
     )
     proc = subprocess.Popen(
         spec.argv,
@@ -294,7 +328,7 @@ def launch_adapter(
             descriptor_holder=descriptor_holder,
             stop_event=stop_event,
         ),
-        name=f"tail-{system}",
+        name=f"tail-{system}-{instance_id}",
         daemon=True,
     )
     tailer.start()
@@ -319,23 +353,108 @@ def launch_adapter(
     while "descriptor" not in descriptor_holder and time.time() < deadline:
         if proc.poll() is not None:
             raise _abort(
-                f"{system} exited during startup (rc={proc.returncode}) "
-                f"before emitting a descriptor record."
+                f"{system} replica {instance_id} exited during startup "
+                f"(rc={proc.returncode}) before emitting a descriptor record."
             )
         time.sleep(0.1)
     descriptor = descriptor_holder.get("descriptor")
     if not descriptor:
         raise _abort(
-            f"{system} did not emit a startup descriptor within 60s. "
-            "The harness requires a descriptor record to cross-check the "
-            "adapter against its static manifest; running blind would let "
-            "drift slip through unnoticed."
+            f"{system} replica {instance_id} did not emit a startup "
+            "descriptor within 60s. The harness requires a descriptor "
+            "record to cross-check the adapter against its static "
+            "manifest; running blind would let drift slip through "
+            "unnoticed."
         )
     try:
         _check_descriptor_drift(manifest, descriptor)
     except RuntimeError as exc:
         raise _abort(str(exc)) from exc
-    return RunningAdapter(process=proc, tailer=tailer, descriptor=descriptor)
+    return ReplicaHandle(
+        instance_id=instance_id,
+        process=proc,
+        tailer=tailer,
+        stop_event=stop_event,
+        descriptor=descriptor,
+    )
+
+
+def launch_adapter(
+    system: str,
+    entry: AdapterEntry,
+    manifest: AdapterManifest,
+    overrides: dict[str, str],
+    *,
+    replicas: int = 1,
+    run_id: str,
+    bench_start: float,
+    tracker: PhaseTracker,
+    out_queue: "queue.Queue[Sample]",
+) -> RunningAdapter:
+    if replicas < 1:
+        raise ValueError(f"replicas must be >= 1, got {replicas}")
+    handles: list[ReplicaHandle] = []
+    try:
+        for i in range(replicas):
+            handle = _launch_one_replica(
+                system,
+                entry,
+                manifest,
+                overrides,
+                instance_id=i,
+                run_id=run_id,
+                bench_start=bench_start,
+                tracker=tracker,
+                out_queue=out_queue,
+            )
+            handles.append(handle)
+    except Exception:
+        # Partial launch — tear down everything we did start before
+        # propagating. Preserves the "all-or-nothing" contract even when
+        # replica 2 of 3 fails its descriptor handshake.
+        for h in handles:
+            _terminate_replica(h, system, timeout_s=5.0)
+        raise
+
+    # Cross-replica agreement check on static fields. Drift here is not a
+    # scenario we test today, so log-and-continue rather than fail.
+    first = handles[0].descriptor
+    first_tables = sorted(first.get("event_tables") or [])
+    first_exts = sorted(first.get("extensions") or [])
+    for h in handles[1:]:
+        if sorted(h.descriptor.get("event_tables") or []) != first_tables:
+            print(
+                f"[{system}] WARNING: replica {h.instance_id} declared "
+                f"event_tables different from replica 0",
+                file=sys.stderr,
+            )
+        if sorted(h.descriptor.get("extensions") or []) != first_exts:
+            print(
+                f"[{system}] WARNING: replica {h.instance_id} declared "
+                f"extensions different from replica 0",
+                file=sys.stderr,
+            )
+    return RunningAdapter(system=system, replicas=handles, descriptor=first)
+
+
+def _terminate_replica(
+    handle: ReplicaHandle, system: str, timeout_s: float = 10.0
+) -> None:
+    proc = handle.process
+    if proc.poll() is None:
+        proc.send_signal(signal.SIGTERM)
+        try:
+            proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            print(
+                f"[{system}] replica {handle.instance_id} did not exit "
+                f"within {timeout_s}s, killing",
+                file=sys.stderr,
+            )
+            proc.kill()
+            proc.wait()
+    handle.stop_event.set()
+    handle.tailer.join(timeout=2.0)
 
 
 def _check_descriptor_drift(manifest: AdapterManifest, descriptor: dict) -> None:
@@ -360,18 +479,11 @@ def _check_descriptor_drift(manifest: AdapterManifest, descriptor: dict) -> None
 def terminate_adapter(
     running: RunningAdapter, system: str, timeout_s: float = 10.0
 ) -> None:
-    proc = running.process
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
-            print(
-                f"[{system}] did not exit within {timeout_s}s, killing", file=sys.stderr
-            )
-            proc.kill()
-            proc.wait()
-    running.tailer.join(timeout=2.0)
+    """Terminate every replica of a running adapter. Best-effort — each
+    replica is given `timeout_s` individually so a slow shutdown on one
+    replica doesn't rob the others of their full window."""
+    for handle in running.replicas:
+        _terminate_replica(handle, system, timeout_s=timeout_s)
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -411,6 +523,7 @@ def run_one_system(
     target_depth: int,
     worker_count: int,
     high_load_multiplier: float,
+    replicas: int = 1,
 ) -> dict:
     entry = ADAPTERS[system]
     manifest = AdapterManifest.load(entry.bench_dir)
@@ -443,6 +556,7 @@ def run_one_system(
         entry,
         manifest,
         overrides,
+        replicas=replicas,
         run_id=run_id,
         bench_start=bench_start,
         tracker=tracker,
@@ -504,15 +618,23 @@ def run_one_system(
 
 
 def _sleep_or_abort(seconds: float, adapter: RunningAdapter) -> None:
-    """Sleep in small increments so adapter crash is noticed quickly."""
+    """Sleep in small increments so replica crash is noticed quickly.
+
+    Any replica exiting unexpectedly during a phase aborts the whole
+    phase. Later scenarios (kill-worker, rolling-replace) are expected
+    to drive lifecycle changes through the phase registry, so a
+    surprise exit here genuinely indicates a fault.
+    """
     end = time.time() + seconds
     while time.time() < end:
         remaining = end - time.time()
         time.sleep(min(1.0, max(0.05, remaining)))
-        if adapter.process.poll() is not None:
-            raise RuntimeError(
-                f"adapter exited during phase (rc={adapter.process.returncode})"
-            )
+        for replica in adapter.replicas:
+            if replica.process.poll() is not None:
+                raise RuntimeError(
+                    f"{adapter.system} replica {replica.instance_id} exited "
+                    f"during phase (rc={replica.process.returncode})"
+                )
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -543,6 +665,7 @@ def drive(
     target_depth: int,
     worker_count: int,
     high_load_multiplier: float,
+    replicas: int,
     cli_args: list[str],
 ) -> Path:
     unknown = [s for s in systems if s not in ADAPTERS]
@@ -600,6 +723,7 @@ def drive(
                 target_depth=target_depth,
                 worker_count=worker_count,
                 high_load_multiplier=high_load_multiplier,
+                replicas=replicas,
             )
             # Merge the runtime descriptor the adapter emitted with the
             # harness-proven revision block (git SHA / submodule SHA /
@@ -741,6 +865,16 @@ def build_parser() -> argparse.ArgumentParser:
         default=1.5,
         help="Producer-rate multiplier applied during high-load phases (default 1.5).",
     )
+    parser.add_argument(
+        "--replicas",
+        type=int,
+        default=1,
+        help="Replica count per system (default 1). Each replica runs the "
+        "configured producer rate and worker count independently, so "
+        "N replicas at --producer-rate=800 offer 800*N jobs/s in "
+        "aggregate. Divide --producer-rate by --replicas to hold total "
+        "offered load constant across replica counts.",
+    )
     return parser
 
 
@@ -778,6 +912,7 @@ def main(argv: list[str] | None = None) -> int:
         target_depth=config.target_depth,
         worker_count=config.worker_count,
         high_load_multiplier=config.high_load_multiplier,
+        replicas=config.replicas,
         cli_args=list(sys.argv) if argv is None else list(argv),
     )
     return 0
