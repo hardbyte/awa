@@ -28,6 +28,8 @@ DEFAULT_TIMELINE_METRICS = [
     "n_dead_tup",
 ]
 
+DEFAULT_PHASE_FILTER = "steady"
+
 METRIC_LABELS = {
     "completion_rate": "Completion throughput",
     "enqueue_rate": "Producer throughput",
@@ -230,6 +232,8 @@ def _phase_table(summary: dict, systems: list[str], phases: list[Phase], system_
         system_block = summary["systems"].get(system, {})
         phase_map = system_block.get("phases", {})
         for phase in phases:
+            if phase.type.value == "warmup":
+                continue
             block = phase_map.get(phase.label)
             if not block:
                 continue
@@ -421,7 +425,7 @@ function seriesFor(metric) {
 }
 
 function currentPhaseLabel() {
-  return phaseSelect.value || 'all';
+  return phaseSelect.value || '__DEFAULT_PHASE_FILTER__';
 }
 
 function currentMetric() {
@@ -454,11 +458,19 @@ function renderTimeline() {
   const allSecondarySeries = secondaryMetric ? seriesFor(secondaryMetric) : {};
 
   const pointsBySystem = systems.map((system) => {
-    const points = (allSeries[system] || []).filter((pt) => phaseLabel === 'all' || pt.phase_label === phaseLabel);
+    const points = (allSeries[system] || []).filter((pt) => {
+      if (phaseLabel === 'all') return true;
+      if (phaseLabel === 'steady') return pt.phase_type !== 'warmup';
+      return pt.phase_label === phaseLabel;
+    });
     return { system, points };
   }).filter((entry) => entry.points.length > 0);
   const secondaryPointsBySystem = secondaryMetric ? systems.map((system) => {
-    const points = (allSecondarySeries[system] || []).filter((pt) => phaseLabel === 'all' || pt.phase_label === phaseLabel);
+    const points = (allSecondarySeries[system] || []).filter((pt) => {
+      if (phaseLabel === 'all') return true;
+      if (phaseLabel === 'steady') return pt.phase_type !== 'warmup';
+      return pt.phase_label === phaseLabel;
+    });
     return { system, points };
   }).filter((entry) => entry.points.length > 0) : [];
 
@@ -493,11 +505,18 @@ function renderTimeline() {
   const yScale = (y) => margin.top + plotH - ((y - minY) / Math.max(1e-9, maxY - minY)) * plotH;
   const yScale2 = (y) => margin.top + plotH - ((y - minY2) / Math.max(1e-9, maxY2 - minY2)) * plotH;
 
-  const phaseBands = phaseLabel === 'all' ? PHASES : PHASES.filter((p) => p.label === phaseLabel);
+  const phaseBands = phaseLabel === 'all'
+    ? PHASES
+    : phaseLabel === 'steady'
+      ? PHASES.filter((p) => p.type !== 'warmup')
+      : PHASES.filter((p) => p.label === phaseLabel);
   let phaseStart = 0;
   for (const phase of PHASES) {
     const phaseEnd = phaseStart + phase.duration_s;
-    if (phaseLabel !== 'all' && phase.label !== phaseLabel) {
+    const includePhase = phaseLabel === 'all'
+      || (phaseLabel === 'steady' && phase.type !== 'warmup')
+      || phase.label === phaseLabel;
+    if (!includePhase) {
       phaseStart = phaseEnd;
       continue;
     }
@@ -707,12 +726,13 @@ init();
           </label>
           <label>Phase
             <select id="phase-select">
+              <option value="steady" selected>Presented phases (exclude warmup)</option>
               <option value="all">All phases</option>
               {''.join(f"<option value='{p.label}'>{html.escape(p.label)} ({html.escape(p.type.value)})</option>" for p in phases)}
             </select>
           </label>
           <div id="system-chips" class="chips"></div>
-          <div class="hint">Solid lines use the left axis. Dashed comparison lines use the right axis.</div>
+          <div class="hint">Warmup is diagnostic-only and hidden by default. Solid lines use the left axis. Dashed comparison lines use the right axis.</div>
         </div>
         <div id="timeline" class="timeline-shell"></div>
         <div id="timeline-tooltip"></div>
@@ -757,7 +777,7 @@ init();
   </div>
 
   <script>
-  {script.replace('__SYSTEMS__', systems_json).replace('__PHASES__', phase_json).replace('__TIMELINE__', timeline_json).replace('__LABELS__', json.dumps(METRIC_LABELS)).replace('__PRESETS__', preset_json)}
+  {script.replace('__SYSTEMS__', systems_json).replace('__PHASES__', phase_json).replace('__TIMELINE__', timeline_json).replace('__LABELS__', json.dumps(METRIC_LABELS)).replace('__PRESETS__', preset_json).replace('__DEFAULT_PHASE_FILTER__', DEFAULT_PHASE_FILTER)}
   </script>
 </body>
 </html>"""
