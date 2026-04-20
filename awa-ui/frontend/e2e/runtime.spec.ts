@@ -33,11 +33,19 @@ test.describe("Runtime page", () => {
     // The "no live workers" problem is surfaced by the Attention card.
     // With zero total instances, the table's empty state falls through
     // to the "No worker instances recorded." copy (no stale to offer).
+    // The same copy renders in the mobile sm:hidden fallback too, so
+    // scope to the runtime-instances grid to avoid strict-mode matches.
     await expect(
       page.getByText("No live worker instances").first()
     ).toBeVisible();
-    await expect(page.getByText("No worker instances recorded.")).toBeVisible();
-    await expect(page.getByText("No queue runtime snapshots yet.")).toBeVisible();
+    await expect(
+      page.getByRole("grid", { name: "Runtime instances" })
+        .getByText("No worker instances recorded.")
+    ).toBeVisible();
+    await expect(
+      page.getByRole("grid", { name: "Queue runtime summary" })
+        .getByText("No queue runtime snapshots yet.")
+    ).toBeVisible();
   });
 
   test("renders instance and queue runtime details from API data", async ({ page }) => {
