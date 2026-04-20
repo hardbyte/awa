@@ -660,7 +660,7 @@ async fn test_storage_status_report_returns_canonical_baseline_on_fresh_install(
 
     let report = storage::status_report(&pool).await.unwrap();
     assert_eq!(report.status.active_engine, "canonical");
-    assert_eq!(report.status.state, "active");
+    assert_eq!(report.status.state, "canonical");
     assert_eq!(report.canonical_live_backlog, 0);
     assert!(report.prepared_queue_storage_schema.is_none());
     assert!(!report.prepared_schema_ready);
