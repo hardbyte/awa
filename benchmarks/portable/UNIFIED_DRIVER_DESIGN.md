@@ -42,22 +42,64 @@ All three are expressible as phase types in the existing DSL.
 
 ## 2. New phase types
 
-Grouped by target subsystem.
+Grouped by target subsystem. Each phase type's name encodes its fault
+semantics rather than taking a signal parameter — "`kill-*`" is
+SIGKILL, "`stop-*`" is SIGTERM, "`isolate-*`" / "`partition-*`" are
+network-level. That way a scenario reads honestly: modelling a
+rolling replica restart picks `stop-worker`, modelling a crash picks
+`kill-worker`, modelling a split brain picks `isolate-worker`.
 
-### Adapter-directed
+### Worker-directed (harsh: SIGKILL)
 
-- **`kill-instance`** — SIGKILL a specific replica of the running
+- **`kill-worker`** — SIGKILL a specific replica of the running
   adapter. Takes an `instance: int` parameter (default `0`). Harness
   records the exact kill timestamp as a phase boundary; the process
   stays down until the phase ends, then the relauncher restarts it.
   Replaces `scenario_crash_recovery`.
-- **`repeated-kills`** — the same but with a `period_s: float`
-  parameter that kills the instance repeatedly across the phase
-  duration (current `scenario_repeated_kills`).
+- **`repeated-kills`** — same but with a `period_s: float` parameter
+  that kills the instance repeatedly across the phase duration.
+  Replaces `scenario_repeated_kills`.
 - **`kill-leader`** — a multi-replica variant: identifies the current
   leader (via a simple "whoever holds the maintenance advisory lock"
   SQL probe for Awa; per-adapter probe functions for River/Oban) and
   kills it. Replaces `scenario_leader_failover`.
+
+### Worker-directed (graceful: SIGTERM)
+
+- **`stop-worker`** — SIGTERM a specific replica. Waits for graceful
+  shutdown within a bounded window before escalating to SIGKILL.
+  Models the "rolling replica replace" operator workflow that today
+  has no coverage in chaos.py — a proper answer to "does the fleet
+  stay correct during a rolling deploy?"
+- **`rolling-replace`** — composable macro: `stop-worker(i)` →
+  `start-worker(i)` for each `i` in sequence, with configurable
+  inter-step dwell. Expressible as a phase sequence rather than a
+  new primitive, so it lives as a named `SCENARIOS` entry, not a
+  phase type.
+
+### Worker-directed (isolation)
+
+- **`isolate-worker`** — drop network packets between a replica and
+  Postgres via `iptables` / `docker network disconnect` for the
+  phase duration, then restore. Models a partial-partition scenario
+  (replica still alive, can't reach PG). The lease + heartbeat
+  semantics should push its in-flight jobs onto other replicas;
+  this phase verifies that.
+
+### Postgres-directed
+
+- **`pg-restart`** — `docker restart portable-postgres-1`. Entire
+  fleet experiences a PG drop. Replaces `scenario_postgres_restart`.
+- **`pg-backend-kill`** — `pg_terminate_backend(...)` against all
+  adapter connections. Replaces `scenario_pg_backend_kill`.
+- **`pool-exhaustion`** — drop `max_connections` on the running PG
+  container for the phase duration. Replaces
+  `scenario_pool_exhaustion`; note that existing adapters configure
+  pool size per process, so this hits all replicas uniformly.
+- **`partition-pg`** — block network traffic to Postgres from *all*
+  replicas. Harsher than `pg-backend-kill` (connections can't
+  reconnect until restored). Models a PG-side partition rather than
+  a restart.
 
 ### Postgres-directed
 
@@ -159,32 +201,34 @@ own.
 3. **Relauncher contract.** `ReplicaPool` in the harness, with
    start/stop/restart. Existing scenarios still invoke it in "start
    once" mode.
-4. **New phase type #1: `kill-instance`.** Smallest destructive phase;
+4. **New phase type #1: `kill-worker`.** Smallest destructive phase;
    proves the relauncher works. Port `scenario_crash_recovery` as a
    named phase sequence. Keep `chaos.py::scenario_crash_recovery`
-   alive in parallel; add a CI job that runs both and asserts
-   derived outcomes match.
-5. **Remaining adapter-directed phases:** `repeated-kills`, `kill-leader`.
-6. **Postgres-directed phases:** `pg-restart`, `pg-backend-kill`,
+   alive in parallel for one commit; add a CI job that runs both and
+   asserts derived outcomes match. Once agreement is established,
+   the legacy scenario is deleted in the same PR.
+5. **Remaining harsh phases:** `repeated-kills`, `kill-leader`.
+6. **Graceful phases:** `stop-worker` (SIGTERM), `rolling-replace`
+   (as a named phase sequence composing `stop-worker` +
+   `start-worker`).
+7. **Isolation phases:** `isolate-worker`, `partition-pg`.
+8. **Postgres-directed phases:** `pg-restart`, `pg-backend-kill`,
    `pool-exhaustion`.
-7. **Load-directed setup-hook:** `retry-storm`, `priority-starvation`
+9. **Load-directed setup-hook:** `retry-storm`, `priority-starvation`
    as `setup_sql` hooks on a `high-load` phase.
-8. **Cut-over.** Rename `long_horizon.py` to `run.py` (or keep as-is),
-   `chaos.py` becomes a 30-line dispatcher that translates its
-   legacy CLI into the phase DSL and forwards. All 8 chaos scenarios
-   are reachable via both entry points.
-9. **Delete chaos.py.** Per-system SQL dict, `start_<system>_worker`
-   functions, and the if/elif ladders are gone. The CodeRabbit-
-   caught class of bug (priority-starvation missing docker image
-   names across three near-identical argv lists) cannot recur —
-   there's one launcher, not six.
-10. **Documentation.** Update `CONTRIBUTING_ADAPTERS.md` with the
+10. **Delete chaos.py.** Per-system SQL dict, `start_<system>_worker`
+    functions, and the if/elif ladders are gone. The CodeRabbit-
+    caught class of bug (priority-starvation missing docker image
+    names across three near-identical argv lists) cannot recur —
+    there's one launcher, not six. No shim, no dispatcher alias:
+    the legacy CLI is gone at merge.
+11. **Documentation.** Update `CONTRIBUTING_ADAPTERS.md` with the
     new contract. One README, one driver.
 
 ## 7. Acceptance gate (copied from #174, annotated)
 
-- [ ] `chaos.py` deleted or reduced to a thin alias dispatching to the
-      unified entry point.
+- [ ] `chaos.py` deleted outright. No dispatcher alias, no shim window.
+      Legacy CLI users migrate by reading the new driver's help output.
 - [ ] No per-adapter identifier (`"awa"`, `"river"`, `"oban"`,
       `"procrastinate"`, `"pgque"`) appears in any central harness
       file. Anything adapter-specific lives under the adapter's
@@ -205,10 +249,9 @@ own.
   (`rate_limit_test.rs` is single-client). The `replicas` knob
   unlocks a one-line scenario for it, but wiring that test is a
   separate piece of work.
-- **Extracting `benchmarks/portable/` into its own repo.** Separate
-  tracking issue. This branch stays in-tree, structured so that
-  extraction (when it happens) is a near-mechanical `git-filter-repo`
-  move.
+- **Extracting `benchmarks/portable/` into its own repo.** Parked.
+  Staying in-tree for now, with the contribution-friction / neutrality
+  arguments deferred until the unified driver is stable.
 
 ## 9. Risks and mitigations
 
@@ -228,18 +271,19 @@ own.
   stay system-aggregated by default (sum/mean across replicas),
   with an opt-in `--per-replica` flag for debugging.
 
-## 10. Open questions for reviewer
+## 10. Decisions locked in
 
-1. **Naming.** `kill-instance` vs. `kill-adapter` vs. `kill-worker`.
-   The existing `long-horizon` DSL talks about workers; chaos talks
-   about processes; React terminology is "instances". Pick one and
-   hold.
-2. **Preserving legacy CLI for a release cycle.** The unification
-   is long-awaited but external consumers (Partly, if any,
-   dashboards reading the old `chaos_summary_*.csv` shape) might
-   pin the old tool. Shim window: should `chaos.py` stay as a
-   dispatcher for one release, or cut over at merge?
-3. **Relauncher SIGTERM vs SIGKILL default.** Destructive chaos
-   historically uses SIGKILL ("no graceful shutdown"). For rolling-
-   replace, SIGTERM is more realistic. Expose both, default SIGKILL
-   for `kill-*` phase types, SIGTERM for `rolling-replace`.
+Resolved from the initial review on this branch:
+
+1. **Naming**: `kill-worker` (plus `stop-worker`, `isolate-worker`,
+   etc.) — matches the Rust trait (`Worker`) and the long-horizon
+   DSL, drops the chaos-specific "instance" / "adapter process"
+   terminology.
+2. **Legacy CLI**: `chaos.py` is deleted at merge. No shim, no
+   dispatcher alias. Users migrate by reading `long_horizon.py
+   --help` and the named scenarios it exposes.
+3. **Signals per phase type, not per run**: each phase type encodes
+   its fault model in its name. `kill-*` is SIGKILL, `stop-*` is
+   SIGTERM, `isolate-*` / `partition-*` are network-level. No
+   top-level default, no per-phase signal parameter — scenarios
+   read honestly by their phase-type names.
