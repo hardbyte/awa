@@ -1290,6 +1290,44 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            let mut backfill_tx = pool.begin().await.map_err(map_sqlx_error)?;
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.queue_terminal_rollups AS rollups (
+                queue,
+                priority,
+                pruned_completed_count
+            )
+            SELECT
+                queue,
+                priority,
+                pruned_completed_count
+            FROM {schema}.queue_lanes
+            WHERE pruned_completed_count > 0
+            ON CONFLICT (queue, priority) DO UPDATE
+            SET pruned_completed_count = GREATEST(
+                rollups.pruned_completed_count,
+                EXCLUDED.pruned_completed_count
+            )
+            "#
+            ))
+            .execute(backfill_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            UPDATE {schema}.queue_lanes
+            SET pruned_completed_count = 0
+            WHERE pruned_completed_count > 0
+            "#
+            ))
+            .execute(backfill_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            backfill_tx.commit().await.map_err(map_sqlx_error)?;
+
             sqlx::query(
                 r#"
             CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
@@ -2754,20 +2792,6 @@ impl QueueStorage {
         Ok(())
     }
 
-    async fn adjust_terminal_rollups_on_pool<I>(
-        &self,
-        pool: &PgPool,
-        deltas: I,
-    ) -> Result<(), AwaError>
-    where
-        I: IntoIterator<Item = (String, i16, i64)>,
-    {
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.adjust_terminal_rollups_batch(&mut tx, deltas).await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(())
-    }
-
     async fn enqueue_runtime_rows(
         &self,
         pool: &PgPool,
@@ -3307,9 +3331,26 @@ impl QueueStorage {
                 WHERE queue = $1
             ),
             pruned_terminal AS (
-                SELECT COALESCE(sum(pruned_completed_count), 0)::bigint AS completed
-                FROM {schema}.queue_terminal_rollups
-                WHERE queue = $1
+                SELECT COALESCE(
+                    sum(
+                        GREATEST(
+                            COALESCE(lanes.pruned_completed_count, 0),
+                            COALESCE(rollups.pruned_completed_count, 0)
+                        )
+                    ),
+                    0
+                )::bigint AS completed
+                FROM (
+                    SELECT queue, priority, pruned_completed_count
+                    FROM {schema}.queue_lanes
+                    WHERE queue = $1
+                ) AS lanes
+                FULL OUTER JOIN (
+                    SELECT queue, priority, pruned_completed_count
+                    FROM {schema}.queue_terminal_rollups
+                    WHERE queue = $1
+                ) AS rollups
+                USING (queue, priority)
             ),
             live_running AS (
                 SELECT count(*)::bigint AS running
@@ -6600,16 +6641,16 @@ impl QueueStorage {
 
         match truncate {
             Ok(_) => {
-                tx.commit().await.map_err(map_sqlx_error)?;
                 if !pruned_terminal_counts.is_empty() {
-                    self.adjust_terminal_rollups_on_pool(
-                        pool,
+                    self.adjust_terminal_rollups_batch(
+                        &mut tx,
                         pruned_terminal_counts
                             .into_iter()
                             .map(|(queue, priority, count)| (queue, priority, count)),
                     )
                     .await?;
                 }
+                tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(PruneOutcome::Pruned { slot })
             }
             Err(_) => {

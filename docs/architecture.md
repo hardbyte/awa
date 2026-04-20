@@ -58,9 +58,8 @@ truth when this overview needs more detail.
   `attempt_state`
 - control plane: `lane_state` plus ready/lease segment cursor tables
 - `lane_state` stays off the terminal-completion hot path: live completion
-  totals come from `terminal_entries`, and the cached
-  `pruned_completed_count` rollup is applied only after successful segment
-  prune
+  totals come from `terminal_entries`, and the cached cold rollup used to keep
+  counts stable across prune lives outside `lane_state`
 - maintenance leader: promotion, rescue, rotation, prune, DLQ retention, and
   queue-health publication
 

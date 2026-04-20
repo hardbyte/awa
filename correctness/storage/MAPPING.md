@@ -26,10 +26,10 @@ implementation.
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
 
-The TLA+ model does not represent `queue_lanes.pruned_completed_count`.
-That rollup is an implementation-level cache used by `queue_counts()` to keep
-completed totals stable across terminal-segment prune without putting terminal
-counter updates on the completion hot path.
+The TLA+ model does not represent the cold completed-history rollup cache.
+Rust currently stores that in `{schema}.queue_terminal_rollups`, with
+`queue_lanes.pruned_completed_count` kept only as a transitional legacy source
+for backfill / fallback reads during upgrades.
 
 ## Action mapping
 
@@ -60,7 +60,7 @@ counter updates on the completion hot path.
 | `PurgeDlq(j)` | `QueueStorage::purge_dlq_job` / bulk `purge_dlq` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
 | `RotateDeferredSegments` / `RotateWaitingSegments` / `RotateLeaseSegments` / `RotateDlqSegments` | parallel maintenance rotate functions per family | analogous `UPDATE *_ring_state` |
-| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx; Rust also applies the cold `pruned_completed_count` rollup after a successful terminal-segment prune |
+| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
 | `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family | `TRUNCATE {schema}.X_segment_N` with active-row check |
 
 ## Invariant mapping
@@ -78,7 +78,7 @@ counter updates on the completion hot path.
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
 | `PrunedXSegmentsAreEmpty` | per-family prune requires no live-row precondition before TRUNCATE |
-| `LaneStateConsistent` | `queue_lanes.available_count` is maintained by enqueue/claim transitions; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus `queue_lanes.pruned_completed_count`, which is updated only after successful prune |
+| `LaneStateConsistent` | `queue_lanes.available_count` is maintained by enqueue/claim transitions; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
 
 ## Known modelling gaps with implementation implications
 

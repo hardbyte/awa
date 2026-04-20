@@ -92,18 +92,18 @@ The implementation and migrations use these physical names:
 7. `lane_state` and segment cursor tables
 
 - Queue-local cursor metadata lives in a tiny hot table.
-- `lane_state` owns enqueue and claim cursors, `available_count`, and the cold
-  `pruned_completed_count` rollup used to preserve queue counts across
-  terminal-segment prune.
+- `lane_state` owns enqueue and claim cursors plus `available_count`.
+- Completed-history rollups live in a separate cold cache table so prune can
+  preserve queue counts without serializing on the hot `lane_state` rows.
 - Completion must not update `lane_state` on every terminal transition; the
   hot path only mutates claim/enqueue control state. Per-completion
   `running` / `completed` counter updates on a single busy lane collapse
   throughput by an order of magnitude under benchmark, so `running` is
   derived from `active_leases` and terminal counts come from live
   `terminal_entries` plus the post-prune rollup rather than from a hot
-  completion counter. The rollup is applied only after a successful prune,
-  outside the lock-holding transaction, so the prune path does not serialize
-  on the same hot `lane_state` rows as claim and enqueue.
+  completion counter. That rollup is written in the prune transaction, but to
+  a separate cold table rather than to `lane_state`, so the prune path does
+  not serialize on the same hot rows as claim and enqueue.
 - Ready and lease segment cursor tables tell dispatch and maintenance which
   physical segment is active, claimable, or prunable.
 - Rotation state for queue and lease segments is owned by the maintenance
