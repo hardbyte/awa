@@ -80,6 +80,13 @@ pub struct AwaMetrics {
     /// Info gauge for declared job-kind descriptors. Same pattern as
     /// [`queue_info`][Self::queue_info].
     pub job_kind_info: Gauge<i64>,
+    /// Readiness gauge for storage transition actions such as
+    /// `enter_mixed_transition` and `finalize` (1 = ready, 0 = blocked).
+    pub storage_transition_ready: Gauge<i64>,
+    /// Current canonical live backlog observed by queue-storage-capable runtimes.
+    pub storage_canonical_live_backlog: Gauge<i64>,
+    /// Current live runtime count per reported storage capability.
+    pub storage_live_runtime_capability: Gauge<i64>,
 }
 
 impl AwaMetrics {
@@ -234,6 +241,21 @@ impl AwaMetrics {
                     "Declared job-kind descriptors (always 1; use as a label-join target)",
                 )
                 .with_unit("{kind}")
+                .build(),
+            storage_transition_ready: meter
+                .i64_gauge("awa.storage.transition_ready")
+                .with_description("Storage transition readiness by action (1 = ready, 0 = blocked)")
+                .with_unit("{state}")
+                .build(),
+            storage_canonical_live_backlog: meter
+                .i64_gauge("awa.storage.canonical_live_backlog")
+                .with_description("Current canonical live backlog during a storage transition")
+                .with_unit("{job}")
+                .build(),
+            storage_live_runtime_capability: meter
+                .i64_gauge("awa.storage.live_runtime_capability")
+                .with_description("Current live runtime count by reported storage capability")
+                .with_unit("{runtime}")
                 .build(),
         }
     }
@@ -517,6 +539,30 @@ impl AwaMetrics {
             ));
         }
         self.job_kind_info.record(1, &attrs);
+    }
+
+    /// Record whether a storage transition action is currently ready.
+    pub fn record_storage_transition_ready(&self, action: &str, ready: bool) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.storage.action",
+            action.to_string(),
+        )];
+        self.storage_transition_ready
+            .record(if ready { 1 } else { 0 }, &attrs);
+    }
+
+    /// Record canonical live backlog for the storage transition.
+    pub fn record_storage_canonical_live_backlog(&self, count: i64) {
+        self.storage_canonical_live_backlog.record(count, &[]);
+    }
+
+    /// Record the number of live runtimes reporting a given storage capability.
+    pub fn record_storage_live_runtime_capability(&self, capability: &str, count: i64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.storage.capability",
+            capability.to_string(),
+        )];
+        self.storage_live_runtime_capability.record(count, &attrs);
     }
 }
 

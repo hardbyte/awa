@@ -923,6 +923,48 @@ impl Client {
         reporter.publish_snapshot().await;
     }
 
+    async fn log_transition_startup_status(
+        &self,
+        effective_storage: &RuntimeStorage,
+    ) -> Result<(), awa_model::AwaError> {
+        if self.storage.queue_storage().is_none() {
+            return Ok(());
+        }
+
+        let report = transition::status_report(&self.pool).await?;
+        let effective_engine = match effective_storage {
+            RuntimeStorage::Canonical => "canonical",
+            RuntimeStorage::QueueStorage(_) => "queue_storage",
+        };
+
+        info!(
+            transition_role = ?self.transition_role,
+            state = %report.status.state,
+            current_engine = %report.status.current_engine,
+            active_engine = %report.status.active_engine,
+            prepared_engine = ?report.status.prepared_engine,
+            effective_engine,
+            canonical_live_backlog = report.canonical_live_backlog,
+            "Resolved storage transition state for worker startup"
+        );
+
+        if report.status.state == "prepared" && !report.can_enter_mixed_transition {
+            warn!(
+                blockers = %report.enter_mixed_transition_blockers.join("; "),
+                "Storage transition is prepared but cannot yet enter mixed transition"
+            );
+        }
+
+        if report.status.state == "mixed_transition" && !report.can_finalize {
+            warn!(
+                blockers = %report.finalize_blockers.join("; "),
+                "Storage transition is in mixed_transition but cannot yet finalize"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Start the worker runtime. Spawns dispatchers, heartbeat, and maintenance.
     pub async fn start(&self) -> Result<(), awa_model::AwaError> {
         info!(
@@ -936,6 +978,8 @@ impl Client {
             let mut guard = self.effective_storage.write().await;
             *guard = effective_storage.clone();
         }
+
+        self.log_transition_startup_status(&effective_storage).await?;
 
         admin::sync_queue_descriptors(
             &self.pool,
@@ -1479,6 +1523,47 @@ impl RuntimeReporterState {
         let snapshot = self.snapshot_input().await;
         if let Err(err) = admin::upsert_runtime_snapshot(&self.pool, &snapshot).await {
             warn!(error = %err, "Failed to publish runtime snapshot");
+        }
+
+        if self.queue_storage_capable {
+            match transition::status_report(&self.pool).await {
+                Ok(report) => {
+                    self.metrics
+                        .record_storage_transition_ready(
+                            "enter_mixed_transition",
+                            report.can_enter_mixed_transition,
+                        );
+                    self.metrics
+                        .record_storage_transition_ready("finalize", report.can_finalize);
+                    self.metrics
+                        .record_storage_canonical_live_backlog(report.canonical_live_backlog);
+
+                    for capability in ["canonical", "canonical_drain_only", "queue_storage"] {
+                        let count = report
+                            .live_runtime_capability_counts
+                            .get(capability)
+                            .copied()
+                            .unwrap_or(0) as i64;
+                        self.metrics
+                            .record_storage_live_runtime_capability(capability, count);
+                    }
+
+                    for (capability, count) in report.live_runtime_capability_counts {
+                        if capability != "canonical"
+                            && capability != "canonical_drain_only"
+                            && capability != "queue_storage"
+                        {
+                            self.metrics.record_storage_live_runtime_capability(
+                                &capability,
+                                count as i64,
+                            );
+                        }
+                    }
+                }
+                Err(err) => {
+                    warn!(error = %err, "Failed to publish storage transition metrics");
+                }
+            }
         }
     }
 
