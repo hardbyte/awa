@@ -22,12 +22,15 @@ function kindLabel(kind: JobKindOverview): string {
   return kind.display_name?.trim() ? kind.display_name : kind.kind;
 }
 
-function descriptorSyncLabel(kind: JobKindOverview): string {
+// Only surfaces a line when the descriptor needs attention — drift, stale,
+// or not declared. A fresh descriptor is implied by the row's presence.
+function descriptorSyncLabel(kind: JobKindOverview): string | null {
   if (kind.descriptor_mismatch) return "Descriptor drift across live runtimes";
   if (!kind.descriptor_last_seen_at) return "Descriptor not declared";
-  return kind.descriptor_stale
-    ? `Descriptor stale · seen ${timeAgo(kind.descriptor_last_seen_at)}`
-    : `Descriptor seen ${timeAgo(kind.descriptor_last_seen_at)}`;
+  if (kind.descriptor_stale) {
+    return `Descriptor stale · seen ${timeAgo(kind.descriptor_last_seen_at)}`;
+  }
+  return null;
 }
 
 export function KindsPage() {
@@ -45,7 +48,17 @@ export function KindsPage() {
     <div className="space-y-4">
       <Heading level={2}>Job Kinds</Heading>
 
-      {kinds.length > 0 && (
+      {kinds.length === 0 ? (
+        <div
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+        >
+          {kindsQuery.isLoading
+            ? "Loading job kinds…"
+            : kindsQuery.isError
+              ? "Failed to load job kinds."
+              : "No job kinds found."}
+        </div>
+      ) : (
         <div className="space-y-3 sm:hidden">
           {kinds.map((kind) => (
             <div key={kind.kind} className="rounded-lg border p-4">
@@ -61,9 +74,11 @@ export function KindsPage() {
                   {kind.display_name && (
                     <div className="text-xs text-muted-fg">{kind.kind}</div>
                   )}
-                  <div className="mt-1 text-xs text-muted-fg">
-                    {descriptorSyncLabel(kind)}
-                  </div>
+                  {descriptorSyncLabel(kind) && (
+                    <div className="mt-1 text-xs text-muted-fg">
+                      {descriptorSyncLabel(kind)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {!kind.descriptor_last_seen_at ? (
@@ -110,18 +125,29 @@ export function KindsPage() {
         </div>
       )}
 
-      {kinds.length > 0 ? (
-        <Table aria-label="Job kinds" className="hidden sm:table">
-          <TableHeader>
-            <TableColumn isRowHeader>Kind</TableColumn>
-            <TableColumn>Jobs</TableColumn>
-            <TableColumn>Queues</TableColumn>
-            <TableColumn>Completed/hr</TableColumn>
-            <TableColumn>Owner</TableColumn>
-            <TableColumn>Status</TableColumn>
-          </TableHeader>
-          <TableBody>
-            {kinds.map((kind) => (
+      <Table aria-label="Job kinds" className="hidden sm:table">
+        <TableHeader>
+          <TableColumn isRowHeader>Kind</TableColumn>
+          <TableColumn className="text-right">Jobs</TableColumn>
+          <TableColumn className="text-right">Queues</TableColumn>
+          <TableColumn className="text-right">Completed/hr</TableColumn>
+          <TableColumn>Owner</TableColumn>
+          <TableColumn>Status</TableColumn>
+        </TableHeader>
+        <TableBody
+          renderEmptyState={() => (
+            <div
+              className={`p-6 text-center text-sm ${kindsQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {kindsQuery.isLoading
+                ? "Loading job kinds…"
+                : kindsQuery.isError
+                  ? "Failed to load job kinds."
+                  : "No job kinds found."}
+            </div>
+          )}
+        >
+          {kinds.map((kind) => (
               <TableRow key={kind.kind} id={kind.kind}>
                 <TableCell className="font-medium">
                   <div>
@@ -140,14 +166,22 @@ export function KindsPage() {
                         {kind.description}
                       </div>
                     )}
-                    <div className="mt-1 text-xs font-normal text-muted-fg">
-                      {descriptorSyncLabel(kind)}
-                    </div>
+                    {descriptorSyncLabel(kind) && (
+                      <div className="mt-1 text-xs font-normal text-muted-fg">
+                        {descriptorSyncLabel(kind)}
+                      </div>
+                    )}
                   </div>
                 </TableCell>
-                <TableCell>{kind.job_count.toLocaleString()}</TableCell>
-                <TableCell>{kind.queue_count.toLocaleString()}</TableCell>
-                <TableCell>{kind.completed_last_hour.toLocaleString()}</TableCell>
+                <TableCell className="text-right tabular-nums">
+                  {kind.job_count.toLocaleString()}
+                </TableCell>
+                <TableCell className="text-right tabular-nums">
+                  {kind.queue_count.toLocaleString()}
+                </TableCell>
+                <TableCell className="text-right tabular-nums">
+                  {kind.completed_last_hour.toLocaleString()}
+                </TableCell>
                 <TableCell>{kind.owner ?? "—"}</TableCell>
                 <TableCell>
                   <div className="flex flex-wrap gap-1">
@@ -165,13 +199,8 @@ export function KindsPage() {
                 </TableCell>
               </TableRow>
             ))}
-          </TableBody>
-        </Table>
-      ) : kindsQuery.isLoading ? (
-        <p className="text-sm text-muted-fg">Loading...</p>
-      ) : (
-        <p className="text-sm text-muted-fg">No job kinds found.</p>
-      )}
+        </TableBody>
+      </Table>
     </div>
   );
 }

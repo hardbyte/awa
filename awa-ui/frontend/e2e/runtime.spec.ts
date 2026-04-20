@@ -30,10 +30,22 @@ test.describe("Runtime page", () => {
 
     await page.goto("/runtime");
 
+    // The "no live workers" problem is surfaced by the Attention card.
+    // With zero total instances, the table's empty state falls through
+    // to the "No worker instances recorded." copy (no stale to offer).
+    // The same copy renders in the mobile sm:hidden fallback too, so
+    // scope to the runtime-instances grid to avoid strict-mode matches.
     await expect(
-      page.getByText("No runtime snapshots yet. Start a worker to populate this view.")
+      page.getByText("No live worker instances").first()
     ).toBeVisible();
-    await expect(page.getByText("No queue runtime snapshots yet.")).toBeVisible();
+    await expect(
+      page.getByRole("grid", { name: "Runtime instances" })
+        .getByText("No worker instances recorded.")
+    ).toBeVisible();
+    await expect(
+      page.getByRole("grid", { name: "Queue runtime summary" })
+        .getByText("No queue runtime snapshots yet.")
+    ).toBeVisible();
   });
 
   test("renders instance and queue runtime details from API data", async ({ page }) => {
@@ -256,7 +268,8 @@ test.describe("Runtime page", () => {
 
     await page.goto("/runtime");
     const instancesGrid = page.getByRole("grid", { name: "Runtime instances" });
-    await instancesGrid.getByRole("link", { name: "View details" }).click();
+    // Whole row is clickable (design refresh: affordance fix)
+    await instancesGrid.getByRole("rowheader", { name: /worker-a/ }).click();
 
     await expect(page).toHaveURL(/\/runtime\/11111111-1111-4111-8111-111111111111$/);
     await expect(page.getByRole("heading", { name: "worker-a" })).toBeVisible();

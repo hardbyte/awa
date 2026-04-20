@@ -2,6 +2,7 @@ use axum::extract::State;
 use axum::Json;
 
 use awa_model::admin;
+use awa_model::storage;
 
 use crate::cache::CacheError;
 use crate::error::ApiError;
@@ -37,4 +38,20 @@ pub async fn list_queue_runtime(
         })
         .await?;
     Ok(Json(summary))
+}
+
+pub async fn get_storage(
+    State(state): State<AppState>,
+) -> Result<Json<storage::StorageStatusReport>, ApiError> {
+    let pool = state.pool.clone();
+    let report = state
+        .cache
+        .storage
+        .try_get_with((), async {
+            storage::status_report(&pool)
+                .await
+                .map_err(CacheError::from)
+        })
+        .await?;
+    Ok(Json(report))
 }

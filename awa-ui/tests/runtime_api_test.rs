@@ -2,6 +2,7 @@ use awa_model::admin::{
     self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeOverview, RuntimeSnapshotInput, StorageCapability,
 };
+use awa_model::storage::StorageStatusReport;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
@@ -461,5 +462,53 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             .and_then(|cfg| cfg.get("weight"))
             .and_then(Value::as_u64),
         Some(3)
+    );
+}
+
+#[tokio::test]
+async fn test_storage_endpoint_returns_canonical_baseline_report() {
+    let pool = setup_pool().await;
+    sqlx::query("SELECT * FROM awa.storage_abort()")
+        .execute(&pool)
+        .await
+        .expect("storage abort reset should succeed");
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/storage")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("storage request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let report: StorageStatusReport =
+        serde_json::from_slice(&body).expect("storage report should deserialize");
+
+    // On a canonical-only cluster the readiness gates should all be
+    // closed — prepared_engine is None and no queue-storage runtimes
+    // are reporting. The blocker lists must be populated so operators
+    // can see what's missing before kicking off a rollout.
+    assert_eq!(report.status.active_engine, "canonical");
+    assert!(report.prepared_queue_storage_schema.is_none());
+    assert!(!report.prepared_schema_ready);
+    assert!(!report.can_enter_mixed_transition);
+    assert!(!report.can_finalize);
+    assert!(
+        !report.enter_mixed_transition_blockers.is_empty(),
+        "canonical baseline should list at least one enter-mixed-transition blocker"
+    );
+    assert!(
+        !report.finalize_blockers.is_empty(),
+        "canonical baseline should list at least one finalize blocker"
     );
 }

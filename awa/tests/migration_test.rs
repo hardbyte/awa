@@ -651,6 +651,28 @@ async fn test_storage_finalize_stub_requires_0_6() {
 }
 
 #[tokio::test]
+async fn test_storage_status_report_returns_canonical_baseline_on_fresh_install() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let report = storage::status_report(&pool).await.unwrap();
+    assert_eq!(report.status.active_engine, "canonical");
+    assert_eq!(report.status.state, "canonical");
+    assert_eq!(report.canonical_live_backlog, 0);
+    assert!(report.prepared_queue_storage_schema.is_none());
+    assert!(!report.prepared_schema_ready);
+    assert!(!report.can_enter_mixed_transition);
+    assert!(!report.can_finalize);
+    assert!(
+        !report.enter_mixed_transition_blockers.is_empty(),
+        "fresh install should report at least one blocker"
+    );
+}
+
+#[tokio::test]
 async fn test_mixed_transition_fails_safe_for_0_5_producers() {
     let _guard = test_mutex().lock().await;
     let pool = pool().await;

@@ -243,12 +243,15 @@ export function JobsPage() {
     });
   };
 
+  // Any change that shifts the visible result set clears bulk selection —
+  // otherwise the toolbar count reflects ids that are no longer visible.
   const setSearch = (q: string) => {
+    setSelected(new Set());
     setUrlParams({ q: q || undefined, before_id: undefined });
   };
 
-
   const setBeforeId = (id: number | undefined) => {
+    setSelected(new Set());
     setUrlParams({
       before_id: id !== undefined ? String(id) : undefined,
     });
@@ -392,9 +395,12 @@ export function JobsPage() {
       {/* Mobile card layout */}
       <div className="space-y-2 sm:hidden">
         {jobsQuery.isLoading && (
-          <p className="py-8 text-center text-sm text-muted-fg">Loading...</p>
+          <p className="py-8 text-center text-sm text-muted-fg">Loading…</p>
         )}
-        {!jobsQuery.isLoading && jobs.length === 0 && (
+        {!jobsQuery.isLoading && jobsQuery.isError && (
+          <p className="py-8 text-center text-sm text-danger-fg">Failed to load jobs.</p>
+        )}
+        {!jobsQuery.isLoading && !jobsQuery.isError && jobs.length === 0 && (
           <p className="py-8 text-center text-sm text-muted-fg">No jobs found.</p>
         )}
         {jobs.map((job) => (
@@ -492,23 +498,33 @@ export function JobsPage() {
           <TableColumn isRowHeader>Kind</TableColumn>
           <TableColumn>State</TableColumn>
           <TableColumn>Queue</TableColumn>
-          <TableColumn>Pri</TableColumn>
-          <TableColumn>Attempt</TableColumn>
+          <TableColumn className="text-right">Pri</TableColumn>
+          <TableColumn className="text-right">Attempt</TableColumn>
           <TableColumn>Tags</TableColumn>
           <TableColumn>{timeColumnLabel(filters.state)}</TableColumn>
         </TableHeader>
         <TableBody
-          renderEmptyState={() =>
-            jobsQuery.isLoading ? (
-              <div className="flex h-32 items-center justify-center text-sm text-muted-fg">
-                Loading...
-              </div>
-            ) : (
+          renderEmptyState={() => {
+            if (jobsQuery.isLoading) {
+              return (
+                <div className="flex h-32 items-center justify-center text-sm text-muted-fg">
+                  Loading…
+                </div>
+              );
+            }
+            if (jobsQuery.isError) {
+              return (
+                <div className="flex h-32 items-center justify-center text-sm text-danger-fg">
+                  Failed to load jobs.
+                </div>
+              );
+            }
+            return (
               <div className="flex h-32 items-center justify-center text-sm text-muted-fg">
                 No jobs found.
               </div>
-            )
-          }
+            );
+          }}
         >
           {jobs.map((job) => (
             <TableRow
@@ -543,7 +559,7 @@ export function JobsPage() {
                   )}
                 </div>
               </TableCell>
-              <TableCell>
+              <TableCell className="text-right tabular-nums">
                 {job.priority !== 2 ? (
                   <Badge intent={job.priority === 1 ? "danger" : "secondary"} className="text-[10px]">
                     {job.original_priority !== job.priority
@@ -556,7 +572,7 @@ export function JobsPage() {
                   <span className="text-muted-fg/40">2</span>
                 )}
               </TableCell>
-              <TableCell>
+              <TableCell className="text-right tabular-nums">
                 {job.attempt}/{job.max_attempts}
               </TableCell>
               <TableCell>
@@ -618,12 +634,13 @@ export function JobsPage() {
           {PAGE_SIZES.map((size) => (
             <button
               key={size}
-              onClick={() =>
+              onClick={() => {
+                setSelected(new Set());
                 setUrlParams({
                   limit: size === DEFAULT_PAGE_SIZE ? undefined : String(size),
                   before_id: undefined,
-                })
-              }
+                });
+              }}
               className={[
                 "rounded px-2 py-0.5 text-sm transition-colors",
                 filters.limit === size

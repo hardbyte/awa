@@ -100,6 +100,11 @@ export interface RuntimeInstance {
   hostname: string | null;
   pid: number;
   version: string;
+  /**
+   * Worker's storage capability — populated by schema v10+. On earlier
+   * deployments the field is absent; treat as "canonical" when reading.
+   */
+  storage_capability?: string | null;
   started_at: string;
   last_seen_at: string;
   snapshot_interval_ms: number;
@@ -165,6 +170,26 @@ export interface Capabilities {
   read_only: boolean;
   /** Server-suggested polling interval in milliseconds. */
   poll_interval_ms: number;
+}
+
+export interface StorageStatusReport {
+  current_engine: string;
+  active_engine: string;
+  prepared_engine: string | null;
+  state: string;
+  transition_epoch: number;
+  details: unknown;
+  entered_at: string;
+  updated_at: string;
+  finalized_at: string | null;
+  canonical_live_backlog: number;
+  prepared_queue_storage_schema: string | null;
+  prepared_schema_ready: boolean;
+  live_runtime_capability_counts: Record<string, number>;
+  can_enter_mixed_transition: boolean;
+  enter_mixed_transition_blockers: string[];
+  can_finalize: boolean;
+  finalize_blockers: string[];
 }
 
 export interface ListJobsParams {
@@ -281,6 +306,19 @@ export function fetchStats(): Promise<StateCounts> {
 
 export function fetchRuntime(): Promise<RuntimeOverview> {
   return apiFetch("/runtime");
+}
+
+// Returns null if the backend is older than 0.5.5-alpha and lacks /storage.
+export async function fetchStorage(): Promise<StorageStatusReport | null> {
+  const res = await fetch("/api/storage", {
+    headers: { "Content-Type": "application/json" },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((body as { error?: string }).error ?? res.statusText);
+  }
+  return res.json() as Promise<StorageStatusReport>;
 }
 
 export function fetchCapabilities(): Promise<Capabilities> {

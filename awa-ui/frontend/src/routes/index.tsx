@@ -1,8 +1,22 @@
+import { useMemo } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { fetchStats, fetchQueues, fetchJobs, fetchRuntime } from "@/lib/api";
-import type { StateCounts, QueueStats, JobRow, RuntimeOverview } from "@/lib/api";
+import {
+  fetchStats,
+  fetchQueues,
+  fetchJobs,
+  fetchRuntime,
+  fetchTimeseries,
+} from "@/lib/api";
+import type {
+  StateCounts,
+  QueueStats,
+  JobRow,
+  RuntimeOverview,
+  TimeseriesBucket,
+} from "@/lib/api";
 import { StateBadge } from "@/components/StateBadge";
+import { Sparkline } from "@/components/Sparkline";
 import { Heading } from "@/components/ui/heading";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
 import {
@@ -40,6 +54,48 @@ export function DashboardPage() {
     queryFn: fetchStats,
     refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
+
+  // Timeseries powers the inline sparklines on the state counter cards.
+  // Returns an empty array on pre-v10 deployments / seed-free databases, in
+  // which case Sparkline renders an empty slot of its reserved size so the
+  // card layout doesn't jump.
+  const timeseriesQuery = useQuery<TimeseriesBucket[]>({
+    queryKey: ["stats", "timeseries", 60],
+    queryFn: () => fetchTimeseries(60),
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
+  });
+
+  /** Pivot the flat timeseries response into a per-state numeric series
+   * suitable for <Sparkline data={...} />. Missing buckets are filled as 0. */
+  const seriesByState = useMemo(() => {
+    const buckets = timeseriesQuery.data ?? [];
+    const byBucket = new Map<string, Map<string, number>>();
+    const ordered: string[] = [];
+    for (const point of buckets) {
+      if (!byBucket.has(point.bucket)) {
+        byBucket.set(point.bucket, new Map());
+        ordered.push(point.bucket);
+      }
+      byBucket.get(point.bucket)!.set(point.state, point.count);
+    }
+    ordered.sort();
+    const result: Record<string, number[]> = {};
+    for (const bucket of ordered) {
+      const stateMap = byBucket.get(bucket)!;
+      for (const state of stateMap.keys()) {
+        if (!result[state]) result[state] = [];
+      }
+    }
+    for (const bucket of ordered) {
+      const stateMap = byBucket.get(bucket)!;
+      for (const state of Object.keys(result)) {
+        const series = result[state];
+        if (series) series.push(stateMap.get(state) ?? 0);
+      }
+    }
+    return result;
+  }, [timeseriesQuery.data]);
 
   const queuesQuery = useQuery<QueueStats[]>({
     queryKey: ["queues"],
@@ -88,6 +144,7 @@ export function DashboardPage() {
         {COUNTER_KEYS.map((key) => {
           const count = statsQuery.data?.[key];
           const bg = STATE_CARD_BG[key] ?? "";
+          const series = seriesByState[key] ?? [];
           return (
             <Link
               key={key}
@@ -106,8 +163,15 @@ export function DashboardPage() {
                       (count ?? 0).toLocaleString()
                     )}
                   </div>
-                  <div className="mt-1.5">
+                  <div className="mt-1.5 flex items-center justify-center gap-2">
                     <StateBadge state={key} />
+                    <Sparkline
+                      data={series}
+                      width={48}
+                      height={14}
+                      className="text-primary/70"
+                      label={`${key} trend over the last hour`}
+                    />
                   </div>
                 </CardContent>
               </Card>
@@ -188,9 +252,19 @@ export function DashboardPage() {
           </div>
 
           {/* Mobile runtime cards */}
-          {runtimeQuery.data && runtimeQuery.data.instances.length > 0 && (
+          {(runtimeQuery.data?.instances.length ?? 0) === 0 ? (
+            <div
+              className={`rounded-lg border p-6 text-center text-sm sm:hidden ${runtimeQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {runtimeQuery.isLoading
+                ? "Loading runtime…"
+                : runtimeQuery.isError
+                  ? "Failed to load runtime data."
+                  : "No runtime snapshots yet. Start a worker to populate this view."}
+            </div>
+          ) : (
             <div className="space-y-2 sm:hidden">
-              {runtimeQuery.data.instances.map((instance) => {
+              {runtimeQuery.data!.instances.map((instance) => {
                 const label = instance.hostname ?? `pid ${instance.pid}`;
                 const healthLabel = instance.stale
                   ? "Stale"
@@ -237,18 +311,27 @@ export function DashboardPage() {
           )}
 
           {/* Desktop runtime table */}
-          {runtimeQuery.data && runtimeQuery.data.instances.length > 0 ? (
-            <Table aria-label="Runtime instances" className="hidden sm:table">
-              <TableHeader>
-                <TableColumn isRowHeader>Instance</TableColumn>
-                <TableColumn>Health</TableColumn>
-                <TableColumn>Loops</TableColumn>
-                <TableColumn>Role</TableColumn>
-                <TableColumn>Queues</TableColumn>
-                <TableColumn>Seen</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {runtimeQuery.data.instances.map((instance) => {
+          <Table bleed aria-label="Runtime instances" className="hidden sm:table">
+            <TableHeader>
+              <TableColumn isRowHeader>Instance</TableColumn>
+              <TableColumn>Health</TableColumn>
+              <TableColumn>Loops</TableColumn>
+              <TableColumn>Role</TableColumn>
+              <TableColumn className="text-right">Queues</TableColumn>
+              <TableColumn>Seen</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div className="p-6 text-center text-sm text-muted-fg">
+                  {runtimeQuery.isLoading
+                    ? "Loading runtime…"
+                    : runtimeQuery.isError
+                      ? "Failed to load runtime data."
+                      : "No runtime snapshots yet. Start a worker to populate this view."}
+                </div>
+              )}
+            >
+              {(runtimeQuery.data?.instances ?? []).map((instance) => {
                   const label = instance.hostname ?? `pid ${instance.pid}`;
                   const healthLabel = instance.stale
                     ? "Stale"
@@ -291,24 +374,15 @@ export function DashboardPage() {
                           <span className="text-sm text-muted-fg">Worker</span>
                         )}
                       </TableCell>
-                      <TableCell>{instance.queues.length}</TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {instance.queues.length}
+                      </TableCell>
                       <TableCell>{timeAgo(instance.last_seen_at)}</TableCell>
                     </TableRow>
                   );
                 })}
-              </TableBody>
-            </Table>
-          ) : runtimeQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading runtime...</p>
-          ) : runtimeQuery.isError ? (
-            <p className="py-4 text-sm text-danger">
-              Failed to load runtime data.
-            </p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No runtime snapshots yet. Start a worker to populate this view.
-            </p>
-          )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
 
@@ -323,24 +397,34 @@ export function DashboardPage() {
           }
         />
         <CardContent>
-          {topQueues.length > 0 ? (
-            <>
-              <Table aria-label="Queue summary">
-                <TableHeader>
-                  <TableColumn isRowHeader>Queue</TableColumn>
-                  <TableColumn>Total queued</TableColumn>
-                  <TableColumn>Scheduled</TableColumn>
-                  <TableColumn>Available</TableColumn>
-                  <TableColumn>Retryable</TableColumn>
-                  <TableColumn>Running</TableColumn>
-                  <TableColumn>Failed</TableColumn>
-                  <TableColumn>Waiting</TableColumn>
-                  <TableColumn>Completed/hr</TableColumn>
-                  <TableColumn>Lag (s)</TableColumn>
-                  <TableColumn>Status</TableColumn>
-                </TableHeader>
-                <TableBody>
-                  {topQueues.map((q) => (
+          <Table bleed aria-label="Queue summary">
+            <TableHeader>
+              <TableColumn isRowHeader>Queue</TableColumn>
+              <TableColumn className="text-right">Total queued</TableColumn>
+              <TableColumn className="text-right">Scheduled</TableColumn>
+              <TableColumn className="text-right">Available</TableColumn>
+              <TableColumn className="text-right">Retryable</TableColumn>
+              <TableColumn className="text-right">Running</TableColumn>
+              <TableColumn className="text-right">Failed</TableColumn>
+              <TableColumn className="text-right">Waiting</TableColumn>
+              <TableColumn className="text-right">Completed/hr</TableColumn>
+              <TableColumn className="text-right">Lag (s)</TableColumn>
+              <TableColumn>Status</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div
+                  className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+                >
+                  {queuesQuery.isLoading
+                    ? "Loading queues…"
+                    : queuesQuery.isError
+                      ? "Failed to load queues."
+                      : "No queues found."}
+                </div>
+              )}
+            >
+              {topQueues.map((q) => (
                     <TableRow
                       key={q.queue}
                       id={q.queue}
@@ -368,23 +452,35 @@ export function DashboardPage() {
                           )}
                         </div>
                       </TableCell>
-                      <TableCell>{q.total_queued.toLocaleString()}</TableCell>
-                      <TableCell>{q.scheduled.toLocaleString()}</TableCell>
-                      <TableCell>{q.available.toLocaleString()}</TableCell>
-                      <TableCell>{q.retryable.toLocaleString()}</TableCell>
-                      <TableCell>{q.running.toLocaleString()}</TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.total_queued.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.scheduled.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.available.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.retryable.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.running.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
                         <span className={q.failed > 0 ? "text-danger" : ""}>
                           {q.failed.toLocaleString()}
                         </span>
                       </TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
                         {q.waiting_external > 0
                           ? q.waiting_external.toLocaleString()
                           : "-"}
                       </TableCell>
-                      <TableCell>{q.completed_last_hour}</TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
+                        {q.completed_last_hour.toLocaleString()}
+                      </TableCell>
+                      <TableCell className="text-right tabular-nums">
                         <LagValue seconds={q.lag_seconds} />
                       </TableCell>
                       <TableCell>
@@ -396,23 +492,17 @@ export function DashboardPage() {
                       </TableCell>
                     </TableRow>
                   ))}
-                </TableBody>
-              </Table>
-              {hasMoreQueues && (
-                <div className="px-4 py-3">
-                  <Link
-                    to="/queues"
-                    className="text-sm text-primary no-underline hover:underline"
-                  >
-                    View all {queuesQuery.data?.length} queues &rarr;
-                  </Link>
-                </div>
-              )}
-            </>
-          ) : queuesQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading queues...</p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">No queues found.</p>
+            </TableBody>
+          </Table>
+          {hasMoreQueues && topQueues.length > 0 && (
+            <div className="px-4 py-3">
+              <Link
+                to="/queues"
+                className="text-sm text-primary no-underline hover:underline"
+              >
+                View all {queuesQuery.data?.length} queues &rarr;
+              </Link>
+            </div>
           )}
         </CardContent>
       </Card>
@@ -421,18 +511,29 @@ export function DashboardPage() {
       <Card>
         <CardHeader title="Recent Failures" />
         <CardContent>
-          {failedQuery.data && failedQuery.data.length > 0 ? (
-            <Table aria-label="Recent failures">
-              <TableHeader>
-                <TableColumn isRowHeader>ID</TableColumn>
-                <TableColumn>Kind</TableColumn>
-                <TableColumn>Queue</TableColumn>
-                <TableColumn>Attempt</TableColumn>
-                <TableColumn>Failed</TableColumn>
-                <TableColumn>Error</TableColumn>
-              </TableHeader>
-              <TableBody>
-                {failedQuery.data.map((job) => {
+          <Table bleed aria-label="Recent failures">
+            <TableHeader>
+              <TableColumn isRowHeader>ID</TableColumn>
+              <TableColumn>Kind</TableColumn>
+              <TableColumn>Queue</TableColumn>
+              <TableColumn className="text-right">Attempt</TableColumn>
+              <TableColumn>Failed</TableColumn>
+              <TableColumn>Error</TableColumn>
+            </TableHeader>
+            <TableBody
+              renderEmptyState={() => (
+                <div
+                  className={`p-6 text-center text-sm ${failedQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+                >
+                  {failedQuery.isLoading
+                    ? "Loading failures…"
+                    : failedQuery.isError
+                      ? "Failed to load recent failures."
+                      : "No recent failures."}
+                </div>
+              )}
+            >
+              {(failedQuery.data ?? []).map((job) => {
                   const lastErr =
                     job.errors && job.errors.length > 0
                       ? job.errors[job.errors.length - 1]
@@ -462,7 +563,7 @@ export function DashboardPage() {
                       </TableCell>
                       <TableCell>{job.kind}</TableCell>
                       <TableCell>{job.queue}</TableCell>
-                      <TableCell>
+                      <TableCell className="text-right tabular-nums">
                         {job.attempt}/{job.max_attempts}
                       </TableCell>
                       <TableCell>
@@ -476,15 +577,8 @@ export function DashboardPage() {
                     </TableRow>
                   );
                 })}
-              </TableBody>
-            </Table>
-          ) : failedQuery.isLoading ? (
-            <p className="py-4 text-sm text-muted-fg">Loading...</p>
-          ) : (
-            <p className="py-4 text-sm text-muted-fg">
-              No recent failures.
-            </p>
-          )}
+            </TableBody>
+          </Table>
         </CardContent>
       </Card>
     </div>

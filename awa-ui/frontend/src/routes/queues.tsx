@@ -18,6 +18,7 @@ import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Menu, MenuContent, MenuItem, MenuTrigger } from "@/components/ui/menu";
 import {
   Table,
   TableHeader,
@@ -114,12 +115,15 @@ export function QueuesPage() {
     return q.display_name?.trim() ? q.display_name : q.queue;
   }
 
-  function descriptorSyncLabel(q: QueueStats): string {
+  // Only surfaces a line when the descriptor needs attention — drift, stale,
+  // or not declared. A fresh descriptor is implied by the row's presence.
+  function descriptorSyncLabel(q: QueueStats): string | null {
     if (q.descriptor_mismatch) return "Descriptor drift across live runtimes";
     if (!q.descriptor_last_seen_at) return "Descriptor not declared";
-    return q.descriptor_stale
-      ? `Descriptor stale · seen ${timeAgo(q.descriptor_last_seen_at)}`
-      : `Descriptor seen ${timeAgo(q.descriptor_last_seen_at)}`;
+    if (q.descriptor_stale) {
+      return `Descriptor stale · seen ${timeAgo(q.descriptor_last_seen_at)}`;
+    }
+    return null;
   }
 
   return (
@@ -127,7 +131,17 @@ export function QueuesPage() {
       <Heading level={2}>Queues</Heading>
 
       {/* Mobile card layout */}
-      {queues.length > 0 && (
+      {queues.length === 0 ? (
+        <div
+          className={`rounded-lg border p-6 text-center text-sm sm:hidden ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+        >
+          {queuesQuery.isLoading
+            ? "Loading queues…"
+            : queuesQuery.isError
+              ? "Failed to load queues."
+              : "No queues found."}
+        </div>
+      ) : (
         <div className="space-y-3 sm:hidden">
           {queues.map((q) => {
             const runtime = runtimeByQueue.get(q.queue);
@@ -145,9 +159,11 @@ export function QueuesPage() {
                   {q.display_name?.trim() && (
                     <div className="text-xs text-muted-fg">{q.queue}</div>
                   )}
-                  <div className="mt-1 text-xs text-muted-fg">
-                    {descriptorSyncLabel(q)}
-                  </div>
+                  {descriptorSyncLabel(q) && (
+                    <div className="mt-1 text-xs text-muted-fg">
+                      {descriptorSyncLabel(q)}
+                    </div>
+                  )}
                 </div>
                 <div className="flex flex-wrap gap-1">
                   {q.paused ? (
@@ -237,33 +253,37 @@ export function QueuesPage() {
       )}
 
       {/* Desktop table layout */}
-      {queues.length > 0 ? (
-        <Table aria-label="Queues" className="hidden sm:table">
-          <TableHeader>
-            <TableColumn isRowHeader>Queue</TableColumn>
-            <TableColumn>Total queued</TableColumn>
-            <TableColumn>Scheduled</TableColumn>
-            <TableColumn>Available</TableColumn>
-            <TableColumn>Retryable</TableColumn>
-            <TableColumn>Running</TableColumn>
-            <TableColumn>Failed</TableColumn>
-            <TableColumn>Waiting</TableColumn>
-            <TableColumn>Completed/hr</TableColumn>
-            <TableColumn>Lag (s)</TableColumn>
-            <TableColumn>Mode</TableColumn>
-            <TableColumn>Capacity</TableColumn>
-            <TableColumn>Rate limit</TableColumn>
-            <TableColumn>Runtime</TableColumn>
-            <TableColumn>Status</TableColumn>
-            <TableColumn>Actions</TableColumn>
-          </TableHeader>
-          <TableBody>
-            {queues.map((q) => {
+      <Table aria-label="Queues" className="hidden sm:table">
+        <TableHeader>
+          <TableColumn isRowHeader>Queue</TableColumn>
+          <TableColumn className="text-right">Queued</TableColumn>
+          <TableColumn className="text-right">Running</TableColumn>
+          <TableColumn className="text-right">Retry</TableColumn>
+          <TableColumn className="text-right">Failed</TableColumn>
+          <TableColumn className="text-right">Rate/hr</TableColumn>
+          <TableColumn>Capacity</TableColumn>
+          <TableColumn>Status</TableColumn>
+          <TableColumn>Actions</TableColumn>
+        </TableHeader>
+        <TableBody
+          renderEmptyState={() => (
+            <div
+              className={`p-6 text-center text-sm ${queuesQuery.isError ? "text-danger-fg" : "text-muted-fg"}`}
+            >
+              {queuesQuery.isLoading
+                ? "Loading queues…"
+                : queuesQuery.isError
+                  ? "Failed to load queues."
+                  : "No queues found."}
+            </div>
+          )}
+        >
+          {queues.map((q) => {
               const runtime = runtimeByQueue.get(q.queue);
               return (
                 <TableRow key={q.queue} id={q.queue}>
-                  <TableCell className="font-medium">
-                    <div>
+                  <TableCell className="max-w-[20rem] font-medium">
+                    <div className="min-w-0">
                       <Link
                         to="/queues/$name"
                         params={{ name: q.queue }}
@@ -272,67 +292,87 @@ export function QueuesPage() {
                         {queueLabel(q)}
                       </Link>
                       {q.display_name && (
-                        <div className="text-xs font-normal text-muted-fg">{q.queue}</div>
+                        <div className="truncate text-xs font-normal text-muted-fg">
+                          {q.queue}
+                        </div>
                       )}
                       {q.description && (
-                        <div className="mt-1 text-xs font-normal text-muted-fg">
+                        <div
+                          className="mt-0.5 truncate text-xs font-normal text-muted-fg"
+                          title={q.description}
+                        >
                           {q.description}
                         </div>
                       )}
-                      <div className="mt-1 text-xs font-normal text-muted-fg">
-                        {descriptorSyncLabel(q)}
-                      </div>
+                      {q.waiting_external > 0 && (
+                        <div className="mt-0.5 text-xs text-muted-fg">
+                          {q.waiting_external.toLocaleString()} waiting · lag{" "}
+                          <LagValue seconds={q.lag_seconds} />
+                        </div>
+                      )}
+                      {descriptorSyncLabel(q) && (
+                        <div className="mt-0.5 truncate text-xs font-normal text-muted-fg">
+                          {descriptorSyncLabel(q)}
+                        </div>
+                      )}
                     </div>
                   </TableCell>
-                  <TableCell>{q.total_queued.toLocaleString()}</TableCell>
-                  <TableCell>{q.scheduled.toLocaleString()}</TableCell>
-                  <TableCell>{q.available.toLocaleString()}</TableCell>
-                  <TableCell>{q.retryable.toLocaleString()}</TableCell>
-                  <TableCell>{q.running.toLocaleString()}</TableCell>
-                  <TableCell>
-                    <span className={q.failed > 0 ? "text-danger" : ""}>
-                      {q.failed.toLocaleString()}
-                    </span>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.total_queued === 0 ? "text-muted-fg/60" : ""
+                    }`}
+                  >
+                    {q.total_queued.toLocaleString()}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.running === 0 ? "text-muted-fg/60" : ""
+                    }`}
+                  >
+                    {q.running.toLocaleString()}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.retryable === 0 ? "text-muted-fg/60" : "text-warning-fg"
+                    }`}
+                  >
+                    {q.retryable.toLocaleString()}
+                  </TableCell>
+                  <TableCell
+                    className={`text-right tabular-nums ${
+                      q.failed === 0 ? "text-muted-fg/60" : "text-danger"
+                    }`}
+                  >
+                    {q.failed.toLocaleString()}
+                  </TableCell>
+                  <TableCell className="text-right tabular-nums text-muted-fg">
+                    {q.completed_last_hour.toLocaleString()}
                   </TableCell>
                   <TableCell>
-                    {q.waiting_external > 0 ? q.waiting_external.toLocaleString() : "-"}
-                  </TableCell>
-                  <TableCell>{q.completed_last_hour}</TableCell>
-                  <TableCell>
-                    <LagValue seconds={q.lag_seconds} />
-                  </TableCell>
-                  <TableCell>
-                    {runtime?.config ? (
-                      <Badge
-                        intent={
-                          runtime.config.mode === "weighted" ? "secondary" : "outline"
-                        }
-                      >
-                        {runtime.config.mode === "weighted" ? "Weighted" : "Reserved"}
-                      </Badge>
-                    ) : (
-                      "—"
-                    )}
-                  </TableCell>
-                  <TableCell>{capacityLabel(runtime)}</TableCell>
-                  <TableCell>{rateLimitLabel(runtime)}</TableCell>
-                  <TableCell>
-                    <div className="text-sm">
-                      {runtime ? (
-                        <>
-                          <div>{runtimeHealthLabel(runtime)} healthy</div>
+                    <div className="flex flex-col gap-0.5 text-sm">
+                      <div>
+                        {runtime?.config ? (
+                          <span className="text-muted-fg">
+                            {runtime.config.mode === "weighted" ? "Weighted" : "Reserved"} ·{" "}
+                            <span className="text-fg">{capacityLabel(runtime)}</span>
+                          </span>
+                        ) : (
+                          <span className="text-muted-fg">—</span>
+                        )}
+                      </div>
+                      {rateLimitLabel(runtime) !== "—" && (
+                        <div className="text-xs text-muted-fg">
+                          rate {rateLimitLabel(runtime)}
+                        </div>
+                      )}
+                      {runtime && (
+                        <div className="text-xs text-muted-fg">
                           {runtime.config_mismatch ? (
-                            <div className="text-warning-fg">Config mismatch</div>
+                            <span className="text-warning-fg">Config mismatch</span>
                           ) : (
-                            <div className="text-muted-fg">
-                              {runtime.stale_instances > 0
-                                ? `${runtime.stale_instances} stale`
-                                : `${runtime.instance_count} nodes`}
-                            </div>
+                            `${runtimeHealthLabel(runtime)} healthy`
                           )}
-                        </>
-                      ) : (
-                        <span className="text-muted-fg">—</span>
+                        </div>
                       )}
                     </div>
                   </TableCell>
@@ -352,47 +392,47 @@ export function QueuesPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    <div className="flex gap-1">
-                      {q.paused ? (
-                        <Button
-                          intent="outline"
-                          size="xs"
-                          onPress={() => resumeMutation.mutate(q.queue)}
+                    <div className="flex justify-end">
+                      <Menu>
+                        <MenuTrigger
                           isDisabled={readOnly}
+                          aria-label={`Actions for ${q.queue}`}
+                          className="inline-flex size-7 items-center justify-center rounded text-muted-fg hover:bg-muted hover:text-fg disabled:opacity-40"
                         >
-                          Resume
-                        </Button>
-                      ) : (
-                        <Button
-                          intent="outline"
-                          size="xs"
-                          onPress={() => pauseMutation.mutate(q.queue)}
-                          isDisabled={readOnly}
-                        >
-                          Pause
-                        </Button>
-                      )}
-                      <Button
-                        intent="outline"
-                        size="xs"
-                        className="text-danger"
-                        onPress={() => setDrainTarget(q.queue)}
-                        isDisabled={readOnly}
-                      >
-                        Drain
-                      </Button>
+                          <svg
+                            viewBox="0 0 20 20"
+                            fill="currentColor"
+                            aria-hidden="true"
+                            className="size-4"
+                          >
+                            <path d="M10 6a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z" />
+                          </svg>
+                        </MenuTrigger>
+                        <MenuContent placement="bottom end">
+                          {q.paused ? (
+                            <MenuItem onAction={() => resumeMutation.mutate(q.queue)}>
+                              Resume queue
+                            </MenuItem>
+                          ) : (
+                            <MenuItem onAction={() => pauseMutation.mutate(q.queue)}>
+                              Pause queue
+                            </MenuItem>
+                          )}
+                          <MenuItem
+                            intent="danger"
+                            onAction={() => setDrainTarget(q.queue)}
+                          >
+                            Drain queue…
+                          </MenuItem>
+                        </MenuContent>
+                      </Menu>
                     </div>
                   </TableCell>
                 </TableRow>
               );
             })}
-          </TableBody>
-        </Table>
-      ) : queuesQuery.isLoading ? (
-        <p className="text-sm text-muted-fg">Loading...</p>
-      ) : (
-        <p className="text-sm text-muted-fg">No queues found.</p>
-      )}
+        </TableBody>
+      </Table>
 
       <ConfirmDialog
         isOpen={drainTarget !== null}
