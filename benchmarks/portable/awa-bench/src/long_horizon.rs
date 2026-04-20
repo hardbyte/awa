@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use awa_macros::JobArgs;
-use awa_model::{insert, QueueStorage};
+use awa_model::{insert, InsertParams, QueueStorage};
 use awa_worker::{
     Client, JobContext, JobError, JobResult, QueueConfig, TransitionWorkerRole, Worker,
 };
@@ -170,6 +170,34 @@ fn instance_id() -> u32 {
     env_u32("BENCH_INSTANCE_ID", 0)
 }
 
+fn build_batch_params(
+    queue_name: &str,
+    next_seq: &mut i64,
+    batch_size: usize,
+    padding: &str,
+) -> Vec<InsertParams> {
+    let mut params = Vec::with_capacity(batch_size);
+    for _ in 0..batch_size {
+        let args = LongHorizonJob {
+            seq: *next_seq,
+            produced_at_ms: now_epoch_ms(),
+            padding: padding.to_owned(),
+        };
+        params.push(
+            insert::params_with(
+                &args,
+                awa_model::InsertOpts {
+                    queue: queue_name.into(),
+                    ..Default::default()
+                },
+            )
+            .expect("failed to build queue storage params"),
+        );
+        *next_seq += 1;
+    }
+    params
+}
+
 fn queue_storage_event_tables(schema: &str, queue_slot_count: usize, lease_slot_count: usize) -> Vec<String> {
     let mut tables = vec![
         format!("{schema}.queue_ring_state"),
@@ -223,6 +251,8 @@ pub async fn run() {
     let payload_bytes = env_u64("JOB_PAYLOAD_BYTES", 256);
     let work_ms = env_u64("JOB_WORK_MS", 1);
     let sample_every_s = env_u64("SAMPLE_EVERY_S", 10);
+    let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 10).max(1);
+    let producer_batch_max = env_u64("PRODUCER_BATCH_MAX", 128).max(1) as usize;
     let max_connections = env_u32("MAX_CONNECTIONS", 40);
     let db_name = database_url
         .rsplit('/')
@@ -294,51 +324,53 @@ pub async fn run() {
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_handle = tokio::spawn(async move {
         let mut seq: i64 = 0;
+        let mut fixed_rate_credit = 0.0_f64;
         let mut next_tick = tokio::time::Instant::now();
         while !producer_shutdown.load(Ordering::Relaxed) {
-            if producer_mode == "depth-target" {
+            let batch_size = if producer_mode == "depth-target" {
                 producer_target_rate_metric.store(0, Ordering::Relaxed);
-                if producer_queue_depth.load(Ordering::Relaxed) >= target_depth {
+                let depth = producer_queue_depth.load(Ordering::Relaxed);
+                if depth >= target_depth {
                     tokio::time::sleep(Duration::from_millis(50)).await;
                     continue;
                 }
                 next_tick = tokio::time::Instant::now();
+                ((target_depth - depth) as usize).clamp(1, producer_batch_max)
             } else {
                 let current_rate = read_producer_rate(producer_rate);
                 producer_target_rate_metric.store(current_rate, Ordering::Relaxed);
                 if current_rate == 0 {
+                    fixed_rate_credit = 0.0;
                     next_tick = tokio::time::Instant::now();
                     tokio::time::sleep(Duration::from_millis(100)).await;
                     continue;
                 }
-                let period = Duration::from_secs_f64(1.0 / current_rate as f64);
+                let period = Duration::from_millis(producer_batch_ms);
                 next_tick = std::cmp::max(next_tick + period, tokio::time::Instant::now());
                 tokio::time::sleep_until(next_tick).await;
-            }
-            let produced_at_ms = now_epoch_ms();
-            let args = LongHorizonJob {
-                seq,
-                produced_at_ms,
-                padding: padding.clone(),
+                fixed_rate_credit += current_rate as f64 * (producer_batch_ms as f64 / 1_000.0);
+                let whole = fixed_rate_credit.floor() as usize;
+                if whole == 0 {
+                    continue;
+                }
+                fixed_rate_credit -= whole as f64;
+                whole.min(producer_batch_max)
             };
-            let params = [insert::params_with(
-                &args,
-                awa_model::InsertOpts {
-                    queue: queue_name.into(),
-                    ..Default::default()
-                },
-            )
-            .expect("failed to build queue storage params")];
+
+            let mut next_seq = seq;
+            let params = build_batch_params(queue_name, &mut next_seq, batch_size, &padding);
             let insert_start = Instant::now();
             let res = producer_store.enqueue_params_batch(&producer_pool, &params).await;
             match res {
                 Ok(_) => {
-                    producer_latencies_window
-                        .lock()
-                        .await
-                        .record(insert_start.elapsed().as_secs_f64() * 1_000.0);
-                    producer_enqueued.fetch_add(1, Ordering::Relaxed);
-                    seq += 1;
+                    let latency_ms = insert_start.elapsed().as_secs_f64() * 1_000.0;
+                    let mut guard = producer_latencies_window.lock().await;
+                    for _ in 0..batch_size {
+                        guard.record(latency_ms);
+                    }
+                    drop(guard);
+                    producer_enqueued.fetch_add(batch_size as u64, Ordering::Relaxed);
+                    seq = next_seq;
                 }
                 Err(err) => {
                     eprintln!("[awa] producer insert failed: {err}");
