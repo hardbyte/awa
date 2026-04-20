@@ -1276,6 +1276,20 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_terminal_rollups (
+                queue                  TEXT NOT NULL,
+                priority               SMALLINT NOT NULL,
+                pruned_completed_count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (queue, priority)
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(
                 r#"
             CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
@@ -2034,6 +2048,7 @@ impl QueueStorage {
                 {schema}.leases,
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
+                {schema}.queue_terminal_rollups,
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
@@ -2672,6 +2687,87 @@ impl QueueStorage {
         Ok(())
     }
 
+    async fn adjust_terminal_rollups_batch<'a, I>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        deltas: I,
+    ) -> Result<(), AwaError>
+    where
+        I: IntoIterator<Item = (String, i16, i64)>,
+    {
+        let mut grouped: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        for (queue, priority, pruned_completed_delta) in deltas {
+            if pruned_completed_delta == 0 {
+                continue;
+            }
+            *grouped.entry((queue, priority)).or_insert(0_i64) += pruned_completed_delta;
+        }
+
+        if grouped.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.schema();
+        let mut queues = Vec::with_capacity(grouped.len());
+        let mut priorities = Vec::with_capacity(grouped.len());
+        let mut pruned_completed_deltas = Vec::with_capacity(grouped.len());
+
+        for ((queue, priority), pruned_completed_delta) in grouped {
+            queues.push(queue);
+            priorities.push(priority);
+            pruned_completed_deltas.push(pruned_completed_delta);
+        }
+
+        sqlx::query(&format!(
+            r#"
+            WITH deltas(queue, priority, pruned_completed_delta) AS (
+                SELECT *
+                FROM unnest(
+                    $1::text[],
+                    $2::smallint[],
+                    $3::bigint[]
+                )
+            )
+            INSERT INTO {schema}.queue_terminal_rollups AS rollups (
+                queue,
+                priority,
+                pruned_completed_count
+            )
+            SELECT
+                deltas.queue,
+                deltas.priority,
+                deltas.pruned_completed_delta
+            FROM deltas
+            ON CONFLICT (queue, priority) DO UPDATE
+            SET pruned_completed_count = GREATEST(
+                0,
+                rollups.pruned_completed_count + EXCLUDED.pruned_completed_count
+            )
+            "#
+        ))
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&pruned_completed_deltas)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    async fn adjust_terminal_rollups_on_pool<I>(
+        &self,
+        pool: &PgPool,
+        deltas: I,
+    ) -> Result<(), AwaError>
+    where
+        I: IntoIterator<Item = (String, i16, i64)>,
+    {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.adjust_terminal_rollups_batch(&mut tx, deltas).await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
     async fn enqueue_runtime_rows(
         &self,
         pool: &PgPool,
@@ -3206,9 +3302,13 @@ impl QueueStorage {
             r#"
             WITH lane_counts AS (
                 SELECT
-                    COALESCE(sum(available_count), 0)::bigint AS available,
-                    COALESCE(sum(pruned_completed_count), 0)::bigint AS pruned_completed
+                    COALESCE(sum(available_count), 0)::bigint AS available
                 FROM {schema}.queue_lanes
+                WHERE queue = $1
+            ),
+            pruned_terminal AS (
+                SELECT COALESCE(sum(pruned_completed_count), 0)::bigint AS completed
+                FROM {schema}.queue_terminal_rollups
                 WHERE queue = $1
             ),
             live_running AS (
@@ -3225,8 +3325,9 @@ impl QueueStorage {
             SELECT
                 lane_counts.available,
                 live_running.running,
-                lane_counts.pruned_completed + live_terminal.completed AS completed
+                pruned_terminal.completed + live_terminal.completed AS completed
             FROM lane_counts
+            CROSS JOIN pruned_terminal
             CROSS JOIN live_running
             CROSS JOIN live_terminal
             "#
@@ -6492,16 +6593,6 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if !pruned_terminal_counts.is_empty() {
-            self.adjust_lane_counts_batch(
-                &mut tx,
-                pruned_terminal_counts
-                    .into_iter()
-                    .map(|(queue, priority, count)| (queue, priority, 0, count)),
-            )
-            .await?;
-        }
-
         let truncate = sqlx::query(&format!("TRUNCATE TABLE {ready_child}, {done_child}",))
             .execute(tx.as_mut())
             .await;
@@ -6509,6 +6600,15 @@ impl QueueStorage {
         match truncate {
             Ok(_) => {
                 tx.commit().await.map_err(map_sqlx_error)?;
+                if !pruned_terminal_counts.is_empty() {
+                    self.adjust_terminal_rollups_on_pool(
+                        pool,
+                        pruned_terminal_counts
+                            .into_iter()
+                            .map(|(queue, priority, count)| (queue, priority, count)),
+                    )
+                    .await?;
+                }
                 Ok(PruneOutcome::Pruned { slot })
             }
             Err(_) => {

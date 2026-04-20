@@ -1502,6 +1502,14 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
         "unexpected prune outcome after completion: {prune_after_completion:?}"
     );
 
+    let counts_after_prune = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to sample queue counts after pruning completed slot");
+    assert_eq!(counts_after_prune.available, 0);
+    assert_eq!(counts_after_prune.running, 0);
+    assert_eq!(counts_after_prune.completed, 1);
+
     client.shutdown(Duration::from_secs(5)).await;
 }
 
