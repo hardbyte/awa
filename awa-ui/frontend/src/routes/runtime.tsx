@@ -89,11 +89,15 @@ export function RuntimePage() {
   // drift (maintenance not running on exactly one node), degraded instances
   // (alive but with an unhealthy loop), and queue config mismatch.
   const hasLiveInstances = runtime ? runtime.live_instances > 0 : true;
+  // Only compute attention once runtime data is loaded — otherwise the
+  // default `leader_instances ?? 0 !== 1` flashes the Attention card in
+  // for one frame on every refresh.
   const hasAttention =
-    !hasLiveInstances ||
-    (runtime?.leader_instances ?? 0) !== 1 ||
-    degradedInstances.length > 0 ||
-    mismatchQueues.length > 0;
+    runtime !== undefined &&
+    (!hasLiveInstances ||
+      runtime.leader_instances !== 1 ||
+      degradedInstances.length > 0 ||
+      mismatchQueues.length > 0);
 
   // Live filter: hide stale instances unless explicitly expanded or mode=all.
   const visibleInstances =

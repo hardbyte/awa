@@ -18,6 +18,7 @@ import type { QueueRuntimeSummary, QueueStats } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { Menu, MenuContent, MenuItem, MenuTrigger } from "@/components/ui/menu";
 import {
   Table,
   TableHeader,
@@ -265,7 +266,7 @@ export function QueuesPage() {
               const runtime = runtimeByQueue.get(q.queue);
               return (
                 <TableRow key={q.queue} id={q.queue}>
-                  <TableCell className="font-medium">
+                  <TableCell className="max-w-[20rem] font-medium">
                     <div className="min-w-0">
                       <Link
                         to="/queues/$name"
@@ -275,7 +276,9 @@ export function QueuesPage() {
                         {queueLabel(q)}
                       </Link>
                       {q.display_name && (
-                        <div className="text-xs font-normal text-muted-fg">{q.queue}</div>
+                        <div className="truncate text-xs font-normal text-muted-fg">
+                          {q.queue}
+                        </div>
                       )}
                       {q.description && (
                         <div
@@ -368,35 +371,40 @@ export function QueuesPage() {
                     </div>
                   </TableCell>
                   <TableCell>
-                    <div className="flex gap-1">
-                      {q.paused ? (
-                        <Button
-                          intent="outline"
-                          size="xs"
-                          onPress={() => resumeMutation.mutate(q.queue)}
+                    <div className="flex justify-end">
+                      <Menu>
+                        <MenuTrigger
                           isDisabled={readOnly}
+                          aria-label={`Actions for ${q.queue}`}
+                          className="inline-flex size-7 items-center justify-center rounded text-muted-fg hover:bg-muted hover:text-fg disabled:opacity-40"
                         >
-                          Resume
-                        </Button>
-                      ) : (
-                        <Button
-                          intent="outline"
-                          size="xs"
-                          onPress={() => pauseMutation.mutate(q.queue)}
-                          isDisabled={readOnly}
-                        >
-                          Pause
-                        </Button>
-                      )}
-                      <Button
-                        intent="outline"
-                        size="xs"
-                        className="text-danger"
-                        onPress={() => setDrainTarget(q.queue)}
-                        isDisabled={readOnly}
-                      >
-                        Drain
-                      </Button>
+                          <svg
+                            viewBox="0 0 20 20"
+                            fill="currentColor"
+                            aria-hidden="true"
+                            className="size-4"
+                          >
+                            <path d="M10 6a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3zm0 5.5a1.5 1.5 0 1 1 0-3 1.5 1.5 0 0 1 0 3z" />
+                          </svg>
+                        </MenuTrigger>
+                        <MenuContent placement="bottom end">
+                          {q.paused ? (
+                            <MenuItem onAction={() => resumeMutation.mutate(q.queue)}>
+                              Resume queue
+                            </MenuItem>
+                          ) : (
+                            <MenuItem onAction={() => pauseMutation.mutate(q.queue)}>
+                              Pause queue
+                            </MenuItem>
+                          )}
+                          <MenuItem
+                            intent="danger"
+                            onAction={() => setDrainTarget(q.queue)}
+                          >
+                            Drain queue…
+                          </MenuItem>
+                        </MenuContent>
+                      </Menu>
                     </div>
                   </TableCell>
                 </TableRow>

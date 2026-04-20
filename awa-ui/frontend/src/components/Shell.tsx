@@ -209,7 +209,21 @@ function CloseMobileOnNavigate({ path }: { path: string }) {
 }
 
 // Live-worker pulse for the sidebar footer.
-function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }) {
+function ClusterStatusChip({
+  runtime,
+  isPending,
+}: {
+  runtime: RuntimeOverview | undefined;
+  isPending: boolean;
+}) {
+  if (isPending) {
+    return (
+      <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-fg">
+        <span className="size-2 rounded-full bg-muted-fg/30" />
+        <span className="invisible">loading</span>
+      </div>
+    );
+  }
   const summary = summariseCluster(runtime);
   if (!summary) {
     return (
@@ -357,7 +371,10 @@ export function Shell() {
         </SidebarContent>
         <SidebarFooter>
           <div className="group-data-[collapsible=dock]:hidden">
-            <ClusterStatusChip runtime={runtimeQuery.data} />
+            <ClusterStatusChip
+              runtime={runtimeQuery.data}
+              isPending={runtimeQuery.isPending}
+            />
           </div>
         </SidebarFooter>
         <CloseMobileOnNavigate path={currentPath} />
