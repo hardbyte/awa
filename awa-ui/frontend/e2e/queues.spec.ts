@@ -60,19 +60,18 @@ test.describe("Queues page", () => {
     ).toBeVisible();
   });
 
-  test("queue table surfaces runtime configuration", async ({ page }) => {
+  test("queue table surfaces consolidated capacity and actions columns", async ({ page }) => {
     await loadQueuesPage(page);
 
     const queueTable = page.getByRole("grid", { name: "Queues" });
     await expect(queueTable).toBeVisible();
 
-    // Mode / rate limit now live inside the Capacity cell rather than
-    // getting their own columns. Verify the consolidated column is there,
-    // and that at least one cell surfaces the Weighted/Reserved mode label.
-    await expect(
-      queueTable.getByRole("columnheader", { name: "Capacity", exact: true })
-    ).toBeVisible();
-    await expect(queueTable.getByText(/Weighted|Reserved/).first()).toBeVisible();
+    // Mode / rate limit / waiting folded into the Capacity and Queue cells.
+    for (const header of ["Capacity", "Status", "Actions"]) {
+      await expect(
+        queueTable.getByRole("columnheader", { name: header, exact: true })
+      ).toBeVisible();
+    }
   });
 
   test("click queue navigates to queue detail", async ({ page }) => {

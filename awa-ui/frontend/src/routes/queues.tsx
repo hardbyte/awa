@@ -300,6 +300,11 @@ export function QueuesPage() {
                           <LagValue seconds={q.lag_seconds} />
                         </div>
                       )}
+                      {descriptorSyncLabel(q) && (
+                        <div className="mt-0.5 truncate text-xs font-normal text-muted-fg">
+                          {descriptorSyncLabel(q)}
+                        </div>
+                      )}
                     </div>
                   </TableCell>
                   <TableCell

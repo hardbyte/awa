@@ -30,8 +30,11 @@ test.describe("Runtime page", () => {
 
     await page.goto("/runtime");
 
+    // "No live worker instances" appears in both the Attention card and the
+    // Instances table's empty state, so scope with .first() to avoid strict-
+    // mode violations.
     await expect(
-      page.getByText(/No live worker instances|No worker instances recorded/)
+      page.getByText(/No live worker instances|No worker instances recorded/).first()
     ).toBeVisible();
     await expect(page.getByText("No queue runtime snapshots yet.")).toBeVisible();
   });
