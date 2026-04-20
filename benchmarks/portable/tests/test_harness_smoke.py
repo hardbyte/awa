@@ -417,3 +417,208 @@ def test_argparse_replicas_flag():
     # Default survives when flag is absent.
     ns = p.parse_args(["--scenario", "idle_in_tx_saturation"])
     assert ns.replicas == 1
+
+
+# ── ReplicaPool state machine ───────────────────────────────────────────
+
+
+import threading as _threading
+from unittest.mock import MagicMock
+
+from bench_harness.replica_pool import ReplicaPool, ReplicaState
+
+
+def _fake_launch_fn(
+    *,
+    descriptor_override: dict | None = None,
+) -> tuple:
+    """Build a (launch_fn, launch_calls, processes) triple for tests.
+
+    The fake never actually spawns a subprocess. It returns a `MagicMock`
+    standing in for `subprocess.Popen` with a controllable `poll()` and
+    `send_signal()`. Tests drive state transitions by flipping the
+    process's `poll_value` manually.
+    """
+    calls: list[int] = []
+    processes: list[MagicMock] = []
+
+    def launch(instance_id: int):
+        calls.append(instance_id)
+        proc = MagicMock()
+        proc.poll = MagicMock(return_value=None)  # alive by default
+        proc.returncode = None
+        proc.send_signal = MagicMock(
+            side_effect=lambda _: (
+                setattr(proc, "returncode", 0),
+                proc.poll.configure_mock(return_value=0),
+            )
+        )
+        proc.wait = MagicMock(return_value=0)
+        proc.kill = MagicMock(
+            side_effect=lambda: (
+                setattr(proc, "returncode", -9),
+                proc.poll.configure_mock(return_value=-9),
+            )
+        )
+        processes.append(proc)
+        tailer = _threading.Thread(target=lambda: None)
+        tailer.start()
+        stop_event = _threading.Event()
+        desc = descriptor_override or {
+            "system": "awa",
+            "instance_id": instance_id,
+            "event_tables": ["awa.jobs_hot"],
+            "extensions": [],
+        }
+        return proc, tailer, stop_event, desc
+
+    return launch, calls, processes
+
+
+def test_pool_construction_slots_are_unstarted():
+    launch, _calls, _procs = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=3, launch_fn=launch)
+    assert [s.state for s in pool.slots] == [ReplicaState.UNSTARTED] * 3
+    assert pool.descriptor is None
+
+
+def test_pool_rejects_non_positive_capacity():
+    launch, _, _ = _fake_launch_fn()
+    with pytest.raises(ValueError):
+        ReplicaPool(system="awa", capacity=0, launch_fn=launch)
+
+
+def test_pool_start_all_transitions_to_running():
+    launch, calls, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=3, launch_fn=launch)
+    pool.start_all()
+    assert calls == [0, 1, 2]
+    assert [s.state for s in pool.slots] == [ReplicaState.RUNNING] * 3
+    assert pool.descriptor is not None
+
+
+def test_pool_stop_worker_marks_stopped():
+    launch, _, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=2, launch_fn=launch)
+    pool.start_all()
+    pool.stop_worker(0)
+    assert pool.slot(0).state is ReplicaState.STOPPED
+    assert pool.slot(1).state is ReplicaState.RUNNING
+
+
+def test_pool_kill_worker_marks_killed():
+    launch, _, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=1, launch_fn=launch)
+    pool.start_all()
+    pool.kill_worker(0)
+    assert pool.slot(0).state is ReplicaState.KILLED
+
+
+def test_pool_restart_worker_goes_back_to_running():
+    launch, calls, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=1, launch_fn=launch)
+    pool.start_all()
+    pool.restart_worker(0)
+    assert calls == [0, 0]  # launched twice for the same slot
+    assert pool.slot(0).state is ReplicaState.RUNNING
+
+
+def test_pool_start_worker_on_running_slot_raises():
+    launch, _, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=1, launch_fn=launch)
+    pool.start_all()
+    with pytest.raises(RuntimeError, match="already RUNNING"):
+        pool.start_worker(0)
+
+
+def test_pool_detect_crashes_flips_state_and_returns_slot():
+    launch, _, procs = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=2, launch_fn=launch)
+    pool.start_all()
+    # Simulate replica 1 crashing: poll() starts returning an exit code.
+    procs[1].returncode = 1
+    procs[1].poll.configure_mock(return_value=1)
+    crashed = pool.detect_crashes()
+    assert [s.instance_id for s in crashed] == [1]
+    assert pool.slot(1).state is ReplicaState.CRASHED
+    # Second call must not re-report — state is no longer RUNNING.
+    assert pool.detect_crashes() == []
+
+
+def test_pool_detect_crashes_ignores_deliberate_stops():
+    launch, _, procs = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=2, launch_fn=launch)
+    pool.start_all()
+    pool.stop_worker(0)  # deliberate — slot 0 is now STOPPED
+    # Even though the (simulated) process is no longer alive, detect_crashes
+    # won't treat this as a fault because the state transitioned away from
+    # RUNNING before we looked.
+    assert pool.detect_crashes() == []
+
+
+def test_pool_stop_worker_on_non_running_is_noop():
+    launch, _, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=1, launch_fn=launch)
+    # UNSTARTED → stop is a no-op.
+    pool.stop_worker(0)
+    assert pool.slot(0).state is ReplicaState.UNSTARTED
+    pool.start_all()
+    pool.stop_worker(0)
+    # STOPPED → stop again is a no-op.
+    pool.stop_worker(0)
+    assert pool.slot(0).state is ReplicaState.STOPPED
+
+
+def test_pool_start_all_tears_down_partial_on_failure():
+    # Two replicas succeed, the third fails mid-launch. The pool must
+    # tear down 0 and 1 before propagating.
+    counter = {"n": 0}
+
+    def flaky_launch(instance_id: int):
+        counter["n"] += 1
+        if instance_id == 2:
+            raise RuntimeError("simulated descriptor handshake failure")
+        proc = MagicMock()
+        proc.poll = MagicMock(return_value=None)
+        proc.returncode = None
+        proc.send_signal = MagicMock(
+            side_effect=lambda _: (
+                setattr(proc, "returncode", 0),
+                proc.poll.configure_mock(return_value=0),
+            )
+        )
+        proc.wait = MagicMock(return_value=0)
+        proc.kill = MagicMock()
+        tailer = _threading.Thread(target=lambda: None)
+        tailer.start()
+        return proc, tailer, _threading.Event(), {"instance_id": instance_id}
+
+    pool = ReplicaPool(system="awa", capacity=3, launch_fn=flaky_launch)
+    with pytest.raises(RuntimeError, match="simulated descriptor handshake"):
+        pool.start_all()
+    # Slots 0 and 1 were launched then torn down — handle cleared.
+    assert pool.slot(0).process is None
+    assert pool.slot(1).process is None
+
+
+def test_pool_out_of_range_instance_id_raises():
+    launch, _, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=2, launch_fn=launch)
+    with pytest.raises(IndexError):
+        pool.slot(5)
+    with pytest.raises(IndexError):
+        pool.slot(-1)
+
+
+def test_pool_stop_all_is_idempotent():
+    launch, _, _ = _fake_launch_fn()
+    pool = ReplicaPool(system="awa", capacity=2, launch_fn=launch)
+    pool.start_all()
+    pool.kill_worker(0)  # now slot 0 is KILLED (not RUNNING)
+    pool.stop_all()      # only slot 1 needs stopping
+    assert pool.slot(0).state is ReplicaState.KILLED
+    assert pool.slot(1).state is ReplicaState.STOPPED
+    # Second stop_all is a no-op — nothing to transition.
+    pool.stop_all()
+    assert pool.slot(0).state is ReplicaState.KILLED
+    assert pool.slot(1).state is ReplicaState.STOPPED

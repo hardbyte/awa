@@ -45,6 +45,7 @@ from .phases import (
     resolve_scenario,
 )
 from .plots import render_all
+from .replica_pool import ReplicaPool
 from .sample import Sample
 from .versions import capture_adapter_revision
 from .writers import (
@@ -208,36 +209,11 @@ def preflight_database(manifest: AdapterManifest, *, recreate: bool = False) -> 
 # ────────────────────────────────────────────────────────────────────────
 
 
-@dataclass
-class ReplicaHandle:
-    """One launched adapter replica: subprocess + its tailer + descriptor."""
-
-    instance_id: int
-    process: subprocess.Popen
-    tailer: threading.Thread
-    stop_event: threading.Event
-    descriptor: dict
-
-
-@dataclass
-class RunningAdapter:
-    """A running adapter as a collection of 1..N replicas.
-
-    `descriptor` is the representative (first-received) descriptor used
-    for manifest inclusion and static-manifest cross-check. Per-replica
-    descriptors live on each `ReplicaHandle.descriptor`; they're checked
-    for agreement on static fields (event_tables, extensions) during
-    launch, with drift logged rather than fatal — the scenario may
-    intentionally mix versions in a later iteration of this work.
-    """
-
-    system: str
-    replicas: list[ReplicaHandle]
-    descriptor: dict
-
-    @property
-    def all_running(self) -> bool:
-        return all(r.process.poll() is None for r in self.replicas)
+# Lifecycle state — subprocess handle / tailer / descriptor per replica —
+# lives on `ReplicaSlot`. Lifecycle methods (start/stop/kill/restart) live
+# on `ReplicaPool`. Orchestrator here builds the pool from a
+# `_launch_one_replica` closure and exposes the pool on phase_state so
+# destructive phase types can drive it.
 
 
 def _tail_stdout(
@@ -291,7 +267,7 @@ def _launch_one_replica(
     bench_start: float,
     tracker: PhaseTracker,
     out_queue: "queue.Queue[Sample]",
-) -> ReplicaHandle:
+) -> tuple[subprocess.Popen, threading.Thread, threading.Event, dict]:
     """Launch one replica and wait for its startup descriptor."""
     # Per-instance env: the only variable is BENCH_INSTANCE_ID. Copy the
     # shared overrides first so the caller's producer-rate / worker-count
@@ -370,91 +346,74 @@ def _launch_one_replica(
         _check_descriptor_drift(manifest, descriptor)
     except RuntimeError as exc:
         raise _abort(str(exc)) from exc
-    return ReplicaHandle(
-        instance_id=instance_id,
-        process=proc,
-        tailer=tailer,
-        stop_event=stop_event,
-        descriptor=descriptor,
-    )
+    return proc, tailer, stop_event, descriptor
 
 
-def launch_adapter(
+def build_replica_pool(
     system: str,
     entry: AdapterEntry,
     manifest: AdapterManifest,
     overrides: dict[str, str],
     *,
-    replicas: int = 1,
+    replicas: int,
     run_id: str,
     bench_start: float,
     tracker: PhaseTracker,
     out_queue: "queue.Queue[Sample]",
-) -> RunningAdapter:
-    if replicas < 1:
-        raise ValueError(f"replicas must be >= 1, got {replicas}")
-    handles: list[ReplicaHandle] = []
-    try:
-        for i in range(replicas):
-            handle = _launch_one_replica(
-                system,
-                entry,
-                manifest,
-                overrides,
-                instance_id=i,
-                run_id=run_id,
-                bench_start=bench_start,
-                tracker=tracker,
-                out_queue=out_queue,
-            )
-            handles.append(handle)
-    except Exception:
-        # Partial launch — tear down everything we did start before
-        # propagating. Preserves the "all-or-nothing" contract even when
-        # replica 2 of 3 fails its descriptor handshake.
-        for h in handles:
-            _terminate_replica(h, system, timeout_s=5.0)
-        raise
+) -> ReplicaPool:
+    """Construct a pool whose ``launch_fn`` captures this run's context.
 
-    # Cross-replica agreement check on static fields. Drift here is not a
-    # scenario we test today, so log-and-continue rather than fail.
-    first = handles[0].descriptor
-    first_tables = sorted(first.get("event_tables") or [])
-    first_exts = sorted(first.get("extensions") or [])
-    for h in handles[1:]:
-        if sorted(h.descriptor.get("event_tables") or []) != first_tables:
-            print(
-                f"[{system}] WARNING: replica {h.instance_id} declared "
-                f"event_tables different from replica 0",
-                file=sys.stderr,
-            )
-        if sorted(h.descriptor.get("extensions") or []) != first_exts:
-            print(
-                f"[{system}] WARNING: replica {h.instance_id} declared "
-                f"extensions different from replica 0",
-                file=sys.stderr,
-            )
-    return RunningAdapter(system=system, replicas=handles, descriptor=first)
+    Start/restart operations on the pool will re-invoke the launcher
+    with the same entry, manifest, overrides, and ingestion pipeline
+    that the initial launch used — crucial for destructive scenarios
+    (kill-worker then start-worker) to come back up identically.
+    """
+
+    def _launch_fn(instance_id: int):
+        return _launch_one_replica(
+            system,
+            entry,
+            manifest,
+            overrides,
+            instance_id=instance_id,
+            run_id=run_id,
+            bench_start=bench_start,
+            tracker=tracker,
+            out_queue=out_queue,
+        )
+
+    return ReplicaPool(system=system, capacity=replicas, launch_fn=_launch_fn)
 
 
-def _terminate_replica(
-    handle: ReplicaHandle, system: str, timeout_s: float = 10.0
-) -> None:
-    proc = handle.process
-    if proc.poll() is None:
-        proc.send_signal(signal.SIGTERM)
-        try:
-            proc.wait(timeout=timeout_s)
-        except subprocess.TimeoutExpired:
+def _check_cross_replica_drift(pool: ReplicaPool) -> None:
+    """Warn when replicas of the same system disagree on static descriptor
+    fields. Not fatal — mixed-version scenarios are a planned future
+    iteration and the harness shouldn't pre-emptively ban them."""
+    first = None
+    first_tables: list[str] = []
+    first_exts: list[str] = []
+    for slot in pool.slots:
+        if slot.descriptor is None:
+            continue
+        if first is None:
+            first = slot
+            first_tables = sorted(slot.descriptor.get("event_tables") or [])
+            first_exts = sorted(slot.descriptor.get("extensions") or [])
+            continue
+        if sorted(slot.descriptor.get("event_tables") or []) != first_tables:
             print(
-                f"[{system}] replica {handle.instance_id} did not exit "
-                f"within {timeout_s}s, killing",
+                f"[{pool.system}] WARNING: replica {slot.instance_id} "
+                f"declared event_tables different from replica "
+                f"{first.instance_id}",
                 file=sys.stderr,
             )
-            proc.kill()
-            proc.wait()
-    handle.stop_event.set()
-    handle.tailer.join(timeout=2.0)
+        if sorted(slot.descriptor.get("extensions") or []) != first_exts:
+            print(
+                f"[{pool.system}] WARNING: replica {slot.instance_id} "
+                f"declared extensions different from replica "
+                f"{first.instance_id}",
+                file=sys.stderr,
+            )
 
 
 def _check_descriptor_drift(manifest: AdapterManifest, descriptor: dict) -> None:
@@ -476,14 +435,10 @@ def _check_descriptor_drift(manifest: AdapterManifest, descriptor: dict) -> None
         )
 
 
-def terminate_adapter(
-    running: RunningAdapter, system: str, timeout_s: float = 10.0
-) -> None:
-    """Terminate every replica of a running adapter. Best-effort — each
-    replica is given `timeout_s` individually so a slow shutdown on one
-    replica doesn't rob the others of their full window."""
-    for handle in running.replicas:
-        _terminate_replica(handle, system, timeout_s=timeout_s)
+# Teardown lives on the pool now: `pool.stop_all(timeout_s=...)` walks
+# every RUNNING replica and transitions it to STOPPED. Prior incarnations
+# that were KILLED or CRASHED mid-run are left as-is (their handles are
+# already cleared on the slot). See ReplicaPool.stop_all.
 
 
 # ────────────────────────────────────────────────────────────────────────
@@ -551,7 +506,7 @@ def run_one_system(
     overrides["PRODUCER_RATE_CONTROL_FILE_CONTAINER"] = "/control/producer_rate.txt"
 
     bench_start = time.time()
-    adapter = launch_adapter(
+    pool = build_replica_pool(
         system,
         entry,
         manifest,
@@ -562,6 +517,8 @@ def run_one_system(
         tracker=tracker,
         out_queue=out_queue,
     )
+    pool.start_all()
+    _check_cross_replica_drift(pool)
 
     # Register the metrics daemon now so it covers all phases including warmup.
     daemon = MetricsDaemon(
@@ -587,6 +544,10 @@ def run_one_system(
         # Exposed so the active-readers hook can scan this system's hot
         # table instead of the catalog. See hooks.enter_active_readers.
         "event_tables": list(manifest.event_tables),
+        # Destructive / lifecycle phases (kill-worker, stop-worker,
+        # rolling-replace — landing in #174 step 4+) act on this.
+        # Pre-existing phase hooks ignore it.
+        "replica_pool": pool,
     }
     try:
         for phase in phases:
@@ -603,7 +564,7 @@ def run_one_system(
             )
             registry.enter(runtime)
             try:
-                _sleep_or_abort(phase.duration_s, adapter)
+                _sleep_or_abort(phase.duration_s, pool)
             finally:
                 registry.exit(runtime)
                 # Phase-boundary snapshot: pgstattuple / pgstatindex.
@@ -611,30 +572,38 @@ def run_one_system(
     finally:
         daemon.stop()
         daemon.join(timeout=5.0)
-        terminate_adapter(adapter, system)
+        pool.stop_all()
         shutil.rmtree(control_dir, ignore_errors=True)
 
-    return adapter.descriptor
+    # Representative descriptor for manifest inclusion. Prefer replica 0's
+    # if still available; otherwise any slot's (replica 0 may have been
+    # killed mid-run by a destructive phase and not restarted).
+    return pool.descriptor or {}
 
 
-def _sleep_or_abort(seconds: float, adapter: RunningAdapter) -> None:
+def _sleep_or_abort(seconds: float, pool: ReplicaPool) -> None:
     """Sleep in small increments so replica crash is noticed quickly.
 
-    Any replica exiting unexpectedly during a phase aborts the whole
-    phase. Later scenarios (kill-worker, rolling-replace) are expected
-    to drive lifecycle changes through the phase registry, so a
-    surprise exit here genuinely indicates a fault.
+    Only replicas in state RUNNING are watched. A replica that a phase
+    deliberately stopped or killed (STOPPED / KILLED) is expected to
+    have exited; the pool's `detect_crashes` skips it.
+
+    The later destructive phase types (kill-worker, stop-worker) drive
+    lifecycle changes through `state["replica_pool"]`, so the pool's
+    intended state tracks whether any exit is a fault or expected.
     """
     end = time.time() + seconds
     while time.time() < end:
         remaining = end - time.time()
         time.sleep(min(1.0, max(0.05, remaining)))
-        for replica in adapter.replicas:
-            if replica.process.poll() is not None:
-                raise RuntimeError(
-                    f"{adapter.system} replica {replica.instance_id} exited "
-                    f"during phase (rc={replica.process.returncode})"
-                )
+        crashed = pool.detect_crashes()
+        if crashed:
+            slot = crashed[0]
+            rc = slot.process.returncode if slot.process else "unknown"
+            raise RuntimeError(
+                f"{pool.system} replica {slot.instance_id} exited "
+                f"during phase (rc={rc}) while state was RUNNING"
+            )
 
 
 # ────────────────────────────────────────────────────────────────────────
