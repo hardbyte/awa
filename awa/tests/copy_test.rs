@@ -219,6 +219,55 @@ async fn test_copy_unique_constraint() {
     assert_eq!(result2[0].args["id"], 3);
 }
 
+#[tokio::test]
+async fn test_copy_unique_constraint_deduplicates_within_batch() {
+    let pool = setup().await;
+    let queue = "copy_unique_same_batch";
+    clean_queue(&pool, queue).await;
+
+    let unique_opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts {
+            by_args: true,
+            by_queue: true,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+
+    let jobs = vec![
+        InsertParams {
+            kind: "unique_job".to_string(),
+            args: serde_json::json!({"id": 1}),
+            opts: unique_opts.clone(),
+        },
+        InsertParams {
+            kind: "unique_job".to_string(),
+            args: serde_json::json!({"id": 1}),
+            opts: unique_opts.clone(),
+        },
+        InsertParams {
+            kind: "unique_job".to_string(),
+            args: serde_json::json!({"id": 2}),
+            opts: unique_opts.clone(),
+        },
+    ];
+
+    let result = insert_many_copy_from_pool(&pool, &jobs).await.unwrap();
+    assert_eq!(result.len(), 2);
+    assert_eq!(result[0].args["id"], 1);
+    assert_eq!(result[1].args["id"], 2);
+
+    let stored: Vec<i64> = sqlx::query_scalar(
+        "SELECT (args->>'id')::bigint FROM awa.jobs WHERE queue = $1 ORDER BY 1",
+    )
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(stored, vec![1, 2]);
+}
+
 // ── Test 7: Mixed run_at (NULL = available, future = scheduled) ─────
 
 #[tokio::test]

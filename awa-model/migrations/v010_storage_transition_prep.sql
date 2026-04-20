@@ -206,6 +206,26 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION awa.assert_writable_canonical_storage()
+RETURNS BOOLEAN
+LANGUAGE plpgsql
+STABLE
+SET search_path = pg_catalog, awa
+AS $$
+DECLARE
+    active_engine TEXT;
+BEGIN
+    active_engine := awa.active_storage_engine();
+
+    IF active_engine IS DISTINCT FROM 'canonical' THEN
+        RAISE EXCEPTION 'storage engine "%" is not writable in this release', active_engine
+            USING ERRCODE = '55000';
+    END IF;
+
+    RETURN TRUE;
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_kind TEXT,
     p_queue TEXT DEFAULT 'default',
@@ -224,15 +244,9 @@ LANGUAGE plpgsql
 SET search_path = pg_catalog, awa
 AS $$
 DECLARE
-    active_engine TEXT;
     inserted awa.jobs%ROWTYPE;
 BEGIN
-    active_engine := awa.active_storage_engine();
-
-    IF active_engine IS DISTINCT FROM 'canonical' THEN
-        RAISE EXCEPTION 'storage engine "%" is not writable in this release', active_engine
-            USING ERRCODE = '55000';
-    END IF;
+    PERFORM awa.assert_writable_canonical_storage();
 
     INSERT INTO awa.jobs (
         kind,

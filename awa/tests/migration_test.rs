@@ -41,6 +41,15 @@ async fn reset_schema(pool: &PgPool) {
         .expect("Failed to drop schema");
 }
 
+fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
+    match err {
+        awa::AwaError::Database(sqlx::Error::Database(db_err)) => {
+            db_err.code().map(|code| code.to_string())
+        }
+        _ => None,
+    }
+}
+
 // ── Fresh install ────────────────────────────────────────────────
 
 #[tokio::test]
@@ -433,6 +442,125 @@ async fn test_storage_prepare_keeps_canonical_routing() {
     assert_eq!(aborted.state, "canonical");
     assert_eq!(aborted.active_engine, "canonical");
     assert_eq!(aborted.prepared_engine, None);
+}
+
+#[tokio::test]
+async fn test_storage_prepare_rejects_current_engine() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let err = storage::prepare(&pool, "canonical", serde_json::json!({}))
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("22023"));
+    assert!(
+        err.to_string().contains("already active"),
+        "expected already-active error, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_storage_prepare_same_details_is_idempotent() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let details = serde_json::json!({
+        "schema": "awa_queue_storage"
+    });
+    let prepared = storage::prepare(&pool, "queue_storage", details.clone())
+        .await
+        .unwrap();
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+    let prepared_again = storage::prepare(&pool, "queue_storage", details)
+        .await
+        .unwrap();
+    assert_eq!(prepared_again.state, "prepared");
+    assert_eq!(prepared_again.transition_epoch, prepared.transition_epoch);
+    assert_eq!(prepared_again.entered_at, prepared.entered_at);
+}
+
+#[tokio::test]
+async fn test_storage_abort_from_canonical_is_noop() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let before = storage::status(&pool).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let after = storage::abort(&pool).await.unwrap();
+
+    assert_eq!(after.state, "canonical");
+    assert_eq!(after.transition_epoch, before.transition_epoch);
+    assert_eq!(after.entered_at, before.entered_at);
+}
+
+#[tokio::test]
+async fn test_insert_job_compat_refuses_non_canonical_active_engine() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'active',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            updated_at = now(),
+            finalized_at = now()
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let err = sqlx::query_as::<_, awa::JobRow>(
+        r#"
+        SELECT *
+        FROM awa.insert_job_compat(
+            'compat_refusal_test',
+            'compat_refusal_queue',
+            '{}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            NULL::timestamptz,
+            '{}'::jsonb,
+            ARRAY[]::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_err();
+
+    match err {
+        sqlx::Error::Database(db_err) => {
+            assert_eq!(db_err.code().as_deref(), Some("55000"));
+            assert!(
+                db_err.message().contains("not writable"),
+                "expected non-writable error, got {}",
+                db_err.message()
+            );
+        }
+        other => panic!("expected sqlx database error, got {other:?}"),
+    }
 }
 
 // ── Legacy V3-only upgrade (0.3.0 exact, no V4/V5) ──────────────
