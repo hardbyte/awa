@@ -206,6 +206,48 @@ BEGIN
 END;
 $$;
 
+CREATE OR REPLACE FUNCTION awa.storage_enter_mixed_transition()
+RETURNS TABLE (
+    current_engine TEXT,
+    active_engine TEXT,
+    prepared_engine TEXT,
+    state TEXT,
+    transition_epoch BIGINT,
+    details JSONB,
+    entered_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    finalized_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SET search_path = pg_catalog, awa
+AS $$
+BEGIN
+    RAISE EXCEPTION 'storage mixed transition is not supported in this release; requires 0.6'
+        USING ERRCODE = '55000';
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION awa.storage_finalize()
+RETURNS TABLE (
+    current_engine TEXT,
+    active_engine TEXT,
+    prepared_engine TEXT,
+    state TEXT,
+    transition_epoch BIGINT,
+    details JSONB,
+    entered_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ,
+    finalized_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SET search_path = pg_catalog, awa
+AS $$
+BEGIN
+    RAISE EXCEPTION 'storage finalization is not supported in this release; requires 0.6'
+        USING ERRCODE = '55000';
+END;
+$$;
+
 CREATE OR REPLACE FUNCTION awa.assert_writable_canonical_storage()
 RETURNS BOOLEAN
 LANGUAGE plpgsql

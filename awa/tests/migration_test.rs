@@ -51,6 +51,13 @@ fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
     }
 }
 
+fn sqlstate_from_sqlx_error(err: &sqlx::Error) -> Option<String> {
+    match err {
+        sqlx::Error::Database(db_err) => db_err.code().map(|code| code.to_string()),
+        _ => None,
+    }
+}
+
 async fn simulate_non_canonical_compat_routing(pool: &PgPool) {
     sqlx::raw_sql(
         r#"
@@ -603,6 +610,133 @@ async fn test_storage_abort_from_mixed_transition_returns_to_canonical() {
     assert_eq!(after.prepared_engine, None);
     assert_eq!(after.transition_epoch, before.transition_epoch + 1);
     assert!(after.entered_at > before.entered_at);
+}
+
+#[tokio::test]
+async fn test_storage_enter_mixed_transition_stub_requires_0_6() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let err = sqlx::query("SELECT * FROM awa.storage_enter_mixed_transition()")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate_from_sqlx_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("requires 0.6"),
+        "expected 0.6 guard error, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_storage_finalize_stub_requires_0_6() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let err = sqlx::query("SELECT * FROM awa.storage_finalize()")
+        .execute(&pool)
+        .await
+        .unwrap_err();
+    assert_eq!(sqlstate_from_sqlx_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("requires 0.6"),
+        "expected 0.6 guard error, got {err}"
+    );
+}
+
+#[tokio::test]
+async fn test_mixed_transition_fails_safe_for_0_5_producers() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET prepared_engine = 'queue_storage',
+            state = 'mixed_transition',
+            transition_epoch = transition_epoch + 1,
+            details = '{"schema":"awa_queue_storage"}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let compat_err = sqlx::query_as::<_, awa::JobRow>(
+        r#"
+        SELECT *
+        FROM awa.insert_job_compat(
+            'compat_mixed_transition_test',
+            'compat_mixed_transition_queue',
+            '{}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            NULL::timestamptz,
+            '{}'::jsonb,
+            ARRAY[]::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate_from_sqlx_error(&compat_err).as_deref(),
+        Some("55000")
+    );
+
+    let batch_err = insert_many(
+        &pool,
+        &[InsertParams {
+            kind: "compat_mixed_transition_batch".to_string(),
+            args: serde_json::json!({"seq": 1}),
+            opts: InsertOpts {
+                queue: "compat_mixed_transition_batch".to_string(),
+                ..Default::default()
+            },
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(
+        sqlstate_from_awa_error(&batch_err).as_deref(),
+        Some("55000")
+    );
+
+    let copy_err = insert_many_copy_from_pool(
+        &pool,
+        &[InsertParams {
+            kind: "compat_mixed_transition_copy".to_string(),
+            args: serde_json::json!({"seq": 2}),
+            opts: InsertOpts {
+                queue: "compat_mixed_transition_copy".to_string(),
+                unique: Some(UniqueOpts {
+                    by_args: true,
+                    by_queue: true,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        }],
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&copy_err).as_deref(), Some("55000"));
 }
 
 #[tokio::test]
