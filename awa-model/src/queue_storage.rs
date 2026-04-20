@@ -6490,10 +6490,6 @@ impl QueueStorage {
     pub async fn prune_oldest(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        sqlx::query("SET LOCAL lock_timeout = '50ms'")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
 
         let state: (i32,) = sqlx::query_as(&format!(
             r#"
@@ -6530,6 +6526,11 @@ impl QueueStorage {
 
         let ready_child = ready_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
+
+        sqlx::query("SET LOCAL lock_timeout = '50ms'")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
         let lock_tables = sqlx::query(&format!(
             "LOCK TABLE {ready_child}, {done_child} IN ACCESS EXCLUSIVE MODE"
@@ -6622,10 +6623,6 @@ impl QueueStorage {
     pub async fn prune_oldest_leases(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        sqlx::query("SET LOCAL lock_timeout = '50ms'")
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
 
         let state: (i32,) = sqlx::query_as(&format!(
             r#"
@@ -6661,6 +6658,11 @@ impl QueueStorage {
         };
 
         let lease_child = lease_child_name(schema, slot as usize);
+
+        sqlx::query("SET LOCAL lock_timeout = '50ms'")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
 
         let lock_table = sqlx::query(&format!(
             "LOCK TABLE {lease_child} IN ACCESS EXCLUSIVE MODE"
