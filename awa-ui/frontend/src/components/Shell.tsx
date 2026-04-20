@@ -169,16 +169,12 @@ function RefreshControl() {
   );
 }
 
-/**
- * Aggregate a cluster-wide storage-capability label from live runtime
- * instances. Reads `storage_capability` on each instance; if the field
- * is absent (pre-v10 schema) every instance falls through as "canonical",
- * so the chip stays informative on deployments that haven't yet applied
- * the storage-transition-prep migration.
- */
-function summariseCapabilities(runtime: RuntimeOverview | undefined): {
-  label: string;
-  hint: string;
+// Returns live worker count, plus a capability label when the cluster is
+// mid-transition (mixed or non-canonical). On a canonical-only cluster the
+// label is suppressed — the engine name conveys nothing operators need to see.
+function summariseCluster(runtime: RuntimeOverview | undefined): {
+  liveCount: number;
+  capability: string | null;
 } | null {
   if (!runtime) return null;
   const live = runtime.instances.filter((instance) => !instance.stale);
@@ -188,16 +184,15 @@ function summariseCapabilities(runtime: RuntimeOverview | undefined): {
     live.map((instance) => instance.storage_capability ?? "canonical")
   );
   const ordered = Array.from(capabilities).sort();
-  const count = live.length;
-  if (ordered.length === 1 && ordered[0]) {
-    return {
-      label: ordered[0].replace(/_/g, " "),
-      hint: `${count} live ${count === 1 ? "worker" : "workers"}`,
-    };
-  }
+  const mixedOrNonCanonical =
+    ordered.length > 1 || (ordered[0] !== undefined && ordered[0] !== "canonical");
   return {
-    label: "mixed",
-    hint: ordered.join(" · "),
+    liveCount: live.length,
+    capability: mixedOrNonCanonical
+      ? ordered.length > 1
+        ? "mixed storage"
+        : (ordered[0] ?? "").replace(/_/g, " ")
+      : null,
   };
 }
 
@@ -213,9 +208,9 @@ function CloseMobileOnNavigate({ path }: { path: string }) {
   return null;
 }
 
-/** Cluster status chip — health pulse + storage-capability summary. */
+// Live-worker pulse for the sidebar footer.
 function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }) {
-  const summary = summariseCapabilities(runtime);
+  const summary = summariseCluster(runtime);
   if (!summary) {
     return (
       <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs text-muted-fg">
@@ -224,6 +219,7 @@ function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }
       </div>
     );
   }
+  const workerLabel = `${summary.liveCount} live ${summary.liveCount === 1 ? "worker" : "workers"}`;
   return (
     <div className="flex items-center gap-2 rounded-md bg-muted/40 px-2.5 py-1.5 text-xs">
       <span className="relative flex size-2">
@@ -231,8 +227,10 @@ function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }
         <span className="relative inline-flex size-2 rounded-full bg-primary" />
       </span>
       <span className="flex flex-col">
-        <span className="font-medium capitalize text-fg">{summary.label}</span>
-        <span className="text-muted-fg">{summary.hint}</span>
+        <span className="font-medium text-fg">{workerLabel}</span>
+        {summary.capability && (
+          <span className="capitalize text-muted-fg">{summary.capability}</span>
+        )}
       </span>
     </div>
   );

@@ -1,8 +1,20 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { Link, useNavigate } from "@tanstack/react-router";
-import { fetchQueueRuntime, fetchRuntime } from "@/lib/api";
-import type { QueueRuntimeSummary, RuntimeOverview } from "@/lib/api";
+import {
+  fetchQueueRuntime,
+  fetchRuntime,
+  fetchStorage,
+} from "@/lib/api";
+import type {
+  QueueRuntimeSummary,
+  RuntimeOverview,
+  StorageStatusReport,
+} from "@/lib/api";
+import {
+  shouldShowStorageTransitionCard,
+  StorageTransitionCard,
+} from "@/components/StorageTransition";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
@@ -49,6 +61,16 @@ export function RuntimePage() {
     queryKey: ["queue-runtime"],
     queryFn: fetchQueueRuntime,
     refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
+  // Optional: backends before 0.5.5-alpha return 404 for /storage, in which
+  // case fetchStorage resolves to null and the card simply doesn't render.
+  const storageQuery = useQuery<StorageStatusReport | null>({
+    queryKey: ["storage"],
+    queryFn: fetchStorage,
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
+    retry: false,
   });
 
   const runtime = runtimeQuery.data;
@@ -154,6 +176,10 @@ export function RuntimePage() {
             )}
           </CardContent>
         </Card>
+      )}
+
+      {shouldShowStorageTransitionCard(storageQuery.data) && storageQuery.data && (
+        <StorageTransitionCard report={storageQuery.data} />
       )}
 
       <Card>
