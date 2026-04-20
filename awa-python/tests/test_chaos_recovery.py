@@ -43,9 +43,43 @@ async def client():
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'chaos_%'")
     await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'chaos_%'")
+    await tx.execute(
+        "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+    )
     await tx.commit()
     yield c
     await c.close()
+
+
+async def _active_queue_storage_schema(client: awa.AsyncClient) -> str | None:
+    tx = await client.transaction()
+    try:
+        row = await tx.fetch_one("SELECT awa.active_queue_storage_schema() AS schema_name")
+        return row["schema_name"]
+    finally:
+        await tx.rollback()
+
+
+async def _backdate_running_deadline(client: awa.AsyncClient, job_id: int) -> None:
+    schema = await _active_queue_storage_schema(client)
+    tx = await client.transaction()
+    try:
+        if schema:
+            await tx.execute(
+                f"UPDATE {schema}.leases "
+                "SET deadline_at = now() - interval '1 second' "
+                "WHERE job_id = $1 AND state = 'running'",
+                job_id,
+            )
+        else:
+            await tx.execute(
+                "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
+                job_id,
+            )
+        await tx.commit()
+    except Exception:
+        await tx.rollback()
+        raise
 
 
 @pytest.mark.asyncio
@@ -65,12 +99,7 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
             timeout=10,
         )
 
-        tx = await client.transaction()
-        await tx.execute(
-            "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
-            job.id,
-        )
-        await tx.commit()
+        await _backdate_running_deadline(client, job.id)
 
         worker_a.kill()
         await asyncio.wait_for(worker_a.wait(), timeout=5)
@@ -114,12 +143,7 @@ async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
             timeout=10,
         )
 
-        tx = await client.transaction()
-        await tx.execute(
-            "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
-            job.id,
-        )
-        await tx.commit()
+        await _backdate_running_deadline(client, job.id)
 
         await _wait_for_line(
             worker,

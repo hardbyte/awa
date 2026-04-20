@@ -853,7 +853,7 @@ impl MaintenanceService {
                     }
                 }
                 RuntimeStorage::QueueStorage(runtime) => {
-                    let state = match state {
+                    let job_state = match state {
                         "scheduled" => awa_model::JobState::Scheduled,
                         "retryable" => awa_model::JobState::Retryable,
                         other => {
@@ -862,10 +862,16 @@ impl MaintenanceService {
                             )));
                         }
                     };
+                    let promote_start = std::time::Instant::now();
                     let promoted = runtime
                         .store
-                        .promote_due(&self.pool, state, PROMOTE_BATCH_SIZE)
+                        .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
                         .await?;
+                    self.metrics.record_promotion_batch(
+                        state,
+                        promoted as u64,
+                        promote_start.elapsed(),
+                    );
                     if promoted == 0 {
                         break;
                     }

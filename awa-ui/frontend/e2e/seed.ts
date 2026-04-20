@@ -95,7 +95,7 @@ export default async function globalSetup() {
       claim_seq       BIGINT NOT NULL DEFAULT 1,
       available_count BIGINT NOT NULL DEFAULT 0,
       running_count   BIGINT NOT NULL DEFAULT 0,
-      completed_count BIGINT NOT NULL DEFAULT 0,
+      pruned_completed_count BIGINT NOT NULL DEFAULT 0,
       PRIMARY KEY (queue, priority)
     );
 

@@ -412,21 +412,22 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
 async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: &str) {
     let start = std::time::Instant::now();
     loop {
-        let current_state: String =
-            sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
-                .bind(job_id)
-                .fetch_one(pool)
-                .await
-                .expect("Failed to query job state");
-
-        if current_state == state {
-            return;
-        }
-
-        if start.elapsed() > Duration::from_secs(60) {
-            panic!(
-                "Timed out waiting for job {job_id} to reach state {state}; current state: {current_state}"
-            );
+        match awa::model::admin::get_job(pool, job_id).await {
+            Ok(job) if job.state.to_string() == state => return,
+            Ok(job) => {
+                if start.elapsed() > Duration::from_secs(60) {
+                    panic!(
+                        "Timed out waiting for job {job_id} to reach state {state}; current state: {}",
+                        job.state
+                    );
+                }
+            }
+            Err(awa::model::AwaError::JobNotFound { .. }) => {
+                if start.elapsed() > Duration::from_secs(60) {
+                    panic!("Timed out waiting for job {job_id} to reach state {state}; job disappeared");
+                }
+            }
+            Err(err) => panic!("Failed to query job state: {err}"),
         }
 
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1605,8 +1606,8 @@ async fn dashboard_panels_have_observed_data() {
 
     let promotion = wait_for_series(
         &http,
-        "sum by (awa_job_state) (rate(awa_maintenance_promote_batch_size_sum[5m]))",
-        2,
+        "sum by (awa_job_state) (rate(awa_maintenance_promote_batches_total[5m]))",
+        1,
         timeout,
     )
     .await;
