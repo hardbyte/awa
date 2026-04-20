@@ -56,6 +56,11 @@ enum Commands {
         #[command(subcommand)]
         command: CronCommands,
     },
+    /// Storage transition management
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommands,
+    },
     /// Start the web UI server
     Serve {
         /// Host to bind to
@@ -151,6 +156,22 @@ enum CronCommands {
     List,
     /// Remove a cron job schedule by name
     Remove { name: String },
+}
+
+#[derive(Subcommand)]
+enum StorageCommands {
+    /// Show the current storage transition state
+    Status,
+    /// Prepare a future storage engine without changing execution routing
+    Prepare {
+        #[arg(long)]
+        engine: String,
+        /// Optional JSON details recorded alongside the prepared engine
+        #[arg(long)]
+        details: Option<String>,
+    },
+    /// Abort a prepared or mixed-transition storage rollout before final activation
+    Abort,
 }
 
 #[derive(Subcommand)]
@@ -426,6 +447,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         } else {
                             println!("No cron schedule found with name '{name}'");
                         }
+                    }
+                },
+
+                Commands::Storage { command } => match command {
+                    StorageCommands::Status => {
+                        let status = awa_model::storage::status(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    }
+                    StorageCommands::Prepare { engine, details } => {
+                        let details = match details {
+                            Some(raw) => serde_json::from_str(&raw)?,
+                            None => serde_json::json!({}),
+                        };
+                        let status = awa_model::storage::prepare(&pool, &engine, details).await?;
+                        println!("{}", serde_json::to_string_pretty(&status)?);
+                    }
+                    StorageCommands::Abort => {
+                        let status = awa_model::storage::abort(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&status)?);
                     }
                 },
 

@@ -7,6 +7,8 @@ use sqlx::PgExecutor;
 use sqlx::PgPool;
 use std::cmp::max;
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -896,6 +898,43 @@ pub struct QueueRuntimeSnapshot {
     pub config: QueueRuntimeConfigSnapshot,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum StorageCapability {
+    Canonical,
+    CanonicalDrainOnly,
+    QueueStorage,
+}
+
+impl StorageCapability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Canonical => "canonical",
+            Self::CanonicalDrainOnly => "canonical_drain_only",
+            Self::QueueStorage => "queue_storage",
+        }
+    }
+}
+
+impl fmt::Display for StorageCapability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for StorageCapability {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "canonical" => Ok(Self::Canonical),
+            "canonical_drain_only" => Ok(Self::CanonicalDrainOnly),
+            "queue_storage" => Ok(Self::QueueStorage),
+            _ => Err(value.to_string()),
+        }
+    }
+}
+
 /// Data written by a worker runtime into the observability snapshot table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeSnapshotInput {
@@ -903,6 +942,7 @@ pub struct RuntimeSnapshotInput {
     pub hostname: Option<String>,
     pub pid: i32,
     pub version: String,
+    pub storage_capability: StorageCapability,
     pub started_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
     pub healthy: bool,
@@ -925,6 +965,7 @@ pub struct RuntimeInstance {
     pub hostname: Option<String>,
     pub pid: i32,
     pub version: String,
+    pub storage_capability: StorageCapability,
     pub started_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
@@ -946,13 +987,20 @@ impl RuntimeInstance {
         Duration::milliseconds(max(interval_ms.saturating_mul(3), 30_000))
     }
 
-    fn from_db_row(row: RuntimeInstanceRow, now: DateTime<Utc>) -> Self {
+    fn from_db_row(row: RuntimeInstanceRow, now: DateTime<Utc>) -> Result<Self, AwaError> {
         let stale = row.last_seen_at + Self::stale_cutoff(row.snapshot_interval_ms) < now;
-        Self {
+        let storage_capability =
+            StorageCapability::from_str(&row.storage_capability).map_err(|value| {
+                AwaError::Validation(format!(
+                    "invalid storage capability in runtime_instances: {value}"
+                ))
+            })?;
+        Ok(Self {
             instance_id: row.instance_id,
             hostname: row.hostname,
             pid: row.pid,
             version: row.version,
+            storage_capability,
             started_at: row.started_at,
             last_seen_at: row.last_seen_at,
             snapshot_interval_ms: row.snapshot_interval_ms,
@@ -966,7 +1014,7 @@ impl RuntimeInstance {
             leader: row.leader,
             global_max_workers: row.global_max_workers.map(|v| v as u32),
             queues: row.queues.0,
-        }
+        })
     }
 }
 
@@ -1001,6 +1049,7 @@ struct RuntimeInstanceRow {
     hostname: Option<String>,
     pid: i32,
     version: String,
+    storage_capability: String,
     started_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
     snapshot_interval_ms: i64,
@@ -1030,6 +1079,7 @@ where
             hostname,
             pid,
             version,
+            storage_capability,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -1046,12 +1096,13 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, now(), $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17
+            $1, $2, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
             pid = EXCLUDED.pid,
             version = EXCLUDED.version,
+            storage_capability = EXCLUDED.storage_capability,
             started_at = EXCLUDED.started_at,
             last_seen_at = now(),
             snapshot_interval_ms = EXCLUDED.snapshot_interval_ms,
@@ -1072,6 +1123,7 @@ where
     .bind(snapshot.hostname.as_deref())
     .bind(snapshot.pid)
     .bind(&snapshot.version)
+    .bind(snapshot.storage_capability.as_str())
     .bind(snapshot.started_at)
     .bind(snapshot.snapshot_interval_ms)
     .bind(snapshot.healthy)
@@ -1154,6 +1206,7 @@ where
             hostname,
             pid,
             version,
+            storage_capability,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -1174,10 +1227,9 @@ where
     .await?;
 
     let now = Utc::now();
-    Ok(rows
-        .into_iter()
+    rows.into_iter()
         .map(|row| RuntimeInstance::from_db_row(row, now))
-        .collect())
+        .collect()
 }
 
 /// Cluster runtime overview with instance list.

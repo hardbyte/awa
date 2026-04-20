@@ -1469,6 +1469,7 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
         hostname: Some("fresh-host".into()),
         pid: 1,
         version: "test".into(),
+        storage_capability: admin::StorageCapability::Canonical,
         started_at: Utc::now(),
         snapshot_interval_ms: 10_000,
         healthy: true,
@@ -1521,6 +1522,13 @@ async fn test_cleanup_runtime_snapshots_preserves_fresh() {
     assert!(
         instances.iter().any(|i| i.instance_id == fresh_id),
         "fresh snapshot should not be deleted"
+    );
+    assert_eq!(
+        instances
+            .iter()
+            .find(|i| i.instance_id == fresh_id)
+            .map(|i| i.storage_capability.as_str()),
+        Some("canonical")
     );
     assert!(
         !instances.iter().any(|i| i.instance_id == stale_id),

@@ -8,7 +8,7 @@ use crate::runtime::{InFlightMap, InFlightRegistry};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
-    RuntimeSnapshotInput,
+    RuntimeSnapshotInput, StorageCapability,
 };
 use awa_model::{JobArgs, PeriodicJob};
 use chrono::{DateTime, Utc};
@@ -1154,6 +1154,7 @@ impl RuntimeReporterState {
             hostname: self.hostname.clone(),
             pid: self.pid,
             version: self.version.to_string(),
+            storage_capability: StorageCapability::Canonical,
             started_at: self.started_at,
             snapshot_interval_ms: self.snapshot_interval.as_millis() as i64,
             healthy,
