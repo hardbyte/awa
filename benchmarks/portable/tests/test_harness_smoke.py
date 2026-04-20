@@ -21,6 +21,7 @@ from bench_harness.phases import (
     resolve_scenario,
 )
 from bench_harness.plots import PLOT_SPECS, lttb, render_all
+from bench_harness.report import write_interactive_report
 from bench_harness.sample import RAW_CSV_HEADER
 from bench_harness.writers import compute_summary, write_run_readme
 
@@ -139,6 +140,40 @@ def test_plot_renderer_produces_all_files(tmp_path: Path):
         assert (out / f"{spec.filename_stem}.png").exists()
         assert (out / f"{spec.filename_stem}.svg").exists()
     assert (out / "dead_tuples_faceted.png").exists()
+
+
+def test_interactive_report_written(tmp_path: Path):
+    phases = [
+        parse_phase_spec("warmup=warmup:60s"),
+        parse_phase_spec("clean_1=clean:90s"),
+        parse_phase_spec("idle_1=idle-in-tx:90s"),
+        parse_phase_spec("recovery_1=recovery:90s"),
+    ]
+    out = tmp_path / "run"
+    plots = out / "plots"
+    plots.mkdir(parents=True)
+    render_all(FIXTURE_CSV, systems=["awa", "river"], phases=phases, out_dir=plots)
+    summary = compute_summary(
+        FIXTURE_CSV, run_id="fixture-run", scenario="idle_in_tx_saturation", phases=phases
+    )
+    manifest = {
+        "run_id": "fixture-run",
+        "scenario": "idle_in_tx_saturation",
+        "pg_image": "postgres:17.2-alpine",
+        "cli": ["long_horizon.py", "--scenario", "idle_in_tx_saturation"],
+    }
+    report = write_interactive_report(
+        run_dir=out,
+        raw_csv=FIXTURE_CSV,
+        summary=summary,
+        manifest=manifest,
+        phases=phases,
+        systems=["awa", "river"],
+    )
+    body = report.read_text()
+    assert "Timeline Explorer" in body
+    assert "phase-summary-table" in body
+    assert "plots/throughput.svg" in body
 
 
 def test_run_readme_written(tmp_path: Path):
