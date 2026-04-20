@@ -418,11 +418,11 @@ pub async fn run() {
         let sleep_for = next_boundary_s.saturating_sub(now_epoch);
         tokio::time::sleep(Duration::from_secs(sleep_for)).await;
 
-        let mut last_enqueued: u64 = 0;
-        let mut last_completed: u64 = 0;
+        let mut last_enqueued: u64 = sample_enqueued.load(Ordering::Relaxed);
+        let mut last_completed: u64 = sample_completed.load(Ordering::Relaxed);
         let mut last_tick = Instant::now();
         let mut ticker = interval_at(
-            tokio::time::Instant::now(),
+            tokio::time::Instant::now() + Duration::from_secs(sample_every_s),
             Duration::from_secs(sample_every_s),
         );
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);

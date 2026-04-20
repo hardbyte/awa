@@ -241,9 +241,10 @@ body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
 .card-sub { font-size: 13px; color: #475569; margin-top: 4px; }
 .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
 .controls label { font-size: 13px; color: #334155; }
+.controls .hint { font-size: 12px; color: #64748b; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; background: #fff; }
-.timeline-shell { border: 1px solid #dbe4ee; border-radius: 10px; overflow: hidden; background: #fff; }
+.timeline-shell { border: 1px solid #dbe4ee; border-radius: 10px; overflow-x: auto; overflow-y: hidden; background: #fff; }
 #timeline-tooltip { position: absolute; pointer-events: none; background: rgba(15,23,42,0.92); color: white; padding: 8px 10px; border-radius: 8px; font-size: 12px; display: none; z-index: 20; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { border-bottom: 1px solid #e2e8f0; padding: 10px 8px; text-align: left; }
@@ -274,7 +275,8 @@ const PHASES = __PHASES__;
 const TIMELINE = __TIMELINE__;
 const LABELS = __LABELS__;
 
-const metricSelect = document.getElementById('metric-select');
+const primaryMetricSelect = document.getElementById('primary-metric-select');
+const compareMetricSelect = document.getElementById('compare-metric-select');
 const phaseSelect = document.getElementById('phase-select');
 const chips = document.getElementById('system-chips');
 const table = document.getElementById('phase-summary-table');
@@ -309,7 +311,11 @@ function currentPhaseLabel() {
 }
 
 function currentMetric() {
-  return metricSelect.value;
+  return primaryMetricSelect.value;
+}
+
+function compareMetric() {
+  return compareMetricSelect.value || '';
 }
 
 function svgEl(name, attrs = {}) {
@@ -323,42 +329,55 @@ function svgEl(name, attrs = {}) {
 function renderTimeline() {
   const shell = document.getElementById('timeline');
   shell.innerHTML = '';
-  const width = Math.max(880, shell.clientWidth || 880);
+  const width = Math.max(980, shell.clientWidth || 980);
   const height = 360;
-  const margin = { top: 20, right: 24, bottom: 36, left: 56 };
+  const margin = { top: 20, right: 132, bottom: 36, left: 56 };
   const phaseLabel = currentPhaseLabel();
   const metric = currentMetric();
+  const secondaryMetric = compareMetric();
   const systems = selectedSystems();
   const allSeries = seriesFor(metric);
+  const allSecondarySeries = secondaryMetric ? seriesFor(secondaryMetric) : {};
 
   const pointsBySystem = systems.map((system) => {
     const points = (allSeries[system] || []).filter((pt) => phaseLabel === 'all' || pt.phase_label === phaseLabel);
     return { system, points };
   }).filter((entry) => entry.points.length > 0);
+  const secondaryPointsBySystem = secondaryMetric ? systems.map((system) => {
+    const points = (allSecondarySeries[system] || []).filter((pt) => phaseLabel === 'all' || pt.phase_label === phaseLabel);
+    return { system, points };
+  }).filter((entry) => entry.points.length > 0) : [];
 
   const svg = svgEl('svg', { viewBox: `0 0 ${width} ${height}`, width: '100%', height: height });
   shell.appendChild(svg);
-  if (!pointsBySystem.length) {
+  if (!pointsBySystem.length && !secondaryPointsBySystem.length) {
     const text = svgEl('text', { x: width / 2, y: height / 2, 'text-anchor': 'middle', fill: '#64748b' });
     text.textContent = 'No data for selected systems / phase.';
     svg.appendChild(text);
     return;
   }
 
-  const allPoints = pointsBySystem.flatMap((entry) => entry.points);
+  const allPoints = pointsBySystem.flatMap((entry) => entry.points).concat(secondaryPointsBySystem.flatMap((entry) => entry.points));
   const minX = Math.min(...allPoints.map((pt) => pt.elapsed_s));
   const maxX = Math.max(...allPoints.map((pt) => pt.elapsed_s));
-  let minY = Math.min(...allPoints.map((pt) => pt.value));
-  let maxY = Math.max(...allPoints.map((pt) => pt.value));
+  let minY = pointsBySystem.length ? Math.min(...pointsBySystem.flatMap((entry) => entry.points.map((pt) => pt.value))) : 0;
+  let maxY = pointsBySystem.length ? Math.max(...pointsBySystem.flatMap((entry) => entry.points.map((pt) => pt.value))) : 1;
   if (minY === maxY) {
     minY = 0;
     maxY = maxY || 1;
+  }
+  let minY2 = secondaryPointsBySystem.length ? Math.min(...secondaryPointsBySystem.flatMap((entry) => entry.points.map((pt) => pt.value))) : 0;
+  let maxY2 = secondaryPointsBySystem.length ? Math.max(...secondaryPointsBySystem.flatMap((entry) => entry.points.map((pt) => pt.value))) : 1;
+  if (secondaryPointsBySystem.length && minY2 === maxY2) {
+    minY2 = 0;
+    maxY2 = maxY2 || 1;
   }
 
   const plotW = width - margin.left - margin.right;
   const plotH = height - margin.top - margin.bottom;
   const xScale = (x) => margin.left + ((x - minX) / Math.max(1e-9, maxX - minX)) * plotW;
   const yScale = (y) => margin.top + plotH - ((y - minY) / Math.max(1e-9, maxY - minY)) * plotH;
+  const yScale2 = (y) => margin.top + plotH - ((y - minY2) / Math.max(1e-9, maxY2 - minY2)) * plotH;
 
   const phaseBands = phaseLabel === 'all' ? PHASES : PHASES.filter((p) => p.label === phaseLabel);
   let phaseStart = 0;
@@ -387,6 +406,9 @@ function renderTimeline() {
   }
   svg.appendChild(svgEl('line', { x1: margin.left, x2: margin.left, y1: margin.top, y2: height - margin.bottom, stroke: '#94a3b8' }));
   svg.appendChild(svgEl('line', { x1: margin.left, x2: width - margin.right, y1: height - margin.bottom, y2: height - margin.bottom, stroke: '#94a3b8' }));
+  if (secondaryPointsBySystem.length) {
+    svg.appendChild(svgEl('line', { x1: width - margin.right, x2: width - margin.right, y1: margin.top, y2: height - margin.bottom, stroke: '#94a3b8' }));
+  }
 
   const palette = ['#2563eb', '#dc2626', '#16a34a', '#7c3aed', '#ea580c', '#0891b2', '#be123c'];
   pointsBySystem.forEach((entry, idx) => {
@@ -394,7 +416,12 @@ function renderTimeline() {
     svg.appendChild(svgEl('path', { d: path, fill: 'none', stroke: palette[idx % palette.length], 'stroke-width': 2 }));
     const label = SYSTEMS.find((item) => item.id === entry.system)?.label || entry.system;
     const last = entry.points[entry.points.length - 1];
-    const text = svgEl('text', { x: xScale(last.elapsed_s) + 6, y: yScale(last.value), fill: palette[idx % palette.length], 'font-size': 12 });
+    const text = svgEl('text', {
+      x: Math.min(width - margin.right + 10, xScale(last.elapsed_s) + 10),
+      y: yScale(last.value),
+      fill: palette[idx % palette.length],
+      'font-size': 12,
+    });
     text.textContent = label;
     svg.appendChild(text);
     for (const pt of entry.points) {
@@ -416,12 +443,50 @@ function renderTimeline() {
     }
   });
 
+  secondaryPointsBySystem.forEach((entry, idx) => {
+    const path = entry.points.map((pt, i) => `${i ? 'L' : 'M'} ${xScale(pt.elapsed_s)} ${yScale2(pt.value)}`).join(' ');
+    svg.appendChild(svgEl('path', {
+      d: path,
+      fill: 'none',
+      stroke: palette[idx % palette.length],
+      'stroke-width': 2,
+      'stroke-dasharray': '6 4',
+      opacity: 0.7,
+    }));
+    for (const pt of entry.points) {
+      const dot = svgEl('circle', {
+        cx: xScale(pt.elapsed_s),
+        cy: yScale2(pt.value),
+        r: 2.5,
+        fill: palette[idx % palette.length],
+        opacity: 0.45,
+      });
+      const label = SYSTEMS.find((item) => item.id === entry.system)?.label || entry.system;
+      dot.addEventListener('mouseenter', (event) => {
+        tooltip.style.display = 'block';
+        tooltip.style.left = `${event.pageX + 12}px`;
+        tooltip.style.top = `${event.pageY + 12}px`;
+        tooltip.innerHTML = `<strong>${label}</strong><br>${LABELS[secondaryMetric] || secondaryMetric}: ${pt.value.toFixed(3)}<br>t=${pt.elapsed_s.toFixed(1)}s<br>${pt.phase_label}`;
+      });
+      dot.addEventListener('mouseleave', () => { tooltip.style.display = 'none'; });
+      svg.appendChild(dot);
+    }
+  });
+
   const yTop = svgEl('text', { x: 12, y: margin.top + 4, fill: '#64748b', 'font-size': 12 });
   yTop.textContent = maxY.toFixed(1);
   svg.appendChild(yTop);
   const yBottom = svgEl('text', { x: 12, y: height - margin.bottom, fill: '#64748b', 'font-size': 12 });
   yBottom.textContent = minY.toFixed(1);
   svg.appendChild(yBottom);
+  if (secondaryPointsBySystem.length) {
+    const yTop2 = svgEl('text', { x: width - 12, y: margin.top + 4, fill: '#64748b', 'font-size': 12, 'text-anchor': 'end' });
+    yTop2.textContent = maxY2.toFixed(1);
+    svg.appendChild(yTop2);
+    const yBottom2 = svgEl('text', { x: width - 12, y: height - margin.bottom, fill: '#64748b', 'font-size': 12, 'text-anchor': 'end' });
+    yBottom2.textContent = minY2.toFixed(1);
+    svg.appendChild(yBottom2);
+  }
   const xStart = svgEl('text', { x: margin.left, y: height - 8, fill: '#64748b', 'font-size': 12 });
   xStart.textContent = `${minX.toFixed(0)}s`;
   svg.appendChild(xStart);
@@ -472,7 +537,8 @@ function setupModal() {
 
 function init() {
   renderSystemChips();
-  metricSelect.addEventListener('change', renderTimeline);
+  primaryMetricSelect.addEventListener('change', renderTimeline);
+  compareMetricSelect.addEventListener('change', renderTimeline);
   phaseSelect.addEventListener('change', renderTimeline);
   makeSortableTable(table);
   setupModal();
@@ -512,8 +578,14 @@ init();
       <section class="panel" id="timeline-section">
         <h2>Timeline Explorer</h2>
         <div class="controls">
-          <label>Metric
-            <select id="metric-select">
+          <label>Primary metric
+            <select id="primary-metric-select">
+              {''.join(f"<option value='{m}'>{html.escape(METRIC_LABELS.get(m, m))}</option>" for m in DEFAULT_TIMELINE_METRICS)}
+            </select>
+          </label>
+          <label>Compare against
+            <select id="compare-metric-select">
+              <option value="">None</option>
               {''.join(f"<option value='{m}'>{html.escape(METRIC_LABELS.get(m, m))}</option>" for m in DEFAULT_TIMELINE_METRICS)}
             </select>
           </label>
@@ -524,6 +596,7 @@ init();
             </select>
           </label>
           <div id="system-chips" class="chips"></div>
+          <div class="hint">Solid lines use the left axis. Dashed comparison lines use the right axis.</div>
         </div>
         <div id="timeline" class="timeline-shell"></div>
         <div id="timeline-tooltip"></div>
