@@ -10,6 +10,7 @@ from __future__ import annotations
 import csv
 import html
 import json
+import statistics
 from pathlib import Path
 
 from .adapters import AdapterManifest
@@ -37,6 +38,12 @@ METRIC_LABELS = {
     "queue_depth": "Queue depth",
     "n_dead_tup": "Dead tuples",
 }
+
+TIMELINE_PRESETS = [
+    ("Throughput vs dead tuples", "completion_rate", "n_dead_tup"),
+    ("Producer vs end-to-end latency", "producer_p99_ms", "end_to_end_p99_ms"),
+    ("Subscriber vs queue depth", "subscriber_p99_ms", "queue_depth"),
+]
 
 PLOT_ORDER = [
     "throughput",
@@ -124,6 +131,88 @@ def _timeline_series(rows: list[dict], systems: list[str]) -> dict[str, dict[str
     return out
 
 
+def _timeline_outliers(
+    timeline_data: dict[str, dict[str, list[dict]]],
+    systems: list[str],
+    phases: list[Phase],
+) -> list[dict[str, object]]:
+    """Find suspicious adapter samples that are likely to warp timeline plots."""
+    flagged: list[dict[str, object]] = []
+    metrics = [
+        "completion_rate",
+        "enqueue_rate",
+        "producer_p99_ms",
+        "subscriber_p99_ms",
+        "end_to_end_p99_ms",
+        "claim_p99_ms",
+        "queue_depth",
+    ]
+    for metric in metrics:
+        for system in systems:
+            points = timeline_data.get(metric, {}).get(system, [])
+            for phase in phases:
+                phase_points = [pt for pt in points if pt["phase_label"] == phase.label]
+                if len(phase_points) < 5:
+                    continue
+                values = [float(pt["value"]) for pt in phase_points]
+                median = statistics.median(values)
+                deviations = [abs(v - median) for v in values]
+                mad = statistics.median(deviations)
+                floor = max(1.0, abs(median) * 0.5)
+                for pt in phase_points:
+                    value = float(pt["value"])
+                    delta = abs(value - median)
+                    if mad > 0:
+                        is_outlier = delta > 8 * mad and delta > floor
+                    else:
+                        is_outlier = delta > max(10.0, abs(median) * 3.0)
+                    if is_outlier:
+                        flagged.append(
+                            {
+                                "system": system,
+                                "metric": metric,
+                                "phase_label": phase.label,
+                                "elapsed_s": float(pt["elapsed_s"]),
+                                "value": value,
+                                "median": median,
+                            }
+                        )
+    flagged.sort(key=lambda item: abs(float(item["value"]) - float(item["median"])), reverse=True)
+    return flagged[:12]
+
+
+def _outlier_panel(outliers: list[dict[str, object]], system_meta: dict[str, dict[str, str]]) -> str:
+    if not outliers:
+        return (
+            "<div class='card'>"
+            "<div class='card-title'>Sample Quality</div>"
+            "<div class='card-sub'>No suspicious adapter-metric outliers detected in this bundle.</div>"
+            "</div>"
+        )
+
+    items = []
+    for outlier in outliers:
+        system = str(outlier["system"])
+        items.append(
+            "<li><strong>{system}</strong> {metric} in <code>{phase}</code> at {elapsed:.1f}s: "
+            "{value:.3f} vs median {median:.3f}</li>".format(
+                system=html.escape(system_meta.get(system, {}).get("display_name", system)),
+                metric=html.escape(METRIC_LABELS.get(str(outlier["metric"]), str(outlier["metric"]))),
+                phase=html.escape(str(outlier["phase_label"])),
+                elapsed=float(outlier["elapsed_s"]),
+                value=float(outlier["value"]),
+                median=float(outlier["median"]),
+            )
+        )
+    return (
+        "<div class='card'>"
+        "<div class='card-title'>Sample Quality</div>"
+        "<div class='card-sub'>Potential graph-warping samples detected. Check raw.csv before trusting the exact timeline shape.</div>"
+        f"<ul class='outlier-list'>{''.join(items)}</ul>"
+        "</div>"
+    )
+
+
 def _phase_table(summary: dict, systems: list[str], phases: list[Phase], system_meta: dict[str, dict[str, str]]) -> str:
     headers = [
         "System",
@@ -208,6 +297,10 @@ def _build_html(
         ]
     )
     timeline_json = json.dumps(timeline_data)
+    preset_json = json.dumps(
+        [{"label": label, "primary": primary, "secondary": secondary} for label, primary, secondary in TIMELINE_PRESETS]
+    )
+    outliers = _timeline_outliers(timeline_data, systems, phases)
     summary_cards = []
     for system in systems:
         phase_map = summary["systems"].get(system, {}).get("phases", {})
@@ -242,10 +335,14 @@ body { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
 .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; margin-bottom: 16px; }
 .controls label { font-size: 13px; color: #334155; }
 .controls .hint { font-size: 12px; color: #64748b; }
+.preset-row { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+.preset-row button { border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 999px; padding: 6px 10px; cursor: pointer; font-size: 12px; }
+.preset-row button:hover { background: #eef2ff; border-color: #93c5fd; }
 .chips { display: flex; flex-wrap: wrap; gap: 8px; }
 .chip { display: inline-flex; align-items: center; gap: 6px; border: 1px solid #cbd5e1; border-radius: 999px; padding: 4px 10px; background: #fff; }
 .timeline-shell { border: 1px solid #dbe4ee; border-radius: 10px; overflow-x: auto; overflow-y: hidden; background: #fff; }
 #timeline-tooltip { position: absolute; pointer-events: none; background: rgba(15,23,42,0.92); color: white; padding: 8px 10px; border-radius: 8px; font-size: 12px; display: none; z-index: 20; }
+.outlier-list { margin: 10px 0 0 18px; padding: 0; display: grid; gap: 6px; color: #334155; font-size: 13px; }
 table { width: 100%; border-collapse: collapse; font-size: 14px; }
 th, td { border-bottom: 1px solid #e2e8f0; padding: 10px 8px; text-align: left; }
 th { cursor: pointer; background: #f8fafc; position: sticky; top: 0; }
@@ -274,6 +371,7 @@ const SYSTEMS = __SYSTEMS__;
 const PHASES = __PHASES__;
 const TIMELINE = __TIMELINE__;
 const LABELS = __LABELS__;
+const PRESETS = __PRESETS__;
 
 const primaryMetricSelect = document.getElementById('primary-metric-select');
 const compareMetricSelect = document.getElementById('compare-metric-select');
@@ -295,6 +393,22 @@ function renderSystemChips() {
     label.appendChild(input);
     label.appendChild(document.createTextNode(system.label));
     chips.appendChild(label);
+  }
+}
+
+function renderPresets() {
+  const row = document.getElementById('timeline-presets');
+  row.innerHTML = '';
+  for (const preset of PRESETS) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.textContent = preset.label;
+    button.addEventListener('click', () => {
+      primaryMetricSelect.value = preset.primary;
+      compareMetricSelect.value = preset.secondary || '';
+      renderTimeline();
+    });
+    row.appendChild(button);
   }
 }
 
@@ -537,6 +651,7 @@ function setupModal() {
 
 function init() {
   renderSystemChips();
+  renderPresets();
   primaryMetricSelect.addEventListener('change', renderTimeline);
   compareMetricSelect.addEventListener('change', renderTimeline);
   phaseSelect.addEventListener('change', renderTimeline);
@@ -572,11 +687,12 @@ init();
     <main class="content">
       <section class="panel" id="overview">
         <h2>Overview</h2>
-        <div class="cards">{''.join(summary_cards)}</div>
+        <div class="cards">{''.join(summary_cards)}{_outlier_panel(outliers, system_meta)}</div>
       </section>
 
       <section class="panel" id="timeline-section">
         <h2>Timeline Explorer</h2>
+        <div id="timeline-presets" class="preset-row"></div>
         <div class="controls">
           <label>Primary metric
             <select id="primary-metric-select">
@@ -641,7 +757,7 @@ init();
   </div>
 
   <script>
-  {script.replace('__SYSTEMS__', systems_json).replace('__PHASES__', phase_json).replace('__TIMELINE__', timeline_json).replace('__LABELS__', json.dumps(METRIC_LABELS))}
+  {script.replace('__SYSTEMS__', systems_json).replace('__PHASES__', phase_json).replace('__TIMELINE__', timeline_json).replace('__LABELS__', json.dumps(METRIC_LABELS)).replace('__PRESETS__', preset_json)}
   </script>
 </body>
 </html>"""
