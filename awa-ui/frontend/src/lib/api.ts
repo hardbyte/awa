@@ -115,6 +115,7 @@ export interface RuntimeInstance {
   hostname: string | null;
   pid: number;
   version: string;
+  storage_capability: string;
   started_at: string;
   last_seen_at: string;
   snapshot_interval_ms: number;
@@ -137,6 +138,29 @@ export interface RuntimeOverview {
   healthy_instances: number;
   leader_instances: number;
   instances: RuntimeInstance[];
+}
+
+export interface StorageStatus {
+  current_engine: string;
+  active_engine: string;
+  prepared_engine: string | null;
+  state: string;
+  transition_epoch: number;
+  details: unknown;
+  entered_at: string;
+  updated_at: string;
+  finalized_at: string | null;
+}
+
+export interface StorageStatusReport extends StorageStatus {
+  canonical_live_backlog: number;
+  prepared_queue_storage_schema: string | null;
+  prepared_schema_ready: boolean;
+  live_runtime_capability_counts: Record<string, number>;
+  can_enter_mixed_transition: boolean;
+  enter_mixed_transition_blockers: string[];
+  can_finalize: boolean;
+  finalize_blockers: string[];
 }
 
 export interface QueueRuntimeSummary {
@@ -384,6 +408,10 @@ export function fetchStats(): Promise<StateCounts> {
 
 export function fetchRuntime(): Promise<RuntimeOverview> {
   return apiFetch("/runtime");
+}
+
+export function fetchStorage(): Promise<StorageStatusReport> {
+  return apiFetch("/storage");
 }
 
 export function fetchCapabilities(): Promise<Capabilities> {

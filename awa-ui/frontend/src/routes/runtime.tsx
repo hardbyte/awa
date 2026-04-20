@@ -1,7 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { Link } from "@tanstack/react-router";
-import { fetchQueueRuntime, fetchRuntime } from "@/lib/api";
-import type { QueueRuntimeSummary, RuntimeOverview } from "@/lib/api";
+import { fetchQueueRuntime, fetchRuntime, fetchStorage } from "@/lib/api";
+import type {
+  QueueRuntimeSummary,
+  RuntimeOverview,
+  StorageStatusReport,
+} from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Card, CardAction, CardContent, CardHeader } from "@/components/ui/card";
@@ -30,6 +34,45 @@ import {
   ShutdownBadge,
 } from "@/components/RuntimeDisplay";
 
+function storageCapabilityIntent(capability: string): "primary" | "secondary" | "warning" | "outline" {
+  switch (capability) {
+    case "queue_storage":
+      return "primary";
+    case "canonical_drain_only":
+      return "warning";
+    case "canonical":
+      return "outline";
+    default:
+      return "secondary";
+  }
+}
+
+function storageCapabilityLabel(capability: string): string {
+  switch (capability) {
+    case "queue_storage":
+      return "Queue storage";
+    case "canonical_drain_only":
+      return "Canonical drain";
+    case "canonical":
+      return "Canonical";
+    default:
+      return capability;
+  }
+}
+
+function storageStateIntent(state: string): "primary" | "secondary" | "warning" | "outline" {
+  switch (state) {
+    case "active":
+      return "primary";
+    case "mixed_transition":
+      return "warning";
+    case "prepared":
+      return "secondary";
+    default:
+      return "outline";
+  }
+}
+
 export function RuntimePage() {
   const poll = usePollInterval();
 
@@ -45,8 +88,15 @@ export function RuntimePage() {
     refetchInterval: poll.interval, staleTime: poll.staleTime,
   });
 
+  const storageQuery = useQuery<StorageStatusReport>({
+    queryKey: ["storage"],
+    queryFn: fetchStorage,
+    refetchInterval: poll.interval, staleTime: poll.staleTime,
+  });
+
   const runtime = runtimeQuery.data;
   const queues = queueRuntimeQuery.data ?? [];
+  const storage = storageQuery.data;
   const staleInstances = runtime?.instances.filter((instance) => instance.stale) ?? [];
   const degradedInstances =
     runtime?.instances.filter((instance) => !instance.stale && !instance.healthy) ?? [];
@@ -99,6 +149,116 @@ export function RuntimePage() {
               </div>
             </div>
           </div>
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader
+          title="Storage Transition"
+          description="Current engine state, mixed-cutover readiness, and live runtime capabilities"
+        />
+        <CardContent>
+          {storage ? (
+            <div className="space-y-4">
+              <div className="grid grid-cols-2 gap-3 md:grid-cols-4">
+                <div className="rounded-lg border p-3">
+                  <div className="text-xs uppercase tracking-wide text-muted-fg">State</div>
+                  <div className="mt-2">
+                    <Badge intent={storageStateIntent(storage.state)}>{storage.state}</Badge>
+                  </div>
+                </div>
+                <div className="rounded-lg border p-3">
+                  <div className="text-xs uppercase tracking-wide text-muted-fg">Current</div>
+                  <div className="mt-1 text-lg font-semibold">{storage.current_engine}</div>
+                  <div className="text-xs text-muted-fg">active {storage.active_engine}</div>
+                </div>
+                <div className="rounded-lg border p-3">
+                  <div className="text-xs uppercase tracking-wide text-muted-fg">Prepared</div>
+                  <div className="mt-1 text-lg font-semibold">
+                    {storage.prepared_engine ?? "—"}
+                  </div>
+                  <div className="text-xs text-muted-fg">
+                    schema {storage.prepared_queue_storage_schema ?? "—"}
+                  </div>
+                </div>
+                <div className="rounded-lg border p-3">
+                  <div className="text-xs uppercase tracking-wide text-muted-fg">Backlog</div>
+                  <div className="mt-1 text-lg font-semibold tabular-nums">
+                    {storage.canonical_live_backlog}
+                  </div>
+                  <div className="text-xs text-muted-fg">
+                    canonical live backlog
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid gap-4 lg:grid-cols-2">
+                <div className="rounded-lg border p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="font-medium">Enter mixed transition</div>
+                    <Badge intent={storage.can_enter_mixed_transition ? "success" : "warning"}>
+                      {storage.can_enter_mixed_transition ? "Ready" : "Blocked"}
+                    </Badge>
+                  </div>
+                  <div className="mt-2 text-sm text-muted-fg">
+                    Queue-storage schema ready: {storage.prepared_schema_ready ? "yes" : "no"}
+                  </div>
+                  {storage.enter_mixed_transition_blockers.length > 0 ? (
+                    <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-muted-fg">
+                      {storage.enter_mixed_transition_blockers.map((blocker) => (
+                        <li key={blocker}>{blocker}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-3 text-sm text-success">
+                      No blockers reported.
+                    </p>
+                  )}
+                </div>
+
+                <div className="rounded-lg border p-4">
+                  <div className="flex items-center justify-between gap-3">
+                    <div className="font-medium">Finalize queue storage</div>
+                    <Badge intent={storage.can_finalize ? "success" : "warning"}>
+                      {storage.can_finalize ? "Ready" : "Blocked"}
+                    </Badge>
+                  </div>
+                  {storage.finalize_blockers.length > 0 ? (
+                    <ul className="mt-3 list-disc space-y-1 pl-5 text-sm text-muted-fg">
+                      {storage.finalize_blockers.map((blocker) => (
+                        <li key={blocker}>{blocker}</li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <p className="mt-3 text-sm text-success">
+                      No blockers reported.
+                    </p>
+                  )}
+                </div>
+              </div>
+
+              <div className="rounded-lg border p-4">
+                <div className="font-medium">Live runtime capabilities</div>
+                {Object.keys(storage.live_runtime_capability_counts).length > 0 ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    {Object.entries(storage.live_runtime_capability_counts).map(([capability, count]) => (
+                      <Badge key={capability} intent={storageCapabilityIntent(capability)}>
+                        {storageCapabilityLabel(capability)}: {count}
+                      </Badge>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-2 text-sm text-muted-fg">No live runtime snapshots reported.</p>
+                )}
+              </div>
+            </div>
+          ) : storageQuery.isLoading ? (
+            <p className="py-4 text-sm text-muted-fg">Loading storage transition status...</p>
+          ) : storageQuery.isError ? (
+            <p className="py-4 text-sm text-danger">Failed to load storage transition status.</p>
+          ) : (
+            <p className="py-4 text-sm text-muted-fg">No storage transition status available.</p>
+          )}
         </CardContent>
       </Card>
 
@@ -181,6 +341,11 @@ export function RuntimePage() {
                       <div className="text-xs text-muted-fg">
                         {instance.version} · pid {instance.pid}
                       </div>
+                      <div className="mt-1">
+                        <Badge intent={storageCapabilityIntent(instance.storage_capability)}>
+                          {storageCapabilityLabel(instance.storage_capability)}
+                        </Badge>
+                      </div>
                       <div className="text-xs text-muted-fg">
                         instance {shortInstanceId(instance.instance_id)}
                       </div>
@@ -237,11 +402,16 @@ export function RuntimePage() {
               <TableBody>
                 {runtime.instances.map((instance) => (
                     <TableRow key={instance.instance_id} id={instance.instance_id}>
-                      <TableCell className="font-medium">
+                    <TableCell className="font-medium">
                         <div>{instanceLabel(instance)}</div>
                         <div className="text-xs text-muted-fg">
                           {instance.version} · pid {instance.pid}
                         </div>
+                      <div className="mt-1">
+                        <Badge intent={storageCapabilityIntent(instance.storage_capability)}>
+                          {storageCapabilityLabel(instance.storage_capability)}
+                        </Badge>
+                      </div>
                       <div className="text-xs text-muted-fg">
                         instance {shortInstanceId(instance.instance_id)}
                       </div>
