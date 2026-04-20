@@ -61,6 +61,36 @@ export function LoopBadge({ label, healthy }: { label: string; healthy: boolean 
   return <Badge intent={healthy ? "success" : "danger"}>{label}</Badge>;
 }
 
+// Inline dot+label row for the three worker loops.
+export function LoopStatus({
+  instance,
+}: {
+  instance: Pick<RuntimeInstance, "poll_loop_alive" | "heartbeat_alive" | "maintenance_alive">;
+}) {
+  const items: Array<{ label: string; healthy: boolean }> = [
+    { label: "poll", healthy: instance.poll_loop_alive },
+    { label: "heartbeat", healthy: instance.heartbeat_alive },
+    { label: "maintenance", healthy: instance.maintenance_alive },
+  ];
+  return (
+    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs">
+      {items.map((item) => (
+        <span key={item.label} className="inline-flex items-center gap-1.5">
+          <span
+            aria-hidden="true"
+            className={`inline-block size-1.5 rounded-full ${
+              item.healthy ? "bg-success" : "bg-danger"
+            }`}
+          />
+          <span className={item.healthy ? "text-muted-fg" : "text-danger-fg"}>
+            {item.label}
+          </span>
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function PostgresBadge({ connected }: { connected: boolean }) {
   return <Badge intent={connected ? "secondary" : "danger"}>{connected ? "db ok" : "db down"}</Badge>;
 }

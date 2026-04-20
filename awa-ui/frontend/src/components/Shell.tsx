@@ -1,4 +1,6 @@
-import { Outlet, useRouterState } from "@tanstack/react-router";
+import { useEffect } from "react";
+import { Outlet, useRouterState, useNavigate } from "@tanstack/react-router";
+import { RouterProvider as AriaRouterProvider } from "react-aria-components";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useTheme, type Theme } from "@/hooks/use-theme";
 import { fetchCapabilities, fetchRuntime, type RuntimeOverview } from "@/lib/api";
@@ -12,9 +14,9 @@ import {
   SidebarItem,
   SidebarLabel,
   SidebarProvider,
-  SidebarRail,
   SidebarSection,
   SidebarTrigger,
+  useSidebar,
 } from "@/components/ui/sidebar";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 
@@ -199,6 +201,18 @@ function summariseCapabilities(runtime: RuntimeOverview | undefined): {
   };
 }
 
+// Closes the mobile sidebar sheet on route change. No-op on desktop.
+function CloseMobileOnNavigate({ path }: { path: string }) {
+  const { isMobile, isOpenOnMobile, setIsOpenOnMobile } = useSidebar();
+  useEffect(() => {
+    if (isMobile && isOpenOnMobile) {
+      setIsOpenOnMobile(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [path]);
+  return null;
+}
+
 /** Cluster status chip — health pulse + storage-capability summary. */
 function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }) {
   const summary = summariseCapabilities(runtime);
@@ -224,19 +238,69 @@ function ClusterStatusChip({ runtime }: { runtime: RuntimeOverview | undefined }
   );
 }
 
+// data-slot="icon" lets the Sidebar primitive render these as the dock-mode glyph.
+const IconDashboard = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6">
+    <rect x="2.5" y="2.5" width="6" height="6" rx="1" />
+    <rect x="11.5" y="2.5" width="6" height="4" rx="1" />
+    <rect x="2.5" y="11.5" width="6" height="6" rx="1" />
+    <rect x="11.5" y="9.5" width="6" height="8" rx="1" />
+  </svg>
+);
+const IconJobs = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round">
+    <path d="M4 5h12M4 10h12M4 15h8" />
+  </svg>
+);
+const IconKinds = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M10.5 2.5h5a2 2 0 0 1 2 2v5a1 1 0 0 1-.3.7l-7 7a1 1 0 0 1-1.4 0L3 11.5a1 1 0 0 1 0-1.4l7-7a1 1 0 0 1 .5-.6z" />
+    <circle cx="13.5" cy="6.5" r="1.2" fill="currentColor" stroke="none" />
+  </svg>
+);
+const IconQueues = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <path d="M10 3 2.5 6.5 10 10l7.5-3.5L10 3z" />
+    <path d="M2.5 10 10 13.5 17.5 10" />
+    <path d="M2.5 13.5 10 17l7.5-3.5" />
+  </svg>
+);
+const IconRuntime = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3" y="3.5" width="14" height="5" rx="1.5" />
+    <rect x="3" y="11.5" width="14" height="5" rx="1.5" />
+    <circle cx="6.5" cy="6" r="0.8" fill="currentColor" stroke="none" />
+    <circle cx="6.5" cy="14" r="0.8" fill="currentColor" stroke="none" />
+  </svg>
+);
+const IconCron = () => (
+  <svg data-slot="icon" viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="10" cy="10" r="7.5" />
+    <path d="M10 5.5V10l3 2" />
+  </svg>
+);
+
 const NAV_ITEMS = [
-  { to: "/", label: "Dashboard" },
-  { to: "/jobs", label: "Jobs" },
-  { to: "/kinds", label: "Kinds" },
-  { to: "/queues", label: "Queues" },
-  { to: "/runtime", label: "Runtime" },
-  { to: "/cron", label: "Cron" },
+  { to: "/", label: "Dashboard", Icon: IconDashboard },
+  { to: "/jobs", label: "Jobs", Icon: IconJobs },
+  { to: "/kinds", label: "Kinds", Icon: IconKinds },
+  { to: "/queues", label: "Queues", Icon: IconQueues },
+  { to: "/runtime", label: "Runtime", Icon: IconRuntime },
+  { to: "/cron", label: "Cron", Icon: IconCron },
 ] as const;
 
 export function Shell() {
   const routerState = useRouterState();
   const currentPath = routerState.location.pathname;
+  const navigate = useNavigate();
   const poll = usePollInterval();
+
+  // Routes react-aria-components Link clicks through TanStack Router so sidebar
+  // nav is client-side. Modifier-key handling (cmd/ctrl/shift-click → new tab)
+  // is handled inside RouterProvider via shouldClientNavigate.
+  const ariaNavigate = (to: string) => {
+    void navigate({ to });
+  };
 
   // Show the banner only once we've confirmed read-only (not while loading)
   const capabilitiesQuery = useQuery({
@@ -261,17 +325,19 @@ export function Shell() {
     return currentPath.startsWith(to);
   }
 
-  // Breadcrumb: derive a simple current-page label from the active nav item.
-  const activeNav = NAV_ITEMS.find((item) => isActive(item.to));
-  const currentLabel = activeNav?.label ?? "AWA";
-
   return (
-    <SidebarProvider>
-      <Sidebar>
+    <AriaRouterProvider navigate={ariaNavigate}>
+    <SidebarProvider
+      style={{ "--sidebar-width": "13.5rem" } as React.CSSProperties}
+    >
+      <Sidebar collapsible="dock">
         <SidebarHeader>
-          <a href="/" className="flex items-center gap-2 px-2 py-1 no-underline">
-            <KoruLogo className="size-7 text-primary" />
-            <span className="text-base font-semibold tracking-tight text-fg">
+          <a
+            href="/"
+            className="flex items-center gap-2 px-2 py-1 no-underline"
+          >
+            <KoruLogo className="size-7 shrink-0 text-primary" />
+            <span className="text-base font-semibold tracking-tight text-fg group-data-[collapsible=dock]:hidden">
               AWA
             </span>
           </a>
@@ -283,25 +349,26 @@ export function Shell() {
                 key={item.to}
                 href={item.to}
                 isCurrent={isActive(item.to)}
+                tooltip={item.label}
               >
+                <item.Icon />
                 <SidebarLabel>{item.label}</SidebarLabel>
               </SidebarItem>
             ))}
           </SidebarSection>
         </SidebarContent>
         <SidebarFooter>
-          <ClusterStatusChip runtime={runtimeQuery.data} />
+          <div className="group-data-[collapsible=dock]:hidden">
+            <ClusterStatusChip runtime={runtimeQuery.data} />
+          </div>
         </SidebarFooter>
-        <SidebarRail />
+        <CloseMobileOnNavigate path={currentPath} />
       </Sidebar>
 
       <SidebarInset>
-        {/* Topbar: mobile trigger, breadcrumb, global actions */}
         <header className="sticky top-0 z-10 flex items-center gap-2 border-b bg-bg/70 px-4 py-2.5 backdrop-blur sm:px-6">
           <SidebarTrigger className="-ml-1" />
-          <div className="flex flex-1 items-center gap-2 text-sm text-muted-fg">
-            <span className="text-fg">{currentLabel}</span>
-          </div>
+          <div className="flex-1" />
           <div className="flex items-center gap-1">
             <RefreshControl />
             <ThemeToggle />
@@ -318,5 +385,6 @@ export function Shell() {
         </main>
       </SidebarInset>
     </SidebarProvider>
+    </AriaRouterProvider>
   );
 }

@@ -20,7 +20,7 @@ import {
   formatDateTime,
   formatSnapshotInterval,
   instanceLabel,
-  LoopBadge,
+  LoopStatus,
   PostgresBadge,
   queueCapacityLabel,
   queueConfigDetails,
@@ -92,47 +92,6 @@ export function RuntimePage() {
     <div className="space-y-6">
       <Heading level={2}>Runtime</Heading>
 
-      <Card>
-        <CardHeader
-          title="Cluster Summary"
-          description="Leader election, worker liveness, and queue configuration snapshots"
-        />
-        <CardContent>
-          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Instances</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtime?.total_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Live</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtime?.live_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Healthy</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtime?.healthy_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Leader</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtime?.leader_instances ?? "—"}
-              </div>
-            </div>
-            <div className="rounded-lg border p-3">
-              <div className="text-xs uppercase tracking-wide text-muted-fg">Stale</div>
-              <div className="mt-1 text-2xl font-semibold tabular-nums">
-                {runtime?.stale_instances ?? "—"}
-              </div>
-            </div>
-          </div>
-        </CardContent>
-      </Card>
-
       {hasAttention && (
         <Card>
           <CardHeader
@@ -152,7 +111,7 @@ export function RuntimePage() {
                 </div>
               </div>
             )}
-            {(runtime?.leader_instances ?? 0) !== 1 && (
+            {hasLiveInstances && (runtime?.leader_instances ?? 0) !== 1 && (
               <div className="rounded-lg border border-warning/40 bg-warning-subtle px-4 py-3 text-sm">
                 <div className="font-medium text-warning-subtle-fg">
                   Leader status is unexpected
@@ -196,6 +155,47 @@ export function RuntimePage() {
           </CardContent>
         </Card>
       )}
+
+      <Card>
+        <CardHeader
+          title="Cluster Summary"
+          description="Leader election, worker liveness, and queue configuration snapshots"
+        />
+        <CardContent>
+          <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Instances</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtime?.total_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Live</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtime?.live_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Healthy</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtime?.healthy_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Leader</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtime?.leader_instances ?? "—"}
+              </div>
+            </div>
+            <div className="rounded-lg border p-3">
+              <div className="text-xs uppercase tracking-wide text-muted-fg">Stale</div>
+              <div className="mt-1 text-2xl font-semibold tabular-nums">
+                {runtime?.stale_instances ?? "—"}
+              </div>
+            </div>
+          </div>
+        </CardContent>
+      </Card>
 
       <Card>
         <CardHeader
@@ -275,10 +275,8 @@ export function RuntimePage() {
                       <ShutdownBadge shuttingDown={instance.shutting_down} />
                     </div>
                   </div>
-                  <div className="mt-3 flex flex-wrap gap-1">
-                    <LoopBadge label="poll" healthy={instance.poll_loop_alive} />
-                    <LoopBadge label="heartbeat" healthy={instance.heartbeat_alive} />
-                    <LoopBadge label="maintenance" healthy={instance.maintenance_alive} />
+                  <div className="mt-3">
+                    <LoopStatus instance={instance} />
                   </div>
                   <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
                     <span className="text-muted-fg">Snapshot</span>
@@ -332,11 +330,7 @@ export function RuntimePage() {
                       </div>
                     </TableCell>
                     <TableCell>
-                      <div className="flex flex-wrap gap-1">
-                        <LoopBadge label="poll" healthy={instance.poll_loop_alive} />
-                        <LoopBadge label="heartbeat" healthy={instance.heartbeat_alive} />
-                        <LoopBadge label="maintenance" healthy={instance.maintenance_alive} />
-                      </div>
+                      <LoopStatus instance={instance} />
                     </TableCell>
                     <TableCell>
                       <div className="flex flex-col gap-0.5">
