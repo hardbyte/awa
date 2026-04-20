@@ -13,6 +13,7 @@ use awa::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
@@ -297,6 +298,17 @@ async fn failed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &st
     .expect("Failed to count failed done rows")
 }
 
+async fn completed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'completed'",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to count completed done rows")
+}
+
 async fn dlq_reason(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) -> String {
     sqlx::query_scalar::<_, String>(&format!(
         "SELECT dlq_reason FROM {}.dlq_entries WHERE job_id = $1 ORDER BY dlq_at DESC LIMIT 1",
@@ -473,6 +485,34 @@ impl Worker for StaleHeartbeatWorker {
     }
 }
 
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct MultiClientJob {
+    id: i64,
+}
+
+struct MultiClientTrackingWorker {
+    seen: Arc<Mutex<HashSet<i64>>>,
+    saw_duplicate: Arc<AtomicBool>,
+}
+
+#[async_trait::async_trait]
+impl Worker for MultiClientTrackingWorker {
+    fn kind(&self) -> &'static str {
+        "multi_client_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        let mut seen = self.seen.lock().await;
+        if !seen.insert(ctx.job.id) {
+            self.saw_duplicate.store(true, Ordering::SeqCst);
+        }
+        drop(seen);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        Ok(JobResult::Completed)
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_retry_after() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -515,6 +555,128 @@ async fn test_queue_storage_runtime_retry_after() {
     assert_eq!(completed.attempt, 2);
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(20).await;
+    let queue = "qs_two_clients";
+    let schema = "awa_qs_two_clients";
+    let store = create_store(&pool, schema).await;
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+    };
+
+    let seen = Arc::new(Mutex::new(HashSet::new()));
+    let saw_duplicate = Arc::new(AtomicBool::new(false));
+
+    let client_a = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config.clone(),
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .register_worker(MultiClientTrackingWorker {
+            seen: seen.clone(),
+            saw_duplicate: saw_duplicate.clone(),
+        })
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build first queue_storage client");
+
+    let client_b = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 2,
+                poll_interval: Duration::from_millis(25),
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config.clone(),
+            Duration::from_secs(60),
+            Duration::from_millis(50),
+        )
+        .register_worker(MultiClientTrackingWorker {
+            seen: seen.clone(),
+            saw_duplicate: saw_duplicate.clone(),
+        })
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build second queue_storage client");
+
+    client_a
+        .start()
+        .await
+        .expect("Failed to start first queue_storage client");
+    client_b
+        .start()
+        .await
+        .expect("Failed to start second queue_storage client");
+
+    let job_count = 64_i64;
+    for id in 0..job_count {
+        enqueue_job(
+            &pool,
+            &store,
+            &MultiClientJob { id },
+            InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    let start = Instant::now();
+    loop {
+        let completed = completed_done_count(&pool, &store, queue).await;
+        let unique_seen = seen.lock().await.len();
+
+        if completed == job_count && unique_seen == job_count as usize {
+            break;
+        }
+
+        if start.elapsed() > Duration::from_secs(20) {
+            panic!(
+                "Timed out draining two-client queue storage test; completed={completed}, unique_seen={unique_seen}, saw_duplicate={}",
+                saw_duplicate.load(Ordering::SeqCst)
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        !saw_duplicate.load(Ordering::SeqCst),
+        "two queue-storage clients should not execute the same job twice"
+    );
+    assert_eq!(seen.lock().await.len(), job_count as usize);
+
+    client_a.shutdown(Duration::from_secs(5)).await;
+    client_b.shutdown(Duration::from_secs(5)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -696,6 +858,63 @@ async fn test_queue_storage_late_completion_after_cancel_is_noop() {
         .expect("Failed to load cancelled guard job")
         .expect("Expected cancelled job to exist");
     assert_eq!(current.state, JobState::Cancelled);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dlq_and_retry_race_has_single_winner() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_guard_dlq_race";
+    let schema = "awa_qs_guard_dlq_race";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 104 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim DLQ race job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+
+    let (retry_result, dlq_result) = tokio::join!(
+        store.retry_after(&pool, job_id, claimed.job.run_lease, Duration::ZERO, None),
+        store.fail_to_dlq(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "raced to dlq",
+            "boom",
+            None,
+        )
+    );
+
+    let retry_result = retry_result.expect("retry_after should not error");
+    let dlq_result = dlq_result.expect("fail_to_dlq should not error");
+    assert_ne!(
+        retry_result.is_some(),
+        dlq_result.is_some(),
+        "retry and DLQ finalization must not both win the same lease"
+    );
+
+    if retry_result.is_some() {
+        let current = store
+            .load_job(&pool, job_id)
+            .await
+            .expect("Failed to load retried job")
+            .expect("Expected retried job to exist");
+        assert_eq!(current.state, JobState::Retryable);
+        assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+    } else {
+        assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

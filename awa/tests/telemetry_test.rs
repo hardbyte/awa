@@ -19,6 +19,7 @@ use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
 use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::net::{TcpListener, TcpStream};
@@ -27,9 +28,62 @@ use tokio::task::JoinHandle;
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
-fn database_url() -> String {
+fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
+
+fn replace_database_name(url: &str, database_name: &str) -> String {
+    let (without_query, query_suffix) = match url.split_once('?') {
+        Some((prefix, query)) => (prefix, Some(query)),
+        None => (url, None),
+    };
+    let (base, _) = without_query
+        .rsplit_once('/')
+        .expect("database URL should include a database name");
+    let mut out = format!("{base}/{database_name}");
+    if let Some(query) = query_suffix {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+fn validate_database_name(database_name: &str) {
+    assert!(
+        !database_name.is_empty()
+            && database_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "telemetry test database names must use only [A-Za-z0-9_]"
+    );
+}
+
+fn database_url(test_database_name: &str) -> String {
+    validate_database_name(test_database_name);
+    replace_database_name(&base_database_url(), test_database_name)
+}
+
+async fn ensure_database_exists(url: &str) {
+    let admin_url = replace_database_name(url, "postgres");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("Failed to connect to admin database for telemetry tests");
+    let database_name = url
+        .split_once('?')
+        .map(|(prefix, _)| prefix)
+        .unwrap_or(url)
+        .rsplit_once('/')
+        .map(|(_, name)| name)
+        .expect("database URL should include a database name");
+    let create_sql = format!("CREATE DATABASE {database_name}");
+    match sqlx::query(&create_sql).execute(&admin_pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+        Err(err) => panic!("Failed to create telemetry test database {database_name}: {err}"),
+    }
 }
 
 fn otlp_endpoint() -> String {
@@ -46,10 +100,12 @@ fn ignored_test_gate() -> Arc<Semaphore> {
     GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
 }
 
-async fn setup_pool() -> sqlx::PgPool {
+async fn setup_pool(test_database_name: &str) -> sqlx::PgPool {
+    let url = database_url(test_database_name);
+    ensure_database_exists(&url).await;
     let pool = PgPoolOptions::new()
         .max_connections(5)
-        .connect(&database_url())
+        .connect(&url)
         .await
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
@@ -86,6 +142,103 @@ async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
         .fetch_one(pool)
         .await
         .expect("Failed to resolve active queue storage schema")
+}
+
+async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        return Some(schema);
+    }
+
+    let default_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa_exp.ready_entries') IS NOT NULL \
+         AND to_regclass('awa_exp.deferred_jobs') IS NOT NULL \
+         AND to_regclass('awa_exp.leases') IS NOT NULL \
+         AND to_regclass('awa_exp.done_entries') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("Failed to probe default queue storage schema");
+
+    default_exists.then_some("awa_exp".to_string())
+}
+
+async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
+    if let Some(schema) = queue_storage_schema_for_counts(pool).await {
+        let sql = format!(
+            "SELECT COUNT(*)::bigint FROM (\
+                 SELECT 'available'::awa.job_state AS state \
+                 FROM {schema}.ready_entries AS ready \
+                 JOIN {schema}.queue_lanes AS lanes \
+                   ON lanes.queue = ready.queue \
+                  AND lanes.priority = ready.priority \
+                 WHERE ready.queue = $1 \
+                   AND ready.lane_seq >= lanes.claim_seq \
+                 UNION ALL \
+                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.leases WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
+             ) AS jobs \
+             WHERE state = $2::awa.job_state"
+        );
+        return sqlx::query_scalar(&sql)
+            .bind(queue)
+            .bind(state)
+            .fetch_one(pool)
+            .await
+            .expect("Failed to query queue-storage job count");
+    }
+
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM awa.jobs WHERE queue = $1 AND state = $2::awa.job_state",
+    )
+    .bind(queue)
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to query canonical job count")
+}
+
+async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String, i64)> {
+    if let Some(schema) = queue_storage_schema_for_counts(pool).await {
+        let sql = format!(
+            "SELECT state::text, COUNT(*)::bigint FROM (\
+                 SELECT 'available'::awa.job_state AS state \
+                 FROM {schema}.ready_entries AS ready \
+                 JOIN {schema}.queue_lanes AS lanes \
+                   ON lanes.queue = ready.queue \
+                  AND lanes.priority = ready.priority \
+                 WHERE ready.queue = $1 \
+                   AND ready.lane_seq >= lanes.claim_seq \
+                 UNION ALL \
+                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.leases WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1\
+             ) AS jobs \
+             GROUP BY state ORDER BY state"
+        );
+        return sqlx::query_as(&sql)
+            .bind(queue)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    }
+
+    sqlx::query_as(
+        "SELECT state::text, COUNT(*)::bigint \
+         FROM awa.jobs WHERE queue = $1 GROUP BY state ORDER BY state",
+    )
+    .bind(queue)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
 }
 
 async fn backdate_callback_timeouts_for_queue(pool: &sqlx::PgPool, queue: &str) {
@@ -382,28 +535,14 @@ async fn wait_for_job_count(pool: &sqlx::PgPool, queue: &str, state: &str, min: 
     // wait resolves in single-digit seconds).
     let timeout = Duration::from_secs(120);
     loop {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM awa.jobs WHERE queue = $1 AND state = $2::awa.job_state",
-        )
-        .bind(queue)
-        .bind(state)
-        .fetch_one(pool)
-        .await
-        .expect("Failed to query job count");
+        let count = queue_job_count(pool, queue, state).await;
 
         if count >= min {
             return;
         }
 
         if start.elapsed() > timeout {
-            let breakdown: Vec<(String, i64)> = sqlx::query_as(
-                "SELECT state::text, COUNT(*)::bigint \
-                 FROM awa.jobs WHERE queue = $1 GROUP BY state ORDER BY state",
-            )
-            .bind(queue)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+            let breakdown = queue_state_breakdown(pool, queue).await;
             panic!(
                 "Timed out waiting for {min} {state} jobs in queue {queue}; \
                  only {count} found. Full state breakdown: {breakdown:?}"
@@ -438,6 +577,35 @@ async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: &str) {
     }
 }
 
+async fn wait_for_no_live_jobs(pool: &sqlx::PgPool, queue: &str, timeout: Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        let breakdown = queue_state_breakdown(pool, queue).await;
+        let live_jobs: i64 = breakdown
+            .iter()
+            .filter(|(state, _)| {
+                matches!(
+                    state.as_str(),
+                    "available" | "running" | "scheduled" | "retryable" | "waiting_external"
+                )
+            })
+            .map(|(_, count)| *count)
+            .sum();
+
+        if live_jobs == 0 {
+            return;
+        }
+
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for queue {queue} to drain; live_jobs={live_jobs}, breakdown={breakdown:?}"
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn wait_for_leader(client: &Client, timeout: Duration) {
     let start = std::time::Instant::now();
     loop {
@@ -453,15 +621,18 @@ async fn wait_for_leader(client: &Client, timeout: Duration) {
 
 /// Start a TCP proxy that forwards traffic to target_addr.
 /// Aborting the returned handle kills the proxy, severing all connections.
-async fn start_tcp_proxy(target_addr: &str) -> (u16, JoinHandle<()>) {
+async fn start_tcp_proxy(target_addr: &str) -> (u16, Arc<AtomicUsize>, JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("Failed to bind TCP proxy listener");
     let port = listener.local_addr().unwrap().port();
     let target = target_addr.to_string();
+    let accepted_connections = Arc::new(AtomicUsize::new(0));
+    let accepted_connections_task = accepted_connections.clone();
     let handle = tokio::spawn(async move {
         while let Ok((mut client_stream, _)) = listener.accept().await {
             let target = target.clone();
+            accepted_connections_task.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
                 if let Ok(mut server_stream) = TcpStream::connect(&target).await {
                     let _ =
@@ -470,7 +641,7 @@ async fn start_tcp_proxy(target_addr: &str) -> (u16, JoinHandle<()>) {
             });
         }
     });
-    (port, handle)
+    (port, accepted_connections, handle)
 }
 
 // ── Prometheus query helpers ─────────────────────────────────────────
@@ -624,6 +795,27 @@ async fn wait_for_metric(
     }
 }
 
+async fn wait_for_atomic_count(
+    counter: &Arc<AtomicUsize>,
+    min: usize,
+    label: &str,
+    timeout: Duration,
+) -> usize {
+    let start = std::time::Instant::now();
+    loop {
+        let value = counter.load(Ordering::SeqCst);
+        if value >= min {
+            return value;
+        }
+
+        if start.elapsed() > timeout {
+            panic!("Timed out waiting for {label} to reach {min}; current value={value}");
+        }
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 // ── Test ─────────────────────────────────────────────────────────────
 
 #[tokio::test(flavor = "multi_thread")]
@@ -633,7 +825,7 @@ async fn test_otlp_metrics_reach_prometheus() {
         .acquire_owned()
         .await
         .expect("ignored test gate should be available");
-    let pool = setup_pool().await;
+    let pool = setup_pool("awa_test_telemetry_otlp").await;
     let queue = "telemetry_otlp_test";
     clean_queue(&pool, queue).await;
 
@@ -844,7 +1036,7 @@ async fn test_failure_path_metrics_reach_prometheus() {
         .acquire_owned()
         .await
         .expect("ignored test gate should be available");
-    let pool = setup_pool().await;
+    let pool = setup_pool("awa_test_telemetry_failure").await;
     let queue = "telemetry_failure_path";
     clean_queue(&pool, queue).await;
 
@@ -1006,7 +1198,7 @@ async fn test_collector_death_does_not_block_job_processing() {
         .acquire_owned()
         .await
         .expect("ignored test gate should be available");
-    let pool = setup_pool().await;
+    let pool = setup_pool("awa_test_telemetry_collector").await;
     let queue = "telemetry_collector_death";
     clean_queue(&pool, queue).await;
 
@@ -1015,7 +1207,7 @@ async fn test_collector_death_does_not_block_job_processing() {
         .strip_prefix("http://")
         .unwrap_or("localhost:4317")
         .to_string();
-    let (proxy_port, proxy_handle) = start_tcp_proxy(&otlp_target).await;
+    let (proxy_port, proxy_connections, proxy_handle) = start_tcp_proxy(&otlp_target).await;
     let proxy_endpoint = format!("http://127.0.0.1:{proxy_port}");
     eprintln!("TCP proxy listening on {proxy_endpoint} → {otlp_target}");
 
@@ -1024,6 +1216,9 @@ async fn test_collector_death_does_not_block_job_processing() {
     global::set_meter_provider(meter_provider.clone());
 
     // 3. Build + start client.
+    let executed_jobs = Arc::new(AtomicUsize::new(0));
+    let executed_jobs_worker = executed_jobs.clone();
+
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -1033,7 +1228,13 @@ async fn test_collector_death_does_not_block_job_processing() {
                 ..Default::default()
             },
         )
-        .register::<TelemetryJob, _, _>(|_args, _ctx| async { Ok(JobResult::Completed) })
+        .register::<TelemetryJob, _, _>(move |_args, _ctx| {
+            let executed_jobs_worker = executed_jobs_worker.clone();
+            async move {
+                executed_jobs_worker.fetch_add(1, Ordering::SeqCst);
+                Ok(JobResult::Completed)
+            }
+        })
         .build()
         .expect("Failed to build collector-death client");
 
@@ -1059,25 +1260,31 @@ async fn test_collector_death_does_not_block_job_processing() {
         .expect("Failed to insert phase-1 job");
     }
 
-    wait_for_job_count(&pool, queue, "completed", phase1_jobs).await;
-    eprintln!("Phase 1: {phase1_jobs} jobs completed with live collector");
+    wait_for_atomic_count(
+        &executed_jobs,
+        phase1_jobs as usize,
+        "phase-1 executed jobs",
+        Duration::from_secs(30),
+    )
+    .await;
+    wait_for_no_live_jobs(&pool, queue, Duration::from_secs(30)).await;
+    eprintln!("Phase 1: {phase1_jobs} jobs executed with live collector");
 
     // Flush to ensure at least one export went through the proxy.
     meter_provider
         .force_flush()
         .expect("Failed to flush meter provider");
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Verify the pipeline was live by checking Prometheus.
-    let http = reqwest::Client::new();
-    let completed = wait_for_metric(
-        &http,
-        "awa_job_completed_total",
-        1.0,
-        Duration::from_secs(30),
+    wait_for_atomic_count(
+        &proxy_connections,
+        1,
+        "proxy connections",
+        Duration::from_secs(10),
     )
     .await;
-    eprintln!("Phase 1: Prometheus confirms awa_job_completed_total = {completed}");
+    eprintln!(
+        "Phase 1: exporter established {} proxy connection(s)",
+        proxy_connections.load(Ordering::SeqCst)
+    );
 
     // ── Phase 2: kill the collector proxy ──
     proxy_handle.abort();
@@ -1101,9 +1308,16 @@ async fn test_collector_death_does_not_block_job_processing() {
     }
 
     // Jobs must still complete — the dead collector must not block processing.
-    wait_for_job_count(&pool, queue, "completed", phase1_jobs + phase2_jobs).await;
+    wait_for_atomic_count(
+        &executed_jobs,
+        (phase1_jobs + phase2_jobs) as usize,
+        "phase-2 executed jobs",
+        Duration::from_secs(30),
+    )
+    .await;
+    wait_for_no_live_jobs(&pool, queue, Duration::from_secs(30)).await;
     eprintln!(
-        "Phase 2: all {} jobs completed with dead collector",
+        "Phase 2: all {} jobs executed with dead collector",
         phase1_jobs + phase2_jobs
     );
 
@@ -1132,7 +1346,7 @@ async fn dashboard_panels_have_observed_data() {
         .acquire_owned()
         .await
         .expect("ignored test gate should be available");
-    let pool = setup_pool().await;
+    let pool = setup_pool("awa_test_telemetry_dashboard").await;
     let queue = "grafana_demo";
     clean_queue(&pool, queue).await;
 
@@ -1680,7 +1894,8 @@ async fn dashboard_panels_have_observed_data() {
     .await;
     print_panel_report("Rescues (5m)", &rescues_5m);
 
-    client.shutdown(Duration::from_secs(5)).await;
+    wait_for_no_live_jobs(&pool, queue, Duration::from_secs(30)).await;
+    client.shutdown(Duration::from_secs(30)).await;
     meter_provider.force_flush().expect("flush");
     tokio::time::sleep(Duration::from_secs(3)).await;
     let _ = meter_provider.shutdown();

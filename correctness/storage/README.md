@@ -183,7 +183,9 @@ the runtime resolves it.
 [`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla) refines the
 Claim action into a two-step `BeginClaim(w, j)` / `CommitClaim(w)` with a
 per-worker `claimIntent` snapshot, and enables `RotateLeaseSegments` /
-`PruneLeaseSegment` to fire between the steps. Two configs:
+`PruneLeaseSegment` to fire between the steps. The checked-in configs both
+run with two workers so the race is exercised under real contention rather
+than a single-worker self-interleaving. Two configs:
 
 - [`AwaSegmentedStorageRaces.cfg`](./AwaSegmentedStorageRaces.cfg):
   naive `CommitClaim` (uses the snapshotted segment without re-check).
@@ -196,7 +198,10 @@ per-worker `claimIntent` snapshot, and enables `RotateLeaseSegments` /
   prune check-then-act race.
 - [`AwaSegmentedStorageRacesSafe.cfg`](./AwaSegmentedStorageRacesSafe.cfg):
   `CommitClaimChecked` re-reads `leaseSegments[leaseSeg] = "open"` at
-  commit time. TLC completes 22 distinct states with no violations.
+  commit time. TLC completes cleanly with no invariant violations.
+- [`AwaSegmentedStorageRacesMultiWorker.cfg`](./AwaSegmentedStorageRacesMultiWorker.cfg):
+  same safe refinement, but with three workers to exercise the checked
+  claim path under higher claimant contention. TLC completes cleanly.
 
 Run either with `./correctness/run-tlc.sh`. The race-exposing config is
 expected to produce a counterexample; the safe config is expected to pass.
