@@ -92,7 +92,7 @@ The harness sets these before launch. Your adapter reads them:
 | `WORKER_COUNT` | consumer concurrency |
 | `JOB_PAYLOAD_BYTES` | rough payload size (default 256) |
 | `JOB_WORK_MS` | synthetic job work time (default 1 ms) |
-| `SAMPLE_EVERY_S` | emission cadence in seconds (default 10) |
+| `SAMPLE_EVERY_S` | emission cadence in seconds (default 5) |
 
 ### JSONL out
 
