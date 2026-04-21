@@ -191,10 +191,35 @@ The leader-elected maintenance service owns:
 - DLQ retention cleanup
 
 All prune paths remain best-effort and use short lock timeouts. The explicit
-lock contract — claim takes `FOR SHARE` on the lease segment cursor, rotate
-and prune take `FOR UPDATE` plus `ACCESS EXCLUSIVE` on the segment child, and
-prune rechecks liveness inside the lock-holding transaction — is its own
-decision in [ADR-023](023-storage-lock-ordering.md).
+lock contract is:
+
+- claim takes `FOR UPDATE` on the lane row and `FOR SHARE` on the active
+  lease-segment cursor while it inserts the claim
+- rotate takes `FOR UPDATE` on the segment cursor
+- prune takes `FOR UPDATE` on the segment cursor, `FOR UPDATE` on the target
+  slot metadata row, and `ACCESS EXCLUSIVE` on the child partition before it
+  rechecks liveness and truncates
+
+That order is deliberate. The TLA+ storage race / lock-order models exist to
+prove that claim, rotate, and prune cannot interleave into “claim lands in a
+pruned segment” behavior.
+
+Rotation and prune policy is also part of this decision:
+
+- lease segments rotate quickly because lease churn is the remaining hot-path
+  source
+- ready / deferred / waiting / terminal / dlq segments rotate more slowly and
+  are primarily retention-driven
+- prune walks sealed segments oldest-first
+- prune uses `SET LOCAL lock_timeout = '50ms'` and returns gracefully when a
+  reader or writer still holds the segment
+- long-lived readers can still pin a segment horizon, so operators are
+  expected to run analytical reads on replicas and keep primary-side
+  `statement_timeout` discipline
+
+Retention is therefore a rotation-and-prune story, not a row-by-row delete
+story. Queue retention knobs, DLQ retention, and segment counts all compose
+within that operational policy.
 
 ### Hot-path requirements
 
@@ -207,8 +232,15 @@ in implementation:
   read and the lease insert.
 - Short successful completion carries the immutable claim-time job snapshot
   through the completion batcher so the terminal append does not reload
-  `ready_entries`. The batcher shape is its own decision in
-  [ADR-025](025-completion-batcher-snapshot-passthrough.md).
+  `ready_entries`.
+- The completion batcher therefore owns a claim-time snapshot pass-through
+  path: short completions append terminal rows from the already-carried
+  immutable claim snapshot, while stale completions still lose via the
+  `(job_id, run_lease)` guarded delete against the live execution row.
+- Crash safety for the batcher relies on the normal rescue path, not an
+  auxiliary replay log. If an in-memory completion batch is lost with the
+  worker process, the live attempt remains visible to heartbeat/deadline
+  rescue and is reclaimed that way.
 
 ## Validation
 

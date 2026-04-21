@@ -35,9 +35,6 @@ in-place as historical context.
 | 020 | [Dead Letter Queue](020-dead-letter-queue.md) | Accepted | First-class DLQ storage family with per-queue opt-in, retention, and operator retry/purge | Lives inside ADR-019 |
 | 021 | [Sequential callbacks and callback heartbeats](021-enhanced-external-wait.md) | Accepted | `wait_for_callback()` + `resume_external()` for multi-step orchestration; `heartbeat_callback` for long-running externals | Callback state moved to `active_leases` per ADR-019 |
 | 022 | [Descriptor catalog](022-descriptor-catalog.md) | Accepted | `queue_descriptors` / `job_kind_descriptors` tables, BLAKE3-hashed, code-declared, off the hot path | Off the queue-storage hot path |
-| 023 | [Storage lock-ordering protocol](023-storage-lock-ordering.md) | Accepted | Explicit `FOR SHARE` / `FOR UPDATE` / `ACCESS EXCLUSIVE` order for claim / rotate / prune | Implementation contract of ADR-019 |
-| 024 | [Retention and partition rotation policy](024-retention-and-partition-rotation.md) | Accepted | Per-family rotation intervals, lock-timed prune with re-count inside tx, retention knobs | Operational policy for ADR-019 + ADR-020 |
-| 025 | [Completion batcher with snapshot pass-through](025-completion-batcher-snapshot-passthrough.md) | Accepted | Carry the claim-time snapshot through the completion batcher so terminal append avoids re-reading `ready_entries` | Performance contract of ADR-019 |
 
 ## Validation artifacts
 
@@ -48,7 +45,7 @@ Runtime validation for ADR-019 is recorded in
 TLA+ correctness models that pin spec-level invariants are under
 [`../../correctness/`](../../correctness/) — the segmented-storage family
 (`AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,
-`AwaSegmentedStorageTrace`) maps to ADR-019, ADR-020, and ADR-023; the
+`AwaSegmentedStorageTrace`) maps to ADR-019 and ADR-020; the
 worker-runtime family (`AwaCore`, `AwaExtended`, `AwaBatcher`, `AwaCbk`,
 `AwaDispatchClaim`, `AwaViewTrigger`, `AwaCron`) covers rescue, batcher,
 callback race, dispatcher claim, view-trigger concurrency, and cron
