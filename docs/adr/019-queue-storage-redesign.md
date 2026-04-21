@@ -206,6 +206,12 @@ throughput in the event-delivery scenarios, while PgQue keeps a lower
 dead-tuple profile. See [docs/benchmarking.md](../benchmarking.md) for the
 current comparison methodology and caveats.
 
+The current pressure frontier after the split-head change is the lease plane:
+`queue_lanes` is no longer the dominant MVCC hotspot, but the mutable
+`active_leases` family still absorbs steady insert/delete churn and heartbeat
+updates. The follow-up design work is tracked in
+[`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
+
 Spec-level safety is checked by the segmented-storage TLA+ family —
 `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,
 `AwaSegmentedStorageTrace` — under
