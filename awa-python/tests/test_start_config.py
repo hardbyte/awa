@@ -412,7 +412,22 @@ async def test_queue_storage_target_role_executes_after_mixed_transition(client)
         try:
             tx = await reset.transaction()
             await tx.execute("DELETE FROM awa.runtime_instances")
-            await tx.execute("SELECT * FROM awa.storage_abort()")
+            await tx.execute(
+                """
+                UPDATE awa.storage_transition_state
+                SET current_engine = 'canonical',
+                    prepared_engine = NULL,
+                    state = 'canonical',
+                    transition_epoch = transition_epoch + 1,
+                    details = '{}'::jsonb,
+                    updated_at = now(),
+                    finalized_at = NULL
+                WHERE singleton
+                """
+            )
+            await tx.execute(
+                "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+            )
             await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
             await tx.commit()
         finally:
