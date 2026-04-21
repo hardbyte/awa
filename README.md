@@ -33,7 +33,7 @@ without Redis or RabbitMQ, Awa is built for you.
 ### Operations
 - **Web UI** — dashboard, job inspector, queue management, cron controls, DLQ retry/purge.
 - **Structured progress** — handlers report percent, message, and checkpoint metadata; persisted across retries.
-- **OpenTelemetry metrics** — 20+ built-in counters, histograms, and gauges for Prometheus/Grafana.
+- **OpenTelemetry metrics** — 20+ built-in counters, histograms, and gauges for Prometheus/Grafana. Python workers enable export with `awa.init_telemetry(endpoint, service)`; Rust workers install their own provider.
 - **Operator descriptors** — code-declared queue and job-kind names/descriptions with stale/drift visibility in the UI.
 - **Postgres-only** — one dependency you already have; no Redis, no RabbitMQ, no separate scheduler.
 
