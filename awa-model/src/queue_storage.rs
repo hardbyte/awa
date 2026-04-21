@@ -2165,7 +2165,6 @@ impl QueueStorage {
                         SELECT current_slot AS lease_slot, generation AS lease_generation
                         FROM {schema}.lease_ring_state
                         WHERE singleton = TRUE
-                        FOR SHARE
                     ),
                     selected AS (
                         SELECT
@@ -4609,7 +4608,7 @@ impl QueueStorage {
             lease_ring AS (
                 SELECT current_slot AS lease_slot, generation AS lease_generation
                 FROM {schema}.lease_ring_state
-                FOR SHARE
+                WHERE singleton = TRUE
             ),
             claim_refs AS (
                 SELECT
@@ -7514,7 +7513,6 @@ impl QueueStorage {
             SELECT current_slot, generation, slot_count
             FROM {schema}.lease_ring_state
             WHERE singleton = TRUE
-            FOR UPDATE
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -7537,19 +7535,28 @@ impl QueueStorage {
 
         let next_generation = state.1 + 1;
 
-        sqlx::query(&format!(
+        let rotated = sqlx::query(&format!(
             r#"
             UPDATE {schema}.lease_ring_state
             SET current_slot = $1,
                 generation = $2
             WHERE singleton = TRUE
+              AND current_slot = $3
+              AND generation = $4
             "#
         ))
         .bind(next_slot)
         .bind(next_generation)
+        .bind(state.0)
+        .bind(state.1)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
+        if rotated.rows_affected() == 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+        }
 
         sqlx::query(&format!(
             r#"
@@ -7709,7 +7716,6 @@ impl QueueStorage {
             SELECT current_slot
             FROM {schema}.lease_ring_state
             WHERE singleton = TRUE
-            FOR UPDATE
             "#
         ))
         .fetch_one(tx.as_mut())

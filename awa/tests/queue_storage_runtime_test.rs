@@ -2176,7 +2176,7 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_claim_runtime_waits_for_lease_rotation_lock() {
+async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
     let queue = "qs_claim_lease_lock";
@@ -2201,26 +2201,20 @@ async fn test_queue_storage_claim_runtime_waits_for_lease_rotation_lock() {
     .await
     .expect("Failed to lock lease ring state");
 
-    let blocked_claim = tokio::time::timeout(
+    let claimed_while_locked = tokio::time::timeout(
         Duration::from_millis(200),
         store.claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30)),
     )
     .await;
-    assert!(
-        blocked_claim.is_err(),
-        "claim should wait behind lease ring rotation lock"
-    );
+    let claimed_while_locked = claimed_while_locked
+        .expect("claim should not block on lease ring state lock")
+        .expect("claim should succeed while lease ring state is locked");
+    assert_eq!(claimed_while_locked.len(), 1);
 
     lock_tx
         .rollback()
         .await
         .expect("Failed to release lease ring lock");
-
-    let claimed = store
-        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
-        .await
-        .expect("Failed to claim after lease ring lock release");
-    assert_eq!(claimed.len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
