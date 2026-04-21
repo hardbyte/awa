@@ -535,6 +535,7 @@ impl PyClient {
                     schema,
                     queue_slot_count: queue_slot_count as usize,
                     lease_slot_count: lease_slot_count as usize,
+                    ..Default::default()
                 })
                 .map_err(map_awa_error)?;
                 if reset {
@@ -1566,6 +1567,7 @@ impl PyClient {
                     .unwrap_or_else(|| QueueStorageConfig::default().schema),
                 queue_slot_count: queue_storage_queue_slot_count as usize,
                 lease_slot_count: queue_storage_lease_slot_count as usize,
+                ..Default::default()
             },
             Duration::from_millis(queue_storage_queue_rotate_interval_ms),
             Duration::from_millis(queue_storage_lease_rotate_interval_ms),
@@ -2087,6 +2089,7 @@ impl PyClient {
                     schema,
                     queue_slot_count: queue_slot_count as usize,
                     lease_slot_count: lease_slot_count as usize,
+                    ..Default::default()
                 })
                 .map_err(map_awa_error)?;
                 if reset {
