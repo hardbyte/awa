@@ -74,12 +74,25 @@ async fn ensure_database_exists(url: &str) {
         .connect(&admin_url)
         .await
         .expect("Failed to connect to admin database for retention tests");
+    let terminate_sql = format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{database_name}' AND pid <> pg_backend_pid()"
+    );
+    sqlx::query(&terminate_sql)
+        .execute(&admin_pool)
+        .await
+        .expect("Failed to terminate existing retention test connections");
+
+    let drop_sql = format!("DROP DATABASE IF EXISTS {database_name}");
+    sqlx::query(&drop_sql)
+        .execute(&admin_pool)
+        .await
+        .expect("Failed to drop retention test database");
+
     let create_sql = format!("CREATE DATABASE {database_name}");
-    match sqlx::query(&create_sql).execute(&admin_pool).await {
-        Ok(_) => {}
-        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
-        Err(err) => panic!("Failed to create retention test database {database_name}: {err}"),
-    }
+    sqlx::query(&create_sql)
+        .execute(&admin_pool)
+        .await
+        .expect("Failed to create retention test database");
 }
 
 async fn setup() -> TestClient {
