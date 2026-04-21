@@ -82,7 +82,7 @@ for backfill / fallback reads during upgrades.
 
 ## Known modelling gaps with implementation implications
 
-### Claim vs Rotate race — resolved by Postgres row locks
+### Claim vs Rotate race — resolved by checked commit on lease rotation state
 
 The race-exposure spec
 [`AwaSegmentedStorageRaces.tla`](./AwaSegmentedStorageRaces.tla) proves
@@ -90,36 +90,21 @@ that a claim that snapshots the lease segment cursor without further
 synchronisation can land a lease in a segment that has since been
 rotated and pruned.
 
-**Status in the implementation: mitigated.** Inspection of
-`claim_ready_runtime` at `queue_storage.rs:1740-1746` shows:
+**Status in the implementation: mitigated.** The current Rust code no
+longer takes `FOR SHARE` on `lease_ring_state`. Instead:
 
-```sql
-WITH lease_ring AS (
-    SELECT current_slot AS lease_slot, generation AS lease_generation
-    FROM {schema}.lease_ring_state
-    WHERE singleton = TRUE
-    FOR SHARE
-),
-...
-```
+- claim reads the current lease slot / generation from `lease_ring_state`
+  inside the claim statement and writes that generation into the claim
+- `rotate_leases` advances `lease_ring_state` with a compare-and-swap update
+  on `(current_slot, generation)`
+- `prune_oldest_leases` derives the oldest initialized slot from
+  `lease_ring_state`, locks the child partition, then rechecks that the slot
+  is not current before truncating
 
-Claim takes `FOR SHARE` on `lease_ring_state` across the cursor read
-AND the lease insert (both in the same CTE, same statement, same tx).
-The conflicting paths:
-
-- `rotate_leases` at `queue_storage.rs:6194` uses `FOR UPDATE` on
-  `lease_ring_state` — incompatible with `FOR SHARE`, so rotate waits
-  until all in-flight claims commit
-- `prune_oldest_leases` at `queue_storage.rs:6398` also uses
-  `FOR UPDATE` on `lease_ring_state`, plus takes `ACCESS EXCLUSIVE` on
-  the lease partition child, and counts active leases inside the prune
-  transaction
-
-So the race exists at the abstraction level of the TLA+ spec (which
-does not model Postgres row locks) but is unreachable in production.
-The race spec is still valuable because it proves that **removing any
-of those locks would expose the race** — it is a regression harness
-for the locking contract.
+So the race still exists at the abstract spec level, but the production
+implementation closes it by treating `lease_ring_state` as a checked-commit
+cursor rather than an unlocked hint. The race spec remains valuable because
+it proves that weakening that discipline would reintroduce the bug.
 
 ### prune_oldest (ready) check-then-act — resolved
 
@@ -152,11 +137,11 @@ So the "check-then-act" framing is inaccurate: the Rust code is
 
 The spec plus `AwaSegmentedStorageRaces.cfg` (race-exposing) and
 `AwaSegmentedStorageRacesSafe.cfg` (checked-commit) is a regression
-harness. If any future refactor removes the `FOR SHARE` on
+harness. If any future refactor weakens the checked-commit discipline on
 `lease_ring_state`, or weakens the `ACCESS EXCLUSIVE` on the partition
-children, the race spec will still produce a counterexample and the
-safe spec will still pass — making the invariant the checked-commit
-enforces a clear statement of what the SQL locks are buying.
+children, the race spec will still produce a counterexample and the safe
+spec will still pass — making the invariant the checked-commit enforces a
+clear statement of what the SQL coordination is buying.
 
 ### Lock-order regression harness
 

@@ -149,6 +149,54 @@ fn lease_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.leases_{slot}")
 }
 
+fn oldest_initialized_ring_slot(
+    current_slot: i32,
+    generation: i64,
+    slot_count: i32,
+) -> Option<(i32, i64)> {
+    if slot_count <= 1 {
+        return None;
+    }
+
+    let initialized_slots = (generation + 1).min(slot_count as i64) as i32;
+    if initialized_slots <= 1 {
+        return None;
+    }
+
+    let offset = initialized_slots - 1;
+    let oldest_slot = (current_slot - offset).rem_euclid(slot_count);
+    let oldest_generation = generation - offset as i64;
+    if oldest_generation < 0 {
+        return None;
+    }
+
+    Some((oldest_slot, oldest_generation))
+}
+
+#[cfg(test)]
+mod ring_slot_tests {
+    use super::oldest_initialized_ring_slot;
+
+    #[test]
+    fn oldest_initialized_ring_slot_is_none_until_second_slot_exists() {
+        assert_eq!(oldest_initialized_ring_slot(0, 0, 8), None);
+    }
+
+    #[test]
+    fn oldest_initialized_ring_slot_tracks_partial_ring_startup() {
+        assert_eq!(oldest_initialized_ring_slot(1, 1, 8), Some((0, 0)));
+        assert_eq!(oldest_initialized_ring_slot(2, 2, 8), Some((0, 0)));
+        assert_eq!(oldest_initialized_ring_slot(3, 3, 8), Some((0, 0)));
+    }
+
+    #[test]
+    fn oldest_initialized_ring_slot_wraps_after_full_rotation() {
+        assert_eq!(oldest_initialized_ring_slot(7, 7, 8), Some((0, 0)));
+        assert_eq!(oldest_initialized_ring_slot(0, 8, 8), Some((1, 1)));
+        assert_eq!(oldest_initialized_ring_slot(1, 9, 8), Some((2, 2)));
+    }
+}
+
 fn default_payload_metadata() -> serde_json::Value {
     serde_json::json!({})
 }
@@ -7559,19 +7607,6 @@ impl QueueStorage {
             return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
         }
 
-        sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.lease_ring_slots
-            SET generation = $2
-            WHERE slot = $1
-            "#
-        ))
-        .bind(next_slot)
-        .bind(next_generation)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(RotateOutcome::Rotated {
             slot: next_slot,
@@ -7712,9 +7747,9 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        let state: (i32,) = sqlx::query_as(&format!(
+        let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
-            SELECT current_slot
+            SELECT current_slot, generation, slot_count
             FROM {schema}.lease_ring_state
             WHERE singleton = TRUE
             "#
@@ -7723,23 +7758,8 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let target: Option<(i32, i64)> = sqlx::query_as(&format!(
-            r#"
-            SELECT slot, generation
-            FROM {schema}.lease_ring_slots
-            WHERE generation >= 0
-              AND slot <> $1
-            ORDER BY generation ASC, slot ASC
-            LIMIT 1
-            FOR UPDATE
-            "#
-        ))
-        .bind(state.0)
-        .fetch_optional(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let Some((slot, _generation)) = target else {
+        let Some((slot, _generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
@@ -7760,6 +7780,22 @@ impl QueueStorage {
         if lock_table.is_err() {
             let _ = tx.rollback().await;
             return Ok(PruneOutcome::Blocked { slot });
+        }
+
+        let current_slot: i32 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT current_slot
+            FROM {schema}.lease_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if current_slot == slot {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive { slot });
         }
 
         let active_leases: i64 =

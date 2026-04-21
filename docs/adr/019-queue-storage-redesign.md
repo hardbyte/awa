@@ -119,6 +119,10 @@ The implementation and migrations use these physical names:
   not serialize on the same hot rows as claim and enqueue.
 - Ready and lease segment cursor tables tell dispatch and maintenance which
   physical segment is active, claimable, or prunable.
+- Lease prune order is derived from `lease_ring_state(current_slot,
+  generation, slot_count)`. The older `{schema}.lease_ring_slots` table
+  remains as transitional compatibility/inspection state, but it is no longer
+  updated on every rotation and is not the authoritative ordering source.
 - Rotation state for queue and lease segments is owned by the maintenance
   leader.
 - This split is an explicit response to the remaining MVCC hotspot discovered
@@ -200,12 +204,16 @@ The leader-elected maintenance service owns:
 All prune paths remain best-effort and use short lock timeouts. The explicit
 lock contract is:
 
-- claim takes `FOR UPDATE` on the lane row and `FOR SHARE` on the active
-  lease-segment cursor while it inserts the claim
-- rotate takes `FOR UPDATE` on the segment cursor
-- prune takes `FOR UPDATE` on the segment cursor, `FOR UPDATE` on the target
-  slot metadata row, and `ACCESS EXCLUSIVE` on the child partition before it
-  rechecks liveness and truncates
+- claim takes `FOR UPDATE OF claims SKIP LOCKED` on `queue_claim_heads` while
+  it advances the claim cursor and inserts the claim
+- rotate publishes the next lease slot with a compare-and-swap update on
+  `lease_ring_state`
+- prune-ready takes `FOR UPDATE` on `queue_ring_state`, `FOR UPDATE` on the
+  target `queue_ring_slots` row, and `ACCESS EXCLUSIVE` on the child
+  partitions before it rechecks liveness and truncates
+- prune-leases derives the oldest initialized slot from `lease_ring_state`,
+  locks the child partition `ACCESS EXCLUSIVE`, rechecks that the slot is not
+  current, then truncates if it is empty
 
 That order is deliberate. The TLA+ storage race / lock-order models exist to
 prove that claim, rotate, and prune cannot interleave into “claim lands in a

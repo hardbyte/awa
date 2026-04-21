@@ -14,8 +14,10 @@ Small tuning experiments were not enough:
 - slower lease rotation reduced ring-state churn but moved much more dead
   tuples into `leases_*`
 - higher `lease_slot_count` spread churn around but increased total dead tuples
-- removing the `lease_ring_slots` write reduced one metadata hotspot, but the
-  latency / dead-tuple trade-off was too unstable to keep
+- the current implementation keeps `lease_ring_slots` only as transitional
+  compatibility/inspection state; lease prune order is now derived from
+  `lease_ring_state`, and the remaining work is about making the lease plane
+  colder without trading away delivery latency
 
 So the next change has to be architectural rather than another timing tweak.
 
@@ -25,7 +27,7 @@ Today the queue-storage runtime uses a rotating mutable `leases` table family.
 
 Claim:
 
-1. read `{schema}.lease_ring_state` `FOR SHARE`
+1. read the current lease slot / generation from `{schema}.lease_ring_state`
 2. insert a row into `{schema}.leases`
 
 Running / waiting:

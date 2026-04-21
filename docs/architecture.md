@@ -755,7 +755,7 @@ The segmented-storage family has four complementary specs:
 | Spec | Checks | Artifact |
 |---|---|---|
 | `AwaSegmentedStorage` | lifecycle transitions across ready / deferred / waiting / active_leases / attempt_state / terminal / dlq families and their rotate/prune safety; DLQ round-trip with `run_lease` reset; short-job rescue via lease-level heartbeat freshness | [spec](../correctness/storage/AwaSegmentedStorage.tla) |
-| `AwaSegmentedStorageRaces` | the claim-vs-rotate-and-prune race that would exist if the Rust `FOR SHARE` on `lease_ring_state` were removed; paired with a checked-commit variant that closes it | [spec](../correctness/storage/AwaSegmentedStorageRaces.tla) |
+| `AwaSegmentedStorageRaces` | the claim-vs-rotate-and-prune race that would exist if claim snapshots lease rotation state without the current compare-and-swap / checked-commit discipline; paired with a checked-commit variant that closes it | [spec](../correctness/storage/AwaSegmentedStorageRaces.tla) |
 | `AwaStorageLockOrder` | Postgres lock-acquisition order across claim / rotate-leases / prune-leases / rotate-ready / prune-ready; waits-for cycle detector; paired with a cycle-creating demo config to prove the checker works | [spec](../correctness/storage/AwaStorageLockOrder.tla) |
 | `AwaSegmentedStorageTrace` | trace-replay harness that feeds hand-transcribed event sequences from real queue-storage runtime tests through the base spec; single-threaded validation that every observed transition is a legal spec action | [spec](../correctness/storage/AwaSegmentedStorageTrace.tla) |
 
