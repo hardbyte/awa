@@ -56,6 +56,20 @@ async def client():
     await tx.execute(
         "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
     )
+    await tx.execute("DELETE FROM awa.runtime_instances")
+    await tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
     await tx.execute("DELETE FROM awa_test_chaos_markers")
     await tx.commit()
     yield c
