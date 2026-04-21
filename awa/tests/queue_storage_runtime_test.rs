@@ -277,6 +277,17 @@ async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         .expect("Failed to count lease_claims")
 }
 
+async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.open_receipt_claims",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count open_receipt_claims")
+}
+
 async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let sql = format!(
         "SELECT count(*)::bigint FROM {}.lease_claim_closures",
@@ -1314,6 +1325,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
     let running_counts = store
         .queue_counts(&pool, queue)
@@ -1335,6 +1347,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
     let completed_counts = store
         .queue_counts(&pool, queue)
@@ -1465,6 +1478,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(running.state, JobState::Running);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
 
     let materialization_deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -1485,6 +1499,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(running.state, JobState::Running);
     assert!(running.heartbeat_at.is_some());
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
 
@@ -1501,6 +1516,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
 
@@ -1594,6 +1610,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     }
 
     assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     let running = store
         .load_job(&pool, job_id)
         .await
@@ -1615,6 +1632,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -1700,6 +1718,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
 
     let completed = wait_for_job_state(
@@ -1715,6 +1734,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
 
     release.notify_waiters();

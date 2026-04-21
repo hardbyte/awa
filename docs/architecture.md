@@ -18,7 +18,7 @@ queue plane and rotating segments for lease churn.
                        ▼
  ┌─────────────────────────────────────────────────────────┐
  │                    Queue plane (append-only)            │
- │ ready_entries ──claim──► lease_claims / active_leases  │
+ │ ready_entries ──claim──► lease_claims / open_receipt_claims / active_leases │
  │                               │                         │
  │                               ├──retry──► deferred_jobs │
  │                               │              │          │
@@ -31,8 +31,9 @@ queue plane and rotating segments for lease churn.
            ▼               ▼               ▼
      Execution plane   Control plane   Maintenance leader
      lease_claims      lane_state      promote / rescue /
-     active_leases     enqueue_head    rotate / prune /
-     attempt_state     claim_head      dlq retention
+     open_receipt_claims enqueue_head  rotate / prune /
+     active_leases     claim_head      dlq retention
+     attempt_state
      (optional)        *_segments
                        *_segments
                        *_cursor
@@ -43,6 +44,8 @@ Each queue-plane family (`ready_entries`, `deferred_jobs`, `terminal_entries`,
 not sit in one mutable heap. The current lease plane is hybrid:
 
 - zero-deadline short jobs can stay on append-only `lease_claims`
+- `open_receipt_claims` tracks only the currently-live receipt-backed attempts
+  so runtime reads do not have to infer "open" from full claim history
 - stale zero-deadline short jobs can be rescued from `lease_claims` after the
   grace window without first creating a mutable lease row
 - heartbeat/progress-only receipt-backed jobs can materialize into
@@ -65,8 +68,9 @@ truth when this overview needs more detail.
 
 - queue plane: append-only `ready_entries`, `deferred_jobs`,
   `terminal_entries`, and `dlq_entries`
-- execution plane: append-only `lease_claims`, narrow `active_leases`, plus
-  optional per-attempt `attempt_state`
+- execution plane: append-only `lease_claims`, bounded
+  `open_receipt_claims`, narrow `active_leases`, plus optional per-attempt
+  `attempt_state`
 - control plane: cold `lane_state`, hot `queue_enqueue_heads`,
   hot `queue_claim_heads`, plus ready/lease segment cursor tables
 - `lane_state` stays off the terminal-completion hot path: live completion
@@ -303,9 +307,12 @@ completion and rescue. Zero-deadline short jobs can stay on the append-only
 receipt path until they prove they need the richer runtime semantics; the
 first heartbeat or progress flush lazily materializes that receipt into
 `attempt_state` only, while callback registration or other lease-specific
-mutation paths still escalate it into `active_leases`. If the receipt never
-materializes at all, maintenance can still rescue it after the stale-claim
-grace window by closing the receipt append-only and requeueing the attempt.
+mutation paths still escalate it into `active_leases`. The currently-live
+receipt-backed set is tracked in `open_receipt_claims`, so receipt rescue and
+queue counts do not have to infer "open" by scanning the full append-only
+claim and closure history. If the receipt never materializes at all,
+maintenance can still rescue it after the stale-claim grace window by closing
+the receipt append-only and requeueing the attempt.
 
 Dispatch still uses strict priority ordering by `(queue, priority, lane_seq)`.
 Cross-priority fairness is handled separately by the maintenance leader's
@@ -373,7 +380,8 @@ Three flush paths:
 
 3. **Explicit flush** — `ctx.flush_progress()` upserts
    `{schema}.attempt_state(job_id, run_lease, progress)` guarded by the active
-   lease. This is the reliable path for critical checkpoints.
+   attempt identity. Receipt-backed attempts can therefore flush progress
+   before they ever materialize into `active_leases`.
 
 ```text
 ctx.set_progress(50, "halfway")       ──► ProgressState.latest updated, generation bumped

@@ -1064,6 +1064,10 @@ impl QueueStorage {
         "lease_claims"
     }
 
+    pub fn open_receipt_claims_relname(&self) -> &'static str {
+        "open_receipt_claims"
+    }
+
     pub fn lease_claim_closures_relname(&self) -> &'static str {
         "lease_claim_closures"
     }
@@ -1226,12 +1230,40 @@ impl QueueStorage {
                         RETURNING
                             ready_slot,
                             ready_generation,
+                            job_id,
                             queue,
                             priority,
                             lane_seq,
                             attempt,
                             run_lease,
                             max_attempts
+                    ),
+                    opened AS (
+                        INSERT INTO {schema}.open_receipt_claims (
+                            job_id,
+                            run_lease,
+                            ready_slot,
+                            ready_generation,
+                            queue,
+                            priority,
+                            attempt,
+                            max_attempts,
+                            lane_seq,
+                            claimed_at
+                        )
+                        SELECT
+                            claimed.job_id,
+                            claimed.run_lease,
+                            claimed.ready_slot,
+                            claimed.ready_generation,
+                            claimed.queue,
+                            claimed.priority,
+                            claimed.attempt,
+                            claimed.max_attempts,
+                            claimed.lane_seq,
+                            clock_timestamp()
+                        FROM claimed
+                        ON CONFLICT (job_id, run_lease) DO NOTHING
                     )
                     "#
                 )
@@ -1600,6 +1632,47 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
+            CREATE TABLE IF NOT EXISTS {schema}.open_receipt_claims (
+                job_id            BIGINT NOT NULL,
+                run_lease         BIGINT NOT NULL,
+                ready_slot        INT NOT NULL,
+                ready_generation  BIGINT NOT NULL,
+                queue             TEXT NOT NULL,
+                priority          SMALLINT NOT NULL,
+                attempt           SMALLINT NOT NULL,
+                max_attempts      SMALLINT NOT NULL,
+                lane_seq          BIGINT NOT NULL,
+                claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (job_id, run_lease)
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            CREATE INDEX IF NOT EXISTS idx_{schema}_open_receipt_claims_queue
+                ON {schema}.open_receipt_claims (queue, priority, lane_seq)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            CREATE INDEX IF NOT EXISTS idx_{schema}_open_receipt_claims_stale
+                ON {schema}.open_receipt_claims (claimed_at, job_id)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
             CREATE TABLE IF NOT EXISTS {schema}.lease_claim_closures (
                 job_id            BIGINT NOT NULL,
                 run_lease         BIGINT NOT NULL,
@@ -1607,6 +1680,54 @@ impl QueueStorage {
                 closed_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 PRIMARY KEY (job_id, run_lease)
             )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Backfill the bounded live frontier so schema upgrades do not
+            // strand already-running receipt-backed claims on the historical
+            // claim tables.
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.open_receipt_claims (
+                job_id,
+                run_lease,
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                attempt,
+                max_attempts,
+                lane_seq,
+                claimed_at
+            )
+            SELECT
+                claims.job_id,
+                claims.run_lease,
+                claims.ready_slot,
+                claims.ready_generation,
+                claims.queue,
+                claims.priority,
+                claims.attempt,
+                claims.max_attempts,
+                claims.lane_seq,
+                claims.claimed_at
+            FROM {schema}.lease_claims AS claims
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM {schema}.lease_claim_closures AS closures
+                WHERE closures.job_id = claims.job_id
+                  AND closures.run_lease = claims.run_lease
+            )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM {schema}.leases AS lease
+                WHERE lease.job_id = claims.job_id
+                  AND lease.run_lease = claims.run_lease
+            )
+            ON CONFLICT (job_id, run_lease) DO NOTHING
             "#
             ))
             .execute(pool)
@@ -2305,7 +2426,9 @@ impl QueueStorage {
                 {schema}.dlq_entries,
                 {schema}.leases,
                 {schema}.lease_claims,
+                {schema}.open_receipt_claims,
                 {schema}.lease_claim_closures,
+                {schema}.attempt_state,
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
@@ -3430,19 +3553,20 @@ impl QueueStorage {
                     ),
                     inserted AS (
                         INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
-                        SELECT claims.job_id, claims.run_lease, 'completed', clock_timestamp()
-                        FROM {schema}.lease_claims AS claims
+                        SELECT open_claims.job_id, open_claims.run_lease, 'completed', clock_timestamp()
+                        FROM {schema}.open_receipt_claims AS open_claims
                         JOIN completed
-                          ON completed.job_id = claims.job_id
-                         AND completed.run_lease = claims.run_lease
-                        WHERE NOT EXISTS (
-                            SELECT 1
-                            FROM {schema}.leases AS lease
-                            WHERE lease.job_id = claims.job_id
-                              AND lease.run_lease = claims.run_lease
-                        )
+                          ON completed.job_id = open_claims.job_id
+                         AND completed.run_lease = open_claims.run_lease
                         ON CONFLICT (job_id, run_lease) DO NOTHING
                         RETURNING job_id, run_lease
+                    ),
+                    removed_open AS (
+                        DELETE FROM {schema}.open_receipt_claims AS open_claims
+                        USING inserted
+                        WHERE open_claims.job_id = inserted.job_id
+                          AND open_claims.run_lease = inserted.run_lease
+                        RETURNING open_claims.job_id
                     )
                     SELECT job_id, run_lease
                     FROM inserted
@@ -3823,24 +3947,8 @@ impl QueueStorage {
                     +
                     COALESCE((
                         SELECT count(*)::bigint
-                        FROM {schema}.lease_claims AS claims
-                        LEFT JOIN {schema}.attempt_state AS attempt
-                          ON attempt.job_id = claims.job_id
-                         AND attempt.run_lease = claims.run_lease
-                        WHERE claims.queue = $1
-                          AND (claims.materialized_at IS NULL OR attempt.job_id IS NOT NULL)
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM {schema}.lease_claim_closures AS closures
-                              WHERE closures.job_id = claims.job_id
-                                AND closures.run_lease = claims.run_lease
-                          )
-                          AND NOT EXISTS (
-                              SELECT 1
-                              FROM {schema}.leases AS lease
-                              WHERE lease.job_id = claims.job_id
-                                AND lease.run_lease = claims.run_lease
-                          )
+                        FROM {schema}.open_receipt_claims
+                        WHERE queue = $1
                     ), 0)
                 )::bigint AS running
             ),
@@ -4515,17 +4623,10 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.claimed_at
-                FROM {schema}.lease_claims AS claims
+                FROM {schema}.open_receipt_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
                  AND inflight.run_lease = claims.run_lease
-                WHERE claims.materialized_at IS NULL
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
-                  )
                 FOR UPDATE
             ),
             already_live AS (
@@ -4593,6 +4694,17 @@ impl QueueStorage {
                 WHERE claims.job_id = moved.job_id
                   AND claims.run_lease = moved.run_lease
                 RETURNING claims.job_id
+            ),
+            removed_open AS (
+                DELETE FROM {schema}.open_receipt_claims AS open_claims
+                USING (
+                    SELECT job_id, run_lease FROM inserted
+                    UNION
+                    SELECT job_id, run_lease FROM already_live
+                ) AS moved
+                WHERE open_claims.job_id = moved.job_id
+                  AND open_claims.run_lease = moved.run_lease
+                RETURNING open_claims.job_id
             )
             SELECT count(*)::bigint FROM marked
             "#
@@ -4624,22 +4736,10 @@ impl QueueStorage {
             ),
             claim_refs AS (
                 SELECT claims.job_id, claims.run_lease
-                FROM {schema}.lease_claims AS claims
+                FROM {schema}.open_receipt_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
                  AND inflight.run_lease = claims.run_lease
-                WHERE NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.leases AS lease
-                      WHERE lease.job_id = claims.job_id
-                        AND lease.run_lease = claims.run_lease
-                  )
                 FOR UPDATE
             ),
             upserted AS (
@@ -4694,22 +4794,10 @@ impl QueueStorage {
             ),
             claim_refs AS (
                 SELECT claims.job_id, claims.run_lease, inflight.progress
-                FROM {schema}.lease_claims AS claims
+                FROM {schema}.open_receipt_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
                  AND inflight.run_lease = claims.run_lease
-                WHERE NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.leases AS lease
-                      WHERE lease.job_id = claims.job_id
-                        AND lease.run_lease = claims.run_lease
-                  )
                 FOR UPDATE
             ),
             upserted AS (
@@ -4921,24 +5009,11 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.claimed_at AS attempted_at
-                FROM {schema}.lease_claims AS claims
+                FROM {schema}.open_receipt_claims AS claims
                 LEFT JOIN {schema}.attempt_state AS attempt
                   ON attempt.job_id = claims.job_id
                  AND attempt.run_lease = claims.run_lease
-                WHERE (claims.materialized_at IS NULL OR attempt.job_id IS NOT NULL)
-                  AND COALESCE(attempt.heartbeat_at, claims.claimed_at) < $1
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.lease_claim_closures AS closures
-                      WHERE closures.job_id = claims.job_id
-                        AND closures.run_lease = claims.run_lease
-                  )
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM {schema}.leases AS lease
-                      WHERE lease.job_id = claims.job_id
-                        AND lease.run_lease = claims.run_lease
-                  )
+                WHERE COALESCE(attempt.heartbeat_at, claims.claimed_at) < $1
                 ORDER BY COALESCE(attempt.heartbeat_at, claims.claimed_at) ASC
                 LIMIT 500
                 FOR UPDATE OF claims SKIP LOCKED
@@ -4949,6 +5024,13 @@ impl QueueStorage {
                 FROM stale_claims
                 ON CONFLICT (job_id, run_lease) DO NOTHING
                 RETURNING job_id, run_lease
+            ),
+            removed_open AS (
+                DELETE FROM {schema}.open_receipt_claims AS open_claims
+                USING inserted
+                WHERE open_claims.job_id = inserted.job_id
+                  AND open_claims.run_lease = inserted.run_lease
+                RETURNING open_claims.job_id
             )
             SELECT
                 stale_claims.ready_slot,
@@ -5126,7 +5208,7 @@ impl QueueStorage {
                 ready.payload,
                 attempt.progress,
                 attempt.callback_result
-            FROM {schema}.lease_claims AS claims
+            FROM {schema}.open_receipt_claims AS claims
             JOIN {schema}.ready_entries AS ready
               ON ready.ready_slot = claims.ready_slot
              AND ready.ready_generation = claims.ready_generation
@@ -5137,19 +5219,6 @@ impl QueueStorage {
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
             WHERE claims.job_id = $1
-              AND (claims.materialized_at IS NULL OR attempt.job_id IS NOT NULL)
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM {schema}.lease_claim_closures AS closures
-                  WHERE closures.job_id = claims.job_id
-                    AND closures.run_lease = claims.run_lease
-              )
-              AND NOT EXISTS (
-                  SELECT 1
-                  FROM {schema}.leases AS lease
-                  WHERE lease.job_id = claims.job_id
-                    AND lease.run_lease = claims.run_lease
-              )
             ORDER BY claims.run_lease DESC
             "#,
         ))

@@ -56,6 +56,8 @@ The implementation and migrations use these physical names:
 - The common path still records every claim, but the implementation can now do
   that in two stages:
   - append-only `lease_claims` receipts for zero-deadline short jobs
+  - a bounded `open_receipt_claims` frontier for currently-live receipt-backed
+    attempts
   - lazy materialization into `active_leases` when the attempt needs the
     mutable execution path
 - Leases keep only dispatch and rescue-critical fields: ready reference,
@@ -137,6 +139,9 @@ The implementation and migrations use these physical names:
 - Short zero-deadline rescue before first heartbeat: close the stale receipt
   append-only and requeue it without first materializing a mutable
   `active_leases` row.
+- Runtime reads that need the current live receipt-backed set (`queue_counts`,
+  receipt rescue, and receipt-backed `load_job`) read
+  `open_receipt_claims`, not the full append-only claim history.
 - First heartbeat or progress flush for a receipt-backed attempt: lazily
   materialize the claim into `attempt_state` while keeping the claim on the
   append-only receipt path.
@@ -172,6 +177,8 @@ Healthy operating signals for this design are:
 - short jobs complete without creating an `attempt_state` row.
 - short zero-deadline jobs can also complete without ever creating a mutable
   `active_leases` row.
+- the live receipt frontier stays bounded to open receipt-backed attempts
+  rather than growing with total claims and closures.
 - short zero-deadline jobs that never heartbeat can be rescued from
   `lease_claims` after the grace window without first creating
   `active_leases`.
@@ -264,10 +271,12 @@ The current pressure frontier after the split-head change is the lease plane:
 `queue_lanes` is no longer the dominant MVCC hotspot, but the mutable
 `active_leases` family still absorbs steady insert/delete churn and heartbeat
 updates. The current implementation now includes an experimental short-job
-receipt path (`lease_claims` plus lazy lease materialization) that
-substantially reduces dead tuples for zero-deadline short jobs, but the full
-lease-plane redesign is still follow-up work. That design work is tracked in
-[`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
+receipt path (`lease_claims` plus lazy materialization) that substantially
+reduces dead tuples for zero-deadline short jobs. Long-horizon profiling also
+showed that the append-only history alone was not enough: open claims had to
+be tracked in a bounded `open_receipt_claims` frontier so rescue and queue
+counts would not degrade into history scans. Further lease-plane work is still
+tracked in [`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
 
 Spec-level safety is checked by the segmented-storage TLA+ family —
 `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,

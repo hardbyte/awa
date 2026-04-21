@@ -102,6 +102,20 @@ Each claim appends one immutable row containing:
 This row replaces the current use of `leases` as the durable "claim happened"
 record.
 
+#### `open_receipt_claims`
+
+Bounded live frontier for currently-open receipt-backed attempts.
+
+This table duplicates only the metadata the runtime needs to answer hot-path
+questions without scanning append-only history:
+
+- queue / priority / lane ordering for counts and lookup
+- ready reference for hydration and rescue
+- `claimed_at` for the short-attempt grace window
+
+`lease_claims` remains the durable claim history; `open_receipt_claims`
+exists only while the attempt is still live on the receipt path.
+
 #### `attempt_state`
 
 Optional mutable execution state keyed by `(job_id, run_lease)`.
@@ -306,6 +320,7 @@ There is now a narrow experimental path in the branch for **short successful
 jobs only**:
 
 - append-only `lease_claims`
+- bounded `open_receipt_claims`
 - append-only `lease_claim_closures`
 - no mutable `leases` row on the common short path
 - lazy materialization into `attempt_state` on first heartbeat / progress
@@ -347,6 +362,8 @@ So the spike validates the direction:
 - append-only short-claim receipts dramatically reduce steady-state dead tuples
 - heartbeat/progress-only receipt-backed attempts can stay off the mutable
   lease heap while still getting stale-heartbeat rescue
+- long-horizon runs still need a bounded live frontier; otherwise queue counts
+  and receipt rescue degrade into append-only history scans
 - the next work is making the materialized long-running path cheaper on the
   delivery path, and then extending the same model further across more of the
   long-running rescue surface
