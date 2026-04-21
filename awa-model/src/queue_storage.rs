@@ -1569,8 +1569,19 @@ impl QueueStorage {
                 max_attempts      SMALLINT NOT NULL,
                 lane_seq          BIGINT NOT NULL,
                 claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                materialized_at   TIMESTAMPTZ,
                 PRIMARY KEY (job_id, run_lease)
             )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.lease_claims
+                ADD COLUMN IF NOT EXISTS materialized_at TIMESTAMPTZ
             "#
             ))
             .execute(pool)
@@ -3357,69 +3368,207 @@ impl QueueStorage {
         if self.experimental_lease_claim_receipts() {
             let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
             let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
-            let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
+            let materialized_pairs: BTreeSet<(i64, i64)> = sqlx::query_as(&format!(
                 r#"
                 WITH completed(job_id, run_lease) AS (
                     SELECT * FROM unnest($1::bigint[], $2::bigint[])
-                ),
-                inserted AS (
-                    INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
-                    SELECT claims.job_id, claims.run_lease, 'completed', clock_timestamp()
-                    FROM {schema}.lease_claims AS claims
-                    JOIN completed
-                      ON completed.job_id = claims.job_id
-                     AND completed.run_lease = claims.run_lease
-                    ON CONFLICT (job_id, run_lease) DO NOTHING
-                    RETURNING job_id, run_lease
                 )
-                SELECT job_id, run_lease
-                FROM inserted
+                SELECT claims.job_id, claims.run_lease
+                FROM {schema}.lease_claims AS claims
+                JOIN completed
+                  ON completed.job_id = claims.job_id
+                 AND completed.run_lease = claims.run_lease
+                WHERE claims.materialized_at IS NOT NULL
                 "#
             ))
             .bind(&job_ids)
             .bind(&run_leases)
             .fetch_all(tx.as_mut())
             .await
-            .map_err(map_sqlx_error)?;
+            .map_err(map_sqlx_error)?
+            .into_iter()
+            .collect();
 
-            if updated.is_empty() {
-                tx.commit().await.map_err(map_sqlx_error)?;
-                return Ok(Vec::new());
-            }
+            let (materialized_claimed, receipt_claimed): (Vec<_>, Vec<_>) =
+                claimed.iter().cloned().partition(|entry| {
+                    materialized_pairs.contains(&(entry.job.id, entry.job.run_lease))
+                });
 
-            let updated_job_ids: Vec<i64> = updated.iter().map(|(job_id, _)| *job_id).collect();
-            let updated_run_leases: Vec<i64> =
-                updated.iter().map(|(_, run_lease)| *run_lease).collect();
+            let mut updated_all = Vec::new();
 
-            sqlx::query(&format!(
-                r#"
-                WITH completed(job_id, run_lease) AS (
-                    SELECT * FROM unnest($1::bigint[], $2::bigint[])
-                )
-                DELETE FROM {schema}.attempt_state AS attempt
-                USING completed
-                WHERE attempt.job_id = completed.job_id
-                  AND attempt.run_lease = completed.run_lease
-                "#
-            ))
-            .bind(&updated_job_ids)
-            .bind(&updated_run_leases)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            if !receipt_claimed.is_empty() {
+                let receipt_job_ids: Vec<i64> =
+                    receipt_claimed.iter().map(|entry| entry.job.id).collect();
+                let receipt_run_leases: Vec<i64> = receipt_claimed
+                    .iter()
+                    .map(|entry| entry.job.run_lease)
+                    .collect();
+                let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
+                    r#"
+                    WITH completed(job_id, run_lease) AS (
+                        SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                    ),
+                    inserted AS (
+                        INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
+                        SELECT claims.job_id, claims.run_lease, 'completed', clock_timestamp()
+                        FROM {schema}.lease_claims AS claims
+                        JOIN completed
+                          ON completed.job_id = claims.job_id
+                         AND completed.run_lease = claims.run_lease
+                        WHERE claims.materialized_at IS NULL
+                        ON CONFLICT (job_id, run_lease) DO NOTHING
+                        RETURNING job_id, run_lease
+                    )
+                    SELECT job_id, run_lease
+                    FROM inserted
+                    "#
+                ))
+                .bind(&receipt_job_ids)
+                .bind(&receipt_run_leases)
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
 
-            let finalized_at = Utc::now();
-            let mut done_rows = Vec::with_capacity(updated.len());
-            for (job_id, run_lease) in &updated {
-                if let Some(runtime_job) = claimed_map.get(&(*job_id, *run_lease)).cloned() {
-                    done_rows.push(runtime_job.into_done_row(finalized_at)?);
+                if !updated.is_empty() {
+                    let updated_job_ids: Vec<i64> =
+                        updated.iter().map(|(job_id, _)| *job_id).collect();
+                    let updated_run_leases: Vec<i64> =
+                        updated.iter().map(|(_, run_lease)| *run_lease).collect();
+
+                    sqlx::query(&format!(
+                        r#"
+                        WITH completed(job_id, run_lease) AS (
+                            SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                        )
+                        DELETE FROM {schema}.attempt_state AS attempt
+                        USING completed
+                        WHERE attempt.job_id = completed.job_id
+                          AND attempt.run_lease = completed.run_lease
+                        "#
+                    ))
+                    .bind(&updated_job_ids)
+                    .bind(&updated_run_leases)
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+
+                    let finalized_at = Utc::now();
+                    let mut done_rows = Vec::with_capacity(updated.len());
+                    for (job_id, run_lease) in &updated {
+                        if let Some(runtime_job) = claimed_map.get(&(*job_id, *run_lease)).cloned()
+                        {
+                            done_rows.push(runtime_job.into_done_row(finalized_at)?);
+                        }
+                    }
+
+                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                        .await?;
+                    updated_all.extend(updated);
                 }
             }
 
-            self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
-                .await?;
+            if !materialized_claimed.is_empty() {
+                let lease_slots: Vec<i32> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.claim.lease_slot)
+                    .collect();
+                let queues: Vec<String> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.claim.queue.clone())
+                    .collect();
+                let priorities: Vec<i16> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.claim.priority)
+                    .collect();
+                let lane_seqs: Vec<i64> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.claim.lane_seq)
+                    .collect();
+                let run_leases: Vec<i64> = materialized_claimed
+                    .iter()
+                    .map(|entry| entry.job.run_lease)
+                    .collect();
+
+                let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+                    r#"
+                    WITH completed(lease_slot, queue, priority, lane_seq, run_lease) AS (
+                        SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
+                    )
+                    DELETE FROM {schema}.leases AS leases
+                    USING completed
+                    WHERE leases.lease_slot = completed.lease_slot
+                      AND leases.queue = completed.queue
+                      AND leases.priority = completed.priority
+                      AND leases.lane_seq = completed.lane_seq
+                      AND leases.run_lease = completed.run_lease
+                    RETURNING
+                        leases.ready_slot,
+                        leases.ready_generation,
+                        leases.job_id,
+                        leases.queue,
+                        leases.state,
+                        leases.priority,
+                        leases.attempt,
+                        leases.run_lease,
+                        leases.max_attempts,
+                        leases.lane_seq,
+                        leases.heartbeat_at,
+                        leases.deadline_at,
+                        leases.attempted_at,
+                        leases.callback_id,
+                        leases.callback_timeout_at
+                    "#
+                ))
+                .bind(&lease_slots)
+                .bind(&queues)
+                .bind(&priorities)
+                .bind(&lane_seqs)
+                .bind(&run_leases)
+                .fetch_all(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                if !deleted.is_empty() {
+                    let deleted_job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
+                    let deleted_run_leases: Vec<i64> =
+                        deleted.iter().map(|row| row.run_lease).collect();
+
+                    sqlx::query(&format!(
+                        r#"
+                        WITH completed(job_id, run_lease) AS (
+                            SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                        )
+                        DELETE FROM {schema}.attempt_state AS attempt
+                        USING completed
+                        WHERE attempt.job_id = completed.job_id
+                          AND attempt.run_lease = completed.run_lease
+                        "#
+                    ))
+                    .bind(&deleted_job_ids)
+                    .bind(&deleted_run_leases)
+                    .execute(tx.as_mut())
+                    .await
+                    .map_err(map_sqlx_error)?;
+
+                    let finalized_at = Utc::now();
+                    let mut done_rows = Vec::with_capacity(deleted.len());
+                    for deleted_row in deleted {
+                        if let Some(runtime_job) = claimed_map
+                            .get(&(deleted_row.job_id, deleted_row.run_lease))
+                            .cloned()
+                        {
+                            done_rows.push(runtime_job.into_done_row(finalized_at)?);
+                            updated_all.push((deleted_row.job_id, deleted_row.run_lease));
+                        }
+                    }
+
+                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                        .await?;
+                }
+            }
+
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(updated);
+            return Ok(updated_all);
         }
 
         let lease_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.lease_slot).collect();
@@ -3651,6 +3800,7 @@ impl QueueStorage {
                         SELECT count(*)::bigint
                         FROM {schema}.lease_claims AS claims
                         WHERE claims.queue = $1
+                          AND claims.materialized_at IS NULL
                           AND NOT EXISTS (
                               SELECT 1
                               FROM {schema}.lease_claim_closures AS closures
@@ -4303,6 +4453,130 @@ impl QueueStorage {
         Ok(())
     }
 
+    async fn ensure_running_leases_from_receipts_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        jobs: &[(i64, i64)],
+    ) -> Result<usize, AwaError> {
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        let inserted: i64 = sqlx::query_scalar(&format!(
+            r#"
+            WITH inflight(job_id, run_lease) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            ),
+            lease_ring AS (
+                SELECT current_slot AS lease_slot, generation AS lease_generation
+                FROM {schema}.lease_ring_state
+                FOR SHARE
+            ),
+            claim_refs AS (
+                SELECT
+                    claims.job_id,
+                    claims.run_lease,
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.queue,
+                    claims.priority,
+                    claims.attempt,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.claimed_at
+                FROM {schema}.lease_claims AS claims
+                JOIN inflight
+                  ON inflight.job_id = claims.job_id
+                 AND inflight.run_lease = claims.run_lease
+                WHERE claims.materialized_at IS NULL
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
+                FOR UPDATE
+            ),
+            already_live AS (
+                SELECT claim_refs.job_id, claim_refs.run_lease
+                FROM claim_refs
+                WHERE EXISTS (
+                    SELECT 1
+                    FROM {schema}.leases AS lease
+                    WHERE lease.job_id = claim_refs.job_id
+                      AND lease.run_lease = claim_refs.run_lease
+                )
+            ),
+            inserted AS (
+                INSERT INTO {schema}.leases (
+                    lease_slot,
+                    lease_generation,
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    heartbeat_at,
+                    deadline_at,
+                    attempted_at
+                )
+                SELECT
+                    lease_ring.lease_slot,
+                    lease_ring.lease_generation,
+                    claim_refs.ready_slot,
+                    claim_refs.ready_generation,
+                    claim_refs.job_id,
+                    claim_refs.queue,
+                    'running'::awa.job_state,
+                    claim_refs.priority,
+                    claim_refs.attempt,
+                    claim_refs.run_lease,
+                    claim_refs.max_attempts,
+                    claim_refs.lane_seq,
+                    clock_timestamp(),
+                    NULL::timestamptz,
+                    claim_refs.claimed_at
+                FROM claim_refs
+                CROSS JOIN lease_ring
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {schema}.leases AS lease
+                    WHERE lease.job_id = claim_refs.job_id
+                      AND lease.run_lease = claim_refs.run_lease
+                )
+                RETURNING job_id, run_lease
+            ),
+            marked AS (
+                UPDATE {schema}.lease_claims AS claims
+                SET materialized_at = clock_timestamp()
+                FROM (
+                    SELECT job_id, run_lease FROM inserted
+                    UNION
+                    SELECT job_id, run_lease FROM already_live
+                ) AS moved
+                WHERE claims.job_id = moved.job_id
+                  AND claims.run_lease = moved.run_lease
+                RETURNING claims.job_id
+            )
+            SELECT count(*)::bigint FROM marked
+            "#
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(inserted as usize)
+    }
+
     async fn hydrate_deleted_leases_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4611,6 +4885,7 @@ impl QueueStorage {
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
             WHERE claims.job_id = $1
+              AND claims.materialized_at IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures
@@ -4722,6 +4997,10 @@ impl QueueStorage {
     ) -> Result<Uuid, AwaError> {
         let callback_id = Uuid::new_v4();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        if self.experimental_lease_claim_receipts() {
+            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
+                .await?;
+        }
         let updated = sqlx::query(&format!(
             r#"
             UPDATE {}
@@ -4843,6 +5122,10 @@ impl QueueStorage {
 
         let callback_id = Uuid::new_v4();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        if self.experimental_lease_claim_receipts() {
+            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
+                .await?;
+        }
         let updated = sqlx::query(&format!(
             r#"
             UPDATE {}
@@ -5529,6 +5812,11 @@ impl QueueStorage {
 
         let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        if self.experimental_lease_claim_receipts() {
+            self.ensure_running_leases_from_receipts_tx(&mut tx, jobs)
+                .await?;
+        }
         let result = sqlx::query(&format!(
             r#"
             WITH inflight AS (
@@ -5548,9 +5836,10 @@ impl QueueStorage {
         ))
         .bind(&job_ids)
         .bind(&run_leases)
-        .execute(pool)
+        .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(result.rows_affected() as usize)
     }
 
@@ -5568,6 +5857,15 @@ impl QueueStorage {
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
         let progress: Vec<serde_json::Value> =
             jobs.iter().map(|(_, _, value)| value.clone()).collect();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        if self.experimental_lease_claim_receipts() {
+            let refs: Vec<(i64, i64)> = jobs
+                .iter()
+                .map(|(job_id, run_lease, _)| (*job_id, *run_lease))
+                .collect();
+            self.ensure_running_leases_from_receipts_tx(&mut tx, &refs)
+                .await?;
+        }
         let updated: i64 = sqlx::query_scalar(&format!(
             r#"
             WITH inflight AS (
@@ -5598,9 +5896,10 @@ impl QueueStorage {
         .bind(&job_ids)
         .bind(&run_leases)
         .bind(&progress)
-        .fetch_one(pool)
+        .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(updated as usize)
     }
 

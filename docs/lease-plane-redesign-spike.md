@@ -307,8 +307,11 @@ jobs only**:
 
 - append-only `lease_claims`
 - append-only `lease_claim_closures`
-- no mutable `leases` row
-- no `attempt_state` row
+- no mutable `leases` row on the common short path
+- lazy materialization into `leases` on first heartbeat / progress /
+  callback registration
+- no `attempt_state` row unless the attempt actually needs mutable callback or
+  progress state
 - guarded so it only activates when queue `deadline_duration = 0`
 
 That spike is deliberately not the full redesign above. It exists to answer one
@@ -339,5 +342,6 @@ The trade-off in the current spike is latency:
 So the spike validates the direction:
 
 - append-only short-claim receipts dramatically reduce steady-state dead tuples
-- the remaining work is making that lease plane cheaper on the delivery path,
-  and then extending it safely to long-running / rescuable attempts
+- the next work is making the materialized long-running path cheaper on the
+  delivery path, and then extending the same model to full short-attempt
+  rescue semantics

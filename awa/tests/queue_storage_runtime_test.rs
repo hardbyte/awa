@@ -1339,6 +1339,116 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_materialize_heartbeat";
+    let schema = "awa_qs_runtime_lease_claim_materialize_heartbeat";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                experimental_lease_claim_receipts: true,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(BlockingCompleteWorker {
+            release: release.clone(),
+        })
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(250))
+        .deadline_rescue_interval(Duration::from_millis(250))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build heartbeat materialization client");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 4 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start heartbeat materialization client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+
+    let materialization_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if lease_count(&pool, &store).await == 1 {
+            break;
+        }
+        if Instant::now() > materialization_deadline {
+            panic!("timed out waiting for heartbeat to materialize receipt-backed lease");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+
+    release.notify_waiters();
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_snooze() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;

@@ -187,6 +187,7 @@ async fn count_by_state(
             SELECT 'running'::text AS state, count(*)::bigint AS count
             FROM {schema}.lease_claims AS claims
             WHERE queue = $1
+              AND claims.materialized_at IS NULL
               AND NOT EXISTS (
                   SELECT 1
                   FROM {schema}.lease_claim_closures AS closures

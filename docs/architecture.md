@@ -18,7 +18,7 @@ queue plane and rotating segments for lease churn.
                        ▼
  ┌─────────────────────────────────────────────────────────┐
  │                    Queue plane (append-only)            │
- │   ready_entries ──claim──► active_leases ──complete──►  │
+ │ ready_entries ──claim──► lease_claims / active_leases  │
  │                               │                         │
  │                               ├──retry──► deferred_jobs │
  │                               │              │          │
@@ -30,18 +30,23 @@ queue plane and rotating segments for lease churn.
            ┌───────────────┼───────────────┐
            ▼               ▼               ▼
      Execution plane   Control plane   Maintenance leader
-     active_leases     lane_state      promote / rescue /
-     attempt_state     enqueue_head    rotate / prune /
-     (optional)        claim_head      dlq retention
+     lease_claims      lane_state      promote / rescue /
+     active_leases     enqueue_head    rotate / prune /
+     attempt_state     claim_head      dlq retention
+     (optional)        *_segments
                        *_segments
                        *_cursor
 ```
 
 Each queue-plane family (`ready_entries`, `deferred_jobs`, `terminal_entries`,
 `dlq_entries`) rotates through segmented partitions so long-lived history does
-not sit in one mutable heap. `active_leases` is its own rotating family with a
-fast reclaim cycle. `attempt_state` is created lazily and only for jobs that
-need mutable per-attempt data (progress, callback state).
+not sit in one mutable heap. The current lease plane is hybrid:
+
+- zero-deadline short jobs can stay on append-only `lease_claims`
+- jobs that need heartbeat, progress, or callback semantics lazily
+  materialize into `active_leases`
+- `attempt_state` is created lazily and only for jobs that need mutable
+  per-attempt data (progress, callback state)
 
 ADR-019 is the source of truth for storage internals:
 
@@ -56,8 +61,8 @@ truth when this overview needs more detail.
 
 - queue plane: append-only `ready_entries`, `deferred_jobs`,
   `terminal_entries`, and `dlq_entries`
-- execution plane: narrow `active_leases` plus optional per-attempt
-  `attempt_state`
+- execution plane: append-only `lease_claims`, narrow `active_leases`, plus
+  optional per-attempt `attempt_state`
 - control plane: cold `lane_state`, hot `queue_enqueue_heads`,
   hot `queue_claim_heads`, plus ready/lease segment cursor tables
 - `lane_state` stays off the terminal-completion hot path: live completion
@@ -275,8 +280,9 @@ Dispatcher::run()
               lock lane state for queue + priority
               lock the lease segment cursor FOR SHARE
               read the next runnable entry from the current ready segment
-              INSERT an active lease in the current lease segment
-              hydrate the runtime job from the immutable ready entry + lease
+              either append a `lease_claims` receipt (short zero-deadline path)
+              or INSERT an active lease in the current lease segment
+              hydrate the runtime job from the immutable ready entry + claim snapshot
             │
             ├── Release excess permits (if DB returned fewer jobs)
             ├── Consume rate limit tokens
@@ -287,9 +293,12 @@ Dispatcher::run()
 Permits are pre-acquired before the DB claim to guarantee every `running` job
 has a reserved execution slot. The claim path is cursor-based rather than a
 scan over a mutable heap: `claim_seq` on each lane chooses the next lane-local
-ready entry, while the lease insert records the exact `(job_id, run_lease,
+ready entry, while the claim step records the exact `(job_id, run_lease,
 ready_slot, ready_generation, lease_slot, lease_generation)` snapshot used by
-completion and rescue.
+completion and rescue. Zero-deadline short jobs can stay on the append-only
+receipt path until they prove they need the richer runtime semantics; the
+first heartbeat, progress flush, or callback registration lazily materializes
+that receipt into `active_leases`.
 
 Dispatch still uses strict priority ordering by `(queue, priority, lane_seq)`.
 Cross-priority fairness is handled separately by the maintenance leader's

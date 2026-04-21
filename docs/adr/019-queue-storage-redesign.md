@@ -53,7 +53,11 @@ The implementation and migrations use these physical names:
 
 2. `active_leases`
 
-- Claim inserts a narrow lease row keyed by `(job_id, run_lease)`.
+- The common path still records every claim, but the implementation can now do
+  that in two stages:
+  - append-only `lease_claims` receipts for zero-deadline short jobs
+  - lazy materialization into `active_leases` when the attempt needs the
+    mutable execution path
 - Leases keep only dispatch and rescue-critical fields: ready reference,
   attempt identity, lane ordering, heartbeat/deadline state, and callback
   token/timeout.
@@ -128,7 +132,12 @@ The implementation and migrations use these physical names:
 - Claim: read `lane_state`, claim the next ready entries, insert
   `active_leases`, increment `run_lease`, and advance the lane cursor based on
   the rows actually selected.
-- Heartbeat / callback wait: update the active lease row only.
+- Short zero-deadline claim: append a `lease_claims` receipt instead of an
+  immediate `active_leases` row.
+- First heartbeat / progress / callback registration for a receipt-backed
+  attempt: lazily materialize the claim into `active_leases`.
+- Heartbeat / callback wait after materialization: update the active lease row
+  only.
 - Progress flush / callback expressions / callback result: create or update an
   `attempt_state` row only when needed.
 - Retry or snooze: delete the active lease row, merge any `attempt_state`,
@@ -155,6 +164,8 @@ Healthy operating signals for this design are:
 - `attempt_state` row count roughly tracks active long-running attempts, not
   total queue depth or total completions.
 - short jobs complete without creating an `attempt_state` row.
+- short zero-deadline jobs can also complete without ever creating a mutable
+  `active_leases` row.
 - prune and cleanup horizons for `attempt_state` are immediate or very short.
 
 ### Maintenance ownership
@@ -209,7 +220,10 @@ current comparison methodology and caveats.
 The current pressure frontier after the split-head change is the lease plane:
 `queue_lanes` is no longer the dominant MVCC hotspot, but the mutable
 `active_leases` family still absorbs steady insert/delete churn and heartbeat
-updates. The follow-up design work is tracked in
+updates. The current implementation now includes an experimental short-job
+receipt path (`lease_claims` plus lazy lease materialization) that
+substantially reduces dead tuples for zero-deadline short jobs, but the full
+lease-plane redesign is still follow-up work. That design work is tracked in
 [`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
 
 Spec-level safety is checked by the segmented-storage TLA+ family —
