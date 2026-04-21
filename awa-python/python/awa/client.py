@@ -207,6 +207,33 @@ class AsyncClient:
         """
         return await self._raw.flush_admin_metadata()
 
+    async def dump_job(self, job_id: int) -> str:
+        """Return a pretty JSON snapshot of a job and its lifecycle metadata.
+
+        Identical shape to ``awa job dump <id>`` in the Rust CLI.
+        """
+        return await self._raw.dump_job(job_id)
+
+    async def dump_run(self, job_id: int, attempt: int | None = None) -> str:
+        """Return a pretty JSON snapshot of a single attempt run.
+
+        Identical shape to ``awa job dump-run <id> [--attempt N]``.
+        """
+        return await self._raw.dump_run(job_id, attempt)
+
+    async def storage_status(self) -> str:
+        """Return a pretty JSON storage-transition status report."""
+        return await self._raw.storage_status()
+
+    async def list_cron_jobs(self) -> list[dict[str, Any]]:
+        """Return the registered cron/periodic schedules."""
+        import json
+        return json.loads(await self._raw.list_cron_jobs())
+
+    async def delete_cron_job(self, name: str) -> bool:
+        """Delete a cron schedule by name. Returns ``True`` if it existed."""
+        return await self._raw.delete_cron_job(name)
+
     async def queue_stats(self) -> list[QueueStat]:
         """Per-queue statistics."""
         return await self._raw.queue_stats()
@@ -778,6 +805,27 @@ class Client:
     def flush_admin_metadata(self) -> None:
         """Drain dirty keys and recompute cached admin counters."""
         return self._raw.flush_admin_metadata_sync()
+
+    def dump_job(self, job_id: int) -> str:
+        """Return a pretty JSON snapshot of a job and its lifecycle metadata."""
+        return self._raw.dump_job_sync(job_id)
+
+    def dump_run(self, job_id: int, attempt: int | None = None) -> str:
+        """Return a pretty JSON snapshot of a single attempt run."""
+        return self._raw.dump_run_sync(job_id, attempt)
+
+    def storage_status(self) -> str:
+        """Return a pretty JSON storage-transition status report."""
+        return self._raw.storage_status_sync()
+
+    def list_cron_jobs(self) -> list[dict[str, Any]]:
+        """Return the registered cron/periodic schedules."""
+        import json
+        return json.loads(self._raw.list_cron_jobs_sync())
+
+    def delete_cron_job(self, name: str) -> bool:
+        """Delete a cron schedule by name. Returns ``True`` if it existed."""
+        return self._raw.delete_cron_job_sync(name)
 
     def queue_stats(self) -> list[QueueStat]:
         """Per-queue statistics."""
