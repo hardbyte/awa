@@ -28,9 +28,7 @@ fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     Ok(Duration::from_secs_f64(timeout_seconds))
 }
 
-fn parse_transition_worker_role(
-    value: Option<&str>,
-) -> PyResult<awa_worker::TransitionWorkerRole> {
+fn parse_transition_worker_role(value: Option<&str>) -> PyResult<awa_worker::TransitionWorkerRole> {
     match value.unwrap_or("auto") {
         "auto" => Ok(awa_worker::TransitionWorkerRole::Auto),
         "canonical_drain" => Ok(awa_worker::TransitionWorkerRole::CanonicalDrain),
@@ -346,9 +344,9 @@ fn begin_queue_storage_install(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<
             *guard = RuntimeLifecycle::InstallingQueueStorage;
             Ok(())
         }
-        RuntimeLifecycle::InstallingQueueStorage => {
-            Err(state_error("queue storage installation is already in progress"))
-        }
+        RuntimeLifecycle::InstallingQueueStorage => Err(state_error(
+            "queue storage installation is already in progress",
+        )),
         RuntimeLifecycle::Running => Err(state_error(
             "cannot install queue storage while the worker runtime is running",
         )),
@@ -922,6 +920,158 @@ impl PyClient {
         })
     }
 
+    // ── Admin introspection: dumps, cron catalog, storage status ────────
+    //
+    // These return JSON strings (matching the Rust CLI's admin commands) so
+    // the Python CLI can print them verbatim and callers that want structured
+    // data can json.loads them. Keeping the shape as JSON avoids a churn of
+    // PyO3 struct mappings whenever an admin field is added.
+
+    fn dump_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let dump = awa_model::admin::dump_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string_pretty(&dump).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("dump serialization failed: {e}"))
+            })
+        })
+    }
+
+    fn dump_job_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let dump = awa_model::admin::dump_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string_pretty(&dump).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "dump serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    #[pyo3(signature = (job_id, attempt=None))]
+    fn dump_run<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: i64,
+        attempt: Option<i16>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let dump = awa_model::admin::dump_run(&pool, job_id, attempt)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string_pretty(&dump).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "run dump serialization failed: {e}"
+                ))
+            })
+        })
+    }
+
+    #[pyo3(signature = (job_id, attempt=None))]
+    fn dump_run_sync(&self, py: Python<'_>, job_id: i64, attempt: Option<i16>) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let dump = awa_model::admin::dump_run(&pool, job_id, attempt)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string_pretty(&dump).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "run dump serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    fn storage_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = awa_model::storage::status_report(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string_pretty(&report).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "storage status serialization failed: {e}"
+                ))
+            })
+        })
+    }
+
+    fn storage_status_sync(&self, py: Python<'_>) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let report = awa_model::storage::status_report(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string_pretty(&report).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "storage status serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    fn list_cron_jobs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = awa_model::cron::list_cron_jobs(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string(&rows).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "cron list serialization failed: {e}"
+                ))
+            })
+        })
+    }
+
+    fn list_cron_jobs_sync(&self, py: Python<'_>) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let rows = awa_model::cron::list_cron_jobs(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "cron list serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    fn delete_cron_job<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            awa_model::cron::delete_cron_job(&pool, &name)
+                .await
+                .map_err(map_awa_error)
+        })
+    }
+
+    fn delete_cron_job_sync(&self, py: Python<'_>, name: String) -> PyResult<bool> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::cron::delete_cron_job(&pool, &name)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
     fn queue_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -1236,8 +1386,7 @@ impl PyClient {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let queue_attr = queue.clone();
-            let filter =
-                crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
+            let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
             let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
                 .await
                 .map_err(map_awa_error)?;
@@ -1413,7 +1562,8 @@ impl PyClient {
 
         builder = builder.queue_storage(
             QueueStorageConfig {
-                schema: queue_storage_schema.unwrap_or_else(|| QueueStorageConfig::default().schema),
+                schema: queue_storage_schema
+                    .unwrap_or_else(|| QueueStorageConfig::default().schema),
                 queue_slot_count: queue_storage_queue_slot_count as usize,
                 lease_slot_count: queue_storage_lease_slot_count as usize,
             },
