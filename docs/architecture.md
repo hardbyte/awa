@@ -31,8 +31,10 @@ queue plane and rotating segments for lease churn.
            ▼               ▼               ▼
      Execution plane   Control plane   Maintenance leader
      active_leases     lane_state      promote / rescue /
-     attempt_state     *_segments      rotate / prune /
-     (optional)        *_cursor        dlq retention
+     attempt_state     enqueue_head    rotate / prune /
+     (optional)        claim_head      dlq retention
+                       *_segments
+                       *_cursor
 ```
 
 Each queue-plane family (`ready_entries`, `deferred_jobs`, `terminal_entries`,
@@ -56,10 +58,13 @@ truth when this overview needs more detail.
   `terminal_entries`, and `dlq_entries`
 - execution plane: narrow `active_leases` plus optional per-attempt
   `attempt_state`
-- control plane: `lane_state` plus ready/lease segment cursor tables
+- control plane: cold `lane_state`, hot `queue_enqueue_heads`,
+  hot `queue_claim_heads`, plus ready/lease segment cursor tables
 - `lane_state` stays off the terminal-completion hot path: live completion
   totals come from `terminal_entries`, and the cached cold rollup used to keep
   counts stable across prune lives outside `lane_state`
+- live availability is derived from `ready_entries` and `queue_claim_heads`,
+  not from a cached `available_count` field on `lane_state`
 - maintenance leader: promotion, rescue, rotation, prune, DLQ retention, and
   queue-health publication
 
