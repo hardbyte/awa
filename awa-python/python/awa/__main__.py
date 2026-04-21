@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import datetime as dt
 import sys
 
 import awa
@@ -28,6 +29,21 @@ def _require_db(args: argparse.Namespace) -> str:
         print("--database-url is required.", file=sys.stderr)
         sys.exit(1)
     return args.database_url
+
+
+def _iso_datetime(raw: str) -> dt.datetime:
+    """argparse type= parser for ISO-8601 datetime arguments.
+
+    Accepts the same format ``datetime.isoformat()`` emits (which is what
+    this CLI's own "Next page" hint produces), so pagination round-trips
+    through --before-dlq-at without extra formatting.
+    """
+    try:
+        return dt.datetime.fromisoformat(raw)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            f"invalid ISO-8601 datetime {raw!r}: {exc}"
+        ) from exc
 
 
 def main() -> None:
@@ -82,7 +98,7 @@ def main() -> None:
     p_dlq_list.add_argument("--queue")
     p_dlq_list.add_argument("--tag")
     p_dlq_list.add_argument("--before-id", type=int, default=None)
-    p_dlq_list.add_argument("--before-dlq-at")
+    p_dlq_list.add_argument("--before-dlq-at", type=_iso_datetime, default=None)
     p_dlq_list.add_argument("--limit", type=int, default=50)
     p_dlq_depth = sd.add_parser("depth", help="Show DLQ depth")
     p_dlq_depth.add_argument("--queue")
@@ -124,6 +140,22 @@ def main() -> None:
     if not args.command:
         parser.print_help()
         sys.exit(1)
+
+    # Validate mutually-required flags up front, before we spin up a DB
+    # client. Doing this inside the async dispatch would mean a bad flag
+    # still tries to connect and then times out — unfriendly for scripts.
+    if args.command == "job" and args.job_cmd == "retry-failed":
+        if not args.kind and not args.queue:
+            print("Must specify --kind or --queue", file=sys.stderr)
+            sys.exit(1)
+    if args.command == "dlq" and args.dlq_cmd in {"retry-all", "purge"}:
+        has_filter = args.kind or args.queue or args.tag
+        if not has_filter and not args.all:
+            print(
+                f"dlq {args.dlq_cmd}: pass --kind/--queue/--tag to scope, or --all to confirm a fleet-wide operation.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     asyncio.run(_dispatch(args))
 
@@ -217,9 +249,6 @@ async def _dispatch_job(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         await client.cancel(args.id)
         print(f"Cancelled job {args.id}")
     elif jc == "retry-failed":
-        if not args.kind and not args.queue:
-            print("Must specify --kind or --queue", file=sys.stderr)
-            sys.exit(1)
         jobs = await client.retry_failed(kind=args.kind, queue=args.queue)
         print(f"Retried {len(jobs)} failed jobs")
     elif jc == "discard":
@@ -298,10 +327,13 @@ async def _dispatch_dlq(client: "awa.AsyncClient", args: argparse.Namespace) -> 
         print(f"{'ID':<8} {'KIND':<25} {'QUEUE':<10} {'REASON':<30} {'DLQ_AT':<25}")
         for row in rows:
             reason = row.reason if len(row.reason) <= 30 else row.reason[:27] + "..."
-            print(f"{row.id:<8} {str(row.kind):<25} {str(row.queue):<10} {reason:<30} {str(row.dlq_at):<25}")
+            print(
+                f"{row.job.id:<8} {str(row.job.kind):<25} {str(row.job.queue):<10} "
+                f"{reason:<30} {str(row.dlq_at):<25}"
+            )
         print(f"\n{len(rows)} rows.")
         last = rows[-1]
-        print(f"Next page: --before-id {last.id} --before-dlq-at {last.dlq_at}")
+        print(f"Next page: --before-id {last.job.id} --before-dlq-at {last.dlq_at.isoformat()}")
     elif dc == "depth":
         if args.queue:
             depth = await client.dlq_depth(queue=args.queue)
