@@ -22,6 +22,7 @@ results directory.
 
 from __future__ import annotations
 
+import json
 import re
 import subprocess
 from pathlib import Path
@@ -86,6 +87,8 @@ def _pgque_submodule_revision() -> dict[str, Any]:
 _PROCRASTINATE_RE = re.compile(r'"procrastinate==([^"]+)"')
 _RIVER_RE = re.compile(r"github\.com/riverqueue/river\s+v(\S+)")
 _OBAN_RE = re.compile(r":oban,\s*\"~>\s*(\S+?)\"")
+_PGMQ_IMAGE_RE = re.compile(r'^PGMQ_PG_IMAGE = "([^"]+)"$', re.MULTILINE)
+_PGMQ_VERSION_RE = re.compile(r'^PGMQ_UPSTREAM_VERSION = "([^"]+)"$', re.MULTILINE)
 
 
 def _read(path: Path) -> str:
@@ -125,11 +128,40 @@ def _oban_revision() -> dict[str, Any]:
     }
 
 
+def _pgboss_revision() -> dict[str, Any]:
+    path = SCRIPT_DIR / "pgboss-bench" / "package.json"
+    try:
+        data = json.loads(path.read_text())
+    except OSError:
+        data = {}
+    except Exception:
+        data = {}
+    return {
+        "source": "pgboss-bench/package.json",
+        "library": "pg-boss",
+        "pinned_version": ((data.get("dependencies") or {}).get("pg-boss")),
+    }
+
+
+def _pgmq_revision() -> dict[str, Any]:
+    text = _read(SCRIPT_DIR / "pgmq-bench" / "main.py")
+    image = _PGMQ_IMAGE_RE.search(text)
+    version = _PGMQ_VERSION_RE.search(text)
+    return {
+        "source": "pgmq-bench/main.py",
+        "library": "pgmq extension",
+        "pg_image": image.group(1) if image else None,
+        "pinned_version": version.group(1) if version else None,
+    }
+
+
 _CAPTURE: dict[str, Any] = {
     "awa": _awa_repo_revision,
     "awa-docker": _awa_repo_revision,
     "awa-python": _awa_repo_revision,
     "pgque": _pgque_submodule_revision,
+    "pgmq": _pgmq_revision,
+    "pgboss": _pgboss_revision,
     "procrastinate": _procrastinate_revision,
     "river": _river_revision,
     "oban": _oban_revision,

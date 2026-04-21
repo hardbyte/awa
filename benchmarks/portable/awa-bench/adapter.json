@@ -4,14 +4,15 @@
   "display_name": "Awa (Rust, native)",
   "db_name": "awa_bench",
   "event_tables": [
-    "awa.jobs_hot",
-    "awa.scheduled_jobs",
-    "awa.jobs_dlq",
-    "awa.job_unique_claims"
+    "awa_exp.queue_ring_state",
+    "awa_exp.queue_ring_slots",
+    "awa_exp.lease_ring_state",
+    "awa_exp.lease_ring_slots",
+    "awa_exp.queue_lanes",
+    "awa_exp.attempt_state",
+    "awa_exp.deferred_jobs",
+    "awa_exp.dlq_entries"
   ],
-  "event_indexes": [
-    "awa.idx_awa_jobs_hot_dequeue",
-    "awa.idx_awa_jobs_hot_heartbeat"
-  ],
+  "event_indexes": [],
   "extensions": []
 }

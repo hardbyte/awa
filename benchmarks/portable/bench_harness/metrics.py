@@ -1,6 +1,6 @@
 """Metrics daemon.
 
-Polls Postgres every `SAMPLE_EVERY_S` (default 10s) for per-system dead-tuple,
+Polls Postgres every `SAMPLE_EVERY_S` (default 5s) for per-system dead-tuple,
 index, autovacuum, and cluster-wide MVCC state. Runs in a background thread
 and pushes Sample records into a queue; the orchestrator is the consumer.
 

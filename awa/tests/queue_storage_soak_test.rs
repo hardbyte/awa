@@ -163,9 +163,13 @@ async fn prepare_transition_store(
         .reset(pool)
         .await
         .expect("Failed to reset queue_storage schema for transition soak");
-    storage::prepare(pool, "queue_storage", serde_json::json!({ "schema": schema }))
-        .await
-        .expect("Failed to prepare queue_storage transition");
+    storage::prepare(
+        pool,
+        "queue_storage",
+        serde_json::json!({ "schema": schema }),
+    )
+    .await
+    .expect("Failed to prepare queue_storage transition");
     store
 }
 
@@ -493,6 +497,7 @@ fn build_client(
         .expect("Failed to build queue_storage soak client")
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_transition_client(
     pool: &sqlx::PgPool,
     queue: &str,
@@ -849,8 +854,14 @@ async fn test_queue_storage_transition_soak_finalize_path() {
     let pool = setup_pool(20).await;
     ensure_pgstattuple(&pool).await;
 
-    let queue = format!("qs_transition_{}", &Uuid::new_v4().simple().to_string()[..8]);
-    let schema = format!("awa_qs_transition_{}", &Uuid::new_v4().simple().to_string()[..8]);
+    let queue = format!(
+        "qs_transition_{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
+    let schema = format!(
+        "awa_qs_transition_{}",
+        &Uuid::new_v4().simple().to_string()[..8]
+    );
     let queue_slot_count = env_usize("AWA_QS_TRANSITION_QUEUE_SLOTS", 16);
     let lease_slot_count = env_usize("AWA_QS_TRANSITION_LEASE_SLOTS", 4);
     let max_workers = env_u32("AWA_QS_TRANSITION_MAX_WORKERS", 16);
@@ -1105,7 +1116,10 @@ async fn test_queue_storage_transition_soak_finalize_path() {
         exact.attempt_state,
     );
 
-    assert!(transition_entered, "transition soak never entered mixed_transition");
+    assert!(
+        transition_entered,
+        "transition soak never entered mixed_transition"
+    );
     assert!(finalized, "transition soak never finalized");
     assert_eq!(final_report.status.state, "active");
     assert_eq!(final_report.status.current_engine, "queue_storage");
@@ -1294,10 +1308,8 @@ async fn test_queue_storage_transition_survives_target_restart() {
         .await
         .expect("Failed to finalize transition restart soak");
 
-    let drain_timeout = Duration::from_secs(env_u64(
-        "AWA_QS_TRANSITION_RESTART_DRAIN_TIMEOUT_SECS",
-        120,
-    ));
+    let drain_timeout =
+        Duration::from_secs(env_u64("AWA_QS_TRANSITION_RESTART_DRAIN_TIMEOUT_SECS", 120));
     let drain_started = Instant::now();
     loop {
         let done = queue_storage_done_count(&pool, &store, &queue).await;

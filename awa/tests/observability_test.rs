@@ -40,10 +40,30 @@ async fn pool() -> sqlx::PgPool {
 async fn setup() -> sqlx::PgPool {
     let pool = pool().await;
     migrations::run(&pool).await.expect("Failed to migrate");
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to reset storage transition state");
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
         .execute(&pool)
         .await
         .expect("Failed to clear queue storage backend");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear runtime snapshots");
     sqlx::query("DROP SCHEMA IF EXISTS awa_exp CASCADE")
         .execute(&pool)
         .await

@@ -1502,7 +1502,79 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
         "unexpected prune outcome after completion: {prune_after_completion:?}"
     );
 
+    let counts_after_prune = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to sample queue counts after pruning completed slot");
+    assert_eq!(counts_after_prune.available, 0);
+    assert_eq!(counts_after_prune.running, 0);
+    assert_eq!(counts_after_prune.completed, 1);
+
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills_them() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_legacy_pruned_rollup";
+    let schema = "awa_qs_legacy_pruned_rollup";
+    let store = create_store(&pool, schema).await;
+
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.queue_lanes (
+            queue,
+            priority,
+            next_seq,
+            claim_seq,
+            available_count,
+            pruned_completed_count
+        )
+        VALUES ($1, 1, 1, 1, 0, 7)
+        ON CONFLICT (queue, priority) DO UPDATE
+        SET pruned_completed_count = EXCLUDED.pruned_completed_count
+        "#
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to seed legacy lane rollup");
+
+    let counts_before_backfill = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to read queue counts before backfill");
+    assert_eq!(counts_before_backfill.completed, 7);
+
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("Failed to rerun queue storage schema preparation");
+
+    let legacy_lane_rollup: i64 = sqlx::query_scalar(&format!(
+        "SELECT pruned_completed_count FROM {schema}.queue_lanes WHERE queue = $1 AND priority = 1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read legacy lane rollup after backfill");
+    assert_eq!(legacy_lane_rollup, 0);
+
+    let cold_rollup: i64 = sqlx::query_scalar(&format!(
+        "SELECT pruned_completed_count FROM {schema}.queue_terminal_rollups WHERE queue = $1 AND priority = 1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read cold terminal rollup after backfill");
+    assert_eq!(cold_rollup, 7);
+
+    let counts_after_backfill = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to read queue counts after backfill");
+    assert_eq!(counts_after_backfill.completed, 7);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

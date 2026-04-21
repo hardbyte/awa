@@ -10,8 +10,8 @@
 //! - Units declared via `.with_unit()` using UCUM notation
 //! - No unit suffix in metric names (exporters append automatically)
 
-use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use awa_model::storage::StorageStatus;
+use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use std::time::Duration;
 
 /// Awa worker metrics backed by OpenTelemetry.
@@ -262,7 +262,9 @@ impl AwaMetrics {
                 .build(),
             storage_state: meter
                 .i64_gauge("awa.storage.state")
-                .with_description("Current storage transition state and engine combination (always 1)")
+                .with_description(
+                    "Current storage transition state and engine combination (always 1)",
+                )
                 .with_unit("{state}")
                 .build(),
         }
@@ -581,10 +583,7 @@ impl AwaMetrics {
                 "awa.storage.current_engine",
                 status.current_engine.clone(),
             ),
-            opentelemetry::KeyValue::new(
-                "awa.storage.active_engine",
-                status.active_engine.clone(),
-            ),
+            opentelemetry::KeyValue::new("awa.storage.active_engine", status.active_engine.clone()),
         ];
         if let Some(prepared_engine) = &status.prepared_engine {
             attrs.push(opentelemetry::KeyValue::new(

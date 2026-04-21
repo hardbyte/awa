@@ -106,6 +106,33 @@ PLOT_SPECS: dict[str, PlotSpec] = {
         subject_kind="adapter",
         sum_by_subject=False,
     ),
+    "producer_p99_ms": PlotSpec(
+        title="Producer p99 latency",
+        filename_stem="producer_p99",
+        y_label="producer p99 latency (ms)",
+        log_scale=True,
+        use_raw_underlay=True,
+        subject_kind="adapter",
+        sum_by_subject=False,
+    ),
+    "subscriber_p99_ms": PlotSpec(
+        title="Subscriber p99 latency",
+        filename_stem="subscriber_p99",
+        y_label="subscriber p99 latency (ms)",
+        log_scale=True,
+        use_raw_underlay=True,
+        subject_kind="adapter",
+        sum_by_subject=False,
+    ),
+    "end_to_end_p99_ms": PlotSpec(
+        title="End-to-end p99 latency",
+        filename_stem="end_to_end_p99",
+        y_label="end-to-end p99 latency (ms)",
+        log_scale=True,
+        use_raw_underlay=True,
+        subject_kind="adapter",
+        sum_by_subject=False,
+    ),
     "completion_rate": PlotSpec(
         title="Completion throughput",
         filename_stem="throughput",
@@ -407,7 +434,7 @@ def render_faceted_dead_tuples(
     cols = min(3, len(systems))
     rowsn = (len(systems) + cols - 1) // cols
     fig, axes = plt.subplots(
-        rowsn, cols, figsize=(5 * cols, 3.5 * rowsn), sharex=True, squeeze=False
+        rowsn, cols, figsize=(6.5 * cols, 4.5 * rowsn), sharex=True, squeeze=False
     )
     meta = system_meta or {}
     for idx, system in enumerate(systems):
@@ -422,18 +449,15 @@ def render_faceted_dead_tuples(
             y_label="n_dead_tup",
             log_scale=False,
         )
-        # One line per subject (table) for this system.
-        subjects = sorted(
-            {
-                r["subject"]
-                for r in rows
-                if r["system"] == system
-                and r["metric"] == "n_dead_tup"
-                and r["subject_kind"] == "table"
-            }
-        )
-        for j, subj in enumerate(subjects):
-            color = _PALETTE[j % len(_PALETTE)]
+        subject_series: list[tuple[str, list[tuple[float, float]], float]] = []
+        subjects = {
+            r["subject"]
+            for r in rows
+            if r["system"] == system
+            and r["metric"] == "n_dead_tup"
+            and r["subject_kind"] == "table"
+        }
+        for subj in sorted(subjects):
             items = []
             for r in rows:
                 if (
@@ -446,20 +470,49 @@ def render_faceted_dead_tuples(
                     except (TypeError, ValueError):
                         continue
             items.sort()
-            if not items:
-                continue
+            if items:
+                subject_series.append((subj, items, max(v for _, v in items)))
+
+        if any(peak > 0 for _, _, peak in subject_series):
+            ax.set_yscale("symlog", linthresh=1.0)
+
+        subject_series.sort(key=lambda item: item[2], reverse=True)
+        label_limit = 5
+        for j, (subj, items, _peak) in enumerate(subject_series):
+            color = _PALETTE[j % len(_PALETTE)]
             xs = np.array([t for t, _ in items])
             ys = np.array([v for _, v in items])
             px, py = lttb(xs, ys, lttb_target)
-            ax.plot(px, py, color=color, linewidth=1.3, label=subj)
-            _label_end(ax, px[-1], py[-1], subj.split(".")[-1], color)
+            emphasize = j < label_limit
+            ax.plot(
+                px,
+                py,
+                color=color,
+                linewidth=1.6 if emphasize else 1.0,
+                alpha=0.95 if emphasize else 0.35,
+                label=subj,
+            )
+            if emphasize:
+                _label_end(ax, px[-1], py[-1], subj.split(".")[-1], color)
+
+        if len(subject_series) > label_limit:
+            ax.text(
+                0.99,
+                0.02,
+                f"labels show top {label_limit} tables by peak",
+                transform=ax.transAxes,
+                ha="right",
+                va="bottom",
+                fontsize=8,
+                color="#666",
+            )
 
     # Blank out any extra subplot cells.
     for idx in range(len(systems), rowsn * cols):
         axes[idx // cols][idx % cols].axis("off")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0, 1, 0.98])
     fig.savefig(out_dir / "dead_tuples_faceted.png", dpi=300)
     fig.savefig(out_dir / "dead_tuples_faceted.svg")
     plt.close(fig)

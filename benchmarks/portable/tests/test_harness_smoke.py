@@ -21,6 +21,7 @@ from bench_harness.phases import (
     resolve_scenario,
 )
 from bench_harness.plots import PLOT_SPECS, lttb, render_all
+from bench_harness.report import write_interactive_report
 from bench_harness.sample import RAW_CSV_HEADER
 from bench_harness.writers import compute_summary, write_run_readme
 
@@ -141,6 +142,40 @@ def test_plot_renderer_produces_all_files(tmp_path: Path):
     assert (out / "dead_tuples_faceted.png").exists()
 
 
+def test_interactive_report_written(tmp_path: Path):
+    phases = [
+        parse_phase_spec("warmup=warmup:60s"),
+        parse_phase_spec("clean_1=clean:90s"),
+        parse_phase_spec("idle_1=idle-in-tx:90s"),
+        parse_phase_spec("recovery_1=recovery:90s"),
+    ]
+    out = tmp_path / "run"
+    plots = out / "plots"
+    plots.mkdir(parents=True)
+    render_all(FIXTURE_CSV, systems=["awa", "river"], phases=phases, out_dir=plots)
+    summary = compute_summary(
+        FIXTURE_CSV, run_id="fixture-run", scenario="idle_in_tx_saturation", phases=phases
+    )
+    manifest = {
+        "run_id": "fixture-run",
+        "scenario": "idle_in_tx_saturation",
+        "pg_image": "postgres:17.2-alpine",
+        "cli": ["long_horizon.py", "--scenario", "idle_in_tx_saturation"],
+    }
+    report = write_interactive_report(
+        run_dir=out,
+        raw_csv=FIXTURE_CSV,
+        summary=summary,
+        manifest=manifest,
+        phases=phases,
+        systems=["awa", "river"],
+    )
+    body = report.read_text()
+    assert "Timeline Explorer" in body
+    assert "phase-summary-table" in body
+    assert "plots/throughput.svg" in body
+
+
 def test_run_readme_written(tmp_path: Path):
     phases = [parse_phase_spec("warmup=warmup:10s")]
     write_run_readme(tmp_path / "README.md", scenario="custom", phases=phases)
@@ -256,7 +291,7 @@ def test_versions_known_systems_return_dicts():
     # Every registered adapter must get *some* dict back — the harness is
     # the authoritative source on what was compared, so silently returning
     # nothing would be a reporting regression.
-    for system in ("awa", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque"):
+    for system in ("awa", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque", "pgmq", "pgboss"):
         rev = capture_adapter_revision(system)
         assert isinstance(rev, dict)
         assert "source" in rev
@@ -280,6 +315,8 @@ def test_versions_upstream_pins_resolve():
     assert capture_adapter_revision("procrastinate").get("pinned_version")
     assert capture_adapter_revision("river").get("pinned_version")
     assert capture_adapter_revision("oban").get("pinned_version_constraint")
+    assert capture_adapter_revision("pgmq").get("pinned_version")
+    assert capture_adapter_revision("pgboss").get("pinned_version")
 
 
 def test_readme_includes_versions_table(tmp_path: Path):
@@ -316,6 +353,21 @@ def test_readme_includes_versions_table(tmp_path: Path):
                 "pgque_submodule_describe": "alpha3-5-g3b75f58",
             },
         },
+        "pgboss": {
+            "revision": {
+                "source": "pgboss-bench/package.json",
+                "library": "pg-boss",
+                "pinned_version": "12.15.0",
+            },
+        },
+        "pgmq": {
+            "revision": {
+                "source": "pgmq-bench/main.py",
+                "library": "pgmq extension",
+                "pg_image": "ghcr.io/pgmq/pg18-pgmq:v1.10.0",
+                "pinned_version": "v1.10.0",
+            },
+        },
     }
     out = tmp_path / "README.md"
     write_run_readme(out, scenario="custom", phases=phases, adapters=adapters)
@@ -324,6 +376,8 @@ def test_readme_includes_versions_table(tmp_path: Path):
     assert "abc1234" in body  # awa SHA
     assert "procrastinate" in body and "3.7.3" in body  # pinned upstream
     assert "3b75f58" in body  # pgque submodule short SHA
+    assert "pgmq extension" in body and "v1.10.0" in body
+    assert "pg-boss" in body and "12.15.0" in body
 
 
 def test_readme_omits_section_when_no_adapters(tmp_path: Path):
@@ -692,6 +746,26 @@ def test_crash_recovery_scenario_resolves():
     assert kill_phase.int_param("instance", 0) == start_phase.int_param(
         "instance", 0
     )
+
+
+def test_event_delivery_matrix_scenario_resolves_expected_shape():
+    phases = resolve_scenario("event_delivery_matrix", None)
+    assert [p.type for p in phases] == [
+        PhaseType.WARMUP,
+        PhaseType.CLEAN,
+        PhaseType.ACTIVE_READERS,
+        PhaseType.HIGH_LOAD,
+        PhaseType.CLEAN,
+    ]
+
+
+def test_fleet_steady_state_scenario_resolves_expected_shape():
+    phases = resolve_scenario("fleet_steady_state", None)
+    assert [p.type for p in phases] == [
+        PhaseType.WARMUP,
+        PhaseType.CLEAN,
+        PhaseType.ACTIVE_READERS,
+    ]
 
 
 def test_kill_worker_hook_calls_pool_kill():

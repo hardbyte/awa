@@ -1,0 +1,10 @@
+{
+  "system": "pgboss",
+  "display_name": "pg-boss (Node)",
+  "db_name": "pgboss_bench",
+  "event_tables": [
+    "pgboss.queue"
+  ],
+  "event_indexes": [],
+  "extensions": []
+}

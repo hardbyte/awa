@@ -1,8 +1,9 @@
 # Portable Cross-System Benchmarks
 
 Comparable benchmark scenarios for Awa (native Rust and Docker), Awa-Python,
-Procrastinate (Python), River (Go), Oban (Elixir), and PgQue (SQL/PL-pgSQL)
-running against a shared Postgres instance.
+Procrastinate (Python), River (Go), Oban (Elixir), PgQue (SQL/PL-pgSQL; the
+adapter is a thin Python driver around the native database API),
+PGMQ, and pg-boss (Node.js) running against a shared Postgres instance.
 
 ## Prerequisites
 
@@ -68,7 +69,7 @@ benchmarks/portable/
 ├── run.py                 # Orchestrator — builds, runs, collects results
 ├── isolated.py            # Repeats one-system-per-run isolated benchmarks
 ├── docker-compose.yml     # Shared Postgres service (PG17 by default, PG18 via --pg-image)
-├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench
+├── init-databases.sql     # Creates awa_bench, awa_docker_bench, awa_python_bench, procrastinate_bench, river_bench, oban_bench, pgque_bench, pgmq_bench, pgboss_bench
 ├── awa-bench/             # Rust binary (built locally or in Docker from workspace)
 │   ├── Cargo.toml
 │   ├── Dockerfile
@@ -96,6 +97,16 @@ benchmarks/portable/
 │   ├── main.py
 │   ├── pyproject.toml
 │   └── vendor/pgque/      # Git submodule pinned to upstream NikolayS/pgque
+├── pgmq-bench/            # PGMQ adapter (Docker, Python driver)
+│   ├── Dockerfile
+│   ├── adapter.json
+│   ├── main.py
+│   └── pyproject.toml
+├── pgboss-bench/          # pg-boss adapter (Docker, Node.js)
+│   ├── Dockerfile
+│   ├── adapter.json
+│   ├── main.js
+│   └── package.json
 └── results/               # JSON output from benchmark runs
 ```
 
@@ -163,6 +174,12 @@ short-horizon suite above cannot see.
 # Named scenario (idle_in_tx_saturation ≈ 2h40m; long_horizon ≈ 6h10m):
 uv run python benchmarks/portable/long_horizon.py --scenario idle_in_tx_saturation
 
+# Event/message delivery comparison profile:
+uv run python benchmarks/portable/long_horizon.py \
+    --scenario event_delivery_matrix \
+    --systems awa,pgque,pgboss,pgmq \
+    --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0
+
 # Custom phases (label=type:duration):
 uv run python benchmarks/portable/long_horizon.py \
     --phase warmup=warmup:10m \
@@ -178,17 +195,43 @@ uv run python benchmarks/portable/long_horizon.py \
 
 Phase types: `warmup`, `clean`, `idle-in-tx`, `recovery`, `active-readers`,
 `high-load`. `warmup` samples are kept in `raw.csv` but excluded from
-`summary.json`. New phase types plug in via `bench_harness.phases` +
-`bench_harness.hooks`.
+`summary.json` and hidden by default in the interactive report. New phase
+types plug in via `bench_harness.phases` + `bench_harness.hooks`.
+
+### Recommended comparison scenarios
+
+- `event_delivery_matrix`
+  - Balanced event/message-queue comparison.
+  - Sequence: steady-state, active subscriber/read pressure, bursty offered
+    load, then clean tail.
+  - Best default when comparing throughput, subscriber latency, end-to-end
+    latency, and dead tuples together.
+
+- `event_delivery_burst`
+  - Backlog-growth and catch-up profile.
+  - Best when you want to see queue depth, end-to-end delivery inflation, and
+    recovery behaviour after sustained oversupply.
+
+- `fleet_steady_state`
+  - Multi-replica steady-state profile.
+  - Intended for `--replicas >= 2` so systems are compared under real replica
+    contention instead of only single-worker-process pressure.
+
+The shipped scenario lengths are meant to be tractable on a developer machine.
+For deeper pressure studies, extend them with explicit `--phase` overrides
+rather than treating the defaults as "long enough" by definition.
 
 ### Outputs
 
 Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
+- `index.html` — self-contained interactive report with a two-metric timeline
+  explorer and sample-quality / outlier panel
 - `raw.csv` — tidy long-form, one row per (system, subject, metric, sample)
 - `summary.json` — per-system per-phase aggregates + recovery metrics
 - `manifest.json` — PG version, config, host info, adapter versions, CLI args
 - `plots/` — `dead_tuples`, `dead_tuples_faceted`, `claim_p99`, `throughput`,
-  `table_size`, `queue_depth` (PNG 300 DPI + SVG)
+  `producer_p99`, `subscriber_p99`, `end_to_end_p99`, `table_size`,
+  `queue_depth` (PNG 300 DPI + SVG)
 
 ### Default system matrix differs from the steady-state suite
 
@@ -201,6 +244,8 @@ Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
 | river | ✓ | ✓ |
 | oban | ✓ | ✓ |
 | pgque | — | ✓ |
+| pgmq | — | opt-in only |
+| pgboss | — | ✓ |
 
 `awa-docker` is excluded by default from the long-horizon runner because its
 line on any multi-hour dead-tuple / latency plot is the awa-native line —
@@ -208,6 +253,15 @@ same Rust binary, same SQL, same DB-observable behaviour. Keeping it in the
 default would double the runtime and clutter plots with an overlapping
 series. Run it explicitly via `--systems awa-docker` if you're validating
 Docker packaging under long-horizon pressure.
+
+`pgmq` is also opt-in because it requires a pgmq-enabled Postgres image rather
+than the stock pinned `postgres:17.2-alpine` image. Use:
+
+```bash
+uv run python benchmarks/portable/long_horizon.py \
+  --systems pgmq \
+  --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0
+```
 
 ### Reproducibility
 

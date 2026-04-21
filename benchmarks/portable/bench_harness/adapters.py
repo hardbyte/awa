@@ -181,6 +181,24 @@ def build_pgque(skip: bool) -> None:
     )
 
 
+def build_pgboss(skip: bool) -> None:
+    _docker_build(
+        "pgboss-bench",
+        SCRIPT_DIR / "pgboss-bench" / "Dockerfile",
+        REPO_ROOT,
+        skip,
+    )
+
+
+def build_pgmq(skip: bool) -> None:
+    _docker_build(
+        "pgmq-bench",
+        SCRIPT_DIR / "pgmq-bench" / "Dockerfile",
+        REPO_ROOT,
+        skip,
+    )
+
+
 # ─── Launch specs ────────────────────────────────────────────────────────
 
 
@@ -194,7 +212,7 @@ def _base_env(manifest: AdapterManifest, overrides: dict[str, str]) -> dict[str,
         "WORKER_COUNT": "32",
         "JOB_PAYLOAD_BYTES": "256",
         "JOB_WORK_MS": "1",
-        "SAMPLE_EVERY_S": "10",
+        "SAMPLE_EVERY_S": "5",
         # 0-indexed replica id. Defaults to 0 for single-replica runs
         # (the only mode today); the multi-replica spawner (follow-up
         # commit for #174) supplies distinct ids per subprocess.
@@ -266,6 +284,14 @@ def launch_pgque(manifest, overrides):
     return _docker_launch("pgque-bench", manifest, overrides)
 
 
+def launch_pgboss(manifest, overrides):
+    return _docker_launch("pgboss-bench", manifest, overrides)
+
+
+def launch_pgmq(manifest, overrides):
+    return _docker_launch("pgmq-bench", manifest, overrides)
+
+
 # ─── Registry ────────────────────────────────────────────────────────────
 
 
@@ -312,8 +338,18 @@ ADAPTERS: dict[str, AdapterEntry] = {
         builder=build_pgque,
         launcher=launch_pgque,
     ),
+    "pgmq": AdapterEntry(
+        bench_dir=SCRIPT_DIR / "pgmq-bench",
+        builder=build_pgmq,
+        launcher=launch_pgmq,
+    ),
+    "pgboss": AdapterEntry(
+        bench_dir=SCRIPT_DIR / "pgboss-bench",
+        builder=build_pgboss,
+        launcher=launch_pgboss,
+    ),
 }
 
 # Default --systems list for long-horizon. awa-docker is opt-in (it duplicates
 # the awa-native line in cross-system plots — same Rust, same SQL).
-DEFAULT_SYSTEMS = ["awa", "awa-python", "procrastinate", "river", "oban", "pgque"]
+DEFAULT_SYSTEMS = ["awa", "awa-python", "procrastinate", "river", "oban", "pgque", "pgboss"]

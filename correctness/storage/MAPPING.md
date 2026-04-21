@@ -4,7 +4,7 @@ This doc pins each TLA+ action in `AwaSegmentedStorage.tla` to the Rust
 code and SQL that implements it. It is intended as a mechanical cross-check
 as names and internals evolve.
 
-File references are at the time of writing (2026-04-19). This table maps the
+File references are at the time of writing (2026-04-21). This table maps the
 logical storage names used in ADR-019 onto the current Rust / SQL
 implementation.
 
@@ -25,6 +25,11 @@ implementation.
 | `laneState.appendSeq` / `claimSeq` | `{schema}.queue_lanes.append_seq` / `claim_seq` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
+
+The TLA+ model does not represent the cold completed-history rollup cache.
+Rust currently stores that in `{schema}.queue_terminal_rollups`, with
+`queue_lanes.pruned_completed_count` kept only as a transitional legacy source
+for backfill / fallback reads during upgrades.
 
 ## Action mapping
 
@@ -55,7 +60,7 @@ implementation.
 | `PurgeDlq(j)` | `QueueStorage::purge_dlq_job` / bulk `purge_dlq` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
 | `RotateDeferredSegments` / `RotateWaitingSegments` / `RotateLeaseSegments` / `RotateDlqSegments` | parallel maintenance rotate functions per family | analogous `UPDATE *_ring_state` |
-| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx (see "Known modelling gaps" below) |
+| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
 | `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family | `TRUNCATE {schema}.X_segment_N` with active-row check |
 
 ## Invariant mapping
@@ -73,7 +78,7 @@ implementation.
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
 | `PrunedXSegmentsAreEmpty` | per-family prune requires no live-row precondition before TRUNCATE |
-| `LaneStateConsistent` | `queue_lanes.ready_count` / `leased_count` are maintained by the claim/complete paths (**note**: see ADR-019 for the current accounting constraints and validation findings) |
+| `LaneStateConsistent` | `queue_lanes.available_count` is maintained by enqueue/claim transitions; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
 
 ## Known modelling gaps with implementation implications
 

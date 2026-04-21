@@ -30,10 +30,20 @@ async def main() -> None:
         if role == "hang_until_cancel" and job.attempt == 1:
             while not job.is_cancelled():
                 await asyncio.sleep(0.05)
-            print(
-                f"CANCELLED role={role} pid={os.getpid()} job_id={job.id} attempt={job.attempt}",
-                flush=True,
-            )
+            tx = await client.transaction()
+            try:
+                await tx.execute(
+                    """
+                    INSERT INTO awa_test_chaos_markers (job_id, attempt, marker)
+                    VALUES ($1, $2, 'cancel_observed')
+                    """,
+                    job.id,
+                    job.attempt,
+                )
+                await tx.commit()
+            except Exception:
+                await tx.rollback()
+                raise
             return awa.RetryAfter(seconds=0.05)
         if role == "callback_wait":
             if job.attempt == 1:
