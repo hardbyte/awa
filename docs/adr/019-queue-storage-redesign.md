@@ -134,6 +134,9 @@ The implementation and migrations use these physical names:
   the rows actually selected.
 - Short zero-deadline claim: append a `lease_claims` receipt instead of an
   immediate `active_leases` row.
+- Short zero-deadline rescue before first heartbeat: close the stale receipt
+  append-only and requeue it without first materializing a mutable
+  `active_leases` row.
 - First heartbeat / progress / callback registration for a receipt-backed
   attempt: lazily materialize the claim into `active_leases`.
 - Heartbeat / callback wait after materialization: update the active lease row
@@ -166,6 +169,9 @@ Healthy operating signals for this design are:
 - short jobs complete without creating an `attempt_state` row.
 - short zero-deadline jobs can also complete without ever creating a mutable
   `active_leases` row.
+- short zero-deadline jobs that never heartbeat can be rescued from
+  `lease_claims` after the grace window without first creating
+  `active_leases`.
 - prune and cleanup horizons for `attempt_state` are immediate or very short.
 
 ### Maintenance ownership

@@ -310,6 +310,8 @@ jobs only**:
 - no mutable `leases` row on the common short path
 - lazy materialization into `leases` on first heartbeat / progress /
   callback registration
+- stale short claims that never materialize are rescued append-only after the
+  grace window by writing a rescue closure and requeueing the attempt
 - no `attempt_state` row unless the attempt actually needs mutable callback or
   progress state
 - guarded so it only activates when queue `deadline_duration = 0`
@@ -343,5 +345,5 @@ So the spike validates the direction:
 
 - append-only short-claim receipts dramatically reduce steady-state dead tuples
 - the next work is making the materialized long-running path cheaper on the
-  delivery path, and then extending the same model to full short-attempt
-  rescue semantics
+  delivery path, and then extending the same model further across more of the
+  long-running rescue surface

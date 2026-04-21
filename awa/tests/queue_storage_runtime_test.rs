@@ -591,6 +591,25 @@ impl Worker for BlockingCompleteWorker {
     }
 }
 
+struct ReceiptRescueWorker {
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[async_trait::async_trait]
+impl Worker for ReceiptRescueWorker {
+    fn kind(&self) -> &'static str {
+        "complete_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if ctx.job.attempt > 1 {
+            return Ok(JobResult::Completed);
+        }
+        self.release.notified().await;
+        Ok(JobResult::Completed)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct HeartbeatRescueJob {
     id: i64,
@@ -1449,6 +1468,118 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_rescue";
+    let schema = "awa_qs_runtime_lease_claim_rescue";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                experimental_lease_claim_receipts: true,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(ReceiptRescueWorker {
+            release: release.clone(),
+        })
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_interval(Duration::from_secs(60))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .heartbeat_staleness(Duration::from_millis(250))
+        .deadline_rescue_interval(Duration::from_secs(10))
+        .callback_rescue_interval(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build receipt rescue client");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 5 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start receipt rescue client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+    assert_eq!(running.attempt, 1);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(completed.attempt, 2);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+
+    release.notify_waiters();
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let current = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load receipt rescue job after late completion")
+        .expect("Expected receipt rescue job to exist");
+    assert_eq!(current.state, JobState::Completed);
+    assert_eq!(current.attempt, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_snooze() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -2183,8 +2314,19 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
     )
     .await;
     assert_eq!(failed.state, JobState::Failed);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 0);
+    let dlq_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if dlq_count(&pool, &store, queue).await == 1
+            && failed_done_count(&pool, &store, queue).await == 0
+        {
+            break;
+        }
+        assert!(
+            Instant::now() <= dlq_deadline,
+            "timed out waiting for callback timeout failure to move into DLQ"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
     assert_eq!(dlq_reason(&pool, &store, job_id).await, "callback_timeout");
 
     client.shutdown(Duration::from_secs(5)).await;

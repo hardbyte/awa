@@ -43,6 +43,8 @@ Each queue-plane family (`ready_entries`, `deferred_jobs`, `terminal_entries`,
 not sit in one mutable heap. The current lease plane is hybrid:
 
 - zero-deadline short jobs can stay on append-only `lease_claims`
+- stale zero-deadline short jobs can be rescued from `lease_claims` after the
+  grace window without first creating a mutable lease row
 - jobs that need heartbeat, progress, or callback semantics lazily
   materialize into `active_leases`
 - `attempt_state` is created lazily and only for jobs that need mutable
@@ -298,7 +300,9 @@ ready_slot, ready_generation, lease_slot, lease_generation)` snapshot used by
 completion and rescue. Zero-deadline short jobs can stay on the append-only
 receipt path until they prove they need the richer runtime semantics; the
 first heartbeat, progress flush, or callback registration lazily materializes
-that receipt into `active_leases`.
+that receipt into `active_leases`. If they never materialize, maintenance can
+still rescue them after the stale-claim grace window by closing the receipt
+append-only and requeueing the attempt.
 
 Dispatch still uses strict priority ordering by `(queue, priority, lane_seq)`.
 Cross-priority fairness is handled separately by the maintenance leader's

@@ -1590,6 +1590,16 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
+            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_stale
+                ON {schema}.lease_claims (materialized_at, claimed_at, job_id)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
             CREATE TABLE IF NOT EXISTS {schema}.lease_claim_closures (
                 job_id            BIGINT NOT NULL,
                 run_lease         BIGINT NOT NULL,
@@ -4723,6 +4733,78 @@ impl QueueStorage {
         Ok(hydrated)
     }
 
+    async fn rescue_stale_receipt_claims_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        cutoff: DateTime<Utc>,
+    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        let schema = self.schema();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH stale_claims AS (
+                SELECT
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.job_id,
+                    claims.queue,
+                    'running'::awa.job_state AS state,
+                    claims.priority,
+                    claims.attempt,
+                    claims.run_lease,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.claimed_at AS attempted_at
+                FROM {schema}.lease_claims AS claims
+                WHERE claims.materialized_at IS NULL
+                  AND claims.claimed_at < $1
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM {schema}.leases AS lease
+                      WHERE lease.job_id = claims.job_id
+                        AND lease.run_lease = claims.run_lease
+                  )
+                ORDER BY claims.claimed_at ASC
+                LIMIT 500
+                FOR UPDATE OF claims SKIP LOCKED
+            ),
+            inserted AS (
+                INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
+                SELECT stale_claims.job_id, stale_claims.run_lease, 'rescued', clock_timestamp()
+                FROM stale_claims
+                ON CONFLICT (job_id, run_lease) DO NOTHING
+                RETURNING job_id, run_lease
+            )
+            SELECT
+                stale_claims.ready_slot,
+                stale_claims.ready_generation,
+                stale_claims.job_id,
+                stale_claims.queue,
+                stale_claims.state,
+                stale_claims.priority,
+                stale_claims.attempt,
+                stale_claims.run_lease,
+                stale_claims.max_attempts,
+                stale_claims.lane_seq,
+                stale_claims.attempted_at
+            FROM stale_claims
+            JOIN inserted
+              ON inserted.job_id = stale_claims.job_id
+             AND inserted.run_lease = stale_claims.run_lease
+            "#
+        ))
+        .bind(cutoff)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(rescued)
+    }
+
     pub async fn load_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut candidates = Vec::new();
@@ -6764,21 +6846,53 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if deleted.is_empty() {
+        let rescued_receipts = if self.experimental_lease_claim_receipts() {
+            self.rescue_stale_receipt_claims_tx(&mut tx, cutoff).await?
+        } else {
+            Vec::new()
+        };
+
+        if deleted.is_empty() && rescued_receipts.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved_leases = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved_receipts = self
+            .hydrate_deleted_leases_tx(&mut tx, rescued_receipts)
+            .await?;
 
-        let mut rescued = Vec::with_capacity(moved.len());
-        for row in moved {
+        let mut rescued = Vec::with_capacity(moved_leases.len() + moved_receipts.len());
+        for row in moved_leases {
             let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
                 row.payload.clone(),
                 row.progress.clone(),
             )?)?;
             payload.push_error(lifecycle_error(
                 "heartbeat stale: worker presumed dead",
+                row.attempt,
+                false,
+            ));
+            let deferred = row.clone().into_deferred_row(
+                JobState::Retryable,
+                self.backoff_at_tx(&mut tx, row.attempt, row.max_attempts)
+                    .await?,
+                Some(Utc::now()),
+                payload.into_json(),
+            );
+            self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(row.state))
+                .await?;
+            self.adjust_lane_counts(&mut tx, &row.queue, row.priority, 0, 0)
+                .await?;
+            rescued.push(deferred.into_job_row()?);
+        }
+        for row in moved_receipts {
+            let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
+                row.payload.clone(),
+                row.progress.clone(),
+            )?)?;
+            payload.push_error(lifecycle_error(
+                "receipt claim stale: worker presumed dead",
                 row.attempt,
                 false,
             ));
