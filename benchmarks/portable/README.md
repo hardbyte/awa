@@ -217,6 +217,53 @@ types plug in via `bench_harness.phases` + `bench_harness.hooks`.
   - Intended for `--replicas >= 2` so systems are compared under real replica
     contention instead of only single-worker-process pressure.
 
+- `crash_recovery_under_load`
+  - Multi-replica worker-crash profile under sustained backlog pressure.
+  - Best when you want to track rescue/recovery behaviour without dropping out
+    of the phase-driven report/summary flow.
+
+### Scaling and semantics helpers
+
+```bash
+# Sweep the same long-horizon profile across worker counts.
+uv run python benchmarks/portable/worker_scale.py \
+  --systems awa,pgque \
+  --worker-counts 1,4,8,16,32,64
+
+# Awa-only retry / priority semantics run.
+uv run python benchmarks/portable/awa_semantics.py \
+  --scenario retry_priority_mix
+
+# Awa-only crash recovery under load (2 replicas).
+uv run python benchmarks/portable/awa_semantics.py \
+  --scenario crash_recovery_under_load
+
+# Override with explicit short phases when you want a quicker dev loop.
+uv run python benchmarks/portable/awa_semantics.py \
+  --scenario retry_priority_mix \
+  --phase warmup=warmup:5s \
+  --phase clean_1=clean:10s \
+  --phase pressure_1=high-load:15s \
+  --phase recovery_1=clean:10s
+```
+
+`worker_scale.py` answers throughput/latency vs worker-count directly instead
+of relying on one fixed `WORKER_COUNT` long-horizon run. By default it uses a
+short `warmup -> clean -> high-load -> recovery` profile so the sweep answers
+scaling under load, not active-reader interference. Use `--scenario` or
+repeated `--phase` flags when you want a different shape. It also defaults to
+the harness `--fast` mode so repeated sweeps reuse one Postgres instance while
+still recreating benchmark databases between runs; pass `--no-fast` for full
+cold-start runs.
+
+`awa_semantics.py` is intentionally Awa-only for now. It exercises retryable
+failures, mixed priorities, and crash recovery using the same phase-driven
+runner, but it does not pretend those semantics are apples-to-apples across
+systems like `pgque` or `pgmq` that are not full job queues.
+Like `worker_scale.py`, it defaults to harness `--fast` mode for shorter,
+more reliable iteration loops; pass `--no-fast` when you specifically want
+full container restart behaviour.
+
 The shipped scenario lengths are meant to be tractable on a developer machine.
 For deeper pressure studies, extend them with explicit `--phase` overrides
 rather than treating the defaults as "long enough" by definition.

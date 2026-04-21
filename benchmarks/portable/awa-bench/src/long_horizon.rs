@@ -29,6 +29,9 @@ pub struct LongHorizonJob {
     /// Wall-clock producer timestamp in unix milliseconds. Used for
     /// subscriber and end-to-end latency.
     pub produced_at_ms: i64,
+    /// Synthetic semantics knob for the Awa-only retry benchmark: fail once
+    /// on the first attempt, then succeed on retry.
+    pub fail_first_attempt: bool,
     /// Arbitrary filler so jobs approximate the declared payload size.
     pub padding: String,
 }
@@ -85,6 +88,9 @@ struct LongHorizonWorker {
     subscriber_latencies: Arc<Mutex<LatencyWindow>>,
     end_to_end_latencies: Arc<Mutex<LatencyWindow>>,
     completed_counter: Arc<AtomicU64>,
+    retryable_failures_counter: Arc<AtomicU64>,
+    completed_priority_1_counter: Arc<AtomicU64>,
+    completed_priority_4_counter: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -96,6 +102,13 @@ impl Worker for LongHorizonWorker {
     async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
         let args: LongHorizonJob = serde_json::from_value(ctx.job.args.clone())
             .map_err(|err| JobError::Terminal(format!("failed to deserialize args: {err}")))?;
+        if args.fail_first_attempt && ctx.job.attempt == 1 {
+            self.retryable_failures_counter
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(JobError::retryable_msg(
+                "synthetic first-attempt retryable failure",
+            ));
+        }
         let subscriber_latency_ms = (now_epoch_ms() - args.produced_at_ms).max(0) as f64;
         self.subscriber_latencies
             .lock()
@@ -110,6 +123,17 @@ impl Worker for LongHorizonWorker {
             .await
             .record(end_to_end_latency_ms);
         self.completed_counter.fetch_add(1, Ordering::Relaxed);
+        match ctx.job.priority {
+            1 => {
+                self.completed_priority_1_counter
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            4 => {
+                self.completed_priority_4_counter
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
         Ok(JobResult::Completed)
     }
 }
@@ -130,6 +154,32 @@ fn env_u32(name: &str, default: u32) -> u32 {
 
 fn env_string(name: &str, default: &str) -> String {
     std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_u16(name: &str, default: u16) -> u16 {
+    std::env::var(name)
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(default)
+}
+
+fn parse_priority_pattern() -> Vec<i16> {
+    let raw = env_string("JOB_PRIORITY_PATTERN", "2");
+    let parsed: Vec<i16> = raw
+        .split(',')
+        .filter_map(|part| {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                return None;
+            }
+            trimmed.parse::<i16>().ok().filter(|p| (1..=4).contains(p))
+        })
+        .collect();
+    if parsed.is_empty() {
+        vec![2]
+    } else {
+        parsed
+    }
 }
 
 fn read_producer_rate(default: u64) -> u64 {
@@ -174,13 +224,19 @@ fn build_batch_params(
     queue_name: &str,
     next_seq: &mut i64,
     batch_size: usize,
+    priority_pattern: &[i16],
+    fail_first_mod: i64,
+    max_attempts: i16,
     padding: &str,
 ) -> Vec<InsertParams> {
     let mut params = Vec::with_capacity(batch_size);
     for _ in 0..batch_size {
+        let seq = *next_seq;
+        let priority = priority_pattern[seq.rem_euclid(priority_pattern.len() as i64) as usize];
         let args = LongHorizonJob {
-            seq: *next_seq,
+            seq,
             produced_at_ms: now_epoch_ms(),
+            fail_first_attempt: fail_first_mod > 0 && seq.rem_euclid(fail_first_mod) == 0,
             padding: padding.to_owned(),
         };
         params.push(
@@ -188,6 +244,8 @@ fn build_batch_params(
                 &args,
                 awa_model::InsertOpts {
                     queue: queue_name.into(),
+                    priority,
+                    max_attempts,
                     ..Default::default()
                 },
             )
@@ -253,6 +311,9 @@ pub async fn run() {
     let worker_count = env_u32("WORKER_COUNT", 32);
     let payload_bytes = env_u64("JOB_PAYLOAD_BYTES", 256);
     let work_ms = env_u64("JOB_WORK_MS", 1);
+    let fail_first_mod = env_u64("JOB_FAIL_FIRST_MOD", 0) as i64;
+    let max_attempts = env_u16("JOB_MAX_ATTEMPTS", 25) as i16;
+    let priority_pattern = parse_priority_pattern();
     let sample_every_s = env_u64("SAMPLE_EVERY_S", 10);
     let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 25).max(1);
     let producer_batch_max = env_u64("PRODUCER_BATCH_MAX", 128).max(1) as usize;
@@ -271,7 +332,8 @@ pub async fn run() {
         .expect("Failed to connect to database");
     let storage = super::queue_storage_config_with_experimental_default(true);
     let use_lease_claim_receipts = storage.experimental_lease_claim_receipts;
-    let (store, storage) = super::prepare_queue_storage_with_config(&pool, storage).await;
+    let (store, storage) =
+        super::prepare_queue_storage_with_config(&pool, storage, false).await;
     emit_descriptor(&db_name, &store);
 
     let queue_name = "awa_longhorizon_bench";
@@ -284,6 +346,9 @@ pub async fn run() {
     let subscriber_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
     let end_to_end_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
     let completed = Arc::new(AtomicU64::new(0));
+    let retryable_failures = Arc::new(AtomicU64::new(0));
+    let completed_priority_1 = Arc::new(AtomicU64::new(0));
+    let completed_priority_4 = Arc::new(AtomicU64::new(0));
     let enqueued = Arc::new(AtomicU64::new(0));
     let queue_depth = Arc::new(AtomicU64::new(0));
     let producer_target_rate = Arc::new(AtomicU64::new(producer_rate));
@@ -293,6 +358,9 @@ pub async fn run() {
         subscriber_latencies: Arc::clone(&subscriber_latencies),
         end_to_end_latencies: Arc::clone(&end_to_end_latencies),
         completed_counter: Arc::clone(&completed),
+        retryable_failures_counter: Arc::clone(&retryable_failures),
+        completed_priority_1_counter: Arc::clone(&completed_priority_1),
+        completed_priority_4_counter: Arc::clone(&completed_priority_4),
     };
 
     let client_storage = storage.clone();
@@ -339,6 +407,7 @@ pub async fn run() {
     let producer_call_latencies_window = Arc::clone(&producer_call_latencies);
     let producer_latencies_window = Arc::clone(&producer_latencies);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
+    let producer_priority_pattern = priority_pattern.clone();
     let producer_handle = tokio::spawn(async move {
         let mut seq: i64 = 0;
         let mut fixed_rate_credit = 0.0_f64;
@@ -375,7 +444,15 @@ pub async fn run() {
             };
 
             let mut next_seq = seq;
-            let params = build_batch_params(queue_name, &mut next_seq, batch_size, &padding);
+            let params = build_batch_params(
+                queue_name,
+                &mut next_seq,
+                batch_size,
+                &producer_priority_pattern,
+                fail_first_mod,
+                max_attempts,
+                &padding,
+            );
             let insert_start = Instant::now();
             let res = producer_store
                 .enqueue_params_batch(&producer_pool, &params)
@@ -427,6 +504,9 @@ pub async fn run() {
     let sample_shutdown = Arc::clone(&shutdown);
     let sample_enqueued = Arc::clone(&enqueued);
     let sample_completed = Arc::clone(&completed);
+    let sample_retryable_failures = Arc::clone(&retryable_failures);
+    let sample_completed_priority_1 = Arc::clone(&completed_priority_1);
+    let sample_completed_priority_4 = Arc::clone(&completed_priority_4);
     let sample_depth = Arc::clone(&queue_depth);
     let sample_producer_call_latencies = Arc::clone(&producer_call_latencies);
     let sample_producer_latencies = Arc::clone(&producer_latencies);
@@ -445,6 +525,12 @@ pub async fn run() {
 
         let mut last_enqueued: u64 = sample_enqueued.load(Ordering::Relaxed);
         let mut last_completed: u64 = sample_completed.load(Ordering::Relaxed);
+        let mut last_retryable_failures: u64 =
+            sample_retryable_failures.load(Ordering::Relaxed);
+        let mut last_completed_priority_1: u64 =
+            sample_completed_priority_1.load(Ordering::Relaxed);
+        let mut last_completed_priority_4: u64 =
+            sample_completed_priority_4.load(Ordering::Relaxed);
         let mut last_tick = Instant::now();
         let mut ticker = interval_at(
             tokio::time::Instant::now() + Duration::from_secs(sample_every_s),
@@ -460,10 +546,21 @@ pub async fn run() {
 
             let enq = sample_enqueued.load(Ordering::Relaxed);
             let cmp = sample_completed.load(Ordering::Relaxed);
+            let retryable = sample_retryable_failures.load(Ordering::Relaxed);
+            let completed_p1 = sample_completed_priority_1.load(Ordering::Relaxed);
+            let completed_p4 = sample_completed_priority_4.load(Ordering::Relaxed);
             let enq_rate = (enq - last_enqueued) as f64 / dt;
             let cmp_rate = (cmp - last_completed) as f64 / dt;
+            let retryable_rate = (retryable - last_retryable_failures) as f64 / dt;
+            let completed_p1_rate =
+                (completed_p1 - last_completed_priority_1) as f64 / dt;
+            let completed_p4_rate =
+                (completed_p4 - last_completed_priority_4) as f64 / dt;
             last_enqueued = enq;
             last_completed = cmp;
+            last_retryable_failures = retryable;
+            last_completed_priority_1 = completed_p1;
+            last_completed_priority_4 = completed_p4;
 
             let window = Duration::from_secs(30);
             let (producer_call_p50, producer_call_p95, producer_call_p99) = {
@@ -516,6 +613,9 @@ pub async fn run() {
                 ("claim_p99_ms", subscriber_p99, 30.0),
                 ("enqueue_rate", enq_rate, sample_every_s as f64),
                 ("completion_rate", cmp_rate, sample_every_s as f64),
+                ("retryable_failure_rate", retryable_rate, sample_every_s as f64),
+                ("completed_priority_1_rate", completed_p1_rate, sample_every_s as f64),
+                ("completed_priority_4_rate", completed_p4_rate, sample_every_s as f64),
                 ("queue_depth", depth, 0.0),
                 ("producer_target_rate", target_rate, 0.0),
             ] {

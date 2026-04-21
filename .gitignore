@@ -30,3 +30,4 @@ awa-python/python/awa/lib_awa.dylib.dSYM/
 
 # Benchmark run artifacts
 /benchmarks/portable/results/
+/benchmarks/portable/awa-bench/target/

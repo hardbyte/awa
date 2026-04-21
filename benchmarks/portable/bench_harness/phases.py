@@ -253,6 +253,16 @@ SCENARIOS: dict[str, list[str]] = {
         "kill=kill-worker(instance=0):60s",
         "restart=start-worker(instance=0):60s",
     ],
+    # Crash a replica while the fleet is already under backlog pressure, then
+    # restart it and watch the tail recover. Intended for --replicas >= 2.
+    "crash_recovery_under_load": [
+        "warmup=warmup:30s",
+        "baseline=clean:60s",
+        "pressure_1=high-load:120s",
+        "kill=kill-worker(instance=0):60s",
+        "restart=start-worker(instance=0):60s",
+        "recovery_1=clean:120s",
+    ],
 }
 
 

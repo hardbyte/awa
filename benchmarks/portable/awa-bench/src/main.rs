@@ -77,13 +77,14 @@ fn lease_rotate_interval() -> Duration {
 /// backend so inserts through `awa.jobs` route into it and slot state
 /// starts from a clean baseline for each benchmark run.
 async fn prepare_queue_storage(pool: &PgPool) -> (QueueStorage, QueueStorageConfig) {
-    prepare_queue_storage_with_config(pool, queue_storage_config())
+    prepare_queue_storage_with_config(pool, queue_storage_config(), true)
         .await
 }
 
 pub(crate) async fn prepare_queue_storage_with_config(
     pool: &PgPool,
     config: QueueStorageConfig,
+    reset: bool,
 ) -> (QueueStorage, QueueStorageConfig) {
     migrations::run(pool).await.unwrap();
     let store = QueueStorage::new(config.clone()).expect("Invalid QueueStorageConfig");
@@ -91,10 +92,12 @@ pub(crate) async fn prepare_queue_storage_with_config(
         .install(pool)
         .await
         .expect("Failed to install queue_storage backend");
-    store
-        .reset(pool)
-        .await
-        .expect("Failed to reset queue_storage state");
+    if reset {
+        store
+            .reset(pool)
+            .await
+            .expect("Failed to reset queue_storage state");
+    }
     (store, config)
 }
 
