@@ -104,10 +104,7 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
     )
 }
 
-async fn prepared_queue_storage_schema_ready(
-    pool: &PgPool,
-    schema: &str,
-) -> Result<bool, AwaError> {
+pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
     sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
@@ -148,7 +145,7 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
     let canonical_live_backlog = canonical_live_backlog(pool).await?;
     let prepared_queue_storage_schema = queue_storage_schema_from_status(&status);
     let prepared_schema_ready = match prepared_queue_storage_schema.as_deref() {
-        Some(schema) => prepared_queue_storage_schema_ready(pool, schema).await?,
+        Some(schema) => queue_storage_schema_ready(pool, schema).await?,
         None => false,
     };
 

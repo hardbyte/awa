@@ -2132,7 +2132,7 @@ impl QueueStorage {
                   AND claims.claim_seq < enqueues.next_seq
                 ORDER BY lanes.priority ASC
                 LIMIT 1
-                FOR UPDATE;
+                FOR UPDATE OF claims SKIP LOCKED;
 
                 IF NOT FOUND THEN
                     RETURN;
@@ -4716,6 +4716,19 @@ impl QueueStorage {
         Ok(inserted as usize)
     }
 
+    async fn ensure_mutable_running_attempt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+    ) -> Result<(), AwaError> {
+        if self.experimental_lease_claim_receipts() {
+            self.ensure_running_leases_from_receipts_tx(tx, &[(job_id, run_lease)])
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn upsert_attempt_state_from_receipts_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5317,10 +5330,8 @@ impl QueueStorage {
     ) -> Result<Uuid, AwaError> {
         let callback_id = Uuid::new_v4();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let updated = sqlx::query(&format!(
             r#"
             UPDATE {}
@@ -5442,10 +5453,8 @@ impl QueueStorage {
 
         let callback_id = Uuid::new_v4();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let updated = sqlx::query(&format!(
             r#"
             UPDATE {}
@@ -6242,10 +6251,8 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -6313,10 +6320,8 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -6384,10 +6389,8 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -6457,10 +6460,8 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -6526,10 +6527,8 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
-            self.ensure_running_leases_from_receipts_tx(&mut tx, &[(job_id, run_lease)])
-                .await?;
-        }
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -6994,6 +6993,8 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
+            .await?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases

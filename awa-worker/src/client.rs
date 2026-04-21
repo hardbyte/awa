@@ -823,7 +823,7 @@ impl Client {
 
         let status = transition::status(&self.pool).await?;
         let expected_schema = Self::expected_queue_storage_schema(&status)?;
-        if let Some(schema) = expected_schema.as_deref() {
+        let prepared_schema_ready = if let Some(schema) = expected_schema.as_deref() {
             if runtime.store.schema() != schema {
                 return Err(awa_model::AwaError::Validation(format!(
                     "queue storage runtime configured for schema '{}' but transition state requires '{}'",
@@ -831,17 +831,33 @@ impl Client {
                     schema
                 )));
             }
-        }
+            transition::queue_storage_schema_ready(&self.pool, schema).await?
+        } else {
+            false
+        };
 
         match self.transition_role {
             TransitionWorkerRole::CanonicalDrain => Ok(RuntimeStorage::Canonical),
             TransitionWorkerRole::QueueStorageTarget => {
-                runtime.store.prepare_schema(&self.pool).await?;
+                let schema = expected_schema.ok_or_else(|| {
+                    awa_model::AwaError::Validation(
+                        "queue_storage_target requires a prepared queue-storage schema".into(),
+                    )
+                })?;
+                if !prepared_schema_ready {
+                    return Err(awa_model::AwaError::Validation(format!(
+                        "queue storage schema '{schema}' is not prepared; run schema preparation before starting queue-storage-target runtimes"
+                    )));
+                }
                 Ok(RuntimeStorage::QueueStorage(runtime.clone()))
             }
             TransitionWorkerRole::Auto => {
-                if expected_schema.is_some() {
-                    runtime.store.prepare_schema(&self.pool).await?;
+                if let Some(schema) = expected_schema.as_deref() {
+                    if !prepared_schema_ready {
+                        return Err(awa_model::AwaError::Validation(format!(
+                            "queue storage schema '{schema}' is not prepared; run schema preparation before starting 0.6 runtimes"
+                        )));
+                    }
                 }
 
                 if matches!(status.state.as_str(), "mixed_transition" | "active")
@@ -1882,6 +1898,66 @@ mod tests {
         builder.storage = RuntimeStorage::Canonical;
         builder.storage_error = None;
         builder
+    }
+
+    #[tokio::test]
+    async fn queue_storage_target_requires_prepared_schema() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        let queue_storage_schema = "awa_cutover_target_requires_prepare";
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("fresh 0.6 schema install should succeed");
+        drop_queue_storage_schema(&pool, queue_storage_schema).await;
+
+        storage::prepare(
+            &pool,
+            "queue_storage",
+            serde_json::json!({ "schema": queue_storage_schema }),
+        )
+        .await
+        .expect("Failed to prepare queue storage transition without schema");
+
+        let client = Client::builder(pool.clone())
+            .queue(
+                "cutover",
+                QueueConfig {
+                    max_workers: 1,
+                    poll_interval: Duration::from_millis(25),
+                    ..QueueConfig::default()
+                },
+            )
+            .queue_storage(
+                QueueStorageConfig {
+                    schema: queue_storage_schema.to_string(),
+                    queue_slot_count: 4,
+                    lease_slot_count: 2,
+                    ..Default::default()
+                },
+                Duration::from_millis(1_000),
+                Duration::from_millis(50),
+            )
+            .transition_role(TransitionWorkerRole::QueueStorageTarget)
+            .register::<CutoverShortJob, _, _>(move |_args, _ctx| async move {
+                Ok(JobResult::Completed)
+            })
+            .build()
+            .expect("Failed to build queue-storage target client");
+
+        let err = client
+            .start()
+            .await
+            .expect_err("queue-storage target should refuse to start without prepared schema");
+        match err {
+            awa_model::AwaError::Validation(msg) => {
+                assert!(
+                    msg.contains("not prepared"),
+                    "unexpected validation message: {msg}"
+                );
+            }
+            other => panic!("expected Validation error, got {other:?}"),
+        }
     }
 
     #[tokio::test]

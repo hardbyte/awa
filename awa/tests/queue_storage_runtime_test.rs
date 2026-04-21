@@ -1524,6 +1524,69 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claims_retry_successfully() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_retry";
+    let schema = "awa_qs_runtime_lease_claim_retry";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+        RetryOnceWorker,
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start receipt retry client");
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(completed.attempt, 2);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
