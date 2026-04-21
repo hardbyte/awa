@@ -26,3 +26,7 @@ uuid = { version = "1", features = ["v4"] }
 tokio-util = "0.7"
 async-trait = "0.1"
 pythonize = "0.28.0"
+
+opentelemetry = { version = "0.31", features = ["metrics"] }
+opentelemetry_sdk = { version = "0.31", features = ["metrics", "rt-tokio"] }
+opentelemetry-otlp = { version = "0.31", features = ["grpc-tonic"] }

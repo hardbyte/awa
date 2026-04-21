@@ -28,6 +28,8 @@ from awa._awa import (
     migrations,
     migrations_range,
     current_migration_version,
+    init_telemetry,
+    shutdown_telemetry,
     # Exceptions
     AwaError,
     UniqueConflict,
@@ -72,6 +74,8 @@ __all__ = [
     "migrations",
     "migrations_range",
     "current_migration_version",
+    "init_telemetry",
+    "shutdown_telemetry",
     # Exceptions
     "AwaError",
     "UniqueConflict",

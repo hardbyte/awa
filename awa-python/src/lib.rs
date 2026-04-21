@@ -3,6 +3,7 @@ mod client;
 mod dlq;
 mod errors;
 mod job;
+mod telemetry;
 mod transaction;
 mod worker;
 
@@ -100,6 +101,8 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(migrations, m)?)?;
     m.add_function(wrap_pyfunction!(migrations_range, m)?)?;
     m.add_function(wrap_pyfunction!(current_migration_version, m)?)?;
+    m.add_function(wrap_pyfunction!(telemetry::init_telemetry, m)?)?;
+    m.add_function(wrap_pyfunction!(telemetry::shutdown_telemetry, m)?)?;
 
     // Exceptions
     m.add("AwaError", m.py().get_type::<AwaError>())?;
