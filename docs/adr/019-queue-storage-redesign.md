@@ -137,12 +137,15 @@ The implementation and migrations use these physical names:
 - Short zero-deadline rescue before first heartbeat: close the stale receipt
   append-only and requeue it without first materializing a mutable
   `active_leases` row.
-- First heartbeat / progress / callback registration for a receipt-backed
+- First heartbeat or progress flush for a receipt-backed attempt: lazily
+  materialize the claim into `attempt_state` while keeping the claim on the
+  append-only receipt path.
+- Callback registration or other lease-specific mutation for a receipt-backed
   attempt: lazily materialize the claim into `active_leases`.
-- Heartbeat / callback wait after materialization: update the active lease row
-  only.
-- Progress flush / callback expressions / callback result: create or update an
-  `attempt_state` row only when needed.
+- Heartbeat after lease materialization / callback wait: update the active
+  lease row only.
+- Progress flush / callback expressions / callback result: create or update
+  `attempt_state` only when needed.
 - Retry or snooze: delete the active lease row, merge any `attempt_state`,
   append to `deferred_jobs`.
 - Complete: delete the active lease row, ignore or merge any `attempt_state`
@@ -172,6 +175,8 @@ Healthy operating signals for this design are:
 - short zero-deadline jobs that never heartbeat can be rescued from
   `lease_claims` after the grace window without first creating
   `active_leases`.
+- heartbeat/progress-only long attempts can stay on `lease_claims` plus
+  `attempt_state` without creating `active_leases`.
 - prune and cleanup horizons for `attempt_state` are immediate or very short.
 
 ### Maintenance ownership

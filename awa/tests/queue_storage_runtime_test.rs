@@ -610,6 +610,37 @@ impl Worker for ReceiptRescueWorker {
     }
 }
 
+struct ProgressRescueWorker;
+
+#[async_trait::async_trait]
+impl Worker for ProgressRescueWorker {
+    fn kind(&self) -> &'static str {
+        "heartbeat_rescue_job"
+    }
+
+    async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+        if ctx.job.attempt == 1 {
+            ctx.set_progress(10, "started");
+            ctx.flush_progress().await.map_err(JobError::retryable)?;
+            let started = Instant::now();
+            loop {
+                if ctx.is_cancelled() {
+                    break;
+                }
+                if started.elapsed() > Duration::from_secs(5) {
+                    return Err(JobError::terminal(
+                        "progress rescue did not cancel stale attempt",
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            Ok(JobResult::Completed)
+        } else {
+            Ok(JobResult::Completed)
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct HeartbeatRescueJob {
     id: i64,
@@ -1437,17 +1468,25 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
 
     let materialization_deadline = Instant::now() + Duration::from_secs(2);
     loop {
-        if lease_count(&pool, &store).await == 1 {
+        if attempt_state_count(&pool, &store).await == 1 {
             break;
         }
         if Instant::now() > materialization_deadline {
-            panic!("timed out waiting for heartbeat to materialize receipt-backed lease");
+            panic!("timed out waiting for heartbeat to materialize receipt-backed attempt state");
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
+    let running = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load receipt-backed running job after heartbeat")
+        .expect("Expected receipt-backed running job after heartbeat");
+    assert_eq!(running.state, JobState::Running);
+    assert!(running.heartbeat_at.is_some());
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
 
     release.notify_waiters();
 
@@ -1462,7 +1501,121 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(completed.state, JobState::Completed);
     assert_eq!(lease_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 1);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heartbeat() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_attempt_rescue";
+    let schema = "awa_qs_runtime_lease_claim_attempt_rescue";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 6 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 4,
+                poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                queue_slot_count: 4,
+                lease_slot_count: 2,
+                experimental_lease_claim_receipts: true,
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(ProgressRescueWorker)
+        .heartbeat_interval(Duration::from_secs(60))
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .heartbeat_staleness(Duration::from_millis(250))
+        .deadline_rescue_interval(Duration::from_secs(10))
+        .callback_rescue_interval(Duration::from_secs(10))
+        .build()
+        .expect("Failed to build attempt-state receipt rescue client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start attempt-state receipt rescue client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+
+    let materialization_deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if attempt_state_count(&pool, &store).await == 1 {
+            break;
+        }
+        if Instant::now() > materialization_deadline {
+            panic!("timed out waiting for receipt-backed progress flush to create attempt_state");
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    let running = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load running attempt-state receipt job")
+        .expect("Expected running attempt-state receipt job");
+    assert_eq!(running.state, JobState::Running);
+    assert!(running.heartbeat_at.is_some());
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(15),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(completed.attempt, 2);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 2);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
 
     client.shutdown(Duration::from_secs(5)).await;
 }

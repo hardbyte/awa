@@ -45,8 +45,10 @@ not sit in one mutable heap. The current lease plane is hybrid:
 - zero-deadline short jobs can stay on append-only `lease_claims`
 - stale zero-deadline short jobs can be rescued from `lease_claims` after the
   grace window without first creating a mutable lease row
-- jobs that need heartbeat, progress, or callback semantics lazily
-  materialize into `active_leases`
+- heartbeat/progress-only receipt-backed jobs can materialize into
+  `attempt_state` without creating a mutable lease row
+- callback/wait or lease-specific mutation paths still materialize into
+  `active_leases`
 - `attempt_state` is created lazily and only for jobs that need mutable
   per-attempt data (progress, callback state)
 
@@ -299,10 +301,11 @@ ready entry, while the claim step records the exact `(job_id, run_lease,
 ready_slot, ready_generation, lease_slot, lease_generation)` snapshot used by
 completion and rescue. Zero-deadline short jobs can stay on the append-only
 receipt path until they prove they need the richer runtime semantics; the
-first heartbeat, progress flush, or callback registration lazily materializes
-that receipt into `active_leases`. If they never materialize, maintenance can
-still rescue them after the stale-claim grace window by closing the receipt
-append-only and requeueing the attempt.
+first heartbeat or progress flush lazily materializes that receipt into
+`attempt_state` only, while callback registration or other lease-specific
+mutation paths still escalate it into `active_leases`. If the receipt never
+materializes at all, maintenance can still rescue it after the stale-claim
+grace window by closing the receipt append-only and requeueing the attempt.
 
 Dispatch still uses strict priority ordering by `(queue, priority, lane_seq)`.
 Cross-priority fairness is handled separately by the maintenance leader's

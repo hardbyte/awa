@@ -308,8 +308,9 @@ jobs only**:
 - append-only `lease_claims`
 - append-only `lease_claim_closures`
 - no mutable `leases` row on the common short path
-- lazy materialization into `leases` on first heartbeat / progress /
-  callback registration
+- lazy materialization into `attempt_state` on first heartbeat / progress
+- lazy materialization into `leases` on callback registration or rarer
+  lease-specific mutation paths
 - stale short claims that never materialize are rescued append-only after the
   grace window by writing a rescue closure and requeueing the attempt
 - no `attempt_state` row unless the attempt actually needs mutable callback or
@@ -344,6 +345,8 @@ The trade-off in the current spike is latency:
 So the spike validates the direction:
 
 - append-only short-claim receipts dramatically reduce steady-state dead tuples
+- heartbeat/progress-only receipt-backed attempts can stay off the mutable
+  lease heap while still getting stale-heartbeat rescue
 - the next work is making the materialized long-running path cheaper on the
   delivery path, and then extending the same model further across more of the
   long-running rescue surface
