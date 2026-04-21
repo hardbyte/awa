@@ -1236,10 +1236,15 @@ impl Client {
         let available_rows = if let Some(store) = effective_storage.queue_storage_store() {
             sqlx::query_as::<_, (String, i64)>(&format!(
                 r#"
-                SELECT queue, COALESCE(sum(available_count), 0)::bigint AS available
-                FROM {}.queue_lanes
-                GROUP BY queue
+                SELECT ready.queue, count(*)::bigint AS available
+                FROM {}.ready_entries AS ready
+                JOIN {}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                WHERE ready.lane_seq >= claims.claim_seq
+                GROUP BY ready.queue
                 "#,
+                store.schema(),
                 store.schema()
             ))
             .fetch_all(&self.pool)

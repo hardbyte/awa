@@ -39,6 +39,8 @@ The implementation and migrations use these physical names:
 - `terminal_entries` maps to `{schema}.done_entries`
 - `active_leases` maps to `{schema}.leases`
 - `lane_state` maps to `{schema}.queue_lanes`
+- enqueue heads map to `{schema}.queue_enqueue_heads`
+- claim heads map to `{schema}.queue_claim_heads`
 
 ### Physical layout
 
@@ -91,8 +93,13 @@ The implementation and migrations use these physical names:
 
 7. `lane_state` and segment cursor tables
 
-- Queue-local cursor metadata lives in a tiny hot table.
-- `lane_state` owns enqueue and claim cursors plus `available_count`.
+- Queue-local lane metadata is intentionally split so one row family does not
+  absorb every enqueue and claim mutation.
+- `lane_state` itself is reduced to stable per-lane identity and legacy
+  fallback fields. The mutable enqueue cursor lives in `queue_enqueue_heads`
+  and the mutable claim cursor lives in `queue_claim_heads`.
+- Availability is derived from `ready_entries` plus the claim head, not from a
+  hot cached `available_count` field on `lane_state`.
 - Completed-history rollups live in a separate cold cache table so prune can
   preserve queue counts without serializing on the hot `lane_state` rows.
 - Completion must not update `lane_state` on every terminal transition; the
@@ -108,6 +115,12 @@ The implementation and migrations use these physical names:
   physical segment is active, claimable, or prunable.
 - Rotation state for queue and lease segments is owned by the maintenance
   leader.
+- This split is an explicit response to the remaining MVCC hotspot discovered
+  during long-horizon event benchmarks: a single hot `queue_lanes` row per
+  `(queue, priority)` recreated dead-tuple pressure under pinned-reader
+  workloads even after the rest of the storage engine moved to append-only
+  structures. Separate enqueue/claim heads reduce that mutation frequency and
+  leave `lane_state` cold enough to survive long-running readers.
 
 ### Lifecycle mapping
 

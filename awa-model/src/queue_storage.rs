@@ -1278,6 +1278,34 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_enqueue_heads (
+                queue           TEXT NOT NULL,
+                priority        SMALLINT NOT NULL,
+                next_seq        BIGINT NOT NULL DEFAULT 1,
+                PRIMARY KEY (queue, priority)
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_claim_heads (
+                queue           TEXT NOT NULL,
+                priority        SMALLINT NOT NULL,
+                claim_seq       BIGINT NOT NULL DEFAULT 1,
+                PRIMARY KEY (queue, priority)
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
             CREATE TABLE IF NOT EXISTS {schema}.queue_terminal_rollups (
                 queue                  TEXT NOT NULL,
                 priority               SMALLINT NOT NULL,
@@ -1291,6 +1319,46 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             let mut backfill_tx = pool.begin().await.map_err(map_sqlx_error)?;
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.queue_enqueue_heads AS heads (
+                queue,
+                priority,
+                next_seq
+            )
+            SELECT
+                queue,
+                priority,
+                next_seq
+            FROM {schema}.queue_lanes
+            ON CONFLICT (queue, priority) DO UPDATE
+            SET next_seq = GREATEST(heads.next_seq, EXCLUDED.next_seq)
+            "#
+            ))
+            .execute(backfill_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.queue_claim_heads AS heads (
+                queue,
+                priority,
+                claim_seq
+            )
+            SELECT
+                queue,
+                priority,
+                claim_seq
+            FROM {schema}.queue_lanes
+            ON CONFLICT (queue, priority) DO UPDATE
+            SET claim_seq = GREATEST(heads.claim_seq, EXCLUDED.claim_seq)
+            "#
+            ))
+            .execute(backfill_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             INSERT INTO {schema}.queue_terminal_rollups AS rollups (
@@ -1728,15 +1796,24 @@ impl QueueStorage {
             DECLARE
                 lane_priority SMALLINT;
                 lane_claim_seq BIGINT;
-                lane_available_count BIGINT;
+                lane_next_seq BIGINT;
                 claim_limit BIGINT;
                 target_slot INT;
                 target_generation BIGINT;
                 sql TEXT;
             BEGIN
-                SELECT lanes.priority, lanes.claim_seq, lanes.available_count
-                INTO lane_priority, lane_claim_seq, lane_available_count
+                SELECT
+                    lanes.priority,
+                    claims.claim_seq,
+                    enqueues.next_seq
+                INTO lane_priority, lane_claim_seq, lane_next_seq
                 FROM {schema}.queue_lanes AS lanes
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = lanes.queue
+                 AND claims.priority = lanes.priority
+                JOIN {schema}.queue_enqueue_heads AS enqueues
+                  ON enqueues.queue = lanes.queue
+                 AND enqueues.priority = lanes.priority
                 WHERE lanes.queue = p_queue
                   AND NOT EXISTS (
                       SELECT 1
@@ -1744,8 +1821,7 @@ impl QueueStorage {
                       WHERE meta.queue = p_queue
                         AND meta.paused = TRUE
                   )
-                  AND lanes.claim_seq < lanes.next_seq
-                  AND lanes.available_count > 0
+                  AND claims.claim_seq < enqueues.next_seq
                 ORDER BY lanes.priority ASC
                 LIMIT 1
                 FOR UPDATE;
@@ -1764,14 +1840,14 @@ impl QueueStorage {
                 LIMIT 1;
 
                 IF NOT FOUND THEN
-                    UPDATE {schema}.queue_lanes AS lanes
-                    SET available_count = 0
-                    WHERE lanes.queue = p_queue
-                      AND lanes.priority = lane_priority;
+                    UPDATE {schema}.queue_claim_heads AS claims
+                    SET claim_seq = GREATEST(claims.claim_seq, lane_next_seq)
+                    WHERE claims.queue = p_queue
+                      AND claims.priority = lane_priority;
                     RETURN;
                 END IF;
 
-                claim_limit := LEAST(lane_available_count, p_max_batch);
+                claim_limit := LEAST(GREATEST(lane_next_seq - lane_claim_seq, 0), p_max_batch);
                 IF claim_limit <= 0 THEN
                     RETURN;
                 END IF;
@@ -1810,18 +1886,14 @@ impl QueueStorage {
                         LIMIT $5
                     ),
                     advanced AS (
-                        UPDATE {schema}.queue_lanes AS lanes
+                        UPDATE {schema}.queue_claim_heads AS claims
                         SET claim_seq = COALESCE(
                                 (SELECT max(lane_seq) + 1 FROM selected),
-                                lanes.claim_seq
-                            ),
-                            available_count = GREATEST(
-                                0,
-                                lanes.available_count - (SELECT count(*)::bigint FROM selected)
+                                claims.claim_seq
                             )
-                        WHERE lanes.queue = $1
-                          AND lanes.priority = $2
-                        RETURNING lanes.priority
+                        WHERE claims.queue = $1
+                          AND claims.priority = $2
+                        RETURNING claims.priority
                     ),
                     claimed AS (
                         INSERT INTO {schema}.leases (
@@ -1916,10 +1988,10 @@ impl QueueStorage {
                     p_deadline_secs;
 
                 IF NOT FOUND THEN
-                    UPDATE {schema}.queue_lanes AS lanes
-                    SET available_count = 0
-                    WHERE lanes.queue = p_queue
-                      AND lanes.priority = lane_priority;
+                    UPDATE {schema}.queue_claim_heads AS claims
+                    SET claim_seq = GREATEST(claims.claim_seq, lane_next_seq)
+                    WHERE claims.queue = p_queue
+                      AND claims.priority = lane_priority;
                 END IF;
             END;
             $func$
@@ -2180,6 +2252,32 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_enqueue_heads (queue, priority)
+            VALUES ($1, $2)
+            ON CONFLICT (queue, priority) DO NOTHING
+            "#
+        ))
+        .bind(queue)
+        .bind(priority)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_claim_heads (queue, priority)
+            VALUES ($1, $2)
+            ON CONFLICT (queue, priority) DO NOTHING
+            "#
+        ))
+        .bind(queue)
+        .bind(priority)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
         Ok(())
     }
 
@@ -2346,9 +2444,8 @@ impl QueueStorage {
             let count = lane_rows.len() as i64;
             let start_seq: i64 = sqlx::query_scalar(&format!(
                 r#"
-                UPDATE {schema}.queue_lanes
-                SET next_seq = next_seq + $3,
-                    available_count = available_count + $3
+                UPDATE {schema}.queue_enqueue_heads
+                SET next_seq = next_seq + $3
                 WHERE queue = $1 AND priority = $2
                 RETURNING next_seq - $3
                 "#
@@ -2425,9 +2522,8 @@ impl QueueStorage {
             let count = lane_rows.len() as i64;
             let start_seq: i64 = sqlx::query_scalar(&format!(
                 r#"
-                UPDATE {schema}.queue_lanes
-                SET next_seq = next_seq + $3,
-                    available_count = available_count + $3
+                UPDATE {schema}.queue_enqueue_heads
+                SET next_seq = next_seq + $3
                 WHERE queue = $1 AND priority = $2
                 RETURNING next_seq - $3
                 "#
@@ -2666,14 +2762,12 @@ impl QueueStorage {
     where
         I: IntoIterator<Item = (String, i16, i64, i64)>,
     {
-        let mut grouped: BTreeMap<(String, i16), (i64, i64)> = BTreeMap::new();
+        let mut grouped: BTreeMap<(String, i16), i64> = BTreeMap::new();
         for (queue, priority, available_delta, pruned_completed_delta) in deltas {
             if available_delta == 0 && pruned_completed_delta == 0 {
                 continue;
             }
-            let entry = grouped.entry((queue, priority)).or_insert((0_i64, 0_i64));
-            entry.0 += available_delta;
-            entry.1 += pruned_completed_delta;
+            *grouped.entry((queue, priority)).or_insert(0_i64) += pruned_completed_delta;
         }
 
         if grouped.is_empty() {
@@ -2683,30 +2777,26 @@ impl QueueStorage {
         let schema = self.schema();
         let mut queues = Vec::with_capacity(grouped.len());
         let mut priorities = Vec::with_capacity(grouped.len());
-        let mut available_deltas = Vec::with_capacity(grouped.len());
         let mut pruned_completed_deltas = Vec::with_capacity(grouped.len());
 
-        for ((queue, priority), (available_delta, pruned_completed_delta)) in grouped {
+        for ((queue, priority), pruned_completed_delta) in grouped {
             queues.push(queue);
             priorities.push(priority);
-            available_deltas.push(available_delta);
             pruned_completed_deltas.push(pruned_completed_delta);
         }
 
         sqlx::query(&format!(
             r#"
-            WITH deltas(queue, priority, available_delta, pruned_completed_delta) AS (
+            WITH deltas(queue, priority, pruned_completed_delta) AS (
                 SELECT *
                 FROM unnest(
                     $1::text[],
                     $2::smallint[],
-                    $3::bigint[],
-                    $4::bigint[]
+                    $3::bigint[]
                 )
             )
             UPDATE {schema}.queue_lanes
-            SET available_count = GREATEST(0, queue_lanes.available_count + deltas.available_delta),
-                pruned_completed_count = GREATEST(
+            SET pruned_completed_count = GREATEST(
                     0,
                     queue_lanes.pruned_completed_count + deltas.pruned_completed_delta
                 )
@@ -2717,7 +2807,6 @@ impl QueueStorage {
         ))
         .bind(&queues)
         .bind(&priorities)
-        .bind(&available_deltas)
         .bind(&pruned_completed_deltas)
         .execute(tx.as_mut())
         .await
@@ -3326,9 +3415,13 @@ impl QueueStorage {
             r#"
             WITH lane_counts AS (
                 SELECT
-                    COALESCE(sum(available_count), 0)::bigint AS available
-                FROM {schema}.queue_lanes
-                WHERE queue = $1
+                    count(*)::bigint AS available
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                WHERE ready.queue = $1
+                  AND ready.lane_seq >= claims.claim_seq
             ),
             pruned_terminal AS (
                 SELECT COALESCE(
@@ -3592,11 +3685,11 @@ impl QueueStorage {
                     ready.priority,
                     ready.lane_seq
                 FROM {schema}.ready_entries AS ready
-                JOIN {schema}.queue_lanes AS lanes
-                  ON lanes.queue = ready.queue
-                 AND lanes.priority = ready.priority
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
                 WHERE ready.job_id = $1
-                  AND ready.lane_seq >= lanes.claim_seq
+                  AND ready.lane_seq >= claims.claim_seq
                 ORDER BY ready.lane_seq DESC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -3632,8 +3725,6 @@ impl QueueStorage {
                     .clone()
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
-                .await?;
-            self.adjust_lane_counts(tx, &ready.queue, ready.priority, -1, 0)
                 .await?;
             return Ok(Some(done.into_job_row()?));
         }
@@ -3802,10 +3893,10 @@ impl QueueStorage {
                     ready.priority,
                     ready.lane_seq
                 FROM {schema}.ready_entries AS ready
-                JOIN {schema}.queue_lanes AS lanes
-                  ON lanes.queue = ready.queue
-                 AND lanes.priority = ready.priority
-                WHERE ready.lane_seq >= lanes.claim_seq
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                WHERE ready.lane_seq >= claims.claim_seq
                   AND ready.priority > 1
                   AND ready.run_at <= $1
                 ORDER BY ready.run_at ASC, ready.lane_seq ASC
@@ -3845,15 +3936,11 @@ impl QueueStorage {
 
         let mut ids = Vec::with_capacity(moved.len());
         let mut queues = BTreeSet::new();
-        let mut old_lane_counts: BTreeMap<(String, i16), i64> = BTreeMap::new();
         let mut ready_rows = Vec::with_capacity(moved.len());
 
         for row in moved {
             ids.push(row.job_id);
             queues.insert(row.queue.clone());
-            *old_lane_counts
-                .entry((row.queue.clone(), row.priority))
-                .or_default() += 1;
 
             let mut payload = RuntimePayload::from_json(row.payload)?;
             let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
@@ -3881,11 +3968,6 @@ impl QueueStorage {
                 unique_states: row.unique_states,
                 payload: payload.into_json(),
             });
-        }
-
-        for ((queue, priority), count) in old_lane_counts {
-            self.adjust_lane_counts(&mut tx, &queue, priority, -count, 0)
-                .await?;
         }
 
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))

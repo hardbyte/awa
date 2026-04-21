@@ -266,10 +266,10 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
                 ready.run_at,
                 NULL::timestamptz AS finalized_at
             FROM {schema}.ready_entries AS ready
-            JOIN {schema}.queue_lanes AS lanes
-              ON lanes.queue = ready.queue
-             AND lanes.priority = ready.priority
-            WHERE ready.lane_seq >= lanes.claim_seq
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = ready.queue
+             AND claims.priority = ready.priority
+            WHERE ready.lane_seq >= claims.claim_seq
         ),
         current_jobs AS (
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
@@ -501,10 +501,10 @@ pub async fn cancel_by_unique_key(
             WITH current_available AS (
                 SELECT ready.job_id, ready.unique_key
                 FROM {schema}.ready_entries AS ready
-                JOIN {schema}.queue_lanes AS lanes
-                  ON lanes.queue = ready.queue
-                 AND lanes.priority = ready.priority
-                WHERE ready.lane_seq >= lanes.claim_seq
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                WHERE ready.lane_seq >= claims.claim_seq
             ),
             candidates AS (
                 SELECT job_id
@@ -2122,7 +2122,14 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
             r#"
             SELECT
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
-                COALESCE((SELECT sum(available_count)::bigint FROM {schema}.queue_lanes), 0) AS available,
+                COALESCE((
+                    SELECT count(*)::bigint
+                    FROM {schema}.ready_entries AS ready
+                    JOIN {schema}.queue_claim_heads AS claims
+                      ON claims.queue = ready.queue
+                     AND claims.priority = ready.priority
+                    WHERE ready.lane_seq >= claims.claim_seq
+                ), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'), 0) AS completed,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'retryable'), 0) AS retryable,

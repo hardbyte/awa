@@ -482,12 +482,19 @@ BEGIN
         VALUES (v_queue, v_priority)
         ON CONFLICT ON CONSTRAINT queue_lanes_pkey DO NOTHING;
 
-        UPDATE queue_lanes AS lanes
-        SET next_seq = lanes.next_seq + 1,
-            available_count = lanes.available_count + 1
-        WHERE lanes.queue = v_queue
-          AND lanes.priority = v_priority
-        RETURNING lanes.next_seq - 1
+        INSERT INTO queue_enqueue_heads (queue, priority)
+        VALUES (v_queue, v_priority)
+        ON CONFLICT (queue, priority) DO NOTHING;
+
+        INSERT INTO queue_claim_heads (queue, priority)
+        VALUES (v_queue, v_priority)
+        ON CONFLICT (queue, priority) DO NOTHING;
+
+        UPDATE queue_enqueue_heads AS heads
+        SET next_seq = heads.next_seq + 1
+        WHERE heads.queue = v_queue
+          AND heads.priority = v_priority
+        RETURNING heads.next_seq - 1
         INTO v_lane_seq;
 
         SELECT ring.current_slot, ring.generation
@@ -754,10 +761,10 @@ BEGIN
                 ready.run_lease,
                 NULLIF(ready.payload->'progress', 'null'::jsonb) AS progress
             FROM %1$I.ready_entries AS ready
-            JOIN %1$I.queue_lanes AS lanes
-              ON lanes.queue = ready.queue
-             AND lanes.priority = ready.priority
-            WHERE ready.lane_seq >= lanes.claim_seq
+            JOIN %1$I.queue_claim_heads AS claims
+              ON claims.queue = ready.queue
+             AND claims.priority = ready.priority
+            WHERE ready.lane_seq >= claims.claim_seq
         )
         SELECT
             current_available.id,
@@ -1022,13 +1029,6 @@ BEGIN
     USING p_id;
 
     IF FOUND THEN
-        EXECUTE format(
-            'UPDATE %I.queue_lanes
-             SET available_count = GREATEST(0, available_count - 1)
-             WHERE queue = $1 AND priority = $2',
-            v_schema
-        )
-        USING v_queue, v_priority;
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,

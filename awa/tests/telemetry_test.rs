@@ -168,11 +168,11 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
             "SELECT COUNT(*)::bigint FROM (\
                  SELECT 'available'::awa.job_state AS state \
                  FROM {schema}.ready_entries AS ready \
-                 JOIN {schema}.queue_lanes AS lanes \
-                   ON lanes.queue = ready.queue \
-                  AND lanes.priority = ready.priority \
+                 JOIN {schema}.queue_claim_heads AS claims \
+                   ON claims.queue = ready.queue \
+                  AND claims.priority = ready.priority \
                  WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= lanes.claim_seq \
+                   AND ready.lane_seq >= claims.claim_seq \
                  UNION ALL \
                  SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
                  UNION ALL \
@@ -208,11 +208,11 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
             "SELECT state::text, COUNT(*)::bigint FROM (\
                  SELECT 'available'::awa.job_state AS state \
                  FROM {schema}.ready_entries AS ready \
-                 JOIN {schema}.queue_lanes AS lanes \
-                   ON lanes.queue = ready.queue \
-                  AND lanes.priority = ready.priority \
+                 JOIN {schema}.queue_claim_heads AS claims \
+                   ON claims.queue = ready.queue \
+                  AND claims.priority = ready.priority \
                  WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= lanes.claim_seq \
+                   AND ready.lane_seq >= claims.claim_seq \
                  UNION ALL \
                  SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
                  UNION ALL \

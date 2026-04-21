@@ -540,7 +540,21 @@ async fn overlap_reader(
             }
             _ => {
                 let query = format!(
-                    "SELECT COALESCE(sum(available_count + pruned_completed_count), 0)::bigint FROM {schema}.queue_lanes WHERE queue = $1"
+                    "WITH available AS (\
+                         SELECT count(*)::bigint AS current_available \
+                         FROM {schema}.ready_entries AS ready \
+                         JOIN {schema}.queue_claim_heads AS claims \
+                           ON claims.queue = ready.queue \
+                          AND claims.priority = ready.priority \
+                         WHERE ready.queue = $1 \
+                           AND ready.lane_seq >= claims.claim_seq\
+                     ), pruned AS (\
+                         SELECT COALESCE(sum(pruned_completed_count), 0)::bigint AS terminal_rollup \
+                         FROM {schema}.queue_terminal_rollups \
+                         WHERE queue = $1\
+                     ) \
+                     SELECT available.current_available + pruned.terminal_rollup \
+                     FROM available CROSS JOIN pruned"
                 );
                 let _: i64 = sqlx::query_scalar(&query)
                     .bind(&queue)
