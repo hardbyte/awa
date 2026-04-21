@@ -1812,6 +1812,7 @@ mod tests {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         })
         .expect("Failed to build queue storage store");
         drop_queue_storage_schema(pool, schema).await;
@@ -2097,6 +2098,7 @@ mod tests {
             schema: queue_storage_schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         };
         let drain_only_client = {
             let queue_storage_short_seen = queue_storage_short_seen.clone();
@@ -2281,6 +2283,7 @@ mod tests {
             schema: queue_storage_schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         };
 
         prepare_queue_storage_transition(&pool, queue_storage_schema).await;

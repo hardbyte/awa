@@ -299,3 +299,45 @@ The next real storage redesign should be:
 That is the design most likely to remove the remaining lease-plane dead-tuple
 pressure without giving up Awa's dispatch, rescue, callback, and stale-writer
 guarantees.
+
+## Narrow implementation spike
+
+There is now a narrow experimental path in the branch for **short successful
+jobs only**:
+
+- append-only `lease_claims`
+- append-only `lease_claim_closures`
+- no mutable `leases` row
+- no `attempt_state` row
+- guarded so it only activates when queue `deadline_duration = 0`
+
+That spike is deliberately not the full redesign above. It exists to answer one
+question: does removing the insert/delete churn on short claims materially help
+steady-state MVCC behavior?
+
+### Measured result
+
+Short portable profile, `awa` only, before vs after the short-job receipt path:
+
+- `clean_1` median dead tuples: `1647.5 -> 178.5`
+- `readers_1` median dead tuples: `2927.0 -> 727.0`
+- `pressure_1` median dead tuples: `2882.5 -> 610.5`
+- `recovery_1` median dead tuples: `1971.5 -> 218.0`
+
+Throughput stayed effectively flat in the same profile:
+
+- `clean_1`: `~800/s`
+- `readers_1`: `~800/s`
+- `pressure_1`: `~1200/s`
+- `recovery_1`: `~800/s`
+
+The trade-off in the current spike is latency:
+
+- subscriber / end-to-end p99 got worse, especially in `pressure_1` and
+  `recovery_1`
+
+So the spike validates the direction:
+
+- append-only short-claim receipts dramatically reduce steady-state dead tuples
+- the remaining work is making that lease plane cheaper on the delivery path,
+  and then extending it safely to long-running / rescuable attempts

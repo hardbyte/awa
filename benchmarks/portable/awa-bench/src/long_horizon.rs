@@ -208,6 +208,8 @@ fn queue_storage_event_tables(
         format!("{schema}.queue_ring_slots"),
         format!("{schema}.lease_ring_state"),
         format!("{schema}.lease_ring_slots"),
+        format!("{schema}.lease_claims"),
+        format!("{schema}.lease_claim_closures"),
         format!("{schema}.queue_lanes"),
         format!("{schema}.attempt_state"),
         format!("{schema}.deferred_jobs"),
@@ -267,7 +269,9 @@ pub async fn run() {
         .connect(&database_url)
         .await
         .expect("Failed to connect to database");
-    let (store, storage) = super::prepare_queue_storage(&pool).await;
+    let storage = super::queue_storage_config_with_experimental_default(true);
+    let use_lease_claim_receipts = storage.experimental_lease_claim_receipts;
+    let (store, storage) = super::prepare_queue_storage_with_config(&pool, storage).await;
     emit_descriptor(&db_name, &store);
 
     let queue_name = "awa_longhorizon_bench";
@@ -301,6 +305,11 @@ pub async fn run() {
             QueueConfig {
                 max_workers: worker_count,
                 poll_interval: Duration::from_millis(50),
+                deadline_duration: if use_lease_claim_receipts {
+                    Duration::ZERO
+                } else {
+                    QueueConfig::default().deadline_duration
+                },
                 ..QueueConfig::default()
             },
         )

@@ -30,7 +30,13 @@ use std::time::{Duration, Instant};
 
 // ── Queue-storage configuration ───────────────────────────────────
 
-fn queue_storage_config() -> QueueStorageConfig {
+pub(crate) fn queue_storage_config_with_experimental_default(
+    experimental_default: bool,
+) -> QueueStorageConfig {
+    let experimental_lease_claim_receipts = std::env::var("EXPERIMENTAL_LEASE_CLAIM_RECEIPTS")
+        .ok()
+        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
+        .unwrap_or(experimental_default);
     QueueStorageConfig {
         schema: std::env::var("QUEUE_STORAGE_SCHEMA").unwrap_or_else(|_| "awa_exp".into()),
         queue_slot_count: std::env::var("QUEUE_SLOT_COUNT")
@@ -41,7 +47,12 @@ fn queue_storage_config() -> QueueStorageConfig {
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8),
+        experimental_lease_claim_receipts,
     }
+}
+
+fn queue_storage_config() -> QueueStorageConfig {
+    queue_storage_config_with_experimental_default(false)
 }
 
 fn queue_rotate_interval() -> Duration {
@@ -66,8 +77,15 @@ fn lease_rotate_interval() -> Duration {
 /// backend so inserts through `awa.jobs` route into it and slot state
 /// starts from a clean baseline for each benchmark run.
 async fn prepare_queue_storage(pool: &PgPool) -> (QueueStorage, QueueStorageConfig) {
+    prepare_queue_storage_with_config(pool, queue_storage_config())
+        .await
+}
+
+pub(crate) async fn prepare_queue_storage_with_config(
+    pool: &PgPool,
+    config: QueueStorageConfig,
+) -> (QueueStorage, QueueStorageConfig) {
     migrations::run(pool).await.unwrap();
-    let config = queue_storage_config();
     let store = QueueStorage::new(config.clone()).expect("Invalid QueueStorageConfig");
     store
         .install(pool)
@@ -163,6 +181,24 @@ async fn count_by_state(
             FROM {schema}.leases
             WHERE queue = $1
             GROUP BY state
+
+            UNION ALL
+
+            SELECT 'running'::text AS state, count(*)::bigint AS count
+            FROM {schema}.lease_claims AS claims
+            WHERE queue = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.job_id = claims.job_id
+                    AND closures.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.leases AS lease
+                  WHERE lease.job_id = claims.job_id
+                    AND lease.run_lease = claims.run_lease
+              )
 
             UNION ALL
 

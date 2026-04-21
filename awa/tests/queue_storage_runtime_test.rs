@@ -218,13 +218,8 @@ async fn activate_queue_storage_transition(pool: &sqlx::PgPool, schema: &str) {
         .expect("Failed to remove queue storage gate runtime");
 }
 
-async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
-    let store = QueueStorage::new(QueueStorageConfig {
-        schema: schema.to_string(),
-        queue_slot_count: 4,
-        lease_slot_count: 2,
-    })
-    .expect("Failed to create queue_storage store");
+async fn create_store_with_config(pool: &sqlx::PgPool, config: QueueStorageConfig) -> QueueStorage {
+    let store = QueueStorage::new(config).expect("Failed to create queue_storage store");
     recreate_store_schema(pool, &store).await;
     reset_shared_awa_state(pool).await;
     storage::abort(pool)
@@ -235,8 +230,21 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
         .await
         .expect("Failed to prepare store schema");
     store.reset(pool).await.expect("Failed to reset store");
-    activate_queue_storage_transition(pool, schema).await;
+    activate_queue_storage_transition(pool, store.schema()).await;
     store
+}
+
+async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
+    create_store_with_config(
+        pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
@@ -250,18 +258,54 @@ async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         .expect("Failed to count attempt_state rows")
 }
 
+async fn lease_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!("SELECT count(*)::bigint FROM {}.leases", store.schema());
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count leases")
+}
+
+async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.lease_claims",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count lease_claims")
+}
+
+async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let sql = format!(
+        "SELECT count(*)::bigint FROM {}.lease_claim_closures",
+        store.schema()
+    );
+    sqlx::query_scalar::<_, i64>(&sql)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to count lease_claim_closures")
+}
+
 fn queue_storage_client<W: Worker + 'static>(
     pool: &sqlx::PgPool,
     queue: &str,
     store_config: QueueStorageConfig,
     worker: W,
 ) -> Client {
+    let deadline_duration = if store_config.experimental_lease_claim_receipts {
+        Duration::ZERO
+    } else {
+        QueueConfig::default().deadline_duration
+    };
     Client::builder(pool.clone())
         .queue(
             queue,
             QueueConfig {
                 max_workers: 4,
                 poll_interval: Duration::from_millis(25),
+                deadline_duration,
                 ..QueueConfig::default()
             },
         )
@@ -634,6 +678,7 @@ async fn test_queue_storage_runtime_retry_after() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         RetryOnceWorker,
     );
@@ -664,6 +709,7 @@ async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
         schema: schema.to_string(),
         queue_slot_count: 4,
         lease_slot_count: 2,
+        ..Default::default()
     };
 
     let seen = Arc::new(Mutex::new(HashSet::new()));
@@ -1109,6 +1155,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         BlockingCompleteWorker {
             release: release.clone(),
@@ -1159,6 +1206,139 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_short_job";
+    let schema = "awa_qs_runtime_lease_claim_short";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+        BlockingCompleteWorker {
+            release: release.clone(),
+        },
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start lease-claim client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
+    let running_counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to load queue counts while receipt-backed job is running");
+    assert_eq!(running_counts.running, 1);
+
+    release.notify_waiters();
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    let completed_counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to load queue counts after receipt-backed completion");
+    assert_eq!(completed_counts.running, 0);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_deadline_guard";
+    let schema = "awa_qs_runtime_lease_claim_deadline_guard";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+
+    let _job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 3 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let err = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(1))
+        .await
+        .expect_err("receipt-backed claims must reject non-zero deadlines");
+    match err {
+        AwaError::Validation(msg) => {
+            assert!(
+                msg.contains("require queue deadline_duration=0"),
+                "unexpected validation message: {msg}"
+            );
+        }
+        other => panic!("expected Validation error, got {other:?}"),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_snooze() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -1183,6 +1363,7 @@ async fn test_queue_storage_runtime_snooze() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         SnoozeOnceWorker {
             seen: Arc::new(AtomicBool::new(false)),
@@ -1237,6 +1418,7 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -1316,6 +1498,7 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -1431,6 +1614,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         BlockingCompleteWorker {
             release: release.clone(),
@@ -1714,6 +1898,7 @@ async fn test_queue_storage_runtime_complete_external() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         CallbackWorker {
             timeout: Duration::from_secs(30),
@@ -1785,6 +1970,7 @@ async fn test_queue_storage_runtime_terminal_failure_moves_to_dlq() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -1853,6 +2039,7 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -1925,6 +2112,7 @@ async fn test_queue_storage_dlq_api_round_trip() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -2029,6 +2217,7 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         TerminalFailureWorker,
     );
@@ -2114,6 +2303,7 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -2184,6 +2374,7 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         TerminalFailureWorker,
     );
@@ -2245,6 +2436,7 @@ async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         TerminalFailureWorker,
     );
@@ -2320,6 +2512,7 @@ async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conf
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         TerminalFailureWorker,
     );
@@ -2388,6 +2581,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            ..Default::default()
         },
         TerminalFailureWorker,
     );
@@ -2461,6 +2655,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),

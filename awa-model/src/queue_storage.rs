@@ -19,6 +19,7 @@ pub struct QueueStorageConfig {
     pub schema: String,
     pub queue_slot_count: usize,
     pub lease_slot_count: usize,
+    pub experimental_lease_claim_receipts: bool,
 }
 
 impl Default for QueueStorageConfig {
@@ -27,6 +28,7 @@ impl Default for QueueStorageConfig {
             schema: DEFAULT_SCHEMA.to_string(),
             queue_slot_count: DEFAULT_QUEUE_SLOT_COUNT,
             lease_slot_count: DEFAULT_LEASE_SLOT_COUNT,
+            experimental_lease_claim_receipts: false,
         }
     }
 }
@@ -40,6 +42,7 @@ pub struct ClaimedEntry {
     pub ready_generation: i64,
     pub lease_slot: i32,
     pub lease_generation: i64,
+    pub lease_claim_receipt: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -379,7 +382,7 @@ struct ReadyJobLeaseRow {
 }
 
 impl ReadyJobLeaseRow {
-    fn claim_ref(&self) -> ClaimedEntry {
+    fn claim_ref(&self, lease_claim_receipt: bool) -> ClaimedEntry {
         ClaimedEntry {
             queue: self.queue.clone(),
             priority: self.priority,
@@ -388,6 +391,7 @@ impl ReadyJobLeaseRow {
             ready_generation: self.ready_generation,
             lease_slot: self.lease_slot,
             lease_generation: self.lease_generation,
+            lease_claim_receipt,
         }
     }
 
@@ -425,8 +429,11 @@ impl ReadyJobLeaseRow {
         })
     }
 
-    fn into_claimed_runtime_job(self) -> Result<ClaimedRuntimeJob, AwaError> {
-        let claim = self.claim_ref();
+    fn into_claimed_runtime_job(
+        self,
+        lease_claim_receipt: bool,
+    ) -> Result<ClaimedRuntimeJob, AwaError> {
+        let claim = self.claim_ref(lease_claim_receipt);
         let unique_states = self.unique_states.clone();
         let job = self.into_job_row()?;
         Ok(ClaimedRuntimeJob {
@@ -1033,6 +1040,14 @@ impl QueueStorage {
         self.config.lease_slot_count
     }
 
+    pub fn experimental_lease_claim_receipts(&self) -> bool {
+        self.config.experimental_lease_claim_receipts
+    }
+
+    fn use_lease_claim_receipts_for_runtime(&self, deadline_duration: Duration) -> bool {
+        self.experimental_lease_claim_receipts() && deadline_duration.is_zero()
+    }
+
     pub fn ready_child_relname(&self, slot: usize) -> String {
         format!("ready_entries_{slot}")
     }
@@ -1043,6 +1058,14 @@ impl QueueStorage {
 
     pub fn leases_relname(&self) -> &'static str {
         "leases"
+    }
+
+    pub fn lease_claims_relname(&self) -> &'static str {
+        "lease_claims"
+    }
+
+    pub fn lease_claim_closures_relname(&self) -> &'static str {
+        "lease_claim_closures"
     }
 
     pub fn leases_child_relname(&self, slot: usize) -> String {
@@ -1173,6 +1196,102 @@ impl QueueStorage {
                 .execute(pool)
                 .await
                 .map_err(map_sqlx_error)?;
+
+            let claimed_cte = if self.experimental_lease_claim_receipts() {
+                format!(
+                    r#"
+                    claimed AS (
+                        INSERT INTO {schema}.lease_claims (
+                            job_id,
+                            run_lease,
+                            ready_slot,
+                            ready_generation,
+                            queue,
+                            priority,
+                            attempt,
+                            max_attempts,
+                            lane_seq
+                        )
+                        SELECT
+                            selected.job_id,
+                            selected.run_lease + 1,
+                            selected.ready_slot,
+                            selected.ready_generation,
+                            selected.queue,
+                            selected.priority,
+                            selected.attempt + 1,
+                            selected.max_attempts,
+                            selected.lane_seq
+                        FROM selected
+                        RETURNING
+                            ready_slot,
+                            ready_generation,
+                            queue,
+                            priority,
+                            lane_seq,
+                            attempt,
+                            run_lease,
+                            max_attempts
+                    )
+                    "#
+                )
+            } else {
+                format!(
+                    r#"
+                    claimed AS (
+                        INSERT INTO {schema}.leases (
+                            lease_slot,
+                            lease_generation,
+                            ready_slot,
+                            ready_generation,
+                            job_id,
+                            queue,
+                            state,
+                            priority,
+                            attempt,
+                            run_lease,
+                            max_attempts,
+                            lane_seq,
+                            heartbeat_at,
+                            deadline_at,
+                            attempted_at
+                        )
+                        SELECT
+                            lease_ring.lease_slot,
+                            lease_ring.lease_generation,
+                            selected.ready_slot,
+                            selected.ready_generation,
+                            selected.job_id,
+                            selected.queue,
+                            'running'::awa.job_state,
+                            selected.priority,
+                            selected.attempt + 1,
+                            selected.run_lease + 1,
+                            selected.max_attempts,
+                            selected.lane_seq,
+                            clock_timestamp(),
+                            clock_timestamp() + make_interval(secs => $6),
+                            clock_timestamp()
+                        FROM selected
+                        CROSS JOIN lease_ring
+                        RETURNING
+                            ready_slot,
+                            ready_generation,
+                            lease_slot,
+                            lease_generation,
+                            queue,
+                            priority,
+                            lane_seq,
+                            attempt,
+                            run_lease,
+                            max_attempts,
+                            heartbeat_at,
+                            deadline_at,
+                            attempted_at
+                    )
+                    "#
+                )
+            };
 
             sqlx::query(&format!(
                 r#"
@@ -1431,6 +1550,42 @@ impl QueueStorage {
                 callback_timeout_at TIMESTAMPTZ,
                 PRIMARY KEY (lease_slot, queue, priority, lane_seq)
             ) PARTITION BY LIST (lease_slot)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.lease_claims (
+                job_id            BIGINT NOT NULL,
+                run_lease         BIGINT NOT NULL,
+                ready_slot        INT NOT NULL,
+                ready_generation  BIGINT NOT NULL,
+                queue             TEXT NOT NULL,
+                priority          SMALLINT NOT NULL,
+                attempt           SMALLINT NOT NULL,
+                max_attempts      SMALLINT NOT NULL,
+                lane_seq          BIGINT NOT NULL,
+                claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (job_id, run_lease)
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.lease_claim_closures (
+                job_id            BIGINT NOT NULL,
+                run_lease         BIGINT NOT NULL,
+                outcome           TEXT NOT NULL,
+                closed_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (job_id, run_lease)
+            )
             "#
             ))
             .execute(pool)
@@ -1895,63 +2050,13 @@ impl QueueStorage {
                           AND claims.priority = $2
                         RETURNING claims.priority
                     ),
-                    claimed AS (
-                        INSERT INTO {schema}.leases (
-                            lease_slot,
-                            lease_generation,
-                            ready_slot,
-                            ready_generation,
-                            job_id,
-                            queue,
-                            state,
-                            priority,
-                            attempt,
-                            run_lease,
-                            max_attempts,
-                            lane_seq,
-                            heartbeat_at,
-                            deadline_at,
-                            attempted_at
-                        )
-                        SELECT
-                            lease_ring.lease_slot,
-                            lease_ring.lease_generation,
-                            selected.ready_slot,
-                            selected.ready_generation,
-                            selected.job_id,
-                            selected.queue,
-                            'running'::awa.job_state,
-                            selected.priority,
-                            selected.attempt + 1,
-                            selected.run_lease + 1,
-                            selected.max_attempts,
-                            selected.lane_seq,
-                            clock_timestamp(),
-                            clock_timestamp() + make_interval(secs => $6),
-                            clock_timestamp()
-                        FROM selected
-                        CROSS JOIN lease_ring
-                        RETURNING
-                            ready_slot,
-                            ready_generation,
-                            lease_slot,
-                            lease_generation,
-                            queue,
-                            priority,
-                            lane_seq,
-                            attempt,
-                            run_lease,
-                            max_attempts,
-                            heartbeat_at,
-                            deadline_at,
-                            attempted_at
-                    )
+                    {claimed_cte}
                     SELECT
                         claimed.ready_slot,
                         claimed.ready_generation,
                         claimed.lane_seq,
-                        claimed.lease_slot,
-                        claimed.lease_generation,
+                        lease_ring.lease_slot,
+                        lease_ring.lease_generation,
                         selected.job_id,
                         selected.kind,
                         selected.queue,
@@ -1961,14 +2066,24 @@ impl QueueStorage {
                         claimed.run_lease,
                         claimed.max_attempts,
                         selected.run_at,
-                        claimed.heartbeat_at,
-                        claimed.deadline_at,
-                        claimed.attempted_at,
+                        CASE
+                            WHEN $6 > 0 THEN clock_timestamp()
+                            ELSE NULL::timestamptz
+                        END AS heartbeat_at,
+                        CASE
+                            WHEN $6 > 0 THEN clock_timestamp() + make_interval(secs => $6)
+                            ELSE NULL::timestamptz
+                        END AS deadline_at,
+                        CASE
+                            WHEN $6 > 0 THEN clock_timestamp()
+                            ELSE NULL::timestamptz
+                        END AS attempted_at,
                         selected.created_at,
                         selected.unique_key,
                         selected.unique_states,
                         selected.payload
                     FROM claimed
+                    CROSS JOIN lease_ring
                     JOIN selected
                       ON selected.ready_slot = claimed.ready_slot
                      AND selected.ready_generation = claimed.ready_generation
@@ -1995,7 +2110,8 @@ impl QueueStorage {
                 END IF;
             END;
             $func$
-            "#
+            "#,
+                claimed_cte = claimed_cte
             ))
             .execute(pool)
             .await
@@ -2156,6 +2272,8 @@ impl QueueStorage {
                 {schema}.done_entries,
                 {schema}.dlq_entries,
                 {schema}.leases,
+                {schema}.lease_claims,
+                {schema}.lease_claim_closures,
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
@@ -3050,7 +3168,7 @@ impl QueueStorage {
             .claim_ready_rows_tx(&mut tx, queue, max_batch, Duration::ZERO)
             .await?
             .into_iter()
-            .map(|row| row.claim_ref())
+            .map(|row| row.claim_ref(self.experimental_lease_claim_receipts()))
             .collect();
 
         tx.commit().await.map_err(map_sqlx_error)?;
@@ -3067,6 +3185,12 @@ impl QueueStorage {
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
         if max_batch <= 0 {
             return Ok(Vec::new());
+        }
+
+        if self.experimental_lease_claim_receipts() && !deadline_duration.is_zero() {
+            return Err(AwaError::Validation(
+                "experimental lease-claim receipts require queue deadline_duration=0".to_string(),
+            ));
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
@@ -3088,9 +3212,10 @@ impl QueueStorage {
 
         tx.commit().await.map_err(map_sqlx_error)?;
 
+        let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
         claimed
             .into_iter()
-            .map(ReadyJobLeaseRow::into_claimed_runtime_job)
+            .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
             .collect()
     }
 
@@ -3223,6 +3348,80 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
+        let claimed_map: BTreeMap<(i64, i64), ClaimedRuntimeJob> = claimed
+            .iter()
+            .cloned()
+            .map(|entry| ((entry.job.id, entry.job.run_lease), entry))
+            .collect();
+
+        if self.experimental_lease_claim_receipts() {
+            let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
+            let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
+            let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
+                r#"
+                WITH completed(job_id, run_lease) AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                ),
+                inserted AS (
+                    INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
+                    SELECT claims.job_id, claims.run_lease, 'completed', clock_timestamp()
+                    FROM {schema}.lease_claims AS claims
+                    JOIN completed
+                      ON completed.job_id = claims.job_id
+                     AND completed.run_lease = claims.run_lease
+                    ON CONFLICT (job_id, run_lease) DO NOTHING
+                    RETURNING job_id, run_lease
+                )
+                SELECT job_id, run_lease
+                FROM inserted
+                "#
+            ))
+            .bind(&job_ids)
+            .bind(&run_leases)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if updated.is_empty() {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                return Ok(Vec::new());
+            }
+
+            let updated_job_ids: Vec<i64> = updated.iter().map(|(job_id, _)| *job_id).collect();
+            let updated_run_leases: Vec<i64> =
+                updated.iter().map(|(_, run_lease)| *run_lease).collect();
+
+            sqlx::query(&format!(
+                r#"
+                WITH completed(job_id, run_lease) AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                )
+                DELETE FROM {schema}.attempt_state AS attempt
+                USING completed
+                WHERE attempt.job_id = completed.job_id
+                  AND attempt.run_lease = completed.run_lease
+                "#
+            ))
+            .bind(&updated_job_ids)
+            .bind(&updated_run_leases)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let finalized_at = Utc::now();
+            let mut done_rows = Vec::with_capacity(updated.len());
+            for (job_id, run_lease) in &updated {
+                if let Some(runtime_job) = claimed_map.get(&(*job_id, *run_lease)).cloned() {
+                    done_rows.push(runtime_job.into_done_row(finalized_at)?);
+                }
+            }
+
+            self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                .await?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(updated);
+        }
+
         let lease_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.lease_slot).collect();
         let queues: Vec<String> = claimed
             .iter()
@@ -3295,12 +3494,6 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
-
-        let claimed_map: BTreeMap<(i64, i64), ClaimedRuntimeJob> = claimed
-            .iter()
-            .cloned()
-            .map(|entry| ((entry.job.id, entry.job.run_lease), entry))
-            .collect();
 
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(deleted.len());
@@ -3446,10 +3639,32 @@ impl QueueStorage {
                 USING (queue, priority)
             ),
             live_running AS (
-                SELECT count(*)::bigint AS running
-                FROM {schema}.leases
-                WHERE queue = $1
-                  AND state = 'running'
+                SELECT (
+                    COALESCE((
+                        SELECT count(*)::bigint
+                        FROM {schema}.leases
+                        WHERE queue = $1
+                          AND state = 'running'
+                    ), 0)
+                    +
+                    COALESCE((
+                        SELECT count(*)::bigint
+                        FROM {schema}.lease_claims AS claims
+                        WHERE claims.queue = $1
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.lease_claim_closures AS closures
+                              WHERE closures.job_id = claims.job_id
+                                AND closures.run_lease = claims.run_lease
+                          )
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {schema}.leases AS lease
+                              WHERE lease.job_id = claims.job_id
+                                AND lease.run_lease = claims.run_lease
+                          )
+                    ), 0)
+                )::bigint AS running
             ),
             live_terminal AS (
                 SELECT count(*)::bigint AS completed
@@ -4350,6 +4565,72 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         for row in lease_rows {
+            candidates.push(row.into_job_row()?);
+        }
+
+        let lease_claim_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                claims.ready_slot,
+                claims.ready_generation,
+                claims.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                'running'::awa.job_state AS state,
+                claims.priority,
+                claims.attempt,
+                claims.run_lease,
+                claims.max_attempts,
+                claims.lane_seq,
+                ready.run_at,
+                NULL::timestamptz AS heartbeat_at,
+                NULL::timestamptz AS deadline_at,
+                claims.claimed_at AS attempted_at,
+                NULL::timestamptz AS finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                NULL::uuid AS callback_id,
+                NULL::timestamptz AS callback_timeout_at,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                ready.payload,
+                attempt.progress,
+                attempt.callback_result
+            FROM {schema}.lease_claims AS claims
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = claims.ready_slot
+             AND ready.ready_generation = claims.ready_generation
+             AND ready.queue = claims.queue
+             AND ready.priority = claims.priority
+             AND ready.lane_seq = claims.lane_seq
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = claims.job_id
+             AND attempt.run_lease = claims.run_lease
+            WHERE claims.job_id = $1
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.job_id = claims.job_id
+                    AND closures.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM {schema}.leases AS lease
+                  WHERE lease.job_id = claims.job_id
+                    AND lease.run_lease = claims.run_lease
+              )
+            ORDER BY claims.run_lease DESC
+            "#,
+        ))
+        .bind(job_id)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        for row in lease_claim_rows {
             candidates.push(row.into_job_row()?);
         }
 
