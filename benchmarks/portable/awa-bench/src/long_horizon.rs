@@ -198,7 +198,11 @@ fn build_batch_params(
     params
 }
 
-fn queue_storage_event_tables(schema: &str, queue_slot_count: usize, lease_slot_count: usize) -> Vec<String> {
+fn queue_storage_event_tables(
+    schema: &str,
+    queue_slot_count: usize,
+    lease_slot_count: usize,
+) -> Vec<String> {
     let mut tables = vec![
         format!("{schema}.queue_ring_state"),
         format!("{schema}.queue_ring_slots"),
@@ -248,7 +252,7 @@ pub async fn run() {
     let payload_bytes = env_u64("JOB_PAYLOAD_BYTES", 256);
     let work_ms = env_u64("JOB_WORK_MS", 1);
     let sample_every_s = env_u64("SAMPLE_EVERY_S", 10);
-    let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 10).max(1);
+    let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 25).max(1);
     let producer_batch_max = env_u64("PRODUCER_BATCH_MAX", 128).max(1) as usize;
     let default_max_connections = (worker_count.saturating_mul(2)).saturating_add(16).max(40);
     let max_connections = env_u32("MAX_CONNECTIONS", default_max_connections);
@@ -271,6 +275,7 @@ pub async fn run() {
     // rows are not an issue. For --fast we do see stale rows across runs;
     // that's acceptable for dev iteration.
 
+    let producer_call_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
     let producer_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
     let subscriber_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
     let end_to_end_latencies = Arc::new(Mutex::new(LatencyWindow::new()));
@@ -322,6 +327,7 @@ pub async fn run() {
     let producer_enqueued = Arc::clone(&enqueued);
     let producer_queue_depth = Arc::clone(&queue_depth);
     let producer_target_rate_metric = Arc::clone(&producer_target_rate);
+    let producer_call_latencies_window = Arc::clone(&producer_call_latencies);
     let producer_latencies_window = Arc::clone(&producer_latencies);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_handle = tokio::spawn(async move {
@@ -362,13 +368,20 @@ pub async fn run() {
             let mut next_seq = seq;
             let params = build_batch_params(queue_name, &mut next_seq, batch_size, &padding);
             let insert_start = Instant::now();
-            let res = producer_store.enqueue_params_batch(&producer_pool, &params).await;
+            let res = producer_store
+                .enqueue_params_batch(&producer_pool, &params)
+                .await;
             match res {
                 Ok(_) => {
                     let latency_ms = insert_start.elapsed().as_secs_f64() * 1_000.0;
+                    let effective_per_message_ms = latency_ms / batch_size as f64;
+                    producer_call_latencies_window
+                        .lock()
+                        .await
+                        .record(latency_ms);
                     let mut guard = producer_latencies_window.lock().await;
                     for _ in 0..batch_size {
-                        guard.record(latency_ms);
+                        guard.record(effective_per_message_ms);
                     }
                     drop(guard);
                     producer_enqueued.fetch_add(batch_size as u64, Ordering::Relaxed);
@@ -406,6 +419,7 @@ pub async fn run() {
     let sample_enqueued = Arc::clone(&enqueued);
     let sample_completed = Arc::clone(&completed);
     let sample_depth = Arc::clone(&queue_depth);
+    let sample_producer_call_latencies = Arc::clone(&producer_call_latencies);
     let sample_producer_latencies = Arc::clone(&producer_latencies);
     let sample_subscriber_latencies = Arc::clone(&subscriber_latencies);
     let sample_end_to_end_latencies = Arc::clone(&end_to_end_latencies);
@@ -443,6 +457,13 @@ pub async fn run() {
             last_completed = cmp;
 
             let window = Duration::from_secs(30);
+            let (producer_call_p50, producer_call_p95, producer_call_p99) = {
+                let mut guard = sample_producer_call_latencies.lock().await;
+                guard
+                    .snapshot(window)
+                    .map(|(a, b, c, _)| (a, b, c))
+                    .unwrap_or((0.0, 0.0, 0.0))
+            };
             let (producer_p50, producer_p95, producer_p99) = {
                 let mut guard = sample_producer_latencies.lock().await;
                 guard
@@ -469,6 +490,9 @@ pub async fn run() {
             let ts = now_iso_ms();
 
             for (metric, value, window_s) in [
+                ("producer_call_p50_ms", producer_call_p50, 30.0),
+                ("producer_call_p95_ms", producer_call_p95, 30.0),
+                ("producer_call_p99_ms", producer_call_p99, 30.0),
                 ("producer_p50_ms", producer_p50, 30.0),
                 ("producer_p95_ms", producer_p95, 30.0),
                 ("producer_p99_ms", producer_p99, 30.0),
@@ -538,5 +562,9 @@ pub async fn run() {
         let _ = sample_handle.await;
     })
     .await;
-    let _ = tokio::time::timeout(Duration::from_secs(3), client.shutdown(Duration::from_secs(3))).await;
+    let _ = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.shutdown(Duration::from_secs(3)),
+    )
+    .await;
 }

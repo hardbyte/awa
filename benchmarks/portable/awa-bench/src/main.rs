@@ -18,9 +18,7 @@ mod long_horizon;
 
 use async_trait::async_trait;
 use awa_macros::JobArgs;
-use awa_model::{
-    insert, migrations, InsertOpts, QueueStorage, QueueStorageConfig,
-};
+use awa_model::{insert, migrations, InsertOpts, QueueStorage, QueueStorageConfig};
 use awa_worker::{
     Client, JobContext, JobError, JobResult, QueueConfig, TransitionWorkerRole, Worker,
 };

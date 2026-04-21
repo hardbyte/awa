@@ -21,6 +21,7 @@ DEFAULT_TIMELINE_METRICS = [
     "completion_rate",
     "enqueue_rate",
     "producer_p99_ms",
+    "producer_call_p99_ms",
     "subscriber_p99_ms",
     "end_to_end_p99_ms",
     "claim_p99_ms",
@@ -33,7 +34,8 @@ DEFAULT_PHASE_FILTER = "steady"
 METRIC_LABELS = {
     "completion_rate": "Completion throughput",
     "enqueue_rate": "Producer throughput",
-    "producer_p99_ms": "Producer latency p99",
+    "producer_p99_ms": "Producer latency p99 (per message)",
+    "producer_call_p99_ms": "Producer call latency p99",
     "subscriber_p99_ms": "Subscriber latency p99",
     "end_to_end_p99_ms": "End-to-end latency p99",
     "claim_p99_ms": "Claim latency p99",
@@ -44,12 +46,14 @@ METRIC_LABELS = {
 TIMELINE_PRESETS = [
     ("Throughput vs dead tuples", "completion_rate", "n_dead_tup"),
     ("Producer vs end-to-end latency", "producer_p99_ms", "end_to_end_p99_ms"),
+    ("Producer call vs per-message", "producer_call_p99_ms", "producer_p99_ms"),
     ("Subscriber vs queue depth", "subscriber_p99_ms", "queue_depth"),
 ]
 
 PLOT_ORDER = [
     "throughput",
     "producer_p99",
+    "producer_call_p99",
     "subscriber_p99",
     "end_to_end_p99",
     "claim_p99",
@@ -144,6 +148,7 @@ def _timeline_outliers(
         "completion_rate",
         "enqueue_rate",
         "producer_p99_ms",
+        "producer_call_p99_ms",
         "subscriber_p99_ms",
         "end_to_end_p99_ms",
         "claim_p99_ms",
@@ -222,6 +227,7 @@ def _phase_table(summary: dict, systems: list[str], phases: list[Phase], system_
         "Type",
         "Throughput/s",
         "Producer p99 ms",
+        "Producer call p99 ms",
         "Subscriber p99 ms",
         "End-to-end p99 ms",
         "Median dead tuples",
@@ -244,6 +250,7 @@ def _phase_table(summary: dict, systems: list[str], phases: list[Phase], system_
                 f"<td>{html.escape(block.get('phase_type', ''))}</td>"
                 f"<td data-sort='{block.get('median_throughput_per_s') or 0}'>{(block.get('median_throughput_per_s') or 0):.1f}</td>"
                 f"<td data-sort='{block.get('median_producer_p99_ms') or 0}'>{(block.get('median_producer_p99_ms') or 0):.3f}</td>"
+                f"<td data-sort='{block.get('median_producer_call_p99_ms') or 0}'>{(block.get('median_producer_call_p99_ms') or 0):.3f}</td>"
                 f"<td data-sort='{block.get('median_subscriber_p99_ms') or 0}'>{(block.get('median_subscriber_p99_ms') or 0):.3f}</td>"
                 f"<td data-sort='{block.get('median_end_to_end_p99_ms') or 0}'>{(block.get('median_end_to_end_p99_ms') or 0):.3f}</td>"
                 f"<td data-sort='{block.get('median_dead_tup') or 0}'>{(block.get('median_dead_tup') or 0):.0f}</td>"
@@ -313,7 +320,8 @@ def _build_html(
             "<div class='card'>"
             f"<div class='card-title'>{html.escape(system_meta[system]['display_name'])}</div>"
             f"<div class='card-stat'>throughput {(clean.get('median_throughput_per_s') or 0):.1f}/s</div>"
-            f"<div class='card-sub'>producer p99 {(clean.get('median_producer_p99_ms') or 0):.3f} ms</div>"
+            f"<div class='card-sub'>producer p99 {(clean.get('median_producer_p99_ms') or 0):.3f} ms per message</div>"
+            f"<div class='card-sub'>producer call p99 {(clean.get('median_producer_call_p99_ms') or 0):.3f} ms</div>"
             f"<div class='card-sub'>subscriber p99 {(clean.get('median_subscriber_p99_ms') or 0):.3f} ms</div>"
             f"<div class='card-sub'>dead tuples {(clean.get('median_dead_tup') or 0):.0f} median</div>"
             "</div>"

@@ -474,6 +474,9 @@ async def scenario_long_horizon() -> None:
             )
             ts = _now_iso()
             for metric, value, window_s in [
+                ("producer_call_p50_ms", producer_p50, 30.0),
+                ("producer_call_p95_ms", producer_p95, 30.0),
+                ("producer_call_p99_ms", producer_p99, 30.0),
                 ("producer_p50_ms", producer_p50, 30.0),
                 ("producer_p95_ms", producer_p95, 30.0),
                 ("producer_p99_ms", producer_p99, 30.0),

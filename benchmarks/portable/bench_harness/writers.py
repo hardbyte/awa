@@ -192,6 +192,13 @@ def compute_summary(
                 metric="producer_p99_ms",
                 subject_kind="adapter",
             )
+            producer_call_p99 = _phase_metric_values(
+                rows,
+                system=system,
+                phase_label=phase_label,
+                metric="producer_call_p99_ms",
+                subject_kind="adapter",
+            )
             subscriber_p99 = _phase_metric_values(
                 rows,
                 system=system,
@@ -210,6 +217,7 @@ def compute_summary(
             phase_block["median_dead_tup"] = _median(dead_tup)
             phase_block["median_claim_p99_ms"] = _median(claim_p99)
             phase_block["median_producer_p99_ms"] = _median(producer_p99)
+            phase_block["median_producer_call_p99_ms"] = _median(producer_call_p99)
             phase_block["median_subscriber_p99_ms"] = _median(subscriber_p99)
             phase_block["median_end_to_end_p99_ms"] = _median(end_to_end_p99)
             phase_block["median_throughput_per_s"] = _median(throughput)

@@ -204,8 +204,8 @@ types plug in via `bench_harness.phases` + `bench_harness.hooks`.
   - Balanced event/message-queue comparison.
   - Sequence: steady-state, active subscriber/read pressure, bursty offered
     load, then clean tail.
-  - Best default when comparing throughput, subscriber latency, end-to-end
-    latency, and dead tuples together.
+  - Best default when comparing throughput, producer latency, subscriber
+    latency, end-to-end latency, and dead tuples together.
 
 - `event_delivery_burst`
   - Backlog-growth and catch-up profile.
@@ -230,8 +230,17 @@ Per run: `benchmarks/portable/results/<scenario>-<timestamp>-<id>/`
 - `summary.json` — per-system per-phase aggregates + recovery metrics
 - `manifest.json` — PG version, config, host info, adapter versions, CLI args
 - `plots/` — `dead_tuples`, `dead_tuples_faceted`, `claim_p99`, `throughput`,
-  `producer_p99`, `subscriber_p99`, `end_to_end_p99`, `table_size`,
+  `producer_p99`, `producer_call_p99`, `subscriber_p99`, `end_to_end_p99`, `table_size`,
   `queue_depth` (PNG 300 DPI + SVG)
+
+For event-delivery scenarios the report now splits producer latency into:
+- `producer_p99`: effective per-message enqueue latency
+- `producer_call_p99`: producer call / batch-commit latency
+
+Single-row systems report the same value for both. Awa's queue-storage adapter
+microbatches producer writes by default in the long-horizon runner, so the two
+views make the producer trade-off visible without conflating per-message cost
+with batch commit cost.
 
 ### Default system matrix differs from the steady-state suite
 

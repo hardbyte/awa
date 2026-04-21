@@ -115,6 +115,15 @@ PLOT_SPECS: dict[str, PlotSpec] = {
         subject_kind="adapter",
         sum_by_subject=False,
     ),
+    "producer_call_p99_ms": PlotSpec(
+        title="Producer call p99 latency",
+        filename_stem="producer_call_p99",
+        y_label="producer call p99 latency (ms)",
+        log_scale=True,
+        use_raw_underlay=True,
+        subject_kind="adapter",
+        sum_by_subject=False,
+    ),
     "subscriber_p99_ms": PlotSpec(
         title="Subscriber p99 latency",
         filename_stem="subscriber_p99",

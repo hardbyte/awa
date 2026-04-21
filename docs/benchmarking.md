@@ -167,9 +167,13 @@ A separate **cross-system visualisation** track lives at
 against awa plus peer systems (awa-python, river, procrastinate, oban, PgQue,
 pgmq, pg-boss), collects Postgres-side and adapter-side telemetry on a shared
 timebase, and produces both static plots and an offline interactive HTML
-report. The shared metric set now includes producer latency, subscriber
-latency, end-to-end delivery latency, throughput, queue depth, and dead tuples
-over time.
+report. The shared metric set now includes producer latency, producer call
+latency, subscriber latency, end-to-end delivery latency, throughput, queue
+depth, and dead tuples over time. The producer split matters for Awa's
+queue-storage adapter because the long-horizon harness uses direct
+microbatched enqueue into queue storage: `producer_p99` reports effective
+per-message enqueue latency, while `producer_call_p99` reports the batch
+commit cost.
 
 See `benchmarks/portable/README.md` for usage and
 `benchmarks/portable/CONTRIBUTING_ADAPTERS.md` for the adapter contract.
