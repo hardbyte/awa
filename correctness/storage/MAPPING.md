@@ -22,7 +22,7 @@ implementation.
 | `runLease[j]` | `run_lease` column on the lease/ready/deferred row |
 | `taskLease[w][j]` | `ctx.job.run_lease` snapshot captured at claim time in `awa-worker/src/executor.rs` |
 | `heartbeatFresh` | `heartbeat_at` on the lease row + the maintenance cutoff (see `rescue_stale_heartbeats` in `queue_storage.rs:5528`) |
-| `laneState.appendSeq` / `claimSeq` | `{schema}.queue_lanes.append_seq` / `claim_seq` |
+| `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
 
@@ -35,11 +35,11 @@ for backfill / fallback reads during upgrades.
 
 | TLA+ action | Rust function | SQL / DDL |
 |---|---|---|
-| `EnqueueReady(j)` | `QueueStorage::insert_ready` / producer insert path | `INSERT INTO {schema}.ready_entries ... UPDATE {schema}.queue_lanes SET append_seq = append_seq + 1` (single tx) |
+| `EnqueueReady(j)` | `QueueStorage::insert_ready` / producer insert path | `INSERT INTO {schema}.ready_entries ... UPSERT {schema}.queue_enqueue_heads` (single tx) |
 | `EnqueueDeferred(j)` | `QueueStorage::insert_deferred` | `INSERT INTO {schema}.deferred_entries ...` |
 | `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_deferred_jobs` | `DELETE FROM deferred_entries ... INSERT INTO ready_entries ...` in one tx |
-| `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside `claim_ready_runtime` PL/pgSQL function (`queue_storage.rs:1647`); logical `UPDATE queue_lanes SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
-| `Claim(w, j)` | `QueueStorage::claim_runtime_batch` → dispatcher (`awa-worker/src/dispatcher.rs`) | `claim_ready_runtime(...)` server-side fn: `SELECT ... FROM queue_lanes FOR UPDATE`, `INSERT INTO leases`, `UPDATE queue_lanes` in one step |
+| `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside `claim_ready_runtime` PL/pgSQL function; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
+| `Claim(w, j)` | `QueueStorage::claim_runtime_batch` → dispatcher (`awa-worker/src/dispatcher.rs`) | `claim_ready_runtime(...)` server-side fn: lane selection reads `queue_lanes`, serialization uses `FOR UPDATE OF queue_claim_heads SKIP LOCKED`, then inserts receipt/lease rows and advances `queue_claim_heads` |
 | `MaterializeAttemptState(j)` | `QueueStorage::upsert_attempt_state` on first progress / callback / long-path transition | `INSERT INTO attempt_state ... ON CONFLICT (job_id, run_lease) DO NOTHING` |
 | `Heartbeat(j)` | `heartbeat_tick` in `awa-worker/src/heartbeat.rs` | `UPDATE leases SET heartbeat_at = now() WHERE job_id = $1 AND run_lease = $2` |
 | `LoseHeartbeat(j)` | implicit — time passes without a heartbeat UPDATE; maintenance rescue sees a stale cutoff | (no action in real code; represents age) |
@@ -78,7 +78,16 @@ for backfill / fallback reads during upgrades.
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
 | `PrunedXSegmentsAreEmpty` | per-family prune requires no live-row precondition before TRUNCATE |
-| `LaneStateConsistent` | `queue_lanes.available_count` is maintained by enqueue/claim transitions; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
+| `LaneStateConsistent` | live availability is derived from `{schema}.ready_entries` plus `{schema}.queue_claim_heads`; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
+
+## Local runtime note
+
+The TLA+ storage model does not represent local worker-capacity accounting.
+Rust now releases local queue capacity immediately after handler execution and
+progress snapshotting, while durable completion continues asynchronously
+through the completion batcher. That changes throughput and scheduling
+behavior, but it does not change the modeled storage safety boundary because
+the `run_lease`-guarded finalization and rescue semantics are unchanged.
 
 ## Known modelling gaps with implementation implications
 

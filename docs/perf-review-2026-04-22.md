@@ -40,6 +40,12 @@ It was.
 
 The question is now "how much more of the lease/control plane should be made cold before `0.6` lands?".
 
+One concrete outcome after this review: low-worker underfill was not another
+queue-storage MVCC hotspot. The strongest fix so far is releasing local worker
+capacity when handler execution ends, while keeping durable completion on the
+existing `run_lease`-guarded finalization path. That improves `1/4/8/16`
+worker throughput without changing the underlying storage state machine.
+
 ### What now looks solid
 
 #### 1. Queue plane

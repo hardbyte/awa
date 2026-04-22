@@ -252,6 +252,11 @@ in implementation:
   path: short completions append terminal rows from the already-carried
   immutable claim snapshot, while stale completions still lose via the
   `(job_id, run_lease)` guarded delete against the live execution row.
+- Local worker capacity is released when handler execution ends and the
+  progress snapshot is captured; durable completion then continues through the
+  detached completion batcher path. This keeps execution capacity tied to
+  active handler work rather than to completion flush latency while leaving
+  the `run_lease`-guarded rescue boundary unchanged.
 - Crash safety for the batcher relies on the normal rescue path, not an
   auxiliary replay log. If an in-memory completion batch is lost with the
   worker process, the live attempt remains visible to heartbeat/deadline

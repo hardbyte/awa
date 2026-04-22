@@ -67,6 +67,7 @@ What it intentionally does not model:
 - SQL planner behavior
 - MVCC horizons or autovacuum timing
 - queue priorities and fairness
+- local worker-capacity accounting and completion-batcher scheduling
 - `queue_counts()` caching details such as the cold
   `{schema}.queue_terminal_rollups` table and the transitional
   `queue_lanes.pruned_completed_count` fallback; Rust keeps those as

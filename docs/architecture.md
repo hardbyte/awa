@@ -442,20 +442,22 @@ was already rescued, reclaimed, or cancelled — the stale result is silently
 discarded. Metrics are only recorded when the guarded transition succeeds.
 
 Successful `Completed` outcomes are flushed through a small batched finalizer.
-The worker does not release local in-flight tracking or capacity until the
-batch flush acknowledges success or stale rejection, so shutdown drain and
-heartbeat semantics still match the correctness model. Locally, in-flight
-attempts are tracked in a sharded registry keyed by `(job_id, run_lease)`
-rather than a single global lock, which preserves the lease model while
-reducing executor/heartbeat contention.
+The worker releases local in-flight tracking and queue capacity immediately
+after the handler returns and its progress snapshot is captured. Durable
+completion then continues in a detached finalization step. This keeps local
+worker capacity tied to active handler execution rather than to completion
+batch tail latency, while leaving the durable `run_lease` correctness
+boundary unchanged. Locally, in-flight attempts are tracked in a sharded
+registry keyed by `(job_id, run_lease)` rather than a single global lock,
+which preserves the lease model while reducing executor/heartbeat contention.
 
 This also defines the crash-safety boundary for completion: a handler result is
 not considered durably applied until the completion batcher deletes the active
 lease and appends the terminal/deferred row in Postgres. If the process dies
-before that flush commits, the lease remains visible to rescue logic and the
-attempt can be retried or reclaimed. If the flush commits first, the terminal
-or deferred append is already durable and the worker can safely forget the
-attempt.
+after local capacity has been released but before that flush commits, the
+lease remains visible to rescue logic and the attempt can be retried or
+reclaimed. If the flush commits first, the terminal or deferred append is
+already durable and the worker can safely forget the attempt.
 
 ### External Callbacks and Sequential Waits
 
