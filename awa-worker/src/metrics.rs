@@ -31,6 +31,18 @@ pub struct AwaMetrics {
     pub jobs_claimed: Counter<u64>,
     /// Number of dispatcher claim queries executed.
     pub claim_batches: Counter<u64>,
+    /// Number of dispatcher wake-ups by reason.
+    pub dispatch_wakeups: Counter<u64>,
+    /// Time from wake-up to the first claim attempt.
+    pub dispatch_wake_to_claim_seconds: Histogram<f64>,
+    /// Number of permits available when a dispatcher wake is processed.
+    pub dispatch_capacity_available: Histogram<u64>,
+    /// Number of wakes that found no jobs despite available capacity.
+    pub dispatch_empty_claims: Counter<u64>,
+    /// Number of pre-acquired permits released unused after a claim round.
+    pub dispatch_unused_permits: Counter<u64>,
+    /// Number of wakes that were blocked by rate limiting.
+    pub dispatch_rate_limited: Counter<u64>,
     /// Claim batch size distribution.
     pub claim_batch_size: Histogram<u64>,
     /// Claim query duration.
@@ -130,6 +142,36 @@ impl AwaMetrics {
                 .u64_counter("awa.dispatch.claim_batches")
                 .with_description("Number of dispatcher claim queries executed")
                 .with_unit("{batch}")
+                .build(),
+            dispatch_wakeups: meter
+                .u64_counter("awa.dispatch.wakeups")
+                .with_description("Number of dispatcher wake-ups by reason")
+                .with_unit("{wake}")
+                .build(),
+            dispatch_wake_to_claim_seconds: meter
+                .f64_histogram("awa.dispatch.wake_to_claim_duration")
+                .with_description("Time from dispatcher wake-up to first claim attempt")
+                .with_unit("s")
+                .build(),
+            dispatch_capacity_available: meter
+                .u64_histogram("awa.dispatch.capacity_available")
+                .with_description("Number of permits available when a dispatcher wake is processed")
+                .with_unit("{permit}")
+                .build(),
+            dispatch_empty_claims: meter
+                .u64_counter("awa.dispatch.empty_claims")
+                .with_description("Number of dispatcher wakes that found no jobs despite available capacity")
+                .with_unit("{wake}")
+                .build(),
+            dispatch_unused_permits: meter
+                .u64_counter("awa.dispatch.unused_permits")
+                .with_description("Number of pre-acquired permits released unused after claiming fewer jobs than capacity")
+                .with_unit("{permit}")
+                .build(),
+            dispatch_rate_limited: meter
+                .u64_counter("awa.dispatch.rate_limited")
+                .with_description("Number of dispatcher wakes that could not claim because of rate limiting")
+                .with_unit("{wake}")
                 .build(),
             claim_batch_size: meter
                 .u64_histogram("awa.dispatch.claim_batch_size")
@@ -325,6 +367,61 @@ impl AwaMetrics {
         self.claim_batch_size.record(batch_size, &attrs);
         self.claim_duration_seconds
             .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record a dispatcher wake-up reason.
+    pub fn record_dispatch_wake(&self, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_wakeups.add(1, &attrs);
+    }
+
+    /// Record time from wake-up to the first claim attempt.
+    pub fn record_dispatch_wake_to_claim(&self, queue: &str, reason: &str, duration: Duration) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_wake_to_claim_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record how many permits were available on a dispatcher wake.
+    pub fn record_dispatch_capacity_available(&self, queue: &str, reason: &str, permits: u64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_capacity_available.record(permits, &attrs);
+    }
+
+    /// Record a dispatcher wake that found no jobs.
+    pub fn record_dispatch_empty_claim(&self, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_empty_claims.add(1, &attrs);
+    }
+
+    /// Record permits released unused after a claim round.
+    pub fn record_dispatch_unused_permits(&self, queue: &str, count: u64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.dispatch_unused_permits.add(count, &attrs);
+    }
+
+    /// Record a wake that could not claim because of rate limiting.
+    pub fn record_dispatch_rate_limited(&self, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_rate_limited.add(1, &attrs);
     }
 
     /// Record a completion batch flush.

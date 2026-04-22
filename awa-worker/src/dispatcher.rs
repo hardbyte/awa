@@ -14,6 +14,23 @@ use tracing::{debug, error, info, warn};
 
 const CLAIM_BATCH_LIMIT: usize = 128;
 
+#[derive(Debug, Clone, Copy)]
+enum WakeReason {
+    Notify,
+    Capacity,
+    Poll,
+}
+
+impl WakeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            WakeReason::Notify => "notify",
+            WakeReason::Capacity => "capacity",
+            WakeReason::Poll => "poll",
+        }
+    }
+}
+
 /// Rate limit configuration for a queue.
 #[derive(Debug, Clone)]
 pub struct RateLimit {
@@ -347,7 +364,7 @@ impl Dispatcher {
                     match notification {
                         Ok(_) => {
                             debug!(queue = %self.queue, "Woken by NOTIFY");
-                            self.drain_ready().await;
+                            self.drain_ready(WakeReason::Notify, Instant::now()).await;
                         }
                         Err(err) => {
                             warn!(error = %err, "PG listener error, will retry");
@@ -356,10 +373,10 @@ impl Dispatcher {
                     }
                 }
                 _ = self.capacity_wake.notified() => {
-                    self.drain_ready().await;
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.drain_ready().await;
+                    self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
         }
@@ -376,10 +393,10 @@ impl Dispatcher {
                     break;
                 }
                 _ = self.capacity_wake.notified() => {
-                    self.drain_ready().await;
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.drain_ready().await;
+                    self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
         }
@@ -425,21 +442,38 @@ impl Dispatcher {
 
     /// Drain immediately available work after a wake-up until the queue is empty,
     /// capacity is exhausted, rate limiting stops us, or shutdown is requested.
-    async fn drain_ready(&mut self) {
+    async fn drain_ready(&mut self, wake_reason: WakeReason, woke_at: Instant) {
+        self.metrics
+            .record_dispatch_wake(&self.queue, wake_reason.as_str());
+        let mut first_iteration = true;
         while !self.cancel.is_cancelled() {
-            if !self.poll_once().await {
+            let wake_context = first_iteration.then_some((wake_reason, woke_at));
+            if !self.poll_once(wake_context).await {
                 break;
             }
+            first_iteration = false;
         }
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
     #[tracing::instrument(skip(self), fields(queue = %self.queue))]
-    async fn poll_once(&mut self) -> bool {
+    async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
             return false;
+        }
+        if let Some((reason, woke_at)) = wake_context {
+            self.metrics.record_dispatch_wake_to_claim(
+                &self.queue,
+                reason.as_str(),
+                woke_at.elapsed(),
+            );
+            self.metrics.record_dispatch_capacity_available(
+                &self.queue,
+                reason.as_str(),
+                permits.len() as u64,
+            );
         }
 
         // Phase 2: Apply rate limit
@@ -451,6 +485,10 @@ impl Dispatcher {
         let batch_size = permits.len().min(rate_available).min(CLAIM_BATCH_LIMIT);
         if batch_size == 0 {
             // Drop all permits — rate limited
+            if let Some((reason, _)) = wake_context {
+                self.metrics
+                    .record_dispatch_rate_limited(&self.queue, reason.as_str());
+            }
             return false;
         }
         // Release excess permits beyond what rate limit allows
@@ -567,12 +605,21 @@ impl Dispatcher {
         }
 
         // Phase 4: Release excess permits if DB had fewer jobs
+        let unused_permits = permits.len().saturating_sub(jobs.len());
         while permits.len() > jobs.len() {
             permits.pop();
+        }
+        if unused_permits > 0 {
+            self.metrics
+                .record_dispatch_unused_permits(&self.queue, unused_permits as u64);
         }
 
         // Phase 5: Clear overflow demand if no jobs found
         if jobs.is_empty() {
+            if let Some((reason, _)) = wake_context {
+                self.metrics
+                    .record_dispatch_empty_claim(&self.queue, reason.as_str());
+            }
             if let ConcurrencyMode::Weighted {
                 overflow_pool,
                 queue_name,
