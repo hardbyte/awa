@@ -35,7 +35,11 @@ SEMANTIC_SCENARIOS = {
             "PRIORITY_AGING_MS": "10000",
             "RUST_LOG": "error",
         },
-        "target_utilization": 0.8,
+        "target_utilization": 0.9,
+        "calibration_phases": [
+            "warmup=warmup:20s",
+            "clean_1=clean:60s",
+        ],
     },
     "crash_recovery_under_load": {
         "scenario": "crash_recovery_under_load",
@@ -121,10 +125,15 @@ def calibrate_producer_rate(
     target_utilization = float(config.get("target_utilization", 0.8))
     run_dir, summary = run_once(
         semantic_scenario=semantic_scenario,
-        phase_specs=[
-            "warmup=warmup:10s",
-            "clean_1=clean:20s",
-        ],
+        phase_specs=list(
+            config.get(
+                "calibration_phases",
+                [
+                    "warmup=warmup:10s",
+                    "clean_1=clean:20s",
+                ],
+            )
+        ),
         sample_every=sample_every,
         worker_count=worker_count,
         producer_rate=800,
