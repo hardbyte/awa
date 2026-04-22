@@ -126,16 +126,37 @@ The buffered-reservation variant was worse:
 - it preserved the safety boundary better than the earlier naive prefetch spike
 - but it still reduced throughput, including at `1` worker in the benchmark
 
+We also tried a batched reservation/start frontier aimed specifically at the
+realistic many-small-replica case:
+
+- bounded `open_dispatch_reservations`
+- batched dispatcher reservation
+- batched promotion into receipt-backed active attempts
+- maintenance expiry + re-enqueue for workers that died before start
+
+That version kept the intended safety boundary:
+
+- promotion works directly into `open_receipt_claims`
+- stale reservations are re-enqueued
+- late promotion after expiry loses cleanly
+
+But the realistic replica benchmark still regressed badly:
+
+- `1x32`: `clean_1 397/s`, `pressure_1 576/s`, `recovery_1 730/s`
+- `4x8`: `clean_1 157/s`, `pressure_1 92/s`, `recovery_1 12/s`
+
+So even the batched frontier did not clear the bar for `0.6`. It was reverted.
+
 ### Current conclusion
 
 The reservation plane is still a plausible long-term direction, but only if
-promotion is much cheaper than the first spike:
+promotion is much cheaper than the spikes we tried:
 
 - batched reservation promotion
 - or another design that separates reservation from attempt start without
   introducing one extra transaction per job
 
-For the `0.6` branch, the reservation-plane implementation was reverted.
+For the `0.6` branch, every reservation-plane implementation was reverted.
 The design note remains because it explains the right safety boundary if we
 return to this later:
 

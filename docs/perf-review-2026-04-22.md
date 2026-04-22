@@ -76,6 +76,21 @@ follow-up regressed throughput further. So the current branch does **not**
 carry the reservation plane; it only carries the design learning from that
 spike.
 
+A later batched reservation/start frontier pass also kept the safety boundary
+sound:
+
+- direct promotion from reservation -> receipt-backed attempt was validated
+- reserve -> expire -> re-enqueue -> late promotion loses was validated
+
+But the realistic single-producer replica check was still not good enough:
+
+- `1x32`: `clean_1 397/s`, `pressure_1 576/s`, `recovery_1 730/s`
+- `4x8`: `clean_1 157/s`, `pressure_1 92/s`, `recovery_1 12/s`
+
+That means the frontier did **not** solve the many-small-replica deployment
+shape without introducing large throughput and latency regressions. It was
+reverted as well.
+
 ### What now looks solid
 
 #### 1. Queue plane
