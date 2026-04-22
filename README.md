@@ -49,6 +49,19 @@ covering the segmented storage engine, the lock-ordering protocol, and the
 single/multi-instance worker runtime. The storage model has a trace-replay
 harness that verifies concrete runtime-test event sequences against the spec.
 
+## Delivery Contract
+
+- **Transactional enqueue** is a core Postgres-native feature: enqueue inside
+  the same transaction as application data, and the job commits or rolls back
+  with that data.
+- **At-least-once delivery** is the contract. Awa rejects stale completions
+  and rescues stuck work, but it does not promise “exactly once”.
+- **Idempotency is recommended** for handlers, because retries and recovery are
+  part of the honest failure model.
+- **No lost work under failure** takes priority over clever fast paths. If a
+  design weakens crash/restart safety, it loses even if the benchmark looks
+  better.
+
 ## Benchmarks
 
 Local queue-storage soak, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95

@@ -1264,7 +1264,7 @@ impl QueueStorage {
                 format!(
                     r#"
                     claimed AS (
-                        INSERT INTO {schema}.lease_claims (
+                        INSERT INTO {schema}.lease_claims AS claim_rows (
                             job_id,
                             run_lease,
                             ready_slot,
@@ -1287,15 +1287,15 @@ impl QueueStorage {
                             selected.lane_seq
                         FROM selected
                         RETURNING
-                            ready_slot,
-                            ready_generation,
-                            job_id,
-                            queue,
-                            priority,
-                            lane_seq,
-                            attempt,
-                            run_lease,
-                            max_attempts
+                            claim_rows.ready_slot,
+                            claim_rows.ready_generation,
+                            claim_rows.job_id,
+                            claim_rows.queue,
+                            claim_rows.priority,
+                            claim_rows.lane_seq,
+                            claim_rows.attempt,
+                            claim_rows.run_lease,
+                            claim_rows.max_attempts
                     ),
                     opened AS (
                         INSERT INTO {schema}.open_receipt_claims (
@@ -1322,7 +1322,7 @@ impl QueueStorage {
                             claimed.lane_seq,
                             clock_timestamp()
                         FROM claimed
-                        ON CONFLICT (job_id, run_lease) DO NOTHING
+                        ON CONFLICT ON CONSTRAINT open_receipt_claims_pkey DO NOTHING
                     )
                     "#
                 )
@@ -1330,7 +1330,7 @@ impl QueueStorage {
                 format!(
                     r#"
                     claimed AS (
-                        INSERT INTO {schema}.leases (
+                        INSERT INTO {schema}.leases AS lease_rows (
                             lease_slot,
                             lease_generation,
                             ready_slot,
@@ -1366,19 +1366,19 @@ impl QueueStorage {
                         FROM selected
                         CROSS JOIN lease_ring
                         RETURNING
-                            ready_slot,
-                            ready_generation,
-                            lease_slot,
-                            lease_generation,
-                            queue,
-                            priority,
-                            lane_seq,
-                            attempt,
-                            run_lease,
-                            max_attempts,
-                            heartbeat_at,
-                            deadline_at,
-                            attempted_at
+                            lease_rows.ready_slot,
+                            lease_rows.ready_generation,
+                            lease_rows.lease_slot,
+                            lease_rows.lease_generation,
+                            lease_rows.queue,
+                            lease_rows.priority,
+                            lease_rows.lane_seq,
+                            lease_rows.attempt,
+                            lease_rows.run_lease,
+                            lease_rows.max_attempts,
+                            lease_rows.heartbeat_at,
+                            lease_rows.deadline_at,
+                            lease_rows.attempted_at
                     )
                     "#
                 )
@@ -1801,7 +1801,7 @@ impl QueueStorage {
                 WHERE lease.job_id = claims.job_id
                   AND lease.run_lease = claims.run_lease
             )
-            ON CONFLICT (job_id, run_lease) DO NOTHING
+            ON CONFLICT ON CONSTRAINT open_receipt_claims_pkey DO NOTHING
             "#
             ))
             .execute(pool)
@@ -2178,19 +2178,18 @@ impl QueueStorage {
             SET search_path = pg_catalog, awa, public
             AS $func$
             DECLARE
-                lane_priority SMALLINT;
-                lane_claim_seq BIGINT;
-                lane_next_seq BIGINT;
-                claim_limit BIGINT;
-                target_slot INT;
-                target_generation BIGINT;
-                sql TEXT;
+                v_lane_priority SMALLINT;
+                v_lane_claim_seq BIGINT;
+                v_lane_next_seq BIGINT;
+                v_claim_limit BIGINT;
+                v_target_slot INT;
+                v_target_generation BIGINT;
             BEGIN
                 SELECT
                     claims.priority,
                     claims.claim_seq,
                     enqueues.next_seq
-                INTO lane_priority, lane_claim_seq, lane_next_seq
+                INTO v_lane_priority, v_lane_claim_seq, v_lane_next_seq
                 FROM {schema}.queue_claim_heads AS claims
                 JOIN {schema}.queue_enqueue_heads AS enqueues
                   ON enqueues.queue = claims.queue
@@ -2233,131 +2232,121 @@ impl QueueStorage {
                 END IF;
 
                 SELECT ready.ready_slot, ready.ready_generation
-                INTO target_slot, target_generation
+                INTO v_target_slot, v_target_generation
                 FROM {schema}.ready_entries AS ready
                 WHERE ready.queue = p_queue
-                  AND ready.priority = lane_priority
-                  AND ready.lane_seq >= lane_claim_seq
+                  AND ready.priority = v_lane_priority
+                  AND ready.lane_seq >= v_lane_claim_seq
                 ORDER BY ready.lane_seq ASC
                 LIMIT 1;
 
                 IF NOT FOUND THEN
                     UPDATE {schema}.queue_claim_heads AS claims
-                    SET claim_seq = GREATEST(claims.claim_seq, lane_next_seq)
+                    SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
                     WHERE claims.queue = p_queue
-                      AND claims.priority = lane_priority;
+                      AND claims.priority = v_lane_priority;
                     RETURN;
                 END IF;
 
-                claim_limit := LEAST(GREATEST(lane_next_seq - lane_claim_seq, 0), p_max_batch);
-                IF claim_limit <= 0 THEN
+                v_claim_limit := LEAST(GREATEST(v_lane_next_seq - v_lane_claim_seq, 0), p_max_batch);
+                IF v_claim_limit <= 0 THEN
                     RETURN;
                 END IF;
 
-                sql := format($sql$
-                    WITH lease_ring AS (
-                        SELECT current_slot AS lease_slot, generation AS lease_generation
-                        FROM {schema}.lease_ring_state
-                        WHERE singleton = TRUE
-                    ),
-                    selected AS (
-                        SELECT
-                            ready.ready_slot,
-                            ready.ready_generation,
-                            ready.job_id,
-                            ready.kind,
-                            ready.queue,
-                            ready.args,
-                            ready.priority AS lane_priority,
-                            CASE
-                                WHEN $7 > 0 THEN GREATEST(
-                                    1,
-                                    ready.priority - FLOOR(
-                                        EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / $7
-                                    )::smallint
-                                )::smallint
-                                ELSE ready.priority
-                            END AS effective_priority,
-                            ready.attempt,
-                            ready.run_lease,
-                            ready.max_attempts,
-                            ready.lane_seq,
-                            ready.run_at,
-                            ready.created_at,
-                            ready.unique_key,
-                            ready.unique_states,
-                            ready.payload
-                        FROM {schema}.ready_entries_%s AS ready
-                        WHERE ready.queue = $1
-                          AND ready.priority = $2
-                          AND ready.ready_generation = $3
-                          AND ready.lane_seq >= $4
-                        ORDER BY ready.lane_seq ASC
-                        LIMIT $5
-                    ),
-                    advanced AS (
-                        UPDATE {schema}.queue_claim_heads AS claims
-                        SET claim_seq = COALESCE(
-                                (SELECT max(lane_seq) + 1 FROM selected),
-                                claims.claim_seq
-                            )
-                        WHERE claims.queue = $1
-                          AND claims.priority = $2
-                        RETURNING claims.priority
-                    ),
-                    {claimed_cte}
+                RETURN QUERY
+                WITH lease_ring AS (
+                    SELECT current_slot AS lease_slot, generation AS lease_generation
+                    FROM {schema}.lease_ring_state
+                    WHERE singleton = TRUE
+                ),
+                selected AS (
                     SELECT
-                        claimed.ready_slot,
-                        claimed.ready_generation,
-                        claimed.lane_seq,
-                        lease_ring.lease_slot,
-                        lease_ring.lease_generation,
-                        selected.job_id,
-                        selected.kind,
-                        selected.queue,
-                        selected.args,
-                        selected.lane_priority,
-                        selected.effective_priority,
-                        claimed.attempt,
-                        claimed.run_lease,
-                        claimed.max_attempts,
-                        selected.run_at,
+                        ready.ready_slot,
+                        ready.ready_generation,
+                        ready.job_id,
+                        ready.kind,
+                        ready.queue,
+                        ready.args,
+                        ready.priority AS lane_priority,
                         CASE
-                            WHEN $6 > 0 THEN clock_timestamp()
-                            ELSE NULL::timestamptz
-                        END AS heartbeat_at,
-                        CASE
-                            WHEN $6 > 0 THEN clock_timestamp() + make_interval(secs => $6)
-                            ELSE NULL::timestamptz
-                        END AS deadline_at,
-                        CASE
-                            WHEN $6 > 0 THEN clock_timestamp()
-                            ELSE NULL::timestamptz
-                        END AS attempted_at,
-                        selected.created_at,
-                        selected.unique_key,
-                        selected.unique_states,
-                        selected.payload
-                    FROM claimed
-                    CROSS JOIN lease_ring
-                    JOIN selected
-                     ON selected.ready_slot = claimed.ready_slot
-                     AND selected.ready_generation = claimed.ready_generation
-                     AND selected.queue = claimed.queue
-                     AND selected.effective_priority = claimed.priority
-                     AND selected.lane_seq = claimed.lane_seq
-                    ORDER BY selected.lane_seq ASC
-                $sql$, target_slot);
-
-                RETURN QUERY EXECUTE sql
-                USING
-                    p_queue,
-                    lane_priority,
-                    target_generation,
-                    lane_claim_seq,
-                    claim_limit,
-                    p_deadline_secs,
-                    p_aging_secs;
+                            WHEN p_aging_secs > 0 THEN GREATEST(
+                                1,
+                                ready.priority - FLOOR(
+                                    EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
+                                )::smallint
+                            )::smallint
+                            ELSE ready.priority
+                        END AS effective_priority,
+                        ready.attempt,
+                        ready.run_lease,
+                        ready.max_attempts,
+                        ready.lane_seq,
+                        ready.run_at,
+                        ready.created_at,
+                        ready.unique_key,
+                        ready.unique_states,
+                        ready.payload
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.queue = p_queue
+                      AND ready.priority = v_lane_priority
+                      AND ready.ready_slot = v_target_slot
+                      AND ready.ready_generation = v_target_generation
+                      AND ready.lane_seq >= v_lane_claim_seq
+                    ORDER BY ready.lane_seq ASC
+                    LIMIT v_claim_limit
+                ),
+                advanced AS (
+                    UPDATE {schema}.queue_claim_heads AS claims
+                    SET claim_seq = COALESCE(
+                            (SELECT max(selected.lane_seq) + 1 FROM selected),
+                            claims.claim_seq
+                        )
+                    WHERE claims.queue = p_queue
+                      AND claims.priority = v_lane_priority
+                    RETURNING claims.priority
+                ),
+                {claimed_cte}
+                SELECT
+                    claimed.ready_slot,
+                    claimed.ready_generation,
+                    claimed.lane_seq,
+                    lease_ring.lease_slot,
+                    lease_ring.lease_generation,
+                    selected.job_id,
+                    selected.kind,
+                    selected.queue,
+                    selected.args,
+                    selected.lane_priority,
+                    selected.effective_priority,
+                    claimed.attempt,
+                    claimed.run_lease,
+                    claimed.max_attempts,
+                    selected.run_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN clock_timestamp()
+                        ELSE NULL::timestamptz
+                    END AS heartbeat_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN clock_timestamp() + make_interval(secs => p_deadline_secs)
+                        ELSE NULL::timestamptz
+                    END AS deadline_at,
+                    CASE
+                        WHEN p_deadline_secs > 0 THEN clock_timestamp()
+                        ELSE NULL::timestamptz
+                    END AS attempted_at,
+                    selected.created_at,
+                    selected.unique_key,
+                    selected.unique_states,
+                    selected.payload
+                FROM claimed
+                CROSS JOIN lease_ring
+                JOIN selected
+                 ON selected.ready_slot = claimed.ready_slot
+                 AND selected.ready_generation = claimed.ready_generation
+                 AND selected.queue = claimed.queue
+                 AND selected.effective_priority = claimed.priority
+                 AND selected.lane_seq = claimed.lane_seq
+                ORDER BY selected.lane_seq ASC;
 
                 IF NOT FOUND THEN
                     UPDATE {schema}.queue_claim_heads AS claims

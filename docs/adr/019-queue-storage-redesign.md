@@ -18,6 +18,38 @@ rows repeatedly. Benchmarking showed that this leaves a persistent gap to
 append-only queue designs on dead tuples, and eventually on throughput under
 overlap.
 
+## Design goals and non-goals
+
+This ADR is guided by the following `0.6` priorities:
+
+- Preserve Postgres-native **transactional enqueue**. A job created alongside
+  application data must commit or roll back with that data, with no outbox
+  gap.
+- Prefer **no lost work under failure** over benchmark wins. Crashes,
+  restarts, network partitions, and worker death must not silently drop
+  runnable jobs.
+- State the delivery contract honestly: **at-least-once**, not marketing
+  “exactly once”. Retries must be safe, idempotency should be encouraged, and
+  stale writers must be rejected by `(job_id, run_lease)`.
+- Keep the **claim path fast under contention** with short transactions,
+  queue-local cursors, and `SKIP LOCKED`-style claiming rather than global
+  head-of-line blocking.
+- Keep **lease / heartbeat recovery**, **retry discipline**, and
+  **observability** as first-class runtime concerns rather than operational
+  afterthoughts.
+- Remain **vacuum-friendly** by keeping historical state out of the hot claim
+  path and avoiding row-rewrite-heavy designs.
+
+Non-goals and filters:
+
+- Do not claim “exactly once”.
+- Do not turn Awa into a replayable event log or Kafka replacement; the
+  design remains a job queue with one active attempt owner at a time.
+- Do not introduce optimizations that weaken “no lost work under failure”, even
+  if they benchmark well.
+- Do not solve contention by moving back to a single hot mutable jobs table or
+  by holding long-lived transactions around claim/execute/ack.
+
 ## Decision
 
 Adopt a single queue storage engine built around append-only queue records, a

@@ -20,6 +20,23 @@ It is intended to answer two questions:
 1. Is the core `0.6` storage design direction solid?
 2. What are the remaining implementation and performance risks?
 
+### Evaluation rubric
+
+The `0.6` branch should be judged against these priorities, not just the
+headline benchmark:
+
+- transactional enqueue remains a first-class Postgres-native property
+- no lost work under failure beats a faster but weaker design
+- at-least-once delivery is stated honestly; retries and idempotency are part
+  of the contract
+- perf work should keep prioritizing:
+  - claim path under contention
+  - recovery path
+  - retry storm behavior
+  - observability of saturation and backlog
+- any optimization that weakens crash/restart safety or makes retries amplify
+  outages should be rejected, even if it wins a microbenchmark
+
 ### High-level conclusion
 
 The **core design direction is solid**.
