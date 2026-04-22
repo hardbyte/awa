@@ -560,6 +560,11 @@ In order:
      claiming across multiple ready slots for the chosen lane did help the
      higher-concurrency backlog case, but it regressed `1/4` worker throughput
      enough that it was not worth keeping
+   - a later claim-function cleanup spike was also reverted:
+     reusing the first candidate lookup to avoid the second ready-slot query,
+     and reusing one captured timestamp across the batch, made the SQL look
+     cleaner but regressed plugged-in `1/4` worker throughput enough that it
+     was not worth keeping
    - so the next low-worker work should focus on fixed per-claim/start cost on
      the current design, not broader ready-slot selection
 
