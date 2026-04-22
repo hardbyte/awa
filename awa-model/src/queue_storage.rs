@@ -3637,33 +3637,10 @@ impl QueueStorage {
             .collect();
 
         if self.experimental_lease_claim_receipts() {
-            let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
-            let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
-            let lease_backed_pairs: BTreeSet<(i64, i64)> = sqlx::query_as(&format!(
-                r#"
-                WITH completed(job_id, run_lease) AS (
-                    SELECT * FROM unnest($1::bigint[], $2::bigint[])
-                )
-                SELECT lease.job_id, lease.run_lease
-                FROM {schema}.leases AS lease
-                JOIN completed
-                  ON completed.job_id = lease.job_id
-                 AND completed.run_lease = lease.run_lease
-                "#
-            ))
-            .bind(&job_ids)
-            .bind(&run_leases)
-            .fetch_all(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?
-            .into_iter()
-            .collect();
-
-            let (materialized_claimed, receipt_claimed): (Vec<_>, Vec<_>) =
-                claimed.iter().cloned().partition(|entry| {
-                    lease_backed_pairs.contains(&(entry.job.id, entry.job.run_lease))
-                });
-
+            let (mut receipt_claimed, mut materialized_claimed): (Vec<_>, Vec<_>) = claimed
+                .iter()
+                .cloned()
+                .partition(|entry| entry.claim.lease_claim_receipt);
             let mut updated_all = Vec::new();
 
             if !receipt_claimed.is_empty() {
@@ -3741,6 +3718,15 @@ impl QueueStorage {
                         .await?;
                     updated_all.extend(updated);
                 }
+
+                let updated_pairs: BTreeSet<(i64, i64)> = updated_all.iter().copied().collect();
+                let mut escalated_receipts = Vec::new();
+                for entry in receipt_claimed.drain(..) {
+                    if !updated_pairs.contains(&(entry.job.id, entry.job.run_lease)) {
+                        escalated_receipts.push(entry);
+                    }
+                }
+                materialized_claimed.extend(escalated_receipts);
             }
 
             if !materialized_claimed.is_empty() {
