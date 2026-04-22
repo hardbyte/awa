@@ -11,6 +11,7 @@ use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
     UniqueOpts, Worker,
 };
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
@@ -2387,6 +2388,77 @@ async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock(
         .rollback()
         .await
         .expect("Failed to release lease ring lock");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_dynamic_priority_aging";
+    let schema = "awa_qs_dynamic_priority_aging";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+
+    let aging_interval = Duration::from_secs(60);
+    let aged_job_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.ready_entries SET run_at = $1 WHERE job_id = $2"
+    ))
+    .bind(Utc::now() - chrono::Duration::seconds(aging_interval.as_secs() as i64 * 4))
+    .bind(aged_job_id)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate aged queue storage job");
+
+    let fresh_high_priority_job_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 2 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, aging_interval)
+        .await
+        .expect("Failed to claim aged queue storage job");
+
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, aged_job_id);
+    assert_ne!(claimed[0].job.id, fresh_high_priority_job_id);
+    assert_eq!(claimed[0].claim.priority, 4);
+    assert_eq!(claimed[0].job.priority, 1);
+    assert_eq!(
+        claimed[0]
+            .job
+            .metadata
+            .get("_awa_original_priority")
+            .and_then(|value| value.as_i64()),
+        Some(4)
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

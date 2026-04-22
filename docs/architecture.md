@@ -54,6 +54,8 @@ not sit in one mutable heap. The current lease plane is hybrid:
   `active_leases`
 - `attempt_state` is created lazily and only for jobs that need mutable
   per-attempt data (progress, callback state)
+- queue storage applies effective priority aging at claim time, so old waiting
+  jobs rise in priority without physically rewriting ready rows
 
 ADR-019 is the source of truth for storage internals:
 
@@ -673,7 +675,15 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 
 ### Leader Election
 
-Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion, cleanup, cron evaluation, priority aging) run on a single leader instance elected via Postgres advisory lock (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it auto-releases if the leader's connection drops. Non-leaders retry every 10 seconds. The leader verifies its connection is still alive every 30 seconds; if the ping fails, it re-enters the election loop.
+Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion,
+cleanup, cron evaluation, and canonical-table priority aging) run on a single
+leader instance elected via Postgres advisory lock
+(`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it
+auto-releases if the leader's connection drops. Non-leaders retry every 10
+seconds. The leader verifies its connection is still alive every 30 seconds; if
+the ping fails, it re-enters the election loop. Queue storage does not
+physically reprioritize ready rows; it applies effective priority aging at
+claim time.
 
 Scheduled and retryable promotion runs every 250ms by default, in bounded
 batches, and emits queue notifications after promotion. Cron evaluation remains

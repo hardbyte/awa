@@ -523,11 +523,12 @@ impl Dispatcher {
             },
             RuntimeStorage::QueueStorage(runtime) => match runtime
                 .store
-                .claim_runtime_batch(
+                .claim_runtime_batch_with_aging(
                     &self.pool,
                     &self.queue,
                     batch_size as i64,
                     self.config.deadline_duration,
+                    self.config.priority_aging_interval,
                 )
                 .await
             {

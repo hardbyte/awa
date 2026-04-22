@@ -310,9 +310,9 @@ Rust function correspondence is in
 - This is a breaking storage redesign rather than an incremental tweak.
 - Admin and producer paths must become backend-aware instead of assuming the
   canonical hot/deferred tables are the only physical layout.
-- Priority aging and other maintenance operations that once mutated a hot row
-  directly need storage-specific implementations against `lane_state` and
-  segments.
+- Queue storage has to replace some old row-rewrite maintenance patterns with
+  storage-specific equivalents, such as claim-time effective priority aging
+  instead of physically rewriting ready rows.
 - Long-running readers can still delay best-effort partition prune.
 
 ## Alternatives Considered

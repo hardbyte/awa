@@ -746,19 +746,10 @@ impl MaintenanceService {
             return;
         }
         if let Some(runtime) = self.storage.queue_storage() {
-            match runtime
-                .store
-                .age_waiting_priorities(&self.pool, self.priority_aging_interval, 1000)
-                .await
-            {
-                Ok(ids) if !ids.is_empty() => {
-                    debug!(count = ids.len(), "Aged queue storage job priorities");
-                }
-                Err(err) => {
-                    error!(error = %err, "Failed to age queue storage job priorities");
-                }
-                _ => {}
-            }
+            debug!(
+                schema = %runtime.store.schema(),
+                "Queue storage uses claim-time priority aging; skipping physical reprioritization pass"
+            );
             return;
         }
 

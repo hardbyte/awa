@@ -415,6 +415,7 @@ struct ReadyJobLeaseRow {
     kind: String,
     queue: String,
     args: serde_json::Value,
+    lane_priority: i16,
     priority: i16,
     attempt: i16,
     run_lease: i64,
@@ -433,7 +434,7 @@ impl ReadyJobLeaseRow {
     fn claim_ref(&self, lease_claim_receipt: bool) -> ClaimedEntry {
         ClaimedEntry {
             queue: self.queue.clone(),
-            priority: self.priority,
+            priority: self.lane_priority,
             lane_seq: self.lane_seq,
             ready_slot: self.ready_slot,
             ready_generation: self.ready_generation,
@@ -444,7 +445,17 @@ impl ReadyJobLeaseRow {
     }
 
     fn into_job_row(self) -> Result<JobRow, AwaError> {
-        let payload = RuntimePayload::from_json(self.payload)?;
+        let mut payload = RuntimePayload::from_json(self.payload)?;
+        if self.priority < self.lane_priority {
+            let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
+                AwaError::Validation(
+                    "queue storage payload metadata must be a JSON object".to_string(),
+                )
+            })?;
+            metadata
+                .entry("_awa_original_priority".to_string())
+                .or_insert_with(|| serde_json::Value::from(i64::from(self.lane_priority)));
+        }
 
         Ok(JobRow {
             id: self.job_id,
@@ -1270,7 +1281,7 @@ impl QueueStorage {
                             selected.ready_slot,
                             selected.ready_generation,
                             selected.queue,
-                            selected.priority,
+                            selected.effective_priority,
                             selected.attempt + 1,
                             selected.max_attempts,
                             selected.lane_seq
@@ -1344,7 +1355,7 @@ impl QueueStorage {
                             selected.job_id,
                             selected.queue,
                             'running'::awa.job_state,
-                            selected.priority,
+                            selected.effective_priority,
                             selected.attempt + 1,
                             selected.run_lease + 1,
                             selected.max_attempts,
@@ -2136,7 +2147,8 @@ impl QueueStorage {
             CREATE OR REPLACE FUNCTION {schema}.claim_ready_runtime(
                 p_queue TEXT,
                 p_max_batch BIGINT,
-                p_deadline_secs DOUBLE PRECISION
+                p_deadline_secs DOUBLE PRECISION,
+                p_aging_secs DOUBLE PRECISION
             )
             RETURNS TABLE(
                 ready_slot INT,
@@ -2148,6 +2160,7 @@ impl QueueStorage {
                 kind TEXT,
                 queue TEXT,
                 args JSONB,
+                lane_priority SMALLINT,
                 priority SMALLINT,
                 attempt SMALLINT,
                 run_lease BIGINT,
@@ -2174,18 +2187,36 @@ impl QueueStorage {
                 sql TEXT;
             BEGIN
                 SELECT
-                    lanes.priority,
+                    claims.priority,
                     claims.claim_seq,
                     enqueues.next_seq
                 INTO lane_priority, lane_claim_seq, lane_next_seq
-                FROM {schema}.queue_lanes AS lanes
-                JOIN {schema}.queue_claim_heads AS claims
-                  ON claims.queue = lanes.queue
-                 AND claims.priority = lanes.priority
+                FROM {schema}.queue_claim_heads AS claims
                 JOIN {schema}.queue_enqueue_heads AS enqueues
-                  ON enqueues.queue = lanes.queue
-                 AND enqueues.priority = lanes.priority
-                WHERE lanes.queue = p_queue
+                  ON enqueues.queue = claims.queue
+                 AND enqueues.priority = claims.priority
+                JOIN LATERAL (
+                    SELECT
+                        ready.ready_slot,
+                        ready.ready_generation,
+                        ready.run_at,
+                        CASE
+                            WHEN p_aging_secs > 0 THEN GREATEST(
+                                1,
+                                claims.priority - FLOOR(
+                                    EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
+                                )::smallint
+                            )::smallint
+                            ELSE claims.priority
+                        END AS effective_priority
+                    FROM {schema}.ready_entries AS ready
+                    WHERE ready.queue = p_queue
+                      AND ready.priority = claims.priority
+                      AND ready.lane_seq >= claims.claim_seq
+                    ORDER BY ready.lane_seq ASC
+                    LIMIT 1
+                ) AS candidate ON TRUE
+                WHERE claims.queue = p_queue
                   AND NOT EXISTS (
                       SELECT 1
                       FROM awa.queue_meta AS meta
@@ -2193,7 +2224,7 @@ impl QueueStorage {
                         AND meta.paused = TRUE
                   )
                   AND claims.claim_seq < enqueues.next_seq
-                ORDER BY lanes.priority ASC
+                ORDER BY candidate.effective_priority ASC, candidate.run_at ASC, claims.priority ASC
                 LIMIT 1
                 FOR UPDATE OF claims SKIP LOCKED;
 
@@ -2237,7 +2268,16 @@ impl QueueStorage {
                             ready.kind,
                             ready.queue,
                             ready.args,
-                            ready.priority,
+                            ready.priority AS lane_priority,
+                            CASE
+                                WHEN $7 > 0 THEN GREATEST(
+                                    1,
+                                    ready.priority - FLOOR(
+                                        EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / $7
+                                    )::smallint
+                                )::smallint
+                                ELSE ready.priority
+                            END AS effective_priority,
                             ready.attempt,
                             ready.run_lease,
                             ready.max_attempts,
@@ -2276,7 +2316,8 @@ impl QueueStorage {
                         selected.kind,
                         selected.queue,
                         selected.args,
-                        selected.priority,
+                        selected.lane_priority,
+                        selected.effective_priority,
                         claimed.attempt,
                         claimed.run_lease,
                         claimed.max_attempts,
@@ -2300,10 +2341,10 @@ impl QueueStorage {
                     FROM claimed
                     CROSS JOIN lease_ring
                     JOIN selected
-                      ON selected.ready_slot = claimed.ready_slot
+                     ON selected.ready_slot = claimed.ready_slot
                      AND selected.ready_generation = claimed.ready_generation
                      AND selected.queue = claimed.queue
-                     AND selected.priority = claimed.priority
+                     AND selected.effective_priority = claimed.priority
                      AND selected.lane_seq = claimed.lane_seq
                     ORDER BY selected.lane_seq ASC
                 $sql$, target_slot);
@@ -2315,7 +2356,8 @@ impl QueueStorage {
                     target_generation,
                     lane_claim_seq,
                     claim_limit,
-                    p_deadline_secs;
+                    p_deadline_secs,
+                    p_aging_secs;
 
                 IF NOT FOUND THEN
                     UPDATE {schema}.queue_claim_heads AS claims
@@ -2671,6 +2713,7 @@ impl QueueStorage {
         queue: &str,
         max_batch: i64,
         deadline_duration: Duration,
+        aging_interval: Duration,
     ) -> Result<Vec<ReadyJobLeaseRow>, AwaError> {
         let schema = self.schema();
         sqlx::query_as(&format!(
@@ -2685,6 +2728,7 @@ impl QueueStorage {
                 kind,
                 queue,
                 args,
+                lane_priority,
                 priority,
                 attempt,
                 run_lease,
@@ -2697,12 +2741,13 @@ impl QueueStorage {
                 unique_key,
                 unique_states,
                 payload
-            FROM {schema}.claim_ready_runtime($1, $2, $3)
+            FROM {schema}.claim_ready_runtime($1, $2, $3, $4)
             "#
         ))
         .bind(queue)
         .bind(max_batch)
         .bind(deadline_duration.as_secs_f64())
+        .bind(aging_interval.as_secs_f64())
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
@@ -3383,7 +3428,7 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let claimed = self
-            .claim_ready_rows_tx(&mut tx, queue, max_batch, Duration::ZERO)
+            .claim_ready_rows_tx(&mut tx, queue, max_batch, Duration::ZERO, Duration::ZERO)
             .await?
             .into_iter()
             .map(|row| row.claim_ref(self.experimental_lease_claim_receipts()))
@@ -3401,6 +3446,25 @@ impl QueueStorage {
         max_batch: i64,
         deadline_duration: Duration,
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
+        self.claim_runtime_batch_with_aging(
+            pool,
+            queue,
+            max_batch,
+            deadline_duration,
+            Duration::ZERO,
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.claim_runtime_batch_with_aging")]
+    pub async fn claim_runtime_batch_with_aging(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        max_batch: i64,
+        deadline_duration: Duration,
+        aging_interval: Duration,
+    ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
         if max_batch <= 0 {
             return Ok(Vec::new());
         }
@@ -3413,7 +3477,13 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let claimed = self
-            .claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration)
+            .claim_ready_rows_tx(
+                &mut tx,
+                queue,
+                max_batch,
+                deadline_duration,
+                aging_interval,
+            )
             .await?;
 
         for row in &claimed {

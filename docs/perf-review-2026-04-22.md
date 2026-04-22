@@ -309,27 +309,58 @@ Likely directions:
 
 ##### 2. Retry-heavy overload behavior
 
-The semantics run is the current red flag.
+This is no longer a correctness red flag, but it is still a throughput/backlog
+weakness.
 
-Even after fixing the stale-ignore path, retry-heavy mixed-priority overload produces:
+After switching queue storage to claim-time effective priority aging and fixing
+the receipt-backed retry close path:
 
-- large backlog growth
-- bad subscriber and end-to-end tails
-- weak recovery behavior
+- retryable failures are retried correctly
+- aged lower-priority work is now visibly completing during recovery
+- the backlog is dominated by `available` work, not by deferred retry buildup
 
-That means we still need a better story for one or more of:
+The newest semantics run is:
 
-- retry rescheduling policy
-- retry prioritization / starvation protection
-- backpressure / offered-load shaping in the benchmark path
-- faster reclaim of retryable work under sustained retry pressure
+- `benchmarks/portable/results/awa_semantics_retry_priority_mix_20260422_045458.json`
+
+That run shows a materially healthier shape than the earlier benchmark-only
+aging pass:
+
+- `clean_1`: completion `642/s`, subscriber p99 `2.9s`, total backlog `247.5`
+- `pressure_1`: completion `651/s`, subscriber p99 `23.8s`, total backlog `14.2k`
+- `recovery_1`: completion `759/s`, subscriber p99 `28.1s`, total backlog `23.8k`
+- `aged_completion_rate` is now real in `pressure_1` and `recovery_1`
+
+So the remaining problem is not "retries are stuck in the wrong state". It is:
+
+- offered load still outruns completion throughput under retry-heavy overload
+- queue depth still grows too fast during overload phases
+- recovery still has large delivery tails even though starvation is improved
 
 ##### 3. Recovery latency tails
 
-Recovery remains the weakest phase in the main Awa-only runs and in the crash-under-load scenario.
+Recovery remains the weakest phase in both the main Awa-only runs and the
+explicit crash-under-load scenario.
 
-This is now more of a performance issue than a lock-safety issue.
-The system recovers, but the tails are still too large.
+The newest crash-under-load run is:
+
+- `benchmarks/portable/results/awa_semantics_crash_recovery_under_load_20260422_062948.json`
+
+It is important because it confirms two things at once:
+
+- the old restart deadlock cluster is gone
+- recovery tails are still too large to call this "done"
+
+Observed shape:
+
+- `baseline`: completion `731/s`, subscriber p99 `349 ms`, total backlog `34`
+- `pressure_1`: completion `815/s`, subscriber p99 `15.5s`, total backlog `27.1k`
+- `kill`: completion `971/s`, subscriber p99 `44.5s`, total backlog `52.3k`
+- `restart`: completion `780/s`, subscriber p99 `58.1s`, total backlog `41.5k`
+- `recovery_1`: completion `727/s`, subscriber p99 `30.0s`, total backlog `32.7k`
+
+This is now clearly a performance issue, not a lock-safety issue. The system
+recovers, but the recovery path is still too expensive under load.
 
 ##### 4. Counts/admin read model
 
@@ -342,30 +373,82 @@ With the cached queue-count snapshot path used by the portable benchmark adapter
 - crash recovery rerun:
   - `benchmarks/portable/results/awa_semantics_crash_recovery_under_load_20260422_025919.json`
 
-At low to mid worker counts, the old `queue_counts()` warning largely disappears. At higher worker counts it still appears occasionally, but it is no longer the main bottleneck.
+At low to mid worker counts, the old `queue_counts()` warning largely
+disappears. At higher worker counts it still appears occasionally, but it is no
+longer the main bottleneck.
 
 That means the next target has shifted to:
 
-- `age_waiting_priorities` under backlog pressure
 - `claim_ready_runtime(...)` at higher worker counts
 - completion-path receipt/lease reconciliation during crash recovery
+- commit / connection-acquire stalls during crash/restart pressure
+
+##### 5. Worker scaling shape
+
+The newest scaling sweep is:
+
+- `benchmarks/portable/results/worker_scale_20260422_062119.json`
+
+The high-level result is mixed:
+
+- the branch still scales strongly once Awa has enough workers
+- but Awa is underfilled at low worker counts in this benchmark shape
+
+Representative results:
+
+- `1` worker:
+  - `awa clean_1`: `35.5/s`, subscriber p99 `55.9s`
+  - `pgque clean_1`: `358.7/s`, subscriber p99 `142 ms`
+- `16` workers:
+  - `awa clean_1`: `309.9/s`, subscriber p99 `33.1s`
+  - `pgque clean_1`: `422.3/s`, subscriber p99 `126 ms`
+- `32` workers:
+  - `awa clean_1`: `796.8/s`, subscriber p99 `68.5 ms`
+  - `pgque clean_1`: `519.8/s`, subscriber p99 `112 ms`
+- `64` workers:
+  - `awa clean_1`: `798.0/s`, subscriber p99 `43.0 ms`
+  - `pgque clean_1`: `506.6/s`, subscriber p99 `126 ms`
+
+So the scaling story is now:
+
+- the high-worker regime is strong
+- the low-worker regime is still bad enough that we should not ignore it
+- the current bottleneck is likely in the claim / completion pipeline shape,
+  not the old storage-MVCC hotspot class
 
 ### Cross-system position
 
 The newest short `awa` vs `pgque` comparison is:
 
-- `benchmarks/portable/results/custom-20260421T225449Z-2207b2`
+- `benchmarks/portable/results/custom-20260422T045706Z-4a74b9`
 
-But it should be treated as a **sanity check**, not a headline result:
+It should still be treated as a **sanity check**, not a headline result.
 
-- the phases are very short
-- both systems carry visible backlog
-- throughput is lower than in the better-established longer Awa-only profiles
+That run shows:
 
-The more trustworthy conclusion today is:
+- Awa leading on throughput in every presented phase
+- Awa showing lower dead tuples than pgque in the same short profile
+- but Awa also showing very large subscriber and end-to-end tails once the
+  short run carries backlog
 
-- Awa’s current design is strong enough to justify continued investment
-- cross-system headline claims should still be based on longer, better-settled profiles after the next lease-plane work
+Representative medians:
+
+- `clean_1`
+  - `awa`: `706/s`, subscriber p99 `1.3s`, dead tuples `140`
+  - `pgque`: `273/s`, subscriber p99 `177 ms`, dead tuples `514`
+- `pressure_1`
+  - `awa`: `705/s`, subscriber p99 `32.9s`, dead tuples `215`
+  - `pgque`: `456/s`, subscriber p99 `126 ms`, dead tuples `726`
+
+So the cross-system narrative is still not "Awa wins everything". The real
+position is:
+
+- Awa's storage design is now strong enough to compete on throughput and dead
+  tuples
+- but the runtime still has tail-latency problems under short overloaded
+  profiles
+- those tails need to be understood before we use these short compare runs as
+  release messaging
 
 ### Overall judgement
 
@@ -385,30 +468,29 @@ Not yet.
 
 The branch is now **correct enough to keep iterating confidently**, but still has obvious room to improve in:
 
-- retry-heavy overload
+- low-worker underfill
 - recovery latency
-- lease-ring control-plane churn
+- crash/restart claim-complete cost
 
 ### Recommended next steps
 
 In order:
 
-1. Investigate lease-ring control-plane churn
-   - still a real MVCC hotspot
+1. Investigate claim/completion cost under recovery
+   - especially receipt/lease completion reconciliation
+   - and the `COMMIT` / acquire stalls visible in crash-under-load
 
-2. Investigate `age_waiting_priorities`
-   - now one of the clearest recurring slow queries once count polling is cooled
+2. Investigate low-worker underfill
+   - the `1/4/8/16` worker scaling results are still too weak
 
-3. Investigate claim/completion cost under recovery
-   - especially `claim_ready_runtime(...)` and the receipt/lease completion reconciliation path
+3. Investigate retry-heavy overload behavior
+   - especially completion throughput vs queue depth growth
+   - but now on the corrected claim-time aging baseline
 
-4. Investigate retry-heavy overload behavior
-   - especially completion throughput vs queue depth growth vs priority behavior
-
-5. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
+4. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
    - avoid using very short cross-system runs as the main narrative
 
-6. Add a compact report view for semantics/scaling scenarios
+5. Add a compact report view for semantics/scaling scenarios
    - not because it is urgent, but because these scenarios are now part of the real performance story
 
 ### Bottom line
@@ -419,13 +501,13 @@ The branch is in a materially better place than it was before the recent lease-p
 - restart-time schema/backfill contention: solved
 - stale receipt retry path: solved
 - long-horizon history-scan regression: solved
+- physical priority aging on queue storage: replaced with claim-time effective aging
 
 What remains is the next layer down:
 
-- lease-ring control-plane churn
-- priority aging / backlog reshaping cost
+- low-worker underfill
 - claim/completion cost under recovery
-- retry-heavy overload behavior
+- retry-heavy overload behavior under oversupply
 - recovery tails
 
 That is a good place to be.
