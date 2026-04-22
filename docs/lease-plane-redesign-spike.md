@@ -85,6 +85,65 @@ The desired steady state is:
   heartbeat, callback wait, or progress needs it
 - rescue logic still has a bounded, checkable source of truth
 
+## Reservation-plane spike
+
+We also tested a deeper dispatcher-side variant of this idea:
+
+- reserve work ahead in a bounded live frontier
+- promote reservation -> active attempt only when a worker actually starts
+- expire stale reservations back to ready work if the worker dies before start
+
+The safety model was sound:
+
+- late start loses after reservation expiry
+- expired reservations can be reinserted as fresh ready rows
+- the worker/runtime tests stayed green with this boundary
+
+But the first implementation was not good enough to keep.
+
+### What was tried
+
+1. A bounded `open_dispatch_reservations` table.
+2. Executor-side promotion from reservation -> receipt-backed active attempt.
+3. Expiry/re-enqueue for reservations that were never started.
+4. A second pass with local buffering of reservations in the dispatcher.
+
+### What the measurements showed
+
+The reservation plane improved backlog and latency at very low worker counts,
+but it regressed throughput once the worker pool got larger.
+
+The core reason was cost shape:
+
+- reservation requires one DB round-trip
+- start promotion required a second DB round-trip per actually-started job
+
+So the design reduced claim-roundtrip pressure at small worker counts but paid
+for it with an extra per-job start transaction.
+
+The buffered-reservation variant was worse:
+
+- it preserved the safety boundary better than the earlier naive prefetch spike
+- but it still reduced throughput, including at `1` worker in the benchmark
+
+### Current conclusion
+
+The reservation plane is still a plausible long-term direction, but only if
+promotion is much cheaper than the first spike:
+
+- batched reservation promotion
+- or another design that separates reservation from attempt start without
+  introducing one extra transaction per job
+
+For the `0.6` branch, the reservation-plane implementation was reverted.
+The design note remains because it explains the right safety boundary if we
+return to this later:
+
+- `reserved but not started`
+- `active attempt`
+
+must remain distinct.
+
 ## Recommended redesign
 
 ### 1. Split the current lease plane into two structures

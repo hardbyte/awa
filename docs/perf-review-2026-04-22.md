@@ -34,6 +34,7 @@ The remaining problems are **not** signs that the overall storage direction is w
 - lease-ring control-plane churn
 - recovery/retry behavior under sustained oversupply
 - latency tails during recovery or retry-heavy workloads
+- low-worker underfill from claim/start amortization
 
 So the current question is no longer "was the redesign a good idea?".
 It was.
@@ -45,6 +46,18 @@ queue-storage MVCC hotspot. The strongest fix so far is releasing local worker
 capacity when handler execution ends, while keeping durable completion on the
 existing `run_lease`-guarded finalization path. That improves `1/4/8/16`
 worker throughput without changing the underlying storage state machine.
+
+We also tested a reservation-plane spike for low-worker underfill:
+
+- reserve work ahead in a bounded live frontier
+- promote reservation -> active attempt only when a worker actually starts
+- expire stale reservations back to ready work if the worker dies before start
+
+The safety boundary was good, but the implementation was reverted. The first
+version added too much per-job start cost, and the buffered-reservation
+follow-up regressed throughput further. So the current branch does **not**
+carry the reservation plane; it only carries the design learning from that
+spike.
 
 ### What now looks solid
 
