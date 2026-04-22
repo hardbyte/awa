@@ -527,6 +527,7 @@ pub async fn run() {
     // ── Queue depth poller ──────────────────────────────────────────
     let depth_pool = pool.clone();
     let depth_shutdown = Arc::clone(&shutdown);
+    let queue_count_max_age = Duration::from_secs(sample_every_s.max(15));
     let depth_handle = {
         let queue_depth = Arc::clone(&queue_depth);
         let running_depth = Arc::clone(&running_depth);
@@ -534,7 +535,10 @@ pub async fn run() {
         let scheduled_depth = Arc::clone(&scheduled_depth);
         tokio::spawn(async move {
             while !depth_shutdown.load(Ordering::Relaxed) {
-                match depth_store.queue_counts(&depth_pool, queue_name).await {
+                match depth_store
+                    .queue_counts_cached(&depth_pool, queue_name, queue_count_max_age)
+                    .await
+                {
                     Ok(counts) => {
                         queue_depth.store(counts.available as u64, Ordering::Relaxed);
                         running_depth.store(counts.running as u64, Ordering::Relaxed);

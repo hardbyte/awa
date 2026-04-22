@@ -1517,6 +1517,21 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_count_snapshots (
+                queue         TEXT PRIMARY KEY,
+                available     BIGINT NOT NULL DEFAULT 0,
+                running       BIGINT NOT NULL DEFAULT 0,
+                completed     BIGINT NOT NULL DEFAULT 0,
+                refreshed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             let mut backfill_tx = pool.begin().await.map_err(map_sqlx_error)?;
             sqlx::query(&format!(
                 r#"
@@ -2479,6 +2494,7 @@ impl QueueStorage {
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
+                {schema}.queue_count_snapshots,
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
@@ -3946,8 +3962,11 @@ impl QueueStorage {
             .collect())
     }
 
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.queue_counts")]
-    pub async fn queue_counts(&self, pool: &PgPool, queue: &str) -> Result<QueueCounts, AwaError> {
+    async fn queue_counts_exact(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+    ) -> Result<QueueCounts, AwaError> {
         let schema = self.schema();
         let row: (i64, i64, i64) = sqlx::query_as(&format!(
             r#"
@@ -4025,6 +4044,85 @@ impl QueueStorage {
             running,
             completed,
         })
+    }
+
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.queue_counts")]
+    pub async fn queue_counts(&self, pool: &PgPool, queue: &str) -> Result<QueueCounts, AwaError> {
+        self.queue_counts_exact(pool, queue).await
+    }
+
+    #[tracing::instrument(
+        skip(self, pool),
+        fields(queue = %queue, max_age_ms = max_age.as_millis()),
+        name = "queue_storage.queue_counts_cached"
+    )]
+    pub async fn queue_counts_cached(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        max_age: Duration,
+    ) -> Result<QueueCounts, AwaError> {
+        if max_age.is_zero() {
+            return self.queue_counts_exact(pool, queue).await;
+        }
+
+        let schema = self.schema();
+        let snapshot: Option<(i64, i64, i64, DateTime<Utc>)> = sqlx::query_as(&format!(
+            r#"
+            SELECT available, running, completed, refreshed_at
+            FROM {schema}.queue_count_snapshots
+            WHERE queue = $1
+            "#
+        ))
+        .bind(queue)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let now = Utc::now();
+        if let Some((available, running, completed, refreshed_at)) = snapshot {
+            if now
+                .signed_duration_since(refreshed_at)
+                .to_std()
+                .unwrap_or_default()
+                < max_age
+            {
+                return Ok(QueueCounts {
+                    available,
+                    running,
+                    completed,
+                });
+            }
+        }
+
+        let counts = self.queue_counts_exact(pool, queue).await?;
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_count_snapshots AS snapshots (
+                queue,
+                available,
+                running,
+                completed,
+                refreshed_at
+            )
+            VALUES ($1, $2, $3, $4, now())
+            ON CONFLICT (queue) DO UPDATE
+            SET
+                available = EXCLUDED.available,
+                running = EXCLUDED.running,
+                completed = EXCLUDED.completed,
+                refreshed_at = EXCLUDED.refreshed_at
+            "#
+        ))
+        .bind(queue)
+        .bind(counts.available)
+        .bind(counts.running)
+        .bind(counts.completed)
+        .execute(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(counts)
     }
 
     async fn retry_job_tx<'a>(

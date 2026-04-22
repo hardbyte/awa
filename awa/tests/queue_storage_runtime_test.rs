@@ -2292,6 +2292,62 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_queue_counts_cached_uses_snapshot_until_stale() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_counts_cached";
+    let schema = "awa_qs_counts_cached";
+    let store = create_store(&pool, schema).await;
+
+    let initial = store
+        .queue_counts_cached(&pool, queue, Duration::from_secs(60))
+        .await
+        .expect("Failed to populate initial queue count snapshot");
+    assert_eq!(initial.available, 0);
+    assert_eq!(initial.running, 0);
+    assert_eq!(initial.completed, 0);
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("Failed to enqueue queued job");
+
+    let stale = store
+        .queue_counts_cached(&pool, queue, Duration::from_secs(60))
+        .await
+        .expect("Failed to read cached queue counts");
+    assert_eq!(stale.available, 0);
+    assert_eq!(stale.running, 0);
+    assert_eq!(stale.completed, 0);
+
+    sqlx::query(&format!(
+        r#"
+        UPDATE {schema}.queue_count_snapshots
+        SET refreshed_at = now() - interval '1 hour'
+        WHERE queue = $1
+        "#
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to age queue count snapshot");
+
+    let refreshed = store
+        .queue_counts_cached(&pool, queue, Duration::from_secs(60))
+        .await
+        .expect("Failed to refresh queue counts from exact query");
+    assert_eq!(refreshed.available, 1);
+    assert_eq!(refreshed.running, 0);
+    assert_eq!(refreshed.completed, 0);
+
+    let exact = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to read exact queue counts");
+    assert_eq!(exact, refreshed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;

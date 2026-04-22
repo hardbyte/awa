@@ -2,7 +2,7 @@
 
 Date: 2026-04-22
 Branch: `feature/vacuum-aware-storage-redesign`
-Baseline commit for this review: `729e9e9`
+Baseline commit for this review: `3919b05`
 
 ### Scope
 
@@ -333,14 +333,22 @@ The system recovers, but the tails are still too large.
 
 ##### 4. Counts/admin read model
 
-`queue_counts()` has now become the clearest recurring slow query in the broader perf pack.
+`queue_counts()` was the clearest recurring slow query in the earlier broader perf pack, and that is now partly addressed.
 
-It is far better than the old historical anti-join version, but under scaling and crash/recovery pressure it is still expensive enough to show up repeatedly at the 1-2s range.
+With the cached queue-count snapshot path used by the portable benchmark adapter, the count query is no longer the dominant steady-state warning in the rerun scaling/crash passes:
 
-That makes the next likely performance target:
+- worker scaling rerun:
+  - `benchmarks/portable/results/worker_scale_20260422_025018.json`
+- crash recovery rerun:
+  - `benchmarks/portable/results/awa_semantics_crash_recovery_under_load_20260422_025919.json`
 
-- a colder/incremental queue count read model
-- or less frequent count polling in the hot benchmark/runtime paths
+At low to mid worker counts, the old `queue_counts()` warning largely disappears. At higher worker counts it still appears occasionally, but it is no longer the main bottleneck.
+
+That means the next target has shifted to:
+
+- `age_waiting_priorities` under backlog pressure
+- `claim_ready_runtime(...)` at higher worker counts
+- completion-path receipt/lease reconciliation during crash recovery
 
 ### Cross-system position
 
@@ -388,16 +396,19 @@ In order:
 1. Investigate lease-ring control-plane churn
    - still a real MVCC hotspot
 
-2. Investigate `queue_counts()` / read-side control-plane cost
-   - now the clearest recurring slow-query bottleneck in scaling and crash recovery
+2. Investigate `age_waiting_priorities`
+   - now one of the clearest recurring slow queries once count polling is cooled
 
-3. Investigate retry-heavy overload behavior
+3. Investigate claim/completion cost under recovery
+   - especially `claim_ready_runtime(...)` and the receipt/lease completion reconciliation path
+
+4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth vs priority behavior
 
-4. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
+5. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
    - avoid using very short cross-system runs as the main narrative
 
-5. Add a compact report view for semantics/scaling scenarios
+6. Add a compact report view for semantics/scaling scenarios
    - not because it is urgent, but because these scenarios are now part of the real performance story
 
 ### Bottom line
@@ -412,7 +423,8 @@ The branch is in a materially better place than it was before the recent lease-p
 What remains is the next layer down:
 
 - lease-ring control-plane churn
-- `queue_counts()` / read-side control-plane cost
+- priority aging / backlog reshaping cost
+- claim/completion cost under recovery
 - retry-heavy overload behavior
 - recovery tails
 
