@@ -2,7 +2,7 @@
 
 Date: 2026-04-22
 Branch: `feature/vacuum-aware-storage-redesign`
-Baseline commit for this review: `e7c7074`
+Baseline commit for this review: `729e9e9`
 
 ### Scope
 
@@ -155,12 +155,13 @@ The remaining churn is now clearly in the lease control plane, not the queue pla
 
 Bundle:
 
-- `benchmarks/portable/results/awa_semantics_retry_priority_mix_20260421_224035.json`
+- `benchmarks/portable/results/awa_semantics_retry_priority_mix_20260422_003340.json`
 
 Important result:
 
-- the old `retry ignored` correctness bug is gone in the rebuilt benchmark run
+- the old `retry ignored` correctness bug is gone
 - first-attempt failures are now being retried through the real portable loop
+- priority aging is now actually wired into maintenance, so the scenario is measuring real aging behavior instead of a benchmark-only fiction
 
 But this scenario also shows the remaining weakness:
 
@@ -169,79 +170,107 @@ But this scenario also shows the remaining weakness:
 Phase medians:
 
 - `clean_1`
-  - completion rate: `402/s`
-  - retryable failure rate: `58/s`
-  - queue depth: `1945`
-  - subscriber p99: `5529 ms`
+  - completion rate: `631.7/s`
+  - retryable failure rate: `91.4/s`
+  - queue depth: `646`
+  - retryable depth: `240.5`
+  - total backlog: `940`
+  - subscriber p99: `6311.9 ms`
+  - aged completion rate: `0`
 - `pressure_1`
-  - completion rate: `367/s`
-  - retryable failure rate: `55/s`
-  - queue depth: `6759`
-  - subscriber p99: `12509 ms`
+  - completion rate: `537.6/s`
+  - retryable failure rate: `77.5/s`
+  - queue depth: `27929.5`
+  - retryable depth: `196.5`
+  - total backlog: `28158.5`
+  - subscriber p99: `46202.9 ms`
+  - aged completion rate: `22.3`
 - `recovery_1`
-  - completion rate: `423/s`
-  - retryable failure rate: `65/s`
-  - queue depth: `11972`
-  - subscriber p99: `21955 ms`
+  - completion rate: `527.0/s`
+  - retryable failure rate: `81.0/s`
+  - queue depth: `55551`
+  - retryable depth: `192`
+  - total backlog: `55731`
+  - subscriber p99: `3070 ms`
+  - aged completion rate: `182.3`
 
-This is not a correctness failure anymore.
-It is a performance/queuing behavior problem under retry-heavy oversupply.
+This is not a correctness failure anymore. It is now clearly a throughput and queuing-behavior problem under retry-heavy oversupply:
+
+- clean is near steady state
+- pressure is the intentional overload window
+- recovery does show real aging/drain of lower-priority work
+- the backlog is dominated by `available` work, not deferred retries
 
 #### Crash recovery under load
 
 Bundle:
 
-- `benchmarks/portable/results/awa_semantics_crash_recovery_under_load_20260421_224145.json`
+- `benchmarks/portable/results/awa_semantics_crash_recovery_under_load_20260422_014850.json`
 
 Result:
 
 - two replicas ran
 - one worker was killed mid-run
-- recovery completed without the earlier deadlock/slow-query cluster
+- recovery completed without the earlier deadlock/slow-query deadlock cluster
+- restart itself is healthy enough to proceed, but the read-side control plane remains expensive during kill/restart/recovery
 
 Phase medians:
 
-- `clean_1`
-  - completion rate: `239/s`
-  - subscriber p99: `2995 ms`
-  - queue depth: `1969`
-- `crash_1`
-  - completion rate: `641/s`
-  - subscriber p99: `4311 ms`
-  - queue depth: `3669`
+- `baseline`
+  - completion rate: `261.7/s`
+  - subscriber p99: `19046.4 ms`
+  - total backlog: `27316.5`
+- `pressure_1`
+  - completion rate: `220.9/s`
+  - subscriber p99: `46891.0 ms`
+  - total backlog: `94553.5`
+- `kill`
+  - completion rate: `211.9/s`
+  - total backlog: `167839.5`
+- `restart`
+  - completion rate: `167.1/s`
+  - total backlog: `208071.0`
 - `recovery_1`
-  - completion rate: `401/s`
-  - subscriber p99: `8780 ms`
-  - queue depth: `5065`
+  - completion rate: `133.8/s`
+  - total backlog: `251684.0`
 
-This says the restart-time lock graph is much healthier.
-It does **not** say recovery latency is where we want it yet.
+This says:
+
+- restart-time deadlocks are no longer the story
+- the remaining weakness is recovery throughput and read-side/control-plane cost under heavy backlog
+- `queue_counts()` is the most obvious recurring slow query in this scenario
+- startup also still pays a visible `open_receipt_claims` refill cost on the restarted replica
 
 #### Worker scaling
 
 Bundle:
 
-- `benchmarks/portable/results/worker_scale_20260421_224625.json`
+- `benchmarks/portable/results/worker_scale_20260422_013951.json`
 
 Observed `clean_1` throughput:
 
-- `1 worker`: `45/s`
-- `4 workers`: `91/s`
-- `16 workers`: `241/s`
-- `32 workers`: `529/s`
+- `1 worker`: `15.4/s`
+- `4 workers`: `40.3/s`
+- `8 workers`: `107.2/s`
+- `16 workers`: `184.1/s`
+- `32 workers`: `339.5/s`
+- `64 workers`: `528.9/s`
 
 Observed `pressure_1` throughput:
 
-- `1 worker`: `44/s`
-- `4 workers`: `99/s`
-- `16 workers`: `293/s`
-- `32 workers`: `464/s`
+- `1 worker`: `12.5/s`
+- `4 workers`: `46.7/s`
+- `8 workers`: `110.2/s`
+- `16 workers`: `190.0/s`
+- `32 workers`: `288.2/s`
+- `64 workers`: `457.1/s`
 
 Interpretation:
 
 - throughput still scales upward with workers
-- we are not seeing an obvious new serialization cliff at `16` or `32`
-- but this sweep is oversupplied enough that queueing dominates latency, especially at low worker counts
+- we are not seeing an obvious new serialization cliff at `16`, `32`, or `64`
+- the limiting behavior here is queueing and expensive read-side bookkeeping, not an enqueue/claim serialization collapse
+- low-worker runs are heavily oversupplied, so latency is dominated by backlog, but the scaling direction is still correct
 
 ### Current design assessment
 
@@ -262,7 +291,7 @@ I would not revisit any of those unless a correctness proof forces it.
 
 ##### 1. Lease-ring control plane
 
-This is now the clearest remaining MVCC hotspot.
+This is still a real MVCC hotspot, but it is no longer the only or even always the first bottleneck seen in the broader pack.
 
 The evidence is strong:
 
@@ -304,9 +333,14 @@ The system recovers, but the tails are still too large.
 
 ##### 4. Counts/admin read model
 
-`queue_counts()` is far better than the old historical anti-join version, but it is still a relatively heavy read model under stress.
+`queue_counts()` has now become the clearest recurring slow query in the broader perf pack.
 
-That is not the first thing to optimize next, but it is still an area to watch.
+It is far better than the old historical anti-join version, but under scaling and crash/recovery pressure it is still expensive enough to show up repeatedly at the 1-2s range.
+
+That makes the next likely performance target:
+
+- a colder/incremental queue count read model
+- or less frequent count polling in the hot benchmark/runtime paths
 
 ### Cross-system position
 
@@ -352,15 +386,18 @@ The branch is now **correct enough to keep iterating confidently**, but still ha
 In order:
 
 1. Investigate lease-ring control-plane churn
-   - this is now the clearest remaining MVCC hotspot
+   - still a real MVCC hotspot
 
-2. Investigate retry-heavy overload behavior
-   - especially retry scheduling vs queue depth growth vs priority behavior
+2. Investigate `queue_counts()` / read-side control-plane cost
+   - now the clearest recurring slow-query bottleneck in scaling and crash recovery
 
-3. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
+3. Investigate retry-heavy overload behavior
+   - especially completion throughput vs queue depth growth vs priority behavior
+
+4. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
    - avoid using very short cross-system runs as the main narrative
 
-4. Add a compact report view for semantics/scaling scenarios
+5. Add a compact report view for semantics/scaling scenarios
    - not because it is urgent, but because these scenarios are now part of the real performance story
 
 ### Bottom line
@@ -375,6 +412,7 @@ The branch is in a materially better place than it was before the recent lease-p
 What remains is the next layer down:
 
 - lease-ring control-plane churn
+- `queue_counts()` / read-side control-plane cost
 - retry-heavy overload behavior
 - recovery tails
 
