@@ -528,6 +528,9 @@ In order:
 3. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
    - but now on the corrected claim-time aging baseline
+   - note: a quick `PRIORITY_AGING_MS=0` probe was attempted and is not a valid
+     comparison yet; it currently panics the maintenance timer because the
+     queue-storage runtime still requires a non-zero aging interval
 
 4. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
    - avoid using very short cross-system runs as the main narrative
