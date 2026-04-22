@@ -571,6 +571,12 @@ In order:
 3. Investigate realistic multi-replica deployment shape
    - holding total workers constant but splitting them across many replicas is
      now clearly a major remaining weakness
+   - one benchmark artifact was identified and fixed here:
+     - the long-horizon Awa adapter was previously polling queue depth from
+       every replica
+     - only replica `0` now performs that observer work, which removes the
+       artificial "every pod runs queue_counts() every second" load
+   - that fix did **not** remove the core multi-replica problem
    - fixed-load replica-shape runs showed:
      - `1x32` remained healthy
      - `2x16` degraded badly
@@ -578,6 +584,11 @@ In order:
    - a single-producer variant (`PRODUCER_ONLY_INSTANCE_ZERO=1`) still showed
      the same degradation, so this is **not** just queue-enqueue-head
      contention from many producers
+   - after the observer fix, the single-producer matrix still looked like:
+     - `1x32`: `clean_1 662/s`, `pressure_1 896/s`, `recovery_1 676/s`
+     - `2x16`: `clean_1 180/s`, `pressure_1 39/s`, `recovery_1 300/s`
+     - `4x8`: `clean_1 76/s`, `pressure_1 25/s`, `recovery_1 77/s`
+     - `8x4`: `clean_1 18/s`, `pressure_1 23/s`, `recovery_1 16/s`
    - the remaining blocker is now best understood as multi-process
      claim/start coordination on one queue, not one-big-process underfill alone
 

@@ -280,6 +280,10 @@ pure starvation case. Its adapter metrics also distinguish:
 - original enqueue priority completion rates
 - `aged_completion_rate` for work that only completed after aging promoted it
 
+For multi-replica Awa runs, only replica `0` performs the queue-depth observer
+queries. That keeps the benchmark focused on worker/claim coordination instead
+of artificially multiplying queue-count polling load with every extra replica.
+
 The shipped scenario lengths are meant to be tractable on a developer machine.
 For deeper pressure studies, extend them with explicit `--phase` overrides
 rather than treating the defaults as "long enough" by definition.

@@ -261,6 +261,10 @@ fn producer_enabled() -> bool {
     }
 }
 
+fn observer_enabled() -> bool {
+    instance_id() == 0
+}
+
 fn build_batch_params(
     queue_name: &str,
     next_seq: &mut i64,
@@ -548,6 +552,12 @@ pub async fn run() {
         let retryable_depth = Arc::clone(&retryable_depth);
         let scheduled_depth = Arc::clone(&scheduled_depth);
         tokio::spawn(async move {
+            if !observer_enabled() {
+                while !depth_shutdown.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                return;
+            }
             while !depth_shutdown.load(Ordering::Relaxed) {
                 match depth_store
                     .queue_counts_cached(&depth_pool, queue_name, queue_count_max_age)
@@ -745,12 +755,6 @@ pub async fn run() {
                     sample_every_s as f64,
                 ),
                 ("aged_completion_rate", aged_completion_rate, sample_every_s as f64),
-                ("queue_depth", depth, 0.0),
-                ("running_depth", running_depth, 0.0),
-                ("retryable_depth", retryable_depth, 0.0),
-                ("scheduled_depth", scheduled_depth, 0.0),
-                ("total_backlog", total_backlog, 0.0),
-                ("producer_target_rate", target_rate, 0.0),
             ] {
                 emit(json!({
                     "t": ts,
@@ -763,6 +767,28 @@ pub async fn run() {
                     "value": value,
                     "window_s": window_s,
                 }));
+            }
+            if observer_enabled() {
+                for (metric, value, window_s) in [
+                    ("queue_depth", depth, 0.0),
+                    ("running_depth", running_depth, 0.0),
+                    ("retryable_depth", retryable_depth, 0.0),
+                    ("scheduled_depth", scheduled_depth, 0.0),
+                    ("total_backlog", total_backlog, 0.0),
+                    ("producer_target_rate", target_rate, 0.0),
+                ] {
+                    emit(json!({
+                        "t": ts,
+                        "system": "awa",
+                        "instance_id": instance_id(),
+                        "kind": "adapter",
+                        "subject_kind": "adapter",
+                        "subject": "awa",
+                        "metric": metric,
+                        "value": value,
+                        "window_s": window_s,
+                    }));
+                }
             }
         }
     });
