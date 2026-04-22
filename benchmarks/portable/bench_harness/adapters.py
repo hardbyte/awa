@@ -236,6 +236,15 @@ def launch_awa(manifest: AdapterManifest, overrides: dict[str, str]) -> LaunchSp
     )
 
 
+def launch_awa_canonical(manifest: AdapterManifest, overrides: dict[str, str]) -> LaunchSpec:
+    merged = {
+        **overrides,
+        "AWA_STORAGE_ENGINE": "canonical",
+        "AWA_BENCH_SYSTEM": "awa-canonical",
+    }
+    return launch_awa(manifest, merged)
+
+
 def _docker_launch(
     image: str,
     manifest: AdapterManifest,
@@ -307,6 +316,11 @@ ADAPTERS: dict[str, AdapterEntry] = {
         bench_dir=SCRIPT_DIR / "awa-bench",
         builder=build_awa,
         launcher=launch_awa,
+    ),
+    "awa-canonical": AdapterEntry(
+        bench_dir=SCRIPT_DIR / "awa-canonical-bench",
+        builder=build_awa,
+        launcher=launch_awa_canonical,
     ),
     "awa-docker": AdapterEntry(
         bench_dir=SCRIPT_DIR / "awa-docker-bench",

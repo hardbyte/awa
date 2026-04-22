@@ -514,6 +514,17 @@ impl ClientBuilder {
         self
     }
 
+    /// Force the worker runtime onto canonical storage.
+    ///
+    /// This is primarily useful for migration/testing and benchmark
+    /// comparisons against the pre-0.6 engine. Production 0.6 runtimes should
+    /// normally use queue storage.
+    pub fn canonical_storage(mut self) -> Self {
+        self.storage = RuntimeStorage::Canonical;
+        self.storage_error = None;
+        self
+    }
+
     /// Choose how this runtime participates in a storage transition.
     pub fn transition_role(mut self, role: TransitionWorkerRole) -> Self {
         self.transition_role = role;

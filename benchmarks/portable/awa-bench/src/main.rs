@@ -9,10 +9,11 @@
 //! - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` — slot sizing (defaults 16 / 8)
 //! - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` — rotate intervals (defaults 1000 / 50)
 //!
-//! The adapter always runs against the vacuum-aware queue_storage subsystem
-//! — canonical storage is transition-only and not benchmarked here. Each
-//! scenario calls `QueueStorage::install` + `QueueStorage::reset` to ensure
-//! a clean slot set before measuring, so results are reproducible.
+//! The adapter defaults to the vacuum-aware queue_storage subsystem but can
+//! also run the canonical engine for apples-to-apples comparisons via
+//! `AWA_STORAGE_ENGINE=canonical`. Queue-storage scenarios call
+//! `QueueStorage::install` + `QueueStorage::reset` to ensure a clean slot set
+//! before measuring.
 
 mod long_horizon;
 
@@ -57,6 +58,26 @@ pub(crate) fn queue_storage_config_with_experimental_default(
 
 fn queue_storage_config() -> QueueStorageConfig {
     queue_storage_config_with_experimental_default(false)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StorageEngineMode {
+    Canonical,
+    QueueStorage,
+}
+
+pub(crate) fn storage_engine_mode() -> StorageEngineMode {
+    match std::env::var("AWA_STORAGE_ENGINE")
+        .unwrap_or_else(|_| "queue_storage".to_string())
+        .as_str()
+    {
+        "canonical" => StorageEngineMode::Canonical,
+        _ => StorageEngineMode::QueueStorage,
+    }
+}
+
+pub(crate) fn bench_system_name() -> String {
+    std::env::var("AWA_BENCH_SYSTEM").unwrap_or_else(|_| "awa".to_string())
 }
 
 fn queue_rotate_interval() -> Duration {
@@ -108,6 +129,10 @@ fn maybe_install_otlp_metrics() -> Option<SdkMeterProvider> {
 /// starts from a clean baseline for each benchmark run.
 async fn prepare_queue_storage(pool: &PgPool) -> (QueueStorage, QueueStorageConfig) {
     prepare_queue_storage_with_config(pool, queue_storage_config(), true).await
+}
+
+pub(crate) async fn prepare_canonical(pool: &PgPool) {
+    migrations::run(pool).await.unwrap();
 }
 
 pub(crate) async fn prepare_queue_storage_with_config(

@@ -116,8 +116,12 @@ Each adapter:
 - Outputs JSON results to stdout, logs to stderr
 - Manages its own schema migration and cleanup
 
-The Awa adapters (`awa` and `awa-python`) now benchmark the queue-storage
-engine rather than the legacy canonical worker path. They also accept:
+The Awa adapters now have two Rust-native variants:
+- `awa`: queue-storage engine
+- `awa-canonical`: canonical engine
+
+`awa-python` continues to benchmark the queue-storage engine. The Rust-native
+adapters also accept:
 
 - `QUEUE_STORAGE_SCHEMA` (default `awa_exp`)
 - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` (defaults `16` / `8`)
@@ -132,7 +136,7 @@ engine rather than the legacy canonical worker path. They also accept:
   "many worker pods, external producers" and separate enqueue-head contention
   from claim/start coordination.
 
-`awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
+`awa` and `awa-canonical` run natively from the local workspace. `awa-docker`, `awa-python`,
 `procrastinate`, River, and Oban run in Docker containers with `--network host`
 to connect to the shared Postgres.
 
@@ -153,7 +157,7 @@ to connect to the shared Postgres.
 - Same job count, batch size, and worker concurrency
 - Same result schema (JSON with jobs_per_sec, duration_ms, latency percentiles)
 - Each system uses its own database to avoid schema conflicts
-- `awa`, `awa-docker`, `awa-python`, and `procrastinate` use separate databases
+- `awa`, `awa-canonical`, `awa-docker`, `awa-python`, and `procrastinate` use separate databases
   so variant comparisons do not inherit warmed tables or queue metadata from the prior run
 - Aligned poll intervals: all systems use 50ms poll/fetch interval
 - Aligned rescue intent: Awa uses 15s heartbeat staleness, Oban uses 15s

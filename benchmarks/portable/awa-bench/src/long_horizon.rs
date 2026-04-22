@@ -8,7 +8,7 @@
 
 use async_trait::async_trait;
 use awa_macros::JobArgs;
-use awa_model::{insert, InsertParams, QueueStorage};
+use awa_model::{insert, insert_many_copy_from_pool, InsertParams, QueueStorage};
 use awa_worker::{
     Client, JobContext, JobError, JobResult, QueueConfig, TransitionWorkerRole, Worker,
 };
@@ -328,15 +328,18 @@ fn queue_storage_event_tables(
     tables
 }
 
-fn emit_descriptor(db_name: &str, store: &QueueStorage) {
-    let event_tables = queue_storage_event_tables(
-        store.schema(),
-        store.queue_slot_count(),
-        store.lease_slot_count(),
-    );
+fn canonical_event_tables() -> Vec<String> {
+    vec![
+        "awa.jobs_hot".to_string(),
+        "awa.scheduled_jobs".to_string(),
+        "awa.queue_state_counts".to_string(),
+    ]
+}
+
+fn emit_descriptor(system: &str, db_name: &str, event_tables: Vec<String>) {
     emit(json!({
         "kind": "descriptor",
-        "system": "awa",
+        "system": system,
         "instance_id": instance_id(),
         "event_tables": event_tables,
         "event_indexes": [],
@@ -346,6 +349,30 @@ fn emit_descriptor(db_name: &str, store: &QueueStorage) {
         "db_name": db_name,
         "started_at": now_iso_ms(),
     }));
+}
+
+async fn poll_canonical_depths(
+    pool: &sqlx::PgPool,
+    queue_name: &str,
+) -> Result<(u64, u64, u64, u64), sqlx::Error> {
+    let (available, running, retryable, scheduled): (i64, i64, i64, i64) = sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE((SELECT count(*)::bigint FROM awa.jobs_hot WHERE queue = $1 AND state = 'available'), 0) AS available,
+            COALESCE((SELECT count(*)::bigint FROM awa.jobs_hot WHERE queue = $1 AND state = 'running'), 0) AS running,
+            COALESCE((SELECT count(*)::bigint FROM awa.scheduled_jobs WHERE queue = $1 AND state = 'retryable'), 0) AS retryable,
+            COALESCE((SELECT count(*)::bigint FROM awa.scheduled_jobs WHERE queue = $1 AND state = 'scheduled'), 0) AS scheduled
+        "#,
+    )
+    .bind(queue_name)
+    .fetch_one(pool)
+    .await?;
+    Ok((
+        available.max(0) as u64,
+        running.max(0) as u64,
+        retryable.max(0) as u64,
+        scheduled.max(0) as u64,
+    ))
 }
 
 pub async fn run() {
@@ -369,17 +396,40 @@ pub async fn run() {
         .next()
         .unwrap_or("awa_bench")
         .to_string();
+    let system_name = super::bench_system_name();
+    let storage_engine = super::storage_engine_mode();
 
     let pool = PgPoolOptions::new()
         .max_connections(max_connections)
         .connect(&database_url)
         .await
         .expect("Failed to connect to database");
-    let storage = super::queue_storage_config_with_experimental_default(true);
-    let use_lease_claim_receipts = storage.experimental_lease_claim_receipts;
-    let (store, storage) =
-        super::prepare_queue_storage_with_config(&pool, storage, false).await;
-    emit_descriptor(&db_name, &store);
+    let queue_storage = match storage_engine {
+        super::StorageEngineMode::QueueStorage => {
+            let storage = super::queue_storage_config_with_experimental_default(true);
+            let (store, storage) =
+                super::prepare_queue_storage_with_config(&pool, storage, false).await;
+            emit_descriptor(
+                &system_name,
+                &db_name,
+                queue_storage_event_tables(
+                    store.schema(),
+                    store.queue_slot_count(),
+                    store.lease_slot_count(),
+                ),
+            );
+            Some((store, storage))
+        }
+        super::StorageEngineMode::Canonical => {
+            super::prepare_canonical(&pool).await;
+            emit_descriptor(&system_name, &db_name, canonical_event_tables());
+            None
+        }
+    };
+    let use_lease_claim_receipts = queue_storage
+        .as_ref()
+        .map(|(_, storage)| storage.experimental_lease_claim_receipts)
+        .unwrap_or(false);
 
     let queue_name = "awa_longhorizon_bench";
     // No clean here — the bench harness starts from a fresh PG, so existing
@@ -417,11 +467,7 @@ pub async fn run() {
         aged_completion_counter: Arc::clone(&aged_completions),
     };
 
-    let client_storage = storage.clone();
-    let producer_store = QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig");
-    let depth_store = QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig");
-
-    let client = Client::builder(pool.clone())
+    let client_builder = Client::builder(pool.clone())
         .priority_aging_interval(priority_aging_interval())
         .queue(
             queue_name,
@@ -437,19 +483,26 @@ pub async fn run() {
                 ..QueueConfig::default()
             },
         )
-        .queue_storage(
-            client_storage,
-            super::queue_rotate_interval(),
-            super::lease_rotate_interval(),
-        )
         // The portable bench is measuring queue behavior, not the cost of
         // refreshing runtime/admin snapshots every few seconds.
         .queue_stats_interval(Duration::from_secs(300))
         .runtime_snapshot_interval(Duration::from_secs(300))
-        .transition_role(TransitionWorkerRole::QueueStorageTarget)
-        .register_worker(worker)
-        .build()
-        .expect("Failed to build client");
+        .register_worker(worker);
+    let client = match &queue_storage {
+        Some((_, storage)) => client_builder
+            .queue_storage(
+                storage.clone(),
+                super::queue_rotate_interval(),
+                super::lease_rotate_interval(),
+            )
+            .transition_role(TransitionWorkerRole::QueueStorageTarget)
+            .build()
+            .expect("Failed to build client"),
+        None => client_builder
+            .canonical_storage()
+            .build()
+            .expect("Failed to build client"),
+    };
     client.start().await.expect("Failed to start client");
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -464,6 +517,7 @@ pub async fn run() {
     let producer_latencies_window = Arc::clone(&producer_latencies);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_priority_pattern = priority_pattern.clone();
+    let producer_storage = queue_storage.as_ref().map(|(_, storage)| storage.clone());
     let producer_handle = tokio::spawn(async move {
         if !producer_enabled() {
             while !producer_shutdown.load(Ordering::Relaxed) {
@@ -516,9 +570,24 @@ pub async fn run() {
                 &padding,
             );
             let insert_start = Instant::now();
-            let res = producer_store
-                .enqueue_params_batch(&producer_pool, &params)
-                .await;
+            let res = match storage_engine {
+                super::StorageEngineMode::QueueStorage => {
+                    let producer_store = QueueStorage::new(
+                        producer_storage
+                            .clone()
+                            .expect("queue storage config missing"),
+                    )
+                    .expect("Invalid QueueStorageConfig");
+                    producer_store
+                        .enqueue_params_batch(&producer_pool, &params)
+                        .await
+                }
+                super::StorageEngineMode::Canonical => {
+                    insert_many_copy_from_pool(&producer_pool, &params)
+                        .await
+                        .map(|rows| rows.len())
+                }
+            };
             match res {
                 Ok(_) => {
                     let latency_ms = insert_start.elapsed().as_secs_f64() * 1_000.0;
@@ -551,6 +620,7 @@ pub async fn run() {
         let running_depth = Arc::clone(&running_depth);
         let retryable_depth = Arc::clone(&retryable_depth);
         let scheduled_depth = Arc::clone(&scheduled_depth);
+        let depth_storage = queue_storage.as_ref().map(|(_, storage)| storage.clone());
         tokio::spawn(async move {
             if !observer_enabled() {
                 while !depth_shutdown.load(Ordering::Relaxed) {
@@ -559,38 +629,59 @@ pub async fn run() {
                 return;
             }
             while !depth_shutdown.load(Ordering::Relaxed) {
-                match depth_store
-                    .queue_counts_cached(&depth_pool, queue_name, queue_count_max_age)
-                    .await
-                {
-                    Ok(counts) => {
-                        queue_depth.store(counts.available as u64, Ordering::Relaxed);
-                        running_depth.store(counts.running as u64, Ordering::Relaxed);
-                        match sqlx::query_as::<_, (i64, i64)>(&format!(
-                            r#"
-                            SELECT
-                                COALESCE(sum(CASE WHEN state = 'retryable' THEN 1 ELSE 0 END), 0)::bigint AS retryable,
-                                COALESCE(sum(CASE WHEN state = 'scheduled' THEN 1 ELSE 0 END), 0)::bigint AS scheduled
-                            FROM {}.deferred_jobs
-                            WHERE queue = $1
-                            "#,
-                            depth_store.schema()
-                        ))
-                        .bind(queue_name)
-                        .fetch_one(&depth_pool)
-                        .await
+                match storage_engine {
+                    super::StorageEngineMode::QueueStorage => {
+                        let depth_store = QueueStorage::new(
+                            depth_storage.clone().expect("queue storage config missing"),
+                        )
+                        .expect("Invalid QueueStorageConfig");
+                        match depth_store
+                            .queue_counts_cached(&depth_pool, queue_name, queue_count_max_age)
+                            .await
                         {
-                            Ok((retryable, scheduled)) => {
-                                retryable_depth.store(retryable as u64, Ordering::Relaxed);
-                                scheduled_depth.store(scheduled as u64, Ordering::Relaxed);
+                            Ok(counts) => {
+                                queue_depth.store(counts.available as u64, Ordering::Relaxed);
+                                running_depth.store(counts.running as u64, Ordering::Relaxed);
+                                match sqlx::query_as::<_, (i64, i64)>(&format!(
+                                    r#"
+                                    SELECT
+                                        COALESCE(sum(CASE WHEN state = 'retryable' THEN 1 ELSE 0 END), 0)::bigint AS retryable,
+                                        COALESCE(sum(CASE WHEN state = 'scheduled' THEN 1 ELSE 0 END), 0)::bigint AS scheduled
+                                    FROM {}.deferred_jobs
+                                    WHERE queue = $1
+                                    "#,
+                                    depth_store.schema()
+                                ))
+                                .bind(queue_name)
+                                .fetch_one(&depth_pool)
+                                .await
+                                {
+                                    Ok((retryable, scheduled)) => {
+                                        retryable_depth.store(retryable as u64, Ordering::Relaxed);
+                                        scheduled_depth.store(scheduled as u64, Ordering::Relaxed);
+                                    }
+                                    Err(err) => {
+                                        eprintln!("[awa] deferred depth poll failed: {err}");
+                                    }
+                                }
                             }
                             Err(err) => {
-                                eprintln!("[awa] deferred depth poll failed: {err}");
+                                eprintln!("[awa] queue depth poll failed: {err}");
                             }
                         }
                     }
-                    Err(err) => {
-                        eprintln!("[awa] queue depth poll failed: {err}");
+                    super::StorageEngineMode::Canonical => {
+                        match poll_canonical_depths(&depth_pool, queue_name).await {
+                            Ok((available, running, retryable, scheduled)) => {
+                                queue_depth.store(available, Ordering::Relaxed);
+                                running_depth.store(running, Ordering::Relaxed);
+                                retryable_depth.store(retryable, Ordering::Relaxed);
+                                scheduled_depth.store(scheduled, Ordering::Relaxed);
+                            }
+                            Err(err) => {
+                                eprintln!("[awa] canonical queue depth poll failed: {err}");
+                            }
+                        }
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
@@ -758,7 +849,7 @@ pub async fn run() {
             ] {
                 emit(json!({
                     "t": ts,
-                    "system": "awa",
+                    "system": system_name,
                     "instance_id": instance_id(),
                     "kind": "adapter",
                     "subject_kind": "adapter",
@@ -779,11 +870,11 @@ pub async fn run() {
                 ] {
                     emit(json!({
                         "t": ts,
-                        "system": "awa",
+                        "system": system_name,
                         "instance_id": instance_id(),
                         "kind": "adapter",
                         "subject_kind": "adapter",
-                        "subject": "awa",
+                        "subject": system_name,
                         "metric": metric,
                         "value": value,
                         "window_s": window_s,

@@ -291,7 +291,7 @@ def test_versions_known_systems_return_dicts():
     # Every registered adapter must get *some* dict back — the harness is
     # the authoritative source on what was compared, so silently returning
     # nothing would be a reporting regression.
-    for system in ("awa", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque", "pgmq", "pgboss"):
+    for system in ("awa", "awa-canonical", "awa-docker", "awa-python", "procrastinate", "river", "oban", "pgque", "pgmq", "pgboss"):
         rev = capture_adapter_revision(system)
         assert isinstance(rev, dict)
         assert "source" in rev

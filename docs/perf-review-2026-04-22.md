@@ -586,6 +586,10 @@ In order:
 3. Investigate realistic multi-replica deployment shape
    - holding total workers constant but splitting them across many replicas is
      now clearly a major remaining weakness
+   - the portable harness now has a true `awa-canonical` variant using the
+     same `awa-bench` binary, so we can compare canonical and queue storage
+     under the same replica matrix instead of relying only on the direct
+     single-process benchmark
    - one benchmark artifact was identified and fixed here:
      - the long-horizon Awa adapter was previously polling queue depth from
        every replica
@@ -604,6 +608,26 @@ In order:
      - `2x16`: `clean_1 180/s`, `pressure_1 39/s`, `recovery_1 300/s`
      - `4x8`: `clean_1 76/s`, `pressure_1 25/s`, `recovery_1 77/s`
      - `8x4`: `clean_1 18/s`, `pressure_1 23/s`, `recovery_1 16/s`
+   - apples-to-apples canonical vs queue-storage checkpoints now show the
+     remaining bar much more clearly:
+     - `1x32`
+       - `queue_storage`: `clean_1 692/s`, `pressure_1 1140/s`, `recovery_1 741/s`,
+         median dead tuples `130.5 / 92.0 / 109.0`
+       - `canonical`: `clean_1 712/s`, `pressure_1 981/s`, `recovery_1 700/s`,
+         median dead tuples `43429 / 43940 / 54645`
+     - `4x8`
+       - `queue_storage`: `clean_1 181/s`, `pressure_1 143/s`, `recovery_1 148/s`,
+         subscriber p99 `8962 / 23429 / 53658 ms`, median dead tuples
+         `158.5 / 133.0 / 175.0`
+       - `canonical`: `clean_1 163/s`, `pressure_1 217/s`, `recovery_1 155/s`,
+         subscriber p99 `234 / 292 / 315 ms`, median dead tuples
+         `39599.5 / 42828.5 / 55371.0`
+   - interpretation:
+     - queue storage already gives the intended churn profile under both shapes
+     - at `1x32`, queue storage is competitive with canonical and better in
+       `pressure` / `recovery` throughput
+     - at `4x8`, canonical currently wins on latency and pressure/recovery
+       throughput despite its huge dead-tuple cost
    - the remaining blocker is now best understood as multi-process
      claim/start coordination on one queue, not one-big-process underfill alone
 

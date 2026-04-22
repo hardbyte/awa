@@ -157,6 +157,7 @@ def _pgmq_revision() -> dict[str, Any]:
 
 _CAPTURE: dict[str, Any] = {
     "awa": _awa_repo_revision,
+    "awa-canonical": _awa_repo_revision,
     "awa-docker": _awa_repo_revision,
     "awa-python": _awa_repo_revision,
     "pgque": _pgque_submodule_revision,

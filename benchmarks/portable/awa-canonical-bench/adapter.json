@@ -1,0 +1,13 @@
+{
+  "system": "awa-canonical",
+  "family": "awa",
+  "display_name": "Awa (Rust, canonical)",
+  "db_name": "awa_canonical_bench",
+  "event_tables": [
+    "awa.jobs_hot",
+    "awa.scheduled_jobs",
+    "awa.queue_state_counts"
+  ],
+  "event_indexes": [],
+  "extensions": []
+}
