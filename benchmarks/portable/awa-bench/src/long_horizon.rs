@@ -253,6 +253,14 @@ fn instance_id() -> u32 {
     env_u32("BENCH_INSTANCE_ID", 0)
 }
 
+fn producer_enabled() -> bool {
+    if env_u32("PRODUCER_ONLY_INSTANCE_ZERO", 0) == 0 {
+        true
+    } else {
+        instance_id() == 0
+    }
+}
+
 fn build_batch_params(
     queue_name: &str,
     next_seq: &mut i64,
@@ -453,6 +461,12 @@ pub async fn run() {
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_priority_pattern = priority_pattern.clone();
     let producer_handle = tokio::spawn(async move {
+        if !producer_enabled() {
+            while !producer_shutdown.load(Ordering::Relaxed) {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            return;
+        }
         let mut seq: i64 = 0;
         let mut fixed_rate_credit = 0.0_f64;
         let mut next_tick = tokio::time::Instant::now();

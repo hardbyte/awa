@@ -127,6 +127,10 @@ engine rather than the legacy canonical worker path. They also accept:
 - `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SERVICE_NAME` / `OTEL_EXPORT_INTERVAL_MS`
   for optional OTLP metrics export from the native `awa-bench` adapter during
   focused profiling runs (for example against Grafana LGTM)
+- `PRODUCER_ONLY_INSTANCE_ZERO=1` to make only replica `0` produce in
+  long-horizon multi-replica runs. This is useful when you want to model
+  "many worker pods, external producers" and separate enqueue-head contention
+  from claim/start coordination.
 
 `awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
 `procrastinate`, River, and Oban run in Docker containers with `--network host`

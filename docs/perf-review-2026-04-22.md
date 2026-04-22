@@ -568,17 +568,30 @@ In order:
    - so the next low-worker work should focus on fixed per-claim/start cost on
      the current design, not broader ready-slot selection
 
-3. Investigate retry-heavy overload behavior
+3. Investigate realistic multi-replica deployment shape
+   - holding total workers constant but splitting them across many replicas is
+     now clearly a major remaining weakness
+   - fixed-load replica-shape runs showed:
+     - `1x32` remained healthy
+     - `2x16` degraded badly
+     - `4x8` and `8x4` collapsed
+   - a single-producer variant (`PRODUCER_ONLY_INSTANCE_ZERO=1`) still showed
+     the same degradation, so this is **not** just queue-enqueue-head
+     contention from many producers
+   - the remaining blocker is now best understood as multi-process
+     claim/start coordination on one queue, not one-big-process underfill alone
+
+4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
    - but now on the corrected claim-time aging baseline
    - note: a quick `PRIORITY_AGING_MS=0` probe was attempted and is not a valid
      comparison yet; it currently panics the maintenance timer because the
      queue-storage runtime still requires a non-zero aging interval
 
-4. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
+5. Re-run a longer settled `awa` vs `pgque` comparison after those fixes
    - avoid using very short cross-system runs as the main narrative
 
-5. Add a compact report view for semantics/scaling scenarios
+6. Add a compact report view for semantics/scaling scenarios
    - not because it is urgent, but because these scenarios are now part of the real performance story
 
 ### Bottom line
