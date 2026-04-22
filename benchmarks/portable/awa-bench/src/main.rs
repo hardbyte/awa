@@ -22,6 +22,10 @@ use awa_model::{insert, migrations, InsertOpts, QueueStorage, QueueStorageConfig
 use awa_worker::{
     Client, JobContext, JobError, JobResult, QueueConfig, TransitionWorkerRole, Worker,
 };
+use opentelemetry::global;
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::metrics::{PeriodicReader, SdkMeterProvider};
+use opentelemetry_sdk::Resource;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use sqlx::PgPool;
@@ -73,12 +77,37 @@ fn lease_rotate_interval() -> Duration {
     )
 }
 
+fn maybe_install_otlp_metrics() -> Option<SdkMeterProvider> {
+    let endpoint = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok()?;
+    let service_name =
+        std::env::var("OTEL_SERVICE_NAME").unwrap_or_else(|_| "awa-portable-bench".to_string());
+    let export_interval_ms = std::env::var("OTEL_EXPORT_INTERVAL_MS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(1000);
+
+    let exporter = opentelemetry_otlp::MetricExporter::builder()
+        .with_tonic()
+        .with_endpoint(endpoint)
+        .build()
+        .expect("failed to build OTLP metric exporter");
+    let reader = PeriodicReader::builder(exporter)
+        .with_interval(Duration::from_millis(export_interval_ms))
+        .build();
+    let resource = Resource::builder().with_service_name(service_name).build();
+    let provider = SdkMeterProvider::builder()
+        .with_reader(reader)
+        .with_resource(resource)
+        .build();
+    global::set_meter_provider(provider.clone());
+    Some(provider)
+}
+
 /// Migrate the canonical schema, then install + reset the queue_storage
 /// backend so inserts through `awa.jobs` route into it and slot state
 /// starts from a clean baseline for each benchmark run.
 async fn prepare_queue_storage(pool: &PgPool) -> (QueueStorage, QueueStorageConfig) {
-    prepare_queue_storage_with_config(pool, queue_storage_config(), true)
-        .await
+    prepare_queue_storage_with_config(pool, queue_storage_config(), true).await
 }
 
 pub(crate) async fn prepare_queue_storage_with_config(
@@ -527,6 +556,7 @@ async fn main() {
         )
         .with_writer(std::io::stderr)
         .init();
+    let _meter_provider = maybe_install_otlp_metrics();
 
     let scenario = std::env::var("SCENARIO").unwrap_or_else(|_| "all".into());
     let job_count: i64 = std::env::var("JOB_COUNT")

@@ -123,6 +123,9 @@ engine rather than the legacy canonical worker path. They also accept:
 - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` (defaults `16` / `8`)
 - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` (defaults `1000` / `50`)
 - `PRIORITY_AGING_MS` (default `60000` for the long-horizon adapter)
+- `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SERVICE_NAME` / `OTEL_EXPORT_INTERVAL_MS`
+  for optional OTLP metrics export from the native `awa-bench` adapter during
+  focused profiling runs (for example against Grafana LGTM)
 
 `awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
 `procrastinate`, River, and Oban run in Docker containers with `--network host`
