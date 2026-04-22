@@ -191,6 +191,21 @@ async fn sample_pgstattuple_dead_tuples(
     .ok()
 }
 
+async fn sample_canonical_exact_dead_tuples(pool: &sqlx::PgPool) -> HashMap<&'static str, i64> {
+    let mut out = HashMap::new();
+    for (label, relname) in [
+        ("jobs_hot", "jobs_hot"),
+        ("scheduled_jobs", "scheduled_jobs"),
+        ("queue_state_counts", "queue_state_counts"),
+    ] {
+        let count = sample_pgstattuple_dead_tuples(pool, "awa", relname)
+            .await
+            .unwrap_or(-1);
+        out.insert(label, count);
+    }
+    out
+}
+
 /// Clean only jobs and queue_meta for a specific queue.
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
     reset_storage_transition_state(pool).await;
@@ -507,6 +522,7 @@ impl Worker for BenchWorker {
 #[ignore]
 async fn test_throughput_rust_workers() {
     let pool = setup(20).await;
+    ensure_pgstattuple(&pool).await;
     let queue = "bench_throughput";
     clean_queue(&pool, queue).await;
 
@@ -603,6 +619,19 @@ async fn test_throughput_rust_workers() {
             println!("[bench] Throughput: {:.0} jobs/sec", throughput);
 
             client.shutdown(Duration::from_secs(5)).await;
+
+            let dead = sample_canonical_exact_dead_tuples(&pool).await;
+            let jobs_hot_dead = *dead.get("jobs_hot").unwrap_or(&-1);
+            let scheduled_dead = *dead.get("scheduled_jobs").unwrap_or(&-1);
+            let counts_dead = *dead.get("queue_state_counts").unwrap_or(&-1);
+            let total_dead = [jobs_hot_dead, scheduled_dead, counts_dead]
+                .into_iter()
+                .filter(|v| *v >= 0)
+                .sum::<i64>();
+            println!(
+                "[bench] exact_dead_tuples jobs_hot={} scheduled_jobs={} queue_state_counts={} total={}",
+                jobs_hot_dead, scheduled_dead, counts_dead, total_dead
+            );
 
             // Use a lower bound for CI variance (3000), but the PRD target is 5000
             assert!(
