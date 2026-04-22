@@ -5048,6 +5048,142 @@ impl QueueStorage {
         Ok(hydrated)
     }
 
+    async fn close_open_receipt_claim_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        outcome: &str,
+    ) -> Result<Option<LeaseTransitionRow>, AwaError> {
+        if !self.experimental_lease_claim_receipts() {
+            return Ok(None);
+        }
+
+        let schema = self.schema();
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH target AS (
+                SELECT
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.job_id,
+                    claims.queue,
+                    'running'::awa.job_state AS state,
+                    claims.priority,
+                    claims.attempt,
+                    claims.run_lease,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.claimed_at AS attempted_at
+                FROM {schema}.open_receipt_claims AS claims
+                WHERE claims.job_id = $1
+                  AND claims.run_lease = $2
+                FOR UPDATE
+            ),
+            inserted AS (
+                INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
+                SELECT target.job_id, target.run_lease, $3, clock_timestamp()
+                FROM target
+                ON CONFLICT (job_id, run_lease) DO NOTHING
+                RETURNING job_id, run_lease
+            ),
+            removed_open AS (
+                DELETE FROM {schema}.open_receipt_claims AS open_claims
+                USING inserted
+                WHERE open_claims.job_id = inserted.job_id
+                  AND open_claims.run_lease = inserted.run_lease
+                RETURNING open_claims.job_id
+            )
+            SELECT
+                target.ready_slot,
+                target.ready_generation,
+                target.job_id,
+                target.queue,
+                target.state,
+                target.priority,
+                target.attempt,
+                target.run_lease,
+                target.max_attempts,
+                target.lane_seq,
+                NULL::timestamptz AS heartbeat_at,
+                NULL::timestamptz AS deadline_at,
+                target.attempted_at,
+                NULL::uuid AS callback_id,
+                NULL::timestamptz AS callback_timeout_at
+            FROM target
+            JOIN inserted
+              ON inserted.job_id = target.job_id
+             AND inserted.run_lease = target.run_lease
+            "#
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .bind(outcome)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if deleted.is_empty() {
+            return Ok(None);
+        }
+
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        Ok(moved.into_iter().next())
+    }
+
+    async fn take_running_attempt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        receipt_outcome: &str,
+    ) -> Result<Option<LeaseTransitionRow>, AwaError> {
+        if let Some(moved) = self
+            .close_open_receipt_claim_tx(tx, job_id, run_lease, receipt_outcome)
+            .await?
+        {
+            return Ok(Some(moved));
+        }
+
+        let schema = self.schema();
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.leases
+            WHERE job_id = $1
+              AND run_lease = $2
+              AND state = 'running'
+            RETURNING
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                heartbeat_at,
+                deadline_at,
+                attempted_at,
+                callback_id,
+                callback_timeout_at
+            "#
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if deleted.is_empty() {
+            return Ok(None);
+        }
+
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
+        Ok(moved.into_iter().next())
+    }
+
     async fn rescue_stale_receipt_claims_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -6297,47 +6433,14 @@ impl QueueStorage {
         retry_after: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
-            .await?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if deleted.is_empty() {
+        let Some(moved) = self
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "retryable")
+            .await?
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        }
-
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
-        let moved = moved.into_iter().next().expect("deleted running lease");
+        };
         let now = self.current_timestamp_tx(&mut tx).await?;
 
         let payload =
@@ -6366,47 +6469,14 @@ impl QueueStorage {
         snooze_for: Duration,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
-            .await?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if deleted.is_empty() {
+        let Some(moved) = self
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "scheduled")
+            .await?
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        }
-
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
-        let moved = moved.into_iter().next().expect("deleted running lease");
+        };
         let now = self.current_timestamp_tx(&mut tx).await?;
 
         let payload =
@@ -6435,47 +6505,14 @@ impl QueueStorage {
         reason: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
-            .await?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if deleted.is_empty() {
+        let Some(moved) = self
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "cancelled")
+            .await?
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        }
-
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
-        let moved = moved.into_iter().next().expect("deleted running lease");
+        };
 
         let mut payload = RuntimePayload::from_json(Self::with_progress(
             moved.payload.clone(),
@@ -6506,47 +6543,14 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
-            .await?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if deleted.is_empty() {
+        let Some(moved) = self
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "failed")
+            .await?
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        }
-
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
-        let moved = moved.into_iter().next().expect("deleted running lease");
+        };
 
         let mut payload = RuntimePayload::from_json(Self::with_progress(
             moved.payload.clone(),
@@ -6573,47 +6577,14 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
-            .await?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if deleted.is_empty() {
+        let Some(moved) = self
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "dlq")
+            .await?
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        }
-
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
-        let moved = moved.into_iter().next().expect("deleted running lease");
+        };
 
         let finalized_at = Utc::now();
         let dlq_at = finalized_at;
@@ -7039,47 +7010,14 @@ impl QueueStorage {
         error: &str,
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        self.ensure_mutable_running_attempt_tx(&mut tx, job_id, run_lease)
-            .await?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id = $1
-              AND run_lease = $2
-              AND state = 'running'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                queue,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                heartbeat_at,
-                deadline_at,
-                attempted_at,
-                callback_id,
-                callback_timeout_at
-            "#
-        ))
-        .bind(job_id)
-        .bind(run_lease)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
-
-        if deleted.is_empty() {
+        let Some(moved) = self
+            .take_running_attempt_tx(&mut tx, job_id, run_lease, "retryable")
+            .await?
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
-        }
-
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
-        let moved = moved.into_iter().next().expect("deleted running lease");
+        };
 
         let mut payload = RuntimePayload::from_json(Self::with_progress(
             moved.payload.clone(),

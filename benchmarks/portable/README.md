@@ -122,6 +122,7 @@ engine rather than the legacy canonical worker path. They also accept:
 - `QUEUE_STORAGE_SCHEMA` (default `awa_exp`)
 - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` (defaults `16` / `8`)
 - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` (defaults `1000` / `50`)
+- `PRIORITY_AGING_MS` (default `60000` for the long-horizon adapter)
 
 `awa` runs natively from the local workspace. `awa-docker`, `awa-python`,
 `procrastinate`, River, and Oban run in Docker containers with `--network host`
@@ -263,6 +264,13 @@ systems like `pgque` or `pgmq` that are not full job queues.
 Like `worker_scale.py`, it defaults to harness `--fast` mode for shorter,
 more reliable iteration loops; pass `--no-fast` when you specifically want
 full container restart behaviour.
+
+The `retry_priority_mix` scenario now sets an explicit `PRIORITY_AGING_MS`
+override so the benchmark measures Awa's priority-aging behavior instead of a
+pure starvation case. Its adapter metrics also distinguish:
+- current effective priority completion rates
+- original enqueue priority completion rates
+- `aged_completion_rate` for work that only completed after aging promoted it
 
 The shipped scenario lengths are meant to be tractable on a developer machine.
 For deeper pressure studies, extend them with explicit `--phase` overrides

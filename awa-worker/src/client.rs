@@ -120,6 +120,7 @@ pub struct ClientBuilder {
     global_max_workers: Option<u32>,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
+    priority_aging_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -169,6 +170,7 @@ impl ClientBuilder {
             global_max_workers: None,
             leader_election_interval: None,
             leader_check_interval: None,
+            priority_aging_interval: None,
             completed_retention: None,
             failed_retention: None,
             descriptor_retention: None,
@@ -448,6 +450,16 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the maintenance priority aging interval.
+    ///
+    /// This controls how often waiting available jobs are promoted toward
+    /// higher priority to prevent starvation. It is a global maintenance
+    /// setting for this worker runtime.
+    pub fn priority_aging_interval(mut self, interval: Duration) -> Self {
+        self.priority_aging_interval = Some(interval);
+        self
+    }
+
     /// Set how often queue depth/lag metrics are published (default: 30s).
     pub fn queue_stats_interval(mut self, interval: Duration) -> Self {
         self.queue_stats_interval = Some(interval);
@@ -640,6 +652,7 @@ impl ClientBuilder {
             metrics,
             leader_election_interval: self.leader_election_interval,
             leader_check_interval: self.leader_check_interval,
+            priority_aging_interval: self.priority_aging_interval,
             completed_retention: self.completed_retention,
             failed_retention: self.failed_retention,
             descriptor_retention: self.descriptor_retention,
@@ -732,6 +745,7 @@ pub struct Client {
     metrics: crate::metrics::AwaMetrics,
     leader_election_interval: Option<Duration>,
     leader_check_interval: Option<Duration>,
+    priority_aging_interval: Option<Duration>,
     completed_retention: Option<Duration>,
     failed_retention: Option<Duration>,
     descriptor_retention: Option<Duration>,
@@ -1081,6 +1095,9 @@ impl Client {
         }
         if let Some(interval) = self.leader_check_interval {
             maintenance = maintenance.leader_check_interval(interval);
+        }
+        if let Some(interval) = self.priority_aging_interval {
+            maintenance = maintenance.priority_aging_interval(interval);
         }
         if let Some(retention) = self.completed_retention {
             maintenance = maintenance.completed_retention(retention);

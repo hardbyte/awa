@@ -25,7 +25,14 @@ DEFAULT_TIMELINE_METRICS = [
     "subscriber_p99_ms",
     "end_to_end_p99_ms",
     "claim_p99_ms",
+    "completed_original_priority_1_rate",
+    "completed_original_priority_4_rate",
+    "aged_completion_rate",
     "queue_depth",
+    "running_depth",
+    "retryable_depth",
+    "scheduled_depth",
+    "total_backlog",
     "n_dead_tup",
 ]
 
@@ -39,7 +46,14 @@ METRIC_LABELS = {
     "subscriber_p99_ms": "Subscriber latency p99",
     "end_to_end_p99_ms": "End-to-end latency p99",
     "claim_p99_ms": "Claim latency p99",
+    "completed_original_priority_1_rate": "Completed original priority 1 rate",
+    "completed_original_priority_4_rate": "Completed original priority 4 rate",
+    "aged_completion_rate": "Aged completion rate",
     "queue_depth": "Queue depth",
+    "running_depth": "Running depth",
+    "retryable_depth": "Retryable backlog",
+    "scheduled_depth": "Scheduled backlog",
+    "total_backlog": "Total backlog",
     "n_dead_tup": "Dead tuples",
 }
 
@@ -48,6 +62,7 @@ TIMELINE_PRESETS = [
     ("Producer vs end-to-end latency", "producer_p99_ms", "end_to_end_p99_ms"),
     ("Producer call vs per-message", "producer_call_p99_ms", "producer_p99_ms"),
     ("Subscriber vs queue depth", "subscriber_p99_ms", "queue_depth"),
+    ("Subscriber vs total backlog", "subscriber_p99_ms", "total_backlog"),
 ]
 
 PLOT_ORDER = [

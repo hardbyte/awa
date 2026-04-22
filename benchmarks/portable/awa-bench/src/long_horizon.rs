@@ -91,6 +91,9 @@ struct LongHorizonWorker {
     retryable_failures_counter: Arc<AtomicU64>,
     completed_priority_1_counter: Arc<AtomicU64>,
     completed_priority_4_counter: Arc<AtomicU64>,
+    completed_original_priority_1_counter: Arc<AtomicU64>,
+    completed_original_priority_4_counter: Arc<AtomicU64>,
+    aged_completion_counter: Arc<AtomicU64>,
 }
 
 #[async_trait]
@@ -134,6 +137,27 @@ impl Worker for LongHorizonWorker {
             }
             _ => {}
         }
+        let original_priority = ctx
+            .job
+            .metadata
+            .get("_awa_original_priority")
+            .and_then(|value| value.as_i64())
+            .and_then(|value| i16::try_from(value).ok())
+            .unwrap_or(ctx.job.priority);
+        match original_priority {
+            1 => {
+                self.completed_original_priority_1_counter
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            4 => {
+                self.completed_original_priority_4_counter
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+            _ => {}
+        }
+        if original_priority != ctx.job.priority {
+            self.aged_completion_counter.fetch_add(1, Ordering::Relaxed);
+        }
         Ok(JobResult::Completed)
     }
 }
@@ -161,6 +185,15 @@ fn env_u16(name: &str, default: u16) -> u16 {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(default)
+}
+
+fn priority_aging_interval() -> Duration {
+    Duration::from_millis(
+        std::env::var("PRIORITY_AGING_MS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(60_000),
+    )
 }
 
 fn parse_priority_pattern() -> Vec<i16> {
@@ -349,8 +382,14 @@ pub async fn run() {
     let retryable_failures = Arc::new(AtomicU64::new(0));
     let completed_priority_1 = Arc::new(AtomicU64::new(0));
     let completed_priority_4 = Arc::new(AtomicU64::new(0));
+    let completed_original_priority_1 = Arc::new(AtomicU64::new(0));
+    let completed_original_priority_4 = Arc::new(AtomicU64::new(0));
+    let aged_completions = Arc::new(AtomicU64::new(0));
     let enqueued = Arc::new(AtomicU64::new(0));
     let queue_depth = Arc::new(AtomicU64::new(0));
+    let running_depth = Arc::new(AtomicU64::new(0));
+    let retryable_depth = Arc::new(AtomicU64::new(0));
+    let scheduled_depth = Arc::new(AtomicU64::new(0));
     let producer_target_rate = Arc::new(AtomicU64::new(producer_rate));
 
     let worker = LongHorizonWorker {
@@ -361,6 +400,9 @@ pub async fn run() {
         retryable_failures_counter: Arc::clone(&retryable_failures),
         completed_priority_1_counter: Arc::clone(&completed_priority_1),
         completed_priority_4_counter: Arc::clone(&completed_priority_4),
+        completed_original_priority_1_counter: Arc::clone(&completed_original_priority_1),
+        completed_original_priority_4_counter: Arc::clone(&completed_original_priority_4),
+        aged_completion_counter: Arc::clone(&aged_completions),
     };
 
     let client_storage = storage.clone();
@@ -368,6 +410,7 @@ pub async fn run() {
     let depth_store = QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig");
 
     let client = Client::builder(pool.clone())
+        .priority_aging_interval(priority_aging_interval())
         .queue(
             queue_name,
             QueueConfig {
@@ -378,6 +421,7 @@ pub async fn run() {
                 } else {
                     QueueConfig::default().deadline_duration
                 },
+                priority_aging_interval: priority_aging_interval(),
                 ..QueueConfig::default()
             },
         )
@@ -485,11 +529,37 @@ pub async fn run() {
     let depth_shutdown = Arc::clone(&shutdown);
     let depth_handle = {
         let queue_depth = Arc::clone(&queue_depth);
+        let running_depth = Arc::clone(&running_depth);
+        let retryable_depth = Arc::clone(&retryable_depth);
+        let scheduled_depth = Arc::clone(&scheduled_depth);
         tokio::spawn(async move {
             while !depth_shutdown.load(Ordering::Relaxed) {
                 match depth_store.queue_counts(&depth_pool, queue_name).await {
                     Ok(counts) => {
                         queue_depth.store(counts.available as u64, Ordering::Relaxed);
+                        running_depth.store(counts.running as u64, Ordering::Relaxed);
+                        match sqlx::query_as::<_, (i64, i64)>(&format!(
+                            r#"
+                            SELECT
+                                COALESCE(sum(CASE WHEN state = 'retryable' THEN 1 ELSE 0 END), 0)::bigint AS retryable,
+                                COALESCE(sum(CASE WHEN state = 'scheduled' THEN 1 ELSE 0 END), 0)::bigint AS scheduled
+                            FROM {}.deferred_jobs
+                            WHERE queue = $1
+                            "#,
+                            depth_store.schema()
+                        ))
+                        .bind(queue_name)
+                        .fetch_one(&depth_pool)
+                        .await
+                        {
+                            Ok((retryable, scheduled)) => {
+                                retryable_depth.store(retryable as u64, Ordering::Relaxed);
+                                scheduled_depth.store(scheduled as u64, Ordering::Relaxed);
+                            }
+                            Err(err) => {
+                                eprintln!("[awa] deferred depth poll failed: {err}");
+                            }
+                        }
                     }
                     Err(err) => {
                         eprintln!("[awa] queue depth poll failed: {err}");
@@ -507,7 +577,13 @@ pub async fn run() {
     let sample_retryable_failures = Arc::clone(&retryable_failures);
     let sample_completed_priority_1 = Arc::clone(&completed_priority_1);
     let sample_completed_priority_4 = Arc::clone(&completed_priority_4);
+    let sample_completed_original_priority_1 = Arc::clone(&completed_original_priority_1);
+    let sample_completed_original_priority_4 = Arc::clone(&completed_original_priority_4);
+    let sample_aged_completions = Arc::clone(&aged_completions);
     let sample_depth = Arc::clone(&queue_depth);
+    let sample_running_depth = Arc::clone(&running_depth);
+    let sample_retryable_depth = Arc::clone(&retryable_depth);
+    let sample_scheduled_depth = Arc::clone(&scheduled_depth);
     let sample_producer_call_latencies = Arc::clone(&producer_call_latencies);
     let sample_producer_latencies = Arc::clone(&producer_latencies);
     let sample_subscriber_latencies = Arc::clone(&subscriber_latencies);
@@ -531,6 +607,12 @@ pub async fn run() {
             sample_completed_priority_1.load(Ordering::Relaxed);
         let mut last_completed_priority_4: u64 =
             sample_completed_priority_4.load(Ordering::Relaxed);
+        let mut last_completed_original_priority_1: u64 =
+            sample_completed_original_priority_1.load(Ordering::Relaxed);
+        let mut last_completed_original_priority_4: u64 =
+            sample_completed_original_priority_4.load(Ordering::Relaxed);
+        let mut last_aged_completions: u64 =
+            sample_aged_completions.load(Ordering::Relaxed);
         let mut last_tick = Instant::now();
         let mut ticker = interval_at(
             tokio::time::Instant::now() + Duration::from_secs(sample_every_s),
@@ -549,6 +631,11 @@ pub async fn run() {
             let retryable = sample_retryable_failures.load(Ordering::Relaxed);
             let completed_p1 = sample_completed_priority_1.load(Ordering::Relaxed);
             let completed_p4 = sample_completed_priority_4.load(Ordering::Relaxed);
+            let completed_original_p1 =
+                sample_completed_original_priority_1.load(Ordering::Relaxed);
+            let completed_original_p4 =
+                sample_completed_original_priority_4.load(Ordering::Relaxed);
+            let aged_completions = sample_aged_completions.load(Ordering::Relaxed);
             let enq_rate = (enq - last_enqueued) as f64 / dt;
             let cmp_rate = (cmp - last_completed) as f64 / dt;
             let retryable_rate = (retryable - last_retryable_failures) as f64 / dt;
@@ -556,11 +643,20 @@ pub async fn run() {
                 (completed_p1 - last_completed_priority_1) as f64 / dt;
             let completed_p4_rate =
                 (completed_p4 - last_completed_priority_4) as f64 / dt;
+            let completed_original_p1_rate =
+                (completed_original_p1 - last_completed_original_priority_1) as f64 / dt;
+            let completed_original_p4_rate =
+                (completed_original_p4 - last_completed_original_priority_4) as f64 / dt;
+            let aged_completion_rate =
+                (aged_completions - last_aged_completions) as f64 / dt;
             last_enqueued = enq;
             last_completed = cmp;
             last_retryable_failures = retryable;
             last_completed_priority_1 = completed_p1;
             last_completed_priority_4 = completed_p4;
+            last_completed_original_priority_1 = completed_original_p1;
+            last_completed_original_priority_4 = completed_original_p4;
+            last_aged_completions = aged_completions;
 
             let window = Duration::from_secs(30);
             let (producer_call_p50, producer_call_p95, producer_call_p99) = {
@@ -592,6 +688,10 @@ pub async fn run() {
                     .unwrap_or((0.0, 0.0, 0.0))
             };
             let depth = sample_depth.load(Ordering::Relaxed) as f64;
+            let running_depth = sample_running_depth.load(Ordering::Relaxed) as f64;
+            let retryable_depth = sample_retryable_depth.load(Ordering::Relaxed) as f64;
+            let scheduled_depth = sample_scheduled_depth.load(Ordering::Relaxed) as f64;
+            let total_backlog = depth + running_depth + retryable_depth + scheduled_depth;
             let target_rate = sample_target_rate.load(Ordering::Relaxed) as f64;
             let ts = now_iso_ms();
 
@@ -616,7 +716,22 @@ pub async fn run() {
                 ("retryable_failure_rate", retryable_rate, sample_every_s as f64),
                 ("completed_priority_1_rate", completed_p1_rate, sample_every_s as f64),
                 ("completed_priority_4_rate", completed_p4_rate, sample_every_s as f64),
+                (
+                    "completed_original_priority_1_rate",
+                    completed_original_p1_rate,
+                    sample_every_s as f64,
+                ),
+                (
+                    "completed_original_priority_4_rate",
+                    completed_original_p4_rate,
+                    sample_every_s as f64,
+                ),
+                ("aged_completion_rate", aged_completion_rate, sample_every_s as f64),
                 ("queue_depth", depth, 0.0),
+                ("running_depth", running_depth, 0.0),
+                ("retryable_depth", retryable_depth, 0.0),
+                ("scheduled_depth", scheduled_depth, 0.0),
+                ("total_backlog", total_backlog, 0.0),
                 ("producer_target_rate", target_rate, 0.0),
             ] {
                 emit(json!({

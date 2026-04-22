@@ -1581,9 +1581,62 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
     assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
     assert_eq!(lease_claim_count(&pool, &store).await, 2);
-    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_leases() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_fail_retryable";
+    let schema = "awa_qs_runtime_lease_claim_fail_retryable";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 71 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("Failed to claim receipt-backed job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+
+    let retried = store
+        .fail_retryable(
+            &pool,
+            job_id,
+            claimed.job.run_lease,
+            "synthetic error",
+            None,
+        )
+        .await
+        .expect("Failed to fail retryable receipt-backed job")
+        .expect("Expected receipt-backed job to move to retryable");
+    assert_eq!(retried.state, JobState::Retryable);
+    assert_eq!(retried.attempt, 1);
+    assert_eq!(lease_count(&pool, &store).await, 0);
+    assert_eq!(attempt_state_count(&pool, &store).await, 0);
+    assert_eq!(open_receipt_claim_count(&pool, &store).await, 0);
+    assert_eq!(lease_claim_closure_count(&pool, &store).await, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
