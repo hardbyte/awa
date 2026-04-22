@@ -552,6 +552,7 @@ async fn test_throughput_rust_workers() {
     client.start().await.expect("Failed to start client");
 
     // Insert jobs in batches
+    let benchmark_start = Instant::now();
     let insert_start = Instant::now();
     for batch_start in (0..total_jobs).step_by(batch_size) {
         let batch_end = (batch_start + batch_size as i64).min(total_jobs);
@@ -611,12 +612,19 @@ async fn test_throughput_rust_workers() {
         if completed == total_jobs {
             let processing_elapsed = processing_start.elapsed();
             let throughput = total_jobs as f64 / processing_elapsed.as_secs_f64();
+            let end_to_end_elapsed = benchmark_start.elapsed();
+            let end_to_end_throughput = total_jobs as f64 / end_to_end_elapsed.as_secs_f64();
             println!(
                 "[bench] All {} jobs completed in {:.2}s",
                 total_jobs,
                 processing_elapsed.as_secs_f64()
             );
-            println!("[bench] Throughput: {:.0} jobs/sec", throughput);
+            println!("[bench] Post-insert throughput: {:.0} jobs/sec", throughput);
+            println!(
+                "[bench] End-to-end throughput: {:.0} jobs/sec over {:.2}s",
+                end_to_end_throughput,
+                end_to_end_elapsed.as_secs_f64()
+            );
 
             client.shutdown(Duration::from_secs(5)).await;
 
@@ -678,6 +686,7 @@ async fn test_throughput_rust_workers_queue_storage() {
     let store_config = QueueStorageConfig {
         queue_slot_count,
         lease_slot_count,
+        experimental_lease_claim_receipts: true,
         ..Default::default()
     };
     let store =
@@ -699,6 +708,7 @@ async fn test_throughput_rust_workers_queue_storage() {
             QueueConfig {
                 max_workers: 100,
                 poll_interval: Duration::from_millis(50),
+                deadline_duration: Duration::ZERO,
                 ..QueueConfig::default()
             },
         )
@@ -716,6 +726,7 @@ async fn test_throughput_rust_workers_queue_storage() {
         .await
         .expect("Failed to start queue storage client");
 
+    let benchmark_start = Instant::now();
     let insert_start = Instant::now();
     for batch_start in (0..total_jobs).step_by(batch_size) {
         let batch_end = (batch_start + batch_size as i64).min(total_jobs);
@@ -771,12 +782,19 @@ async fn test_throughput_rust_workers_queue_storage() {
         if counts.completed == total_jobs {
             let processing_elapsed = processing_start.elapsed();
             let throughput = total_jobs as f64 / processing_elapsed.as_secs_f64();
+            let end_to_end_elapsed = benchmark_start.elapsed();
+            let end_to_end_throughput = total_jobs as f64 / end_to_end_elapsed.as_secs_f64();
             println!(
                 "[bench-va] All {} jobs completed in {:.2}s",
                 total_jobs,
                 processing_elapsed.as_secs_f64()
             );
-            println!("[bench-va] Throughput: {:.0} jobs/sec", throughput);
+            println!("[bench-va] Post-insert throughput: {:.0} jobs/sec", throughput);
+            println!(
+                "[bench-va] End-to-end throughput: {:.0} jobs/sec over {:.2}s",
+                end_to_end_throughput,
+                end_to_end_elapsed.as_secs_f64()
+            );
 
             client.shutdown(Duration::from_secs(5)).await;
 
@@ -938,6 +956,7 @@ async fn test_pickup_latency_listen_notify_queue_storage() {
     let store_config = QueueStorageConfig {
         queue_slot_count: env_usize("AWA_VA_LATENCY_QUEUE_SLOTS", 16),
         lease_slot_count: env_usize("AWA_VA_LATENCY_LEASE_SLOTS", 4),
+        experimental_lease_claim_receipts: true,
         ..Default::default()
     };
     let queue_rotate_ms = env_i64("AWA_VA_LATENCY_QUEUE_ROTATE_MS", 1_000);
@@ -979,6 +998,7 @@ async fn test_pickup_latency_listen_notify_queue_storage() {
             QueueConfig {
                 max_workers: 10,
                 poll_interval: Duration::from_millis(200),
+                deadline_duration: Duration::ZERO,
                 ..QueueConfig::default()
             },
         )

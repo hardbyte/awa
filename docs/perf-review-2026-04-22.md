@@ -160,6 +160,44 @@ Interpretation:
 - pressure behavior is good
 - recovery is the weakest phase, but no longer catastrophically so
 
+#### Direct runtime benchmark sanity check
+
+The direct Rust runtime benchmark now prints both:
+
+- **post-insert throughput**: drain rate after the insert phase finishes
+- **end-to-end throughput**: total jobs divided by total elapsed time from first insert to final completion
+
+That distinction matters because the old single throughput number over-weighted the
+drain phase and made very fast inserters look artificially better.
+
+Current local Docker PG rerun (`postgres://bench:bench@localhost:15555/awa_bench`,
+`5000` jobs):
+
+- canonical
+  - post-insert throughput: `46827 jobs/s`
+  - end-to-end throughput: `6750 jobs/s`
+  - exact final dead tuples: `826`
+    - `jobs_hot=826`
+    - `scheduled_jobs=0`
+    - `queue_state_counts=0`
+- queue storage
+  - post-insert throughput: `11066 jobs/s`
+  - end-to-end throughput: `5835 jobs/s`
+  - exact final dead tuples: `0`
+    - `queue_lanes=0`
+    - `ready=0`
+    - `done=0`
+    - `leases=0`
+    - `attempt_state=0`
+
+Interpretation:
+
+- canonical still drains a short preloaded burst faster on this microjob benchmark
+- queue storage still has the much cleaner hot-path churn profile
+- the direct runtime benchmark is useful as a smoke check, but the longer portable
+  phase-driven scenarios remain the more trustworthy picture for sustained behavior
+  under readers, pressure, and recovery
+
 #### Table-level dead tuples in the current Awa baseline
 
 From `custom-20260421T194144Z-6b8a25/raw.csv`, the dominant dead-tuple sources are now:
