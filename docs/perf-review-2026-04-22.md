@@ -518,6 +518,12 @@ In order:
 
 2. Investigate low-worker underfill
    - the `1/4/8/16` worker scaling results are still too weak
+   - a direct `claim_ready_runtime(...)` broadening spike was tried and reverted:
+     claiming across multiple ready slots for the chosen lane did help the
+     higher-concurrency backlog case, but it regressed `1/4` worker throughput
+     enough that it was not worth keeping
+   - so the next low-worker work should focus on fixed per-claim/start cost on
+     the current design, not broader ready-slot selection
 
 3. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
