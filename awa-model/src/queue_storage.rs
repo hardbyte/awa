@@ -3477,13 +3477,7 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let claimed = self
-            .claim_ready_rows_tx(
-                &mut tx,
-                queue,
-                max_batch,
-                deadline_duration,
-                aging_interval,
-            )
+            .claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration, aging_interval)
             .await?;
 
         for row in &claimed {

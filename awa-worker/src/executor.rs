@@ -299,56 +299,49 @@ impl JobExecutor {
                 guard.clone_latest()
             };
 
-            // Complete the job based on the result, then record metrics
-            // only if the state transition actually happened (not stale).
+            // Remove from in-flight immediately after the handler returns and
+            // the progress snapshot is captured. This keeps local worker
+            // capacity tied to active handler execution, not to the tail
+            // latency of durable completion bookkeeping.
+            in_flight.remove((job_id, job_run_lease));
+            if let Some(counter) = queue_in_flight.get(&job_queue) {
+                counter.fetch_sub(1, Ordering::SeqCst);
+            }
+            metrics.record_in_flight_change(&job_queue, -1);
+
             let has_lifecycle_handlers = lifecycle_handlers.contains_key(&job_kind);
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
-            let outcome = complete_job(
-                &pool,
-                &job,
-                queue_storage_claim.as_ref(),
-                queue_storage_unique_states.as_deref(),
-                &result,
-                &completion_batcher,
-                progress_snapshot,
-                duration,
-                has_lifecycle_handlers,
-                &storage,
-                dlq_enabled,
-                &metrics,
-            )
-            .await;
+            tokio::spawn(async move {
+                let outcome = complete_job(
+                    &pool,
+                    &job,
+                    queue_storage_claim.as_ref(),
+                    queue_storage_unique_states.as_deref(),
+                    &result,
+                    &completion_batcher,
+                    progress_snapshot,
+                    duration,
+                    has_lifecycle_handlers,
+                    &storage,
+                    dlq_enabled,
+                    &metrics,
+                )
+                .await;
 
-            match &outcome {
-                Ok(CompletionOutcome::Applied { terminal, .. }) => {
-                    // State transition succeeded — record metrics. `terminal`
-                    // is the source of truth for retry-vs-failure because
-                    // JobError::Retryable can resolve to either path.
-                    match &result {
-                        Ok(JobResult::Completed) => {
-                            metrics.record_job_completed(&job_kind, &job_queue, duration);
-                        }
-                        Ok(JobResult::RetryAfter(_)) => {
-                            metrics.record_job_retried(&job_kind, &job_queue);
-                        }
-                        Ok(JobResult::Cancel(_)) => {
-                            metrics.jobs_cancelled.add(
-                                1,
-                                &[
-                                    opentelemetry::KeyValue::new("awa.job.kind", job_kind.clone()),
-                                    opentelemetry::KeyValue::new(
-                                        "awa.job.queue",
-                                        job_queue.clone(),
-                                    ),
-                                ],
-                            );
-                        }
-                        Ok(JobResult::Snooze(_)) => {} // Not a terminal outcome
-                        Ok(JobResult::WaitForCallback(_)) => {
-                            if *terminal {
-                                metrics.record_job_failed(&job_kind, &job_queue, true);
-                            } else {
-                                metrics.jobs_waiting_external.add(
+                match &outcome {
+                    Ok(CompletionOutcome::Applied { terminal, .. }) => {
+                        // State transition succeeded — record metrics. `terminal`
+                        // is the source of truth for retry-vs-failure because
+                        // JobError::Retryable can resolve to either path.
+                        match &result {
+                            Ok(JobResult::Completed) => {
+                                metrics.record_job_completed(&job_kind, &job_queue, duration);
+                            }
+                            Ok(JobResult::RetryAfter(_)) => {
+                                metrics.record_job_retried(&job_kind, &job_queue);
+                            }
+                            Ok(JobResult::Cancel(_)) => {
+                                metrics.jobs_cancelled.add(
                                     1,
                                     &[
                                         opentelemetry::KeyValue::new(
@@ -362,48 +355,51 @@ impl JobExecutor {
                                     ],
                                 );
                             }
-                        }
-                        Err(JobError::Terminal(_)) => {
-                            metrics.record_job_failed(&job_kind, &job_queue, true);
-                        }
-                        Err(JobError::Retryable(_)) => {
-                            if *terminal {
+                            Ok(JobResult::Snooze(_)) => {}
+                            Ok(JobResult::WaitForCallback(_)) => {
+                                if *terminal {
+                                    metrics.record_job_failed(&job_kind, &job_queue, true);
+                                } else {
+                                    metrics.jobs_waiting_external.add(
+                                        1,
+                                        &[
+                                            opentelemetry::KeyValue::new(
+                                                "awa.job.kind",
+                                                job_kind.clone(),
+                                            ),
+                                            opentelemetry::KeyValue::new(
+                                                "awa.job.queue",
+                                                job_queue.clone(),
+                                            ),
+                                        ],
+                                    );
+                                }
+                            }
+                            Err(JobError::Terminal(_)) => {
                                 metrics.record_job_failed(&job_kind, &job_queue, true);
-                            } else {
-                                metrics.record_job_retried(&job_kind, &job_queue);
+                            }
+                            Err(JobError::Retryable(_)) => {
+                                if *terminal {
+                                    metrics.record_job_failed(&job_kind, &job_queue, true);
+                                } else {
+                                    metrics.record_job_retried(&job_kind, &job_queue);
+                                }
                             }
                         }
                     }
+                    Ok(CompletionOutcome::IgnoredStale) => {}
+                    Err(err) => {
+                        error!(job_id, error = %err, "Failed to complete job");
+                    }
                 }
-                Ok(CompletionOutcome::IgnoredStale) => {
-                    // Job was already rescued/cancelled — no metrics
-                }
-                Err(err) => {
-                    error!(job_id, error = %err, "Failed to complete job");
-                }
-            }
 
-            // Remove from in-flight BEFORE dispatching lifecycle events.
-            // This ensures a slow/hung handler doesn't hold the permit open,
-            // block queue capacity, or delay graceful shutdown.
-            in_flight.remove((job_id, job_run_lease));
-            if let Some(counter) = queue_in_flight.get(&job_queue) {
-                counter.fetch_sub(1, Ordering::SeqCst);
-            }
-            metrics.record_in_flight_change(&job_queue, -1);
-
-            // Dispatch lifecycle event as a detached task — best effort,
-            // does not block the executor or affect shutdown drain.
-            if let Ok(CompletionOutcome::Applied {
-                event: Some(event), ..
-            }) = outcome
-            {
-                let handlers = lifecycle_handlers.clone();
-                let kind = job_kind.clone();
-                tokio::spawn(async move {
-                    dispatch_lifecycle_event(&handlers, &kind, event).await;
-                });
-            }
+                if let Ok(CompletionOutcome::Applied {
+                    event: Some(event), ..
+                }) = outcome
+                {
+                    dispatch_lifecycle_event(&lifecycle_handlers, &job_kind, event).await;
+                }
+            });
         }
         .instrument(span)
     }
