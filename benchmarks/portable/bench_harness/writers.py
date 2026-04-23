@@ -24,6 +24,44 @@ from .phases import (
 )
 from .sample import RAW_CSV_HEADER, Sample
 
+RATE_METRICS = {
+    "enqueue_rate",
+    "completion_rate",
+    "retryable_failure_rate",
+    "completed_priority_1_rate",
+    "completed_priority_4_rate",
+    "completed_original_priority_1_rate",
+    "completed_original_priority_4_rate",
+    "aged_completion_rate",
+}
+
+LATENCY_METRICS = {
+    "producer_p50_ms",
+    "producer_p95_ms",
+    "producer_p99_ms",
+    "producer_call_p50_ms",
+    "producer_call_p95_ms",
+    "producer_call_p99_ms",
+    "subscriber_p50_ms",
+    "subscriber_p95_ms",
+    "subscriber_p99_ms",
+    "end_to_end_p50_ms",
+    "end_to_end_p95_ms",
+    "end_to_end_p99_ms",
+    "claim_p50_ms",
+    "claim_p95_ms",
+    "claim_p99_ms",
+}
+
+DEPTH_METRICS = {
+    "queue_depth",
+    "running_depth",
+    "retryable_depth",
+    "scheduled_depth",
+    "total_backlog",
+    "producer_target_rate",
+}
+
 
 # ────────────────────────────────────────────────────────────────────────
 # raw.csv
@@ -81,6 +119,135 @@ def _load_rows(raw_csv: Path) -> list[dict]:
     with raw_csv.open("r", newline="") as fh:
         reader = csv.DictReader(fh)
         return list(reader)
+
+
+def aggregate_replica_metric_series(
+    rows: list[dict],
+    *,
+    system: str,
+    phase_label: str,
+    metric: str,
+    subject_kind: str | None = None,
+) -> list[float]:
+    """Aggregate per-replica adapter metrics into a system-level series.
+
+    Rules:
+    - rate metrics: sum across replicas per timestamp
+    - latency metrics: max across replicas per timestamp (avoid zero-idle dilution)
+    - depth/observer metrics: max across replicas per timestamp
+    - other metrics: raw values
+    """
+    if metric not in RATE_METRICS | LATENCY_METRICS | DEPTH_METRICS:
+        return _phase_metric_values(
+            rows,
+            system=system,
+            phase_label=phase_label,
+            metric=metric,
+            subject_kind=subject_kind,
+        )
+
+    per_elapsed: dict[float, list[float]] = {}
+    for row in rows:
+        if (
+            row["system"] != system
+            or row["phase_label"] != phase_label
+            or row["metric"] != metric
+        ):
+            continue
+        if subject_kind and row["subject_kind"] != subject_kind:
+            continue
+        try:
+            elapsed_s = float(row["elapsed_s"])
+            value = float(row["value"])
+        except (TypeError, ValueError):
+            continue
+        per_elapsed.setdefault(elapsed_s, []).append(value)
+
+    out: list[float] = []
+    for elapsed_s in sorted(per_elapsed):
+        values = per_elapsed[elapsed_s]
+        if metric in RATE_METRICS:
+            out.append(float(sum(values)))
+        else:
+            out.append(float(max(values)))
+    return out
+
+
+def per_instance_phase_metrics(
+    rows: list[dict],
+    *,
+    system: str,
+    phase_label: str,
+) -> dict[str, dict[str, float | int | None]]:
+    """Replica-scoped summary for adapter metrics only."""
+    replica_ids = sorted(
+        {
+            row["instance_id"]
+            for row in rows
+            if row["system"] == system
+            and row["phase_label"] == phase_label
+            and row["subject_kind"] == "adapter"
+        },
+        key=lambda value: int(value),
+    )
+    out: dict[str, dict[str, float | int | None]] = {}
+    for replica_id in replica_ids:
+        metrics = {}
+        for metric in [
+            "completion_rate",
+            "enqueue_rate",
+            "producer_p99_ms",
+            "producer_call_p99_ms",
+            "subscriber_p99_ms",
+            "end_to_end_p99_ms",
+            "claim_p99_ms",
+            "queue_depth",
+            "running_depth",
+            "retryable_depth",
+            "scheduled_depth",
+            "total_backlog",
+        ]:
+            values = []
+            for row in rows:
+                if (
+                    row["system"] != system
+                    or row["phase_label"] != phase_label
+                    or row["subject_kind"] != "adapter"
+                    or row["instance_id"] != replica_id
+                    or row["metric"] != metric
+                ):
+                    continue
+                try:
+                    values.append(float(row["value"]))
+                except (TypeError, ValueError):
+                    continue
+            metrics[f"median_{metric}"] = _median(values)
+            metrics[f"peak_{metric}"] = _peak(values)
+            metrics[f"count_{metric}"] = len(values)
+        out[replica_id] = metrics
+    return out
+
+
+def _replica_metric_sum(
+    replicas: dict[str, dict[str, float | int | None]], metric: str
+) -> float | None:
+    values = [
+        float(value)
+        for replica in replicas.values()
+        if (value := replica.get(metric)) is not None
+    ]
+    return float(sum(values)) if values else None
+
+
+def _replica_metric_max(
+    replicas: dict[str, dict[str, float | int | None]], metric: str
+) -> float | None:
+    values = [
+        float(value)
+        for replica in replicas.values()
+        if (value := replica.get(metric)) is not None
+    ]
+    return float(max(values)) if values else None
 
 
 def compute_summary(
@@ -171,61 +338,44 @@ def compute_summary(
                 metric="n_dead_tup",
                 subject_kind="table",
             )
-            claim_p99 = _phase_metric_values(
-                rows,
-                system=system,
-                phase_label=phase_label,
-                metric="claim_p99_ms",
-                subject_kind="adapter",
-            )
-            throughput = _phase_metric_values(
-                rows,
-                system=system,
-                phase_label=phase_label,
-                metric="completion_rate",
-                subject_kind="adapter",
-            )
-            producer_p99 = _phase_metric_values(
-                rows,
-                system=system,
-                phase_label=phase_label,
-                metric="producer_p99_ms",
-                subject_kind="adapter",
-            )
-            producer_call_p99 = _phase_metric_values(
-                rows,
-                system=system,
-                phase_label=phase_label,
-                metric="producer_call_p99_ms",
-                subject_kind="adapter",
-            )
-            subscriber_p99 = _phase_metric_values(
-                rows,
-                system=system,
-                phase_label=phase_label,
-                metric="subscriber_p99_ms",
-                subject_kind="adapter",
-            )
-            end_to_end_p99 = _phase_metric_values(
-                rows,
-                system=system,
-                phase_label=phase_label,
-                metric="end_to_end_p99_ms",
-                subject_kind="adapter",
+            replicas = per_instance_phase_metrics(
+                rows, system=system, phase_label=phase_label
             )
             phase_block["peak_dead_tup"] = _peak(dead_tup)
             phase_block["median_dead_tup"] = _median(dead_tup)
-            phase_block["median_claim_p99_ms"] = _median(claim_p99)
-            phase_block["median_producer_p99_ms"] = _median(producer_p99)
-            phase_block["median_producer_call_p99_ms"] = _median(producer_call_p99)
-            phase_block["median_subscriber_p99_ms"] = _median(subscriber_p99)
-            phase_block["median_end_to_end_p99_ms"] = _median(end_to_end_p99)
-            phase_block["median_throughput_per_s"] = _median(throughput)
+            phase_block["median_claim_p99_ms"] = _replica_metric_max(
+                replicas, "median_claim_p99_ms"
+            )
+            phase_block["median_producer_p99_ms"] = _replica_metric_max(
+                replicas, "median_producer_p99_ms"
+            )
+            phase_block["median_producer_call_p99_ms"] = _replica_metric_max(
+                replicas, "median_producer_call_p99_ms"
+            )
+            phase_block["median_subscriber_p99_ms"] = _replica_metric_max(
+                replicas, "median_subscriber_p99_ms"
+            )
+            phase_block["median_end_to_end_p99_ms"] = _replica_metric_max(
+                replicas, "median_end_to_end_p99_ms"
+            )
+            phase_block["median_throughput_per_s"] = _replica_metric_sum(
+                replicas, "median_completion_rate"
+            )
+            phase_block["median_enqueue_rate_per_s"] = _replica_metric_sum(
+                replicas, "median_enqueue_rate"
+            )
+            phase_block["median_queue_depth"] = _replica_metric_max(
+                replicas, "median_queue_depth"
+            )
+            phase_block["median_running_depth"] = _replica_metric_max(
+                replicas, "median_running_depth"
+            )
             phase_block["autovacuum_count_delta"] = _autovacuum_count_delta(
                 rows,
                 system=system,
                 phase_label=phase_label,
             )
+            phase_block["replicas"] = replicas
 
     return {
         "run_id": run_id,

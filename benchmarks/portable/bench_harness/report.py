@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .adapters import AdapterManifest
 from .phases import Phase
+from .writers import DEPTH_METRICS, LATENCY_METRICS, RATE_METRICS
 
 
 DEFAULT_TIMELINE_METRICS = [
@@ -135,17 +136,32 @@ def _timeline_series(rows: list[dict], systems: list[str]) -> dict[str, dict[str
                     for (elapsed, phase_label, phase_type), value in sorted(per_elapsed.items())
                 ]
             else:
-                points = [
-                    {
-                        "elapsed_s": float(row["elapsed_s"]),
-                        "phase_label": row["phase_label"],
-                        "phase_type": row["phase_type"],
-                        "value": float(row["value"]),
-                    }
-                    for row in selected
-                    if row["subject_kind"] == "adapter"
-                ]
-                points.sort(key=lambda item: item["elapsed_s"])
+                per_elapsed: dict[tuple[float, str, str], list[float]] = {}
+                for row in selected:
+                    if row["subject_kind"] != "adapter":
+                        continue
+                    key = (
+                        float(row["elapsed_s"]),
+                        row["phase_label"],
+                        row["phase_type"],
+                    )
+                    per_elapsed.setdefault(key, []).append(float(row["value"]))
+                points = []
+                for (elapsed, phase_label, phase_type), values in sorted(per_elapsed.items()):
+                    if metric in RATE_METRICS:
+                        value = float(sum(values))
+                    elif metric in LATENCY_METRICS or metric in DEPTH_METRICS:
+                        value = float(max(values))
+                    else:
+                        value = float(values[-1])
+                    points.append(
+                        {
+                            "elapsed_s": elapsed,
+                            "phase_label": phase_label,
+                            "phase_type": phase_type,
+                            "value": value,
+                        }
+                    )
 
             if points:
                 out[metric][system] = points
@@ -276,6 +292,50 @@ def _phase_table(summary: dict, systems: list[str], phases: list[Phase], system_
     return (
         "<table id='phase-summary-table'>"
         f"<thead><tr>{head}</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+    )
+
+
+def _replica_table(summary: dict, systems: list[str], phases: list[Phase], system_meta: dict[str, dict[str, str]]) -> str:
+    headers = [
+        "System",
+        "Replica",
+        "Phase",
+        "Completion/s",
+        "Enqueue/s",
+        "Subscriber p99 ms",
+        "End-to-end p99 ms",
+        "Queue depth",
+        "Running depth",
+    ]
+    rows: list[str] = []
+    for system in systems:
+        phase_map = summary["systems"].get(system, {}).get("phases", {})
+        for phase in phases:
+            if phase.type.value == "warmup":
+                continue
+            block = phase_map.get(phase.label)
+            if not block:
+                continue
+            replicas = block.get("replicas", {})
+            for replica_id, replica_block in sorted(replicas.items(), key=lambda item: int(item[0])):
+                rows.append(
+                    "<tr>"
+                    f"<td>{html.escape(system_meta[system]['display_name'])}</td>"
+                    f"<td>{html.escape(str(replica_id))}</td>"
+                    f"<td>{html.escape(phase.label)}</td>"
+                    f"<td>{(replica_block.get('median_completion_rate') or 0):.1f}</td>"
+                    f"<td>{(replica_block.get('median_enqueue_rate') or 0):.1f}</td>"
+                    f"<td>{(replica_block.get('median_subscriber_p99_ms') or 0):.3f}</td>"
+                    f"<td>{(replica_block.get('median_end_to_end_p99_ms') or 0):.3f}</td>"
+                    f"<td>{(replica_block.get('median_queue_depth') or 0):.1f}</td>"
+                    f"<td>{(replica_block.get('median_running_depth') or 0):.1f}</td>"
+                    "</tr>"
+                )
+    return (
+        "<table id='replica-summary-table'>"
+        f"<thead><tr>{''.join(f'<th>{html.escape(h)}</th>' for h in headers)}</tr></thead>"
         f"<tbody>{''.join(rows)}</tbody>"
         "</table>"
     )
@@ -722,6 +782,7 @@ init();
         <a href="#overview">Overview</a>
         <a href="#timeline">Timeline</a>
         <a href="#phase-summary">Phase Summary</a>
+        <a href="#replica-summary">Replica Summary</a>
         <a href="#plots">Plots</a>
         <a href="#run-meta">Run Metadata</a>
       </nav>
@@ -770,6 +831,12 @@ init();
       <section class="panel" id="phase-summary">
         <h2>Per-phase Summary</h2>
         {_phase_table(summary, systems, phases, system_meta)}
+      </section>
+
+      <section class="panel" id="replica-summary">
+        <h2>Per-replica Summary</h2>
+        <div class="card-sub">Replica-scoped adapter metrics for presented phases, excluding warmup. This is the primary view for multi-replica load distribution.</div>
+        {_replica_table(summary, systems, phases, system_meta)}
       </section>
 
       <section class="panel" id="plots">
