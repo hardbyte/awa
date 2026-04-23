@@ -11,8 +11,12 @@ use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 const CLAIM_BATCH_LIMIT: usize = 128;
+const FIXED_MAX_CLAIMERS_PER_QUEUE: i16 = 2;
+const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
+const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy)]
 enum WakeReason {
@@ -239,6 +243,7 @@ impl OverflowPool {
 /// Dispatcher polls a single queue for available jobs and dispatches them.
 pub struct Dispatcher {
     queue: String,
+    runtime_instance_id: Uuid,
     config: QueueConfig,
     pool: PgPool,
     executor: Arc<JobExecutor>,
@@ -257,6 +262,7 @@ impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         queue: String,
+        runtime_instance_id: Uuid,
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
@@ -273,6 +279,7 @@ impl Dispatcher {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
         Self {
             queue,
+            runtime_instance_id,
             config,
             pool,
             executor,
@@ -292,6 +299,7 @@ impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_concurrency(
         queue: String,
+        runtime_instance_id: Uuid,
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
@@ -306,6 +314,7 @@ impl Dispatcher {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
         Self {
             queue,
+            runtime_instance_id,
             config,
             pool,
             executor,
@@ -561,12 +570,16 @@ impl Dispatcher {
             },
             RuntimeStorage::QueueStorage(runtime) => match runtime
                 .store
-                .claim_runtime_batch_with_aging(
+                .claim_runtime_batch_with_aging_for_instance(
                     &self.pool,
                     &self.queue,
                     batch_size as i64,
                     self.config.deadline_duration,
                     self.config.priority_aging_interval,
+                    self.runtime_instance_id,
+                    FIXED_MAX_CLAIMERS_PER_QUEUE,
+                    CLAIMER_LEASE_TTL,
+                    CLAIMER_IDLE_THRESHOLD,
                 )
                 .await
             {
