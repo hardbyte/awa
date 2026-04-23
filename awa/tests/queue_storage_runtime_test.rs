@@ -1288,6 +1288,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1301,6 +1302,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
         BlockingCompleteWorker {
@@ -1382,6 +1384,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 4,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1395,6 +1398,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 4,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
         BlockingCompleteWorker {
@@ -1456,6 +1460,7 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1500,6 +1505,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1521,6 +1527,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
+                dynamic_queue_striping: false,
                 experimental_lease_claim_receipts: true,
             },
             Duration::from_millis(1_000),
@@ -1624,6 +1631,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1636,6 +1644,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
         RetryOnceWorker,
@@ -1689,6 +1698,7 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1743,6 +1753,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1775,6 +1786,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
+                dynamic_queue_striping: false,
                 experimental_lease_claim_receipts: true,
             },
             Duration::from_millis(1_000),
@@ -1860,6 +1872,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1881,6 +1894,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
+                dynamic_queue_striping: false,
                 experimental_lease_claim_receipts: true,
             },
             Duration::from_millis(1_000),
@@ -2515,6 +2529,91 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_dynamic_striping_expands_active_stripes_monotonically() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_dynamic_stripes";
+    let schema = "awa_qs_dynamic_stripes";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 4,
+            dynamic_queue_striping: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 64)
+        .await
+        .expect("Failed to enqueue first dynamic stripe batch");
+
+    let first_queues: Vec<String> = sqlx::query_scalar(&format!(
+        r#"
+        SELECT DISTINCT queue
+        FROM {schema}.ready_entries
+        ORDER BY queue
+        "#
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read first dynamic stripe queues");
+    assert_eq!(first_queues, vec![format!("{queue}#0")]);
+
+    let first_active: i16 = sqlx::query_scalar(&format!(
+        r#"
+        SELECT active_stripes
+        FROM {schema}.queue_stripe_state
+        WHERE queue = $1
+        "#
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read first active stripe state");
+    assert_eq!(first_active, 1);
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 64)
+        .await
+        .expect("Failed to enqueue second dynamic stripe batch");
+
+    let second_queues: Vec<String> = sqlx::query_scalar(&format!(
+        r#"
+        SELECT DISTINCT queue
+        FROM {schema}.ready_entries
+        ORDER BY queue
+        "#
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read second dynamic stripe queues");
+    assert_eq!(
+        second_queues,
+        vec![format!("{queue}#0"), format!("{queue}#1")]
+    );
+
+    let second_active: i16 = sqlx::query_scalar(&format!(
+        r#"
+        SELECT active_stripes
+        FROM {schema}.queue_stripe_state
+        WHERE queue = $1
+        "#
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read second active stripe state");
+    assert_eq!(second_active, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -2569,6 +2668,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
+            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: true,
         },
     )
