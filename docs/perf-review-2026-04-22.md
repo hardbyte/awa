@@ -630,6 +630,26 @@ In order:
        throughput despite its huge dead-tuple cost
    - the remaining blocker is now best understood as multi-process
      claim/start coordination on one queue, not one-big-process underfill alone
+   - one later spike reused the receipt-backed live frontier as a local
+     prefetch buffer so each replica could claim ahead and dispatch from memory
+   - that spike was the first thing that materially improved the realistic
+     `4x8` shape:
+     - `clean_1 174.8/s`
+     - `pressure_1 208.0/s`
+     - `recovery_1 161.2/s`
+     - subscriber p99 about `140 / 269 / 237 ms`
+   - but it was reverted because it crossed the safety/observability boundary:
+     - prefetched receipt claims were indistinguishable from active attempts, so
+       `running_depth` was inflated badly
+     - crash-under-load runs surfaced stale rescue errors:
+       - `queue storage ready row missing for deleted lease job ...`
+   - the lesson is now stronger than before:
+     - a buffered frontier probably **is** required to clear the many-small-
+       replica blocker
+     - but it cannot safely reuse `open_receipt_claims` as both
+       reservation-state and active-attempt state
+     - the proper remaining fix is an explicit reserved-but-not-started
+       frontier with separate promotion into the active receipt/attempt plane
 
 4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
