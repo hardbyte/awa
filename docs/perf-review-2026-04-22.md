@@ -239,6 +239,51 @@ That means:
 
 So the current first-principles picture is:
 
+### Reverted sticky shard leasing v1
+
+We then tried the next design shift: make claim authority sticky at the shard
+level instead of introducing another per-job pre-start state transition.
+
+The v1 sticky-shard pass did this:
+
+- added shard-local `queue_claim_heads(queue, priority, claim_shard)`
+- assigned each ready row to a `claim_shard`
+- added `lane_shard_leases(queue, priority, claim_shard, owner_instance_id, expires_at)`
+- kept the direct short-job path:
+  - `ready -> active_receipt`
+- had claimers prefer owned or expired shards, with no explicit reservation or
+  promotion step
+
+That version compiled cleanly, passed targeted queue-storage runtime tests, and
+was benchmarked on the same realistic single-producer gate.
+
+Results:
+
+- `1x32`
+  - `clean_1 750/s`
+  - `pressure_1 1063/s`
+  - `recovery_1 723/s`
+  - subscriber p99 `147 / 775 / 237 ms`
+  - median dead tuples `197 / 153 / 128`
+- `4x8`
+  - `clean_1 131/s`
+  - `pressure_1 175/s`
+  - `recovery_1 0/s`
+  - subscriber p99 `58 / 65 / 0 ms`
+  - median dead tuples `178 / 130 / 138`
+
+This tells us:
+
+- sticky shard ownership is promising for the `1x32` shape
+- it keeps churn low and does not need a second start-phase transaction
+- but the naïve ownership/renewal rules over-localize work in the `4x8` shape
+- recovery can stall entirely because shards are not being rebalanced or stolen
+  aggressively enough once ownership goes stale or uneven
+
+So sticky shard leasing as a concept is still alive, but **v1 is not
+keepable**. Any next pass has to add a real rebalance / steal policy rather
+than just sticky ownership over expired or unowned shards.
+
 - unsafe local receipt buffering is wrong
 - explicit reserve/promote frontiers are too expensive
 - striped claim heads help but are not sufficient
