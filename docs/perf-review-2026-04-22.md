@@ -173,6 +173,34 @@ Acceptance bar for a striped-claim pass:
 - dead tuples remain low
 - no new hidden control-plane state is needed to explain `running_depth`
 
+We implemented and measured the first striped-claim-head version, then
+reverted it.
+
+Results on the same single-producer gate:
+
+- `1x32`
+  - `clean_1 739/s`
+  - `pressure_1 897/s`
+  - `recovery_1 747/s`
+- `4x8`
+  - `clean_1 152/s`
+  - `pressure_1 168/s`
+  - `recovery_1 52/s`
+
+That means:
+
+- the striped claim heads did reduce the single-row claim-head serialization
+  point
+- `1x32` stayed healthy
+- `4x8` improved one pressure phase versus the prior queue-storage baseline,
+  but recovery still collapsed badly and the overall shape was not good enough
+  to keep
+
+So the next many-small-replica fix still needs to do more than split one claim
+cursor into shards. The remaining cost is not just the single-row cursor lock;
+it is still the amount of per-start coordination each small replica pays on the
+hot queue.
+
 ### What now looks solid
 
 #### 1. Queue plane
