@@ -1304,6 +1304,13 @@ throughput/tail issue. There is still at least one recovery-path correctness or
 control-plane interaction issue to resolve before the design can be considered
 ready.
 
+Because the tuned adaptive claimer controller is now good enough to keep in the
+branch, but still not boring enough to ship on hot queues, queue striping has
+been promoted from "future escape hatch" to the next serious design track. See
+[`queue-striping-plan.md`](queue-striping-plan.md) for the proposed logical
+queue -> physical stripe model and the measurement plan against the current
+`4x8` blocker.
+
 4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
    - but now on the corrected claim-time aging baseline
