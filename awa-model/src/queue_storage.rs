@@ -3581,10 +3581,7 @@ impl QueueStorage {
         }
         let claimed = claimed_rows
             .into_iter()
-            .map(|mut row| {
-                row.queue = self.logical_queue_name(&row.queue).to_string();
-                row.claim_ref(self.experimental_lease_claim_receipts())
-            })
+            .map(|row| row.claim_ref(self.experimental_lease_claim_receipts()))
             .collect();
 
         tx.commit().await.map_err(map_sqlx_error)?;
@@ -3671,10 +3668,7 @@ impl QueueStorage {
         let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
         claimed
             .into_iter()
-            .map(|mut row| {
-                row.queue = self.logical_queue_name(&row.queue).to_string();
-                row.into_claimed_runtime_job(use_lease_claim_receipts)
-            })
+            .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
             .collect()
     }
 

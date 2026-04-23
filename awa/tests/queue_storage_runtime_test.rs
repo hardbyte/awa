@@ -344,6 +344,13 @@ async fn enqueue_job<T: JobArgs>(
     args: &T,
     opts: InsertOpts,
 ) -> i64 {
+    let queue_names: Vec<String> = if store.queue_stripe_count() > 1 && !opts.queue.contains('#') {
+        (0..store.queue_stripe_count())
+            .map(|stripe| format!("{}#{stripe}", opts.queue))
+            .collect()
+    } else {
+        vec![opts.queue.clone()]
+    };
     let params = [insert::params_with(args, opts.clone()).expect("Failed to build insert params")];
     store
         .enqueue_params_batch(pool, &params)
@@ -352,18 +359,18 @@ async fn enqueue_job<T: JobArgs>(
 
     let query = if opts.run_at.is_some() {
         format!(
-            "SELECT job_id FROM {}.deferred_jobs WHERE queue = $1 ORDER BY job_id DESC LIMIT 1",
+            "SELECT job_id FROM {}.deferred_jobs WHERE queue = ANY($1) ORDER BY job_id DESC LIMIT 1",
             store.schema()
         )
     } else {
         format!(
-            "SELECT job_id FROM {}.ready_entries WHERE queue = $1 ORDER BY job_id DESC LIMIT 1",
+            "SELECT job_id FROM {}.ready_entries WHERE queue = ANY($1) ORDER BY job_id DESC LIMIT 1",
             store.schema()
         )
     };
 
     sqlx::query_scalar::<_, i64>(&query)
-        .bind(&opts.queue)
+        .bind(&queue_names)
         .fetch_one(pool)
         .await
         .expect("Failed to fetch queue_storage job id")
@@ -1358,6 +1365,80 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
         .await
         .expect("Failed to load queue counts after receipt-backed completion");
     assert_eq!(completed_counts.running, 0);
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_lease_claim_short_job_striped";
+    let schema = "awa_qs_runtime_lease_claim_short_striped";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 4,
+            experimental_lease_claim_receipts: true,
+        },
+    )
+    .await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 4,
+            experimental_lease_claim_receipts: true,
+        },
+        BlockingCompleteWorker {
+            release: release.clone(),
+        },
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2002 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    client
+        .start()
+        .await
+        .expect("Failed to start striped lease-claim client");
+
+    let running = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Running],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(running.state, JobState::Running);
+
+    release.notify_waiters();
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -2420,8 +2501,10 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
         .expect("Failed to claim striped logical queue");
     assert_eq!(claimed.len(), 8);
     assert!(
-        claimed.iter().all(|entry| entry.queue == queue),
-        "expected logical queue names on claimed entries: {claimed:?}"
+        claimed
+            .iter()
+            .all(|entry| entry.queue.starts_with(&format!("{queue}#"))),
+        "expected physical striped queue names on claimed entries: {claimed:?}"
     );
 
     let counts_after = store
