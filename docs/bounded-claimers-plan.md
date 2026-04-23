@@ -815,6 +815,18 @@ Why it is not done yet:
 - `4x8 pressure_1` and `recovery_1` tails are still far above the shipping bar
 - crash-under-load still needs to be rerun on this tuned controller
 
+After the crash-under-load rerun, that last point is now concrete:
+
+- the tuned controller still shows recovery-path maintenance errors
+- backlog and tails remain too high during restart/recovery
+
+So bounded claimers are still an active line of investigation, but no longer
+look like a complete hot-queue answer by themselves.
+
+This strengthens the case that **queue striping should move up from “future
+idea” to “real hot-queue mode”** if the next controller pass still cannot make
+the realistic and crash gates boring.
+
 ## Why this is the next design
 
 This design is attractive because it keeps the good properties of the current

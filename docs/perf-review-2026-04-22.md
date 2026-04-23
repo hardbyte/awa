@@ -1262,6 +1262,48 @@ Current conclusion:
 - next work should focus on further controller tuning and crash/recovery
   validation, not discarding the design
 
+#### Crash-under-load on the tuned controller
+
+The tuned adaptive controller was also exercised through the existing
+`crash_recovery_under_load` semantics scenario at `2x8`.
+
+That run completed, but it is not operationally clean enough to count as a
+shipping answer yet.
+
+Observed behavior:
+
+- repeated maintenance errors during restart/recovery:
+  - `queue storage ready row missing for deleted lease job ...`
+- completion continued, but backlog exploded during pressure/recovery
+- the scenario spent long periods with very poor delivery latency
+
+Recorded medians from `awa_semantics_crash_recovery_under_load_20260423_130433`:
+
+- `baseline`
+  - completion `528.2/s`
+  - end-to-end p99 `14627 ms`
+  - queue depth `22656.5`
+- `pressure_1`
+  - completion `372.4/s`
+  - end-to-end p99 `46711 ms`
+  - queue depth `130063`
+- `restart`
+  - completion `328.0/s`
+  - queue depth `263199`
+- `recovery_1`
+  - completion `334.8/s`
+  - queue depth `344323.5`
+
+So the tuned adaptive claimer controller remains:
+
+- viable enough to keep in-branch for further study
+- not yet safe/boring enough to call production-ready
+
+Most importantly, this means the remaining blocker is no longer just a `4x8`
+throughput/tail issue. There is still at least one recovery-path correctness or
+control-plane interaction issue to resolve before the design can be considered
+ready.
+
 4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
    - but now on the corrected claim-time aging baseline
