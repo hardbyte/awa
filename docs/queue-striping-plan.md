@@ -107,6 +107,8 @@ This should be treated as:
 
 - an implementation/proof step first
 - a product-shape decision later
+- an **experimental / investigation-only** engine mode until the churn and
+  counting regressions are understood
 
 So the first implementation can still use an explicit stripe count internally.
 Whether striping becomes automatic or always-on can be decided after measurement.
@@ -313,6 +315,8 @@ We keep striping only if:
 - `4x8` materially improves over the current unstriped adaptive claimer result
 - `4x8` tails are much lower than the current unstriped adaptive claimer result
 - dead tuples remain in the current low-hundreds regime
+- logical `running_depth` remains plausible for the offered load and queue
+  depth, rather than inflating into thousands of apparently-running jobs
 - crash-under-load remains correct
 
 ## Comparison targets
@@ -407,6 +411,8 @@ So the first striping pass should be treated as:
 
 - evidence that striping can help the realistic `4x8` throughput problem
 - but **not yet** a keepable implementation
+- and explicitly as an **investigation-only** branch experiment until the
+  churn/counting regression is explained
 
 The next step, before treating striping as the leading answer, is to investigate:
 

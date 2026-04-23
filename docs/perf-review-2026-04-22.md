@@ -281,6 +281,16 @@ So the current position is:
 - the first implementation pass is promising on throughput
 - but it introduced a serious churn/counting regression that must be understood
   before it is considered a keepable engine change
+- until then, the current striping code should be treated as an
+  **experimental / investigation-only** implementation, not the candidate
+  shipping answer
+
+More concretely, any striping pass is only worth keeping if it does **both**:
+
+- improves the realistic `4x8` throughput / distribution problem
+- and avoids regressing the engine back into:
+  - multi-thousand dead-tuple churn
+  - or implausible logical `running_depth` inflation
 
 ### Reverted sticky shard leasing v1
 
