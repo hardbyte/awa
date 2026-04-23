@@ -7,18 +7,23 @@ use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::{BTreeMap, BTreeSet};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use uuid::Uuid;
 
 const DEFAULT_SCHEMA: &str = "awa_exp";
 const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
 const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
+const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
+const QUEUE_STRIPE_DELIMITER: &str = "#";
 
 #[derive(Debug, Clone)]
 pub struct QueueStorageConfig {
     pub schema: String,
     pub queue_slot_count: usize,
     pub lease_slot_count: usize,
+    pub queue_stripe_count: usize,
     pub experimental_lease_claim_receipts: bool,
 }
 
@@ -28,6 +33,7 @@ impl Default for QueueStorageConfig {
             schema: DEFAULT_SCHEMA.to_string(),
             queue_slot_count: DEFAULT_QUEUE_SLOT_COUNT,
             lease_slot_count: DEFAULT_LEASE_SLOT_COUNT,
+            queue_stripe_count: DEFAULT_QUEUE_STRIPE_COUNT,
             experimental_lease_claim_receipts: false,
         }
     }
@@ -1083,6 +1089,11 @@ impl QueueStorage {
                 "queue storage requires at least 2 lease slots".into(),
             ));
         }
+        if config.queue_stripe_count == 0 {
+            return Err(AwaError::Validation(
+                "queue storage requires at least 1 queue stripe".into(),
+            ));
+        }
         validate_ident(&config.schema)?;
         Ok(Self { config })
     }
@@ -1110,8 +1121,66 @@ impl QueueStorage {
         self.config.lease_slot_count
     }
 
+    pub fn queue_stripe_count(&self) -> usize {
+        self.config.queue_stripe_count
+    }
+
     pub fn experimental_lease_claim_receipts(&self) -> bool {
         self.config.experimental_lease_claim_receipts
+    }
+
+    fn uses_queue_striping(&self) -> bool {
+        self.queue_stripe_count() > 1
+    }
+
+    fn is_physical_stripe_queue(&self, queue: &str) -> bool {
+        self.uses_queue_striping()
+            && queue
+                .rsplit_once(QUEUE_STRIPE_DELIMITER)
+                .is_some_and(|(_, suffix)| suffix.parse::<usize>().is_ok())
+    }
+
+    fn physical_queue_for_stripe(&self, queue: &str, stripe: usize) -> String {
+        format!("{queue}{QUEUE_STRIPE_DELIMITER}{stripe}")
+    }
+
+    fn physical_queues_for_logical(&self, queue: &str) -> Vec<String> {
+        if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
+            return vec![queue.to_string()];
+        }
+        (0..self.queue_stripe_count())
+            .map(|stripe| self.physical_queue_for_stripe(queue, stripe))
+            .collect()
+    }
+
+    fn logical_queue_name<'a>(&self, queue: &'a str) -> &'a str {
+        if !self.uses_queue_striping() {
+            return queue;
+        }
+        queue
+            .rsplit_once(QUEUE_STRIPE_DELIMITER)
+            .and_then(|(prefix, suffix)| suffix.parse::<usize>().ok().map(|_| prefix))
+            .unwrap_or(queue)
+    }
+
+    fn queue_stripe_for_enqueue(
+        &self,
+        queue: &str,
+        unique_key: &Option<Vec<u8>>,
+        salt: i64,
+    ) -> String {
+        if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
+            return queue.to_string();
+        }
+
+        let stripe = if let Some(key) = unique_key {
+            let mut hasher = DefaultHasher::new();
+            key.hash(&mut hasher);
+            (hasher.finish() as usize) % self.queue_stripe_count()
+        } else {
+            salt.rem_euclid(self.queue_stripe_count() as i64) as usize
+        };
+        self.physical_queue_for_stripe(queue, stripe)
     }
 
     fn use_lease_claim_receipts_for_runtime(&self, deadline_duration: Duration) -> bool {
@@ -3317,7 +3386,10 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let total_rows = self.insert_ready_rows_tx(&mut tx, rows.clone()).await?;
 
-        let queues_to_notify: BTreeSet<String> = rows.iter().map(|row| row.queue.clone()).collect();
+        let queues_to_notify: BTreeSet<String> = rows
+            .iter()
+            .map(|row| self.logical_queue_name(&row.queue).to_string())
+            .collect();
         for queue in queues_to_notify {
             sqlx::query("SELECT pg_notify($1, '')")
                 .bind(format!("awa:{queue}"))
@@ -3341,10 +3413,17 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let rows = (0..count)
+        let rows: Vec<_> = (0..count)
             .map(|seq| RuntimeReadyRow {
                 kind: "bench_job".to_string(),
-                queue: queue.to_string(),
+                queue: if self.uses_queue_striping() && !self.is_physical_stripe_queue(queue) {
+                    self.physical_queue_for_stripe(
+                        queue,
+                        seq.rem_euclid(self.queue_stripe_count() as i64) as usize,
+                    )
+                } else {
+                    queue.to_string()
+                },
                 args: serde_json::json!({ "seq": seq }),
                 priority,
                 attempt: 0,
@@ -3358,7 +3437,6 @@ impl QueueStorage {
                 payload: RuntimePayload::default().into_json(),
             })
             .collect();
-
         self.enqueue_runtime_rows(pool, rows)
             .await
             .map(|count| count as i64)
@@ -3377,13 +3455,18 @@ impl QueueStorage {
         let mut ready_rows = Vec::new();
         let mut deferred_rows = Vec::new();
 
-        for job in jobs {
+        for (idx, job) in jobs.iter().enumerate() {
             let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
             let payload = Self::payload_from_parts(prepared.metadata, prepared.tags, None, None)?;
+            let queue = self.queue_stripe_for_enqueue(
+                &prepared.queue,
+                &prepared.unique_key,
+                idx as i64,
+            );
 
             let ready_row = RuntimeReadyRow {
                 kind: prepared.kind,
-                queue: prepared.queue,
+                queue: queue.clone(),
                 args: prepared.args,
                 priority: prepared.priority,
                 attempt: 0,
@@ -3402,7 +3485,7 @@ impl QueueStorage {
                 JobState::Scheduled => deferred_rows.push(DeferredJobRow {
                     job_id: 0,
                     kind: ready_row.kind,
-                    queue: ready_row.queue,
+                    queue: queue,
                     args: ready_row.args,
                     state: JobState::Scheduled,
                     priority: ready_row.priority,
@@ -3444,8 +3527,10 @@ impl QueueStorage {
                 .await?;
         }
 
-        let queues_to_notify: BTreeSet<String> =
-            ready_rows.into_iter().map(|row| row.queue).collect();
+        let queues_to_notify: BTreeSet<String> = ready_rows
+            .into_iter()
+            .map(|row| self.logical_queue_name(&row.queue).to_string())
+            .collect();
         for queue in queues_to_notify {
             sqlx::query("SELECT pg_notify($1, '')")
                 .bind(format!("awa:{queue}"))
@@ -3470,11 +3555,36 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let claimed = self
-            .claim_ready_rows_tx(&mut tx, queue, max_batch, Duration::ZERO, Duration::ZERO)
-            .await?
+        let mut claimed_rows = Vec::new();
+        let stripe_queues = self.physical_queues_for_logical(queue);
+        let start = if stripe_queues.len() > 1 {
+            (Utc::now().timestamp_millis() as usize) % stripe_queues.len()
+        } else {
+            0
+        };
+        for offset in 0..stripe_queues.len() {
+            if claimed_rows.len() >= max_batch as usize {
+                break;
+            }
+            let stripe_queue = &stripe_queues[(start + offset) % stripe_queues.len()];
+            let remaining = max_batch - claimed_rows.len() as i64;
+            claimed_rows.extend(
+                self.claim_ready_rows_tx(
+                    &mut tx,
+                    stripe_queue,
+                    remaining,
+                    Duration::ZERO,
+                    Duration::ZERO,
+                )
+                .await?,
+            );
+        }
+        let claimed = claimed_rows
             .into_iter()
-            .map(|row| row.claim_ref(self.experimental_lease_claim_receipts()))
+            .map(|mut row| {
+                row.queue = self.logical_queue_name(&row.queue).to_string();
+                row.claim_ref(self.experimental_lease_claim_receipts())
+            })
             .collect();
 
         tx.commit().await.map_err(map_sqlx_error)?;
@@ -3519,9 +3629,30 @@ impl QueueStorage {
         }
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let claimed = self
-            .claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration, aging_interval)
-            .await?;
+        let mut claimed = Vec::new();
+        let stripe_queues = self.physical_queues_for_logical(queue);
+        let start = if stripe_queues.len() > 1 {
+            (Utc::now().timestamp_millis() as usize) % stripe_queues.len()
+        } else {
+            0
+        };
+        for offset in 0..stripe_queues.len() {
+            if claimed.len() >= max_batch as usize {
+                break;
+            }
+            let stripe_queue = &stripe_queues[(start + offset) % stripe_queues.len()];
+            let remaining = max_batch - claimed.len() as i64;
+            claimed.extend(
+                self.claim_ready_rows_tx(
+                    &mut tx,
+                    stripe_queue,
+                    remaining,
+                    deadline_duration,
+                    aging_interval,
+                )
+                .await?,
+            );
+        }
 
         for row in &claimed {
             self.sync_unique_claim(
@@ -3540,7 +3671,10 @@ impl QueueStorage {
         let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
         claimed
             .into_iter()
-            .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
+            .map(|mut row| {
+                row.queue = self.logical_queue_name(&row.queue).to_string();
+                row.into_claimed_runtime_job(use_lease_claim_receipts)
+            })
             .collect()
     }
 
@@ -4394,6 +4528,7 @@ impl QueueStorage {
         queue: &str,
     ) -> Result<QueueCounts, AwaError> {
         let schema = self.schema();
+        let queues = self.physical_queues_for_logical(queue);
         let row: (i64, i64, i64) = sqlx::query_as(&format!(
             r#"
             WITH lane_counts AS (
@@ -4403,7 +4538,7 @@ impl QueueStorage {
                 JOIN {schema}.queue_claim_heads AS claims
                   ON claims.queue = ready.queue
                  AND claims.priority = ready.priority
-                WHERE ready.queue = $1
+                WHERE ready.queue = ANY($1)
                   AND ready.lane_seq >= claims.claim_seq
             ),
             pruned_terminal AS (
@@ -4419,12 +4554,12 @@ impl QueueStorage {
                 FROM (
                     SELECT queue, priority, pruned_completed_count
                     FROM {schema}.queue_lanes
-                    WHERE queue = $1
+                    WHERE queue = ANY($1)
                 ) AS lanes
                 FULL OUTER JOIN (
                     SELECT queue, priority, pruned_completed_count
                     FROM {schema}.queue_terminal_rollups
-                    WHERE queue = $1
+                    WHERE queue = ANY($1)
                 ) AS rollups
                 USING (queue, priority)
             ),
@@ -4433,21 +4568,21 @@ impl QueueStorage {
                     COALESCE((
                         SELECT count(*)::bigint
                         FROM {schema}.leases
-                        WHERE queue = $1
+                        WHERE queue = ANY($1)
                           AND state = 'running'
                     ), 0)
                     +
                     COALESCE((
                         SELECT count(*)::bigint
                         FROM {schema}.open_receipt_claims
-                        WHERE queue = $1
+                        WHERE queue = ANY($1)
                     ), 0)
                 )::bigint AS running
             ),
             live_terminal AS (
                 SELECT count(*)::bigint AS completed
                 FROM {schema}.done_entries
-                WHERE queue = $1
+                WHERE queue = ANY($1)
             )
             SELECT
                 lane_counts.available,
@@ -4459,7 +4594,7 @@ impl QueueStorage {
             CROSS JOIN live_terminal
             "#
         ))
-        .bind(queue)
+        .bind(&queues)
         .fetch_one(pool)
         .await
         .map_err(map_sqlx_error)?;
@@ -5149,7 +5284,10 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queues: impl IntoIterator<Item = String>,
     ) -> Result<(), AwaError> {
-        let queues: BTreeSet<String> = queues.into_iter().collect();
+        let queues: BTreeSet<String> = queues
+            .into_iter()
+            .map(|queue| self.logical_queue_name(&queue).to_string())
+            .collect();
         for queue in queues {
             sqlx::query("SELECT pg_notify($1, '')")
                 .bind(format!("awa:{queue}"))

@@ -6,6 +6,7 @@
 //! Env:
 //! - `DATABASE_URL` (required)
 //! - `QUEUE_STORAGE_SCHEMA` — queue_storage schema name (default `awa_exp`)
+//! - `QUEUE_STRIPE_COUNT` — logical queue stripe count (default `1`)
 //! - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` — slot sizing (defaults 16 / 8)
 //! - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` — rotate intervals (defaults 1000 / 50)
 //!
@@ -52,6 +53,10 @@ pub(crate) fn queue_storage_config_with_experimental_default(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8),
+        queue_stripe_count: std::env::var("QUEUE_STRIPE_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1),
         experimental_lease_claim_receipts,
     }
 }

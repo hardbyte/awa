@@ -1280,6 +1280,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1292,6 +1293,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
         BlockingCompleteWorker {
@@ -1372,6 +1374,7 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1415,6 +1418,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1435,6 +1439,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                queue_stripe_count: 1,
                 experimental_lease_claim_receipts: true,
             },
             Duration::from_millis(1_000),
@@ -1537,6 +1542,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1548,6 +1554,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
         RetryOnceWorker,
@@ -1600,6 +1607,7 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1653,6 +1661,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1684,6 +1693,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                queue_stripe_count: 1,
                 experimental_lease_claim_receipts: true,
             },
             Duration::from_millis(1_000),
@@ -1768,6 +1778,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
@@ -1788,6 +1799,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                queue_stripe_count: 1,
                 experimental_lease_claim_receipts: true,
             },
             Duration::from_millis(1_000),
@@ -2350,6 +2362,76 @@ async fn test_queue_storage_queue_counts_cached_uses_snapshot_until_stale() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_striped_counts";
+    let schema = "awa_qs_striped_counts";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    assert_eq!(store.queue_stripe_count(), 4);
+
+    store
+        .enqueue_batch(&pool, queue, 1, 8)
+        .await
+        .expect("Failed to enqueue striped jobs");
+
+    let physical_queues: Vec<String> = sqlx::query_scalar(&format!(
+        r#"
+        SELECT DISTINCT queue
+        FROM {schema}.ready_entries
+        ORDER BY queue
+        "#
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to read physical stripe queues");
+    assert!(
+        physical_queues.len() > 1,
+        "expected jobs to span multiple physical queues, got {physical_queues:?}"
+    );
+    assert!(
+        physical_queues
+            .iter()
+            .all(|physical_queue| physical_queue.starts_with(&format!("{queue}#"))),
+        "expected physical striped queue names, got {physical_queues:?}"
+    );
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to aggregate queue counts across stripes");
+    assert_eq!(counts.available, 8);
+    assert_eq!(counts.running, 0);
+    assert_eq!(counts.completed, 0);
+
+    let claimed = store
+        .claim_batch(&pool, queue, 8)
+        .await
+        .expect("Failed to claim striped logical queue");
+    assert_eq!(claimed.len(), 8);
+    assert!(
+        claimed.iter().all(|entry| entry.queue == queue),
+        "expected logical queue names on claimed entries: {claimed:?}"
+    );
+
+    let counts_after = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to read queue counts after striped claim");
+    assert_eq!(counts_after.available, 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -2403,6 +2485,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
         },
     )
