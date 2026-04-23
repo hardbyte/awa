@@ -448,6 +448,67 @@ In other words, the repeated lesson still holds:
 - but the runtime must still be able to raise claim parallelism when one hot
   queue is genuinely saturated
 
+#### Adaptive bounded claimers MVP (reverted)
+
+The next pass replaced the fixed cap with a small adaptive controller:
+
+- queue-level claimer leases remained
+- the dispatcher started at `1` active claimer target per queue
+- repeated full-batch claims expanded the target toward `4`
+- repeated empty claims contracted it back toward `1`
+
+The safety/runtime checks stayed clean:
+
+- targeted bounded-claimer runtime tests passed
+- `1x32` stayed excellent
+
+`1x32` realistic gate:
+
+- `clean_1`
+  - `800/s`
+  - subscriber p99 `17 ms`
+  - median dead tuples `175.5`
+- `pressure_1`
+  - `1199/s`
+  - subscriber p99 `20 ms`
+  - median dead tuples `137.0`
+- `recovery_1`
+  - `800/s`
+  - subscriber p99 `19 ms`
+  - median dead tuples `194.5`
+
+But the realistic `4x8` gate failed badly:
+
+- `clean_1`
+  - `0/s`
+- `pressure_1`
+  - `0/s`
+- `recovery_1`
+  - `0/s`
+
+Operationally, the `4x8` run showed:
+
+- multi-second `COMMIT`s
+- blocked `queue_claimer_leases` updates
+- stale-heartbeat rescues during the phase transition
+- pool timeouts while waiting for claim connections
+
+So this version was also **not keepable**.
+
+The useful learning is narrower than before:
+
+- bounded claim authority is still directionally right
+- but the naïve adaptive control loop is not enough
+- once the queue enters the hot/recovery regime, the claimer-lease update path
+  itself becomes part of the problem
+
+That means the next design should not be “adaptive bounded claimers, but tuned
+better.” It should reconsider the control plane itself:
+
+- either a cheaper queue-level claimer authority mechanism
+- or an explicit hot-queue mode such as queue striping that reduces
+  cross-replica coordination at the source
+
 ### What now looks solid
 
 #### 1. Queue plane

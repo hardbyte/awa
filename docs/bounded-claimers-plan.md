@@ -646,6 +646,49 @@ The next variant should be:
 That keeps the same semantic model, but makes the claimer limit part of the
 runtime control loop rather than a hard static ceiling.
 
+## Current status after the adaptive MVP
+
+The first adaptive bounded-claimers implementation was also reverted.
+
+What it did:
+
+- kept queue-level claimer leases
+- used a local controller that started at `1` claimer target
+- expanded toward `4` after repeated full-batch claims
+- contracted after repeated empty claims
+
+What held up:
+
+- targeted bounded-claimer runtime tests passed
+- the `1x32` realistic gate remained healthy
+
+What failed:
+
+- the realistic `4x8` gate collapsed
+- phase summaries showed effectively `0/s` useful throughput across
+  `clean_1`, `pressure_1`, and `recovery_1`
+- the run emitted:
+  - multi-second `COMMIT`s
+  - blocked `queue_claimer_leases` updates
+  - stale-heartbeat rescues
+  - pool timeouts under load
+
+So the useful conclusion is:
+
+- **adaptive bounded claimers is not enough in its naïve form**
+- the claimer-lease control plane itself becomes a bottleneck in the hot queue
+  shape
+
+That means the next direction should not be “keep tuning the same adaptive
+controller.” It should be a broader control-plane rethink, likely one of:
+
+- a cheaper claimer-authority mechanism
+- or queue striping as an explicit hot-queue mode
+
+The latter should stay on the table even if a better bounded-claimers variant
+is found, because it remains the clearest operational escape hatch for extreme
+single-queue workloads.
+
 ## Why this is the next design
 
 This design is attractive because it keeps the good properties of the current
