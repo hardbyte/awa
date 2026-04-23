@@ -1068,6 +1068,27 @@ In order:
        reservation-state and active-attempt state
      - the proper remaining fix is an explicit reserved-but-not-started
        frontier with separate promotion into the active receipt/attempt plane
+   - after fixing the multi-replica reporting bug, we ran a fixed bounded-
+     claimers pass and learned something more precise:
+     - `1x32` stayed healthy:
+       - `clean_1 800/s`
+       - `pressure_1 1199/s`
+       - `recovery_1 800/s`
+     - `4x8` no longer looked like `0/s`, but it was still not healthy:
+       - `clean_1 778/s`
+       - `pressure_1 829/s`
+       - `recovery_1 754/s`
+       - subscriber p99 `210 / 5583 / 17023 ms`
+     - the per-replica summary made the actual failure mode obvious:
+       - replica `0` did essentially all the work
+       - replicas `1-3` stayed idle
+       - backlog and running depth were effectively localized to the incumbent
+         claimer
+   - so fixed bounded claimers is not keepable as-is:
+     - it reduces contention
+     - but it over-localizes claim authority to one replica
+     - the next bounded-claimers iteration needs queue-global adaptation and
+       explicit anti-hoarding rather than a fixed small cap
 
 4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth

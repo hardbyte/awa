@@ -629,10 +629,22 @@ The first bounded-claimers pass used a **fixed small claimer cap** per queue.
 
 That version was informative but reverted:
 
-- it preserved the healthy `1x32` shape
-- it improved the calm `4x8 clean_1` phase
-- but it starved the hot queue under `pressure_1` and especially
-  `recovery_1`
+- it preserved the healthy `1x32` shape:
+  - `clean_1 800/s`
+  - `pressure_1 1199/s`
+  - `recovery_1 800/s`
+- after fixing the multi-replica report aggregation, it became clear that the
+  `4x8` shape did **not** collapse to zero throughput:
+  - `clean_1 778/s`
+  - `pressure_1 829/s`
+  - `recovery_1 754/s`
+- but the corrected per-replica summary showed the real failure mode:
+  - replica `0` did essentially all the work
+  - replicas `1-3` remained idle
+  - subscriber p99 was still very poor:
+    - `clean_1 210 ms`
+    - `pressure_1 5583 ms`
+    - `recovery_1 17023 ms`
 
 So the next bounded-claimers iteration should **not** keep a rigid cap under
 all conditions.
