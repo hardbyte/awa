@@ -201,6 +201,53 @@ cursor into shards. The remaining cost is not just the single-row cursor lock;
 it is still the amount of per-start coordination each small replica pays on the
 hot queue.
 
+### Reverted stateful receipt-frontier pass
+
+We then tried the next more integrated design: keep a distinct
+`reserved-but-not-started` state, but make it live inside the receipt frontier
+so batched worker start becomes an in-place state transition instead of a
+second insert/delete promotion into another hot table.
+
+That version was safe enough to test:
+
+- a direct `reserve -> start` round-trip worked
+- the existing short-job receipt runtime test passed again
+- reserved work stayed distinct from running work semantically
+
+But the realistic gate still regressed badly, so it was reverted.
+
+Single-producer results on the same short gate:
+
+- `1x32`
+  - `clean_1 488/s`
+  - `pressure_1 850/s`
+  - `recovery_1 680/s`
+  - subscriber p99 `599 / 3105 / 2144 ms`
+- `4x8`
+  - `clean_1 91/s`
+  - `pressure_1 106/s`
+  - `recovery_1 125/s`
+  - subscriber p99 `25936 / 48464 / 62587 ms`
+
+That means:
+
+- folding reservation state into the receipt frontier still adds too much hot
+  path cost
+- the problem is not just *where* the state lives
+- the remaining blocker is still the extra coordination work many small
+  replicas pay before actual execution starts
+
+So the current first-principles picture is:
+
+- unsafe local receipt buffering is wrong
+- explicit reserve/promote frontiers are too expensive
+- striped claim heads help but are not sufficient
+- a stateful receipt frontier is also too expensive in its current form
+
+The next design, if we pursue another one, has to reduce many-small-replica
+coordination cost **without** introducing a second effective start-phase
+transaction or widening the active receipt frontier again.
+
 ### What now looks solid
 
 #### 1. Queue plane
