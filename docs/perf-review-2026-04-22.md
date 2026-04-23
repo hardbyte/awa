@@ -429,11 +429,18 @@ Interpretation:
 - but it starves the hot queue under `pressure_1` and especially `recovery_1`
 - so a **hard fixed cap is too blunt**
 
-That means the next bounded-claimers variant should be:
+The next bounded-claimers pass should therefore be:
 
 - **adaptive**, not fixed
-- locality-first under low/moderate load
-- able to expand the active claimer set under sustained saturation / recovery
+- locality-first when the queue is calm
+- able to expand the active claimer set during sustained saturation
+- able to contract again after backlog drains
+
+The target is no longer “choose the right fixed cap.” It is:
+
+- keep the calm path cheap
+- raise claim parallelism only when measured signals say the queue is genuinely
+  saturated
 
 In other words, the repeated lesson still holds:
 

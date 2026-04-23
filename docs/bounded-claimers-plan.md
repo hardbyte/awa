@@ -314,6 +314,108 @@ This is the intended trade:
 - rebalance second
 - fairness over time
 
+## Adaptive bounded-claimers v2
+
+The fixed-cap experiment established that the claimer idea itself is useful,
+but a hard cap is too blunt:
+
+- it helps calm phases
+- it preserves the good `1x32` shape
+- but it can starve a hot queue during `pressure_1` and especially
+  `recovery_1`
+
+So the next real design is **adaptive bounded claimers**, not fixed bounded
+claimers.
+
+### Controller states
+
+The queue-level controller should be modeled explicitly:
+
+```text
+[calm]
+   |
+   | sustained backlog + underfilled running depth
+   v
+[expanding]
+   |
+   | active claimer target reached
+   v
+[steady-hot]
+   |
+   | backlog drains / saturation clears
+   v
+[contracting]
+   |
+   | extra claimers released or allowed to expire
+   v
+[calm]
+```
+
+This is still not a new job state machine. It is only a queue-level control
+loop over how many replicas are allowed to claim from that queue.
+
+### Control variables
+
+The queue should maintain:
+
+- `min_claimers_per_queue`
+- `max_claimers_per_queue`
+- `current_target_claimers`
+- `scale_up_window`
+- `scale_down_window`
+- `idle_threshold`
+- `lease_ttl`
+
+The first version should keep `min_claimers_per_queue = 1` and `max_claimers`
+small, likely `4`.
+
+### Inputs to the controller
+
+Use only signals we already trust and can export:
+
+- queue depth
+- running depth
+- local free permits
+- empty-claim rate
+- unused-permit rate
+- claim batch size
+- claim success rate
+- optionally queue lag
+
+### Expansion heuristic
+
+Expand the claimer target when all of these hold over a short rolling window:
+
+- queue depth is above a threshold
+- running depth is materially below total configured worker capacity
+- claimers are making successful claims
+- backlog is not shrinking fast enough
+
+Interpretation:
+
+- there is genuine runnable work
+- executors are underfilled
+- claim coordination, not lack of jobs, is the limiting factor
+
+### Contraction heuristic
+
+Contract the claimer target when, over a longer window:
+
+- queue depth stays near zero
+- running depth is low
+- claim success rate drops
+- or extra claimers are mostly idle
+
+This keeps the default calm path local and cheap.
+
+### Why this is the right control loop
+
+It matches the principle we agreed on:
+
+- strong fairness over time
+- locality when calm
+- more coordination only when saturation proves it is necessary
+
 ## Safety invariants
 
 These are the non-negotiables.
@@ -330,6 +432,10 @@ These are the non-negotiables.
 7. Stale claimers cannot renew or continue owning once epoch changes.
 8. Idle claimers cannot block progress indefinitely because idle slots are
    stealable.
+9. Changing the active claimer target changes only claim authority, not job
+   state.
+10. Contraction is safe because allowing a claimer lease to expire does not
+    revoke already-claimed jobs.
 
 ## Measurement plan
 
@@ -378,6 +484,35 @@ Metrics to record:
 - crash-under-load scenario
 - retry/priority semantics scenario
 
+### Robust build/test plan
+
+Do not judge the adaptive version on one lucky run.
+
+The minimum confidence plan should be:
+
+1. **Build + targeted runtime tests**
+   - queue claimer acquisition
+   - idle/expired takeover
+   - adaptive scale-up trigger
+   - adaptive scale-down / contraction
+   - stale claimer epoch rejection
+2. **Three repeated realistic gates**
+   - `1x32`
+   - `4x8`
+   - `8x4`
+   - same single-producer workload each time
+3. **Crash-under-load**
+   - at least one replica kill during `pressure_1`
+   - ensure `recovery_1` does not stall
+4. **Longer recovery hold**
+   - keep `recovery_1` long enough to observe contraction after backlog drains
+5. **Canonical comparison**
+   - rerun `awa-canonical` in `1x32` and `4x8`
+6. **Dead-tuple check**
+   - confirm we remain in the current low-hundreds regime
+
+Only keep it if the *pattern* is stable across repeats.
+
 ### Success thresholds
 
 The minimum bar to keep the design:
@@ -388,6 +523,8 @@ The minimum bar to keep the design:
   - `clean_1` materially above current poor shapes
   - `pressure_1` materially above current poor shapes
   - `recovery_1` no longer stalls or collapses
+- `8x4`
+  - should improve in the same direction, even if it remains worse than `4x8`
 - dead tuples remain in the current low-hundreds regime, not canonical-style
   tens of thousands
 - `running_depth` remains honest
@@ -413,16 +550,20 @@ shape that still blocks shipping confidence.
 
 ### Phase 1: schema and config
 
-1. add `max_claimers_per_queue`
-2. add `queue_claimer_leases`
-3. add metrics fields for queue claimer state
+1. add `min_claimers_per_queue`
+2. add `max_claimers_per_queue`
+3. add adaptive thresholds / windows
+4. add `queue_claimer_leases`
+5. add metrics fields for queue claimer state
 
 ### Phase 2: worker runtime
 
 1. track owned claimer slots per queue
 2. renew only on successful claims
-3. attempt idle/expired steal only when underfilled
-4. cap owned claimer slots per replica
+3. compute a queue-local target claimer count from observed saturation
+4. attempt idle/expired steal only when the active claimer set is below the
+   adaptive target
+5. let excess claimers expire or relinquish during contraction
 
 ### Phase 3: claim path integration
 
@@ -433,9 +574,10 @@ shape that still blocks shipping confidence.
 ### Phase 4: measurement and hardening
 
 1. rerun `1x32 / 2x16 / 4x8 / 8x4`
-2. rerun crash-under-load
-3. rerun retry/priority semantics
-4. compare to canonical in the realistic shape
+2. repeat the realistic gate to confirm stable behavior
+3. rerun crash-under-load
+4. rerun retry/priority semantics
+5. compare to canonical in the realistic shape
 
 ## Future ideas to keep on the table
 
