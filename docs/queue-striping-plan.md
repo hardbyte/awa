@@ -79,7 +79,8 @@ Queue striping should:
 
 - materially improve `4x8` and `8x4` hot-queue behavior
 - preserve the current good `1x32` shape
-- keep dead tuples in the current low-hundreds regime
+- avoid making hot-path churn materially worse than the current unstriped
+  short-job baseline once `open_receipt_claims` is measured explicitly
 - preserve current short-job and long-running job semantics
 - preserve honest `running_depth`
 - avoid a second start transaction
@@ -314,7 +315,8 @@ We keep striping only if:
 - `1x32` stays roughly where the current good branch is
 - `4x8` materially improves over the current unstriped adaptive claimer result
 - `4x8` tails are much lower than the current unstriped adaptive claimer result
-- dead tuples remain in the current low-hundreds regime
+- dead tuples do not materially exceed the current unstriped short-job baseline
+  once `open_receipt_claims` is included in the sampled event tables
 - logical `running_depth` remains plausible for the offered load and queue
   depth, rather than inflating into thousands of apparently-running jobs
 - crash-under-load remains correct
@@ -363,7 +365,9 @@ What we expect, based on the experiments so far:
 
 - `1x32` may stay about the same or regress slightly
 - `4x8` should benefit substantially because the hot queue is no longer one shared coordination point
-- dead tuples should remain low because striping changes the coordination shape, not the per-job lifecycle
+- dead tuples should stay in roughly the same range as the current unstriped
+  short-job path, because striping changes the coordination shape, not the
+  receipt-claim lifecycle itself
 - fairness should remain good enough if stripes are probed cyclically and priority aging remains active
 
 The biggest risk is:
@@ -396,26 +400,67 @@ same single-producer realistic gate used for the bounded-claimer work.
 - work is distributed across multiple replicas instead of collapsing to one claimer.
 - the hot-queue throughput problem is plausibly reduced by striping.
 
-### What is not acceptable yet
+### Investigation result: the first regression signal was misleading
 
-The current implementation also shows a serious churn/counting regression:
+The first write-up treated striping as if it had caused a new dead-tuple and
+counting regression. A focused root-cause pass showed that conclusion was too
+strong.
 
-- `median_dead_tup` moved back into the `~9k-24k` range instead of the current low-hundreds regime
-- the top dead-tuple sources are now:
-  - `lease_claim_closures`
-  - `done_entries_*`
-- `running_depth` on the observer replica is implausibly high (`~2.7k`, `~7.4k`, `~13.5k` in `1x32`)
-  relative to the offered load and queue depth
+What was actually happening:
 
-So the first striping pass should be treated as:
+- the portable benchmark was **not sampling `open_receipt_claims`**, which is
+  the real short-job churn hotspot under sustained load
+- the observer was using a hard `15s` queue-count cache TTL against `10–15s`
+  phases, which overstated logical `running_depth`
 
-- evidence that striping can help the realistic `4x8` throughput problem
-- but **not yet** a keepable implementation
-- and explicitly as an **investigation-only** branch experiment until the
-  churn/counting regression is explained
+After fixing the benchmark:
 
-The next step, before treating striping as the leading answer, is to investigate:
+- `open_receipt_claims` is included in the sampled event tables
+- queue-count sampling is tied to the sample interval by default (and can be
+  overridden via `QUEUE_COUNT_MAX_AGE_MS`)
 
-1. whether the striped completion/closure path is creating unnecessary churn in `lease_claim_closures`
-2. whether `done_entries_*` churn is a real storage regression or a measurement artifact
-3. whether `running_depth` is being overcounted for logical striped queues
+On a fresh manual `4x8` striped repro with phase transitions (`800 -> 1200 ->
+800`), the live database state was:
+
+- `open_receipt_claims` carried the dead tuples (`n_dead_tup ~= 11611`)
+- `lease_claim_closures` had `0` dead tuples
+- `done_entries_*` partitions had `0` dead tuples
+- exact queue-count snapshots remained plausible
+
+And a matched unstriped repro showed essentially the same shape:
+
+- `open_receipt_claims` was also the hot dead-tuple source
+- `lease_claim_closures` and `done_entries_*` still had `0` dead tuples
+
+So the corrected conclusion is:
+
+- striping did **not** introduce a special `lease_claim_closures` or
+  `done_entries_*` churn regression
+- the dead-tuple hotspot is the existing `open_receipt_claims` insert/delete
+  cycle
+- striping should now be judged on whether it improves realistic `4x8`
+  throughput/tails **without making that existing hotspot materially worse**
+
+### Corrected comparison
+
+With the corrected benchmark path, a short `4x8` single-producer comparison
+looks like this:
+
+Striped (`QUEUE_STRIPE_COUNT=4`)
+- `clean_1`: throughput about `798/s`, subscriber p99 about `32 ms`
+- `pressure_1`: throughput about `1198/s`, subscriber p99 about `34 ms`
+- `recovery_1`: throughput about `799/s`, subscriber p99 about `36 ms`
+- median dead tuples about `8817 / 3646 / 14033`
+
+Unstriped (`QUEUE_STRIPE_COUNT=1`)
+- `clean_1`: throughput about `793/s`, subscriber p99 about `21 ms`
+- `pressure_1`: throughput about `1183/s`, subscriber p99 about `24 ms`
+- `recovery_1`: throughput about `786/s`, subscriber p99 about `33 ms`
+- median dead tuples about `8771 / 3683 / 13838`
+
+So the first striping pass is now best understood as:
+
+- **not** a clear regression
+- **not yet** a clear win
+- still an investigation-only implementation until it shows a stronger
+  `4x8` benefit than the unstriped baseline

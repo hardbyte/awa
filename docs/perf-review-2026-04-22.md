@@ -251,46 +251,57 @@ The first implementation used:
 
 Measured with `QUEUE_STRIPE_COUNT=4` on the same single-producer realistic gate:
 
-`1x32`
-- `clean_1 883/s`
-- `pressure_1 1048/s`
-- `recovery_1 744/s`
-- subscriber p99 `250 / 226 / 154 ms`
-- median dead tuples `9879 / 10013 / 23688`
+The first striping readout looked promising on throughput, but alarming on
+dead tuples and `running_depth`. A follow-up root-cause pass showed the
+regression signal was mostly a benchmark artifact:
 
-`4x8`
-- `clean_1 833/s`
-- `pressure_1 934/s`
-- `recovery_1 827/s`
-- subscriber p99 `456 / 670 / 686 ms`
-- median dead tuples `9246 / 10300 / 20676`
+- the portable event-table set was **not sampling `open_receipt_claims`**, which
+  is the real short-job churn hotspot
+- the observer was using a hard `15s` queue-count cache TTL against very short
+  phases, which overstated logical `running_depth`
 
-This is the first striping signal worth taking seriously because it appears to
-improve the realistic `4x8` throughput and distribution problem.
+After fixing the benchmark path:
 
-But the implementation is not yet ready to keep as-is:
+- `open_receipt_claims` is now part of the sampled queue-storage event tables
+- queue-count sampling uses a short, configurable max age (`QUEUE_COUNT_MAX_AGE_MS`)
+  tied to the sample interval by default
 
-- dead tuples jumped back into the `~9k-24k` range
-- the main churn sources were `lease_claim_closures` and `done_entries_*`
-- observer `running_depth` became implausibly high for the offered load, which
-  suggests either a real lifecycle leak or a striped logical-queue counting bug
+Fresh `4x8` comparisons after that fix show:
 
-So the current position is:
+Striped (`QUEUE_STRIPE_COUNT=4`)
+- `clean_1`: throughput `797.7/s`, subscriber p99 `32 ms`, median dead tuples `8817`
+- `pressure_1`: throughput `1198.0/s`, subscriber p99 `34 ms`, median dead tuples `3646`
+- `recovery_1`: throughput `798.8/s`, subscriber p99 `36 ms`, median dead tuples `14033`
 
-- queue striping remains a strong next direction
-- the first implementation pass is promising on throughput
-- but it introduced a serious churn/counting regression that must be understood
-  before it is considered a keepable engine change
-- until then, the current striping code should be treated as an
-  **experimental / investigation-only** implementation, not the candidate
-  shipping answer
+Unstriped (`QUEUE_STRIPE_COUNT=1`)
+- `clean_1`: throughput `792.8/s`, subscriber p99 `21 ms`, median dead tuples `8771`
+- `pressure_1`: throughput `1183.3/s`, subscriber p99 `24 ms`, median dead tuples `3683`
+- `recovery_1`: throughput `786.0/s`, subscriber p99 `33 ms`, median dead tuples `13838`
 
-More concretely, any striping pass is only worth keeping if it does **both**:
+And direct live-table inspection during a fresh striped `800 -> 1200 -> 800`
+repro showed:
 
-- improves the realistic `4x8` throughput / distribution problem
-- and avoids regressing the engine back into:
-  - multi-thousand dead-tuple churn
-  - or implausible logical `running_depth` inflation
+- `open_receipt_claims` carries the real dead-tuple churn
+- `lease_claim_closures` dead tuples remain `0`
+- `done_entries_*` dead tuples remain `0`
+- exact queue-count snapshots remain plausible once the cache TTL is reduced
+
+So the corrected conclusion is:
+
+- striping did **not** introduce a special `lease_claim_closures` or
+  `done_entries_*` regression
+- the earlier “striping regression” mostly reflected a benchmark blind spot and
+  stale observer counts
+- the real hot table under both striped and unstriped short-job pressure is
+  `open_receipt_claims`
+
+That means queue striping is still experimental, but it is now being judged on
+the right thing:
+
+- does it improve realistic hot-queue distribution/tails enough to justify the
+  added complexity?
+- and does it avoid making the existing `open_receipt_claims` churn materially
+  worse than the unstriped baseline?
 
 ### Reverted sticky shard leasing v1
 

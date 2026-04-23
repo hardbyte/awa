@@ -312,6 +312,7 @@ fn queue_storage_event_tables(
         format!("{schema}.lease_ring_state"),
         format!("{schema}.lease_ring_slots"),
         format!("{schema}.lease_claims"),
+        format!("{schema}.open_receipt_claims"),
         format!("{schema}.lease_claim_closures"),
         format!("{schema}.queue_lanes"),
         format!("{schema}.attempt_state"),
@@ -614,7 +615,15 @@ pub async fn run() {
     // ── Queue depth poller ──────────────────────────────────────────
     let depth_pool = pool.clone();
     let depth_shutdown = Arc::clone(&shutdown);
-    let queue_count_max_age = Duration::from_secs(sample_every_s.max(15));
+    // For short phases, a long cache TTL makes the observer report stale
+    // running/available counts long after the queue has drained. Keep the
+    // default tied to the sampling cadence, but allow overrides for profiling.
+    let queue_count_max_age = Duration::from_millis(
+        std::env::var("QUEUE_COUNT_MAX_AGE_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(sample_every_s.saturating_mul(1_000)),
+    );
     let depth_handle = {
         let queue_depth = Arc::clone(&queue_depth);
         let running_depth = Arc::clone(&running_depth);

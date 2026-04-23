@@ -125,6 +125,9 @@ adapters also accept:
 
 - `QUEUE_STORAGE_SCHEMA` (default `awa_exp`)
 - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` (defaults `16` / `8`)
+- `QUEUE_COUNT_MAX_AGE_MS` (default `SAMPLE_EVERY_S * 1000`; lower values make
+  observer queue-depth/running-depth samples more exact at the cost of more
+  database reads)
 - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` (defaults `1000` / `50`)
 - `PRIORITY_AGING_MS` (default `60000` for the long-horizon adapter; must be
   greater than `0` on the current branch)
