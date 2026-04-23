@@ -108,6 +108,71 @@ So the first-principles conclusion is now stronger:
   but it will not be solved by this frontier shape without another batching
   step or a cheaper promotion mechanism
 
+### Next design pass: striped claim heads instead of explicit reservations
+
+After the reverted frontier passes, the next recommended direction is **not**
+another reserve/promote control plane. The stronger candidate is to reduce
+multi-replica contention at the source by **striping the claim cursor itself**.
+
+The current queue-storage design still serializes all claimers for one
+`(queue, priority)` through a single `queue_claim_heads` row. That scales
+acceptably for one large worker process (`1x32`) but collapses when many small
+replicas (`4x8`, `8x4`) all contend on the same hot queue.
+
+The proposed next shape is:
+
+- keep the current direct `ready -> active attempt` transition
+- keep `running_depth` honest
+- keep crash/retry/rescue semantics unchanged
+- replace one `queue_claim_heads(queue, priority)` row with a small fixed set of
+  `queue_claim_heads(queue, priority, claim_shard)` rows
+
+Conceptually:
+
+- enqueue still appends immutable `ready_entries`
+- each ready row carries a `claim_shard`
+- claimers lock one shard-local claim head at a time using `SKIP LOCKED`
+- many small replicas can claim from different shards concurrently
+- no new reserved-but-not-started state is needed
+- no extra promotion transaction is added to the short-job hot path
+
+This is a better fit for the current evidence because it targets the measured
+serialization point directly:
+
+- `1x32` already shows that the current start/completion path can work when
+  claim contention is low
+- `4x8` shows that many small replicas are coordinating badly even with one
+  producer and low dead tuples
+- explicit reservations improved coordination but paid too much extra hot-path
+  transaction cost
+
+Key design constraints for a striped claim-head pass:
+
+- preserve no-lost-work semantics under crash/restart
+- keep claim and start in one hot-path transaction for short jobs
+- preserve honest `running_depth`
+- avoid reintroducing a hot mutable jobs table or a long-lived reservation
+  frontier
+- keep fairness good enough that low-priority or older work does not starve
+  behind shard-local skew
+
+The likely trade-off is that strict per-priority FIFO becomes **approximate**
+across shards rather than globally serialized through one lane head. That is
+acceptable only if:
+
+- ordering skew is bounded by the shard count
+- claim-time effective priority aging still works across shards
+- real fairness/backlog behavior improves materially in the realistic
+  `4x8`/`8x4` deployment shape
+
+Acceptance bar for a striped-claim pass:
+
+- `1x32` remains roughly competitive with the current branch
+- `4x8` improves materially on throughput and latency
+- crash-under-load still behaves correctly
+- dead tuples remain low
+- no new hidden control-plane state is needed to explain `running_depth`
+
 ### What now looks solid
 
 #### 1. Queue plane
