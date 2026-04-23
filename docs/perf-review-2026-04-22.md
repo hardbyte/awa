@@ -239,6 +239,49 @@ That means:
 
 So the current first-principles picture is:
 
+### Queue striping first pass
+
+We also moved queue striping up from a future escape hatch into a real measured track.
+The first implementation used:
+
+- logical queue -> physical stripes (`queue#0..N-1`)
+- deterministic stripe selection on enqueue
+- cyclic stripe probing on claim
+- no extra per-job reservation or promotion state
+
+Measured with `QUEUE_STRIPE_COUNT=4` on the same single-producer realistic gate:
+
+`1x32`
+- `clean_1 883/s`
+- `pressure_1 1048/s`
+- `recovery_1 744/s`
+- subscriber p99 `250 / 226 / 154 ms`
+- median dead tuples `9879 / 10013 / 23688`
+
+`4x8`
+- `clean_1 833/s`
+- `pressure_1 934/s`
+- `recovery_1 827/s`
+- subscriber p99 `456 / 670 / 686 ms`
+- median dead tuples `9246 / 10300 / 20676`
+
+This is the first striping signal worth taking seriously because it appears to
+improve the realistic `4x8` throughput and distribution problem.
+
+But the implementation is not yet ready to keep as-is:
+
+- dead tuples jumped back into the `~9k-24k` range
+- the main churn sources were `lease_claim_closures` and `done_entries_*`
+- observer `running_depth` became implausibly high for the offered load, which
+  suggests either a real lifecycle leak or a striped logical-queue counting bug
+
+So the current position is:
+
+- queue striping remains a strong next direction
+- the first implementation pass is promising on throughput
+- but it introduced a serious churn/counting regression that must be understood
+  before it is considered a keepable engine change
+
 ### Reverted sticky shard leasing v1
 
 We then tried the next design shift: make claim authority sticky at the shard

@@ -367,3 +367,49 @@ The biggest risk is:
 - stripe skew causing one stripe to stay disproportionately hot
 
 The first version should measure that explicitly rather than trying to solve it prematurely.
+
+
+## First experiment results
+
+The first implementation pass was built and measured with `QUEUE_STRIPE_COUNT=4` on the
+same single-producer realistic gate used for the bounded-claimer work.
+
+### `1x32`
+
+- `clean_1`: throughput about `883/s`, subscriber p99 about `250 ms`
+- `pressure_1`: throughput about `1048/s`, subscriber p99 about `226 ms`
+- `recovery_1`: throughput about `744/s`, subscriber p99 about `154 ms`
+
+### `4x8`
+
+- `clean_1`: throughput about `833/s`, subscriber p99 about `456 ms`
+- `pressure_1`: throughput about `934/s`, subscriber p99 about `670 ms`
+- `recovery_1`: throughput about `827/s`, subscriber p99 about `686 ms`
+
+### What looked promising
+
+- `4x8` throughput is materially better than the current adaptive bounded-claimer baseline.
+- work is distributed across multiple replicas instead of collapsing to one claimer.
+- the hot-queue throughput problem is plausibly reduced by striping.
+
+### What is not acceptable yet
+
+The current implementation also shows a serious churn/counting regression:
+
+- `median_dead_tup` moved back into the `~9k-24k` range instead of the current low-hundreds regime
+- the top dead-tuple sources are now:
+  - `lease_claim_closures`
+  - `done_entries_*`
+- `running_depth` on the observer replica is implausibly high (`~2.7k`, `~7.4k`, `~13.5k` in `1x32`)
+  relative to the offered load and queue depth
+
+So the first striping pass should be treated as:
+
+- evidence that striping can help the realistic `4x8` throughput problem
+- but **not yet** a keepable implementation
+
+The next step, before treating striping as the leading answer, is to investigate:
+
+1. whether the striped completion/closure path is creating unnecessary churn in `lease_claim_closures`
+2. whether `done_entries_*` churn is a real storage regression or a measurement artifact
+3. whether `running_depth` is being overcounted for logical striped queues
