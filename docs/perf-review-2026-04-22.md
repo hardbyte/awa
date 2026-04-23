@@ -337,6 +337,15 @@ So the current striping conclusion is:
 - it is “can a 2-stripe hot-queue mode make tails boring enough without
   worsening `open_receipt_claims` churn?”
 
+One measurement caveat from this pass:
+
+- the portable `awa-bench` adapter currently emits `claim_p99_ms` as the same
+  value as `subscriber_p99_ms`
+- so it should **not** be treated as an independent database-claim latency
+  signal in these striping investigations
+- the reliable striping signals here are throughput, queue depth/backlog
+  growth, per-replica completion spread, and dead-tuple sources
+
 ### Reverted sticky shard leasing v1
 
 We then tried the next design shift: make claim authority sticky at the shard

@@ -535,6 +535,13 @@ real `4x8` win:
 - materially lower tails
 - better clean and recovery throughput
 
+Measurement caveat:
+
+- the portable `awa-bench` adapter currently reports `claim_p99_ms` using the
+  same windowed value as `subscriber_p99_ms`
+- so `claim_p99_ms` should not be used as an independent diagnosis signal for
+  striping until the adapter emits a true claim-latency metric
+
 But it is still not yet “boring” enough to call done:
 
 - tails remain high in absolute terms
