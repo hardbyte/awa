@@ -481,6 +481,29 @@ over:
 That principle has repeatedly matched the measurements better than globally
 optimal hot-path fairness.
 
+## Current status after the first implementation pass
+
+The first bounded-claimers pass used a **fixed small claimer cap** per queue.
+
+That version was informative but reverted:
+
+- it preserved the healthy `1x32` shape
+- it improved the calm `4x8 clean_1` phase
+- but it starved the hot queue under `pressure_1` and especially
+  `recovery_1`
+
+So the next bounded-claimers iteration should **not** keep a rigid cap under
+all conditions.
+
+The next variant should be:
+
+- adaptive rather than fixed
+- locality-first when the queue is calm
+- able to expand active claimers during sustained saturation / recovery
+
+That keeps the same semantic model, but makes the claimer limit part of the
+runtime control loop rather than a hard static ceiling.
+
 ## Why this is the next design
 
 This design is attractive because it keeps the good properties of the current

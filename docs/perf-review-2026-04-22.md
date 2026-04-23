@@ -396,6 +396,51 @@ That gives us both:
 - a better default engine
 - and an explicit escape hatch for extreme single-queue workloads
 
+#### Fixed-cap bounded claimers (reverted)
+
+The first bounded-claimers implementation used a small fixed queue-level cap:
+
+- queue-level claimer leases in queue storage
+- a fixed active claimer limit per queue
+- direct `ready -> active_receipt` start path preserved
+- no per-job reservation or promotion state
+
+That version was safe enough to test and it preserved the good `1x32` shape:
+
+- `1x32`
+  - `clean_1 800/s`
+  - `pressure_1 1197/s`
+  - `recovery_1 800/s`
+
+But it was **not** keepable, because the realistic hot-queue `4x8` shape still
+collapsed once the workload moved beyond the calm phase:
+
+- `4x8`
+  - `clean_1 250/s`
+  - `pressure_1 34/s`
+  - `recovery_1 0.4/s`
+  - subscriber p99 about `49 / 396 / 38 ms`
+  - median dead tuples stayed low at about `181 / 138 / 153`
+
+Interpretation:
+
+- the fixed claimer cap does reduce contention enough to help the calm
+  `4x8 clean_1` phase
+- but it starves the hot queue under `pressure_1` and especially `recovery_1`
+- so a **hard fixed cap is too blunt**
+
+That means the next bounded-claimers variant should be:
+
+- **adaptive**, not fixed
+- locality-first under low/moderate load
+- able to expand the active claimer set under sustained saturation / recovery
+
+In other words, the repeated lesson still holds:
+
+- strong fairness over time is the right target
+- but the runtime must still be able to raise claim parallelism when one hot
+  queue is genuinely saturated
+
 ### What now looks solid
 
 #### 1. Queue plane
