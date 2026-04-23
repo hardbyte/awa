@@ -1090,6 +1090,114 @@ In order:
      - the next bounded-claimers iteration needs queue-global adaptation and
        explicit anti-hoarding rather than a fixed small cap
 
+#### Queue-global adaptive bounded claimers (current experiment)
+
+The next bounded-claimers pass moved from a fixed small cap to a queue-depth
+driven target while keeping the same core semantic boundary:
+
+- no per-job reservation/start state
+- direct `ready -> active_receipt`
+- one claimer slot per instance per queue
+- queue-global-ish target derived from shared queue depth / running depth,
+  rather than replica-local streaks
+
+The realistic single-producer gate on commit `a7043fb` produced:
+
+- `1x32`
+  - `clean_1 797.6/s`
+  - `pressure_1 1194.2/s`
+  - `recovery_1 799.5/s`
+  - subscriber p99 `48 / 53 / 110 ms`
+  - median dead tuples `146 / 186 / 146`
+- `4x8`
+  - `clean_1 701.2/s`
+  - `pressure_1 611.4/s`
+  - `recovery_1 738.3/s`
+  - subscriber p99 `671 / 11420 / 31441 ms`
+  - median dead tuples `129 / 152 / 147`
+
+The important improvement over the earlier fixed-cap pass is that the corrected
+per-replica raw adapter metrics now show real work spread across multiple
+replicas after warmup, rather than replica `0` doing almost everything:
+
+- `clean_1`
+  - replica `0`: median nonzero completion rate `334.6/s`
+  - replica `1`: `366.6/s`
+  - replica `2`: some participation
+  - replica `3`: some participation
+- `pressure_1`
+  - replicas `0..3`: roughly `143–166/s` median nonzero completion rate
+- `recovery_1`
+  - replicas `0..3`: roughly `167–191/s` median nonzero completion rate
+
+So this version appears to address the worst over-localization problem that
+made fixed bounded claimers unattractive.
+
+However, it is not yet a shipping answer because:
+
+- `4x8` subscriber tails are still far too high under `pressure_1` and
+  `recovery_1`
+- the adaptive controller is still likely too eager or too sticky under hot
+  queue conditions
+- we have not yet rerun crash-under-load on this version
+
+Current conclusion:
+
+- this is the first bounded-claimers variant worth keeping in the branch as an
+  active candidate
+- it improves realistic multi-replica throughput materially relative to the
+  unbounded baseline
+- but it still needs controller tuning before it clears the shipping bar
+
+#### First investigation of the adaptive claimer result
+
+Before discarding the adaptive claimer direction, the first follow-up check was
+to look at the corrected per-replica adapter metrics from the realistic `4x8`
+run rather than only the aggregate phase summary.
+
+That investigation changes the diagnosis:
+
+- this version does **not** collapse to `0/s`
+- it does **not** over-localize to one replica the way the fixed-cap pass did
+- under `pressure_1` and `recovery_1`, all four replicas show sustained nonzero
+  completion rates
+
+From `custom-20260423T123737Z-b7c2f9`:
+
+- `clean_1`
+  - replica `0` median nonzero completion rate `334.6/s`
+  - replica `1` `366.6/s`
+  - replicas `2` and `3` participate intermittently
+- `pressure_1`
+  - replicas `0..3` roughly `143–166/s` median nonzero completion rate
+- `recovery_1`
+  - replicas `0..3` roughly `167–191/s` median nonzero completion rate
+
+So the remaining problem is not “only one replica is active.” The remaining
+problem is:
+
+- throughput under `4x8` is still below producer rate
+- queue depth builds materially:
+  - `clean_1` median queue depth `408`
+  - `pressure_1` median queue depth `11066`
+  - `recovery_1` median queue depth `24212`
+- that backlog then drives very poor subscriber/end-to-end tails
+
+One caveat from this investigation:
+
+- `running_depth` in the current portable harness is still effectively an
+  observer-instance metric, not a true cluster-wide aggregate, so it should not
+  be over-interpreted in this multi-replica analysis
+
+Working interpretation after this first investigation:
+
+- the adaptive claimer idea is still alive
+- the current queue-depth controller is likely too conservative or too
+  expensive, so the queue accumulates backlog early and never regains latency
+  control
+- the next tuning pass should focus on the controller and claimer-lease
+  overhead rather than discarding the design immediately
+
 4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
    - but now on the corrected claim-time aging baseline
