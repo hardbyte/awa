@@ -322,6 +322,11 @@ showed that the append-only history alone was not enough: open claims had to
 be tracked in a bounded `open_receipt_claims` frontier so rescue and queue
 counts would not degrade into history scans. Further lease-plane work is still
 tracked in [`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
+The current next-step design for the remaining many-small-replica blocker is
+tracked in [`sticky-shard-leasing-plan.md`](../sticky-shard-leasing-plan.md):
+keep direct `ready -> active attempt` starts, but reduce hot-queue
+coordination by leasing shard-local claim authority rather than introducing a
+second start-phase transaction.
 
 Spec-level safety is checked by the segmented-storage TLA+ family —
 `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,

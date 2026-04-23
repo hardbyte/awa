@@ -248,6 +248,12 @@ The next design, if we pursue another one, has to reduce many-small-replica
 coordination cost **without** introducing a second effective start-phase
 transaction or widening the active receipt frontier again.
 
+The current concrete proposal for that next pass is documented in
+[`sticky-shard-leasing-plan.md`](sticky-shard-leasing-plan.md): sticky
+shard-local claim authority with direct `ready -> active attempt` starts, no
+reserved-but-not-started job state, and no second promotion transaction on the
+short-job path.
+
 ### What now looks solid
 
 #### 1. Queue plane
