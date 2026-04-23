@@ -284,6 +284,77 @@ So sticky shard leasing as a concept is still alive, but **v1 is not
 keepable**. Any next pass has to add a real rebalance / steal policy rather
 than just sticky ownership over expired or unowned shards.
 
+### Reverted sticky shard leasing v2
+
+We then tried the next obvious refinement: keep the direct short-job path, but
+make shard ownership **decay and rebalance** instead of staying sticky.
+
+The v2 pass added:
+
+- `last_claimed_at` on `lane_shard_leases`
+- derived shard states:
+  - `unowned`
+  - `owned-active`
+  - `owned-idle`
+- renewals only on successful claims
+- idle-shard steal eligibility based on recent inactivity
+- per-instance queue-storage claiming, so shard ownership could be tied to the
+  live runtime instance
+
+The important part is that v2 still preserved the good short-job invariant:
+
+- direct `ready -> active_receipt`
+- no reserved-but-not-started job state
+- no second start-phase promotion transaction
+
+That version also compiled cleanly and passed the focused queue-storage runtime
+tests we use as the fast gate:
+
+- `test_queue_storage_claim_runtime_applies_priority_aging_dynamically`
+- `test_queue_storage_short_jobs_complete_via_lease_claim_receipts`
+
+Results on the realistic single-producer gate:
+
+- `1x32`
+  - `clean_1 799/s`
+  - `pressure_1 1196/s`
+  - `recovery_1 789/s`
+  - subscriber p99 `58 / 74 / 100 ms`
+  - median dead tuples `109.5 / 121.0 / 111.5`
+- `4x8`
+  - `clean_1 44/s`
+  - `pressure_1 52/s`
+  - `recovery_1 0/s`
+  - subscriber p99 `17.5 / 10.5 / 0 ms`
+  - median dead tuples `177.5 / 139.5 / 138.0`
+
+This is not keepable.
+
+What it tells us:
+
+- the direct short-job path remains healthy in the `1x32` shape
+- shard leasing with idle-aware rebalance does **not** by itself solve the
+  many-small-replica problem
+- `4x8` is still collapsing hard enough that the remaining coordination cost is
+  deeper than “one hot claim-head row with overly sticky ownership”
+
+So sticky shard leasing is now in the same bucket as striped claim heads:
+
+- directionally useful
+- not sufficient by itself
+
+The remaining blocker is still the same one:
+
+- many-small-replica claim/start coordination on a hot queue
+
+But the search space is now tighter:
+
+- unsafe local buffering: wrong
+- explicit reserve/promote frontier: too expensive
+- stateful receipt frontier: too expensive
+- striped claim heads alone: not enough
+- sticky shard leasing v1/v2: not enough
+
 - unsafe local receipt buffering is wrong
 - explicit reserve/promote frontiers are too expensive
 - striped claim heads help but are not sufficient
