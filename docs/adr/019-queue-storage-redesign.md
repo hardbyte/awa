@@ -328,6 +328,18 @@ keep direct `ready -> active attempt` starts, but reduce hot-queue
 coordination by leasing shard-local claim authority rather than introducing a
 second start-phase transaction.
 
+The next queue-level coordination direction after the reverted sticky-shard
+passes is tracked in
+[`bounded-claimers-plan.md`](../bounded-claimers-plan.md): bound how many
+replicas may actively claim from a hot queue at once, keep direct short-job
+starts, and rely on claimer expiry/takeover rather than adding another
+per-job pre-start state.
+
+The next queue-level coordination alternative after the sticky-shard passes is
+tracked in [`bounded-claimers-plan.md`](../bounded-claimers-plan.md): bound the
+number of active claimers per hot queue so the engine reduces cross-process
+coordination without adding another per-job start state.
+
 Spec-level safety is checked by the segmented-storage TLA+ family —
 `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,
 `AwaSegmentedStorageTrace` — under

@@ -355,20 +355,46 @@ But the search space is now tighter:
 - striped claim heads alone: not enough
 - sticky shard leasing v1/v2: not enough
 
-- unsafe local receipt buffering is wrong
-- explicit reserve/promote frontiers are too expensive
-- striped claim heads help but are not sufficient
-- a stateful receipt frontier is also too expensive in its current form
+### Next design pass: bounded claimers per queue
 
-The next design, if we pursue another one, has to reduce many-small-replica
-coordination cost **without** introducing a second effective start-phase
-transaction or widening the active receipt frontier again.
+The next direction to try is **bounded claimers per queue**.
 
-The current concrete proposal for that next pass is documented in
-[`sticky-shard-leasing-plan.md`](sticky-shard-leasing-plan.md): sticky
-shard-local claim authority with direct `ready -> active attempt` starts, no
-reserved-but-not-started job state, and no second promotion transaction on the
-short-job path.
+The idea is to stop treating every replica with free workers as an active
+claimer for one hot queue. Instead:
+
+- only a small bounded set of replicas may claim from that queue at once
+- all other replicas remain executor-only for that queue
+- jobs still go directly `ready -> active_receipt`
+- no reserved-but-not-started job state is introduced
+- no second hot-path promotion transaction is added
+
+This is different from a fragile leader:
+
+- there can be more than one active claimer
+- ownership is time-bounded
+- expiry and takeover are automatic
+- claimer ownership controls claim authority, not job state
+
+Why this direction is promising:
+
+- repeated experiments now suggest the main remaining cost is **how many
+  independent small replicas are trying to coordinate on one hot queue**
+- several reservation/frontier variants improved coordination but paid too much
+  extra hot-path state-transition cost
+- bounded claimers attacks the measured blocker directly while preserving the
+  current job lifecycle semantics
+
+The concrete design package for this next pass is tracked in
+[`bounded-claimers-plan.md`](bounded-claimers-plan.md).
+
+That plan also records a future escape hatch worth keeping on the table:
+
+- **queue striping as a hot-queue mode**
+
+That gives us both:
+
+- a better default engine
+- and an explicit escape hatch for extreme single-queue workloads
 
 ### What now looks solid
 
