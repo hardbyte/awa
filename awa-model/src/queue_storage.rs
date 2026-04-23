@@ -58,6 +58,11 @@ pub struct QueueClaimerLease {
     pub lease_epoch: i64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+pub struct QueueClaimerState {
+    pub target_claimers: i16,
+}
+
 impl ClaimedRuntimeJob {
     fn into_done_row(self, finalized_at: DateTime<Utc>) -> Result<DoneJobRow, AwaError> {
         let payload = QueueStorage::payload_from_parts(
@@ -1569,6 +1574,19 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_claimer_state (
+                queue            TEXT PRIMARY KEY,
+                target_claimers  SMALLINT NOT NULL,
+                updated_at       TIMESTAMPTZ NOT NULL
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
             CREATE INDEX IF NOT EXISTS idx_{schema}_queue_claimer_leases_owner
                 ON {schema}.queue_claimer_leases (queue, owner_instance_id, expires_at)
             "#
@@ -2561,10 +2579,11 @@ impl QueueStorage {
                 {schema}.queue_terminal_rollups,
                 {schema}.queue_count_snapshots,
                 {schema}.queue_claimer_leases,
+                {schema}.queue_claimer_state,
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
-        ))
+            ))
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -3548,6 +3567,12 @@ impl QueueStorage {
             - TimeDelta::from_std(idle_threshold).map_err(|err| {
                 AwaError::Validation(format!("invalid claimer idle threshold: {err}"))
             })?;
+        let probe_start = if max_claimers > 1 {
+            ((instance_id.as_u128() ^ (now.timestamp_millis() as u128)) % (max_claimers as u128))
+                as i16
+        } else {
+            0
+        };
 
         if let Some(owned) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
             r#"
@@ -3570,7 +3595,8 @@ impl QueueStorage {
             return Ok(Some(owned));
         }
 
-        for slot in 0..max_claimers {
+        for offset in 0..max_claimers {
+            let slot = (probe_start + offset) % max_claimers;
             if let Some(updated) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
                 r#"
                 UPDATE {schema}.queue_claimer_leases
@@ -3676,20 +3702,122 @@ impl QueueStorage {
         Ok(result.rows_affected() == 1)
     }
 
-    fn desired_queue_claimer_target(&self, counts: &QueueCounts, max_claimers: i16) -> i16 {
+    fn desired_queue_claimer_target(
+        &self,
+        current_target: Option<i16>,
+        counts: &QueueCounts,
+        max_claimers: i16,
+    ) -> i16 {
         let available = counts.available.max(0) as u64;
         let running = counts.running.max(0) as u64;
         let backlog = available.saturating_sub(running);
+        let current = current_target.unwrap_or(1).clamp(1, max_claimers.max(1));
+        let max_four = 4.min(max_claimers.max(1));
+        let max_two = 2.min(max_claimers.max(1));
 
-        let desired: i16 = if backlog >= 2048 || available >= 1024 {
-            4
-        } else if backlog >= 256 || available >= 128 {
-            2
-        } else {
-            1
-        };
+        match current {
+            4.. => {
+                if available >= 32 || backlog >= 16 {
+                    max_four
+                } else if available >= 8 || backlog >= 4 {
+                    max_two
+                } else {
+                    1
+                }
+            }
+            2..=3 => {
+                if available >= 128 || backlog >= 64 {
+                    max_four
+                } else if available >= 4 || backlog >= 2 {
+                    max_two
+                } else {
+                    1
+                }
+            }
+            _ => {
+                if available >= 64 || backlog >= 32 {
+                    max_four
+                } else if available >= 8 || backlog >= 4 {
+                    max_two
+                } else {
+                    1
+                }
+            }
+        }
+    }
 
-        desired.min(max_claimers.max(1))
+    async fn queue_claimer_target(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        max_claimers: i16,
+        queue_counts_max_age: Duration,
+        control_interval: Duration,
+    ) -> Result<i16, AwaError> {
+        let schema = self.schema();
+        let now = Utc::now();
+        let stale_cutoff = now
+            - TimeDelta::from_std(control_interval).map_err(|err| {
+                AwaError::Validation(format!("invalid claimer control interval: {err}"))
+            })?;
+
+        if let Some(target) = sqlx::query_scalar::<_, i16>(&format!(
+            r#"
+            SELECT target_claimers
+            FROM {schema}.queue_claimer_state
+            WHERE queue = $1
+              AND updated_at > $2
+            "#
+        ))
+        .bind(queue)
+        .bind(stale_cutoff)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?
+        {
+            return Ok(target.clamp(1, max_claimers.max(1)));
+        }
+
+        let current_target = sqlx::query_scalar::<_, i16>(&format!(
+            r#"
+            SELECT target_claimers
+            FROM {schema}.queue_claimer_state
+            WHERE queue = $1
+            "#
+        ))
+        .bind(queue)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let counts = self
+            .queue_counts_cached(pool, queue, queue_counts_max_age)
+            .await?;
+        let desired = self.desired_queue_claimer_target(current_target, &counts, max_claimers);
+
+        if let Some(updated) = sqlx::query_scalar::<_, i16>(&format!(
+            r#"
+            INSERT INTO {schema}.queue_claimer_state (queue, target_claimers, updated_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (queue) DO UPDATE
+            SET target_claimers = EXCLUDED.target_claimers,
+                updated_at = EXCLUDED.updated_at
+            WHERE {schema}.queue_claimer_state.updated_at <= $4
+            RETURNING target_claimers
+            "#
+        ))
+        .bind(queue)
+        .bind(desired)
+        .bind(now)
+        .bind(stale_cutoff)
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?
+        {
+            return Ok(updated.clamp(1, max_claimers.max(1)));
+        }
+
+        Ok(current_target.unwrap_or(desired).clamp(1, max_claimers.max(1)))
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
@@ -3706,10 +3834,15 @@ impl QueueStorage {
         idle_threshold: Duration,
         queue_counts_max_age: Duration,
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
-        let counts = self
-            .queue_counts_cached(pool, queue, queue_counts_max_age)
+        let target_claimers = self
+            .queue_claimer_target(
+                pool,
+                queue,
+                max_claimers,
+                queue_counts_max_age,
+                Duration::from_millis(500),
+            )
             .await?;
-        let target_claimers = self.desired_queue_claimer_target(&counts, max_claimers);
 
         let Some(lease) = self
             .acquire_queue_claimer(
