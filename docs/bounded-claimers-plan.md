@@ -59,6 +59,17 @@ The core idea is:
 - keep short-job starts direct:
   - `ready -> active_receipt`
 
+This is **not** static partitioning of jobs across claimers.
+
+If a queue currently allows `2` or `4` active claimers:
+
+- those replicas are the only ones allowed to hit the hot claim path
+- they still claim from the same logical queue
+- they do **not** each receive a fixed `1/N` share of jobs
+
+So the design is about bounding and rotating **claim authority**, not dividing
+jobs into quotas.
+
 That preserves:
 
 - honest `running_depth`
@@ -324,8 +335,16 @@ but a hard cap is too blunt:
 - but it can starve a hot queue during `pressure_1` and especially
   `recovery_1`
 
-So the next real design is **adaptive bounded claimers**, not fixed bounded
-claimers.
+So the next real design is **queue-global adaptive bounded claimers with
+anti-hoarding**, not fixed bounded claimers and not per-replica local
+adaptation.
+
+That means:
+
+- the queue has one shared active-claimer target
+- replicas do not each privately decide their own target
+- one replica should not be allowed to monopolize all claimer slots while
+  others are healthy and interested
 
 ### Controller states
 
@@ -354,6 +373,40 @@ The queue-level controller should be modeled explicitly:
 This is still not a new job state machine. It is only a queue-level control
 loop over how many replicas are allowed to claim from that queue.
 
+### Queue-global target
+
+For each queue, maintain one shared target:
+
+- `current_target_claimers`
+
+Example:
+
+```text
+queue = email
+
+calm            -> target = 1
+backlog grows   -> target = 2
+steady hot      -> target = 4
+backlog drains  -> target = 1
+```
+
+That target should be derived from queue-level signals, not one replica's
+private claim streak.
+
+### Anti-hoarding
+
+The fixed-cap experiment showed that throughput can look healthy while one
+replica still does essentially all the useful claiming/completing work.
+
+So the next version needs an explicit anti-hoarding rule:
+
+- until the queue reaches its current target, prefer assigning claimer slots to
+  replicas that do not already own one for that queue
+- in the first adaptive version, cap ownership at **one claimer slot per
+  instance per queue**
+
+This is still not a `1/N` job split. It only limits who may claim.
+
 ### Control variables
 
 The queue should maintain:
@@ -375,6 +428,7 @@ Use only signals we already trust and can export:
 
 - queue depth
 - running depth
+- total configured worker capacity for that queue across the cluster
 - local free permits
 - empty-claim rate
 - unused-permit rate
@@ -415,6 +469,37 @@ It matches the principle we agreed on:
 - strong fairness over time
 - locality when calm
 - more coordination only when saturation proves it is necessary
+
+### Example timeline
+
+```text
+Queue "email", replicas A B C D
+
+calm:
+  target = 1
+  slot0 -> A
+  B/C/D executor-only
+
+backlog grows while running depth < total worker capacity:
+  target = 2
+  slot1 -> B
+
+queue remains hot:
+  target = 4
+  slot2 -> C
+  slot3 -> D
+
+backlog drains:
+  target = 1
+  B/C/D stop renewing and their slots expire
+  A remains claimer
+```
+
+That is the intended behavior:
+
+- locality while calm
+- broader claiming only under sustained saturation
+- contraction back to the cheap path once the queue settles
 
 ## Safety invariants
 
@@ -472,6 +557,7 @@ Metrics to record:
 - dispatcher wake reasons
 - empty claims
 - unused permits
+- per-replica throughput / latency after warmup
 - claimer metrics:
   - active claimer count
   - claimer acquire success/miss
@@ -510,6 +596,8 @@ The minimum confidence plan should be:
    - rerun `awa-canonical` in `1x32` and `4x8`
 6. **Dead-tuple check**
    - confirm we remain in the current low-hundreds regime
+7. **Per-replica distribution**
+   - confirm `4x8` does not collapse into one effective claimer after warmup
 
 Only keep it if the *pattern* is stable across repeats.
 
