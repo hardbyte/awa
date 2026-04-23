@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
-use uuid::Uuid;
 
 static QUEUE_STORAGE_RUNTIME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -2459,76 +2458,6 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
             .get("_awa_original_priority")
             .and_then(|value| value.as_i64()),
         Some(4)
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
-    let schema = "awa_qs_bounded_claimers_limit";
-    let store = create_store(&pool, schema).await;
-    let queue = "qs_bounded_claimers_limit";
-    let instance_a = Uuid::new_v4();
-    let instance_b = Uuid::new_v4();
-    let ttl = Duration::from_secs(3);
-    let idle_threshold = Duration::from_millis(500);
-
-    let lease_a = store
-        .acquire_queue_claimer(&pool, queue, instance_a, 1, ttl, idle_threshold)
-        .await
-        .expect("instance A should acquire claimer")
-        .expect("instance A should get a claimer slot");
-    assert_eq!(lease_a.claimer_slot, 0);
-
-    let lease_b = store
-        .acquire_queue_claimer(&pool, queue, instance_b, 1, ttl, idle_threshold)
-        .await
-        .expect("instance B acquire should succeed");
-    assert!(
-        lease_b.is_none(),
-        "bounded claimers should block extra owners"
-    );
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_bounded_claimers_can_steal_idle_slot() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
-    let schema = "awa_qs_bounded_claimers_idle";
-    let store = create_store(&pool, schema).await;
-    let queue = "qs_bounded_claimers_idle";
-    let instance_a = Uuid::new_v4();
-    let instance_b = Uuid::new_v4();
-    let ttl = Duration::from_secs(3);
-    let idle_threshold = Duration::from_millis(500);
-
-    let lease_a = store
-        .acquire_queue_claimer(&pool, queue, instance_a, 1, ttl, idle_threshold)
-        .await
-        .expect("instance A should acquire claimer")
-        .expect("instance A should get a claimer slot");
-
-    sqlx::query(&format!(
-        "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
-    ))
-    .bind(Utc::now() - chrono::Duration::milliseconds(1_000))
-    .bind(queue)
-    .bind(lease_a.claimer_slot)
-    .execute(&pool)
-    .await
-    .expect("failed to age claimer lease idle");
-
-    let lease_b = store
-        .acquire_queue_claimer(&pool, queue, instance_b, 1, ttl, idle_threshold)
-        .await
-        .expect("instance B should acquire idle claimer")
-        .expect("instance B should steal idle claimer slot");
-
-    assert_eq!(lease_b.claimer_slot, lease_a.claimer_slot);
-    assert!(
-        lease_b.lease_epoch > lease_a.lease_epoch,
-        "stealing should bump the lease epoch"
     );
 }
 

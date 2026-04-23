@@ -52,12 +52,6 @@ pub struct ClaimedRuntimeJob {
     pub unique_states: Option<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
-pub struct QueueClaimerLease {
-    pub claimer_slot: i16,
-    pub lease_epoch: i64,
-}
-
 impl ClaimedRuntimeJob {
     fn into_done_row(self, finalized_at: DateTime<Utc>) -> Result<DoneJobRow, AwaError> {
         let payload = QueueStorage::payload_from_parts(
@@ -1549,34 +1543,6 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_claimer_leases (
-                queue             TEXT NOT NULL,
-                claimer_slot      SMALLINT NOT NULL,
-                owner_instance_id UUID NOT NULL,
-                lease_epoch       BIGINT NOT NULL DEFAULT 0,
-                leased_at         TIMESTAMPTZ NOT NULL,
-                last_claimed_at   TIMESTAMPTZ NOT NULL,
-                expires_at        TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY (queue, claimer_slot)
-            )
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_queue_claimer_leases_owner
-                ON {schema}.queue_claimer_leases (queue, owner_instance_id, expires_at)
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
             let mut backfill_tx = pool.begin().await.map_err(map_sqlx_error)?;
             sqlx::query(&format!(
                 r#"
@@ -2560,7 +2526,6 @@ impl QueueStorage {
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
                 {schema}.queue_count_snapshots,
-                {schema}.queue_claimer_leases,
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
@@ -3523,203 +3488,6 @@ impl QueueStorage {
             .into_iter()
             .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
             .collect()
-    }
-
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.acquire_queue_claimer")]
-    pub async fn acquire_queue_claimer(
-        &self,
-        pool: &PgPool,
-        queue: &str,
-        instance_id: Uuid,
-        max_claimers: i16,
-        lease_ttl: Duration,
-        idle_threshold: Duration,
-    ) -> Result<Option<QueueClaimerLease>, AwaError> {
-        if max_claimers <= 0 {
-            return Ok(None);
-        }
-
-        let schema = self.schema();
-        let now = Utc::now();
-        let expires_at = now
-            + TimeDelta::from_std(lease_ttl)
-                .map_err(|err| AwaError::Validation(format!("invalid claimer lease ttl: {err}")))?;
-        let idle_cutoff = now
-            - TimeDelta::from_std(idle_threshold).map_err(|err| {
-                AwaError::Validation(format!("invalid claimer idle threshold: {err}"))
-            })?;
-
-        if let Some(owned) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
-            r#"
-            SELECT claimer_slot, lease_epoch
-            FROM {schema}.queue_claimer_leases
-            WHERE queue = $1
-              AND owner_instance_id = $2
-              AND expires_at > $3
-            ORDER BY claimer_slot
-            LIMIT 1
-            "#
-        ))
-        .bind(queue)
-        .bind(instance_id)
-        .bind(now)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(Some(owned));
-        }
-
-        for slot in 0..max_claimers {
-            if let Some(updated) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
-                r#"
-                UPDATE {schema}.queue_claimer_leases
-                SET owner_instance_id = $3,
-                    lease_epoch = CASE
-                        WHEN owner_instance_id = $3 THEN lease_epoch
-                        ELSE lease_epoch + 1
-                    END,
-                    leased_at = $4,
-                    last_claimed_at = $4,
-                    expires_at = $5
-                WHERE queue = $1
-                  AND claimer_slot = $2
-                  AND (
-                        owner_instance_id = $3
-                     OR expires_at <= $4
-                     OR last_claimed_at <= $6
-                  )
-                RETURNING claimer_slot, lease_epoch
-                "#
-            ))
-            .bind(queue)
-            .bind(slot)
-            .bind(instance_id)
-            .bind(now)
-            .bind(expires_at)
-            .bind(idle_cutoff)
-            .fetch_optional(pool)
-            .await
-            .map_err(map_sqlx_error)?
-            {
-                return Ok(Some(updated));
-            }
-
-            if let Some(inserted) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
-                r#"
-                INSERT INTO {schema}.queue_claimer_leases (
-                    queue,
-                    claimer_slot,
-                    owner_instance_id,
-                    lease_epoch,
-                    leased_at,
-                    last_claimed_at,
-                    expires_at
-                )
-                VALUES ($1, $2, $3, 0, $4, $4, $5)
-                ON CONFLICT (queue, claimer_slot) DO NOTHING
-                RETURNING claimer_slot, lease_epoch
-                "#
-            ))
-            .bind(queue)
-            .bind(slot)
-            .bind(instance_id)
-            .bind(now)
-            .bind(expires_at)
-            .fetch_optional(pool)
-            .await
-            .map_err(map_sqlx_error)?
-            {
-                return Ok(Some(inserted));
-            }
-        }
-
-        Ok(None)
-    }
-
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id, claimer_slot = lease.claimer_slot), name = "queue_storage.mark_queue_claimer_active")]
-    pub async fn mark_queue_claimer_active(
-        &self,
-        pool: &PgPool,
-        queue: &str,
-        instance_id: Uuid,
-        lease: QueueClaimerLease,
-        lease_ttl: Duration,
-    ) -> Result<bool, AwaError> {
-        let schema = self.schema();
-        let now = Utc::now();
-        let expires_at = now
-            + TimeDelta::from_std(lease_ttl)
-                .map_err(|err| AwaError::Validation(format!("invalid claimer lease ttl: {err}")))?;
-
-        let result = sqlx::query(&format!(
-            r#"
-            UPDATE {schema}.queue_claimer_leases
-            SET last_claimed_at = $5,
-                expires_at = $6
-            WHERE queue = $1
-              AND claimer_slot = $2
-              AND owner_instance_id = $3
-              AND lease_epoch = $4
-            "#
-        ))
-        .bind(queue)
-        .bind(lease.claimer_slot)
-        .bind(instance_id)
-        .bind(lease.lease_epoch)
-        .bind(now)
-        .bind(expires_at)
-        .execute(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-
-        Ok(result.rows_affected() == 1)
-    }
-
-    #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
-    pub async fn claim_runtime_batch_with_aging_for_instance(
-        &self,
-        pool: &PgPool,
-        queue: &str,
-        max_batch: i64,
-        deadline_duration: Duration,
-        aging_interval: Duration,
-        instance_id: Uuid,
-        max_claimers: i16,
-        lease_ttl: Duration,
-        idle_threshold: Duration,
-    ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
-        let Some(lease) = self
-            .acquire_queue_claimer(
-                pool,
-                queue,
-                instance_id,
-                max_claimers,
-                lease_ttl,
-                idle_threshold,
-            )
-            .await?
-        else {
-            return Ok(Vec::new());
-        };
-
-        let claimed = self
-            .claim_runtime_batch_with_aging(
-                pool,
-                queue,
-                max_batch,
-                deadline_duration,
-                aging_interval,
-            )
-            .await?;
-
-        if !claimed.is_empty() {
-            let _ = self
-                .mark_queue_claimer_active(pool, queue, instance_id, lease, lease_ttl)
-                .await?;
-        }
-
-        Ok(claimed)
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.claim_job_batch")]

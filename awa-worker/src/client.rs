@@ -1163,7 +1163,6 @@ impl Client {
                 };
                 Dispatcher::with_concurrency(
                     queue_name.clone(),
-                    self.runtime_instance_id,
                     config.clone(),
                     self.pool.clone(),
                     executor.clone(),
@@ -1179,7 +1178,6 @@ impl Client {
                 // Hard-reserved mode (default)
                 Dispatcher::new(
                     queue_name.clone(),
-                    self.runtime_instance_id,
                     config.clone(),
                     self.pool.clone(),
                     executor.clone(),
