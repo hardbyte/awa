@@ -789,6 +789,32 @@ The latter should stay on the table even if a better bounded-claimers variant
 is found, because it remains the clearest operational escape hatch for extreme
 single-queue workloads.
 
+## Current status after controller tuning
+
+The next adaptive tuning pass kept the same semantic model but moved target
+calculation off the hot claim round:
+
+- shared `queue_claimer_state`
+- queue-wide target refresh at most every `500ms`
+- more aggressive expansion
+- slower contraction
+- jittered slot probing
+
+That version is the current active bounded-claimers candidate.
+
+Why it is being kept:
+
+- `1x32` remained healthy
+- `4x8` stayed genuinely multi-replica after warmup
+- `pressure_1` and `recovery_1` both improved relative to the earlier adaptive
+  pass
+
+Why it is not done yet:
+
+- `4x8 clean_1` latency is still too high
+- `4x8 pressure_1` and `recovery_1` tails are still far above the shipping bar
+- crash-under-load still needs to be rerun on this tuned controller
+
 ## Why this is the next design
 
 This design is attractive because it keeps the good properties of the current

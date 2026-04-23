@@ -1198,6 +1198,70 @@ Working interpretation after this first investigation:
 - the next tuning pass should focus on the controller and claimer-lease
   overhead rather than discarding the design immediately
 
+#### Adaptive bounded claimers after controller tuning
+
+The next tuning pass moved the target calculation off the hot claim round:
+
+- added a cheap shared `queue_claimer_state`
+- refreshed the queue-wide claimer target at most every `500ms`
+- used more aggressive expansion and slower contraction heuristics
+- added jittered claimer slot probe order
+
+This reduced the amount of `queue_counts_cached(...)` work paid directly on
+every claim attempt and made the controller materially less replica-local.
+
+Results on commit `84483bc`:
+
+- `1x32`
+  - `clean_1 800.0/s`
+  - `pressure_1 1193.9/s`
+  - `recovery_1 799.9/s`
+  - subscriber p99 `88 / 114 / 206 ms`
+  - median queue depth `20 / 0 / 0`
+  - median dead tuples `128 / 164 / 153`
+- `4x8`
+  - `clean_1 693.9/s`
+  - `pressure_1 727.4/s`
+  - `recovery_1 742.6/s`
+  - subscriber p99 `1727 / 7090 / 25149 ms`
+  - median queue depth `375 / 7489 / 18639`
+  - median dead tuples `155 / 185 / 181`
+
+Compared with the first adaptive claimer run (`a7043fb`), the tuned controller
+shows:
+
+- `1x32`
+  - still healthy overall, though with somewhat worse tails
+- `4x8`
+  - slightly lower `clean_1` throughput
+  - materially better `pressure_1` throughput (`611 -> 727/s`)
+  - slightly better `recovery_1` throughput (`738 -> 743/s`)
+  - much lower `pressure_1` and `recovery_1` queue depth
+  - substantially better `pressure_1` and `recovery_1` subscriber tails
+
+Per-replica completion medians remain distributed across all four replicas
+after warmup:
+
+- `clean_1`
+  - replicas `0..3`: `136–197/s`
+- `pressure_1`
+  - replicas `0..3`: `173–194/s`
+- `recovery_1`
+  - replicas `0..3`: `179–193/s`
+
+So this tuning pass does not solve the realistic `4x8` tail problem yet, but
+it is the first adaptive claimer version that is both:
+
+- clearly multi-replica, not over-localized to one owner
+- and measurably better than the earlier adaptive controller in the hot
+  backlog phases
+
+Current conclusion:
+
+- keep this version in the branch as the active bounded-claimers candidate
+- next work should focus on further controller tuning and crash/recovery
+  validation, not discarding the design
+
 4. Investigate retry-heavy overload behavior
    - especially completion throughput vs queue depth growth
    - but now on the corrected claim-time aging baseline
