@@ -91,6 +91,23 @@ That means the frontier did **not** solve the many-small-replica deployment
 shape without introducing large throughput and latency regressions. It was
 reverted as well.
 
+After adding the dedicated `awa-canonical` adapter and fixing the
+single-producer observer artifact, we tried one more explicit
+reserved-but-not-started frontier on the same gate (`1x32` and `4x8`,
+single-producer only). That version was also reverted.
+
+- `1x32`: `clean_1 511/s`, `pressure_1 486/s`, `recovery_1 531/s`
+- `4x8`: `clean_1 86/s`, `pressure_1 82/s`, `recovery_1 85/s`
+
+So the first-principles conclusion is now stronger:
+
+- a distinct reservation state is still the right conceptual fix
+- but the current explicit frontier implementation shape adds too much
+  transactional overhead to the hot start path
+- the remaining blocker is still many-small-replica claim/start coordination,
+  but it will not be solved by this frontier shape without another batching
+  step or a cheaper promotion mechanism
+
 ### What now looks solid
 
 #### 1. Queue plane
