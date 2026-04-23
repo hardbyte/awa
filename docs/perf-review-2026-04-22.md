@@ -337,6 +337,44 @@ So the current striping conclusion is:
 - it is “can a 2-stripe hot-queue mode make tails boring enough without
   worsening `open_receipt_claims` churn?”
 
+We also built and measured a first dynamic striping controller:
+
+- stripe universe `4`
+- queue-global `queue_stripe_state`
+- monotonic `1 -> 2` active-stripe expansion
+- enqueue and claim both restricted to the active stripe set
+
+That controller was **not** keepable.
+
+Initial controller:
+
+- `1x32`
+  - `clean_1 790/s`, subscriber p99 `347 ms`, queue depth `20`
+  - `pressure_1 810/s`, subscriber p99 `9548 ms`, queue depth `8618`
+  - `recovery_1 646/s`, subscriber p99 `18326 ms`, queue depth `12936`
+- `4x8`
+  - `clean_1 723/s`, subscriber p99 `550 ms`, queue depth `54`
+  - `pressure_1 672/s`, subscriber p99 `13103 ms`, queue depth `13358`
+  - `recovery_1 604/s`, subscriber p99 `43499 ms`, queue depth `30339`
+
+Faster-expansion retune:
+
+- `1x32`
+  - `clean_1 528/s`, subscriber p99 `5226 ms`, queue depth `652`
+  - `pressure_1 693/s`, subscriber p99 `8757 ms`, queue depth `6725`
+  - `recovery_1 388/s`, subscriber p99 `34144 ms`, queue depth `15994`
+- `4x8`
+  - `clean_1 591/s`, subscriber p99 `5980 ms`, queue depth `3582`
+  - `pressure_1 502/s`, subscriber p99 `20365 ms`, queue depth `16568`
+  - `recovery_1 496/s`, subscriber p99 `48595 ms`, queue depth `28699`
+
+So the updated striping recommendation is:
+
+- static `2` stripes remains the leading candidate
+- the current dynamic-striping controller should be reverted
+- if dynamic striping is revisited later, it needs a substantially cheaper
+  control path than queue-global state consulted from both enqueue and claim
+
 One measurement caveat from this pass:
 
 - the portable `awa-bench` adapter currently emits `claim_p99_ms` as the same

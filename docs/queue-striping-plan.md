@@ -548,3 +548,55 @@ But it is still not yet “boring” enough to call done:
 - `open_receipt_claims` churn remains the limiting table family
 - the best candidate so far is specifically `QUEUE_STRIPE_COUNT=2`, not
   striping in general
+
+### Dynamic striping controller experiment
+
+We then tested the first dynamic controller for striping:
+
+- fixed stripe universe from `QUEUE_STRIPE_COUNT=4`
+- queue-global `queue_stripe_state`
+- monotonic active-stripe expansion
+- initial target `1`, widening toward `2`
+- enqueue and claim both limited to the currently active stripe set
+
+The intent was to preserve the proven `2`-stripe hot-queue win without paying
+the steady-state cost of always-on striping.
+
+That implementation was benchmarked twice:
+
+Initial controller:
+
+- `1x32`
+  - `clean_1 790/s`, subscriber p99 `347 ms`, queue depth `20`
+  - `pressure_1 810/s`, subscriber p99 `9548 ms`, queue depth `8618`
+  - `recovery_1 646/s`, subscriber p99 `18326 ms`, queue depth `12936`
+- `4x8`
+  - `clean_1 723/s`, subscriber p99 `550 ms`, queue depth `54`
+  - `pressure_1 672/s`, subscriber p99 `13103 ms`, queue depth `13358`
+  - `recovery_1 604/s`, subscriber p99 `43499 ms`, queue depth `30339`
+
+Faster-expansion retune:
+
+- `1x32`
+  - `clean_1 528/s`, subscriber p99 `5226 ms`, queue depth `652`
+  - `pressure_1 693/s`, subscriber p99 `8757 ms`, queue depth `6725`
+  - `recovery_1 388/s`, subscriber p99 `34144 ms`, queue depth `15994`
+- `4x8`
+  - `clean_1 591/s`, subscriber p99 `5980 ms`, queue depth `3582`
+  - `pressure_1 502/s`, subscriber p99 `20365 ms`, queue depth `16568`
+  - `recovery_1 496/s`, subscriber p99 `48595 ms`, queue depth `28699`
+
+The controller is therefore **not** the current answer:
+
+- both versions regressed relative to the static `2`-stripe candidate
+- the retuned version regressed relative to the initial dynamic version
+- the failure is not a special new dead-tuple hotspot; `open_receipt_claims`
+  remains the dominant table family
+- the problem is the dynamic control path itself, not the basic striping idea
+
+Current conclusion:
+
+- keep static `2` stripes as the leading striping candidate
+- do **not** keep the current dynamic-striping controller
+- if dynamic striping is revisited, it needs a much cheaper control model than
+  “queue-global state consulted on both enqueue and claim”
