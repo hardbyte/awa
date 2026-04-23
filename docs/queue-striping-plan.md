@@ -464,3 +464,80 @@ So the first striping pass is now best understood as:
 - **not yet** a clear win
 - still an investigation-only implementation until it shows a stronger
   `4x8` benefit than the unstriped baseline
+
+### Stripe-count sweep
+
+With the corrected benchmark path in place, the next question was whether a
+different stripe count could produce a real `4x8` win.
+
+Short `4x8` sweep (`15s` warmup, `30s` phases):
+
+- `QUEUE_STRIPE_COUNT=1`
+  - `clean_1`: throughput about `762/s`, subscriber p99 about `336 ms`
+  - `pressure_1`: throughput about `887/s`, subscriber p99 about `2487 ms`
+  - `recovery_1`: throughput about `909/s`, subscriber p99 about `6029 ms`
+- `QUEUE_STRIPE_COUNT=2`
+  - `clean_1`: throughput about `796/s`, subscriber p99 about `166 ms`
+  - `pressure_1`: throughput about `1054/s`, subscriber p99 about `378 ms`
+  - `recovery_1`: throughput about `726/s`, subscriber p99 about `425 ms`
+- `QUEUE_STRIPE_COUNT=4`
+  - `clean_1`: throughput about `762/s`, subscriber p99 about `142 ms`
+  - `pressure_1`: throughput about `1092/s`, subscriber p99 about `439 ms`
+  - `recovery_1`: throughput about `761/s`, subscriber p99 about `713 ms`
+- `QUEUE_STRIPE_COUNT=8`
+  - `clean_1`: throughput about `729/s`, subscriber p99 about `562 ms`
+  - `pressure_1`: throughput about `957/s`, subscriber p99 about `558 ms`
+  - `recovery_1`: throughput about `627/s`, subscriber p99 about `1729 ms`
+
+What this suggests:
+
+- `8` stripes is too many for this workload shape
+- `4` stripes helps the hot pressure phase but hurts `1x32` badly
+- `2` stripes is the first count that looks plausibly worth keeping
+
+The hot dead-tuple source remains unchanged across the sweep:
+
+- `open_receipt_claims` is still the dominant dead-tuple table
+- striping is changing queueing behavior, not introducing a new closure/done
+  regression
+
+### Longer `4x8` confirmation: `1` vs `2` stripes
+
+To reduce the noise in the short sweep, we then reran a longer pair:
+
+- `30s` warmup
+- `60s` `clean_1`
+- `60s` `pressure_1`
+- `60s` `recovery_1`
+
+Results:
+
+Unstriped (`QUEUE_STRIPE_COUNT=1`)
+- `clean_1`: throughput about `446/s`, subscriber p99 about `7823 ms`,
+  queue depth about `5537`
+- `pressure_1`: throughput about `465/s`, subscriber p99 about `33579 ms`,
+  queue depth about `34286`
+- `recovery_1`: throughput about `520/s`, subscriber p99 about `64455 ms`,
+  queue depth about `59008`
+
+Two stripes (`QUEUE_STRIPE_COUNT=2`)
+- `clean_1`: throughput about `667/s`, subscriber p99 about `1728 ms`,
+  queue depth about `1070`
+- `pressure_1`: throughput about `553/s`, subscriber p99 about `15630 ms`,
+  queue depth about `14150`
+- `recovery_1`: throughput about `762/s`, subscriber p99 about `36340 ms`,
+  queue depth about `26252`
+
+This longer pair is the strongest evidence so far that striping can produce a
+real `4x8` win:
+
+- lower backlog growth
+- materially lower tails
+- better clean and recovery throughput
+
+But it is still not yet “boring” enough to call done:
+
+- tails remain high in absolute terms
+- `open_receipt_claims` churn remains the limiting table family
+- the best candidate so far is specifically `QUEUE_STRIPE_COUNT=2`, not
+  striping in general

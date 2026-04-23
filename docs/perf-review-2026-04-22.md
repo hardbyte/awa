@@ -303,6 +303,40 @@ the right thing:
 - and does it avoid making the existing `open_receipt_claims` churn materially
   worse than the unstriped baseline?
 
+A follow-up stripe-count sweep on the corrected path gave a clearer answer:
+
+- `QUEUE_STRIPE_COUNT=8` was too much
+- `QUEUE_STRIPE_COUNT=4` helped the hot phase but hurt the `1x32` shape
+- `QUEUE_STRIPE_COUNT=2` is the first candidate that looks plausibly worth
+  keeping
+
+Short `4x8` sweep (`15s` warmup, `30s` phases):
+
+- `1` stripe: `762 / 887 / 909/s` with subscriber p99 `336 / 2487 / 6029 ms`
+- `2` stripes: `796 / 1054 / 726/s` with subscriber p99 `166 / 378 / 425 ms`
+- `4` stripes: `762 / 1092 / 761/s` with subscriber p99 `142 / 439 / 713 ms`
+- `8` stripes: `729 / 957 / 627/s` with subscriber p99 `562 / 558 / 1729 ms`
+
+That sweep was still noisy, so a longer `4x8` confirmation pair (`30s`
+warmup, `60s` phases) was run comparing `1` vs `2` stripes:
+
+- unstriped:
+  - `clean_1 446/s`, subscriber p99 `7823 ms`, queue depth `5537`
+  - `pressure_1 465/s`, subscriber p99 `33579 ms`, queue depth `34286`
+  - `recovery_1 520/s`, subscriber p99 `64455 ms`, queue depth `59008`
+- two stripes:
+  - `clean_1 667/s`, subscriber p99 `1728 ms`, queue depth `1070`
+  - `pressure_1 553/s`, subscriber p99 `15630 ms`, queue depth `14150`
+  - `recovery_1 762/s`, subscriber p99 `36340 ms`, queue depth `26252`
+
+So the current striping conclusion is:
+
+- a real `4x8` win does seem possible
+- the promising candidate is specifically **2 stripes**
+- the remaining problem is no longer “does striping help at all?”
+- it is “can a 2-stripe hot-queue mode make tails boring enough without
+  worsening `open_receipt_claims` churn?”
+
 ### Reverted sticky shard leasing v1
 
 We then tried the next design shift: make claim authority sticky at the shard
