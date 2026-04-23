@@ -6,8 +6,8 @@ use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
+use std::collections::{BTreeMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 use uuid::Uuid;
@@ -17,7 +17,6 @@ const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
 const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
 const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
-const DYNAMIC_STRIPE_CONTROL_INTERVAL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 pub struct QueueStorageConfig {
@@ -25,7 +24,6 @@ pub struct QueueStorageConfig {
     pub queue_slot_count: usize,
     pub lease_slot_count: usize,
     pub queue_stripe_count: usize,
-    pub dynamic_queue_striping: bool,
     pub experimental_lease_claim_receipts: bool,
 }
 
@@ -36,7 +34,6 @@ impl Default for QueueStorageConfig {
             queue_slot_count: DEFAULT_QUEUE_SLOT_COUNT,
             lease_slot_count: DEFAULT_LEASE_SLOT_COUNT,
             queue_stripe_count: DEFAULT_QUEUE_STRIPE_COUNT,
-            dynamic_queue_striping: false,
             experimental_lease_claim_receipts: false,
         }
     }
@@ -1136,18 +1133,6 @@ impl QueueStorage {
         self.queue_stripe_count() > 1
     }
 
-    fn uses_dynamic_queue_striping(&self) -> bool {
-        self.config.dynamic_queue_striping && self.uses_queue_striping()
-    }
-
-    fn max_active_queue_stripes(&self) -> usize {
-        if !self.uses_dynamic_queue_striping() {
-            self.queue_stripe_count()
-        } else {
-            self.queue_stripe_count().min(2).max(1)
-        }
-    }
-
     fn is_physical_stripe_queue(&self, queue: &str) -> bool {
         self.uses_queue_striping()
             && queue
@@ -1168,20 +1153,6 @@ impl QueueStorage {
             .collect()
     }
 
-    fn physical_queues_for_logical_active(
-        &self,
-        queue: &str,
-        active_stripes: usize,
-    ) -> Vec<String> {
-        if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
-            return vec![queue.to_string()];
-        }
-        let active = active_stripes.clamp(1, self.queue_stripe_count());
-        (0..active)
-            .map(|stripe| self.physical_queue_for_stripe(queue, stripe))
-            .collect()
-    }
-
     fn logical_queue_name<'a>(&self, queue: &'a str) -> &'a str {
         if !self.uses_queue_striping() {
             return queue;
@@ -1192,25 +1163,22 @@ impl QueueStorage {
             .unwrap_or(queue)
     }
 
-    fn queue_stripe_for_enqueue_with_count(
+    fn queue_stripe_for_enqueue(
         &self,
         queue: &str,
         unique_key: &Option<Vec<u8>>,
         salt: i64,
-        stripe_count: usize,
     ) -> String {
         if !self.uses_queue_striping() || self.is_physical_stripe_queue(queue) {
             return queue.to_string();
         }
 
-        let stripe_count = stripe_count.clamp(1, self.queue_stripe_count());
-
         let stripe = if let Some(key) = unique_key {
             let mut hasher = DefaultHasher::new();
             key.hash(&mut hasher);
-            (hasher.finish() as usize) % stripe_count
+            (hasher.finish() as usize) % self.queue_stripe_count()
         } else {
-            salt.rem_euclid(stripe_count as i64) as usize
+            salt.rem_euclid(self.queue_stripe_count() as i64) as usize
         };
         self.physical_queue_for_stripe(queue, stripe)
     }
@@ -1679,19 +1647,6 @@ impl QueueStorage {
                 queue            TEXT PRIMARY KEY,
                 target_claimers  SMALLINT NOT NULL,
                 updated_at       TIMESTAMPTZ NOT NULL
-            )
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_stripe_state (
-                queue           TEXT PRIMARY KEY,
-                active_stripes  SMALLINT NOT NULL,
-                updated_at      TIMESTAMPTZ NOT NULL
             )
             "#
             ))
@@ -2694,11 +2649,10 @@ impl QueueStorage {
                 {schema}.queue_count_snapshots,
                 {schema}.queue_claimer_leases,
                 {schema}.queue_claimer_state,
-                {schema}.queue_stripe_state,
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
-        ))
+            ))
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -3459,22 +3413,13 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let active_stripes = self
-            .active_queue_stripe_count(
-                pool,
-                queue,
-                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-            )
-            .await?;
-
         let rows: Vec<_> = (0..count)
             .map(|seq| RuntimeReadyRow {
                 kind: "bench_job".to_string(),
                 queue: if self.uses_queue_striping() && !self.is_physical_stripe_queue(queue) {
                     self.physical_queue_for_stripe(
                         queue,
-                        seq.rem_euclid(active_stripes as i64) as usize,
+                        seq.rem_euclid(self.queue_stripe_count() as i64) as usize,
                     )
                 } else {
                     queue.to_string()
@@ -3509,35 +3454,14 @@ impl QueueStorage {
         let now = Utc::now();
         let mut ready_rows = Vec::new();
         let mut deferred_rows = Vec::new();
-        let mut active_stripes_by_queue: HashMap<String, usize> = HashMap::new();
 
         for (idx, job) in jobs.iter().enumerate() {
             let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
             let payload = Self::payload_from_parts(prepared.metadata, prepared.tags, None, None)?;
-            let stripe_count =
-                if self.uses_queue_striping() && !self.is_physical_stripe_queue(&prepared.queue) {
-                    if let Some(active) = active_stripes_by_queue.get(&prepared.queue) {
-                        *active
-                    } else {
-                        let active = self
-                            .active_queue_stripe_count(
-                                pool,
-                                &prepared.queue,
-                                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-                                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-                            )
-                            .await?;
-                        active_stripes_by_queue.insert(prepared.queue.clone(), active);
-                        active
-                    }
-                } else {
-                    1
-                };
-            let queue = self.queue_stripe_for_enqueue_with_count(
+            let queue = self.queue_stripe_for_enqueue(
                 &prepared.queue,
                 &prepared.unique_key,
                 idx as i64,
-                stripe_count,
             );
 
             let ready_row = RuntimeReadyRow {
@@ -3632,15 +3556,7 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut claimed_rows = Vec::new();
-        let active_stripes = self
-            .active_queue_stripe_count(
-                pool,
-                queue,
-                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-            )
-            .await?;
-        let stripe_queues = self.physical_queues_for_logical_active(queue, active_stripes);
+        let stripe_queues = self.physical_queues_for_logical(queue);
         let start = if stripe_queues.len() > 1 {
             (Utc::now().timestamp_millis() as usize) % stripe_queues.len()
         } else {
@@ -3711,15 +3627,7 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
-        let active_stripes = self
-            .active_queue_stripe_count(
-                pool,
-                queue,
-                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-                DYNAMIC_STRIPE_CONTROL_INTERVAL,
-            )
-            .await?;
-        let stripe_queues = self.physical_queues_for_logical_active(queue, active_stripes);
+        let stripe_queues = self.physical_queues_for_logical(queue);
         let start = if stripe_queues.len() > 1 {
             (Utc::now().timestamp_millis() as usize) % stripe_queues.len()
         } else {
@@ -3966,114 +3874,6 @@ impl QueueStorage {
         }
     }
 
-    fn desired_active_queue_stripes(
-        &self,
-        current_active: Option<i16>,
-        counts: &QueueCounts,
-    ) -> i16 {
-        let max_allowed = self.max_active_queue_stripes() as i16;
-        let current = current_active.unwrap_or(1).clamp(1, max_allowed);
-        if max_allowed <= 1 {
-            return 1;
-        }
-
-        // First pass is intentionally monotonic and only widens to two stripes,
-        // but it should react early enough to approximate the proven static-2
-        // shape under sustained traffic rather than waiting for a large backlog
-        // to form on one stripe.
-        let active_pressure = counts.available >= 8
-            || counts.running >= 8
-            || counts.available.saturating_add(counts.running) >= 16;
-        if current < max_allowed && active_pressure {
-            max_allowed
-        } else {
-            current
-        }
-    }
-
-    async fn active_queue_stripe_count(
-        &self,
-        pool: &PgPool,
-        queue: &str,
-        queue_counts_max_age: Duration,
-        control_interval: Duration,
-    ) -> Result<usize, AwaError> {
-        if !self.uses_dynamic_queue_striping() || self.is_physical_stripe_queue(queue) {
-            return Ok(if self.is_physical_stripe_queue(queue) {
-                1
-            } else {
-                self.queue_stripe_count()
-            });
-        }
-
-        let schema = self.schema();
-        let now = Utc::now();
-        let stale_cutoff = now
-            - TimeDelta::from_std(control_interval).map_err(|err| {
-                AwaError::Validation(format!("invalid stripe control interval: {err}"))
-            })?;
-
-        if let Some(active) = sqlx::query_scalar::<_, i16>(&format!(
-            r#"
-            SELECT active_stripes
-            FROM {schema}.queue_stripe_state
-            WHERE queue = $1
-              AND updated_at > $2
-            "#
-        ))
-        .bind(queue)
-        .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(active.clamp(1, self.max_active_queue_stripes() as i16) as usize);
-        }
-
-        let current_active = sqlx::query_scalar::<_, i16>(&format!(
-            r#"
-            SELECT active_stripes
-            FROM {schema}.queue_stripe_state
-            WHERE queue = $1
-            "#
-        ))
-        .bind(queue)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-
-        let counts = self
-            .queue_counts_cached(pool, queue, queue_counts_max_age)
-            .await?;
-        let desired = self.desired_active_queue_stripes(current_active, &counts);
-
-        if let Some(updated) = sqlx::query_scalar::<_, i16>(&format!(
-            r#"
-            INSERT INTO {schema}.queue_stripe_state (queue, active_stripes, updated_at)
-            VALUES ($1, $2, $3)
-            ON CONFLICT (queue) DO UPDATE
-            SET active_stripes = EXCLUDED.active_stripes,
-                updated_at = EXCLUDED.updated_at
-            WHERE {schema}.queue_stripe_state.updated_at <= $4
-            RETURNING active_stripes
-            "#
-        ))
-        .bind(queue)
-        .bind(desired)
-        .bind(now)
-        .bind(stale_cutoff)
-        .fetch_optional(pool)
-        .await
-        .map_err(map_sqlx_error)?
-        {
-            return Ok(updated.clamp(1, self.max_active_queue_stripes() as i16) as usize);
-        }
-
-        Ok(current_active
-            .unwrap_or(desired)
-            .clamp(1, self.max_active_queue_stripes() as i16) as usize)
-    }
-
     async fn queue_claimer_target(
         &self,
         pool: &PgPool,
@@ -4145,9 +3945,7 @@ impl QueueStorage {
             return Ok(updated.clamp(1, max_claimers.max(1)));
         }
 
-        Ok(current_target
-            .unwrap_or(desired)
-            .clamp(1, max_claimers.max(1)))
+        Ok(current_target.unwrap_or(desired).clamp(1, max_claimers.max(1)))
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
