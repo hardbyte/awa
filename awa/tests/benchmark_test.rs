@@ -680,12 +680,14 @@ async fn test_throughput_rust_workers_queue_storage() {
     let batch_size = env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500);
     let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
     let lease_slot_count = env_usize("AWA_VA_RUNTIME_LEASE_SLOTS", 4);
+    let queue_stripe_count = env_usize("AWA_VA_RUNTIME_QUEUE_STRIPES", 1);
     let queue_rotate_ms = env_i64("AWA_VA_RUNTIME_QUEUE_ROTATE_MS", 1_000);
     let lease_rotate_ms = env_i64("AWA_VA_RUNTIME_LEASE_ROTATE_MS", 50);
 
     let store_config = QueueStorageConfig {
         queue_slot_count,
         lease_slot_count,
+        queue_stripe_count,
         experimental_lease_claim_receipts: true,
         ..Default::default()
     };
@@ -789,7 +791,10 @@ async fn test_throughput_rust_workers_queue_storage() {
                 total_jobs,
                 processing_elapsed.as_secs_f64()
             );
-            println!("[bench-va] Post-insert throughput: {:.0} jobs/sec", throughput);
+            println!(
+                "[bench-va] Post-insert throughput: {:.0} jobs/sec",
+                throughput
+            );
             println!(
                 "[bench-va] End-to-end throughput: {:.0} jobs/sec over {:.2}s",
                 end_to_end_throughput,
@@ -956,6 +961,7 @@ async fn test_pickup_latency_listen_notify_queue_storage() {
     let store_config = QueueStorageConfig {
         queue_slot_count: env_usize("AWA_VA_LATENCY_QUEUE_SLOTS", 16),
         lease_slot_count: env_usize("AWA_VA_LATENCY_LEASE_SLOTS", 4),
+        queue_stripe_count: env_usize("AWA_VA_LATENCY_QUEUE_STRIPES", 1),
         experimental_lease_claim_receipts: true,
         ..Default::default()
     };

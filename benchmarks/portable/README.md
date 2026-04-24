@@ -128,6 +128,10 @@ adapters also accept:
 - `QUEUE_COUNT_MAX_AGE_MS` (default `SAMPLE_EVERY_S * 1000`; lower values make
   observer queue-depth/running-depth samples more exact at the cost of more
   database reads)
+- `LATENCY_WINDOW_MS` (default `30000`) controls the rolling latency window used
+  for native adapter p50/p95/p99 samples. Short fault-injection phases should
+  use a smaller value so recovery summaries are not dominated by earlier phase
+  samples.
 - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` (defaults `1000` / `50`)
 - `PRIORITY_AGING_MS` (default `60000` for the long-horizon adapter; must be
   greater than `0` on the current branch)

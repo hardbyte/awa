@@ -388,6 +388,7 @@ pub async fn run() {
     let max_attempts = env_u16("JOB_MAX_ATTEMPTS", 25) as i16;
     let priority_pattern = parse_priority_pattern();
     let sample_every_s = env_u64("SAMPLE_EVERY_S", 10);
+    let latency_window = Duration::from_millis(env_u64("LATENCY_WINDOW_MS", 30_000).max(1));
     let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 25).max(1);
     let producer_batch_max = env_u64("PRODUCER_BATCH_MAX", 128).max(1) as usize;
     let default_max_connections = (worker_count.saturating_mul(2)).saturating_add(16).max(40);
@@ -786,7 +787,8 @@ pub async fn run() {
             last_completed_original_priority_4 = completed_original_p4;
             last_aged_completions = aged_completions;
 
-            let window = Duration::from_secs(30);
+            let window = latency_window;
+            let latency_window_s = latency_window.as_secs_f64();
             let (producer_call_p50, producer_call_p95, producer_call_p99) = {
                 let mut guard = sample_producer_call_latencies.lock().await;
                 guard
@@ -824,21 +826,21 @@ pub async fn run() {
             let ts = now_iso_ms();
 
             for (metric, value, window_s) in [
-                ("producer_call_p50_ms", producer_call_p50, 30.0),
-                ("producer_call_p95_ms", producer_call_p95, 30.0),
-                ("producer_call_p99_ms", producer_call_p99, 30.0),
-                ("producer_p50_ms", producer_p50, 30.0),
-                ("producer_p95_ms", producer_p95, 30.0),
-                ("producer_p99_ms", producer_p99, 30.0),
-                ("subscriber_p50_ms", subscriber_p50, 30.0),
-                ("subscriber_p95_ms", subscriber_p95, 30.0),
-                ("subscriber_p99_ms", subscriber_p99, 30.0),
-                ("end_to_end_p50_ms", end_to_end_p50, 30.0),
-                ("end_to_end_p95_ms", end_to_end_p95, 30.0),
-                ("end_to_end_p99_ms", end_to_end_p99, 30.0),
-                ("claim_p50_ms", subscriber_p50, 30.0),
-                ("claim_p95_ms", subscriber_p95, 30.0),
-                ("claim_p99_ms", subscriber_p99, 30.0),
+                ("producer_call_p50_ms", producer_call_p50, latency_window_s),
+                ("producer_call_p95_ms", producer_call_p95, latency_window_s),
+                ("producer_call_p99_ms", producer_call_p99, latency_window_s),
+                ("producer_p50_ms", producer_p50, latency_window_s),
+                ("producer_p95_ms", producer_p95, latency_window_s),
+                ("producer_p99_ms", producer_p99, latency_window_s),
+                ("subscriber_p50_ms", subscriber_p50, latency_window_s),
+                ("subscriber_p95_ms", subscriber_p95, latency_window_s),
+                ("subscriber_p99_ms", subscriber_p99, latency_window_s),
+                ("end_to_end_p50_ms", end_to_end_p50, latency_window_s),
+                ("end_to_end_p95_ms", end_to_end_p95, latency_window_s),
+                ("end_to_end_p99_ms", end_to_end_p99, latency_window_s),
+                ("claim_p50_ms", subscriber_p50, latency_window_s),
+                ("claim_p95_ms", subscriber_p95, latency_window_s),
+                ("claim_p99_ms", subscriber_p99, latency_window_s),
                 ("enqueue_rate", enq_rate, sample_every_s as f64),
                 ("completion_rate", cmp_rate, sample_every_s as f64),
                 ("retryable_failure_rate", retryable_rate, sample_every_s as f64),

@@ -6,9 +6,10 @@ use crate::{InsertParams, JobRow, JobState};
 use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use std::collections::{BTreeMap, BTreeSet};
 use std::collections::hash_map::DefaultHasher;
+use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -1075,6 +1076,7 @@ impl DeferredJobRow {
 #[derive(Debug)]
 pub struct QueueStorage {
     config: QueueStorageConfig,
+    next_stripe_probe: AtomicUsize,
 }
 
 impl QueueStorage {
@@ -1095,7 +1097,10 @@ impl QueueStorage {
             ));
         }
         validate_ident(&config.schema)?;
-        Ok(Self { config })
+        Ok(Self {
+            config,
+            next_stripe_probe: AtomicUsize::new(0),
+        })
     }
 
     pub fn from_existing_schema(schema: impl Into<String>) -> Result<Self, AwaError> {
@@ -1151,6 +1156,13 @@ impl QueueStorage {
         (0..self.queue_stripe_count())
             .map(|stripe| self.physical_queue_for_stripe(queue, stripe))
             .collect()
+    }
+
+    fn stripe_probe_start(&self, stripe_count: usize) -> usize {
+        if stripe_count <= 1 {
+            return 0;
+        }
+        self.next_stripe_probe.fetch_add(1, Ordering::Relaxed) % stripe_count
     }
 
     fn logical_queue_name<'a>(&self, queue: &'a str) -> &'a str {
@@ -2652,7 +2664,7 @@ impl QueueStorage {
                 {schema}.queue_ring_slots,
                 {schema}.lease_ring_slots
             "#
-            ))
+        ))
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -3458,11 +3470,8 @@ impl QueueStorage {
         for (idx, job) in jobs.iter().enumerate() {
             let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
             let payload = Self::payload_from_parts(prepared.metadata, prepared.tags, None, None)?;
-            let queue = self.queue_stripe_for_enqueue(
-                &prepared.queue,
-                &prepared.unique_key,
-                idx as i64,
-            );
+            let queue =
+                self.queue_stripe_for_enqueue(&prepared.queue, &prepared.unique_key, idx as i64);
 
             let ready_row = RuntimeReadyRow {
                 kind: prepared.kind,
@@ -3557,11 +3566,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut claimed_rows = Vec::new();
         let stripe_queues = self.physical_queues_for_logical(queue);
-        let start = if stripe_queues.len() > 1 {
-            (Utc::now().timestamp_millis() as usize) % stripe_queues.len()
-        } else {
-            0
-        };
+        let start = self.stripe_probe_start(stripe_queues.len());
         for offset in 0..stripe_queues.len() {
             if claimed_rows.len() >= max_batch as usize {
                 break;
@@ -3628,11 +3633,7 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
         let stripe_queues = self.physical_queues_for_logical(queue);
-        let start = if stripe_queues.len() > 1 {
-            (Utc::now().timestamp_millis() as usize) % stripe_queues.len()
-        } else {
-            0
-        };
+        let start = self.stripe_probe_start(stripe_queues.len());
         for offset in 0..stripe_queues.len() {
             if claimed.len() >= max_batch as usize {
                 break;
@@ -3945,7 +3946,9 @@ impl QueueStorage {
             return Ok(updated.clamp(1, max_claimers.max(1)));
         }
 
-        Ok(current_target.unwrap_or(desired).clamp(1, max_claimers.max(1)))
+        Ok(current_target
+            .unwrap_or(desired)
+            .clamp(1, max_claimers.max(1)))
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]

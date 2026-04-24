@@ -2515,6 +2515,50 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_striped_round_robin";
+    let schema = "awa_qs_striped_round_robin";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 4)
+        .await
+        .expect("Failed to enqueue striped jobs");
+
+    let mut claimed_queues = Vec::new();
+    for _ in 0..4 {
+        let claimed = store
+            .claim_batch(&pool, queue, 1)
+            .await
+            .expect("Failed to claim striped logical queue");
+        assert_eq!(claimed.len(), 1);
+        claimed_queues.push(claimed[0].queue.clone());
+    }
+
+    assert_eq!(
+        claimed_queues,
+        vec![
+            format!("{queue}#0"),
+            format!("{queue}#1"),
+            format!("{queue}#0"),
+            format!("{queue}#1"),
+        ]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
