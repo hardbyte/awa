@@ -10,6 +10,15 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* partitions. This spec models those locks directly so a future
 \* refactor that weakens or re-orders them would trip an invariant.
 \*
+\* ADR-023 extends the locked resources with the claim ring
+\* (claim_ring_state, claim_ring_slots, lease_claims child partitions,
+\* lease_claim_closures child partitions) and the parallel rotate/prune
+\* plans for the claim ring. The claim path now also takes a FOR SHARE
+\* on claim_ring_state and a RowExclusive on the lease_claims child
+\* partition. Closure writes on terminal transitions take a RowExclusive
+\* on the lease_claim_closures child partition that was selected when
+\* the claim was first made.
+\*
 \* What it models:
 \* - each transaction as an ordered sequence of (resource, mode) lock
 \*   acquisitions
@@ -40,7 +49,8 @@ CONSTANTS TxIds,
           Queues,
           Priorities,
           LeaseSlots,
-          ReadySlots
+          ReadySlots,
+          ClaimSlots
 
 \* Lock modes. We collapse the Postgres matrix to S/X because the only
 \* nontrivial compatibility in the claim/rotate/prune paths is FOR
@@ -51,21 +61,8 @@ Modes == {ModeShared, ModeExclusive}
 
 Compatible(held, wanted) == held = ModeShared /\ wanted = ModeShared
 
-\* Resource identities. We use strings for readability in TLC traces.
-QueueLaneRes(q, p) == "queue_lane"
-LeaseRingState == "lease_ring_state"
-LeaseRingSlot(s) == "lease_ring_slot"
-LeaseChild(s) == "lease_child"
-QueueRingState == "queue_ring_state"
-QueueRingSlot(s) == "queue_ring_slot"
-ReadyChild(s) == "ready_child"
-DoneChild(s) == "done_child"
-LeasesParent == "leases_parent"
-
-\* Since identities collapse to strings when TLC renders them, we make
-\* the actual identities concrete by tagging them with the parameter.
-\* TLA+ doesn't have native nominal strings for this, so we model each
-\* parameterised resource as a record. Use records for uniqueness.
+\* Resource identities. We model each parameterised resource as a record
+\* so its identity is uniquely carried by its parameters.
 LaneResource(q, p) == [k |-> "queue_lane", q |-> q, p |-> p]
 LeaseRingStateResource == [k |-> "lease_ring_state"]
 LeaseRingSlotResource(s) == [k |-> "lease_ring_slot", s |-> s]
@@ -75,6 +72,10 @@ QueueRingSlotResource(s) == [k |-> "queue_ring_slot", s |-> s]
 ReadyChildResource(s) == [k |-> "ready_child", s |-> s]
 DoneChildResource(s) == [k |-> "done_child", s |-> s]
 LeasesParentResource == [k |-> "leases_parent"]
+ClaimRingStateResource == [k |-> "claim_ring_state"]
+ClaimRingSlotResource(s) == [k |-> "claim_ring_slot", s |-> s]
+ClaimChildResource(s) == [k |-> "claim_child", s |-> s]
+ClosureChildResource(s) == [k |-> "closure_child", s |-> s]
 
 LaneResources == { LaneResource(q, p) : q \in Queues, p \in Priorities }
 LeaseRingSlotResources == { LeaseRingSlotResource(s) : s \in LeaseSlots }
@@ -82,6 +83,9 @@ LeaseChildResources == { LeaseChildResource(s) : s \in LeaseSlots }
 QueueRingSlotResources == { QueueRingSlotResource(s) : s \in ReadySlots }
 ReadyChildResources == { ReadyChildResource(s) : s \in ReadySlots }
 DoneChildResources == { DoneChildResource(s) : s \in ReadySlots }
+ClaimRingSlotResources == { ClaimRingSlotResource(s) : s \in ClaimSlots }
+ClaimChildResources == { ClaimChildResource(s) : s \in ClaimSlots }
+ClosureChildResources == { ClosureChildResource(s) : s \in ClaimSlots }
 
 Resources ==
     LaneResources \cup
@@ -92,7 +96,11 @@ Resources ==
     QueueRingSlotResources \cup
     ReadyChildResources \cup
     DoneChildResources \cup
-    {LeasesParentResource}
+    {LeasesParentResource} \cup
+    {ClaimRingStateResource} \cup
+    ClaimRingSlotResources \cup
+    ClaimChildResources \cup
+    ClosureChildResources
 
 \* A plan step is [res, mode].
 Step(res, mode) == [res |-> res, mode |-> mode]
@@ -100,20 +108,34 @@ Step(res, mode) == [res |-> res, mode |-> mode]
 \* Transaction kind plans. Each mirrors the actual SQL in
 \* awa-model/src/queue_storage.rs as noted inline.
 
-\* claim_ready_runtime at queue_storage.rs:1647
+\* claim_ready_runtime
 \*   SELECT ... FROM queue_lanes FOR UPDATE (per-priority row)
 \*   CTE lease_ring: SELECT ... FROM lease_ring_state FOR SHARE
+\*   CTE claim_ring: SELECT ... FROM claim_ring_state FOR SHARE (ADR-023)
 \*   SELECT ... FROM ready_entries_SLOT ... (implicit AccessShare on child)
 \*   INSERT INTO leases (routed to current lease partition)
+\*   INSERT INTO lease_claims (routed to current claim partition, ADR-023)
 \* We parameterise the tx by the queue/priority, the ready slot it
-\* reads from, and the lease slot the ring points at when it reads.
-ClaimPlan(q, p, readySlot, leaseSlot) ==
+\* reads from, and the lease/claim slots the rings point at when it reads.
+ClaimPlan(q, p, readySlot, leaseSlot, claimSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
        Step(LeaseRingStateResource, ModeShared),
+       Step(ClaimRingStateResource, ModeShared),
        Step(ReadyChildResource(readySlot), ModeShared),
-       Step(LeaseChildResource(leaseSlot), ModeExclusive) >>
+       Step(LeaseChildResource(leaseSlot), ModeExclusive),
+       Step(ClaimChildResource(claimSlot), ModeExclusive) >>
 
-\* rotate_leases at queue_storage.rs:6184
+\* complete_runtime_batch receipt branch (ADR-023)
+\*   No queue_lanes lock (completion does not gate on a lane row)
+\*   INSERT INTO lease_claim_closures (routed to the originating claim_slot)
+\*   INSERT INTO done_entries / dlq_entries / deferred_entries
+\* We parameterise the tx by the claim slot (carried on the completed
+\* claim) and the ready slot of the terminal row.
+CompletePlan(claimSlot, readySlot) ==
+    << Step(ClosureChildResource(claimSlot), ModeExclusive),
+       Step(DoneChildResource(readySlot), ModeExclusive) >>
+
+\* rotate_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT count(*) FROM lease_child[next_slot] (AccessShare on child)
 \*   UPDATE lease_ring_state / lease_ring_slots
@@ -121,7 +143,7 @@ RotateLeasesPlan(nextSlot) ==
     << Step(LeaseRingStateResource, ModeExclusive),
        Step(LeaseChildResource(nextSlot), ModeShared) >>
 
-\* prune_oldest_leases at queue_storage.rs:6384
+\* prune_oldest_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
 \*   SELECT ... FROM lease_ring_slots[slot] FOR UPDATE
 \*   LOCK TABLE lease_child[slot] ACCESS EXCLUSIVE
@@ -135,7 +157,7 @@ RotateReadyPlan(nextSlot) ==
     << Step(QueueRingStateResource, ModeExclusive),
        Step(ReadyChildResource(nextSlot), ModeShared) >>
 
-\* prune_oldest at queue_storage.rs:6252
+\* prune_oldest
 \*   SELECT ... FROM queue_ring_state FOR UPDATE
 \*   SELECT ... FROM queue_ring_slots FOR UPDATE
 \*   LOCK TABLE ready_child[slot], done_child[slot] ACCESS EXCLUSIVE
@@ -146,6 +168,31 @@ PruneReadyPlan(slot) ==
        Step(ReadyChildResource(slot), ModeExclusive),
        Step(DoneChildResource(slot), ModeExclusive),
        Step(LeasesParentResource, ModeShared) >>
+
+\* rotate_claims (ADR-023)
+\*   SELECT ... FROM claim_ring_state FOR UPDATE
+\*   SELECT count(*) FROM claim_child[next_slot]
+\*   SELECT count(*) FROM closure_child[next_slot]
+\*   UPDATE claim_ring_state
+RotateClaimsPlan(nextSlot) ==
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimChildResource(nextSlot), ModeShared),
+       Step(ClosureChildResource(nextSlot), ModeShared) >>
+
+\* prune_oldest_claims (ADR-023)
+\*   SELECT ... FROM claim_ring_state FOR UPDATE
+\*   SELECT ... FROM claim_ring_slots[slot] FOR UPDATE
+\*   LOCK TABLE claim_child[slot] ACCESS EXCLUSIVE
+\*   LOCK TABLE closure_child[slot] ACCESS EXCLUSIVE
+\*   rescue-before-truncate: close any still-open claims via the
+\*     existing receipt-rescue path (modelled at the data-spec level, no
+\*     extra locks here because the rescue uses the same child AccessExclusive)
+\*   TRUNCATE claim_child[slot] + closure_child[slot]
+PruneClaimsPlan(slot) ==
+    << Step(ClaimRingStateResource, ModeExclusive),
+       Step(ClaimRingSlotResource(slot), ModeExclusive),
+       Step(ClaimChildResource(slot), ModeExclusive),
+       Step(ClosureChildResource(slot), ModeExclusive) >>
 
 VARIABLES
     heldLocks,     \* [resource -> set of <<tx, mode>>]
@@ -179,15 +226,26 @@ BlockingTxsForStep(t, step) ==
 
 \* Start a Claim transaction. Different txs can pick different slots,
 \* exercising the protocol across interleavings.
-StartClaim(t, q, p, readySlot, leaseSlot) ==
+StartClaim(t, q, p, readySlot, leaseSlot, claimSlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
     /\ q \in Queues
     /\ p \in Priorities
     /\ readySlot \in ReadySlots
     /\ leaseSlot \in LeaseSlots
+    /\ claimSlot \in ClaimSlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = ClaimPlan(q, p, readySlot, leaseSlot)]
+    /\ txPlan' = [txPlan EXCEPT ![t] = ClaimPlan(q, p, readySlot, leaseSlot, claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartComplete(t, claimSlot, readySlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ readySlot \in ReadySlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = CompletePlan(claimSlot, readySlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -224,6 +282,24 @@ StartPruneReady(t, slot) ==
     /\ slot \in ReadySlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = PruneReadyPlan(slot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartRotateClaims(t, nextSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ nextSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = RotateClaimsPlan(nextSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartPruneClaims(t, slot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ slot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = PruneClaimsPlan(slot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -267,12 +343,16 @@ Stutter == /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
-         rs \in ReadySlots, ls \in LeaseSlots :
-          StartClaim(t, q, p, rs, ls)
+         rs \in ReadySlots, ls \in LeaseSlots, cs \in ClaimSlots :
+          StartClaim(t, q, p, rs, ls, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots, rs \in ReadySlots :
+          StartComplete(t, cs, rs)
     \/ \E t \in TxIds, ls \in LeaseSlots : StartRotateLeases(t, ls)
     \/ \E t \in TxIds, ls \in LeaseSlots : StartPruneLeases(t, ls)
     \/ \E t \in TxIds, rs \in ReadySlots : StartRotateReady(t, rs)
     \/ \E t \in TxIds, rs \in ReadySlots : StartPruneReady(t, rs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRotateClaims(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)
@@ -328,6 +408,7 @@ TypeOK ==
     /\ Priorities # {}
     /\ LeaseSlots # {}
     /\ ReadySlots # {}
+    /\ ClaimSlots # {}
     /\ heldLocks \in [Resources -> SUBSET (TxIds \X Modes)]
     /\ txState \in [TxIds -> {"idle", "running", "committed"}]
     /\ txNextStep \in [TxIds -> Nat]

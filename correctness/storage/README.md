@@ -19,6 +19,10 @@ It uses the naming set discussed for the redesign:
 - `lease_segments` / `lease_segment_cursor`
 - `dlq_segments` / `dlq_segment_cursor`
 - `terminal_segments` / `terminal_segment_cursor`
+- `claim_segments` / `claim_segment_cursor` (ADR-023: `lease_claims` and
+  `lease_claim_closures` partitioned by `claim_slot`, reclaimed by
+  rotation and `TRUNCATE` instead of the earlier `open_receipt_claims`
+  INSERT+DELETE frontier)
 
 What it models:
 
@@ -38,7 +42,10 @@ What it models:
 - `retry_from_dlq` round trip back to `ready_entries` with `run_lease` reset to 0
 - admin purge of DLQ rows
 - stale completion rejection via per-worker lease snapshots
-- segment rotation and prune safety for ready, deferred, waiting, lease, dlq, **and terminal** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019)
+- segment rotation and prune safety for ready, deferred, waiting, lease, dlq, terminal, **and claim** segment families (retention by partition rotation rather than row-by-row cleanup, per ADR-019 and ADR-023)
+- receipt-plane append-only receipts and closures matched into the same
+  `claim_slot` partition, with `RescueStaleReceipt` modelling Tier-A
+  rescue-before-truncate
 - a second config with two workers to exercise interleavings on the same storage invariants
 
 Heartbeat freshness is tracked at the `active_leases` level (not
@@ -61,6 +68,10 @@ Key safety checks include:
 - pruned terminal segments hold no live terminal rows; terminal rotation
   is deadlock-free and respects the same open/sealed/pruned lifecycle as
   the other families
+- pruned claim segments hold no open receipts (`NoLostClaim`,
+  `PrunedClaimSegmentsAreEmpty` from ADR-023); `PruneClaimSegment`
+  requires every claim in the partition to have a matching closure
+  before `TRUNCATE` fires
 
 What it intentionally does not model:
 

@@ -25,6 +25,11 @@ implementation.
 | `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
+| `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. Pending Phase 2+ implementation. |
+| `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time; pending Phase 4 cutover. |
+| `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. Pending Phase 4. |
+| `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Pending Phase 2. |
+| `claimSegmentCursor` | `{schema}.claim_ring_state.current_slot`. Pending Phase 2. |
 
 The TLA+ model does not represent the cold completed-history rollup cache.
 Rust currently stores that in `{schema}.queue_terminal_rollups`, with
@@ -62,6 +67,9 @@ for backfill / fallback reads during upgrades.
 | `RotateDeferredSegments` / `RotateWaitingSegments` / `RotateLeaseSegments` / `RotateDlqSegments` | parallel maintenance rotate functions per family | analogous `UPDATE *_ring_state` |
 | `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
 | `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family | `TRUNCATE {schema}.X_segment_N` with active-row check |
+| `RotateClaimSegments` | maintenance `rotate_claims` (ADR-023, pending Phase 2) | `UPDATE claim_ring_state SET current_slot = next` with compare-and-swap on `(current_slot, generation)` |
+| `PruneClaimSegment(seg)` | maintenance `prune_oldest_claims` (ADR-023, pending Phase 2+) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `ACCESS EXCLUSIVE` on both `{schema}.lease_claims_N` and `{schema}.lease_claim_closures_N`, rescue-before-truncate for any still-open claim in the partition, then `TRUNCATE` both children |
+| `RescueStaleReceipt(j)` | receipt rescue scan integrated with `prune_oldest_claims` (pending Phase 2+) | anti-join `lease_claims` against `lease_claim_closures` over the active partitions; close stragglers by appending to `lease_claim_closures` |
 
 ## Invariant mapping
 
@@ -78,6 +86,9 @@ for backfill / fallback reads during upgrades.
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
 | `PrunedXSegmentsAreEmpty` | per-family prune requires no live-row precondition before TRUNCATE |
+| `PrunedClaimSegmentsAreEmpty` (ADR-023) | `prune_oldest_claims` requires no open claim in the partition before TRUNCATE; rescue-before-truncate closes stragglers in the same transaction |
+| `NoLostClaim` (ADR-023) | receipts and their closures both live in `claim_slot`-partitioned tables; partitions only truncate once all their receipts are closed, so no open claim is physically dropped |
+| `ClaimOpenAndClosedDisjoint` (ADR-023) | closure insertion and receipt-clearing are a single transaction; a partition's receipt+closure pair is either both present or both dropped by `TRUNCATE` |
 | `LaneStateConsistent` | live availability is derived from `{schema}.ready_entries` plus `{schema}.queue_claim_heads`; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
 
 ## Local runtime note
@@ -274,3 +285,66 @@ has no unique keys, so it simply allows `RetryFromDlq(j)` whenever
 `j \in dlqEntries`. A refinement adding `uniqueKey: Jobs -> UniqueKeys`
 and a `uniqueClaim: UniqueKeys -> Jobs \cup {NoJob}` variable could check
 the invariant directly.
+
+## ADR-023 implementation status (Phase 1: specs ahead of code)
+
+The TLA+ specs now cover the ADR-023 claim-ring redesign ahead of the
+Rust implementation landing. In both the base spec and the race / lock
+specs:
+
+- `claimSegmentOf`, `claimOpen`, `claimClosed`, `claimSegments`,
+  `claimSegmentCursor` track the receipt plane parallel to the existing
+  lease plane.
+- `Claim` now appends a receipt into the current claim segment.
+  Attempt-ending transitions (`FastComplete`, `StatefulComplete`,
+  `FailToDlq`, `RetryToDeferred`, `RescueToReady`,
+  `CancelWaitingToTerminal`, `TimeoutWaitingToDlq`,
+  `TimeoutWaitingToReady`, `ResumeWaitingToReady`) append a closure row
+  in the same partition.
+- `ParkToWaiting` does NOT close the receipt — the attempt is still
+  alive in callback wait; resume/timeout/cancel close it.
+- `RescueStaleReceipt(j)` models Tier-A receipt rescue: force-close a
+  straggler receipt whose attempt is no longer on the ready / leased /
+  waiting lifecycle. This is the rescue-before-truncate precondition
+  that `prune_oldest_claims` will invoke.
+- `RotateClaimSegments` and `PruneClaimSegment(seg)` parallel the
+  lease-ring rotation/prune pattern.
+- `AwaStorageLockOrder` adds `ClaimRingStateResource`,
+  `ClaimRingSlotResource`, `ClaimChildResource`, `ClosureChildResource`;
+  `ClaimPlan` now includes `claim_ring_state FOR SHARE` and
+  `RowExclusive` on the claim child; `CompletePlan`, `RotateClaimsPlan`,
+  and `PruneClaimsPlan` are added.
+- `AwaSegmentedStorageRaces` adds `claimSeg` to the claim-intent
+  snapshot and exposes the claim-ring version of the naive commit race.
+
+Invariants added:
+
+- `OneOpenClaimSegment`, `ClaimCursorIsOpen`,
+  `PrunedClaimSegmentsAreEmpty` (every segment family shape).
+- `NoLostClaim`: every open receipt's segment is not pruned.
+- `ClaimOpenAndClosedDisjoint`, `OpenClaimHasSegment`,
+  `ClosedClaimHasSegment`: the receipt-lifecycle bookkeeping is sound.
+
+Model checking results as of Phase 1:
+
+- `AwaSegmentedStorage.cfg`: 2.3M distinct states, clean.
+- `AwaSegmentedStorageInterleavings.cfg` (2 workers): 4.7M distinct
+  states, clean.
+- `AwaSegmentedStorageTrace.cfg`: snooze trace accepted cleanly.
+- `AwaSegmentedStorageTraceBroken.cfg`: broken trace rejected with the
+  expected deadlock at traceIdx = 2.
+- `AwaSegmentedStorageRaces.cfg`: race exposed
+  (`PrunedLeaseSegmentsAreEmpty` violated — the naive commit lets a row
+  land in a pruned segment). Claim-ring race has the same shape and
+  would trip `PrunedClaimSegmentsAreEmpty` if the state-space search
+  hit it first.
+- `AwaSegmentedStorageRacesSafe.cfg`: safe commit, clean.
+- `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers,
+  clean.
+- `AwaStorageLockOrder.cfg`: 9,680 distinct states, clean (up from
+  2,076 pre-ADR-023 because claim-ring transaction kinds are added).
+- `AwaStorageLockOrderDeadlockDemo.cfg`: still trips `NoDeadlock` in 5
+  steps, confirming the detector works.
+
+Rust function columns in the action/variable tables above are marked
+"pending Phase N" until the corresponding code lands.

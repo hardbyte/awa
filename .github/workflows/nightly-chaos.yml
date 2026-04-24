@@ -12,6 +12,72 @@ env:
   DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
 jobs:
+  tla-storage:
+    name: TLA+ storage model checking
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Docker version
+        run: docker --version
+      - name: AwaSegmentedStorage (1 worker)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
+      - name: AwaSegmentedStorage (2-worker interleavings)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+      - name: AwaSegmentedStorageRaces (race-exposing — expected to fail)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg > /tmp/tlc-races.log 2>&1
+          rc=$?
+          if grep -q "PrunedLeaseSegmentsAreEmpty is violated\|PrunedClaimSegmentsAreEmpty is violated" /tmp/tlc-races.log; then
+            echo "race spec correctly exposes the claim/rotate/prune race"
+            exit 0
+          fi
+          cat /tmp/tlc-races.log
+          exit 1
+      - name: AwaSegmentedStorageRaces (safe commit)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
+      - name: AwaSegmentedStorageRaces (safe commit, 3 workers)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesMultiWorker.cfg
+      - name: AwaSegmentedStorageTrace (snooze trace accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTrace.cfg > /tmp/tlc-trace.log 2>&1
+          rc=$?
+          if grep -q "SnoozeTraceIncomplete is violated" /tmp/tlc-trace.log; then
+            echo "snooze trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (broken trace rejected)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg > /tmp/tlc-trace-broken.log 2>&1
+          rc=$?
+          if grep -q "Deadlock reached" /tmp/tlc-trace-broken.log; then
+            echo "broken trace rejected with expected deadlock"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-broken.log
+          exit 1
+      - name: AwaStorageLockOrder
+        run: ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrder.cfg
+      - name: AwaStorageLockOrder (deadlock-demo — expected to fail)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg > /tmp/tlc-deadlock.log 2>&1
+          rc=$?
+          if grep -q "NoDeadlock is violated" /tmp/tlc-deadlock.log; then
+            echo "deadlock detector is working"
+            exit 0
+          fi
+          cat /tmp/tlc-deadlock.log
+          exit 1
+
   postgres-failover-smoke:
     name: Postgres failover smoke
     runs-on: ubuntu-latest
@@ -270,7 +336,7 @@ jobs:
   # ─── Notify on failure ───────────────────────────────────
   notify-failure:
     name: Create issue on failure
-    needs: [postgres-failover-smoke, rust-nightly, python-nightly]
+    needs: [tla-storage, postgres-failover-smoke, rust-nightly, python-nightly]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -286,6 +352,7 @@ jobs:
           Nightly run failed on $(date -u +%Y-%m-%d).
 
           **Failed jobs:**
+          - tla-storage: ${{ needs.tla-storage.result }}
           - postgres-failover-smoke: ${{ needs.postgres-failover-smoke.result }}
           - rust-nightly: ${{ needs.rust-nightly.result }}
           - python-nightly: ${{ needs.python-nightly.result }}

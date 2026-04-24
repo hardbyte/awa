@@ -273,3 +273,71 @@ posture.
 - `lease-plane-redesign-spike.md` identifies `open_receipt_claims` as the
   compromise that unblocked the receipt-backed path. This ADR is the
   follow-through that the spike anticipated.
+
+## Implementation status
+
+### Phase 1 — TLA+ spec ahead of code (complete)
+
+The TLA+ storage model now covers the claim-ring redesign in advance of
+any Rust changes. Additions:
+
+- `AwaSegmentedStorage.tla` variables: `claimSegmentOf`, `claimOpen`,
+  `claimClosed`, `claimSegments`, `claimSegmentCursor`.
+- `AwaSegmentedStorage.tla` actions: `Claim` opens a receipt; every
+  attempt-ending transition closes one; `ParkToWaiting` keeps receipts
+  open; `RescueStaleReceipt` models Tier-A force-close;
+  `RotateClaimSegments` and `PruneClaimSegment(seg)` mirror the
+  lease-ring rotation/prune pattern.
+- `AwaSegmentedStorage.tla` invariants added: `OneOpenClaimSegment`,
+  `ClaimCursorIsOpen`, `PrunedClaimSegmentsAreEmpty`, `NoLostClaim`,
+  `ClaimOpenAndClosedDisjoint`, `OpenClaimHasSegment`,
+  `ClosedClaimHasSegment`.
+- `AwaSegmentedStorageRaces.tla` extended with a claim-segment snapshot
+  in `claimIntent`, matching rotate/prune actions, and a
+  `PrunedClaimSegmentsAreEmpty` invariant — the race-exposing config
+  still trips (naive commit exposes claim/rotate/prune race), and both
+  safe-commit configs stay clean.
+- `AwaStorageLockOrder.tla` adds `ClaimRingStateResource`,
+  `ClaimRingSlotResource`, `ClaimChildResource`,
+  `ClosureChildResource`; the claim path's `ClaimPlan` takes a `FOR
+  SHARE` on `claim_ring_state` and a `RowExclusive` on the claim child;
+  `CompletePlan`, `RotateClaimsPlan`, and `PruneClaimsPlan` are added.
+  `NoDeadlock` remains clean at 9,680 distinct states (up from 2,076 —
+  reflecting the new transaction kinds and slots).
+
+TLC runs recorded at Phase 1:
+
+- `AwaSegmentedStorage.cfg`: 2.3M distinct states, all invariants pass.
+- `AwaSegmentedStorageInterleavings.cfg` (2 workers): 4.7M distinct
+  states, all invariants pass.
+- `AwaSegmentedStorageTrace.cfg`: snooze trace accepted cleanly.
+- `AwaSegmentedStorageTraceBroken.cfg`: broken trace rejected with
+  expected deadlock at `traceIdx = 2`.
+- `AwaSegmentedStorageRaces.cfg`: race exposed
+  (`PrunedLeaseSegmentsAreEmpty` violated; the claim-ring invariant is
+  at parallel risk and would trip with a different state-space order).
+- `AwaSegmentedStorageRacesSafe.cfg`: safe commit, clean.
+- `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers,
+  clean.
+- `AwaStorageLockOrder.cfg`: 9,680 distinct states, clean.
+- `AwaStorageLockOrderDeadlockDemo.cfg`: still trips `NoDeadlock` in 5
+  steps.
+
+All nine runs are wired into `.github/workflows/nightly-chaos.yml` as a
+dedicated `tla-storage` job that gates nightly runs and is added to the
+failure-notification list. Running locally: `./correctness/run-tlc.sh
+storage/<Spec>.tla [<Cfg>.cfg]`.
+
+`correctness/storage/MAPPING.md` records the action → Rust-function
+correspondence; claim-ring rows are marked "pending Phase N" until the
+matching code lands.
+
+### Phase 2 — Claim-ring control plane (pending)
+
+### Phase 3 — Partition `lease_claims` + `lease_claim_closures`; propagate `claim_slot` (pending)
+
+### Phase 4 — Rewrite the six `open_receipt_claims` SQL sites (pending)
+
+### Phase 5 — Delete `open_receipt_claims` (pending)
+
+### Phase 6 — Make receipts the default, land the validation artifact (pending)
