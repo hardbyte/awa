@@ -1499,6 +1499,26 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // Singleton row is rewritten on every queue rotation. Columns being
+            // updated (current_slot, generation) are not indexed, so a low
+            // fillfactor keeps the update in-page as a HOT update and the
+            // aggressive vacuum threshold reclaims the non-HOT line pointer
+            // churn quickly.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.queue_ring_state SET (
+                fillfactor = 50,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             INSERT INTO {schema}.queue_ring_state (singleton, current_slot, generation, slot_count)
@@ -1525,11 +1545,41 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
+            ALTER TABLE {schema}.queue_ring_slots SET (
+                fillfactor = 70,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
             CREATE TABLE IF NOT EXISTS {schema}.lease_ring_state (
                 singleton      BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
                 current_slot   INT NOT NULL,
                 generation     BIGINT NOT NULL,
                 slot_count     INT NOT NULL
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.lease_ring_state SET (
+                fillfactor = 50,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
             )
             "#
             ))
@@ -1554,6 +1604,21 @@ impl QueueStorage {
             CREATE TABLE IF NOT EXISTS {schema}.lease_ring_slots (
                 slot        INT PRIMARY KEY,
                 generation  BIGINT NOT NULL
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.lease_ring_slots SET (
+                fillfactor = 70,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
             )
             "#
             ))
@@ -1592,6 +1657,24 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // Updated once per enqueue batch to advance next_seq. The primary
+            // key is the only index, and next_seq is not part of it, so a
+            // reduced fillfactor keeps the update HOT on the same page.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.queue_enqueue_heads SET (
+                fillfactor = 70,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             CREATE TABLE IF NOT EXISTS {schema}.queue_claim_heads (
@@ -1599,6 +1682,21 @@ impl QueueStorage {
                 priority        SMALLINT NOT NULL,
                 claim_seq       BIGINT NOT NULL DEFAULT 1,
                 PRIMARY KEY (queue, priority)
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.queue_claim_heads SET (
+                fillfactor = 70,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
             )
             "#
             ))
@@ -1966,6 +2064,25 @@ impl QueueStorage {
                 r#"
             ALTER TABLE {schema}.attempt_state
                 ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Upserted on every heartbeat, deleted on every completion. The PK
+            // is the only index, and all mutable columns (heartbeat_at,
+            // updated_at, progress, callback_*) are outside it, so a reduced
+            // fillfactor keeps heartbeat UPDATEs HOT.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.attempt_state SET (
+                fillfactor = 80,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
             "#
             ))
             .execute(pool)
