@@ -161,7 +161,13 @@ class AsyncClient:
         return await self._raw.retry(job_id)
 
     async def cancel(self, job_id: int) -> Job | None:
-        """Cancel a job."""
+        """Cancel a job.
+
+        Pending/waiting jobs transition to ``cancelled`` immediately.
+        Running jobs are also cancelled in storage, but handler-visible
+        ``job.is_cancelled()`` is primarily driven by shutdown/rescue signals,
+        not by admin cancel alone.
+        """
         return await self._raw.cancel(job_id)
 
     async def cancel_by_unique_key(
@@ -764,7 +770,13 @@ class Client:
         return self._raw.retry_sync(job_id)
 
     def cancel(self, job_id: int) -> Job | None:
-        """Cancel a job."""
+        """Cancel a job.
+
+        Pending/waiting jobs transition to ``cancelled`` immediately.
+        Running jobs are also cancelled in storage, but handler-visible
+        ``job.is_cancelled()`` is primarily driven by shutdown/rescue signals,
+        not by admin cancel alone.
+        """
         return self._raw.cancel_sync(job_id)
 
     def cancel_by_unique_key(

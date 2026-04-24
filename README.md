@@ -264,6 +264,15 @@ let client = Client::builder(pool)
 client.start().await?;
 ```
 
+Cancellation is cooperative for running handlers:
+
+- Rust handlers can poll `ctx.is_cancelled()`.
+- Python handlers can poll `job.is_cancelled()`.
+- Shutdown and runtime rescue paths flip that flag.
+- Admin cancel (`awa::admin::cancel`, `client.cancel`) always updates job state
+  in storage, but a running handler is not currently guaranteed to observe an
+  in-memory cancellation signal from admin cancel alone.
+
 ## Installation
 
 ### Python

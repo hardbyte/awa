@@ -577,6 +577,24 @@ Shutdown uses a phased lifecycle with two cancellation domains (`dispatch_cancel
 
 This ensures in-flight jobs complete (or timeout) with heartbeats still running, preventing other workers from rescuing jobs that are still actively executing.
 
+Cancellation is cooperative:
+
+- Rust handlers observe `ctx.is_cancelled()`.
+- Python handlers observe `job.is_cancelled()`.
+- Shutdown and runtime rescue paths set that in-memory flag so long-running
+  handlers can notice cancellation and exit gracefully.
+
+That is distinct from **admin cancellation**:
+
+- `admin::cancel(...)` / `client.cancel(...)` transitions the job row to
+  `cancelled` in storage.
+- Pending and `waiting_external` jobs cancel immediately.
+- Running jobs are also cancelled in storage, but that storage transition does
+  not currently imply that the in-memory handler cancellation flag has been
+  signalled.
+- If a running handler continues after an admin cancel, its later
+  completion/retry/cancel result is treated as stale and ignored.
+
 ## Periodic/Cron Jobs
 
 Awa supports periodic job scheduling via the `PeriodicJob` API. Schedules are defined in application code, synced to an `awa.cron_jobs` table, and evaluated by the maintenance leader. See [ADR-007](adr/007-periodic-cron-jobs.md) for design rationale.
