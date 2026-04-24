@@ -332,7 +332,51 @@ storage/<Spec>.tla [<Cfg>.cfg]`.
 correspondence; claim-ring rows are marked "pending Phase N" until the
 matching code lands.
 
-### Phase 2 — Claim-ring control plane (pending)
+### Phase 2 — Claim-ring control plane (complete)
+
+Additive, data-plane-quiescent infrastructure that gives the runtime the
+control surface the Phase 3+ migration will attach data to. At end of
+Phase 2 the claim ring exists, rotates, and is scheduled by maintenance,
+but nothing is written to it on the hot path yet.
+
+Shipped:
+
+- `QueueStorageConfig::claim_slot_count` (default `8`, minimum `2`).
+  Thread through to `awa-bench` via `CLAIM_SLOT_COUNT`.
+- `prepare_schema()` adds `{schema}.claim_ring_state` and
+  `{schema}.claim_ring_slots` with the same fillfactor and autovacuum
+  knobs already applied to the lease-ring control plane, seeds the
+  singleton at `(0, 0, claim_slot_count)`, and seeds one open slot plus
+  `slot_count - 1` uninitialized slots.
+- `reset()` re-seeds the ring and includes the new tables in its
+  `TRUNCATE` list so test-cycle resets are clean.
+- `QueueStorage::rotate_claims(pool)` and
+  `QueueStorage::prune_oldest_claims(pool)` mirror the existing
+  `rotate_leases` / `prune_oldest_leases` methods. Phase 2
+  `prune_oldest_claims` deliberately returns `PruneOutcome::Noop`
+  because the data partitions don't exist yet; Phase 3 swaps in the
+  real partition-truncate body.
+- Maintenance leader wires `claim_rotate_interval` into the `select!`
+  loop and invokes `rotate_queue_storage_claims` alongside the queue
+  and lease rotation ticks. Default cadence is `queue_rotate_interval`;
+  tests and benches override via
+  `ClientBuilder::claim_rotate_interval`.
+
+Validation:
+
+- `cargo fmt --all --check` clean.
+- `cargo build --workspace` on `awa-model`, `awa-worker`, `awa`, and
+  `awa-testing` passes. (`awa-cli` has a pre-existing compile error
+  unrelated to ADR-023.)
+- `test_claim_ring_rotates_and_prunes_empty` drives the full Phase 2
+  contract: one rotation cycle through every slot (0→1→2→3→0,
+  generation 0→4), `prune_oldest_claims` stays a `Noop`, `reset()` and
+  `prepare_schema()` stay idempotent.
+- Full `cargo test --test queue_storage_runtime_test` — all 42 tests
+  pass, confirming the additive posture didn't regress any existing
+  lifecycle path.
+- TLC unchanged from Phase 1; the data-plane specs still describe the
+  invariants the Rust code will take on in Phase 3+.
 
 ### Phase 3 — Partition `lease_claims` + `lease_claim_closures`; propagate `claim_slot` (pending)
 

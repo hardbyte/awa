@@ -318,6 +318,10 @@ impl MaintenanceService {
                 .storage
                 .queue_storage()
                 .map(|runtime| tokio::time::interval(runtime.lease_rotate_interval));
+            let mut vacuum_claim_timer = self
+                .storage
+                .queue_storage()
+                .map(|runtime| tokio::time::interval(runtime.claim_rotate_interval));
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -336,6 +340,9 @@ impl MaintenanceService {
                 timer.tick().await;
             }
             if let Some(timer) = &mut vacuum_lease_timer {
+                timer.tick().await;
+            }
+            if let Some(timer) = &mut vacuum_claim_timer {
                 timer.tick().await;
             }
 
@@ -405,6 +412,15 @@ impl MaintenanceService {
                         }
                     }, if vacuum_lease_timer.is_some() => {
                         self.rotate_queue_storage_leases().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut vacuum_claim_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if vacuum_claim_timer.is_some() => {
+                        self.rotate_queue_storage_claims().await;
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -1045,6 +1061,48 @@ impl MaintenanceService {
             }
             Err(err) => {
                 error!(error = %err, "Failed to prune queue storage lease segments");
+            }
+        }
+    }
+
+    /// ADR-023 claim-ring maintenance tick. Rotates the claim-ring cursor
+    /// and prunes the oldest fully-closed partition, mirroring the
+    /// lease-ring rotate/prune pair above. Phase 2 is additive: there are
+    /// no `lease_claims_<slot>` / `lease_claim_closures_<slot>` child
+    /// partitions yet so both operations are essentially no-ops, but the
+    /// timer is wired and exercised now so Phase 3 only needs to swap in
+    /// the real partition bodies.
+    async fn rotate_queue_storage_claims(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+
+        match runtime.store.rotate_claims(&self.pool).await {
+            Ok(RotateOutcome::Rotated { slot, generation }) => {
+                debug!(slot, generation, "Rotated queue storage claim segment");
+            }
+            Ok(RotateOutcome::SkippedBusy { slot }) => {
+                debug!(slot, "Skipped busy queue storage claim segment");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rotate queue storage claim segments");
+                return;
+            }
+        }
+
+        match runtime.store.prune_oldest_claims(&self.pool).await {
+            Ok(PruneOutcome::Noop) => {}
+            Ok(PruneOutcome::Pruned { slot }) => {
+                debug!(slot, "Pruned queue storage claim segment");
+            }
+            Ok(PruneOutcome::Blocked { slot }) => {
+                debug!(slot, "Queue storage claim segment prune blocked");
+            }
+            Ok(PruneOutcome::SkippedActive { slot }) => {
+                debug!(slot, "Queue storage claim segment still active");
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to prune queue storage claim segments");
             }
         }
     }

@@ -16,6 +16,7 @@ use uuid::Uuid;
 const DEFAULT_SCHEMA: &str = "awa_exp";
 const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
 const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
+const DEFAULT_CLAIM_SLOT_COUNT: usize = 8;
 const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
 
@@ -24,6 +25,11 @@ pub struct QueueStorageConfig {
     pub schema: String,
     pub queue_slot_count: usize,
     pub lease_slot_count: usize,
+    /// Number of child partitions the ADR-023 receipt ring splits
+    /// `lease_claims` / `lease_claim_closures` across. Mirrors
+    /// `lease_slot_count`: a small fixed set of slots reclaimed by
+    /// rotation + TRUNCATE rather than by row-level DELETE.
+    pub claim_slot_count: usize,
     pub queue_stripe_count: usize,
     pub experimental_lease_claim_receipts: bool,
 }
@@ -34,6 +40,7 @@ impl Default for QueueStorageConfig {
             schema: DEFAULT_SCHEMA.to_string(),
             queue_slot_count: DEFAULT_QUEUE_SLOT_COUNT,
             lease_slot_count: DEFAULT_LEASE_SLOT_COUNT,
+            claim_slot_count: DEFAULT_CLAIM_SLOT_COUNT,
             queue_stripe_count: DEFAULT_QUEUE_STRIPE_COUNT,
             experimental_lease_claim_receipts: false,
         }
@@ -165,6 +172,19 @@ fn done_child_name(schema: &str, slot: usize) -> String {
 
 fn lease_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.leases_{slot}")
+}
+
+// ADR-023 Phase 3 will partition lease_claims / lease_claim_closures by
+// claim_slot; these helpers will be used by the partition DDL and the
+// rewritten SQL sites at that point.
+#[allow(dead_code)]
+fn claim_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.lease_claims_{slot}")
+}
+
+#[allow(dead_code)]
+fn closure_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.lease_claim_closures_{slot}")
 }
 
 fn oldest_initialized_ring_slot(
@@ -1091,6 +1111,11 @@ impl QueueStorage {
                 "queue storage requires at least 2 lease slots".into(),
             ));
         }
+        if config.claim_slot_count < 2 {
+            return Err(AwaError::Validation(
+                "queue storage requires at least 2 claim slots".into(),
+            ));
+        }
         if config.queue_stripe_count == 0 {
             return Err(AwaError::Validation(
                 "queue storage requires at least 1 queue stripe".into(),
@@ -1124,6 +1149,10 @@ impl QueueStorage {
 
     pub fn lease_slot_count(&self) -> usize {
         self.config.lease_slot_count
+    }
+
+    pub fn claim_slot_count(&self) -> usize {
+        self.config.claim_slot_count
     }
 
     pub fn queue_stripe_count(&self) -> usize {
@@ -1614,6 +1643,80 @@ impl QueueStorage {
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.lease_ring_slots SET (
+                fillfactor = 70,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // ADR-023 claim-ring control plane. Mirrors lease_ring_state /
+            // lease_ring_slots above. The current_slot is the partition that
+            // new `lease_claims` receipts and `lease_claim_closures`
+            // tombstones append into; rotate_claims advances it with a
+            // compare-and-swap on (current_slot, generation); prune_oldest_claims
+            // reclaims older partitions via TRUNCATE.
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.claim_ring_state (
+                singleton      BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+                current_slot   INT NOT NULL,
+                generation     BIGINT NOT NULL,
+                slot_count     INT NOT NULL
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.claim_ring_state SET (
+                fillfactor = 50,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 50,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.claim_ring_state (singleton, current_slot, generation, slot_count)
+            VALUES (TRUE, 0, 0, $1)
+            ON CONFLICT (singleton) DO NOTHING
+            "#
+            ))
+            .bind(self.claim_slot_count() as i32)
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.claim_ring_slots (
+                slot        INT PRIMARY KEY,
+                generation  BIGINT NOT NULL
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.claim_ring_slots SET (
                 fillfactor = 70,
                 autovacuum_vacuum_scale_factor = 0.0,
                 autovacuum_vacuum_threshold = 50,
@@ -2643,6 +2746,21 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
+            for slot in 0..self.claim_slot_count() {
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {schema}.claim_ring_slots (slot, generation)
+                    VALUES ($1, $2)
+                    ON CONFLICT (slot) DO NOTHING
+                    "#
+                ))
+                .bind(slot as i32)
+                .bind(if slot == 0 { 0_i64 } else { -1_i64 })
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+
             Ok(())
         }
         .await;
@@ -2779,7 +2897,8 @@ impl QueueStorage {
                 {schema}.queue_claimer_leases,
                 {schema}.queue_claimer_state,
                 {schema}.queue_ring_slots,
-                {schema}.lease_ring_slots
+                {schema}.lease_ring_slots,
+                {schema}.claim_ring_slots
             "#
         ))
         .execute(tx.as_mut())
@@ -2821,6 +2940,20 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.claim_ring_state
+            SET current_slot = 0,
+                generation = 0,
+                slot_count = $1
+            WHERE singleton = TRUE
+            "#
+        ))
+        .bind(self.claim_slot_count() as i32)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         for slot in 0..self.queue_slot_count() {
             sqlx::query(&format!(
                 r#"
@@ -2839,6 +2972,20 @@ impl QueueStorage {
             sqlx::query(&format!(
                 r#"
                 INSERT INTO {schema}.lease_ring_slots (slot, generation)
+                VALUES ($1, $2)
+                "#
+            ))
+            .bind(slot as i32)
+            .bind(if slot == 0 { 0_i64 } else { -1_i64 })
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        for slot in 0..self.claim_slot_count() {
+            sqlx::query(&format!(
+                r#"
+                INSERT INTO {schema}.claim_ring_slots (slot, generation)
                 VALUES ($1, $2)
                 "#
             ))
@@ -8545,6 +8692,100 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
         Ok(())
+    }
+
+    /// ADR-023 claim-ring rotation. Parallel of `rotate_leases`.
+    ///
+    /// Phase 2 note: `lease_claims` and `lease_claim_closures` are not yet
+    /// partitioned by `claim_slot`, so there is no child partition to
+    /// busy-check against here — every call advances the cursor. Phase 3
+    /// adds the partition busy check to this function so rotation waits
+    /// for the incoming slot to drain before flipping the cursor.
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_claims")]
+    pub async fn rotate_claims(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let state: (i32, i64, i32) = sqlx::query_as(&format!(
+            r#"
+            SELECT current_slot, generation, slot_count
+            FROM {schema}.claim_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let next_slot = (state.0 + 1).rem_euclid(state.2);
+        let next_generation = state.1 + 1;
+
+        let rotated = sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.claim_ring_state
+            SET current_slot = $1,
+                generation = $2
+            WHERE singleton = TRUE
+              AND current_slot = $3
+              AND generation = $4
+            "#
+        ))
+        .bind(next_slot)
+        .bind(next_generation)
+        .bind(state.0)
+        .bind(state.1)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if rotated.rows_affected() == 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(RotateOutcome::Rotated {
+            slot: next_slot,
+            generation: next_generation,
+        })
+    }
+
+    /// ADR-023 claim-ring prune. Parallel of `prune_oldest_leases`.
+    ///
+    /// Phase 2 note: until Phase 3 partitions `lease_claims` /
+    /// `lease_claim_closures` by `claim_slot`, there is no child
+    /// partition to TRUNCATE. This function returns `Noop` in that
+    /// regime after validating that the ring state is reachable. Phase 3
+    /// replaces the body with the real partition-truncate path
+    /// (rescue-before-truncate for any still-open claim, `ACCESS
+    /// EXCLUSIVE` on both the claim and closure children, then
+    /// `TRUNCATE`).
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_claims")]
+    pub async fn prune_oldest_claims(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        let state: (i32, i64, i32) = sqlx::query_as(&format!(
+            r#"
+            SELECT current_slot, generation, slot_count
+            FROM {schema}.claim_ring_state
+            WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        // Pick the oldest sealed slot — Phase 2 can't actually truncate
+        // anything because the partitions don't exist yet, so this is a
+        // no-op that still validates the ring-state lookup path.
+        let Some(_oldest) = oldest_initialized_ring_slot(state.0, state.1, state.2) else {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        };
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(PruneOutcome::Noop)
     }
 
     fn job_id_sequence(&self) -> String {

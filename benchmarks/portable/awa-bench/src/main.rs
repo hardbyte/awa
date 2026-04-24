@@ -7,7 +7,7 @@
 //! - `DATABASE_URL` (required)
 //! - `QUEUE_STORAGE_SCHEMA` — queue_storage schema name (default `awa_exp`)
 //! - `QUEUE_STRIPE_COUNT` — logical queue stripe count (default `1`)
-//! - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` — slot sizing (defaults 16 / 8)
+//! - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` / `CLAIM_SLOT_COUNT` — slot sizing (defaults 16 / 8 / 8)
 //! - `QUEUE_ROTATE_MS` / `LEASE_ROTATE_MS` — rotate intervals (defaults 1000 / 50)
 //!
 //! The adapter defaults to the vacuum-aware queue_storage subsystem but can
@@ -50,6 +50,10 @@ pub(crate) fn queue_storage_config_with_experimental_default(
             .and_then(|v| v.parse().ok())
             .unwrap_or(16),
         lease_slot_count: std::env::var("LEASE_SLOT_COUNT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8),
+        claim_slot_count: std::env::var("CLAIM_SLOT_COUNT")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(8),

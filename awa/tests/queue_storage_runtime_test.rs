@@ -723,6 +723,112 @@ impl Worker for MultiClientTrackingWorker {
     }
 }
 
+/// ADR-023 Phase 2 smoke test. Exercises the claim-ring control plane:
+/// rotate_claims advances the cursor through every slot and cycles back,
+/// prune_oldest_claims stays a no-op (no partitions yet in Phase 2), and
+/// install + reset leaves the ring seeded correctly. Phase 3 will extend
+/// this to cover partition-truncate once lease_claims /
+/// lease_claim_closures become PARTITIONED BY LIST (claim_slot).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_ring_rotates_and_prunes_empty() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_claim_ring";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Seeded state: current_slot = 0, generation = 0, slot_count = 4.
+    let (initial_slot, initial_gen, initial_count): (i32, i64, i32) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation, slot_count FROM {schema}.claim_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read initial claim ring state");
+    assert_eq!(initial_slot, 0);
+    assert_eq!(initial_gen, 0);
+    assert_eq!(initial_count, 4);
+
+    let slot_rows: Vec<(i32, i64)> = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.claim_ring_slots ORDER BY slot"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("read initial claim ring slot rows");
+    assert_eq!(
+        slot_rows,
+        vec![(0, 0), (1, -1), (2, -1), (3, -1)],
+        "seeded slot table should have one open slot and the rest uninitialized"
+    );
+
+    // Rotate four times — should advance cursor 0 -> 1 -> 2 -> 3 -> 0,
+    // generation 0 -> 1 -> 2 -> 3 -> 4.
+    for step in 1..=4_i64 {
+        let outcome = store
+            .rotate_claims(&pool)
+            .await
+            .expect("rotate_claims should succeed");
+        let expected_slot = (step % 4) as i32;
+        match outcome {
+            RotateOutcome::Rotated { slot, generation } => {
+                assert_eq!(slot, expected_slot, "slot at step {step}");
+                assert_eq!(generation, step, "generation at step {step}");
+            }
+            other => panic!("rotate_claims step {step} unexpected outcome: {other:?}"),
+        }
+    }
+
+    // Prune is a no-op until Phase 3 adds partitioned child tables.
+    let prune = store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("prune_oldest_claims should succeed");
+    assert!(
+        matches!(prune, PruneOutcome::Noop),
+        "Phase 2 prune_oldest_claims must be a noop, got {prune:?}"
+    );
+
+    // reset() re-seeds the ring to the initial shape — claim_ring_state
+    // back to (0, 0, N), claim_ring_slots back to one-open-rest-uninit.
+    store.reset(&pool).await.expect("reset should succeed");
+    let (reset_slot, reset_gen, reset_count): (i32, i64, i32) = sqlx::query_as(&format!(
+        "SELECT current_slot, generation, slot_count FROM {schema}.claim_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read claim ring state after reset");
+    assert_eq!(reset_slot, 0);
+    assert_eq!(reset_gen, 0);
+    assert_eq!(reset_count, 4);
+
+    let post_reset_rows: Vec<(i32, i64)> = sqlx::query_as(&format!(
+        "SELECT slot, generation FROM {schema}.claim_ring_slots ORDER BY slot"
+    ))
+    .fetch_all(&pool)
+    .await
+    .expect("read claim ring slot rows after reset");
+    assert_eq!(
+        post_reset_rows,
+        vec![(0, 0), (1, -1), (2, -1), (3, -1)],
+        "reset should restore the seeded claim-ring slot table"
+    );
+
+    // prepare_schema() is idempotent: re-running after reset must not
+    // duplicate rows or fail.
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("prepare_schema should be idempotent");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_retry_after() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -1289,6 +1395,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1302,6 +1409,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
         BlockingCompleteWorker {
             release: release.clone(),
@@ -1383,6 +1491,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             lease_slot_count: 2,
             queue_stripe_count: 4,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1396,6 +1505,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             lease_slot_count: 2,
             queue_stripe_count: 4,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
         BlockingCompleteWorker {
             release: release.clone(),
@@ -1457,6 +1567,7 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1501,6 +1612,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1522,6 +1634,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
                 experimental_lease_claim_receipts: true,
+                claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -1625,6 +1738,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1637,6 +1751,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
         RetryOnceWorker,
     );
@@ -1690,6 +1805,7 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1744,6 +1860,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1776,6 +1893,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
                 experimental_lease_claim_receipts: true,
+                claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -1861,6 +1979,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;
@@ -1882,6 +2001,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
                 experimental_lease_claim_receipts: true,
+                claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -2614,6 +2734,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             experimental_lease_claim_receipts: true,
+            claim_slot_count: 2,
         },
     )
     .await;

@@ -28,8 +28,8 @@ implementation.
 | `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. Pending Phase 2+ implementation. |
 | `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time; pending Phase 4 cutover. |
 | `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. Pending Phase 4. |
-| `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Pending Phase 2. |
-| `claimSegmentCursor` | `{schema}.claim_ring_state.current_slot`. Pending Phase 2. |
+| `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Seeded in `prepare_schema`; rotated by `rotate_claims`. |
+| `claimSegmentCursor` | `{schema}.claim_ring_state.current_slot`. |
 
 The TLA+ model does not represent the cold completed-history rollup cache.
 Rust currently stores that in `{schema}.queue_terminal_rollups`, with
@@ -67,9 +67,9 @@ for backfill / fallback reads during upgrades.
 | `RotateDeferredSegments` / `RotateWaitingSegments` / `RotateLeaseSegments` / `RotateDlqSegments` | parallel maintenance rotate functions per family | analogous `UPDATE *_ring_state` |
 | `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
 | `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family | `TRUNCATE {schema}.X_segment_N` with active-row check |
-| `RotateClaimSegments` | maintenance `rotate_claims` (ADR-023, pending Phase 2) | `UPDATE claim_ring_state SET current_slot = next` with compare-and-swap on `(current_slot, generation)` |
-| `PruneClaimSegment(seg)` | maintenance `prune_oldest_claims` (ADR-023, pending Phase 2+) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `ACCESS EXCLUSIVE` on both `{schema}.lease_claims_N` and `{schema}.lease_claim_closures_N`, rescue-before-truncate for any still-open claim in the partition, then `TRUNCATE` both children |
-| `RescueStaleReceipt(j)` | receipt rescue scan integrated with `prune_oldest_claims` (pending Phase 2+) | anti-join `lease_claims` against `lease_claim_closures` over the active partitions; close stragglers by appending to `lease_claim_closures` |
+| `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`awa-model/src/queue_storage.rs`) wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
+| `PruneClaimSegment(seg)` | maintenance `QueueStorage::prune_oldest_claims` (Phase 2: returns `Noop` because the partitions don't exist yet; Phase 3+ swaps in the real partition-truncate body) | Phase 3 target: `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `ACCESS EXCLUSIVE` on both `{schema}.lease_claims_N` and `{schema}.lease_claim_closures_N`, rescue-before-truncate for any still-open claim in the partition, then `TRUNCATE` both children |
+| `RescueStaleReceipt(j)` | receipt rescue scan integrated with `prune_oldest_claims` (pending Phase 3+) | anti-join `lease_claims` against `lease_claim_closures` over the active partitions; close stragglers by appending to `lease_claim_closures` |
 
 ## Invariant mapping
 
@@ -286,7 +286,7 @@ has no unique keys, so it simply allows `RetryFromDlq(j)` whenever
 and a `uniqueClaim: UniqueKeys -> Jobs \cup {NoJob}` variable could check
 the invariant directly.
 
-## ADR-023 implementation status (Phase 1: specs ahead of code)
+## ADR-023 implementation status (Phase 2: claim-ring control plane)
 
 The TLA+ specs now cover the ADR-023 claim-ring redesign ahead of the
 Rust implementation landing. In both the base spec and the race / lock
@@ -348,3 +348,35 @@ Model checking results as of Phase 1:
 
 Rust function columns in the action/variable tables above are marked
 "pending Phase N" until the corresponding code lands.
+
+### Phase 2 — claim-ring control plane (landed)
+
+The claim-ring control plane is live in the Rust runtime as additive,
+data-plane-quiescent infrastructure:
+
+- `QueueStorageConfig::claim_slot_count` (default `8`, minimum `2`).
+- `prepare_schema()` creates `{schema}.claim_ring_state` and
+  `{schema}.claim_ring_slots` with the same fillfactor and autovacuum
+  knobs the ADR-023 small ring-state tables already use, seeds the
+  singleton row at `(0, 0, claim_slot_count)`, and seeds one open slot
+  plus `slot_count - 1` uninitialized slots. `reset()` re-seeds the
+  same shape.
+- `QueueStorage::rotate_claims(pool)` and
+  `QueueStorage::prune_oldest_claims(pool)` mirror `rotate_leases` and
+  `prune_oldest_leases`. Phase 2 `prune_oldest_claims` returns
+  `PruneOutcome::Noop` because the data partitions don't exist yet;
+  Phase 3 adds the partition-truncate body.
+- The maintenance leader schedules the claim-ring tick alongside the
+  queue and lease rings. `claim_rotate_interval` defaults to
+  `queue_rotate_interval`; tests and benches can override via
+  `ClientBuilder::claim_rotate_interval`.
+
+Unit coverage: `test_claim_ring_rotates_and_prunes_empty` in
+`awa/tests/queue_storage_runtime_test.rs` drives the claim ring through
+one full cycle (current_slot 0→1→2→3→0, generation 0→4), asserts
+`prune_oldest_claims` stays a `Noop`, and verifies `reset()` +
+`prepare_schema()` idempotency.
+
+The full `queue_storage_runtime_test` suite (42 tests) passes with the
+Phase 2 changes in place, confirming the additive-only posture didn't
+regress any existing lifecycle path.

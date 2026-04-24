@@ -131,6 +131,7 @@ async fn create_store(
         schema: schema.to_string(),
         queue_slot_count,
         lease_slot_count,
+        ..Default::default()
     })
     .expect("Failed to create queue_storage soak store");
     recreate_store_schema(pool, &store).await;
@@ -149,6 +150,7 @@ async fn prepare_transition_store(
         schema: schema.to_string(),
         queue_slot_count,
         lease_slot_count,
+        ..Default::default()
     })
     .expect("Failed to create queue_storage transition soak store");
     recreate_store_schema(pool, &store).await;
@@ -480,6 +482,7 @@ fn build_client(
                 schema: schema.to_string(),
                 queue_slot_count,
                 lease_slot_count,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),
@@ -523,6 +526,7 @@ fn build_transition_client(
                 schema: schema.to_string(),
                 queue_slot_count,
                 lease_slot_count,
+                ..Default::default()
             },
             Duration::from_millis(1_000),
             Duration::from_millis(50),

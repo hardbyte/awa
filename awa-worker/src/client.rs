@@ -514,6 +514,20 @@ impl ClientBuilder {
         self
     }
 
+    /// Override the ADR-023 claim-ring rotation cadence.
+    ///
+    /// Defaults to `queue_rotate_interval` so claim partitions age out in
+    /// step with the ready / done partitions they reference. Only takes
+    /// effect when queue storage is active; no-op on the canonical engine.
+    pub fn claim_rotate_interval(mut self, claim_rotate_interval: Duration) -> Self {
+        if let RuntimeStorage::QueueStorage(runtime) = self.storage {
+            self.storage = RuntimeStorage::QueueStorage(
+                runtime.with_claim_rotate_interval(claim_rotate_interval),
+            );
+        }
+        self
+    }
+
     /// Force the worker runtime onto canonical storage.
     ///
     /// This is primarily useful for migration/testing and benchmark
