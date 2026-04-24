@@ -1,3 +1,4 @@
+mod cancel_listener;
 pub mod client;
 mod completion;
 pub mod context;

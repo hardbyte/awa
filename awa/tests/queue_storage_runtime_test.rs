@@ -864,6 +864,123 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .expect("prepare_schema should be idempotent");
 }
 
+/// Admin-cancel wakes an in-flight handler via the `awa:cancel`
+/// NOTIFY channel. A slow handler checks `ctx.is_cancelled()` and exits
+/// with a cancel result as soon as the flag flips. The test enqueues a
+/// slow job, waits for it to reach Running, issues
+/// `admin::cancel(job_id)` on a separate connection, and asserts the
+/// handler observed the cancellation (via a shared atomic) within a
+/// tight timeout — proving the NOTIFY → listener → in-flight-flag
+/// plumbing is live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_admin_cancel_wakes_in_flight_handler() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let schema = "awa_qs_admin_cancel_wake";
+    let queue = "qs_admin_cancel_wake";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Shared across the handler and the test: the handler sets
+    // `observed_cancel` to true the moment `ctx.is_cancelled()` flips.
+    let running = Arc::new(tokio::sync::Notify::new());
+    let observed_cancel = Arc::new(AtomicBool::new(false));
+
+    struct CancelObservingWorker {
+        running: Arc<tokio::sync::Notify>,
+        observed_cancel: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for CancelObservingWorker {
+        fn kind(&self) -> &'static str {
+            "complete_job"
+        }
+
+        async fn perform(&self, ctx: &JobContext) -> Result<JobResult, JobError> {
+            // Tell the test harness we're alive.
+            self.running.notify_waiters();
+            // Poll the cancel flag every 50ms for up to 10s. As soon as
+            // it flips, record and return Cancel.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                if ctx.is_cancelled() {
+                    self.observed_cancel.store(true, Ordering::SeqCst);
+                    return Ok(JobResult::Cancel("admin cancelled".to_string()));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Ok(JobResult::Completed)
+        }
+    }
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            experimental_lease_claim_receipts: false,
+        },
+        CancelObservingWorker {
+            running: running.clone(),
+            observed_cancel: observed_cancel.clone(),
+        },
+    );
+    client.start().await.expect("client start");
+
+    // Wait for the handler to actually start executing.
+    tokio::time::timeout(Duration::from_secs(5), running.notified())
+        .await
+        .expect("handler should start running");
+
+    // Issue an admin cancel on a fresh connection — this is what an
+    // operator running `awa_model::admin::cancel` in another process
+    // would do.
+    awa::model::admin::cancel(&pool, job_id)
+        .await
+        .expect("admin::cancel should succeed on running job");
+
+    // Within a reasonable window the handler should have observed
+    // `ctx.is_cancelled() == true` via the NOTIFY-driven listener.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        if observed_cancel.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        observed_cancel.load(Ordering::SeqCst),
+        "handler must observe admin cancellation via NOTIFY → in-flight flag"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
 /// ADR-023 Phase 4 regression test. After Phase 4 the hot path never
 /// writes to `open_receipt_claims` — the partitioned `lease_claims` is
 /// the authoritative record of "currently open" and every read site

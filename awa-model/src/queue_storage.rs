@@ -5362,6 +5362,57 @@ impl QueueStorage {
         Ok(rows)
     }
 
+    /// Write a `cancelled` closure row for any matching open receipt.
+    /// Idempotent: no-op if no lease_claims row exists for the
+    /// `(job_id, run_lease)` pair, or if a closure already exists. Used
+    /// by the admin cancel path to keep the receipt plane consistent
+    /// with the job's new terminal state so rescue doesn't revive it.
+    async fn close_receipt_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        outcome: &str,
+    ) -> Result<(), AwaError> {
+        let schema = self.schema();
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+            SELECT claims.claim_slot, claims.job_id, claims.run_lease, $3, clock_timestamp()
+            FROM {schema}.lease_claims AS claims
+            WHERE claims.job_id = $1 AND claims.run_lease = $2
+            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+            "#
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .bind(outcome)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Emit a `pg_notify('awa:cancel', ...)` inside the cancel
+    /// transaction so any worker runtime currently executing this
+    /// `(job_id, run_lease)` learns about the cancellation on commit
+    /// and fires its in-flight cancel flag. Notifications are
+    /// automatically discarded on rollback.
+    async fn notify_cancellation_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+    ) -> Result<(), AwaError> {
+        let payload = serde_json::json!({ "job_id": job_id, "run_lease": run_lease }).to_string();
+        sqlx::query("SELECT pg_notify('awa:cancel', $1)")
+            .bind(payload)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
     async fn cancel_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5466,7 +5517,167 @@ impl QueueStorage {
                 .await?;
             self.adjust_lane_counts(tx, &lease.queue, lease.priority, 0, 0)
                 .await?;
+            // Receipt-plane consistency: close any matching open
+            // receipt so the ADR-023 anti-join no longer considers this
+            // attempt live, and rescue doesn't try to revive it.
+            self.close_receipt_tx(tx, lease.job_id, lease.run_lease, "cancelled")
+                .await?;
+            // Wake any worker currently executing this attempt.
+            self.notify_cancellation_tx(tx, lease.job_id, lease.run_lease)
+                .await?;
             return Ok(Some(done.into_job_row()?));
+        }
+
+        // ADR-023 receipt-only cancel: the job may be running on a
+        // receipt-backed short path that never materialized a `leases`
+        // row. Find it by anti-joining lease_claims with
+        // lease_claim_closures, cancel it by writing a closure and a
+        // done row, and notify listening workers.
+        if self.experimental_lease_claim_receipts() {
+            let receipt: Option<(
+                i32,
+                i64,
+                i32,
+                i64,
+                String,
+                i16,
+                i16,
+                i16,
+                i64,
+                DateTime<Utc>,
+            )> = sqlx::query_as(&format!(
+                r#"
+                    SELECT
+                        claims.claim_slot,
+                        claims.run_lease,
+                        claims.ready_slot,
+                        claims.ready_generation,
+                        claims.queue,
+                        claims.priority,
+                        claims.attempt,
+                        claims.max_attempts,
+                        claims.lane_seq,
+                        claims.claimed_at
+                    FROM {schema}.lease_claims AS claims
+                    WHERE claims.job_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                          WHERE closures.claim_slot = claims.claim_slot
+                            AND closures.job_id = claims.job_id
+                            AND closures.run_lease = claims.run_lease
+                      )
+                    ORDER BY claims.run_lease DESC
+                    LIMIT 1
+                    FOR UPDATE OF claims SKIP LOCKED
+                    "#
+            ))
+            .bind(job_id)
+            .fetch_optional(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if let Some((
+                claim_slot,
+                run_lease,
+                ready_slot,
+                ready_generation,
+                queue,
+                priority,
+                attempt,
+                max_attempts,
+                lane_seq,
+                claimed_at,
+            )) = receipt
+            {
+                // Hydrate the ready row so we can synthesize the done
+                // row with the original args/payload.
+                let ready_match: Option<ReadyTransitionRow> = sqlx::query_as(&format!(
+                    r#"
+                    SELECT
+                        ready_slot,
+                        ready_generation,
+                        job_id,
+                        kind,
+                        queue,
+                        args,
+                        priority,
+                        attempt,
+                        run_lease,
+                        max_attempts,
+                        lane_seq,
+                        run_at,
+                        attempted_at,
+                        created_at,
+                        unique_key,
+                        unique_states,
+                        payload
+                    FROM {schema}.ready_entries
+                    WHERE job_id = $1
+                      AND ready_slot = $2
+                      AND ready_generation = $3
+                      AND queue = $4
+                      AND priority = $5
+                      AND lane_seq = $6
+                    "#
+                ))
+                .bind(job_id)
+                .bind(ready_slot)
+                .bind(ready_generation)
+                .bind(&queue)
+                .bind(priority)
+                .bind(lane_seq)
+                .fetch_optional(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                let Some(ready) = ready_match else {
+                    // Shouldn't happen — the claim references a ready
+                    // row. Fall through to the deferred / not-found
+                    // branches.
+                    return Ok(None);
+                };
+
+                let done = DoneJobRow {
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    kind: ready.kind,
+                    queue: queue.clone(),
+                    args: ready.args,
+                    state: JobState::Cancelled,
+                    priority,
+                    attempt,
+                    run_lease,
+                    max_attempts,
+                    lane_seq,
+                    run_at: ready.run_at,
+                    attempted_at: Some(claimed_at),
+                    finalized_at: Utc::now(),
+                    created_at: ready.created_at,
+                    unique_key: ready.unique_key,
+                    unique_states: ready.unique_states,
+                    payload: ready.payload,
+                };
+                self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Running))
+                    .await?;
+                // Write the closure row into the same claim partition.
+                sqlx::query(&format!(
+                    r#"
+                    INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                    VALUES ($1, $2, $3, 'cancelled', clock_timestamp())
+                    ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                    "#
+                ))
+                .bind(claim_slot)
+                .bind(job_id)
+                .bind(run_lease)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                self.adjust_lane_counts(tx, &queue, priority, 0, 0).await?;
+                self.notify_cancellation_tx(tx, job_id, run_lease).await?;
+                return Ok(Some(done.into_job_row()?));
+            }
         }
 
         let deferred: Option<DeferredJobRow> = sqlx::query_as(&format!(

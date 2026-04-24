@@ -433,7 +433,24 @@ pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErr
             .map(Some);
     }
 
-    sqlx::query_as::<_, JobRow>(
+    // Cancel the row and capture its prior state. If we moved it out
+    // of `running` / `waiting_external`, NOTIFY listening workers so
+    // the handler currently executing it can learn about the
+    // cancellation and stop cleanly.
+    let mut tx = pool.begin().await?;
+
+    let prior_state: Option<JobState> =
+        sqlx::query_scalar::<_, JobState>("SELECT state FROM awa.jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+
+    let Some(prior_state) = prior_state else {
+        tx.rollback().await.ok();
+        return Err(AwaError::JobNotFound { id: job_id });
+    };
+
+    let job: Option<JobRow> = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
         SET state = 'cancelled', finalized_at = now(),
@@ -445,10 +462,25 @@ pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaErr
         "#,
     )
     .bind(job_id)
-    .fetch_optional(pool)
-    .await?
-    .ok_or(AwaError::JobNotFound { id: job_id })
-    .map(Some)
+    .fetch_optional(tx.as_mut())
+    .await?;
+
+    let Some(job) = job else {
+        tx.rollback().await.ok();
+        return Err(AwaError::JobNotFound { id: job_id });
+    };
+
+    if matches!(prior_state, JobState::Running | JobState::WaitingExternal) {
+        let payload =
+            serde_json::json!({ "job_id": job.id, "run_lease": job.run_lease }).to_string();
+        sqlx::query("SELECT pg_notify('awa:cancel', $1)")
+            .bind(payload)
+            .execute(tx.as_mut())
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(Some(job))
 }
 
 /// Cancel a job by its unique key components.

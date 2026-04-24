@@ -1217,6 +1217,19 @@ impl Client {
             reporter.run().await;
         }));
 
+        // Admin cancellation listener: fires the in-flight cancel flag
+        // for any locally-running attempt when an admin issues
+        // `cancel(job_id)` on the DB. Uses `service_cancel` so it
+        // shuts down alongside the other background services.
+        let cancel_listener = crate::cancel_listener::CancelListener::new(
+            self.pool.clone(),
+            self.in_flight.clone(),
+            self.service_cancel.clone(),
+        );
+        service_handles.push(tokio::spawn(async move {
+            cancel_listener.run().await;
+        }));
+
         info!("Awa worker runtime started");
         Ok(())
     }
