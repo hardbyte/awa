@@ -279,15 +279,37 @@ async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
         .expect("Failed to count lease_claims")
 }
 
+/// Count of receipt-backed attempts that are currently "open" — claimed
+/// but not yet closed (completed, rescued, or materialized into a live
+/// lease row). ADR-023 Phase 4 moves the source of truth from the
+/// `open_receipt_claims` table to a derived anti-join on the
+/// partitioned `lease_claims` + `lease_claim_closures` tables, which
+/// matches the runtime's new queries exactly. The pre-existing
+/// assertions that used to read `open_receipt_claims` now read this
+/// derived set.
 async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
+    let schema = store.schema();
     let sql = format!(
-        "SELECT count(*)::bigint FROM {}.open_receipt_claims",
-        store.schema()
+        r#"
+        SELECT count(*)::bigint
+        FROM {schema}.lease_claims AS claims
+        WHERE NOT EXISTS (
+            SELECT 1 FROM {schema}.lease_claim_closures AS closures
+            WHERE closures.claim_slot = claims.claim_slot
+              AND closures.job_id = claims.job_id
+              AND closures.run_lease = claims.run_lease
+        )
+          AND NOT EXISTS (
+            SELECT 1 FROM {schema}.leases AS lease
+            WHERE lease.job_id = claims.job_id
+              AND lease.run_lease = claims.run_lease
+        )
+        "#,
     );
     sqlx::query_scalar::<_, i64>(&sql)
         .fetch_one(pool)
         .await
-        .expect("Failed to count open_receipt_claims")
+        .expect("Failed to count open receipt claims (derived)")
 }
 
 async fn lease_claim_closure_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
@@ -611,6 +633,19 @@ impl Worker for BlockingCompleteWorker {
     }
 }
 
+struct CompleteWorker;
+
+#[async_trait::async_trait]
+impl Worker for CompleteWorker {
+    fn kind(&self) -> &'static str {
+        "complete_job"
+    }
+
+    async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+        Ok(JobResult::Completed)
+    }
+}
+
 struct ReceiptRescueWorker {
     release: Arc<tokio::sync::Notify>,
 }
@@ -827,6 +862,107 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .prepare_schema(&pool)
         .await
         .expect("prepare_schema should be idempotent");
+}
+
+/// ADR-023 Phase 4 regression test. After Phase 4 the hot path never
+/// writes to `open_receipt_claims` — the partitioned `lease_claims` is
+/// the authoritative record of "currently open" and every read site
+/// derives that set via an anti-join with `lease_claim_closures`. Run
+/// a full claim + complete cycle on a receipt-backed short job and
+/// assert `open_receipt_claims` stays at zero rows at every observable
+/// point, while `lease_claims` and `lease_claim_closures` reflect the
+/// lifecycle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_phase4_no_writes_to_open_receipt_claims() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_phase4_no_orc";
+    let queue = "qs_phase4_no_orc";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            experimental_lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 42 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Raw-table count (not the derived helper) — this is what we want
+    // to stay zero after Phase 4.
+    async fn raw_open_receipt_count(pool: &sqlx::PgPool, schema: &str) -> i64 {
+        let sql = format!("SELECT count(*)::bigint FROM {schema}.open_receipt_claims");
+        sqlx::query_scalar::<_, i64>(&sql)
+            .fetch_one(pool)
+            .await
+            .expect("count open_receipt_claims")
+    }
+
+    assert_eq!(
+        raw_open_receipt_count(&pool, schema).await,
+        0,
+        "open_receipt_claims must be empty on a fresh schema"
+    );
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            queue_stripe_count: 1,
+            experimental_lease_claim_receipts: true,
+        },
+        CompleteWorker,
+    );
+    client.start().await.expect("start client");
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+
+    // The lifecycle left trace in the partitioned tables...
+    assert_eq!(
+        lease_claim_count(&pool, &store).await,
+        1,
+        "the single receipt must live in lease_claims"
+    );
+    assert_eq!(
+        lease_claim_closure_count(&pool, &store).await,
+        1,
+        "the completion must have written a closure row"
+    );
+
+    // ...but never in open_receipt_claims.
+    assert_eq!(
+        raw_open_receipt_count(&pool, schema).await,
+        0,
+        "ADR-023 Phase 4 invariant: open_receipt_claims must never receive writes"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// ADR-023 Phase 3 smoke test. A receipt-backed claim + completion

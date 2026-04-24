@@ -1428,36 +1428,13 @@ impl QueueStorage {
                             claim_rows.attempt,
                             claim_rows.run_lease,
                             claim_rows.max_attempts
-                    ),
-                    opened AS (
-                        INSERT INTO {schema}.open_receipt_claims (
-                            claim_slot,
-                            job_id,
-                            run_lease,
-                            ready_slot,
-                            ready_generation,
-                            queue,
-                            priority,
-                            attempt,
-                            max_attempts,
-                            lane_seq,
-                            claimed_at
-                        )
-                        SELECT
-                            claimed.claim_slot,
-                            claimed.job_id,
-                            claimed.run_lease,
-                            claimed.ready_slot,
-                            claimed.ready_generation,
-                            claimed.queue,
-                            claimed.priority,
-                            claimed.attempt,
-                            claimed.max_attempts,
-                            claimed.lane_seq,
-                            clock_timestamp()
-                        FROM claimed
-                        ON CONFLICT ON CONSTRAINT open_receipt_claims_pkey DO NOTHING
                     )
+                    -- ADR-023 Phase 4f: the legacy `opened AS (INSERT
+                    -- INTO open_receipt_claims ...)` CTE is gone. The
+                    -- partitioned lease_claims row above IS the
+                    -- authoritative record of "currently open"; every
+                    -- other receipt-plane query reads it anti-joined
+                    -- with lease_claim_closures.
                     "#
                 )
             } else {
@@ -4653,6 +4630,15 @@ impl QueueStorage {
             let mut updated_all = Vec::new();
 
             if !receipt_claimed.is_empty() {
+                // ADR-023 Phase 4: claim_slot rides along on
+                // `ClaimedEntry`, so the closure INSERT no longer needs
+                // to join against open_receipt_claims to discover it.
+                // Pass (claim_slot, job_id, run_lease) triples directly
+                // and let Postgres route to the correct partition.
+                let receipt_claim_slots: Vec<i32> = receipt_claimed
+                    .iter()
+                    .map(|entry| entry.claim.claim_slot)
+                    .collect();
                 let receipt_job_ids: Vec<i64> =
                     receipt_claimed.iter().map(|entry| entry.job.id).collect();
                 let receipt_run_leases: Vec<i64> = receipt_claimed
@@ -4661,30 +4647,21 @@ impl QueueStorage {
                     .collect();
                 let updated: Vec<(i64, i64)> = sqlx::query_as(&format!(
                     r#"
-                    WITH completed(job_id, run_lease) AS (
-                        SELECT * FROM unnest($1::bigint[], $2::bigint[])
+                    WITH completed(claim_slot, job_id, run_lease) AS (
+                        SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[])
                     ),
                     inserted AS (
                         INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-                        SELECT open_claims.claim_slot, open_claims.job_id, open_claims.run_lease, 'completed', clock_timestamp()
-                        FROM {schema}.open_receipt_claims AS open_claims
-                        JOIN completed
-                          ON completed.job_id = open_claims.job_id
-                         AND completed.run_lease = open_claims.run_lease
+                        SELECT completed.claim_slot, completed.job_id, completed.run_lease, 'completed', clock_timestamp()
+                        FROM completed
                         ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                         RETURNING job_id, run_lease
-                    ),
-                    removed_open AS (
-                        DELETE FROM {schema}.open_receipt_claims AS open_claims
-                        USING inserted
-                        WHERE open_claims.job_id = inserted.job_id
-                          AND open_claims.run_lease = inserted.run_lease
-                        RETURNING open_claims.job_id
                     )
                     SELECT job_id, run_lease
                     FROM inserted
                     "#
                 ))
+                .bind(&receipt_claim_slots)
                 .bind(&receipt_job_ids)
                 .bind(&receipt_run_leases)
                 .fetch_all(tx.as_mut())
@@ -5071,10 +5048,20 @@ impl QueueStorage {
                           AND state = 'running'
                     ), 0)
                     +
+                    -- ADR-023 Phase 4: derive the receipt-backed running
+                    -- count from lease_claims anti-joined with
+                    -- lease_claim_closures, so the query never reads the
+                    -- legacy open_receipt_claims frontier.
                     COALESCE((
                         SELECT count(*)::bigint
-                        FROM {schema}.open_receipt_claims
-                        WHERE queue = ANY($1)
+                        FROM {schema}.lease_claims AS claims
+                        WHERE claims.queue = ANY($1)
+                          AND NOT EXISTS (
+                              SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                              WHERE closures.claim_slot = claims.claim_slot
+                                AND closures.job_id = claims.job_id
+                                AND closures.run_lease = claims.run_lease
+                          )
                     ), 0)
                 )::bigint AS running
             ),
@@ -5820,7 +5807,12 @@ impl QueueStorage {
                 WHERE singleton = TRUE
             ),
             claim_refs AS (
+                -- ADR-023 Phase 4: source claim metadata directly from
+                -- the partitioned lease_claims table anti-joined against
+                -- lease_claim_closures, instead of the legacy
+                -- open_receipt_claims frontier.
                 SELECT
+                    claims.claim_slot,
                     claims.job_id,
                     claims.run_lease,
                     claims.ready_slot,
@@ -5831,11 +5823,17 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.claimed_at
-                FROM {schema}.open_receipt_claims AS claims
+                FROM {schema}.lease_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
                  AND inflight.run_lease = claims.run_lease
-                FOR UPDATE
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
+                FOR UPDATE OF claims
             ),
             already_live AS (
                 SELECT claim_refs.job_id, claim_refs.run_lease
@@ -5902,17 +5900,6 @@ impl QueueStorage {
                 WHERE claims.job_id = moved.job_id
                   AND claims.run_lease = moved.run_lease
                 RETURNING claims.job_id
-            ),
-            removed_open AS (
-                DELETE FROM {schema}.open_receipt_claims AS open_claims
-                USING (
-                    SELECT job_id, run_lease FROM inserted
-                    UNION
-                    SELECT job_id, run_lease FROM already_live
-                ) AS moved
-                WHERE open_claims.job_id = moved.job_id
-                  AND open_claims.run_lease = moved.run_lease
-                RETURNING open_claims.job_id
             )
             SELECT count(*)::bigint FROM marked
             "#
@@ -5956,12 +5943,22 @@ impl QueueStorage {
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
             ),
             claim_refs AS (
+                -- ADR-023 Phase 4: source open-claim identity from
+                -- lease_claims anti-joined against lease_claim_closures
+                -- rather than from the legacy open_receipt_claims
+                -- frontier.
                 SELECT claims.job_id, claims.run_lease
-                FROM {schema}.open_receipt_claims AS claims
+                FROM {schema}.lease_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
                  AND inflight.run_lease = claims.run_lease
-                FOR UPDATE
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
+                FOR UPDATE OF claims
             ),
             upserted AS (
                 INSERT INTO {schema}.attempt_state (job_id, run_lease, heartbeat_at, updated_at)
@@ -6014,12 +6011,20 @@ impl QueueStorage {
                 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[])
             ),
             claim_refs AS (
+                -- ADR-023 Phase 4: same anti-join pattern as the
+                -- heartbeat-only path above.
                 SELECT claims.job_id, claims.run_lease, inflight.progress
-                FROM {schema}.open_receipt_claims AS claims
+                FROM {schema}.lease_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
                  AND inflight.run_lease = claims.run_lease
-                FOR UPDATE
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
+                FOR UPDATE OF claims
             ),
             upserted AS (
                 INSERT INTO {schema}.attempt_state (
@@ -6224,6 +6229,10 @@ impl QueueStorage {
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH target AS (
+                -- ADR-023 Phase 4: target is the open claim identified
+                -- from the partitioned lease_claims table anti-joined
+                -- against lease_claim_closures, instead of a lookup into
+                -- the legacy open_receipt_claims frontier.
                 SELECT
                     claims.claim_slot,
                     claims.ready_slot,
@@ -6237,10 +6246,16 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.claimed_at AS attempted_at
-                FROM {schema}.open_receipt_claims AS claims
+                FROM {schema}.lease_claims AS claims
                 WHERE claims.job_id = $1
                   AND claims.run_lease = $2
-                FOR UPDATE
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claims.claim_slot
+                        AND closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
+                FOR UPDATE OF claims
             ),
             inserted AS (
                 INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
@@ -6248,13 +6263,6 @@ impl QueueStorage {
                 FROM target
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 RETURNING job_id, run_lease
-            ),
-            removed_open AS (
-                DELETE FROM {schema}.open_receipt_claims AS open_claims
-                USING inserted
-                WHERE open_claims.job_id = inserted.job_id
-                  AND open_claims.run_lease = inserted.run_lease
-                RETURNING open_claims.job_id
             )
             SELECT
                 target.ready_slot,
@@ -6355,6 +6363,9 @@ impl QueueStorage {
         let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH stale_claims AS (
+                -- ADR-023 Phase 4: rescue scans partitioned lease_claims
+                -- anti-joined with lease_claim_closures so the receipt
+                -- rescue path no longer depends on open_receipt_claims.
                 SELECT
                     claims.claim_slot,
                     claims.ready_slot,
@@ -6368,11 +6379,17 @@ impl QueueStorage {
                     claims.max_attempts,
                     claims.lane_seq,
                     claims.claimed_at AS attempted_at
-                FROM {schema}.open_receipt_claims AS claims
+                FROM {schema}.lease_claims AS claims
                 LEFT JOIN {schema}.attempt_state AS attempt
                   ON attempt.job_id = claims.job_id
                  AND attempt.run_lease = claims.run_lease
                 WHERE COALESCE(attempt.heartbeat_at, claims.claimed_at) < $1
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claims.claim_slot
+                        AND closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
                 ORDER BY COALESCE(attempt.heartbeat_at, claims.claimed_at) ASC
                 LIMIT 500
                 FOR UPDATE OF claims SKIP LOCKED
@@ -6383,13 +6400,6 @@ impl QueueStorage {
                 FROM stale_claims
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 RETURNING job_id, run_lease
-            ),
-            removed_open AS (
-                DELETE FROM {schema}.open_receipt_claims AS open_claims
-                USING inserted
-                WHERE open_claims.job_id = inserted.job_id
-                  AND open_claims.run_lease = inserted.run_lease
-                RETURNING open_claims.job_id
             )
             SELECT
                 stale_claims.ready_slot,
@@ -6535,6 +6545,9 @@ impl QueueStorage {
             candidates.push(row.into_job_row()?);
         }
 
+        // ADR-023 Phase 4: report receipt-backed attempts as running by
+        // anti-joining lease_claims against lease_claim_closures rather
+        // than reading the legacy open_receipt_claims frontier.
         let lease_claim_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -6567,7 +6580,7 @@ impl QueueStorage {
                 ready.payload,
                 attempt.progress,
                 attempt.callback_result
-            FROM {schema}.open_receipt_claims AS claims
+            FROM {schema}.lease_claims AS claims
             JOIN {schema}.ready_entries AS ready
               ON ready.ready_slot = claims.ready_slot
              AND ready.ready_generation = claims.ready_generation
@@ -6578,6 +6591,20 @@ impl QueueStorage {
               ON attempt.job_id = claims.job_id
              AND attempt.run_lease = claims.run_lease
             WHERE claims.job_id = $1
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                  WHERE closures.claim_slot = claims.claim_slot
+                    AND closures.job_id = claims.job_id
+                    AND closures.run_lease = claims.run_lease
+              )
+              -- Exclude claims that have already been materialized into
+              -- leases — the lease-backed branch above already reports
+              -- those.
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.leases AS lease
+                  WHERE lease.job_id = claims.job_id
+                    AND lease.run_lease = claims.run_lease
+              )
             ORDER BY claims.run_lease DESC
             "#,
         ))

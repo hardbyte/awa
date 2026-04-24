@@ -427,7 +427,60 @@ Validation:
   `lease_claims_N_job_id_run_lease_idx` (plus the closure pair) on
   every child partition.
 
-### Phase 4 — Rewrite the six `open_receipt_claims` SQL sites (pending)
+### Phase 4 — Rewrite the `open_receipt_claims` SQL sites (complete)
+
+After Phase 4 the runtime never reads or writes `open_receipt_claims`
+on the hot path. The partitioned `lease_claims` table is the
+authoritative record of "currently open"; every query that used to
+target `open_receipt_claims` now does a bounded anti-join against
+`lease_claim_closures`. The table still exists — dropped in Phase 5 —
+but is untouched by the hot path.
+
+Rewritten sites (originally six, one more surfaced under test as the
+`load_job` receipt branch — plus two closely related heartbeat/progress
+upsert paths):
+
+- `queue_counts_exact` `live_running` CTE: anti-join-based count of
+  receipt-backed attempts instead of a `count(*) FROM
+  open_receipt_claims` subquery.
+- `ensure_running_leases_from_receipts_tx`: `claim_refs` CTE now
+  selects from `lease_claims` anti-joined with
+  `lease_claim_closures`; the trailing `removed_open` DELETE is
+  dropped.
+- `upsert_attempt_state_heartbeat_from_receipts_tx` and
+  `upsert_attempt_state_progress_from_receipts_tx`: same anti-join
+  pattern for the upsert paths that materialize `attempt_state`.
+- `close_open_receipt_claim_tx`: `target` CTE sources the open claim
+  from `lease_claims` anti-joined with closures, routes the closure
+  INSERT to the matching partition via `claim_slot`.
+- `rescue_stale_receipt_claims_tx`: `stale_claims` CTE similarly
+  rewritten; `removed_open` DELETE dropped.
+- `complete_runtime_batch` receipt branch: the `completed` CTE now
+  carries `(claim_slot, job_id, run_lease)` triples directly from
+  `ClaimedEntry`, so the closure INSERT routes by partition key
+  without reading `open_receipt_claims` at all. Strictly cheaper than
+  the pre-Phase-4 path.
+- `load_job` receipt branch: reports receipt-backed attempts as
+  Running by anti-joining `lease_claims` with closures and excluding
+  any that already have a materialized lease row.
+
+Phase 4f: the claim CTE no longer emits the `opened AS (INSERT INTO
+open_receipt_claims ...)` sibling. The partitioned `lease_claims`
+insert is the sole authoritative claim record.
+
+Validation:
+
+- `cargo fmt --all --check`, `cargo build`, `cargo test` clean.
+- `test_phase4_no_writes_to_open_receipt_claims` locks in the
+  invariant: a full claim + complete cycle on a receipt-backed short
+  job leaves `open_receipt_claims` at zero rows throughout.
+- Full `queue_storage_runtime_test` suite: 46/46 pass (Phase 3's 45 +
+  the new Phase 4 regression test).
+- The test helper `open_receipt_claim_count` is now a derived
+  anti-join query — all existing assertions that used to count
+  `open_receipt_claims` rows continue to pass because they were really
+  checking the "currently open receipt" invariant, which now lives in
+  `lease_claims` minus `lease_claim_closures`.
 
 ### Phase 5 — Delete `open_receipt_claims` (pending)
 

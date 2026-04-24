@@ -286,7 +286,7 @@ has no unique keys, so it simply allows `RetryFromDlq(j)` whenever
 and a `uniqueClaim: UniqueKeys -> Jobs \cup {NoJob}` variable could check
 the invariant directly.
 
-## ADR-023 implementation status (Phase 3: partitioned receipt plane)
+## ADR-023 implementation status (Phase 4: receipt queries derived from lease_claims)
 
 The TLA+ specs now cover the ADR-023 claim-ring redesign ahead of the
 Rust implementation landing. In both the base spec and the race / lock
@@ -348,6 +348,49 @@ Model checking results as of Phase 1:
 
 Rust function columns in the action/variable tables above are marked
 "pending Phase N" until the corresponding code lands.
+
+### Phase 4 — every read derives "currently open" from lease_claims anti-join closures (landed)
+
+After Phase 4 the runtime never reads or writes `open_receipt_claims`
+on the hot path. The partitioned `lease_claims` table is the
+authoritative record of "currently open"; every query that used to
+target `open_receipt_claims` now does a bounded anti-join against
+`lease_claim_closures` over the active partitions.
+
+Seven SQL sites rewritten:
+
+1. `queue_counts_exact` (`awa-model/src/queue_storage.rs`,
+   `live_running` CTE): running count of receipt-backed attempts
+   derives from the anti-join.
+2. `ensure_running_leases_from_receipts_tx` (claim → lease
+   materialization): `claim_refs` CTE now selects from lease_claims
+   anti-joined with closures; `removed_open` DELETE is dropped.
+3. `upsert_attempt_state_heartbeat_from_receipts_tx`: same pattern for
+   the heartbeat-only upsert path.
+4. `upsert_attempt_state_progress_from_receipts_tx`: same for the
+   progress-flush upsert.
+5. `close_open_receipt_claim_tx`: `target` CTE now sources the open
+   claim from lease_claims anti-joined with closures; the closure INSERT
+   targets the matching partition via `claim_slot`.
+6. `rescue_stale_receipt_claims_tx`: `stale_claims` CTE similarly
+   rewritten; `removed_open` DELETE removed.
+7. `complete_runtime_batch` receipt branch: the `completed` CTE now
+   carries `(claim_slot, job_id, run_lease)` triples directly from
+   `ClaimedEntry`, so the closure INSERT routes by partition key
+   without reading open_receipt_claims at all.
+8. `load_job` receipt branch: reports receipt-backed attempts as
+   Running by anti-joining lease_claims with closures and excluding
+   any that already have a materialized lease row.
+
+Phase 4f: the claim CTE no longer emits the `opened AS (INSERT INTO
+open_receipt_claims ...)` sibling. The partitioned `lease_claims`
+insert is the authoritative claim record.
+
+The `open_receipt_claims` table still exists (to be dropped in Phase
+5) but is untouched by the hot path. ADR-023 Phase 4 regression test
+`test_phase4_no_writes_to_open_receipt_claims` locks this in by
+running a full claim + complete cycle and asserting
+`open_receipt_claims` stays at zero rows throughout.
 
 ### Phase 3 — partitioned lease_claims + lease_claim_closures (landed)
 
