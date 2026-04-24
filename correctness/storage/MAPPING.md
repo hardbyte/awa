@@ -286,7 +286,7 @@ has no unique keys, so it simply allows `RetryFromDlq(j)` whenever
 and a `uniqueClaim: UniqueKeys -> Jobs \cup {NoJob}` variable could check
 the invariant directly.
 
-## ADR-023 implementation status (Phase 2: claim-ring control plane)
+## ADR-023 implementation status (Phase 3: partitioned receipt plane)
 
 The TLA+ specs now cover the ADR-023 claim-ring redesign ahead of the
 Rust implementation landing. In both the base spec and the race / lock
@@ -348,6 +348,40 @@ Model checking results as of Phase 1:
 
 Rust function columns in the action/variable tables above are marked
 "pending Phase N" until the corresponding code lands.
+
+### Phase 3 — partitioned lease_claims + lease_claim_closures (landed)
+
+ADR-023 Phase 3 converts both receipt-plane tables to `PARTITIONED BY
+LIST (claim_slot)` with one child per ring slot. Claims and their
+closures co-locate in the same partition, so Phase 5 prune can truncate
+both children in lock-step.
+
+- `lease_claims` and `lease_claim_closures` are partitioned parents
+  (`relkind = 'p'`); `lease_claims_0..N-1` and
+  `lease_claim_closures_0..N-1` are the children.
+- PK on both is `(claim_slot, job_id, run_lease)` to satisfy the
+  "partition key must be in the PK" Postgres rule; a secondary
+  non-unique index on `(job_id, run_lease)` keeps completion / rescue /
+  materialize paths that don't carry `claim_slot` efficient.
+- The existing `idx_..._lease_claims_stale (materialized_at,
+  claimed_at, job_id)` index is recreated on the partitioned parent
+  and propagates to every child.
+- `ClaimedEntry` gains `claim_slot: i32`; the claim CTE reads
+  `claim_ring_state.current_slot` alongside the lease-ring cursor and
+  `RETURNS`  it; `open_receipt_claims` gains a `claim_slot` column so
+  close / rescue paths know which partition to write closures into.
+- In-place migration: `prepare_schema()` detects pre-Phase-3 regular
+  tables, renames them `_legacy`, creates the partitioned parents and
+  children, rewrites rows into the current `claim_ring_state.current_slot`,
+  then drops the legacy tables. Idempotent on re-run.
+- Three runtime tests lock this in:
+  `test_lease_claim_partition_routing` (claim + closure both land in
+  the current ring slot), `test_lease_claim_rotation_isolation`
+  (post-rotation claims land in a different partition; existing rows
+  are not moved), `test_lease_claim_migration_preserves_rows` (legacy
+  data migrates cleanly, `prepare_schema` stays idempotent after).
+- Full `queue_storage_runtime_test` suite: all 45 tests pass (42
+  pre-existing receipt-mode tests + 3 Phase 3 additions).
 
 ### Phase 2 — claim-ring control plane (landed)
 

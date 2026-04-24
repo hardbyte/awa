@@ -56,6 +56,11 @@ pub struct ClaimedEntry {
     pub ready_generation: i64,
     pub lease_slot: i32,
     pub lease_generation: i64,
+    /// ADR-023: the `claim_slot` partition this attempt's
+    /// `lease_claims` receipt landed in. The completion path uses this
+    /// to target the matching `lease_claim_closures` partition when
+    /// writing the closure tombstone.
+    pub claim_slot: i32,
     pub lease_claim_receipt: bool,
 }
 
@@ -174,15 +179,10 @@ fn lease_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.leases_{slot}")
 }
 
-// ADR-023 Phase 3 will partition lease_claims / lease_claim_closures by
-// claim_slot; these helpers will be used by the partition DDL and the
-// rewritten SQL sites at that point.
-#[allow(dead_code)]
 fn claim_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claims_{slot}")
 }
 
-#[allow(dead_code)]
 fn closure_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.lease_claim_closures_{slot}")
 }
@@ -449,6 +449,7 @@ struct ReadyJobLeaseRow {
     lane_seq: i64,
     lease_slot: i32,
     lease_generation: i64,
+    claim_slot: i32,
     job_id: i64,
     kind: String,
     queue: String,
@@ -478,6 +479,7 @@ impl ReadyJobLeaseRow {
             ready_generation: self.ready_generation,
             lease_slot: self.lease_slot,
             lease_generation: self.lease_generation,
+            claim_slot: self.claim_slot,
             lease_claim_receipt,
         }
     }
@@ -1384,8 +1386,14 @@ impl QueueStorage {
             let claimed_cte = if self.experimental_lease_claim_receipts() {
                 format!(
                     r#"
+                    claim_ring AS (
+                        SELECT current_slot AS claim_slot
+                        FROM {schema}.claim_ring_state
+                        WHERE singleton = TRUE
+                    ),
                     claimed AS (
                         INSERT INTO {schema}.lease_claims AS claim_rows (
+                            claim_slot,
                             job_id,
                             run_lease,
                             ready_slot,
@@ -1397,6 +1405,7 @@ impl QueueStorage {
                             lane_seq
                         )
                         SELECT
+                            claim_ring.claim_slot,
                             selected.job_id,
                             selected.run_lease + 1,
                             selected.ready_slot,
@@ -1407,7 +1416,9 @@ impl QueueStorage {
                             selected.max_attempts,
                             selected.lane_seq
                         FROM selected
+                        CROSS JOIN claim_ring
                         RETURNING
+                            claim_rows.claim_slot,
                             claim_rows.ready_slot,
                             claim_rows.ready_generation,
                             claim_rows.job_id,
@@ -1420,6 +1431,7 @@ impl QueueStorage {
                     ),
                     opened AS (
                         INSERT INTO {schema}.open_receipt_claims (
+                            claim_slot,
                             job_id,
                             run_lease,
                             ready_slot,
@@ -1432,6 +1444,7 @@ impl QueueStorage {
                             claimed_at
                         )
                         SELECT
+                            claimed.claim_slot,
                             claimed.job_id,
                             claimed.run_lease,
                             claimed.ready_slot,
@@ -1448,6 +1461,10 @@ impl QueueStorage {
                     "#
                 )
             } else {
+                // Non-receipts path doesn't write to lease_claims, so
+                // claim_slot is meaningless here. We still emit a
+                // placeholder value so the outer SELECT can reference
+                // `claimed.claim_slot` unconditionally.
                 format!(
                     r#"
                     claimed AS (
@@ -1487,6 +1504,7 @@ impl QueueStorage {
                         FROM selected
                         CROSS JOIN lease_ring
                         RETURNING
+                            0::int AS claim_slot,
                             lease_rows.ready_slot,
                             lease_rows.ready_generation,
                             lease_rows.lease_slot,
@@ -1996,9 +2014,64 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // ADR-023 Phase 3: `lease_claims` and `lease_claim_closures`
+            // become partitioned by `claim_slot`. Fresh installs create the
+            // partitioned parents directly; existing installs with regular
+            // tables take the in-place migration path (rename → create
+            // partitioned → copy → drop legacy). Idempotent: re-running on
+            // an already-partitioned table is a no-op.
+            let claim_slot_count = self.claim_slot_count();
+
+            // Detect the current shape of lease_claims / lease_claim_closures.
+            let lease_claims_relkind: Option<String> = sqlx::query_scalar(
+                r#"
+                SELECT c.relkind::text
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = $1 AND c.relname = 'lease_claims'
+                "#,
+            )
+            .bind(schema)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let closures_relkind: Option<String> = sqlx::query_scalar(
+                r#"
+                SELECT c.relkind::text
+                FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = $1 AND c.relname = 'lease_claim_closures'
+                "#,
+            )
+            .bind(schema)
+            .fetch_optional(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Regular tables → rename aside before creating the partitioned
+            // parent. Partitioned or absent → do nothing.
+            if lease_claims_relkind.as_deref() == Some("r") {
+                sqlx::query(&format!(
+                    "ALTER TABLE {schema}.lease_claims RENAME TO lease_claims_legacy"
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+            if closures_relkind.as_deref() == Some("r") {
+                sqlx::query(&format!(
+                    "ALTER TABLE {schema}.lease_claim_closures RENAME TO lease_claim_closures_legacy"
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+
             sqlx::query(&format!(
                 r#"
             CREATE TABLE IF NOT EXISTS {schema}.lease_claims (
+                claim_slot        INT NOT NULL,
                 job_id            BIGINT NOT NULL,
                 run_lease         BIGINT NOT NULL,
                 ready_slot        INT NOT NULL,
@@ -2010,23 +2083,26 @@ impl QueueStorage {
                 lane_seq          BIGINT NOT NULL,
                 claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 materialized_at   TIMESTAMPTZ,
-                PRIMARY KEY (job_id, run_lease)
-            )
+                PRIMARY KEY (claim_slot, job_id, run_lease)
+            ) PARTITION BY LIST (claim_slot)
             "#
             ))
             .execute(pool)
             .await
             .map_err(map_sqlx_error)?;
 
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.lease_claims
-                ADD COLUMN IF NOT EXISTS materialized_at TIMESTAMPTZ
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
+            for slot in 0..claim_slot_count {
+                sqlx::query(&format!(
+                    r#"
+                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.lease_claims
+                FOR VALUES IN ({slot})
+                "#,
+                    claim_child_name(schema, slot)
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
 
             sqlx::query(&format!(
                 r#"
@@ -2037,6 +2113,68 @@ impl QueueStorage {
             .execute(pool)
             .await
             .map_err(map_sqlx_error)?;
+
+            // Secondary index on (job_id, run_lease) for completion /
+            // materialize / rescue paths that don't carry claim_slot in
+            // hand. Propagates to every child partition.
+            sqlx::query(&format!(
+                r#"
+            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_job_run
+                ON {schema}.lease_claims (job_id, run_lease)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Phase 3 in-place migration: move existing rows into the
+            // partitioned parent. Every legacy row lands in the
+            // current claim_slot — the ring rotates naturally and
+            // existing receipts will close (or be force-rescued) on
+            // their normal lifecycle. Guarded by EXISTS so fresh
+            // installs skip it.
+            let lease_claims_legacy_exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = $1 AND c.relname = 'lease_claims_legacy'
+                )
+                "#,
+            )
+            .bind(schema)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if lease_claims_legacy_exists {
+                sqlx::query(&format!(
+                    r#"
+                INSERT INTO {schema}.lease_claims (
+                    claim_slot, job_id, run_lease, ready_slot, ready_generation,
+                    queue, priority, attempt, max_attempts, lane_seq,
+                    claimed_at, materialized_at
+                )
+                SELECT
+                    (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton),
+                    job_id, run_lease, ready_slot, ready_generation,
+                    queue, priority, attempt, max_attempts, lane_seq,
+                    claimed_at, materialized_at
+                FROM {schema}.lease_claims_legacy
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                "#
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    "DROP TABLE {schema}.lease_claims_legacy"
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
 
             sqlx::query(&format!(
                 r#"
@@ -2051,8 +2189,37 @@ impl QueueStorage {
                 max_attempts      SMALLINT NOT NULL,
                 lane_seq          BIGINT NOT NULL,
                 claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                claim_slot        INT NOT NULL DEFAULT 0,
                 PRIMARY KEY (job_id, run_lease)
             )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Existing installs that already have `open_receipt_claims`
+            // without the `claim_slot` column gain it here. New rows will
+            // carry the claim_slot the claim CTE sees; legacy rows are
+            // backfilled to the current claim_ring_state.current_slot so
+            // their close path writes closures into the matching
+            // lease_claim_closures partition.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.open_receipt_claims
+                ADD COLUMN IF NOT EXISTS claim_slot INT NOT NULL DEFAULT 0
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            UPDATE {schema}.open_receipt_claims
+            SET claim_slot = (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton)
+            WHERE claim_slot = 0
+              AND EXISTS (SELECT 1 FROM {schema}.claim_ring_state WHERE singleton AND current_slot <> 0)
             "#
             ))
             .execute(pool)
@@ -2082,17 +2249,83 @@ impl QueueStorage {
             sqlx::query(&format!(
                 r#"
             CREATE TABLE IF NOT EXISTS {schema}.lease_claim_closures (
+                claim_slot        INT NOT NULL,
                 job_id            BIGINT NOT NULL,
                 run_lease         BIGINT NOT NULL,
                 outcome           TEXT NOT NULL,
                 closed_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                PRIMARY KEY (job_id, run_lease)
-            )
+                PRIMARY KEY (claim_slot, job_id, run_lease)
+            ) PARTITION BY LIST (claim_slot)
             "#
             ))
             .execute(pool)
             .await
             .map_err(map_sqlx_error)?;
+
+            for slot in 0..claim_slot_count {
+                sqlx::query(&format!(
+                    r#"
+                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.lease_claim_closures
+                FOR VALUES IN ({slot})
+                "#,
+                    closure_child_name(schema, slot)
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+
+            // Secondary index on (job_id, run_lease) mirroring the one on
+            // lease_claims — completion / rescue sites that don't have
+            // claim_slot in hand still find closures via this index.
+            sqlx::query(&format!(
+                r#"
+            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claim_closures_job_run
+                ON {schema}.lease_claim_closures (job_id, run_lease)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let closures_legacy_exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = $1 AND c.relname = 'lease_claim_closures_legacy'
+                )
+                "#,
+            )
+            .bind(schema)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if closures_legacy_exists {
+                sqlx::query(&format!(
+                    r#"
+                INSERT INTO {schema}.lease_claim_closures (
+                    claim_slot, job_id, run_lease, outcome, closed_at
+                )
+                SELECT
+                    (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton),
+                    job_id, run_lease, outcome, closed_at
+                FROM {schema}.lease_claim_closures_legacy
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                "#
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    "DROP TABLE {schema}.lease_claim_closures_legacy"
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
 
             // Backfill the bounded live frontier so schema upgrades do not
             // strand already-running receipt-backed claims on the historical
@@ -2100,6 +2333,7 @@ impl QueueStorage {
             sqlx::query(&format!(
                 r#"
             INSERT INTO {schema}.open_receipt_claims (
+                claim_slot,
                 job_id,
                 run_lease,
                 ready_slot,
@@ -2112,6 +2346,7 @@ impl QueueStorage {
                 claimed_at
             )
             SELECT
+                claims.claim_slot,
                 claims.job_id,
                 claims.run_lease,
                 claims.ready_slot,
@@ -2509,6 +2744,7 @@ impl QueueStorage {
                 lane_seq BIGINT,
                 lease_slot INT,
                 lease_generation BIGINT,
+                claim_slot INT,
                 job_id BIGINT,
                 kind TEXT,
                 queue TEXT,
@@ -2665,6 +2901,7 @@ impl QueueStorage {
                     claimed.lane_seq,
                     lease_ring.lease_slot,
                     lease_ring.lease_generation,
+                    claimed.claim_slot,
                     selected.job_id,
                     selected.kind,
                     selected.queue,
@@ -3112,6 +3349,7 @@ impl QueueStorage {
                 lane_seq,
                 lease_slot,
                 lease_generation,
+                claim_slot,
                 job_id,
                 kind,
                 queue,
@@ -4427,13 +4665,13 @@ impl QueueStorage {
                         SELECT * FROM unnest($1::bigint[], $2::bigint[])
                     ),
                     inserted AS (
-                        INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
-                        SELECT open_claims.job_id, open_claims.run_lease, 'completed', clock_timestamp()
+                        INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                        SELECT open_claims.claim_slot, open_claims.job_id, open_claims.run_lease, 'completed', clock_timestamp()
                         FROM {schema}.open_receipt_claims AS open_claims
                         JOIN completed
                           ON completed.job_id = open_claims.job_id
                          AND completed.run_lease = open_claims.run_lease
-                        ON CONFLICT (job_id, run_lease) DO NOTHING
+                        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                         RETURNING job_id, run_lease
                     ),
                     removed_open AS (
@@ -5987,6 +6225,7 @@ impl QueueStorage {
             r#"
             WITH target AS (
                 SELECT
+                    claims.claim_slot,
                     claims.ready_slot,
                     claims.ready_generation,
                     claims.job_id,
@@ -6004,10 +6243,10 @@ impl QueueStorage {
                 FOR UPDATE
             ),
             inserted AS (
-                INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
-                SELECT target.job_id, target.run_lease, $3, clock_timestamp()
+                INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                SELECT target.claim_slot, target.job_id, target.run_lease, $3, clock_timestamp()
                 FROM target
-                ON CONFLICT (job_id, run_lease) DO NOTHING
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 RETURNING job_id, run_lease
             ),
             removed_open AS (
@@ -6117,6 +6356,7 @@ impl QueueStorage {
             r#"
             WITH stale_claims AS (
                 SELECT
+                    claims.claim_slot,
                     claims.ready_slot,
                     claims.ready_generation,
                     claims.job_id,
@@ -6138,10 +6378,10 @@ impl QueueStorage {
                 FOR UPDATE OF claims SKIP LOCKED
             ),
             inserted AS (
-                INSERT INTO {schema}.lease_claim_closures (job_id, run_lease, outcome, closed_at)
-                SELECT stale_claims.job_id, stale_claims.run_lease, 'rescued', clock_timestamp()
+                INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                SELECT stale_claims.claim_slot, stale_claims.job_id, stale_claims.run_lease, 'rescued', clock_timestamp()
                 FROM stale_claims
-                ON CONFLICT (job_id, run_lease) DO NOTHING
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 RETURNING job_id, run_lease
             ),
             removed_open AS (

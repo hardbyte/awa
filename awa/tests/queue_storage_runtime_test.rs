@@ -829,6 +829,448 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .expect("prepare_schema should be idempotent");
 }
 
+/// ADR-023 Phase 3 smoke test. A receipt-backed claim + completion
+/// cycle lands rows in the expected child partitions of `lease_claims`
+/// and `lease_claim_closures`, and both rows share the same
+/// `claim_slot` so the closure co-locates with the claim it tombstones.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lease_claim_partition_routing() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_claim_partition_routing";
+    let queue = "qs_claim_partition_routing";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            experimental_lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Rotate the claim ring forward so the current slot is not zero —
+    // this proves the claim CTE actually reads claim_ring_state rather
+    // than defaulting.
+    for _ in 0..2 {
+        store
+            .rotate_claims(&pool)
+            .await
+            .expect("rotate_claims should succeed");
+    }
+    let current_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read current claim slot");
+    assert_eq!(
+        current_slot, 2,
+        "ring should be at slot 2 after two rotations"
+    );
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 777 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            queue_stripe_count: 1,
+            experimental_lease_claim_receipts: true,
+        },
+        RetryOnceWorker,
+    );
+    client.start().await.expect("client start");
+
+    let _completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+
+    // Assert claim and closure both live in claim_slot = 2, and in the
+    // matching physical child partition.
+    let claim_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 ORDER BY run_lease DESC LIMIT 1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read claim_slot from lease_claims");
+    assert_eq!(claim_slot, 2, "claim row should land in current slot");
+
+    let closure_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT claim_slot FROM {schema}.lease_claim_closures WHERE job_id = $1 ORDER BY closed_at DESC LIMIT 1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("read claim_slot from lease_claim_closures");
+    assert_eq!(
+        closure_slot, claim_slot,
+        "closure must live in the same partition as its originating claim"
+    );
+
+    // Physically: both rows must be addressable via their child-partition names.
+    let claim_in_child: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claims_2 WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count in lease_claims_2");
+    assert!(claim_in_child >= 1, "claim row must be in lease_claims_2");
+
+    let closure_in_child: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closures_2 WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("count in lease_claim_closures_2");
+    assert!(
+        closure_in_child >= 1,
+        "closure row must be in lease_claim_closures_2"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// ADR-023 Phase 3 rotation-isolation check. A claim landed in slot A
+/// before rotation stays in slot A. After rotation, a fresh claim lands
+/// in slot B. Neither disturbs the other — partitioning and ring state
+/// are consistent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lease_claim_rotation_isolation() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_claim_rotation_isolation";
+    let queue = "qs_claim_rotation_isolation";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            experimental_lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let job_a = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            queue_stripe_count: 1,
+            experimental_lease_claim_receipts: true,
+        },
+        RetryOnceWorker,
+    );
+    client.start().await.expect("client start");
+
+    let _ = wait_for_job_state(
+        &store,
+        &pool,
+        job_a,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let slot_a: i32 = sqlx::query_scalar(&format!(
+        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 LIMIT 1"
+    ))
+    .bind(job_a)
+    .fetch_one(&pool)
+    .await
+    .expect("read slot_a");
+
+    // Rotate the ring so subsequent claims land in a different partition.
+    store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate_claims between jobs");
+
+    let job_b = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _ = wait_for_job_state(
+        &store,
+        &pool,
+        job_b,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+
+    let slot_b: i32 = sqlx::query_scalar(&format!(
+        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 LIMIT 1"
+    ))
+    .bind(job_b)
+    .fetch_one(&pool)
+    .await
+    .expect("read slot_b");
+    assert_ne!(
+        slot_a, slot_b,
+        "job B (post-rotation) must land in a different claim_slot than job A"
+    );
+
+    // Job A is still exactly where it was written — rotation didn't
+    // mutate existing rows.
+    let job_a_slot_still: i32 = sqlx::query_scalar(&format!(
+        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 LIMIT 1"
+    ))
+    .bind(job_a)
+    .fetch_one(&pool)
+    .await
+    .expect("read slot_a still");
+    assert_eq!(
+        slot_a, job_a_slot_still,
+        "rotation must not move existing claim rows across partitions"
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// ADR-023 Phase 3 migration test. Start from a schema that still has
+/// the pre-Phase-3 regular (non-partitioned) `lease_claims` +
+/// `lease_claim_closures`, seed some rows in them, run `prepare_schema`,
+/// and assert:
+/// - both parents are now partitioned (`relkind = 'p'`)
+/// - all pre-existing rows landed in the current `claim_ring_state` slot
+/// - the legacy tables are dropped
+/// Validates the rename → create partitioned → copy → drop path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_lease_claim_migration_preserves_rows() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_claim_migration";
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("drop schema");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create schema");
+
+    // Stand up the pre-Phase-3 regular-table shape so the migration path
+    // runs on `prepare_schema`.
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE {schema}.lease_claims (
+            job_id BIGINT NOT NULL,
+            run_lease BIGINT NOT NULL,
+            ready_slot INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue TEXT NOT NULL,
+            priority SMALLINT NOT NULL,
+            attempt SMALLINT NOT NULL,
+            max_attempts SMALLINT NOT NULL,
+            lane_seq BIGINT NOT NULL,
+            claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            materialized_at TIMESTAMPTZ,
+            PRIMARY KEY (job_id, run_lease)
+        )
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("legacy lease_claims");
+
+    sqlx::query(&format!(
+        r#"
+        CREATE TABLE {schema}.lease_claim_closures (
+            job_id BIGINT NOT NULL,
+            run_lease BIGINT NOT NULL,
+            outcome TEXT NOT NULL,
+            closed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            PRIMARY KEY (job_id, run_lease)
+        )
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("legacy lease_claim_closures");
+
+    for job_id in 1..=5_i64 {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.lease_claims
+                (job_id, run_lease, ready_slot, ready_generation, queue,
+                 priority, attempt, max_attempts, lane_seq, claimed_at, materialized_at)
+            VALUES ($1, 1, 0, 0, 'legacy', 2, 1, 25, $1, now(), NULL)
+            "#
+        ))
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("seed lease_claims row");
+    }
+    for job_id in [1_i64, 2] {
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.lease_claim_closures
+                (job_id, run_lease, outcome, closed_at)
+            VALUES ($1, 1, 'completed', now())
+            "#
+        ))
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("seed closure row");
+    }
+
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 4,
+        ..Default::default()
+    })
+    .expect("construct store");
+
+    reset_shared_awa_state(&pool).await;
+    storage::abort(&pool)
+        .await
+        .expect("reset storage transition state");
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("prepare_schema with legacy data");
+
+    // Both parents are partitioned now.
+    for name in ["lease_claims", "lease_claim_closures"] {
+        let relkind: String = sqlx::query_scalar(
+            r#"
+            SELECT c.relkind::text FROM pg_class c
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE n.nspname = $1 AND c.relname = $2
+            "#,
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .expect("relkind lookup");
+        assert_eq!(
+            relkind, "p",
+            "{name} must be partitioned after prepare_schema"
+        );
+    }
+
+    // Legacy tables are dropped.
+    for name in ["lease_claims_legacy", "lease_claim_closures_legacy"] {
+        let exists: bool = sqlx::query_scalar(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = $1 AND c.relname = $2
+            )
+            "#,
+        )
+        .bind(schema)
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .expect("legacy table existence");
+        assert!(!exists, "{name} must be dropped after migration");
+    }
+
+    // All pre-existing rows landed in current claim_slot.
+    let current_slot: i32 = sqlx::query_scalar(&format!(
+        "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read current slot");
+
+    let claims_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claims WHERE claim_slot = $1"
+    ))
+    .bind(current_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("count migrated claims");
+    assert_eq!(
+        claims_count, 5,
+        "all 5 legacy claim rows must migrate into current_slot"
+    );
+
+    let closures_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closures WHERE claim_slot = $1"
+    ))
+    .bind(current_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("count migrated closures");
+    assert_eq!(
+        closures_count, 2,
+        "both legacy closure rows must migrate into current_slot"
+    );
+
+    // prepare_schema is idempotent: second call on the already-partitioned
+    // tables is a no-op and doesn't duplicate or drop rows.
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("prepare_schema idempotent after migration");
+
+    let claims_count_after: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims"))
+            .fetch_one(&pool)
+            .await
+            .expect("count claims after idempotent call");
+    assert_eq!(
+        claims_count_after, 5,
+        "idempotent prepare must not duplicate"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_runtime_retry_after() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;

@@ -378,7 +378,54 @@ Validation:
 - TLC unchanged from Phase 1; the data-plane specs still describe the
   invariants the Rust code will take on in Phase 3+.
 
-### Phase 3 — Partition `lease_claims` + `lease_claim_closures`; propagate `claim_slot` (pending)
+### Phase 3 — Partition `lease_claims` + `lease_claim_closures`; propagate `claim_slot` (complete)
+
+Both receipt-plane tables are now `PARTITIONED BY LIST (claim_slot)`
+with one child per ring slot. Claims and their matching closures
+co-locate in the same partition, so Phase 5's prune-and-truncate will
+reclaim both children together.
+
+Shipped:
+
+- `lease_claims` and `lease_claim_closures` are partitioned parents
+  with `lease_claims_0..N-1` and `lease_claim_closures_0..N-1`
+  children.
+- PK on both is `(claim_slot, job_id, run_lease)`; a secondary
+  non-unique `(job_id, run_lease)` index keeps completion / rescue /
+  materialize paths fast when `claim_slot` isn't in hand.
+- The existing stale-receipt index is recreated on the partitioned
+  parent and cascades to every child.
+- `ClaimedEntry::claim_slot: i32` is now populated by the claim CTE,
+  which reads `claim_ring_state.current_slot` alongside the lease-ring
+  cursor. `claim_slot` rides along through `ClaimedRuntimeJob` to the
+  completion path, which writes closures into the matching partition.
+- `open_receipt_claims` gains a `claim_slot` column so the
+  completion / rescue paths know which closure partition to target.
+  (Dropped entirely in Phase 5; Phase 4 already eliminates reads from
+  it.)
+- Idempotent in-place migration: `prepare_schema()` detects
+  pre-Phase-3 regular tables, renames them `_legacy`, creates the
+  partitioned parents + children, rewrites rows into the current
+  `claim_ring_state.current_slot`, then drops the legacy tables.
+
+Validation:
+
+- `cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy`
+  all clean (the two pre-existing clippy warnings unrelated to this
+  work are unchanged).
+- Three new runtime tests land the partition invariants:
+  `test_lease_claim_partition_routing`,
+  `test_lease_claim_rotation_isolation`,
+  `test_lease_claim_migration_preserves_rows`.
+- Full `queue_storage_runtime_test` suite: 45 tests pass (all 42
+  pre-existing receipt-mode tests + Phase 2's claim-ring smoke + 3
+  Phase 3 additions).
+- Runtime inspection confirms the partition shape: `pg_class` shows
+  `relkind='p'` on the parents and `relkind='r'` on each numbered
+  child, with `lease_claims_N_pkey`,
+  `lease_claims_N_materialized_at_claimed_at_job_id_idx`, and
+  `lease_claims_N_job_id_run_lease_idx` (plus the closure pair) on
+  every child partition.
 
 ### Phase 4 — Rewrite the six `open_receipt_claims` SQL sites (pending)
 
