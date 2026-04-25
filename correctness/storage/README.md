@@ -243,6 +243,65 @@ functions as a regression harness: if any of those locks are weakened,
 the race re-appears. See [`MAPPING.md`](./MAPPING.md) for the full
 lock-interaction analysis.
 
+## Dead-tuple architectural contract
+
+[`AwaDeadTupleContract.tla`](./AwaDeadTupleContract.tla) is the
+companion to ADR-023 that catches dead-tuple regressions at design
+time, before they show up as autovacuum running behind in production.
+Each table declares a `kind` (`PartitionTruncate`, `RowVacuum`,
+`AppendOnly`) and a `hot` flag; each transaction declares the
+`Insert` / `Update` / `Delete` / `Truncate` operations it performs.
+
+The four invariants:
+
+- `HotPartitionedTablesUseTruncate`: a hot-mutation table must use
+  partition rotation + TRUNCATE for reclaim, not row-level vacuum.
+  This is the rule that the original `open_receipt_claims` design
+  violated. A new entry like
+  `open_receipt_claims |-> [kind |-> "RowVacuum", hot |-> "hot"]`
+  fires this assumption.
+- `PartitionTruncateTablesAreReclaimed`: every partitioned hot table
+  must have at least one transaction in the model that performs
+  `Truncate` on it (i.e. a `prune_*` maintenance path is wired).
+  Without this, partitions never get reclaimed and the table grows
+  monotonically.
+- `AppendOnlyAcceptsOnlyInsert`: archive / never-reclaimed tables
+  forbid `Update` and `Delete`.
+- `RowVacuumTablesNotTruncated`: TRUNCATE is the
+  `PartitionTruncate` reclaim mechanism; using it on a `RowVacuum`
+  table either contradicts the kind or means the kind is wrong.
+
+The four checks are TLA+ `ASSUME` declarations evaluated during
+semantic analysis, so a violation surfaces as a parse-time error
+rather than a model-checker counterexample. Workflow when adding a
+new SQL site or a new table:
+
+1. Add the table to `TableSpec` in the spec with the right `kind`
+   and honest `hot/cold` label.
+2. Add (or update) the matching `Tx` definition with the mutation
+   list of its `INSERT` / `UPDATE` / `DELETE` / `TRUNCATE`s.
+3. Re-run the TLC check. If anything is wrong, an `ASSUME` fires
+   with the line number of the broken invariant.
+
+Run:
+
+```bash
+./correctness/run-tlc.sh storage/AwaDeadTupleContract.tla
+```
+
+Expected outcome: clean run, no assumption violation. The whole
+check is a single TLC initial state and finishes in well under a
+second.
+
+This spec models the **architectural contract** that bounds dead
+tuples — the structural invariant that says "this design will not
+accumulate dead tuples at production load if the registered
+mutations are accurate". The complementary numerical check (how
+many dead tuples does the system actually accumulate under load
+X?) lives in the bench harness; see
+`benchmarks/portable/long_horizon.py` and the per-table dead-tuple
+columns in the `summary.json` it produces.
+
 ## Trace-validation harness
 
 [`AwaSegmentedStorageTrace.tla`](./AwaSegmentedStorageTrace.tla)

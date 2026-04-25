@@ -362,6 +362,20 @@ Model checking results as of Phase 1:
   `CancelReceiptOnlyPlan`, `CancelRunningPlan` added in Wave 3).
 - `AwaStorageLockOrderDeadlockDemo.cfg`: still trips `NoDeadlock` in 5
   steps, confirming the detector works.
+- `AwaDeadTupleContract.cfg`: 1 distinct state, clean. The four
+  ASSUME-style architectural-contract checks
+  (`HotPartitionedTablesUseTruncate`,
+  `PartitionTruncateTablesAreReclaimed`,
+  `AppendOnlyAcceptsOnlyInsert`,
+  `RowVacuumTablesNotTruncated`) all hold for the post-Wave-3 schema
+  and transaction list. Workflow: when adding a new table to
+  `prepare_schema()` or a new SQL site to queue_storage.rs, register
+  it in `AwaDeadTupleContract.tla` with the correct reclaim kind /
+  hotness / mutation list. A future `open_receipt_claims`-style
+  proposal (hot table, RowVacuum reclaim, INSERT+DELETE traffic)
+  would fire `HotPartitionedTablesUseTruncate` at parse time —
+  verified by adding the row temporarily and watching TLC report
+  the assumption violation, then removing it.
 
 Phases 1–4 of ADR-023 have all landed. The action/variable tables
 above are now in their post-Phase-4 form (Phase 5 deletes
