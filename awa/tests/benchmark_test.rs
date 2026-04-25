@@ -688,7 +688,7 @@ async fn test_throughput_rust_workers_queue_storage() {
         queue_slot_count,
         lease_slot_count,
         queue_stripe_count,
-        experimental_lease_claim_receipts: true,
+        lease_claim_receipts: true,
         claim_slot_count: 2,
         ..Default::default()
     };
@@ -963,7 +963,7 @@ async fn test_pickup_latency_listen_notify_queue_storage() {
         queue_slot_count: env_usize("AWA_VA_LATENCY_QUEUE_SLOTS", 16),
         lease_slot_count: env_usize("AWA_VA_LATENCY_LEASE_SLOTS", 4),
         queue_stripe_count: env_usize("AWA_VA_LATENCY_QUEUE_STRIPES", 1),
-        experimental_lease_claim_receipts: true,
+        lease_claim_receipts: true,
         claim_slot_count: 2,
         ..Default::default()
     };

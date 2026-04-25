@@ -203,14 +203,20 @@ await client.start(
 | `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
+| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Set to `false` to force every claim through the legacy `leases` materialization path. The default flipped from `false` to `true` in 0.6 — see ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Tests that pin claim-ring layout for a deterministic count assertion can push this past their wall-clock window (see `queue_storage_runtime_test.rs::queue_storage_client` helper). |
 
 The corresponding env vars (`QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`,
-`CLAIM_SLOT_COUNT`, `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS`) override
-the same fields when set; useful for benchmark adapters that pull
-configuration from the environment.
+`CLAIM_SLOT_COUNT`, `LEASE_CLAIM_RECEIPTS`) override the same fields
+when set; useful for benchmark adapters that pull configuration
+from the environment.
+
+> **Deprecation:** `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` is still
+> read as an alias for `LEASE_CLAIM_RECEIPTS`, with a deprecation
+> warning logged on first read. The alias will be removed in a
+> future release.
 
 Use the defaults unless you have a reason not to:
 

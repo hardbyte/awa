@@ -101,7 +101,7 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str, claim_slot_count: usize
         queue_slot_count: 4,
         lease_slot_count: 2,
         claim_slot_count,
-        experimental_lease_claim_receipts: true,
+        lease_claim_receipts: true,
         ..Default::default()
     })
     .expect("queue storage");
@@ -351,7 +351,7 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 claim_slot_count: 4,
-                experimental_lease_claim_receipts: true,
+                lease_claim_receipts: true,
                 ..Default::default()
             })
             .expect("queue storage handle");

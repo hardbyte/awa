@@ -36,13 +36,26 @@ use std::time::{Duration, Instant};
 
 // ── Queue-storage configuration ───────────────────────────────────
 
-pub(crate) fn queue_storage_config_with_experimental_default(
-    experimental_default: bool,
+pub(crate) fn queue_storage_config_with_receipts_default(
+    receipts_default: bool,
 ) -> QueueStorageConfig {
-    let experimental_lease_claim_receipts = std::env::var("EXPERIMENTAL_LEASE_CLAIM_RECEIPTS")
-        .ok()
-        .map(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
-        .unwrap_or(experimental_default);
+    fn parse_bool(value: &str) -> bool {
+        matches!(value, "1" | "true" | "TRUE" | "yes" | "on")
+    }
+    let lease_claim_receipts = match std::env::var("LEASE_CLAIM_RECEIPTS") {
+        Ok(value) => parse_bool(value.as_str()),
+        Err(_) => match std::env::var("EXPERIMENTAL_LEASE_CLAIM_RECEIPTS") {
+            Ok(value) => {
+                eprintln!(
+                    "[awa] EXPERIMENTAL_LEASE_CLAIM_RECEIPTS is deprecated; use \
+                     LEASE_CLAIM_RECEIPTS instead. The alias will be removed in a future \
+                     release."
+                );
+                parse_bool(value.as_str())
+            }
+            Err(_) => receipts_default,
+        },
+    };
     QueueStorageConfig {
         schema: std::env::var("QUEUE_STORAGE_SCHEMA").unwrap_or_else(|_| "awa_exp".into()),
         queue_slot_count: std::env::var("QUEUE_SLOT_COUNT")
@@ -61,12 +74,12 @@ pub(crate) fn queue_storage_config_with_experimental_default(
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(1),
-        experimental_lease_claim_receipts,
+        lease_claim_receipts,
     }
 }
 
 fn queue_storage_config() -> QueueStorageConfig {
-    queue_storage_config_with_experimental_default(false)
+    queue_storage_config_with_receipts_default(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

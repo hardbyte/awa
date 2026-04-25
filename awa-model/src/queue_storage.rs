@@ -25,13 +25,20 @@ pub struct QueueStorageConfig {
     pub schema: String,
     pub queue_slot_count: usize,
     pub lease_slot_count: usize,
-    /// Number of child partitions the ADR-023 receipt ring splits
-    /// `lease_claims` / `lease_claim_closures` across. Mirrors
-    /// `lease_slot_count`: a small fixed set of slots reclaimed by
-    /// rotation + TRUNCATE rather than by row-level DELETE.
+    /// Number of child partitions the receipt ring splits
+    /// `lease_claims` / `lease_claim_closures` across (ADR-023).
+    /// Mirrors `lease_slot_count`: a small fixed set of slots
+    /// reclaimed by rotation + TRUNCATE rather than by row-level
+    /// DELETE.
     pub claim_slot_count: usize,
     pub queue_stripe_count: usize,
-    pub experimental_lease_claim_receipts: bool,
+    /// Use the receipt-plane short path for zero-deadline jobs:
+    /// claim writes a row into `lease_claims` and completion writes
+    /// a closure tombstone into `lease_claim_closures`, both
+    /// reclaimed by claim-ring rotation + TRUNCATE. Default `true`.
+    /// Set to `false` to force every claim through the legacy
+    /// `leases` materialization path.
+    pub lease_claim_receipts: bool,
 }
 
 impl Default for QueueStorageConfig {
@@ -42,7 +49,7 @@ impl Default for QueueStorageConfig {
             lease_slot_count: DEFAULT_LEASE_SLOT_COUNT,
             claim_slot_count: DEFAULT_CLAIM_SLOT_COUNT,
             queue_stripe_count: DEFAULT_QUEUE_STRIPE_COUNT,
-            experimental_lease_claim_receipts: false,
+            lease_claim_receipts: true,
         }
     }
 }
@@ -1161,8 +1168,8 @@ impl QueueStorage {
         self.config.queue_stripe_count
     }
 
-    pub fn experimental_lease_claim_receipts(&self) -> bool {
-        self.config.experimental_lease_claim_receipts
+    pub fn lease_claim_receipts(&self) -> bool {
+        self.config.lease_claim_receipts
     }
 
     fn uses_queue_striping(&self) -> bool {
@@ -1227,7 +1234,7 @@ impl QueueStorage {
     }
 
     fn use_lease_claim_receipts_for_runtime(&self, deadline_duration: Duration) -> bool {
-        self.experimental_lease_claim_receipts() && deadline_duration.is_zero()
+        self.lease_claim_receipts() && deadline_duration.is_zero()
     }
 
     pub fn ready_child_relname(&self, slot: usize) -> String {
@@ -1424,7 +1431,7 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
-            let claimed_cte = if self.experimental_lease_claim_receipts() {
+            let claimed_cte = if self.lease_claim_receipts() {
                 format!(
                     r#"
                     claim_ring AS (
@@ -4023,7 +4030,7 @@ impl QueueStorage {
         }
         let claimed = claimed_rows
             .into_iter()
-            .map(|row| row.claim_ref(self.experimental_lease_claim_receipts()))
+            .map(|row| row.claim_ref(self.lease_claim_receipts()))
             .collect();
 
         tx.commit().await.map_err(map_sqlx_error)?;
@@ -4061,7 +4068,7 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        if self.experimental_lease_claim_receipts() && !deadline_duration.is_zero() {
+        if self.lease_claim_receipts() && !deadline_duration.is_zero() {
             return Err(AwaError::Validation(
                 "experimental lease-claim receipts require queue deadline_duration=0".to_string(),
             ));
@@ -4581,7 +4588,7 @@ impl QueueStorage {
             .map(|entry| ((entry.job.id, entry.job.run_lease), entry))
             .collect();
 
-        if self.experimental_lease_claim_receipts() {
+        if self.lease_claim_receipts() {
             let (mut receipt_claimed, mut materialized_claimed): (Vec<_>, Vec<_>) = claimed
                 .iter()
                 .cloned()
@@ -5505,7 +5512,7 @@ impl QueueStorage {
         // row. Find it by anti-joining lease_claims with
         // lease_claim_closures, cancel it by writing a closure and a
         // done row, and notify listening workers.
-        if self.experimental_lease_claim_receipts() {
+        if self.lease_claim_receipts() {
             type ReceiptCancelRow = (
                 i32,
                 i64,
@@ -6119,7 +6126,7 @@ impl QueueStorage {
         job_id: i64,
         run_lease: i64,
     ) -> Result<(), AwaError> {
-        if self.experimental_lease_claim_receipts() {
+        if self.lease_claim_receipts() {
             self.ensure_running_leases_from_receipts_tx(tx, &[(job_id, run_lease)])
                 .await?;
         }
@@ -6420,7 +6427,7 @@ impl QueueStorage {
         run_lease: i64,
         outcome: &str,
     ) -> Result<Option<LeaseTransitionRow>, AwaError> {
-        if !self.experimental_lease_claim_receipts() {
+        if !self.lease_claim_receipts() {
             return Ok(None);
         }
 
@@ -7688,7 +7695,7 @@ impl QueueStorage {
         progress: serde_json::Value,
     ) -> Result<(), AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        if self.experimental_lease_claim_receipts() {
+        if self.lease_claim_receipts() {
             self.upsert_attempt_state_progress_from_receipts_tx(
                 &mut tx,
                 &[(job_id, run_lease, progress.clone())],
@@ -7734,7 +7741,7 @@ impl QueueStorage {
         let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut updated = 0_usize;
-        if self.experimental_lease_claim_receipts() {
+        if self.lease_claim_receipts() {
             updated += self
                 .upsert_attempt_state_from_receipts_tx(&mut tx, jobs)
                 .await?;
@@ -7781,7 +7788,7 @@ impl QueueStorage {
             jobs.iter().map(|(_, _, value)| value.clone()).collect();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut updated = 0_usize;
-        if self.experimental_lease_claim_receipts() {
+        if self.lease_claim_receipts() {
             updated += self
                 .upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
                 .await?;
@@ -8498,7 +8505,7 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let rescued_receipts = if self.experimental_lease_claim_receipts() {
+        let rescued_receipts = if self.lease_claim_receipts() {
             self.rescue_stale_receipt_claims_tx(&mut tx, cutoff).await?
         } else {
             Vec::new()

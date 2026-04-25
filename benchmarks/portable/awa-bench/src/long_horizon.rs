@@ -408,7 +408,7 @@ pub async fn run() {
         .expect("Failed to connect to database");
     let queue_storage = match storage_engine {
         super::StorageEngineMode::QueueStorage => {
-            let storage = super::queue_storage_config_with_experimental_default(true);
+            let storage = super::queue_storage_config_with_receipts_default(true);
             let (store, storage) =
                 super::prepare_queue_storage_with_config(&pool, storage, false).await;
             emit_descriptor(
@@ -430,7 +430,7 @@ pub async fn run() {
     };
     let use_lease_claim_receipts = queue_storage
         .as_ref()
-        .map(|(_, storage)| storage.experimental_lease_claim_receipts)
+        .map(|(_, storage)| storage.lease_claim_receipts)
         .unwrap_or(false);
 
     let queue_name = "awa_longhorizon_bench";

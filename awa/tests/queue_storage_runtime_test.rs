@@ -237,12 +237,18 @@ async fn create_store_with_config(pool: &sqlx::PgPool, config: QueueStorageConfi
 }
 
 async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
+    // Tests that go through this helper exercise the legacy
+    // (non-receipts) lease-materialization path. The receipts mode
+    // tests construct their own config with `lease_claim_receipts:
+    // true`; this helper pins the legacy mode explicitly so it stays
+    // pinned across default flips (see ADR-023 Phase 6).
     create_store_with_config(
         pool,
         QueueStorageConfig {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
     )
@@ -327,7 +333,7 @@ fn queue_storage_client<W: Worker + 'static>(
     store_config: QueueStorageConfig,
     worker: W,
 ) -> Client {
-    let deadline_duration = if store_config.experimental_lease_claim_receipts {
+    let deadline_duration = if store_config.lease_claim_receipts {
         Duration::ZERO
     } else {
         QueueConfig::default().deadline_duration
@@ -905,7 +911,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             claim_slot_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             ..Default::default()
         },
     )
@@ -933,7 +939,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
         },
         CompleteWorker,
     );
@@ -1072,7 +1078,7 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             claim_slot_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             ..Default::default()
         },
     )
@@ -1197,7 +1203,7 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
             lease_slot_count: 2,
             claim_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: false,
+            lease_claim_receipts: false,
         },
         CancelObservingWorker {
             running: running.clone(),
@@ -1253,7 +1259,7 @@ async fn test_open_receipt_claims_is_absent_after_install() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             claim_slot_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             ..Default::default()
         },
     )
@@ -1300,7 +1306,7 @@ async fn test_open_receipt_claims_is_absent_after_install() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
         },
         CompleteWorker,
     );
@@ -1352,7 +1358,7 @@ async fn test_lease_claim_partition_routing() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             claim_slot_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             ..Default::default()
         },
     )
@@ -1398,7 +1404,7 @@ async fn test_lease_claim_partition_routing() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
         },
         RetryOnceWorker,
     );
@@ -1478,7 +1484,7 @@ async fn test_lease_claim_rotation_isolation() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             claim_slot_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             ..Default::default()
         },
     )
@@ -1504,7 +1510,7 @@ async fn test_lease_claim_rotation_isolation() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
         },
         RetryOnceWorker,
     );
@@ -1802,6 +1808,7 @@ async fn test_queue_storage_runtime_retry_after() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         RetryOnceWorker,
@@ -1833,6 +1840,7 @@ async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
         schema: schema.to_string(),
         queue_slot_count: 4,
         lease_slot_count: 2,
+        lease_claim_receipts: false,
         ..Default::default()
     };
 
@@ -2279,6 +2287,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         BlockingCompleteWorker {
@@ -2342,7 +2351,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2356,7 +2365,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
         BlockingCompleteWorker {
@@ -2438,7 +2447,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2452,7 +2461,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 4,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
         BlockingCompleteWorker {
@@ -2514,7 +2523,7 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2559,7 +2568,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2581,7 +2590,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
-                experimental_lease_claim_receipts: true,
+                lease_claim_receipts: true,
                 claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
@@ -2685,7 +2694,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2698,7 +2707,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
         RetryOnceWorker,
@@ -2752,7 +2761,7 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2807,7 +2816,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2840,7 +2849,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
-                experimental_lease_claim_receipts: true,
+                lease_claim_receipts: true,
                 claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
@@ -2927,7 +2936,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -2949,7 +2958,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
-                experimental_lease_claim_receipts: true,
+                lease_claim_receipts: true,
                 claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
@@ -3058,6 +3067,7 @@ async fn test_queue_storage_runtime_snooze() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         SnoozeOnceWorker {
@@ -3113,6 +3123,7 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -3193,6 +3204,7 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -3309,6 +3321,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         BlockingCompleteWorker {
@@ -3683,7 +3696,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             queue_stripe_count: 1,
-            experimental_lease_claim_receipts: true,
+            lease_claim_receipts: true,
             claim_slot_count: 2,
         },
     )
@@ -3902,6 +3915,7 @@ async fn test_queue_storage_runtime_complete_external() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         CallbackWorker {
@@ -3974,6 +3988,7 @@ async fn test_queue_storage_runtime_terminal_failure_moves_to_dlq() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4043,6 +4058,7 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4127,6 +4143,7 @@ async fn test_queue_storage_dlq_api_round_trip() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4232,6 +4249,7 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -4318,6 +4336,7 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4389,6 +4408,7 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -4451,6 +4471,7 @@ async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -4527,6 +4548,7 @@ async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conf
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -4596,6 +4618,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
             schema: schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -4670,6 +4693,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
                 schema: schema.to_string(),
                 queue_slot_count: 4,
                 lease_slot_count: 2,
+                lease_claim_receipts: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),

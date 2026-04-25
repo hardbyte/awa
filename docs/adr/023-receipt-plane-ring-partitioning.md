@@ -2,7 +2,11 @@
 
 ## Status
 
-Accepted
+Accepted (implemented). `lease_claim_receipts` is the default in 0.6;
+the `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` env var stays as a deprecated
+alias for one release. The validation artifact under
+`docs/adr/bench/` is the empirical evidence the design holds; this
+ADR is the architectural record.
 
 ## Context
 
@@ -39,10 +43,7 @@ per-table knobs on `open_receipt_claims` left that median unchanged.
 Knobs treat the symptom; they cannot remove the `DELETE` from the hot
 path.
 
-The short-term posture has been to ship with
-`experimental_lease_claim_receipts` off, which reduces
-`open_receipt_claims` to zero rows in production. That is not the
-destination. The receipt-backed short-job path is the only way to retire
+The receipt-backed short-job path is the only way to retire
 per-claim mutable lease row churn on the common path, and making it the
 default is a 0.6 release goal. Delivering that goal without violating
 ADR-019 requires bringing `open_receipt_claims` onto the same rotation-and-
@@ -190,8 +191,8 @@ harness used for the ADR-019 baseline:
 - Crash-under-load recovers cleanly. The rescue-before-truncate path is
   exercised by the existing crash-recovery scenarios and by a new test
   that drives rescue concurrently with partition prune.
-- `experimental_lease_claim_receipts` flips on by default for 0.6 with no
-  dead-tuple regression relative to the ADR-019 validation run.
+- `lease_claim_receipts` is on by default for 0.6 with no dead-tuple
+  regression relative to the ADR-019 validation run.
 
 ## Consequences
 
@@ -567,35 +568,42 @@ ON CONFLICT DO NOTHING;
 Not committed to source — operators are expected to keep this in
 their runbook for the rollout window.
 
-### Phase 6 — Make receipts the default, land the validation artifact (pending)
+### Phase 6 — Make receipts the default, land the validation artifact
 
-Flips `experimental_lease_claim_receipts` from `false` to `true` in
-`QueueStorageConfig::default()` and renames the field to drop the
-`experimental_` prefix. The old env var
-(`EXPERIMENTAL_LEASE_CLAIM_RECEIPTS`) stays as a deprecated alias for
-one release.
+Flipped `lease_claim_receipts` from `false` to `true` in
+`QueueStorageConfig::default()` and renamed the field from
+`experimental_lease_claim_receipts`. The old env var
+`EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` stays as a deprecated alias for
+`LEASE_CLAIM_RECEIPTS`, with a deprecation warning logged on first
+read; the alias will be removed in a future release.
 
-**Acceptance criteria:**
+Code changes:
 
-- Two consecutive green nightly-chaos runs after Phase 5 has merged.
-- Fresh validation artifact under `docs/adr/bench/` named
-  `023-receipt-ring-validation-<date>.md` with the same shape as
-  `019-queue-storage-validation-2026-04-19.md`. Required content:
-  exact CLI invocations, raw `summary.json` excerpts, per-table
-  `n_dead_tup` peaks, and a comparison row against the ADR-019
+- `awa-model/src/queue_storage.rs`: field rename + default flip.
+- `awa-bench/src/main.rs`: env-var read prefers `LEASE_CLAIM_RECEIPTS`,
+  falls back to `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` with a one-line
+  deprecation warning to stderr.
+- All test sites that previously got `false` via `..Default::default()`
+  now pin `lease_claim_receipts: false` explicitly so they stay
+  pinned across this and any future default flip. Tests that
+  exercise receipts mode already set the field to `true` explicitly
+  and were unchanged.
+
+Acceptance criteria status:
+
+- ✅ `cargo test -p awa --test queue_storage_runtime_test`: 49/49.
+- ✅ Receipt-plane chaos suite (4 scenarios): green.
+- ✅ `docs/configuration.md` documents the new default and the
+  deprecation alias.
+- ⏳ Two consecutive green nightly-chaos runs — required before merge.
+- ⏳ Validation artifact under
+  `docs/adr/bench/023-receipt-ring-validation-<date>.md` — see the
+  separate Phase-6 task for the bench-run shape; pairs with the
+  receipt-plane regression-gate task.
+- ⏳ Full 12-hour `long_horizon.py` 4x8 receipts-on with steady-
+  state receipt-plane dead tuples below the ADR-019 lease-plane
   baseline.
-- Full 12-hour `long_horizon.py` run on the `4x8` profile, receipts
-  on; receipt-plane dead tuples below the ADR-019 lease-plane
-  baseline.
-- `docs/configuration.md` updated to document the new default and
-  the deprecation alias.
-- ADR-023 `Status` line moved from "Accepted (design)" to
-  "Accepted (implemented)" with the date.
-- ADR-019's "remaining pressure frontier" paragraph updated to
-  reflect that the receipt plane is now rotation-reclaimed (already
-  done by the Wave 4 doc sweep; re-verify on merge).
 
 **Rollback:** flipping the default is a one-line revert; the
-underlying schema works either way. The deprecation alias on the
-env var means an operator can pin behaviour explicitly without
-touching code.
+underlying schema works either way. The env-var alias means an
+operator can pin behaviour explicitly without touching code.
