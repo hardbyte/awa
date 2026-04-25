@@ -281,12 +281,10 @@ async fn lease_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
 
 /// Count of receipt-backed attempts that are currently "open" — claimed
 /// but not yet closed (completed, rescued, or materialized into a live
-/// lease row). ADR-023 Phase 4 moves the source of truth from the
-/// `open_receipt_claims` table to a derived anti-join on the
-/// partitioned `lease_claims` + `lease_claim_closures` tables, which
-/// matches the runtime's new queries exactly. The pre-existing
-/// assertions that used to read `open_receipt_claims` now read this
-/// derived set.
+/// lease row). The runtime derives this set from the partitioned
+/// `lease_claims` + `lease_claim_closures` tables anti-joined; this
+/// helper mirrors that exact query so test assertions read the same
+/// definition the runtime does.
 async fn open_receipt_claim_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
     let schema = store.schema();
     let sql = format!(
@@ -349,12 +347,12 @@ fn queue_storage_client<W: Worker + 'static>(
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
-        // Claim-ring prune now actually TRUNCATEs idle child partitions
-        // (ADR-023 Wave 1). Tests assert hard-coded lease_claim/closure
-        // counts assuming those rows survive — keep that invariant by
-        // pushing claim rotation past the test's wall-clock window.
-        // Tests that exercise rotation directly drive `rotate_claims`
-        // explicitly rather than rely on the timer.
+        // Claim-ring prune actually TRUNCATEs idle child partitions.
+        // Tests assert hard-coded lease_claim/closure counts assuming
+        // those rows survive — keep that invariant by pushing claim
+        // rotation past the test's wall-clock window. Tests that
+        // exercise rotation directly drive `rotate_claims` explicitly
+        // rather than rely on the timer.
         .claim_rotate_interval(Duration::from_secs(60))
         .register_worker(worker)
         .promote_interval(Duration::from_millis(25))
@@ -892,8 +890,8 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
 ///   has live rows (busy-check), so the ring doesn't lap silently
 ///   while prune is behind.
 /// - `prune_oldest_claims` actually TRUNCATEs when the partition has
-///   no open claims — previously a no-op — so `lease_claims` doesn't
-///   grow unboundedly once Phase 4 made completion closure-only.
+///   no open claims — without this `lease_claims` would grow
+///   unboundedly under closure-only completion.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_claim_ring_rotate_and_prune_under_load() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -1237,8 +1235,8 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// ADR-023 Phase 4 regression test. After Phase 4 the hot path never
-/// writes to `open_receipt_claims` — the partitioned `lease_claims` is
+/// Regression test for the ADR-023 invariant that the hot path never
+/// writes to `open_receipt_claims`. The partitioned `lease_claims` is
 /// the authoritative record of "currently open" and every read site
 /// derives that set via an anti-join with `lease_claim_closures`. Run
 /// a full claim + complete cycle on a receipt-backed short job and
@@ -1275,8 +1273,8 @@ async fn test_phase4_no_writes_to_open_receipt_claims() {
     )
     .await;
 
-    // Raw-table count (not the derived helper) — this is what we want
-    // to stay zero after Phase 4.
+    // Raw-table count (not the derived helper) — this is what must
+    // stay zero on the hot path.
     async fn raw_open_receipt_count(pool: &sqlx::PgPool, schema: &str) -> i64 {
         let sql = format!("SELECT count(*)::bigint FROM {schema}.open_receipt_claims");
         sqlx::query_scalar::<_, i64>(&sql)
@@ -1332,16 +1330,17 @@ async fn test_phase4_no_writes_to_open_receipt_claims() {
     assert_eq!(
         raw_open_receipt_count(&pool, schema).await,
         0,
-        "ADR-023 Phase 4 invariant: open_receipt_claims must never receive writes"
+        "ADR-023 invariant: open_receipt_claims must never receive writes on the hot path"
     );
 
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// ADR-023 Phase 3 smoke test. A receipt-backed claim + completion
-/// cycle lands rows in the expected child partitions of `lease_claims`
-/// and `lease_claim_closures`, and both rows share the same
-/// `claim_slot` so the closure co-locates with the claim it tombstones.
+/// Partition-routing smoke test for the ADR-023 receipt plane: a
+/// receipt-backed claim + completion cycle lands rows in the expected
+/// child partitions of `lease_claims` and `lease_claim_closures`, and
+/// both rows share the same `claim_slot` so the closure co-locates with
+/// the claim it tombstones.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_partition_routing() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -1464,10 +1463,10 @@ async fn test_lease_claim_partition_routing() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// ADR-023 Phase 3 rotation-isolation check. A claim landed in slot A
-/// before rotation stays in slot A. After rotation, a fresh claim lands
-/// in slot B. Neither disturbs the other — partitioning and ring state
-/// are consistent.
+/// Rotation-isolation check for the ADR-023 claim ring. A claim landed
+/// in slot A before rotation stays in slot A. After rotation, a fresh
+/// claim lands in slot B. Neither disturbs the other — partitioning
+/// and ring state are consistent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_lease_claim_rotation_isolation() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -1584,10 +1583,10 @@ async fn test_lease_claim_rotation_isolation() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// ADR-023 Phase 3 migration test. Start from a schema that still has
-/// the pre-Phase-3 regular (non-partitioned) `lease_claims` +
-/// `lease_claim_closures`, seed some rows in them, run `prepare_schema`,
-/// and assert:
+/// Receipt-plane partition-migration test (see ADR-023). Start from
+/// a schema that still has the legacy regular (non-partitioned)
+/// `lease_claims` + `lease_claim_closures`, seed some rows in them,
+/// run `prepare_schema`, and assert:
 /// - both parents are now partitioned (`relkind = 'p'`)
 /// - all pre-existing rows landed in the current `claim_ring_state` slot
 /// - the legacy tables are dropped
@@ -1606,7 +1605,7 @@ async fn test_lease_claim_migration_preserves_rows() {
         .await
         .expect("create schema");
 
-    // Stand up the pre-Phase-3 regular-table shape so the migration path
+    // Stand up the legacy regular-table shape so the migration path
     // runs on `prepare_schema`.
     sqlx::query(&format!(
         r#"

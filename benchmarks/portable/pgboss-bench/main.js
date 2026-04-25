@@ -28,6 +28,27 @@ function instanceId() {
   return Number.isFinite(value) ? value : 0;
 }
 
+// Mirror of awa-bench's `observer_enabled`. Only instance 0 emits
+// cross-system observer metrics (queue depth, total backlog, producer
+// target rate) so multi-replica runs report a single global observation
+// instead of one per replica that the summary aggregator would have to
+// de-duplicate later.
+function observerEnabled() {
+  return instanceId() === 0;
+}
+
+// Adapter metrics that describe a *global* observation (queue depth,
+// total backlog) rather than this replica's per-instance behaviour.
+// Only instance 0 emits these.
+const OBSERVER_METRICS = new Set([
+  "queue_depth",
+  "running_depth",
+  "retryable_depth",
+  "scheduled_depth",
+  "total_backlog",
+  "producer_target_rate",
+]);
+
 function emit(record) {
   if (record.instance_id === undefined) {
     record.instance_id = instanceId();
@@ -264,6 +285,15 @@ async function scenarioLongHorizon() {
   })();
 
   const depthTask = (async () => {
+    if (!observerEnabled()) {
+      // Non-zero replicas don't emit observer metrics; idle this
+      // task instead of polling. Saves N-1 connections of polling
+      // work on a multi-replica run.
+      while (!shuttingDown) {
+        await sleep(250);
+      }
+      return;
+    }
     while (!shuttingDown) {
       const stats = await boss.getQueueStats(QUEUE_NAME);
       queueDepth = stats.queuedCount;
@@ -308,6 +338,9 @@ async function scenarioLongHorizon() {
       ];
 
       for (const [metric, value, windowS] of metrics) {
+        if (OBSERVER_METRICS.has(metric) && !observerEnabled()) {
+          continue;
+        }
         emit({
           t: sampleTs,
           system: "pgboss",

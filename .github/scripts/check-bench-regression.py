@@ -252,10 +252,13 @@ def main():
         print(f"  [{marker}] {r['scenario']}/{r['metric']}: {r['actual']} (baseline: {r['baseline']})")
 
     if failures:
-        print(f"\n{len(failures)} regression(s) detected (informational — not blocking CI)")
-        # Don't fail CI on benchmark regressions — shared runners are too
-        # variable. The summary table in the Actions UI is the useful signal.
-        # sys.exit(1)
+        print(f"\n{len(failures)} regression(s) detected")
+        # The regression gate is enforced. Shared-runner variance is
+        # real, so the baseline thresholds in
+        # `benchmarks/baseline.json` should be set with enough margin
+        # that healthy runs don't trip — but a genuine regression must
+        # fail the job rather than be buried in a passing summary.
+        sys.exit(1)
 
 
 if __name__ == "__main__":

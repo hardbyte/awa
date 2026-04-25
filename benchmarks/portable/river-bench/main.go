@@ -459,6 +459,27 @@ func instanceID() int {
 	return n
 }
 
+// observerEnabled mirrors awa-bench's `observer_enabled`. Only instance 0
+// emits cross-system observer metrics (queue depth, total backlog, producer
+// target rate) so multi-replica runs report a single global observation
+// instead of one per replica that the summary aggregator would have to
+// de-duplicate later.
+func observerEnabled() bool {
+	return instanceID() == 0
+}
+
+// observerMetrics names the adapter metrics that describe a *global*
+// observation (queue depth, total backlog) rather than this replica's
+// per-instance behaviour. Only instance 0 emits these.
+var observerMetrics = map[string]struct{}{
+	"queue_depth":          {},
+	"running_depth":        {},
+	"retryable_depth":      {},
+	"scheduled_depth":      {},
+	"total_backlog":        {},
+	"producer_target_rate": {},
+}
+
 func emitJSONL(rec map[string]interface{}) {
 	if _, ok := rec["instance_id"]; !ok {
 		rec["instance_id"] = instanceID()
@@ -607,6 +628,13 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 	depthWG.Add(1)
 	go func() {
 		defer depthWG.Done()
+		if !observerEnabled() {
+			// Non-zero replicas don't emit observer metrics; idle this
+			// goroutine instead of polling. Saves N-1 connections of polling
+			// work on a multi-replica run.
+			<-shutdown
+			return
+		}
 		tick := time.NewTicker(1 * time.Second)
 		defer tick.Stop()
 		for {
@@ -683,6 +711,9 @@ func runLongHorizon(ctx context.Context, pool *pgxpool.Pool, workerCount int) {
 					{"queue_depth", depth, 0},
 					{"producer_target_rate", targetRate, 0},
 				} {
+					if _, isObserver := observerMetrics[m.name]; isObserver && !observerEnabled() {
+						continue
+					}
 					emitJSONL(map[string]interface{}{
 						"t":            ts,
 						"system":       "river",

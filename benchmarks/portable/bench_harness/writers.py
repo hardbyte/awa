@@ -261,20 +261,46 @@ def compute_summary(
     also run standalone from a checked-in fixture (used by CI smoke)."""
     rows = _load_rows(raw_csv)
 
-    # Group by (system, phase_label, metric, subject).
-    bucket: dict[tuple[str, str, str, str], list[float]] = {}
+    # Group by (system, phase_label, metric, subject, instance_id).
+    # Replicas of the same system emit independent sample streams; mixing
+    # them here gives a wrong median (and a wrong sample count) for
+    # adapter-scoped rate / latency / depth metrics. The previous bucket
+    # key omitted `instance_id`, so a 4x8 run reported the median of two
+    # interleaved streams instead of two per-replica medians or a
+    # correctly-aggregated system-level series. For adapter metrics in
+    # the rate / latency / depth category, we collapse the per-replica
+    # streams via `aggregate_replica_metric_series`, which encodes the
+    # right per-timestamp reduction (sum for rates, max for depth /
+    # latency). For everything else (table-scoped n_dead_tup / size /
+    # autovacuum count etc.) the per-replica observation is the same
+    # value, so we keep the old single-bucket shape.
+    adapter_metric_set = RATE_METRICS | LATENCY_METRICS | DEPTH_METRICS
+    bucket: dict[tuple[str, str, str, str, str], list[float]] = {}
     for row in rows:
-        key = (row["system"], row["phase_label"], row["metric"], row["subject"])
         try:
             v = float(row["value"])
         except (TypeError, ValueError):
             continue
+        if (
+            row.get("subject_kind") == "adapter"
+            and row["metric"] in adapter_metric_set
+        ):
+            # Defer to the per-timestamp aggregator below; skip raw bucket.
+            continue
+        instance_id = row.get("instance_id") or ""
+        key = (
+            row["system"],
+            row["phase_label"],
+            row["metric"],
+            row["subject"],
+            instance_id,
+        )
         bucket.setdefault(key, []).append(v)
 
     phase_by_label = {p.label: p for p in phases}
     out_systems: dict[str, dict] = {}
 
-    for (system, label, metric, subject), values in bucket.items():
+    for (system, label, metric, subject, _instance), values in bucket.items():
         phase = phase_by_label.get(label)
         if phase is None or not PHASE_INCLUDED_IN_SUMMARY.get(phase.type, True):
             continue
@@ -287,11 +313,56 @@ def compute_summary(
             },
         )
         key = metric if not subject else f"{metric}@{subject}"
-        phase_block["metrics"][key] = {
-            "median": _median(values),
-            "peak": _peak(values),
-            "count": len(values),
-        }
+        existing = phase_block["metrics"].get(key)
+        if existing is None:
+            phase_block["metrics"][key] = {
+                "median": _median(values),
+                "peak": _peak(values),
+                "count": len(values),
+            }
+        else:
+            # Same (system, phase, metric, subject) under different
+            # instance_ids on a non-adapter row: combine. Tables emit
+            # the same value across replicas, so combining is a no-op
+            # for `peak`; we keep the larger `count` and re-derive the
+            # median over the union.
+            combined = values + ([existing["median"]] * existing["count"])
+            phase_block["metrics"][key] = {
+                "median": _median(combined),
+                "peak": max(existing["peak"], _peak(values)),
+                "count": existing["count"] + len(values),
+            }
+
+    # Adapter-metric pass: aggregate per-replica streams into a single
+    # system-level series before bucketing the median/peak/count.
+    systems_seen = {row["system"] for row in rows}
+    for system in systems_seen:
+        for phase in phases:
+            if not PHASE_INCLUDED_IN_SUMMARY.get(phase.type, True):
+                continue
+            for metric in adapter_metric_set:
+                series = aggregate_replica_metric_series(
+                    rows,
+                    system=system,
+                    phase_label=phase.label,
+                    metric=metric,
+                    subject_kind="adapter",
+                )
+                if not series:
+                    continue
+                sys_block = out_systems.setdefault(system, {"phases": {}})
+                phase_block = sys_block["phases"].setdefault(
+                    phase.label,
+                    {
+                        "phase_type": phase.type.value,
+                        "metrics": {},
+                    },
+                )
+                phase_block["metrics"][metric] = {
+                    "median": _median(series),
+                    "peak": _peak(series),
+                    "count": len(series),
+                }
 
     # Recovery metrics: for each system that has a recovery phase immediately
     # following an idle-in-tx phase, compute recovery_halflife_s and
@@ -520,8 +591,17 @@ def _autovacuum_count_delta(
         except (TypeError, ValueError):
             continue
         per_subject.setdefault(row["subject"], []).append(value)
+    # `pg_stat_user_tables.autovacuum_count` is monotonically
+    # non-decreasing, so the delta over a phase is exactly
+    # `max - min` regardless of CSV row order. The previous
+    # `values[-1] - values[0]` reduction depended on the rows
+    # being sorted by `elapsed_s`, which the queue→file drain
+    # does not guarantee — under reorder it could under-count or
+    # go negative.
     deltas = [
-        values[-1] - values[0] for values in per_subject.values() if len(values) >= 2
+        max(values) - min(values)
+        for values in per_subject.values()
+        if len(values) >= 2
     ]
     return float(sum(deltas)) if deltas else None
 

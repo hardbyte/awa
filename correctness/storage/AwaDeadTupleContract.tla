@@ -179,13 +179,13 @@ CompleteLegacyTx == <<
     Mut("Delete", "attempt_state")
 >>
 
-\* close_receipt_tx — queue_storage.rs:5450 (Wave 2b rewrite)
+\* close_receipt_tx — queue_storage.rs:5450
 \* Used by cancel_job_tx and the rescue path.
 CloseReceiptTx == <<
     Mut("Insert", "lease_claim_closures")
 >>
 
-\* rescue_stale_receipt_claims_tx — queue_storage.rs:6672 (Wave 2c)
+\* rescue_stale_receipt_claims_tx — queue_storage.rs:6672
 \* Anti-joins lease_claims against closures + leases; closes
 \* stragglers by appending to lease_claim_closures.
 RescueReceiptsTx == <<
@@ -202,7 +202,7 @@ EnsureRunningTx == <<
 
 \* cancel_job_tx receipt-only branch — queue_storage.rs:5621
 \* Closes the receipt with a `cancelled` outcome, inserts a done row,
-\* defensively deletes any orphan lease (Wave 2d).
+\* defensively deletes any orphan lease.
 CancelReceiptOnlyTx == <<
     Mut("Insert", "done_entries"),
     Mut("Insert", "lease_claim_closures"),

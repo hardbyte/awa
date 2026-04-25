@@ -519,7 +519,13 @@ pub async fn run() {
     let producer_latencies_window = Arc::clone(&producer_latencies);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_priority_pattern = priority_pattern.clone();
-    let producer_storage = queue_storage.as_ref().map(|(_, storage)| storage.clone());
+    // Build the QueueStorage handle once outside the producer loop. The
+    // previous shape rebuilt it on every batch (≈one Arc clone +
+    // QueueStorageConfig validation per insert), which under high
+    // producer rates becomes pure allocator pressure.
+    let producer_store = queue_storage.as_ref().map(|(_, storage)| {
+        QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig")
+    });
     let producer_handle = tokio::spawn(async move {
         if !producer_enabled() {
             while !producer_shutdown.load(Ordering::Relaxed) {
@@ -574,13 +580,10 @@ pub async fn run() {
             let insert_start = Instant::now();
             let res = match storage_engine {
                 super::StorageEngineMode::QueueStorage => {
-                    let producer_store = QueueStorage::new(
-                        producer_storage
-                            .clone()
-                            .expect("queue storage config missing"),
-                    )
-                    .expect("Invalid QueueStorageConfig");
-                    producer_store
+                    let store = producer_store
+                        .as_ref()
+                        .expect("queue storage config missing");
+                    store
                         .enqueue_params_batch(&producer_pool, &params)
                         .await
                 }

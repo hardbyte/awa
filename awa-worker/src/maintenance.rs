@@ -1065,13 +1065,9 @@ impl MaintenanceService {
         }
     }
 
-    /// ADR-023 claim-ring maintenance tick. Rotates the claim-ring cursor
-    /// and prunes the oldest fully-closed partition, mirroring the
-    /// lease-ring rotate/prune pair above. Phase 2 is additive: there are
-    /// no `lease_claims_<slot>` / `lease_claim_closures_<slot>` child
-    /// partitions yet so both operations are essentially no-ops, but the
-    /// timer is wired and exercised now so Phase 3 only needs to swap in
-    /// the real partition bodies.
+    /// Claim-ring maintenance tick (see ADR-023). Rotates the claim-ring
+    /// cursor and prunes the oldest fully-closed partition, mirroring the
+    /// lease-ring rotate/prune pair above.
     async fn rotate_queue_storage_claims(&self) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;

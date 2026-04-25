@@ -17,6 +17,19 @@ defmodule ObanBench.LongHorizon do
   @queue :long_horizon_bench
   @latency_window_s 30.0
 
+  # Adapter metrics that describe a *global* observation (queue depth,
+  # total backlog) rather than this replica's per-instance behaviour.
+  # Only instance 0 emits these. Mirror of pgmq-bench/awa-bench's
+  # observer-metric set.
+  @observer_metrics MapSet.new([
+                      "queue_depth",
+                      "running_depth",
+                      "retryable_depth",
+                      "scheduled_depth",
+                      "total_backlog",
+                      "producer_target_rate"
+                    ])
+
   def run do
     sample_every_s = env_int("SAMPLE_EVERY_S", 10)
     producer_rate = env_int("PRODUCER_RATE", 800)
@@ -133,29 +146,41 @@ defmodule ObanBench.LongHorizon do
   end
 
   defp depth_loop do
-    Process.sleep(1000)
+    if not observer_enabled?() do
+      # Non-zero replicas don't emit observer metrics; idle this
+      # process instead of polling. Saves N-1 connections of polling
+      # work on a multi-replica run.
+      depth_idle_loop()
+    else
+      Process.sleep(1000)
 
-    depth =
-      try do
-        case Repo.one(
-               from(j in "oban_jobs",
-                 where: j.state == "available" and j.queue == "long_horizon_bench",
-                 select: count(j.id)
-               )
-             ) do
-          n when is_integer(n) -> n
-          _ -> 0
+      depth =
+        try do
+          case Repo.one(
+                 from(j in "oban_jobs",
+                   where: j.state == "available" and j.queue == "long_horizon_bench",
+                   select: count(j.id)
+                 )
+               ) do
+            n when is_integer(n) -> n
+            _ -> 0
+          end
+        catch
+          :exit, _reason -> :stopping
         end
-      catch
-        :exit, _reason -> :stopping
-      end
 
-    case depth do
-      :stopping -> :ok
-      value ->
-        :ets.insert(:long_horizon_state, {:queue_depth, value})
-        depth_loop()
+      case depth do
+        :stopping -> :ok
+        value ->
+          :ets.insert(:long_horizon_state, {:queue_depth, value})
+          depth_loop()
+      end
     end
+  end
+
+  defp depth_idle_loop do
+    Process.sleep(250)
+    depth_idle_loop()
   end
 
   defp sampler_loop(sample_every_s) do
@@ -194,16 +219,20 @@ defmodule ObanBench.LongHorizon do
         {"producer_target_rate", producer_target_rate, 0}
       ],
       fn {name, value, window_s} ->
-        emit(%{
-          t: ts,
-          system: "oban",
-          kind: "adapter",
-          subject_kind: "adapter",
-          subject: "",
-          metric: name,
-          value: value,
-          window_s: window_s
-        })
+        if MapSet.member?(@observer_metrics, name) and not observer_enabled?() do
+          :ok
+        else
+          emit(%{
+            t: ts,
+            system: "oban",
+            kind: "adapter",
+            subject_kind: "adapter",
+            subject: "",
+            metric: name,
+            value: value,
+            window_s: window_s
+          })
+        end
       end
     )
 
@@ -249,6 +278,13 @@ defmodule ObanBench.LongHorizon do
         end
     end
   end
+
+  # Mirror of awa-bench's `observer_enabled`. Only instance 0 emits
+  # cross-system observer metrics (queue depth, total backlog, producer
+  # target rate) so multi-replica runs report a single global observation
+  # instead of one per replica that the summary aggregator would have to
+  # de-duplicate later.
+  defp observer_enabled?, do: instance_id() == 0
 
   defp emit(record) do
     record = Map.put_new(record, :instance_id, instance_id())

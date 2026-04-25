@@ -204,19 +204,51 @@ children, TRUNCATE both) plus a busy-check in `rotate_claims` that mirrors
 
 ### Chaos coverage
 
+The reviewer flagged three chaos gaps. The first two are documented
+caveats; the third (receipt-plane chaos coverage) is **deferred to a
+follow-up branch** before Phase 5 merges. Status:
+
 - **"Outage" tests are connection-drop, not real PG restart.**
-  `chaos_suite_test.rs:1184-1292, 1581-1726` use `pg_terminate_backend`.
-  Only `postgres_failover_smoke_test.rs` does a real `docker compose
-  restart`. Document the distinction or add one restart-based scenario.
+  Documented as a known limitation. `chaos_suite_test.rs` uses
+  `pg_terminate_backend`; only `postgres_failover_smoke_test.rs` does
+  a real `docker compose restart`. The distinction matters because a
+  TCP drop preserves the server's WAL state, while a process restart
+  exercises crash recovery. **Acceptance for Phase 5:** document this
+  caveat in `docs/testing.md` (does not exist; add or fold into
+  `architecture.md`'s testing section). A second-mode chaos test that
+  does a real Postgres restart is desirable but not blocking.
 
-- **No network partition / SIGSTOP leader scenario.** Leader-failover tests
-  shutdown gracefully or drop a single TCP connection. The asymmetric
-  "leader alive to itself, dead to followers" failure mode is untested.
+- **No network partition / SIGSTOP leader scenario.** Documented as
+  a known limitation. The asymmetric "leader alive to itself, dead
+  to followers" failure mode requires either iptables fakery or
+  process-pause primitives that don't fit cleanly into the
+  containerised CI stack. **Acceptance for Phase 5:** track in an
+  issue; not a merge blocker.
 
-- **Zero chaos coverage of receipt-plane / claim-ring / partition truncate.**
-  No test covers: receipt rescue under overload, claim-ring prune racing
-  live claims, partition TRUNCATE racing a closure write, admin-cancel
-  during completion (double-closure race). Required before Phase 5 merges.
+- **Zero chaos coverage of receipt-plane / claim-ring / partition
+  truncate.** Deferred to a follow-up branch. The four scenarios that
+  need coverage before Phase 5 merges:
+  1. Receipt rescue under overload — flood `lease_claims` past the
+     active partition's size threshold and confirm
+     `rescue_stale_receipt_claims_tx` makes progress without lapping
+     the partition (relies on the Wave 2c `leases` anti-join).
+  2. Claim-ring prune racing live claims — fire `prune_oldest_claims`
+     concurrently with steady claim/complete traffic and confirm
+     `SkippedActive` returns rather than truncating an open claim.
+     The Wave 1 `test_prune_oldest_claims_refuses_to_truncate_open_claim`
+     covers the static case; the chaos version drives concurrent
+     traffic.
+  3. Partition `TRUNCATE` racing a closure write — confirm the
+     `LOCK TABLE ACCESS EXCLUSIVE` in `prune_oldest_claims` makes
+     `INSERT INTO lease_claim_closures` block (or fail with the
+     50ms `lock_timeout`), not silently lose the closure write.
+  4. Admin cancel during completion — confirm the receipt-only
+     branch's defensive `DELETE FROM leases` (Wave 2d) leaves no
+     orphan when materialize and cancel race over the same claim.
+  These scenarios should land in a new
+  `awa/tests/receipt_plane_chaos_test.rs` or as additional cases in
+  `chaos_suite_test.rs`. Tracked under "ADR-023 Phase 5 acceptance"
+  rather than this review's wave numbering.
 
 ### Docs
 

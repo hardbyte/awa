@@ -499,6 +499,13 @@ async def scenario_long_horizon() -> None:
 
     async def depth_poller() -> None:
         nonlocal queue_depth
+        if not _observer_enabled():
+            # Non-zero replicas don't emit observer metrics; idle this
+            # task instead of polling. Saves N-1 connections of polling
+            # work on a multi-replica run.
+            while not shutdown.is_set():
+                await asyncio.sleep(0.25)
+            return
         while not shutdown.is_set():
             try:
                 tx = await c.transaction()
@@ -546,6 +553,8 @@ async def scenario_long_horizon() -> None:
                 ("queue_depth", float(queue_depth), 0.0),
                 ("producer_target_rate", current_producer_target_rate, 0.0),
             ]:
+                if metric in _OBSERVER_METRICS and not _observer_enabled():
+                    continue
                 _emit(
                     {
                         "t": ts,
@@ -593,6 +602,28 @@ def _instance_id() -> int:
         return int(os.environ.get("BENCH_INSTANCE_ID", "0"))
     except ValueError:
         return 0
+
+
+def _observer_enabled() -> bool:
+    """Mirror of awa-bench's `observer_enabled`. Only instance 0 emits
+    cross-system observer metrics (queue depth, total backlog, producer
+    target rate) so multi-replica runs report a single global observation
+    instead of one per replica that the summary aggregator would have to
+    de-duplicate later."""
+    return _instance_id() == 0
+
+
+# Adapter metrics that describe a *global* observation (queue depth,
+# total backlog) rather than this replica's per-instance behaviour.
+# Only instance 0 emits these.
+_OBSERVER_METRICS = frozenset({
+    "queue_depth",
+    "running_depth",
+    "retryable_depth",
+    "scheduled_depth",
+    "total_backlog",
+    "producer_target_rate",
+})
 
 
 def _emit(record: dict) -> None:

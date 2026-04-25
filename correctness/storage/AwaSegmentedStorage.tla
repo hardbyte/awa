@@ -919,7 +919,7 @@ CancelRunningToTerminal(j) ==
 \* short path (open claim, no `leases` row materialized). Mirrors the
 \* receipt-only branch in `cancel_job_tx`: SELECT FROM lease_claims
 \* FOR UPDATE, INSERT done row, INSERT closure, defensive DELETE FROM
-\* leases (Wave 2d sweeps any concurrent materialization), pg_notify.
+\* leases (defensively sweeping any concurrent materialization), pg_notify.
 \* Distinct from CancelRunningToTerminal because no lease ever existed,
 \* so activeLeases is unchanged and laneState's leasedCount stays put.
 CancelReceiptOnlyToTerminal(j) ==

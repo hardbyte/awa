@@ -1429,9 +1429,7 @@ impl QueueStorage {
                             claim_rows.run_lease,
                             claim_rows.max_attempts
                     )
-                    -- ADR-023 Phase 4f: the legacy `opened AS (INSERT
-                    -- INTO open_receipt_claims ...)` CTE is gone. The
-                    -- partitioned lease_claims row above IS the
+                    -- The partitioned lease_claims row above is the
                     -- authoritative record of "currently open"; every
                     -- other receipt-plane query reads it anti-joined
                     -- with lease_claim_closures.
@@ -1991,8 +1989,8 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            // ADR-023 Phase 3: `lease_claims` and `lease_claim_closures`
-            // become partitioned by `claim_slot`. Fresh installs create the
+            // `lease_claims` and `lease_claim_closures` are partitioned by
+            // `claim_slot` (see ADR-023). Fresh installs create the
             // partitioned parents directly; existing installs with regular
             // tables take the in-place migration path (rename → create
             // partitioned → copy → drop legacy). Idempotent: re-running on
@@ -2104,7 +2102,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            // Phase 3 in-place migration: move existing rows into the
+            // In-place migration: move existing rows into the
             // partitioned parent. Every legacy row lands in the
             // current claim_slot — the ring rotates naturally and
             // existing receipts will close (or be force-rescued) on
@@ -2329,29 +2327,20 @@ impl QueueStorage {
                 migrate_tx.commit().await.map_err(map_sqlx_error)?;
             }
 
-            // Backfill the bounded live frontier so schema upgrades do
-            // not strand already-running receipt-backed claims on the
-            // historical claim tables.
-            //
-            // After ADR-023 Phase 4, the runtime never reads from
-            // `open_receipt_claims` — every receipt query is an
-            // anti-join over the partitioned `lease_claims` /
-            // `lease_claim_closures`. The backfill only matters during
-            // the one-shot legacy migration: if we just renamed the
-            // pre-Phase-3 `lease_claims` to `lease_claims_legacy` and
-            // copied its rows into the partitioned table, we mirror
-            // the still-open subset into `open_receipt_claims` so any
-            // worker that hasn't yet been redeployed onto Phase 4 SQL
-            // can still see the live frontier. Steady-state runs of
-            // `prepare_schema` skip this entirely. Phase 5 deletes the
-            // table.
+            // One-shot mirror of the still-open receipt set into
+            // `open_receipt_claims` during the legacy migration so a
+            // worker still running pre-ADR-023 SQL can see the live
+            // frontier. Steady-state runs skip this entirely; the
+            // hot path reads the partitioned `lease_claims` /
+            // `lease_claim_closures` directly via anti-join, and the
+            // `open_receipt_claims` table is dead weight scheduled
+            // for deletion (see ADR-023).
             //
             // The `NOT EXISTS` against `lease_claim_closures` joins on
             // the full `(claim_slot, job_id, run_lease)` PK — without
             // the `claim_slot` match we'd treat a closure in
             // partition X as also closing a hypothetical re-claim in
-            // partition Y, which the partition-key invariant from
-            // ADR-023 disallows.
+            // partition Y, which the partition-key invariant disallows.
             if lease_claims_legacy_exists || closures_legacy_exists {
                 sqlx::query(&format!(
                     r#"
@@ -4700,11 +4689,10 @@ impl QueueStorage {
             let mut updated_all = Vec::new();
 
             if !receipt_claimed.is_empty() {
-                // ADR-023 Phase 4: claim_slot rides along on
-                // `ClaimedEntry`, so the closure INSERT no longer needs
-                // to join against open_receipt_claims to discover it.
-                // Pass (claim_slot, job_id, run_lease) triples directly
-                // and let Postgres route to the correct partition.
+                // claim_slot rides along on `ClaimedEntry`, so the
+                // closure INSERT can pass (claim_slot, job_id,
+                // run_lease) triples directly and let Postgres route
+                // to the correct partition without an extra lookup.
                 let receipt_claim_slots: Vec<i32> = receipt_claimed
                     .iter()
                     .map(|entry| entry.claim.claim_slot)
@@ -5118,10 +5106,9 @@ impl QueueStorage {
                           AND state = 'running'
                     ), 0)
                     +
-                    -- ADR-023 Phase 4: derive the receipt-backed running
-                    -- count from lease_claims anti-joined with
-                    -- lease_claim_closures, so the query never reads the
-                    -- legacy open_receipt_claims frontier.
+                    -- Derive the receipt-backed running count from
+                    -- lease_claims anti-joined with
+                    -- lease_claim_closures.
                     COALESCE((
                         SELECT count(*)::bigint
                         FROM {schema}.lease_claims AS claims
@@ -6122,10 +6109,9 @@ impl QueueStorage {
                 WHERE singleton = TRUE
             ),
             claim_refs AS (
-                -- ADR-023 Phase 4: source claim metadata directly from
-                -- the partitioned lease_claims table anti-joined against
-                -- lease_claim_closures, instead of the legacy
-                -- open_receipt_claims frontier.
+                -- Source claim metadata directly from the partitioned
+                -- lease_claims table anti-joined against
+                -- lease_claim_closures.
                 SELECT
                     claims.claim_slot,
                     claims.job_id,
@@ -6258,10 +6244,8 @@ impl QueueStorage {
                 SELECT * FROM unnest($1::bigint[], $2::bigint[])
             ),
             claim_refs AS (
-                -- ADR-023 Phase 4: source open-claim identity from
-                -- lease_claims anti-joined against lease_claim_closures
-                -- rather than from the legacy open_receipt_claims
-                -- frontier.
+                -- Source open-claim identity from lease_claims
+                -- anti-joined against lease_claim_closures.
                 SELECT claims.job_id, claims.run_lease
                 FROM {schema}.lease_claims AS claims
                 JOIN inflight
@@ -6326,8 +6310,8 @@ impl QueueStorage {
                 SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[])
             ),
             claim_refs AS (
-                -- ADR-023 Phase 4: same anti-join pattern as the
-                -- heartbeat-only path above.
+                -- Same anti-join pattern as the heartbeat-only path
+                -- above.
                 SELECT claims.job_id, claims.run_lease, inflight.progress
                 FROM {schema}.lease_claims AS claims
                 JOIN inflight
@@ -6544,10 +6528,9 @@ impl QueueStorage {
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH target AS (
-                -- ADR-023 Phase 4: target is the open claim identified
-                -- from the partitioned lease_claims table anti-joined
-                -- against lease_claim_closures, instead of a lookup into
-                -- the legacy open_receipt_claims frontier.
+                -- Target is the open claim identified from the
+                -- partitioned lease_claims table anti-joined against
+                -- lease_claim_closures.
                 SELECT
                     claims.claim_slot,
                     claims.ready_slot,
@@ -6678,9 +6661,8 @@ impl QueueStorage {
         let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH stale_claims AS (
-                -- ADR-023 Phase 4: rescue scans partitioned lease_claims
-                -- anti-joined with lease_claim_closures so the receipt
-                -- rescue path no longer depends on open_receipt_claims.
+                -- Rescue scans partitioned lease_claims anti-joined
+                -- with lease_claim_closures.
                 SELECT
                     claims.claim_slot,
                     claims.ready_slot,
@@ -6872,9 +6854,8 @@ impl QueueStorage {
             candidates.push(row.into_job_row()?);
         }
 
-        // ADR-023 Phase 4: report receipt-backed attempts as running by
-        // anti-joining lease_claims against lease_claim_closures rather
-        // than reading the legacy open_receipt_claims frontier.
+        // Report receipt-backed attempts as running by anti-joining
+        // lease_claims against lease_claim_closures.
         let lease_claim_rows: Vec<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT

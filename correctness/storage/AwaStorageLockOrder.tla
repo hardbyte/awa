@@ -186,7 +186,7 @@ CloseReceiptPlan(claimSlot) ==
 \*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
 \*     FOR UPDATE OF claims SKIP LOCKED
 \*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
-\* The leases anti-join (Wave 2c) takes AccessShare on the leases
+\* The leases anti-join takes AccessShare on the leases
 \* parent so rescue can race against prune_oldest_leases.
 RescueReceiptsPlan(claimSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
@@ -205,7 +205,7 @@ EnsureRunningPlan(claimSlot, leaseSlot) ==
 \*   SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED
 \*   insert_done_rows_tx → INSERT INTO done_entries
 \*   INSERT INTO lease_claim_closures
-\*   defensive DELETE FROM leases (Wave 2d)
+\*   defensive DELETE FROM leases (sweeps any concurrent materialization)
 \*   pg_notify('awa:cancel', ...)
 CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
     << Step(ClaimChildResource(claimSlot), ModeShared),
