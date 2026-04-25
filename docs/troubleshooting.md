@@ -81,6 +81,53 @@ awa --database-url "$DATABASE_URL" job cancel <job-id>
 
 Then investigate why the worker stopped.
 
+### Admin Cancel Doesn't Wake A Running Worker
+
+`awa job cancel <id>` writes the cancellation to the database and emits
+`pg_notify('awa:cancel', {job_id, run_lease})`. Each worker runtime
+runs a `CancelListener` (PgListener-based) that picks up the
+notification and fires the matching `Arc<AtomicBool>` cancel flag the
+handler's `JobContext` holds — so the handler sees
+`ctx.is_cancelled() == true` on its next check and can stop cleanly.
+
+If the listener fails to start or its connection drops, the listener
+logs a `warn!` and exits; admin cancels then silently fall back to
+heartbeat / deadline rescue for detection (i.e. the cancel does take
+effect on the next completion-time `run_lease` check, but the handler
+doesn't get the early wake-up). Symptoms: `awa job cancel` returns
+success and the database shows the job as `cancelled`, but a worker
+reports completing the cancelled `run_lease` long after the cancel
+was issued; the completion is rejected by `StaleCompleteRejected` so
+no harm done, just wasted work.
+
+To diagnose:
+
+- Search the worker logs for `Failed to create PG listener for admin
+  cancel` or `Failed to LISTEN on cancel channel`. Either message
+  means the listener started, hit the failure, and the runtime is
+  now in fallback mode.
+- Search for `PG cancel listener error; will retry` — the listener
+  saw a transient error and is sleeping 1s before reconnecting; not
+  a steady-state failure unless it spams the log.
+- Confirm `pg_listener` works from outside the runtime:
+  `psql -c "LISTEN \"awa:cancel\";"` and watch a separate session
+  fire `SELECT pg_notify('awa:cancel', '{}');`.
+
+To recover:
+
+- Restart the worker process — the listener spawns at runtime
+  startup, so restart re-creates the listener with a fresh
+  connection.
+- If the failure is steady (e.g. a Postgres pool sized so all
+  connections are saturated by claim/complete traffic and `LISTEN`
+  can't acquire one), increase the pool max or dedicate a
+  connection to listening.
+
+In all cases the cancel itself is durable — only the early wake-up
+is lost. Long-running handlers that don't poll `ctx.is_cancelled()`
+between heartbeats won't notice the cancel until they finish or
+heartbeat-rescue fires.
+
 ## Leader Election Delays
 
 ### Expected Behavior

@@ -1,5 +1,12 @@
 # Sticky Shard Leasing Plan
 
+> **Status: reverted experiment, kept as design context.** Sticky shard
+> leasing was prototyped during the 0.6 redesign but not adopted —
+> bounded claimers + queue striping (both shipped) cover the same
+> coordination pressure with simpler operational semantics. This doc is
+> kept for historical context on the design space; do not implement
+> from it without revisiting the trade-off against the shipped path.
+
 ## Why this exists
 
 The queue-storage engine is now in a good place for:

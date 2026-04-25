@@ -247,6 +247,52 @@ Current `0.5.x` fail-safe behavior if someone forces the state forward without
 - the reserved `awa.storage_enter_mixed_transition()` and
   `awa.storage_finalize()` functions raise “requires 0.6”
 
+#### `0.6` Receipt-plane partition migration (ADR-023)
+
+The `0.6` queue-storage engine introduces partitioning on the receipt
+plane: `lease_claims` and `lease_claim_closures` change from regular
+tables to `PARTITIONED BY LIST (claim_slot)` parents with one child
+per claim-ring slot. The migration runs automatically inside
+`prepare_schema()` whenever it detects pre-Phase-3 (regular-table)
+shapes in the schema:
+
+1. The pre-Phase-3 tables are renamed in place to
+   `lease_claims_legacy` / `lease_claim_closures_legacy`.
+2. The new partitioned parents are created alongside the legacy
+   tables.
+3. Rows are copied from the legacy tables into the partitioned
+   parents, all landing in the current `claim_ring_state.current_slot`
+   (so existing receipts close out on their normal lifecycle in
+   that partition; the ring's natural rotation re-balances over
+   subsequent claims).
+4. The legacy tables are dropped.
+
+Steps 3 and 4 run inside a single Postgres transaction (Wave 2e of
+ADR-023), so a crash mid-migration leaves the schema in exactly one
+of two states: pre-migration (legacy tables still present, partitioned
+parents empty) or post-migration (legacy tables gone, partitioned
+parents populated). On restart, `prepare_schema()` detects whichever
+state is current and either re-runs the migration or skips it. The
+`ON CONFLICT DO NOTHING` on the copy step is a defensive belt-and
+braces; under the new transactional shape it should never fire.
+
+If the migration is partially applied at the time of a `reset()` call,
+the legacy tables are dropped explicitly before the main `TRUNCATE`
+(also Wave 2e). Without that, `reset()` would TRUNCATE the
+partitioned parents but leave the legacy data intact, and the next
+`prepare_schema()` would re-run the migration on top, silently
+re-inserting old rows. Operators should not normally call `reset()`
+during an upgrade — it's a test fixture rather than a recovery
+primitive — but the safety net is there.
+
+**Reverse migration** (only relevant if a production rollback fires
+between Phase-3 deploy and the `0.5.x` runtime catching up): create
+unpartitioned `lease_claims` and `lease_claim_closures` tables,
+`INSERT ... SELECT * FROM` each partitioned parent, drop the
+partitioned parents. This is not committed to source — the forward
+path is the only supported one — but operators are expected to keep
+this recipe in their runbook for the rollout window.
+
 ### Why This Exists
 
 If Awa needs another storage redesign in the future, the plan is to reuse the

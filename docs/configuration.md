@@ -171,11 +171,13 @@ let client = Client::builder(pool.clone())
         QueueStorageConfig {
             queue_slot_count: 16,
             lease_slot_count: 8,
+            claim_slot_count: 8,
             ..Default::default()
         },
         Duration::from_millis(1_000),
         Duration::from_millis(50),
     )
+    .claim_rotate_interval(Duration::from_millis(1_000))
     .build()?;
 ```
 
@@ -187,8 +189,10 @@ await client.start(
     queue_storage_schema="awa_exp",
     queue_storage_queue_slot_count=16,
     queue_storage_lease_slot_count=8,
+    queue_storage_claim_slot_count=8,
     queue_storage_queue_rotate_interval_ms=1000,
     queue_storage_lease_rotate_interval_ms=50,
+    queue_storage_claim_rotate_interval_ms=1000,
 )
 ```
 
@@ -198,13 +202,21 @@ await client.start(
 |---|---|---|
 | `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
+| `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |
+| `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Tests that pin claim-ring layout for a deterministic count assertion can push this past their wall-clock window (see `queue_storage_runtime_test.rs::queue_storage_client` helper). |
+
+The corresponding env vars (`QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`,
+`CLAIM_SLOT_COUNT`, `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS`) override
+the same fields when set; useful for benchmark adapters that pull
+configuration from the environment.
 
 Use the defaults unless you have a reason not to:
 
 - Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers or retention keep old segments live.
 - Increase `lease_slot_count` if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.
+- Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
 - Increase rotation intervals to reduce partition churn and metadata activity.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 

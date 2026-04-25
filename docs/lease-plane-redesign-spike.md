@@ -1,5 +1,13 @@
 # Lease Plane Redesign Spike
 
+> **Status: superseded for the receipt plane by [ADR-023](adr/023-receipt-plane-ring-partitioning.md).**
+> The narrow-implementation-spike portion of this doc that covered
+> `open_receipt_claims` as a bounded live-frontier table is now replaced
+> by the partitioned `lease_claims` / `lease_claim_closures` ring. Read
+> the rest of this doc as a snapshot of the lease-plane investigation
+> that triggered ADR-023; the sections on the long-running lease plane
+> (heartbeat, callback, `attempt_state`) are unchanged.
+
 ## Why this exists
 
 The split-head change removed `queue_lanes` as the dominant MVCC hotspot. The

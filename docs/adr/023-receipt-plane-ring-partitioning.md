@@ -484,4 +484,63 @@ Validation:
 
 ### Phase 5 — Delete `open_receipt_claims` (pending)
 
+Removes the `open_receipt_claims` table and any remaining backfill +
+DDL paths. Architecturally irreversible: once the partition migration
++ Phase 4 anti-join cutover have been running cleanly, the table is
+dead weight whose only effect is autovacuum churn during prepare
+schema runs.
+
+**Acceptance criteria (must all hold before Phase 5 merges to main):**
+
+- Two consecutive green runs of the full nightly-chaos workflow
+  (8 ignored chaos/soak tests + portable long-horizon bench).
+- Fresh `test_throughput_rust_workers_queue_storage` shows zero rows
+  in `open_receipt_claims` at every observable point (already locked
+  in by `test_phase4_no_writes_to_open_receipt_claims`; rerun to
+  confirm Phase 5 schema-install changes don't regress this).
+- A 30-min `long_horizon.py` run on the `4x8` profile, receipts on,
+  reports steady-state dead tuples on the receipt plane no worse
+  than the ADR-019 validation baseline (ideally lower — the whole
+  point of ADR-023 is concentrating reclaim into the singletons).
+- New runtime test `test_open_receipt_claims_is_absent_after_install`
+  green on a fresh schema install. Verify by `\d` in the test
+  database and asserting the table is absent.
+- Reverse-migration recipe (recreate `open_receipt_claims` from
+  `lease_claims` minus `lease_claim_closures`) documented in the
+  PR body; not committed to source, but written down so an operator
+  can apply it if a production rollback ever fires.
+- `docs/architecture.md`, `docs/lease-plane-redesign-spike.md`, and
+  `docs/migrations.md` updated to reflect the table's removal.
+
 ### Phase 6 — Make receipts the default, land the validation artifact (pending)
+
+Flips `experimental_lease_claim_receipts` from `false` to `true` in
+`QueueStorageConfig::default()` and renames the field to drop the
+`experimental_` prefix. The old env var
+(`EXPERIMENTAL_LEASE_CLAIM_RECEIPTS`) stays as a deprecated alias for
+one release.
+
+**Acceptance criteria:**
+
+- Two consecutive green nightly-chaos runs after Phase 5 has merged.
+- Fresh validation artifact under `docs/adr/bench/` named
+  `023-receipt-ring-validation-<date>.md` with the same shape as
+  `019-queue-storage-validation-2026-04-19.md`. Required content:
+  exact CLI invocations, raw `summary.json` excerpts, per-table
+  `n_dead_tup` peaks, and a comparison row against the ADR-019
+  baseline.
+- Full 12-hour `long_horizon.py` run on the `4x8` profile, receipts
+  on; receipt-plane dead tuples below the ADR-019 lease-plane
+  baseline.
+- `docs/configuration.md` updated to document the new default and
+  the deprecation alias.
+- ADR-023 `Status` line moved from "Accepted (design)" to
+  "Accepted (implemented)" with the date.
+- ADR-019's "remaining pressure frontier" paragraph updated to
+  reflect that the receipt plane is now rotation-reclaimed (already
+  done by the Wave 4 doc sweep; re-verify on merge).
+
+**Rollback:** flipping the default is a one-line revert; the
+underlying schema works either way. The deprecation alias on the
+env var means an operator can pin behaviour explicitly without
+touching code.

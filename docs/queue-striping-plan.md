@@ -1,5 +1,12 @@
 # Queue Striping Plan
 
+> **Status: shipped (current design).** Queue striping is in production
+> in 0.6 — `QueueStorageConfig::queue_stripe_count` plus the `queue#N`
+> stripe naming routes a logical queue across multiple physical
+> coordination paths. This doc remains as the design rationale; the
+> implementation lives in `awa-model/src/queue_storage.rs` (search for
+> `queue_stripe_count`).
+
 ## Why this exists
 
 The `0.6` queue-storage engine is now in a good place for:

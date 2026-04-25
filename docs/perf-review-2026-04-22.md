@@ -1,5 +1,14 @@
 ## Queue Storage Performance And Design Review
 
+> **Status: pre-ADR-023 snapshot.** The `open_receipt_claims` finding
+> in this review triggered the receipt-plane redesign that became
+> [ADR-023](adr/023-receipt-plane-ring-partitioning.md). The dead-tuple
+> shape described below for that table no longer applies; the
+> partitioned `lease_claims` / `lease_claim_closures` ring reclaims
+> the same data via `TRUNCATE` rather than row-level vacuum. The rest
+> of the review (queue plane, lease ring, observation methodology)
+> still describes the current architecture.
+
 Date: 2026-04-22
 Branch: `feature/vacuum-aware-storage-redesign`
 Baseline commit for this review: `3919b05`

@@ -389,6 +389,8 @@ full details.
 - [019: Queue Storage Engine](https://github.com/hardbyte/awa/blob/main/docs/adr/019-queue-storage-redesign.md)
 - [020: Dead Letter Queue](https://github.com/hardbyte/awa/blob/main/docs/adr/020-dead-letter-queue.md)
 - [021: Sequential callbacks and callback heartbeats](https://github.com/hardbyte/awa/blob/main/docs/adr/021-enhanced-external-wait.md)
+- [022: Descriptor catalog](https://github.com/hardbyte/awa/blob/main/docs/adr/022-descriptor-catalog.md)
+- [023: Receipt plane ring partitioning](https://github.com/hardbyte/awa/blob/main/docs/adr/023-receipt-plane-ring-partitioning.md)
 
 See [docs/adr/README.md](https://github.com/hardbyte/awa/blob/main/docs/adr/README.md) for the index with status and supersession.
 

@@ -2,7 +2,15 @@
 
 ## Status
 
-Accepted
+Accepted. The receipt-plane portion of this design (`open_receipt_claims`
+as a bounded live-frontier table) is **superseded by
+[ADR-023: Receipt Plane Ring Partitioning](023-receipt-plane-ring-partitioning.md)**,
+which replaces the flat `open_receipt_claims` table with partitioned
+`lease_claims` / `lease_claim_closures` reclaimed by ring rotation +
+`TRUNCATE`. The rest of ADR-019 (queue plane, lease ring, ready/done
+partitioning) is unchanged. References to `open_receipt_claims` below
+are kept verbatim as historical context — read them as "the live
+frontier", which is now derived from the anti-join.
 
 ## Context
 
@@ -315,12 +323,16 @@ current comparison methodology and caveats.
 The current pressure frontier after the split-head change is the lease plane:
 `queue_lanes` is no longer the dominant MVCC hotspot, but the mutable
 `active_leases` family still absorbs steady insert/delete churn and heartbeat
-updates. The current implementation now includes an experimental short-job
-receipt path (`lease_claims` plus lazy materialization) that substantially
-reduces dead tuples for zero-deadline short jobs. Long-horizon profiling also
-showed that the append-only history alone was not enough: open claims had to
-be tracked in a bounded `open_receipt_claims` frontier so rescue and queue
-counts would not degrade into history scans. Further lease-plane work is still
+updates. The current implementation now includes a short-job receipt path
+(`lease_claims` plus lazy materialization) that substantially reduces dead
+tuples for zero-deadline short jobs. Long-horizon profiling also showed that
+the append-only history alone was not enough: open claims had to be tracked
+explicitly so rescue and queue counts would not degrade into history scans.
+The original ADR-019 design used a bounded `open_receipt_claims` table for
+this; ADR-023 replaces it with partitioned `lease_claims` / `lease_claim_closures`
+where "currently open" is derived at query time as an anti-join over the
+active partitions, eliminating the last MVCC churn source on the receipt
+plane. Further lease-plane work is still
 tracked in [`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
 The current queue-level coordination track for the remaining many-small-replica
 blocker is [`bounded-claimers-plan.md`](../bounded-claimers-plan.md): bound how

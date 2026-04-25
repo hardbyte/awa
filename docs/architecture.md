@@ -18,7 +18,7 @@ queue plane and rotating segments for lease churn.
                        ▼
  ┌─────────────────────────────────────────────────────────┐
  │                    Queue plane (append-only)            │
- │ ready_entries ──claim──► lease_claims / open_receipt_claims / active_leases │
+ │ ready_entries ──claim──► lease_claims (receipt) / active_leases │
  │                               │                         │
  │                               ├──retry──► deferred_jobs │
  │                               │              │          │
@@ -29,23 +29,25 @@ queue plane and rotating segments for lease churn.
                            │
            ┌───────────────┼───────────────┐
            ▼               ▼               ▼
-     Execution plane   Control plane   Maintenance leader
-     lease_claims      lane_state      promote / rescue /
-     open_receipt_claims enqueue_head  rotate / prune /
-     active_leases     claim_head      dlq retention
-     attempt_state
-     (optional)        *_segments
-                       *_segments
-                       *_cursor
+     Execution plane     Control plane   Maintenance leader
+     lease_claims        lane_state      promote / rescue /
+     lease_claim_closures enqueue_head   rotate / prune /
+     active_leases       claim_head      dlq retention
+     attempt_state       *_ring_state
+     (optional)          *_ring_slots
 ```
 
 Each queue-plane family (`ready_entries`, `deferred_jobs`, `terminal_entries`,
 `dlq_entries`) rotates through segmented partitions so long-lived history does
-not sit in one mutable heap. The current lease plane is hybrid:
+not sit in one mutable heap. The lease plane (ADR-019 / ADR-023) is the same
+shape:
 
-- zero-deadline short jobs can stay on append-only `lease_claims`
-- `open_receipt_claims` tracks only the currently-live receipt-backed attempts
-  so runtime reads do not have to infer "open" from full claim history
+- zero-deadline short jobs stay on append-only `lease_claims` (a partitioned
+  table reclaimed by ring rotation + `TRUNCATE`, not row-level vacuum)
+- the "currently open" set is derived at query time as the anti-join
+  `lease_claims` ⨝̸ `lease_claim_closures` over the active claim-ring
+  partitions; both tables share the same `claim_slot` partition key so a
+  partition's claims and closures are reclaimed together by `TRUNCATE`
 - stale zero-deadline short jobs can be rescued from `lease_claims` after the
   grace window without first creating a mutable lease row
 - heartbeat/progress-only receipt-backed jobs can materialize into
@@ -57,9 +59,11 @@ not sit in one mutable heap. The current lease plane is hybrid:
 - queue storage applies effective priority aging at claim time, so old waiting
   jobs rise in priority without physically rewriting ready rows
 
-ADR-019 is the source of truth for storage internals:
+ADR-019 is the storage-engine source of truth; ADR-023 supersedes it for the
+receipt plane (`lease_claims` / `lease_claim_closures` partitioning):
 
 - [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
+- [ADR-023: Receipt Plane Ring Partitioning](adr/023-receipt-plane-ring-partitioning.md)
 
 This overview focuses on the current runtime boundaries and subsystems. The
 migration and compatibility surfaces for older SQL entry points are documented
@@ -70,8 +74,8 @@ truth when this overview needs more detail.
 
 - queue plane: append-only `ready_entries`, `deferred_jobs`,
   `terminal_entries`, and `dlq_entries`
-- execution plane: append-only `lease_claims`, bounded
-  `open_receipt_claims`, narrow `active_leases`, plus optional per-attempt
+- execution plane: partitioned `lease_claims` + `lease_claim_closures`
+  (claim-ring; ADR-023), narrow `active_leases`, plus optional per-attempt
   `attempt_state`
 - control plane: cold `lane_state`, hot `queue_enqueue_heads`,
   hot `queue_claim_heads`, plus ready/lease segment cursor tables
@@ -286,11 +290,14 @@ Dispatcher::run()
             ├── Apply rate limit (truncate if throttled)
             │
             ▼
-            Claim query:
-              lock lane state for queue + priority
-              lock the lease segment cursor FOR SHARE
+            Claim query (single CTE):
+              lock the (queue, priority) row of queue_claim_heads FOR UPDATE SKIP LOCKED
+              read lease_ring_state and claim_ring_state at the snapshot
+                  (no row-level lock; the rotator's CAS UPDATE on
+                  (current_slot, generation) plus its empty-partition
+                  busy-check is what serialises us against rotate)
               read the next runnable entry from the current ready segment
-              either append a `lease_claims` receipt (short zero-deadline path)
+              either append a lease_claims receipt (short zero-deadline path)
               or INSERT an active lease in the current lease segment
               hydrate the runtime job from the immutable ready entry + claim snapshot
             │
@@ -310,11 +317,13 @@ receipt path until they prove they need the richer runtime semantics; the
 first heartbeat or progress flush lazily materializes that receipt into
 `attempt_state` only, while callback registration or other lease-specific
 mutation paths still escalate it into `active_leases`. The currently-live
-receipt-backed set is tracked in `open_receipt_claims`, so receipt rescue and
-queue counts do not have to infer "open" by scanning the full append-only
-claim and closure history. If the receipt never materializes at all,
-maintenance can still rescue it after the stale-claim grace window by closing
-the receipt append-only and requeueing the attempt.
+receipt-backed set is derived at query time as the anti-join `lease_claims`
+⨝̸ `lease_claim_closures` over the active claim-ring partitions (ADR-023);
+the partitioning is on a shared `claim_slot` so each partition's claim rows
+and closure rows are reclaimed together by `TRUNCATE` at prune time. If the
+receipt never materializes at all, maintenance can still rescue it after the
+stale-claim grace window by appending a closure row and requeueing the
+attempt.
 
 Dispatch still uses strict priority ordering by `(queue, priority, lane_seq)`.
 Cross-priority fairness is handled separately by the maintenance leader's

@@ -1,5 +1,12 @@
 # Bounded Claimers Per Queue Plan
 
+> **Status: shipped (current design).** Bounded claimers are live in
+> 0.6 — `QueueConfig::max_claimers` plus the `queue_claimer_state` /
+> `queue_claimer_leases` tables coordinate which replicas may actively
+> claim from a queue at any moment. The
+> `test_queue_storage_bounded_claimers_*` runtime tests exercise the
+> behaviour. This doc remains as the design rationale.
+
 ## Why this exists
 
 The queue-storage engine is now in a good place for:
