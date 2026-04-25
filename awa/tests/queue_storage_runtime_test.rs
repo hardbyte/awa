@@ -349,6 +349,13 @@ fn queue_storage_client<W: Worker + 'static>(
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
+        // Claim-ring prune now actually TRUNCATEs idle child partitions
+        // (ADR-023 Wave 1). Tests assert hard-coded lease_claim/closure
+        // counts assuming those rows survive — keep that invariant by
+        // pushing claim rotation past the test's wall-clock window.
+        // Tests that exercise rotation directly drive `rotate_claims`
+        // explicitly rather than rely on the timer.
+        .claim_rotate_interval(Duration::from_secs(60))
         .register_worker(worker)
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
@@ -758,12 +765,12 @@ impl Worker for MultiClientTrackingWorker {
     }
 }
 
-/// ADR-023 Phase 2 smoke test. Exercises the claim-ring control plane:
-/// rotate_claims advances the cursor through every slot and cycles back,
-/// prune_oldest_claims stays a no-op (no partitions yet in Phase 2), and
-/// install + reset leaves the ring seeded correctly. Phase 3 will extend
-/// this to cover partition-truncate once lease_claims /
-/// lease_claim_closures become PARTITIONED BY LIST (claim_slot).
+/// ADR-023 claim-ring control-plane smoke test. Exercises
+/// `rotate_claims`, the busy-check, and `prune_oldest_claims` on an
+/// empty schema: rotate cycles through every slot, prune is a noop
+/// when nothing's been written, install + reset leaves the ring
+/// seeded correctly. The end-to-end test
+/// `test_claim_ring_rotate_and_prune_under_load` covers the busy-path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_claim_ring_rotates_and_prunes_empty() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -805,7 +812,8 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
     );
 
     // Rotate four times — should advance cursor 0 -> 1 -> 2 -> 3 -> 0,
-    // generation 0 -> 1 -> 2 -> 3 -> 4.
+    // generation 0 -> 1 -> 2 -> 3 -> 4. Empty partitions make the
+    // busy-check trivially pass.
     for step in 1..=4_i64 {
         let outcome = store
             .rotate_claims(&pool)
@@ -821,14 +829,18 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         }
     }
 
-    // Prune is a no-op until Phase 3 adds partitioned child tables.
+    // On a schema with no claims written yet, prune either noops
+    // (oldest_initialized_ring_slot returns None) or TRUNCATEs an
+    // already-empty partition (Pruned) — both are legitimate. What we
+    // must NOT see is SkippedActive (would mean the safety check
+    // reported an open claim where none exists) or Blocked.
     let prune = store
         .prune_oldest_claims(&pool)
         .await
         .expect("prune_oldest_claims should succeed");
     assert!(
-        matches!(prune, PruneOutcome::Noop),
-        "Phase 2 prune_oldest_claims must be a noop, got {prune:?}"
+        matches!(prune, PruneOutcome::Noop | PruneOutcome::Pruned { .. }),
+        "prune_oldest_claims on untouched ring must be Noop or Pruned, got {prune:?}"
     );
 
     // reset() re-seeds the ring to the initial shape — claim_ring_state
@@ -862,6 +874,250 @@ async fn test_claim_ring_rotates_and_prunes_empty() {
         .prepare_schema(&pool)
         .await
         .expect("prepare_schema should be idempotent");
+}
+
+/// Wave-1 regression test for the claim-ring rotate+prune pair.
+///
+/// Exercises the full cycle: claim a job (populates
+/// `lease_claims_<current>`), complete it (populates
+/// `lease_claim_closures_<current>`), rotate the ring (must NOT flip
+/// onto a slot that still has rows), prune the oldest slot (must
+/// `TRUNCATE` both children because every claim has a closure), rotate
+/// again (now succeeds because the target slot is empty).
+///
+/// This locks in two ADR-023 invariants that were broken before this
+/// fix:
+///
+/// - `rotate_claims` refuses to advance onto a partition that still
+///   has live rows (busy-check), so the ring doesn't lap silently
+///   while prune is behind.
+/// - `prune_oldest_claims` actually TRUNCATEs when the partition has
+///   no open claims — previously a no-op — so `lease_claims` doesn't
+///   grow unboundedly once Phase 4 made completion closure-only.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_claim_ring_rotate_and_prune_under_load() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let schema = "awa_qs_claim_ring_reclaim";
+    let queue = "qs_claim_ring_reclaim";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            experimental_lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Claim + complete a receipt-backed job. Without prune, this leaves
+    // one row in lease_claims_0 and one row in lease_claim_closures_0.
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let client = queue_storage_client(
+        &pool,
+        queue,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            queue_stripe_count: 1,
+            experimental_lease_claim_receipts: true,
+        },
+        CompleteWorker,
+    );
+    client.start().await.expect("client start");
+
+    let _ = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(10),
+    )
+    .await;
+    client.shutdown(Duration::from_secs(5)).await;
+
+    // Sanity: one claim + one closure both landed in slot 0.
+    let slot0_claims: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
+            .fetch_one(&pool)
+            .await
+            .expect("count lease_claims_0");
+    let slot0_closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closures_0"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count lease_claim_closures_0");
+    assert_eq!(slot0_claims, 1, "completed claim must live in slot 0");
+    assert_eq!(slot0_closures, 1, "matching closure must live in slot 0");
+
+    // Rotate from slot 0 → slot 1. Slot 1 is empty, so busy-check
+    // passes and the cursor advances.
+    match store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate_claims -> slot 1")
+    {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 1);
+            assert_eq!(generation, 1);
+        }
+        other => panic!("expected Rotated {{ slot: 1, generation: 1 }}, got {other:?}"),
+    }
+
+    // Now try to rotate once more. Next target is slot 2, still empty,
+    // so this also succeeds.
+    match store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate_claims -> slot 2")
+    {
+        RotateOutcome::Rotated { slot, generation } => {
+            assert_eq!(slot, 2);
+            assert_eq!(generation, 2);
+        }
+        other => panic!("expected Rotated {{ slot: 2, generation: 2 }}, got {other:?}"),
+    }
+
+    // Keep rotating until the next target wraps to slot 0, which still
+    // holds the completed claim + closure pair. The busy-check must
+    // refuse.
+    match store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate_claims -> slot 3")
+    {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 3),
+        other => panic!("expected Rotated to slot 3, got {other:?}"),
+    }
+    let busy_outcome = store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate_claims attempt -> slot 0 (busy)");
+    assert!(
+        matches!(busy_outcome, RotateOutcome::SkippedBusy { slot: 0 }),
+        "rotate onto slot 0 with live rows must SkippedBusy, got {busy_outcome:?}"
+    );
+
+    // Prune the oldest initialized slot. With every claim in slot 0
+    // having a matching closure, PartitionTruncateSafety holds and
+    // prune TRUNCATEs both children.
+    let prune_outcome = store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("prune_oldest_claims");
+    match prune_outcome {
+        PruneOutcome::Pruned { slot } => assert_eq!(slot, 0),
+        other => panic!("expected Pruned {{ slot: 0 }}, got {other:?}"),
+    }
+
+    // Both children of slot 0 are now empty.
+    let post_prune_claims: i64 =
+        sqlx::query_scalar(&format!("SELECT count(*) FROM {schema}.lease_claims_0"))
+            .fetch_one(&pool)
+            .await
+            .expect("count lease_claims_0 after prune");
+    let post_prune_closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claim_closures_0"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count lease_claim_closures_0 after prune");
+    assert_eq!(
+        post_prune_claims, 0,
+        "lease_claims_0 must be empty post-prune"
+    );
+    assert_eq!(
+        post_prune_closures, 0,
+        "lease_claim_closures_0 must be empty post-prune"
+    );
+
+    // And now rotate onto slot 0 succeeds.
+    match store
+        .rotate_claims(&pool)
+        .await
+        .expect("rotate_claims -> slot 0 after prune")
+    {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 0),
+        other => panic!("expected Rotated to slot 0 after prune, got {other:?}"),
+    }
+}
+
+/// Wave-1 regression test for the prune safety predicate. If a claim
+/// is still open (no matching closure), prune must return
+/// `SkippedActive` instead of TRUNCATE-ing the partition and losing
+/// the claim.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_claim_ring_open";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 4,
+            experimental_lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    // Synthesize an open claim in slot 0 without a matching closure.
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.lease_claims (
+            claim_slot, job_id, run_lease, ready_slot, ready_generation,
+            queue, priority, attempt, max_attempts, lane_seq
+        ) VALUES (0, 999, 1, 0, 0, 'synthetic', 2, 1, 25, 999)
+        "#
+    ))
+    .execute(&pool)
+    .await
+    .expect("seed open claim");
+
+    // Rotate past slot 0 so it's no longer current.
+    for _ in 0..1 {
+        store
+            .rotate_claims(&pool)
+            .await
+            .expect("rotate away from slot 0");
+    }
+
+    let outcome = store
+        .prune_oldest_claims(&pool)
+        .await
+        .expect("prune_oldest_claims with open claim");
+    assert!(
+        matches!(outcome, PruneOutcome::SkippedActive { slot: 0 }),
+        "prune must refuse to truncate a partition with an open claim, got {outcome:?}"
+    );
+
+    // The claim is still there — not lost.
+    let survived: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*) FROM {schema}.lease_claims_0 WHERE job_id = 999"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count survivor");
+    assert_eq!(survived, 1, "open claim must survive SkippedActive prune");
 }
 
 /// Admin-cancel wakes an in-flight handler via the `awa:cancel`
@@ -2593,6 +2849,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
+        .claim_rotate_interval(Duration::from_secs(60))
         .register_worker(ProgressRescueWorker)
         .heartbeat_interval(Duration::from_secs(60))
         .promote_interval(Duration::from_millis(25))
@@ -2701,6 +2958,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
+        .claim_rotate_interval(Duration::from_secs(60))
         .register_worker(ReceiptRescueWorker {
             release: release.clone(),
         })

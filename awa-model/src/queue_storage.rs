@@ -3973,7 +3973,7 @@ impl QueueStorage {
                 JobState::Scheduled => deferred_rows.push(DeferredJobRow {
                     job_id: 0,
                     kind: ready_row.kind,
-                    queue: queue,
+                    queue,
                     args: ready_row.args,
                     state: JobState::Scheduled,
                     priority: ready_row.priority,
@@ -4430,6 +4430,7 @@ impl QueueStorage {
             .clamp(1, max_claimers.max(1)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
     pub async fn claim_runtime_batch_with_aging_for_instance(
         &self,
@@ -5534,7 +5535,7 @@ impl QueueStorage {
         // lease_claim_closures, cancel it by writing a closure and a
         // done row, and notify listening workers.
         if self.experimental_lease_claim_receipts() {
-            let receipt: Option<(
+            type ReceiptCancelRow = (
                 i32,
                 i64,
                 i32,
@@ -5545,7 +5546,8 @@ impl QueueStorage {
                 i16,
                 i64,
                 DateTime<Utc>,
-            )> = sqlx::query_as(&format!(
+            );
+            let receipt: Option<ReceiptCancelRow> = sqlx::query_as(&format!(
                 r#"
                     SELECT
                         claims.claim_slot,
@@ -9174,11 +9176,12 @@ impl QueueStorage {
 
     /// ADR-023 claim-ring rotation. Parallel of `rotate_leases`.
     ///
-    /// Phase 2 note: `lease_claims` and `lease_claim_closures` are not yet
-    /// partitioned by `claim_slot`, so there is no child partition to
-    /// busy-check against here — every call advances the cursor. Phase 3
-    /// adds the partition busy check to this function so rotation waits
-    /// for the incoming slot to drain before flipping the cursor.
+    /// Advances `claim_ring_state.current_slot` via compare-and-swap. Before
+    /// flipping the cursor the target partition must be drained: both the
+    /// `lease_claims_<next>` and `lease_claim_closures_<next>` child tables
+    /// must be empty. This is what the `rotate → prune → rotate` ring
+    /// invariant requires — we only hand out a slot to new claims when a
+    /// prior prune has truncated it.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.rotate_claims")]
     pub async fn rotate_claims(&self, pool: &PgPool) -> Result<RotateOutcome, AwaError> {
         let schema = self.schema();
@@ -9189,6 +9192,7 @@ impl QueueStorage {
             SELECT current_slot, generation, slot_count
             FROM {schema}.claim_ring_state
             WHERE singleton = TRUE
+            FOR UPDATE
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -9196,6 +9200,34 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         let next_slot = (state.0 + 1).rem_euclid(state.2);
+
+        // Busy check: both children of the incoming slot must be empty.
+        // A non-empty `lease_claims_<next>` means the previous lap's
+        // prune hasn't run (or didn't complete); rotating anyway would
+        // mix fresh claims with legacy rows and defeat the point of
+        // partitioning. Non-empty `lease_claim_closures_<next>` means
+        // prune fell behind on closures specifically.
+        let claim_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {}",
+            claim_child_name(schema, next_slot as usize)
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let closure_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {}",
+            closure_child_name(schema, next_slot as usize)
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if claim_count > 0 || closure_count > 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+        }
+
         let next_generation = state.1 + 1;
 
         let rotated = sqlx::query(&format!(
@@ -9230,14 +9262,26 @@ impl QueueStorage {
 
     /// ADR-023 claim-ring prune. Parallel of `prune_oldest_leases`.
     ///
-    /// Phase 2 note: until Phase 3 partitions `lease_claims` /
-    /// `lease_claim_closures` by `claim_slot`, there is no child
-    /// partition to TRUNCATE. This function returns `Noop` in that
-    /// regime after validating that the ring state is reachable. Phase 3
-    /// replaces the body with the real partition-truncate path
-    /// (rescue-before-truncate for any still-open claim, `ACCESS
-    /// EXCLUSIVE` on both the claim and closure children, then
-    /// `TRUNCATE`).
+    /// Reclaims the oldest initialized (sealed) claim-ring slot by
+    /// `TRUNCATE`-ing both its `lease_claims_<slot>` and
+    /// `lease_claim_closures_<slot>` children. Takes the full ADR-023
+    /// lock sequence:
+    ///
+    /// 1. `FOR UPDATE` on `claim_ring_state` (serialises with rotate).
+    /// 2. `FOR UPDATE` on the target `claim_ring_slots` row.
+    /// 3. `SET LOCAL lock_timeout = '50ms'` then `LOCK TABLE ACCESS
+    ///    EXCLUSIVE` on both children (serialises with in-flight
+    ///    claim/complete/rescue writers; gives up gracefully under
+    ///    contention).
+    /// 4. Verifies the slot is not the current one, and that every
+    ///    claim in the partition has a matching closure row.
+    /// 5. `TRUNCATE` both children in a single statement.
+    ///
+    /// The "every claim has a closure" precondition is what ADR-023
+    /// calls `PartitionTruncateSafety`. If an open claim remains in the
+    /// partition, prune returns `SkippedActive` and the claim has to
+    /// drain by normal completion or be rescued by
+    /// `rescue_stale_receipt_claims_tx` before prune will try again.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest_claims")]
     pub async fn prune_oldest_claims(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
@@ -9248,22 +9292,113 @@ impl QueueStorage {
             SELECT current_slot, generation, slot_count
             FROM {schema}.claim_ring_state
             WHERE singleton = TRUE
+            FOR UPDATE
             "#
         ))
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        // Pick the oldest sealed slot — Phase 2 can't actually truncate
-        // anything because the partitions don't exist yet, so this is a
-        // no-op that still validates the ring-state lookup path.
-        let Some(_oldest) = oldest_initialized_ring_slot(state.0, state.1, state.2) else {
+        let Some((slot, _generation)) = oldest_initialized_ring_slot(state.0, state.1, state.2)
+        else {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
 
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(PruneOutcome::Noop)
+        // Lock the slot row so concurrent rotate/prune observe the same
+        // state machine transition.
+        let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT slot FROM {schema}.claim_ring_slots
+            WHERE slot = $1
+            FOR UPDATE
+            "#
+        ))
+        .bind(slot)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if slot_locked.is_none() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        }
+
+        let claim_child = claim_child_name(schema, slot as usize);
+        let closure_child = closure_child_name(schema, slot as usize);
+
+        sqlx::query("SET LOCAL lock_timeout = '50ms'")
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let lock_tables = sqlx::query(&format!(
+            "LOCK TABLE {claim_child}, {closure_child} IN ACCESS EXCLUSIVE MODE"
+        ))
+        .execute(tx.as_mut())
+        .await;
+
+        if lock_tables.is_err() {
+            let _ = tx.rollback().await;
+            return Ok(PruneOutcome::Blocked { slot });
+        }
+
+        // After taking ACCESS EXCLUSIVE, recheck that the slot is not
+        // the current one (rotate may have won the ring-state lock
+        // earlier).
+        let current_slot: i32 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton = TRUE
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if current_slot == slot {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive { slot });
+        }
+
+        // `PartitionTruncateSafety`: every claim in this partition must
+        // have a matching closure. Any open claim means a worker is
+        // still running (or a rescue hasn't fired yet); we bail and let
+        // normal lifecycle drain the partition.
+        let open_claims: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT count(*)::bigint
+            FROM {claim_child} AS claims
+            WHERE NOT EXISTS (
+                SELECT 1 FROM {closure_child} AS closures
+                WHERE closures.claim_slot = claims.claim_slot
+                  AND closures.job_id = claims.job_id
+                  AND closures.run_lease = claims.run_lease
+            )
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if open_claims > 0 {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::SkippedActive { slot });
+        }
+
+        let truncate = sqlx::query(&format!("TRUNCATE TABLE {claim_child}, {closure_child}"))
+            .execute(tx.as_mut())
+            .await;
+
+        match truncate {
+            Ok(_) => {
+                tx.commit().await.map_err(map_sqlx_error)?;
+                Ok(PruneOutcome::Pruned { slot })
+            }
+            Err(_) => {
+                let _ = tx.rollback().await;
+                Ok(PruneOutcome::Blocked { slot })
+            }
+        }
     }
 
     fn job_id_sequence(&self) -> String {

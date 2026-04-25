@@ -703,6 +703,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             schema: schema.clone(),
                             queue_slot_count: queue_slot_count as usize,
                             lease_slot_count: lease_slot_count as usize,
+                            ..Default::default()
                         })?;
                         if reset {
                             sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
