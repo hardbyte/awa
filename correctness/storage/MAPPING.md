@@ -4,8 +4,12 @@ This doc pins each TLA+ action in `AwaSegmentedStorage.tla` to the Rust
 code and SQL that implements it. It is intended as a mechanical cross-check
 as names and internals evolve.
 
-File references are at the time of writing (2026-04-21). This table maps the
-logical storage names used in ADR-019 onto the current Rust / SQL
+File references are at the time of writing (2026-04-25, after ADR-023
+Wave 1 + Wave 2 landed). Line numbers in this doc refer to
+`awa-model/src/queue_storage.rs` unless stated otherwise. They drift
+quickly under active development; treat them as a hint and re-grep for
+the function name if the line is wrong. This table maps the logical
+storage names used in ADR-019 onto the current Rust / SQL
 implementation.
 
 ## Variable mapping
@@ -21,13 +25,13 @@ implementation.
 | `attemptState` | `{schema}.attempt_state` |
 | `runLease[j]` | `run_lease` column on the lease/ready/deferred row |
 | `taskLease[w][j]` | `ctx.job.run_lease` snapshot captured at claim time in `awa-worker/src/executor.rs` |
-| `heartbeatFresh` | `heartbeat_at` on the lease row + the maintenance cutoff (see `rescue_stale_heartbeats` in `queue_storage.rs:5528`) |
+| `heartbeatFresh` | `heartbeat_at` on the lease row + the maintenance cutoff (see `rescue_stale_heartbeats` in `queue_storage.rs:8575`) |
 | `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
-| `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. Pending Phase 2+ implementation. |
-| `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time; pending Phase 4 cutover. |
-| `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. Pending Phase 4. |
+| `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. Implemented (Phase 3+). |
+| `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time via the `lease_claims` ⨝ `lease_claim_closures` anti-join (Phase 4 landed). |
+| `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. Phase 4 landed. |
 | `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Seeded in `prepare_schema`; rotated by `rotate_claims`. |
 | `claimSegmentCursor` | `{schema}.claim_ring_state.current_slot`. |
 
@@ -40,36 +44,38 @@ for backfill / fallback reads during upgrades.
 
 | TLA+ action | Rust function | SQL / DDL |
 |---|---|---|
-| `EnqueueReady(j)` | `QueueStorage::insert_ready` / producer insert path | `INSERT INTO {schema}.ready_entries ... UPSERT {schema}.queue_enqueue_heads` (single tx) |
-| `EnqueueDeferred(j)` | `QueueStorage::insert_deferred` | `INSERT INTO {schema}.deferred_entries ...` |
-| `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_deferred_jobs` | `DELETE FROM deferred_entries ... INSERT INTO ready_entries ...` in one tx |
-| `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside `claim_ready_runtime` PL/pgSQL function; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
-| `Claim(w, j)` | `QueueStorage::claim_runtime_batch` → dispatcher (`awa-worker/src/dispatcher.rs`) | `claim_ready_runtime(...)` server-side fn: lane selection reads `queue_lanes`, serialization uses `FOR UPDATE OF queue_claim_heads SKIP LOCKED`, then inserts receipt/lease rows and advances `queue_claim_heads` |
-| `MaterializeAttemptState(j)` | `QueueStorage::upsert_attempt_state` on first progress / callback / long-path transition | `INSERT INTO attempt_state ... ON CONFLICT (job_id, run_lease) DO NOTHING` |
+| `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` (`queue_storage.rs:3470`); producer entry points are `enqueue_batch` / `enqueue_runtime_rows` (`:3937, 3965`) | `INSERT INTO {schema}.ready_entries ... UPSERT {schema}.queue_enqueue_heads` (single tx) |
+| `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` (`queue_storage.rs:3625`) | `INSERT INTO {schema}.deferred_entries ...` |
+| `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_state` | `DELETE FROM deferred_entries ... INSERT INTO ready_entries ...` in one tx |
+| `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside the inline claim CTE; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
+| `Claim(w, j)` | `QueueStorage::claim_runtime_batch` (`queue_storage.rs:4145`) → `claim_runtime_batch_with_aging_for_instance` (`:4504`) → dispatcher (`awa-worker/src/dispatcher.rs`) | inline claim CTE: lane selection via `FOR UPDATE OF queue_claim_heads SKIP LOCKED`; bare reads of `lease_ring_state` and `claim_ring_state` (no FOR SHARE/UPDATE — rotate's CAS UPDATE on `(current_slot, generation)` plus the partition busy-check provides the conflict detection); INSERT into `lease_claims_<claim_slot>` (receipts mode) or `leases_<lease_slot>` (legacy mode); UPDATE `queue_claim_heads` |
+| `MaterializeAttemptState(j)` | `QueueStorage::upsert_attempt_state_from_receipts_tx` (`queue_storage.rs:6243`) and `upsert_attempt_state_progress_from_receipts_tx` (`:6307`) | `INSERT INTO attempt_state ... ON CONFLICT (job_id, run_lease) DO NOTHING` |
 | `Heartbeat(j)` | `heartbeat_tick` in `awa-worker/src/heartbeat.rs` | `UPDATE leases SET heartbeat_at = now() WHERE job_id = $1 AND run_lease = $2` |
 | `LoseHeartbeat(j)` | implicit — time passes without a heartbeat UPDATE; maintenance rescue sees a stale cutoff | (no action in real code; represents age) |
-| `ProgressFlush(j)` | `QueueStorage::flush_progress` (`queue_storage.rs:4746`) | `UPDATE attempt_state SET progress = ... WHERE job_id = $1 AND run_lease = $2` guarded by running/waiting_external state |
-| `ParkToWaiting(w, j)` | `QueueStorage::wait_external` from executor `WaitForCallback` | delete from leases, insert into waiting_entries, preserve attempt_state |
-| `ResumeWaitingToReady(j)` | `QueueStorage::resume_external` on callback success | `DELETE FROM waiting_entries`, `INSERT INTO ready_entries`, clear attempt_state |
+| `ProgressFlush(j)` | `QueueStorage::flush_progress` (`queue_storage.rs:7802`) | `UPDATE attempt_state SET progress = ... WHERE job_id = $1 AND run_lease = $2` guarded by running/waiting_external state |
+| `ParkToWaiting(w, j)` | `QueueStorage::enter_callback_wait` (`queue_storage.rs:7291`) from executor `WaitForCallback` | delete from leases, insert into waiting_entries, preserve attempt_state |
+| `ResumeWaitingToReady(j)` | admin / callback resume (lives in `awa-model/src/admin.rs:2695`) on callback success | `DELETE FROM waiting_entries`, `INSERT INTO ready_entries`, clear attempt_state |
 | `TimeoutWaitingToReady(j)` | maintenance callback rescue with attempts remaining (`awa-worker/src/maintenance.rs::rescue_expired_callbacks`) | rescue SQL with attempt increment |
 | `TimeoutWaitingToDlq(j)` | maintenance callback rescue with exhausted attempts | rescue SQL routes to `dlq_entries` instead of re-enqueue |
-| `FastComplete(w, j)` | `QueueStorage::complete_runtime_batch` short path (no attempt_state hydrate) | `DELETE FROM leases`, `INSERT INTO done_entries` carrying the claim-time snapshot; no `ready_entries` read |
-| `StatefulComplete(w, j)` | `QueueStorage::complete_runtime_batch` + attempt_state delete | same as above plus `DELETE FROM attempt_state` |
-| `FailToDlq(w, j)` | `QueueStorage::fail_to_dlq_terminal` via executor terminal failure path | `DELETE FROM leases`, `DELETE FROM attempt_state`, `INSERT INTO dlq_entries` in one tx |
-| `RetryToDeferred(w, j)` | `QueueStorage::retry_runtime` on `JobError::RetryAfter` / `Snooze` | `DELETE FROM leases`, `INSERT INTO deferred_entries` |
-| `RescueToReady(j)` | `rescue_stale_heartbeats` / `rescue_expired_deadlines` in maintenance (`queue_storage.rs:5528, 5611`) | `DELETE FROM leases ... RETURNING ...; INSERT INTO ready_entries ...` |
-| `CancelWaitingToTerminal(j)` | admin cancel path in `awa-model/src/admin.rs` for a waiting job | `DELETE FROM waiting_entries`, `INSERT INTO done_entries` with cancel reason |
+| `FastComplete(w, j)` | `QueueStorage::complete_runtime_batch` (`queue_storage.rs:4677`) short path (no attempt_state hydrate) | receipts mode: `INSERT INTO lease_claim_closures` (no `DELETE FROM leases`); legacy mode: `DELETE FROM leases` + `INSERT INTO done_entries` carrying the claim-time snapshot |
+| `StatefulComplete(w, j)` | `QueueStorage::complete_runtime_batch` + `DELETE FROM attempt_state` | same as above plus `DELETE FROM attempt_state` |
+| `FailToDlq(w, j)` | `QueueStorage::fail_to_dlq` (`queue_storage.rs:8088`) / `fail_terminal` (`:8055`) via executor terminal failure path | `DELETE FROM leases`, `DELETE FROM attempt_state`, `INSERT INTO dlq_entries` in one tx |
+| `RetryToDeferred(w, j)` | `QueueStorage::retry_after` (`queue_storage.rs:7945`) / `snooze` (`:7981`) on `JobError::RetryAfter` / `Snooze` | `DELETE FROM leases`, `INSERT INTO deferred_entries` |
+| `RescueToReady(j)` | `rescue_stale_heartbeats` (`queue_storage.rs:8575`) / `rescue_expired_deadlines` (`:8688`) in maintenance | `DELETE FROM leases ... RETURNING ...; INSERT INTO ready_entries ...` |
+| `CancelWaitingToTerminal(j)` | admin cancel path in `awa-model/src/admin.rs` for a waiting job; receipt-only and running-lease branches in `cancel_job_tx` (`queue_storage.rs:5501`) | waiting branch: `DELETE FROM waiting_entries` + `INSERT INTO done_entries` with cancel reason. See also `CancelRunningToTerminal`, `CancelReceiptOnlyToTerminal` for the running-job branches. |
 | `StaleCompleteRejected(w, j)` | `complete_runtime_batch` returning `CompletionOutcome::IgnoredStale` | `UPDATE leases ... WHERE run_lease = $2` matching 0 rows |
-| `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (admin) | `DELETE FROM done_entries ... INSERT INTO dlq_entries ...` guarded by state=failed |
-| `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:5509` region) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` with `run_lease = 0`; unique-conflict handled by `sync_unique_claim` |
-| `PurgeDlq(j)` | `QueueStorage::purge_dlq_job` / bulk `purge_dlq` | `DELETE FROM dlq_entries WHERE ...` |
+| `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (`queue_storage.rs:8127`); admin entry in `awa-model/src/dlq.rs:170` | `DELETE FROM done_entries ... INSERT INTO dlq_entries ...` guarded by state=failed |
+| `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:8254`) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` with `run_lease = 0`; unique-conflict handled by `sync_unique_claim` |
+| `PurgeDlq(j)` | `purge_dlq_job` / `purge_dlq` in `awa-model/src/dlq.rs:382, 423` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
 | `RotateDeferredSegments` / `RotateWaitingSegments` / `RotateLeaseSegments` / `RotateDlqSegments` | parallel maintenance rotate functions per family | analogous `UPDATE *_ring_state` |
-| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:5994`) | `SELECT ... WHERE slot = $1` check, then `TRUNCATE {schema}.ready_segment_N` in a separate tx; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
-| `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family | `TRUNCATE {schema}.X_segment_N` with active-row check |
-| `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`awa-model/src/queue_storage.rs`) wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
-| `PruneClaimSegment(seg)` | maintenance `QueueStorage::prune_oldest_claims` (Phase 2: returns `Noop` because the partitions don't exist yet; Phase 3+ swaps in the real partition-truncate body) | Phase 3 target: `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `ACCESS EXCLUSIVE` on both `{schema}.lease_claims_N` and `{schema}.lease_claim_closures_N`, rescue-before-truncate for any still-open claim in the partition, then `TRUNCATE` both children |
-| `RescueStaleReceipt(j)` | receipt rescue scan integrated with `prune_oldest_claims` (pending Phase 3+) | anti-join `lease_claims` against `lease_claim_closures` over the active partitions; close stragglers by appending to `lease_claim_closures` |
+| `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:9080`) | `FOR UPDATE` on `queue_ring_state` and `queue_ring_slots[slot]`, then `LOCK TABLE ... ACCESS EXCLUSIVE`, recheck active rows, then `TRUNCATE`; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
+| `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family (lease prune at `queue_storage.rs:9208`) | `TRUNCATE {schema}.X_segment_N` with active-row check |
+| `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`queue_storage.rs:9333`), wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `FOR UPDATE` on `claim_ring_state`, busy-check both child partitions, then `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
+| `PruneClaimSegment(seg)` | `QueueStorage::prune_oldest_claims` (`queue_storage.rs:9433`) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `SET LOCAL lock_timeout = '50ms'`, `LOCK TABLE` `lease_claims_N` and `lease_claim_closures_N` `IN ACCESS EXCLUSIVE MODE`, recheck not-current, anti-join check that every claim has a closure (`PartitionTruncateSafety`), then `TRUNCATE` both children |
+| `RescueStaleReceipt(j)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` (Wave 2c) so the lease-side rescue path owns those. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
+| `CancelRunningToTerminal(j)` | `cancel_job_tx` lease branch (`queue_storage.rs:5501`, ~line 5581) | `DELETE FROM leases ... RETURNING`, `insert_done_rows_tx` (state = `cancelled`), `close_receipt_tx` (writes the `'cancelled'` closure into the matching claim partition), `pg_notify('awa:cancel', ...)` |
+| `CancelReceiptOnlyToTerminal(j)` | `cancel_job_tx` receipt-only branch (`queue_storage.rs:5621`) | `SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED` → `insert_done_rows_tx` → `INSERT INTO lease_claim_closures` → defensive `DELETE FROM leases` (Wave 2d) → `pg_notify` |
 
 ## Invariant mapping
 
@@ -130,17 +136,16 @@ it proves that weakening that discipline would reintroduce the bug.
 
 The spec's PruneLeaseSegment transition also captures the analogous
 concern on `prune_oldest` (for ready partitions) at
-`queue_storage.rs:6252`.
+`queue_storage.rs:9080`.
 
 **Status in the implementation: mitigated.** The prune path:
 
 1. `FOR UPDATE` on `queue_ring_state` to serialise against concurrent
-   rotates (`queue_storage.rs:6265`)
+   rotates
 2. `FOR UPDATE` on the target `queue_ring_slots` row
-   (`queue_storage.rs:6280`)
-3. `LOCK TABLE ... IN ACCESS EXCLUSIVE MODE` on the ready and done
-   partition children (`queue_storage.rs:6297`) — this blocks the
-   AccessShare lock that `claim_ready_runtime` takes when reading
+3. `SET LOCAL lock_timeout = '50ms'`, then `LOCK TABLE ... IN ACCESS
+   EXCLUSIVE MODE` on the ready and done partition children — this
+   blocks the AccessShare lock that the claim CTE takes when reading
    `{schema}.ready_entries_%s`, forcing prune to wait for in-flight
    claims to commit (or bail via the 50 ms `lock_timeout`)
 4. Only AFTER the lock is held does the count-active-leases check
@@ -311,9 +316,14 @@ specs:
   lease-ring rotation/prune pattern.
 - `AwaStorageLockOrder` adds `ClaimRingStateResource`,
   `ClaimRingSlotResource`, `ClaimChildResource`, `ClosureChildResource`;
-  `ClaimPlan` now includes `claim_ring_state FOR SHARE` and
-  `RowExclusive` on the claim child; `CompletePlan`, `RotateClaimsPlan`,
-  and `PruneClaimsPlan` are added.
+  `ClaimReceiptsPlan` / `ClaimLegacyPlan` model the two execution modes
+  with `RowExclusive` on the appropriate child (the `*_ring_state`
+  reads in the claim CTE are bare SELECTs in Rust, so the spec drops
+  the previously-modelled `FOR SHARE` step — claim is serialised
+  against rotate via the rotator's CAS UPDATE, not via row-level
+  locks); `CompletePlan`, `RotateClaimsPlan`, `PruneClaimsPlan`,
+  `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`, and
+  `CancelReceiptPlan` are added.
 - `AwaSegmentedStorageRaces` adds `claimSeg` to the claim-intent
   snapshot and exposes the claim-ring version of the naive commit race.
 
@@ -327,7 +337,11 @@ Invariants added:
 
 Model checking results as of Phase 1:
 
-- `AwaSegmentedStorage.cfg`: 2.3M distinct states, clean.
+- `AwaSegmentedStorage.cfg`: 2,326,528 distinct states, clean
+  (Wave 3 added `CancelRunningToTerminal` and
+  `CancelReceiptOnlyToTerminal` to `Next`; the new actions clear all
+  workers' `taskLease` snapshots since admin cancel has no worker
+  context, preserving `TaskLeaseBounded`).
 - `AwaSegmentedStorageInterleavings.cfg` (2 workers): 4.7M distinct
   states, clean.
 - `AwaSegmentedStorageTrace.cfg`: snooze trace accepted cleanly.
@@ -341,13 +355,17 @@ Model checking results as of Phase 1:
 - `AwaSegmentedStorageRacesSafe.cfg`: safe commit, clean.
 - `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers,
   clean.
-- `AwaStorageLockOrder.cfg`: 9,680 distinct states, clean (up from
-  2,076 pre-ADR-023 because claim-ring transaction kinds are added).
+- `AwaStorageLockOrder.cfg`: 39,040 distinct states, clean (up from
+  9,680 mid-ADR-023 / 2,076 pre-ADR-023; the further increase is from
+  `ClaimReceiptsPlan` / `ClaimLegacyPlan` split, plus the new
+  `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`,
+  `CancelReceiptOnlyPlan`, `CancelRunningPlan` added in Wave 3).
 - `AwaStorageLockOrderDeadlockDemo.cfg`: still trips `NoDeadlock` in 5
   steps, confirming the detector works.
 
-Rust function columns in the action/variable tables above are marked
-"pending Phase N" until the corresponding code lands.
+Phases 1–4 of ADR-023 have all landed. The action/variable tables
+above are now in their post-Phase-4 form (Phase 5 deletes
+`open_receipt_claims`; Phase 6 flips the receipts default).
 
 ### Phase 4 — every read derives "currently open" from lease_claims anti-join closures (landed)
 
@@ -440,20 +458,23 @@ data-plane-quiescent infrastructure:
   same shape.
 - `QueueStorage::rotate_claims(pool)` and
   `QueueStorage::prune_oldest_claims(pool)` mirror `rotate_leases` and
-  `prune_oldest_leases`. Phase 2 `prune_oldest_claims` returns
-  `PruneOutcome::Noop` because the data partitions don't exist yet;
-  Phase 3 adds the partition-truncate body.
+  `prune_oldest_leases`. Phase 2 stubbed `prune_oldest_claims` as a
+  noop; ADR-023 Wave 1 (commit `137e9ef`) replaced both with the real
+  ring-state CAS busy-check and rescue-before-truncate prune body
+  described under `RotateClaimSegments` / `PruneClaimSegment` above.
 - The maintenance leader schedules the claim-ring tick alongside the
   queue and lease rings. `claim_rotate_interval` defaults to
   `queue_rotate_interval`; tests and benches can override via
   `ClientBuilder::claim_rotate_interval`.
 
-Unit coverage: `test_claim_ring_rotates_and_prunes_empty` in
-`awa/tests/queue_storage_runtime_test.rs` drives the claim ring through
-one full cycle (current_slot 0→1→2→3→0, generation 0→4), asserts
-`prune_oldest_claims` stays a `Noop`, and verifies `reset()` +
-`prepare_schema()` idempotency.
+Unit coverage: `test_claim_ring_rotates_and_prunes_empty` drives the
+claim ring through one full cycle (current_slot 0→1→2→3→0, generation
+0→4) on an empty schema. Wave 1 added
+`test_claim_ring_rotate_and_prune_under_load` (claim a job, complete
+it, rotate, prune actually TRUNCATEs both children) and
+`test_prune_oldest_claims_refuses_to_truncate_open_claim` (the
+`PartitionTruncateSafety` precondition holds when an open claim is
+present).
 
-The full `queue_storage_runtime_test` suite (42 tests) passes with the
-Phase 2 changes in place, confirming the additive-only posture didn't
-regress any existing lifecycle path.
+The full `queue_storage_runtime_test` suite (49 tests as of Wave 2)
+passes.

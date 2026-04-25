@@ -276,7 +276,43 @@ children, TRUNCATE both) plus a busy-check in `rotate_claims` that mirrors
     `claim_slot`, and the `claim_slot` ALTER uses `-1` as an
     unambiguous sentinel rather than conflating with a legitimate
     slot 0. `reset()` drops legacy tables before TRUNCATE.
-- **Wave 3–4:** separate follow-up PRs before Phase 5 merges to main.
+- **Wave 3:** TLA+ fidelity + MAPPING.md cleanup landed alongside this
+  update.
+  - 3a: `AwaStorageLockOrder.tla` — dropped the bogus `FOR SHARE` on
+    `lease_ring_state` / `claim_ring_state` from `ClaimPlan` (Rust
+    takes no such lock — the rotator's CAS UPDATE is what serialises
+    them); split the claim plan into receipts vs legacy modes; added
+    plans for `close_receipt_tx`, `rescue_stale_receipt_claims_tx`,
+    `ensure_running_leases_from_receipts_tx`, and the two
+    `cancel_job_tx` branches; re-classified table-level INSERTs as
+    `ModeShared` so two concurrent inserts to the same partition no
+    longer report a false-positive deadlock. TLC now passes 39,040
+    distinct states (was 9,680). The discovery: with the old "INSERT
+    is exclusive" abstraction, complete-vs-cancel raced into a real
+    AB-BA pattern in the model — but Postgres `RowExclusive` is
+    compatible with itself, so it was a model error rather than a
+    code bug. Moot for now since the Rust code never hit it; logged
+    as part of the spec hardening.
+  - 3b: `MAPPING.md` swept of stale function names, line numbers, and
+    "pending Phase N" hedges that contradicted the post-Phase-4
+    headings; same for `correctness/{,storage/}README.md`'s state-count
+    references.
+  - 3c: Added `CancelRunningToTerminal(j)` and
+    `CancelReceiptOnlyToTerminal(j)` to `AwaSegmentedStorage.tla` so
+    the model covers the running-lease and receipt-only branches of
+    `cancel_job_tx` (in addition to the pre-existing
+    `CancelWaitingToTerminal`); both clear every worker's
+    `taskLease[w][j]` snapshot since admin cancel has no worker
+    context. Wired into both `Next` and the trace harness's
+    `TraceStep`. TLC base spec passes 2,326,528 distinct states.
+  - Deferred: re-keying `claimOpen` / `claimClosed` from `Jobs` to
+    `Jobs × RunLease` (the per-attempt bookkeeping). The reviewer's
+    concern about losing the closure binding on re-claim is real but
+    only fires if rescue-and-re-claim aren't atomic — they are
+    (single `rescue_stale_receipt_claims_tx` transaction), so the
+    spec gap doesn't currently mask a code bug. Logging as a
+    nice-to-have for a future refinement.
+- **Wave 4:** separate follow-up PR before Phase 5 merges to main.
   Each wave closes a finding; this file is updated as findings resolve.
   Delete this file (or fold it into an ADR-023 validation artifact)
   before the 0.6 release.

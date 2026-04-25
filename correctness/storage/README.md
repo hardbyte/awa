@@ -169,9 +169,14 @@ that captures the cases relevant to deadlock analysis. Invariants:
 Configs:
 
 - [`AwaStorageLockOrder.cfg`](./AwaStorageLockOrder.cfg): main run
-  against the real Rust lock plans — **2,076 distinct states, clean**.
-  This is the positive artifact saying the current SQL lock ordering
-  is deadlock-free and the lock compatibility contract holds.
+  against the real Rust lock plans — **39,040 distinct states, clean**
+  (was 9,680 mid-ADR-023 / 2,076 pre-ADR-023; the post-Wave-3 spec
+  models the receipts and legacy claim modes separately and adds
+  plans for `close_receipt_tx`, `rescue_stale_receipt_claims_tx`,
+  `ensure_running_leases_from_receipts_tx`, and the two `cancel_job_tx`
+  branches). This is the positive artifact saying the current SQL
+  lock ordering is deadlock-free and the lock compatibility contract
+  holds.
 - [`AwaStorageLockOrderDeadlockDemo.cfg`](./AwaStorageLockOrderDeadlockDemo.cfg):
   sanity harness using a deliberately cycle-creating pair of plans —
   **NoDeadlock tripped in 5 steps** (confirms the checker works).

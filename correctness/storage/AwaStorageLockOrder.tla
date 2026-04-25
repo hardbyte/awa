@@ -4,20 +4,31 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 \* Lock-ordering protocol spec for the queue-storage engine.
 \*
 \* The data-level specs (AwaSegmentedStorage, AwaSegmentedStorageRaces)
-\* deliberately abstract away from Postgres locks. After reviewing the
-\* Rust SQL, the claim/rotate/prune race turned out to be mitigated by
-\* FOR SHARE on lease_ring_state plus ACCESS EXCLUSIVE on lease
-\* partitions. This spec models those locks directly so a future
-\* refactor that weakens or re-orders them would trip an invariant.
+\* deliberately abstract away from Postgres locks. This spec models the
+\* SQL locks directly so a future refactor that weakens or re-orders
+\* them trips an invariant.
+\*
+\* The claim/rotate/prune race against the lease ring is mitigated by:
+\*   - the rotators taking FOR UPDATE on lease_ring_state and the
+\*     target slot row (so two rotators serialise),
+\*   - LOCK TABLE ACCESS EXCLUSIVE on the partition child (so prune
+\*     waits for in-flight claim/complete writes to commit before
+\*     truncating).
+\* Note: the claim CTE reads lease_ring_state with a plain SELECT, NOT
+\* a FOR SHARE. The conflict detection between claim and rotate is the
+\* rotator's CAS UPDATE (`WHERE current_slot=$ AND generation=$`) plus
+\* the rotator's empty-partition busy-check, not a row-level lock.
+\* The plans below treat the ring-state read as a no-lock step (it is
+\* simply elided from the plan).
 \*
 \* ADR-023 extends the locked resources with the claim ring
 \* (claim_ring_state, claim_ring_slots, lease_claims child partitions,
 \* lease_claim_closures child partitions) and the parallel rotate/prune
-\* plans for the claim ring. The claim path now also takes a FOR SHARE
-\* on claim_ring_state and a RowExclusive on the lease_claims child
-\* partition. Closure writes on terminal transitions take a RowExclusive
-\* on the lease_claim_closures child partition that was selected when
-\* the claim was first made.
+\* plans for the claim ring. The claim path takes a RowExclusive on
+\* the lease_claims child partition (receipts mode) or the leases child
+\* partition (legacy mode). Closure writes on terminal transitions take
+\* a RowExclusive on the lease_claim_closures child partition matching
+\* the originating claim.
 \*
 \* What it models:
 \* - each transaction as an ordered sequence of (resource, mode) lock
@@ -52,9 +63,27 @@ CONSTANTS TxIds,
           ReadySlots,
           ClaimSlots
 
-\* Lock modes. We collapse the Postgres matrix to S/X because the only
-\* nontrivial compatibility in the claim/rotate/prune paths is FOR
-\* SHARE vs FOR UPDATE; everything else is X.
+\* Lock modes. We collapse the Postgres matrix to S/X.
+\*
+\* `ModeShared` covers everything in Postgres that allows other writers
+\* to proceed concurrently: AccessShare (plain SELECT), RowShare (SELECT
+\* FOR UPDATE / FOR SHARE), and RowExclusive (INSERT / UPDATE / DELETE).
+\* These all share with each other at the table level — two concurrent
+\* INSERTs to the same partition do not deadlock at the table level.
+\* Row-level FOR UPDATE conflicts on the same row are deliberately
+\* abstracted away; the spec models partition-level locking, not
+\* row-level. Conflicts that fall through that abstraction (e.g. two
+\* admin cancels of the same job) serialise via row locks the spec
+\* doesn't track, and they can't deadlock with anything else because
+\* they're per-row.
+\*
+\* `ModeExclusive` covers AccessExclusive (LOCK TABLE / TRUNCATE) and
+\* the FOR UPDATE on singleton rows like `lease_ring_state`. For a
+\* singleton row, "FOR UPDATE" really IS exclusive at the abstraction
+\* level — only one tx at a time gets to advance the cursor.
+\*
+\* The compatibility check therefore is: S/S allowed, S/X and X/X both
+\* conflict.
 ModeShared == "S"
 ModeExclusive == "X"
 Modes == {ModeShared, ModeExclusive}
@@ -108,32 +137,92 @@ Step(res, mode) == [res |-> res, mode |-> mode]
 \* Transaction kind plans. Each mirrors the actual SQL in
 \* awa-model/src/queue_storage.rs as noted inline.
 
-\* claim_ready_runtime
-\*   SELECT ... FROM queue_lanes FOR UPDATE (per-priority row)
-\*   CTE lease_ring: SELECT ... FROM lease_ring_state FOR SHARE
-\*   CTE claim_ring: SELECT ... FROM claim_ring_state FOR SHARE (ADR-023)
-\*   SELECT ... FROM ready_entries_SLOT ... (implicit AccessShare on child)
-\*   INSERT INTO leases (routed to current lease partition)
-\*   INSERT INTO lease_claims (routed to current claim partition, ADR-023)
-\* We parameterise the tx by the queue/priority, the ready slot it
-\* reads from, and the lease/claim slots the rings point at when it reads.
-ClaimPlan(q, p, readySlot, leaseSlot, claimSlot) ==
+\* The claim CTE
+\* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
+\*   FOR UPDATE OF queue_claim_heads SKIP LOCKED (per-(queue,priority) row)
+\*   plain SELECT of lease_ring_state and claim_ring_state — no
+\*     FOR SHARE / FOR UPDATE; serialisation against rotate is via
+\*     the rotator's CAS UPDATE on (current_slot, generation), not a
+\*     row lock here, so these reads are NOT modelled as plan steps.
+\*   plain SELECT of ready_entries_<slot> (implicit AccessShare on child)
+\*   INSERT INTO lease_claims_<claim_slot> (receipts mode) OR
+\*   INSERT INTO leases_<lease_slot> (legacy mode)
+\*   UPDATE queue_claim_heads (already locked, no new acquire)
+\*
+\* Two distinct plans because the receipts and legacy modes write to
+\* different children. `experimental_lease_claim_receipts` selects
+\* between them at runtime.
+\* RowExclusive on partition children (INSERT/UPDATE/DELETE/SELECT FOR
+\* UPDATE) is `ModeShared` in this spec — see the lock-mode comment
+\* above. The lane row uses `ModeExclusive` because `FOR UPDATE OF
+\* queue_claim_heads` on the same lane row really does serialise.
+ClaimReceiptsPlan(q, p, readySlot, claimSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
-       Step(LeaseRingStateResource, ModeShared),
-       Step(ClaimRingStateResource, ModeShared),
        Step(ReadyChildResource(readySlot), ModeShared),
-       Step(LeaseChildResource(leaseSlot), ModeExclusive),
-       Step(ClaimChildResource(claimSlot), ModeExclusive) >>
+       Step(ClaimChildResource(claimSlot), ModeShared) >>
+
+ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
+    << Step(LaneResource(q, p), ModeExclusive),
+       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(LeaseChildResource(leaseSlot), ModeShared) >>
 
 \* complete_runtime_batch receipt branch (ADR-023)
 \*   No queue_lanes lock (completion does not gate on a lane row)
 \*   INSERT INTO lease_claim_closures (routed to the originating claim_slot)
 \*   INSERT INTO done_entries / dlq_entries / deferred_entries
-\* We parameterise the tx by the claim slot (carried on the completed
-\* claim) and the ready slot of the terminal row.
 CompletePlan(claimSlot, readySlot) ==
-    << Step(ClosureChildResource(claimSlot), ModeExclusive),
-       Step(DoneChildResource(readySlot), ModeExclusive) >>
+    << Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(DoneChildResource(readySlot), ModeShared) >>
+
+\* close_receipt_tx (queue_storage.rs:5450, called from cancel_job_tx)
+\*   WITH locked_claim AS (SELECT ... FROM lease_claims FOR UPDATE)
+\*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
+CloseReceiptPlan(claimSlot) ==
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
+
+\* rescue_stale_receipt_claims_tx (queue_storage.rs:6672)
+\*   SELECT ... FROM lease_claims claims LEFT JOIN attempt_state ...
+\*     WHERE NOT EXISTS (closures) AND NOT EXISTS (leases)
+\*     FOR UPDATE OF claims SKIP LOCKED
+\*   INSERT INTO lease_claim_closures ... ON CONFLICT DO NOTHING
+\* The leases anti-join (Wave 2c) takes AccessShare on the leases
+\* parent so rescue can race against prune_oldest_leases.
+RescueReceiptsPlan(claimSlot) ==
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(LeasesParentResource, ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
+
+\* ensure_running_leases_from_receipts_tx (queue_storage.rs:6102)
+\*   CTE claim_refs: SELECT ... FROM lease_claims FOR UPDATE OF claims
+\*   INSERT INTO leases ...
+\*   UPDATE lease_claims SET materialized_at = ...
+EnsureRunningPlan(claimSlot, leaseSlot) ==
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(LeaseChildResource(leaseSlot), ModeShared) >>
+
+\* cancel_job_tx receipt-only branch (queue_storage.rs:5621)
+\*   SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED
+\*   insert_done_rows_tx → INSERT INTO done_entries
+\*   INSERT INTO lease_claim_closures
+\*   defensive DELETE FROM leases (Wave 2d)
+\*   pg_notify('awa:cancel', ...)
+CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot) ==
+    << Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(DoneChildResource(readySlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared),
+       Step(LeaseChildResource(leaseSlot), ModeShared) >>
+
+\* cancel_job_tx running-lease branch (queue_storage.rs ~:5581)
+\*   DELETE FROM leases ... RETURNING
+\*   insert_done_rows_tx → INSERT INTO done_entries
+\*   close_receipt_tx (claim child + closure child)
+\*   pg_notify
+CancelRunningPlan(leaseSlot, readySlot, claimSlot) ==
+    << Step(LeaseChildResource(leaseSlot), ModeShared),
+       Step(DoneChildResource(readySlot), ModeShared),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(ClosureChildResource(claimSlot), ModeShared) >>
 
 \* rotate_leases
 \*   SELECT ... FROM lease_ring_state FOR UPDATE
@@ -224,18 +313,32 @@ BlockingTxsForStep(t, step) ==
             /\ <<u, m>> \in heldLocks[step.res]
             /\ ~ Compatible(m, step.mode) }
 
-\* Start a Claim transaction. Different txs can pick different slots,
-\* exercising the protocol across interleavings.
-StartClaim(t, q, p, readySlot, leaseSlot, claimSlot) ==
+\* Start a Claim transaction in receipts mode. Different txs can pick
+\* different slots, exercising the protocol across interleavings.
+StartClaimReceipts(t, q, p, readySlot, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ q \in Queues
+    /\ p \in Priorities
+    /\ readySlot \in ReadySlots
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = ClaimReceiptsPlan(q, p, readySlot, claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+\* Start a Claim transaction in legacy (non-receipts) mode. The two
+\* modes don't run interleaved in production — the runtime config
+\* picks one — but modelling both lets TLC explore each shape.
+StartClaimLegacy(t, q, p, readySlot, leaseSlot) ==
     /\ t \in TxIds
     /\ txState[t] = "idle"
     /\ q \in Queues
     /\ p \in Priorities
     /\ readySlot \in ReadySlots
     /\ leaseSlot \in LeaseSlots
-    /\ claimSlot \in ClaimSlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
-    /\ txPlan' = [txPlan EXCEPT ![t] = ClaimPlan(q, p, readySlot, leaseSlot, claimSlot)]
+    /\ txPlan' = [txPlan EXCEPT ![t] = ClaimLegacyPlan(q, p, readySlot, leaseSlot)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -303,6 +406,56 @@ StartPruneClaims(t, slot) ==
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
+StartCloseReceipt(t, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = CloseReceiptPlan(claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartRescueReceipts(t, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = RescueReceiptsPlan(claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartEnsureRunning(t, claimSlot, leaseSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ leaseSlot \in LeaseSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = EnsureRunningPlan(claimSlot, leaseSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartCancelReceiptOnly(t, claimSlot, readySlot, leaseSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ claimSlot \in ClaimSlots
+    /\ readySlot \in ReadySlots
+    /\ leaseSlot \in LeaseSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = CancelReceiptOnlyPlan(claimSlot, readySlot, leaseSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartCancelRunning(t, leaseSlot, readySlot, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ leaseSlot \in LeaseSlots
+    /\ readySlot \in ReadySlots
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = CancelRunningPlan(leaseSlot, readySlot, claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
 \* Try to acquire the next lock in t's plan. Enabled iff no conflict.
 \* A blocked tx does not fire this — it simply sits until the blocker
 \* commits. The state-space accounts for "some other tx commits first"
@@ -343,8 +496,11 @@ Stutter == /\ UNCHANGED vars
 
 Next ==
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
-         rs \in ReadySlots, ls \in LeaseSlots, cs \in ClaimSlots :
-          StartClaim(t, q, p, rs, ls, cs)
+         rs \in ReadySlots, cs \in ClaimSlots :
+          StartClaimReceipts(t, q, p, rs, cs)
+    \/ \E t \in TxIds, q \in Queues, p \in Priorities,
+         rs \in ReadySlots, ls \in LeaseSlots :
+          StartClaimLegacy(t, q, p, rs, ls)
     \/ \E t \in TxIds, cs \in ClaimSlots, rs \in ReadySlots :
           StartComplete(t, cs, rs)
     \/ \E t \in TxIds, ls \in LeaseSlots : StartRotateLeases(t, ls)
@@ -353,6 +509,16 @@ Next ==
     \/ \E t \in TxIds, rs \in ReadySlots : StartPruneReady(t, rs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartRotateClaims(t, cs)
     \/ \E t \in TxIds, cs \in ClaimSlots : StartPruneClaims(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartCloseReceipt(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots : StartRescueReceipts(t, cs)
+    \/ \E t \in TxIds, cs \in ClaimSlots, ls \in LeaseSlots :
+          StartEnsureRunning(t, cs, ls)
+    \/ \E t \in TxIds, cs \in ClaimSlots, rs \in ReadySlots,
+         ls \in LeaseSlots :
+          StartCancelReceiptOnly(t, cs, rs, ls)
+    \/ \E t \in TxIds, ls \in LeaseSlots, rs \in ReadySlots,
+         cs \in ClaimSlots :
+          StartCancelRunning(t, ls, rs, cs)
     \/ \E t \in TxIds : AcquireNext(t)
     \/ \E t \in TxIds : Commit(t)
     \/ \E t \in TxIds : Recycle(t)

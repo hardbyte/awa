@@ -872,6 +872,88 @@ CancelWaitingToTerminal(j) ==
                    laneState>>
     /\ UnchangedSegmentState
 
+\* Admin cancel of a running (lease-backed) job. Mirrors
+\* `cancel_job_tx`'s lease branch in awa-model/src/queue_storage.rs:
+\* DELETE FROM leases ... RETURNING, INSERT INTO done_entries (state =
+\* cancelled), close_receipt_tx (writes the closure into the matching
+\* claim partition), pg_notify('awa:cancel', ...). Equivalent to
+\* StatefulComplete on the runtime side but routes to terminal with
+\* the cancelled label rather than completed; the receipt closure is
+\* identical so the claim-partition prune precondition still holds.
+CancelRunningToTerminal(j) ==
+    /\ j \in activeLeases
+    /\ terminalSegments[terminalSegmentCursor] = "open"
+    /\ terminalEntries' = terminalEntries \cup {j}
+    /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
+    /\ activeLeases' = activeLeases \ {j}
+    /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
+    \* Cancel has no worker context (admin path), so clear every
+    \* worker's taskLease snapshot for this job. Worker-driven
+    \* terminal transitions clear only their own; here we keep
+    \* TaskLeaseBounded by zeroing all of them, mirroring the runtime
+    \* behaviour where the pg_notify wakes whichever local worker (if
+    \* any) was running this attempt and the StaleCompleteRejected
+    \* path discards any subsequent completion that does come back.
+    /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
+    /\ attemptState' = attemptState \ {j}
+    /\ heartbeatFresh' = heartbeatFresh \ {j}
+    /\ progressTouched' = progressTouched \ {j}
+    /\ readyEntries' = readyEntries \ {j}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
+    /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
+    /\ claimOpen' = claimOpen \ {j}
+    /\ claimClosed' = claimClosed \cup {j}
+    /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
+    /\ UNCHANGED <<deferredEntries,
+                   waitingEntries,
+                   dlqEntries,
+                   runLease,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   dlqSegmentOf,
+                   claimSegmentOf>>
+    /\ UnchangedSegmentState
+
+\* Admin cancel of a job whose attempt is running on the receipt-only
+\* short path (open claim, no `leases` row materialized). Mirrors the
+\* receipt-only branch in `cancel_job_tx`: SELECT FROM lease_claims
+\* FOR UPDATE, INSERT done row, INSERT closure, defensive DELETE FROM
+\* leases (Wave 2d sweeps any concurrent materialization), pg_notify.
+\* Distinct from CancelRunningToTerminal because no lease ever existed,
+\* so activeLeases is unchanged and laneState's leasedCount stays put.
+CancelReceiptOnlyToTerminal(j) ==
+    /\ j \in claimOpen
+    /\ j \notin activeLeases
+    /\ j \notin waitingEntries
+    /\ terminalSegments[terminalSegmentCursor] = "open"
+    /\ terminalEntries' = terminalEntries \cup {j}
+    /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
+    /\ readyEntries' = readyEntries \ {j}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
+    \* Same rationale as CancelRunningToTerminal: zero every worker's
+    \* taskLease snapshot since admin cancel has no worker context.
+    /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
+    /\ claimOpen' = claimOpen \ {j}
+    /\ claimClosed' = claimClosed \cup {j}
+    /\ UNCHANGED <<deferredEntries,
+                   waitingEntries,
+                   dlqEntries,
+                   activeLeases,
+                   leaseOwner,
+                   runLease,
+                   attemptState,
+                   heartbeatFresh,
+                   progressTouched,
+                   deferredSegmentOf,
+                   waitingSegmentOf,
+                   leaseSegmentOf,
+                   dlqSegmentOf,
+                   claimSegmentOf,
+                   laneState>>
+    /\ UnchangedSegmentState
+
 StaleCompleteRejected(w, j) ==
     /\ w \in Workers
     /\ j \in Jobs
@@ -1599,6 +1681,8 @@ Next ==
     \/ \E j \in Jobs : RescueToReady(j)
     \/ \E j \in Jobs : RescueStaleReceipt(j)
     \/ \E j \in Jobs : CancelWaitingToTerminal(j)
+    \/ \E j \in Jobs : CancelRunningToTerminal(j)
+    \/ \E j \in Jobs : CancelReceiptOnlyToTerminal(j)
     \/ \E w \in Workers, j \in Jobs : StaleCompleteRejected(w, j)
     \/ \E j \in Jobs : MoveFailedToDlq(j)
     \/ \E j \in Jobs : RetryFromDlq(j)
