@@ -1235,14 +1235,11 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// `open_receipt_claims` was the live-frontier table from the
-/// pre-ADR-023 design. After the receipt plane moved to anti-joins
-/// over the partitioned `lease_claims` / `lease_claim_closures`, the
-/// table became dead weight; `prepare_schema` now drops it on every
-/// install (refusing to drop a non-empty table — see ADR-023). This
-/// test asserts the table is absent on a fresh schema and stays
-/// absent across a full claim + complete cycle, while `lease_claims`
-/// and `lease_claim_closures` reflect the lifecycle.
+/// `prepare_schema` drops `open_receipt_claims` on every install,
+/// refusing to drop a non-empty table (see ADR-023). This test
+/// asserts the table is absent on a fresh schema and stays absent
+/// across a full claim + complete cycle, while `lease_claims` and
+/// `lease_claim_closures` reflect the lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_open_receipt_claims_is_absent_after_install() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;

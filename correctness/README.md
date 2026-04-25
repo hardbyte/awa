@@ -82,9 +82,8 @@ What is intentionally not modeled:
   prune-leases, rotate-ready, prune-ready) as an ordered sequence of
   Postgres lock acquisitions with a shared/exclusive compatibility matrix.
   Checks `NoDeadlock` via a waits-for cycle detector. The main config
-  passes cleanly (39,040 distinct states post-Wave-3 of ADR-023; was
-  9,680 mid-ADR-023 / 2,076 pre), confirming the current lock ordering
-  is deadlock-free. The demo config uses a deliberately
+  passes cleanly (39,040 distinct states), confirming the current
+  lock ordering is deadlock-free. The demo config uses a deliberately
   cycle-creating plan pair to prove the detector itself works.
 - `storage/AwaSegmentedStorageTrace.tla` /
   `storage/AwaSegmentedStorageTrace.cfg` /

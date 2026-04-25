@@ -519,10 +519,10 @@ pub async fn run() {
     let producer_latencies_window = Arc::clone(&producer_latencies);
     let padding = "x".repeat(payload_bytes.saturating_sub(32) as usize);
     let producer_priority_pattern = priority_pattern.clone();
-    // Build the QueueStorage handle once outside the producer loop. The
-    // previous shape rebuilt it on every batch (≈one Arc clone +
-    // QueueStorageConfig validation per insert), which under high
-    // producer rates becomes pure allocator pressure.
+    // Build the QueueStorage handle once outside the producer loop;
+    // the handle is conceptually pool-scoped, not batch-scoped, and
+    // re-creating it per batch would be pure allocator pressure at
+    // high producer rates.
     let producer_store = queue_storage.as_ref().map(|(_, storage)| {
         QueueStorage::new(storage.clone()).expect("Invalid QueueStorageConfig")
     });

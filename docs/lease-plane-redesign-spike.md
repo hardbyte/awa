@@ -4,14 +4,14 @@
 > The narrow-implementation-spike portion of this doc that proposed
 > `open_receipt_claims` as a bounded live-frontier table has been
 > replaced by the partitioned `lease_claims` / `lease_claim_closures`
-> ring; the table itself was deleted in the post-Phase-4 cleanup
-> (`prepare_schema` now drops it on every install). Read the rest of
-> this doc as a snapshot of the lease-plane investigation that
-> triggered ADR-023; the sections on the long-running lease plane
-> (heartbeat, callback, `attempt_state`) are unchanged. References
-> to `open_receipt_claims` in the body below are kept verbatim as
-> historical context — they describe the design that motivated
-> ADR-023, not the shipping architecture.
+> ring; the table no longer exists in the schema (`prepare_schema`
+> drops it on every install). Read the rest of this doc as a snapshot
+> of the lease-plane investigation that triggered ADR-023; the
+> sections on the long-running lease plane (heartbeat, callback,
+> `attempt_state`) are unchanged. References to `open_receipt_claims`
+> in the body below are kept verbatim as historical context — they
+> describe the design that motivated ADR-023, not the shipping
+> architecture.
 
 ## Why this exists
 

@@ -140,11 +140,10 @@ Tables == DOMAIN TableSpec
 \* `FOR UPDATE` is also not modelled (row lock without UPDATE doesn't
 \* mutate the row).
 \*
-\* The list below is the post-Wave-3 ADR-023 hot-path. Add a new
-\* transaction here when adding a new SQL site. Update an existing
-\* transaction when its mutation profile changes (e.g. a new INSERT
-\* added to the claim CTE, or a DELETE removed from the completion
-\* path).
+\* The list below covers the current hot path. Add a new transaction
+\* here when adding a new SQL site. Update an existing transaction
+\* when its mutation profile changes (e.g. a new INSERT added to the
+\* claim CTE, or a DELETE removed from the completion path).
 
 Mut(op, tbl) == [op |-> op, table |-> tbl]
 

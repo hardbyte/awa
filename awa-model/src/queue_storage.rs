@@ -1379,15 +1379,15 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
-            // ADR-023 made `open_receipt_claims` dead weight after the
-            // hot path moved to anti-joins over the partitioned
-            // `lease_claims` / `lease_claim_closures` pair. Drop it
-            // here on every install. We refuse to drop a non-empty
-            // table — that would mean the operator has rolled forward
-            // from a pre-anti-join build that still wrote rows we
-            // don't want to silently delete. Treat that as an error
-            // the operator must resolve (typically by running the
-            // ADR-023 reverse-migration recipe and re-trying).
+            // The hot path reads "currently open" by anti-joining the
+            // partitioned `lease_claims` / `lease_claim_closures`
+            // pair, so `open_receipt_claims` is unused (see ADR-023).
+            // Drop it on every install. Refuse to drop a non-empty
+            // table — non-empty here means an operator rolled forward
+            // from an older build that still wrote rows we don't want
+            // to silently delete. Treat that as an error the operator
+            // must resolve (typically by running the reverse-
+            // migration recipe in ADR-023 and re-trying).
             let open_receipt_claims_exists: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (

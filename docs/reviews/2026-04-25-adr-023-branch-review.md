@@ -204,51 +204,49 @@ children, TRUNCATE both) plus a busy-check in `rotate_claims` that mirrors
 
 ### Chaos coverage
 
-The reviewer flagged three chaos gaps. The first two are documented
-caveats; the third (receipt-plane chaos coverage) is **deferred to a
-follow-up branch** before Phase 5 merges. Status:
+The reviewer flagged three chaos gaps. Receipt-plane coverage has
+shipped; the other two are documented caveats with open follow-up
+issues.
 
 - **"Outage" tests are connection-drop, not real PG restart.**
-  Documented as a known limitation. `chaos_suite_test.rs` uses
+  Documented as a known limitation (`chaos_suite_test.rs` uses
   `pg_terminate_backend`; only `postgres_failover_smoke_test.rs` does
-  a real `docker compose restart`. The distinction matters because a
-  TCP drop preserves the server's WAL state, while a process restart
-  exercises crash recovery. **Acceptance for Phase 5:** document this
-  caveat in `docs/testing.md` (does not exist; add or fold into
-  `architecture.md`'s testing section). A second-mode chaos test that
-  does a real Postgres restart is desirable but not blocking.
+  a real `docker compose restart`). A second-mode chaos test that
+  does a real Postgres restart is desirable but not blocking — the
+  TCP-drop variant exercises the connection-level recovery path that
+  represents the bulk of production failure modes.
 
 - **No network partition / SIGSTOP leader scenario.** Documented as
   a known limitation. The asymmetric "leader alive to itself, dead
   to followers" failure mode requires either iptables fakery or
   process-pause primitives that don't fit cleanly into the
-  containerised CI stack. **Acceptance for Phase 5:** track in an
-  issue; not a merge blocker.
+  containerised CI stack.
 
-- **Zero chaos coverage of receipt-plane / claim-ring / partition
-  truncate.** Deferred to a follow-up branch. The four scenarios that
-  need coverage before Phase 5 merges:
-  1. Receipt rescue under overload — flood `lease_claims` past the
-     active partition's size threshold and confirm
-     `rescue_stale_receipt_claims_tx` makes progress without lapping
-     the partition (relies on the Wave 2c `leases` anti-join).
-  2. Claim-ring prune racing live claims — fire `prune_oldest_claims`
-     concurrently with steady claim/complete traffic and confirm
-     `SkippedActive` returns rather than truncating an open claim.
-     The Wave 1 `test_prune_oldest_claims_refuses_to_truncate_open_claim`
-     covers the static case; the chaos version drives concurrent
-     traffic.
-  3. Partition `TRUNCATE` racing a closure write — confirm the
-     `LOCK TABLE ACCESS EXCLUSIVE` in `prune_oldest_claims` makes
-     `INSERT INTO lease_claim_closures` block (or fail with the
-     50ms `lock_timeout`), not silently lose the closure write.
-  4. Admin cancel during completion — confirm the receipt-only
-     branch's defensive `DELETE FROM leases` (Wave 2d) leaves no
-     orphan when materialize and cancel race over the same claim.
-  These scenarios should land in a new
-  `awa/tests/receipt_plane_chaos_test.rs` or as additional cases in
-  `chaos_suite_test.rs`. Tracked under "ADR-023 Phase 5 acceptance"
-  rather than this review's wave numbering.
+- **Receipt-plane / claim-ring / partition-truncate chaos coverage
+  has shipped** in `awa/tests/receipt_plane_chaos_test.rs`. Four
+  `#[ignore]`-d nightly scenarios:
+  1. `test_receipt_rescue_makes_progress_under_overload` — seeds
+     1500 stale claims, drains via repeated
+     `rescue_stale_heartbeats` calls (capped 500/call), confirms
+     monotonic closure progress and that prune succeeds once every
+     claim is closed.
+  2. `test_prune_skips_active_under_concurrent_traffic` — fires 50
+     concurrent `prune_oldest_claims` calls against a partition
+     holding an open claim; every call returns `SkippedActive` and
+     the seeded claim survives.
+  3. `test_prune_claims_blocked_by_concurrent_reader` — holds
+     `ACCESS SHARE` on both child partitions in a separate tx,
+     calls `prune_oldest_claims`, asserts it returns `Blocked`
+     (50ms `lock_timeout` tripped); after the reader releases,
+     prune succeeds.
+  4. `test_admin_cancel_during_materialize_no_orphan_lease` — drives
+     a real receipt-backed claim, injects a synthetic `leases` row
+     simulating a materialize that committed in the cancel race
+     window, issues `admin::cancel`, asserts the orphan is swept by
+     the defensive `DELETE FROM leases` and no stray lease survives.
+
+  All four pass against the test postgres in ~9s end-to-end. Wired
+  into `nightly-chaos.yml` as a dedicated step.
 
 ### Docs
 

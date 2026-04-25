@@ -4,13 +4,11 @@ This doc pins each TLA+ action in `AwaSegmentedStorage.tla` to the Rust
 code and SQL that implements it. It is intended as a mechanical cross-check
 as names and internals evolve.
 
-File references are at the time of writing (2026-04-25, after ADR-023
-Wave 1 + Wave 2 landed). Line numbers in this doc refer to
-`awa-model/src/queue_storage.rs` unless stated otherwise. They drift
-quickly under active development; treat them as a hint and re-grep for
-the function name if the line is wrong. This table maps the logical
-storage names used in ADR-019 onto the current Rust / SQL
-implementation.
+Line numbers in this doc refer to `awa-model/src/queue_storage.rs`
+unless stated otherwise. They drift under active development; treat
+them as a hint and re-grep for the function name if the line is wrong.
+This table maps the logical storage names used in ADR-019 / ADR-023
+onto the current Rust / SQL implementation.
 
 ## Variable mapping
 
@@ -29,9 +27,9 @@ implementation.
 | `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
-| `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. Implemented (Phase 3+). |
-| `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time via the `lease_claims` ⨝ `lease_claim_closures` anti-join (Phase 4 landed). |
-| `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. Phase 4 landed. |
+| `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. |
+| `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time via the `lease_claims` ⨝ `lease_claim_closures` anti-join. |
+| `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. |
 | `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Seeded in `prepare_schema`; rotated by `rotate_claims`. |
 | `claimSegmentCursor` | `{schema}.claim_ring_state.current_slot`. |
 
@@ -73,9 +71,9 @@ for backfill / fallback reads during upgrades.
 | `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family (lease prune at `queue_storage.rs:9208`) | `TRUNCATE {schema}.X_segment_N` with active-row check |
 | `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`queue_storage.rs:9333`), wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `FOR UPDATE` on `claim_ring_state`, busy-check both child partitions, then `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
 | `PruneClaimSegment(seg)` | `QueueStorage::prune_oldest_claims` (`queue_storage.rs:9433`) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `SET LOCAL lock_timeout = '50ms'`, `LOCK TABLE` `lease_claims_N` and `lease_claim_closures_N` `IN ACCESS EXCLUSIVE MODE`, recheck not-current, anti-join check that every claim has a closure (`PartitionTruncateSafety`), then `TRUNCATE` both children |
-| `RescueStaleReceipt(j)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` (Wave 2c) so the lease-side rescue path owns those. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
+| `RescueStaleReceipt(j)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` so the lease-side rescue path owns those. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
 | `CancelRunningToTerminal(j)` | `cancel_job_tx` lease branch (`queue_storage.rs:5501`, ~line 5581) | `DELETE FROM leases ... RETURNING`, `insert_done_rows_tx` (state = `cancelled`), `close_receipt_tx` (writes the `'cancelled'` closure into the matching claim partition), `pg_notify('awa:cancel', ...)` |
-| `CancelReceiptOnlyToTerminal(j)` | `cancel_job_tx` receipt-only branch (`queue_storage.rs:5621`) | `SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED` → `insert_done_rows_tx` → `INSERT INTO lease_claim_closures` → defensive `DELETE FROM leases` (Wave 2d) → `pg_notify` |
+| `CancelReceiptOnlyToTerminal(j)` | `cancel_job_tx` receipt-only branch (`queue_storage.rs:5621`) | `SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED` → `insert_done_rows_tx` → `INSERT INTO lease_claim_closures` → defensive `DELETE FROM leases` (sweeps any concurrent materialization) → `pg_notify` |
 
 ## Invariant mapping
 
@@ -172,10 +170,12 @@ clear statement of what the SQL coordination is buying.
 
 `AwaStorageLockOrder.tla` (see [`README.md`](./README.md)) is the
 complementary positive artifact: it models the Postgres locks
-directly and checks that no interleaving of claim / rotate-leases /
-prune-leases / rotate-ready / prune-ready transactions produces a
-waits-for cycle. Current result: 2,076 distinct states, no
-deadlock. A deliberately-broken demo config
+directly and checks that no interleaving of claim / complete /
+close-receipt / rescue-receipts / ensure-running / cancel /
+rotate-leases / prune-leases / rotate-ready / prune-ready /
+rotate-claims / prune-claims transactions produces a waits-for cycle.
+Current result: 39,040 distinct states, no deadlock. A
+deliberately-broken demo config
 (`AwaStorageLockOrderDeadlockDemo.cfg`) confirms the deadlock
 detector fires when a cycle exists.
 
@@ -291,11 +291,10 @@ has no unique keys, so it simply allows `RetryFromDlq(j)` whenever
 and a `uniqueClaim: UniqueKeys -> Jobs \cup {NoJob}` variable could check
 the invariant directly.
 
-## ADR-023 implementation status (Phase 4: receipt queries derived from lease_claims)
+## ADR-023 receipt-plane coverage
 
-The TLA+ specs now cover the ADR-023 claim-ring redesign ahead of the
-Rust implementation landing. In both the base spec and the race / lock
-specs:
+The TLA+ specs cover the ADR-023 claim-ring shape end-to-end. In both
+the base spec and the race / lock specs:
 
 - `claimSegmentOf`, `claimOpen`, `claimClosed`, `claimSegments`,
   `claimSegmentCursor` track the receipt plane parallel to the existing
@@ -314,16 +313,17 @@ specs:
   that `prune_oldest_claims` will invoke.
 - `RotateClaimSegments` and `PruneClaimSegment(seg)` parallel the
   lease-ring rotation/prune pattern.
-- `AwaStorageLockOrder` adds `ClaimRingStateResource`,
-  `ClaimRingSlotResource`, `ClaimChildResource`, `ClosureChildResource`;
-  `ClaimReceiptsPlan` / `ClaimLegacyPlan` model the two execution modes
-  with `RowExclusive` on the appropriate child (the `*_ring_state`
-  reads in the claim CTE are bare SELECTs in Rust, so the spec drops
-  the previously-modelled `FOR SHARE` step — claim is serialised
-  against rotate via the rotator's CAS UPDATE, not via row-level
-  locks); `CompletePlan`, `RotateClaimsPlan`, `PruneClaimsPlan`,
-  `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`, and
-  `CancelReceiptPlan` are added.
+- `AwaStorageLockOrder` includes `ClaimRingStateResource`,
+  `ClaimRingSlotResource`, `ClaimChildResource`, `ClosureChildResource`,
+  and `ClaimReceiptsPlan` / `ClaimLegacyPlan` for the two execution
+  modes with `RowExclusive` on the appropriate child. The
+  `*_ring_state` reads in the claim CTE are bare `SELECT`s in Rust
+  (no `FOR SHARE`); claim is serialised against rotate via the
+  rotator's CAS UPDATE on `(current_slot, generation)`, not via
+  row-level locks. `CompletePlan`, `RotateClaimsPlan`,
+  `PruneClaimsPlan`, `CloseReceiptPlan`, `RescueReceiptsPlan`,
+  `EnsureRunningPlan`, and `CancelReceiptPlan` round out the
+  receipt-plane transactions.
 - `AwaSegmentedStorageRaces` adds `claimSeg` to the claim-intent
   snapshot and exposes the claim-ring version of the naive commit race.
 
@@ -335,13 +335,13 @@ Invariants added:
 - `ClaimOpenAndClosedDisjoint`, `OpenClaimHasSegment`,
   `ClosedClaimHasSegment`: the receipt-lifecycle bookkeeping is sound.
 
-Model checking results as of Phase 1:
+Model checking results:
 
-- `AwaSegmentedStorage.cfg`: 2,326,528 distinct states, clean
-  (Wave 3 added `CancelRunningToTerminal` and
-  `CancelReceiptOnlyToTerminal` to `Next`; the new actions clear all
-  workers' `taskLease` snapshots since admin cancel has no worker
-  context, preserving `TaskLeaseBounded`).
+- `AwaSegmentedStorage.cfg`: 2,326,528 distinct states, clean. Admin
+  cancel actions (`CancelRunningToTerminal`,
+  `CancelReceiptOnlyToTerminal`) clear all workers' `taskLease`
+  snapshots since admin cancel has no worker context, preserving
+  `TaskLeaseBounded`.
 - `AwaSegmentedStorageInterleavings.cfg` (2 workers): 4.7M distinct
   states, clean.
 - `AwaSegmentedStorageTrace.cfg`: snooze trace accepted cleanly.
@@ -355,140 +355,71 @@ Model checking results as of Phase 1:
 - `AwaSegmentedStorageRacesSafe.cfg`: safe commit, clean.
 - `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers,
   clean.
-- `AwaStorageLockOrder.cfg`: 39,040 distinct states, clean (up from
-  9,680 mid-ADR-023 / 2,076 pre-ADR-023; the further increase is from
-  `ClaimReceiptsPlan` / `ClaimLegacyPlan` split, plus the new
+- `AwaStorageLockOrder.cfg`: 39,040 distinct states, clean. Models
+  the receipts and legacy claim modes separately, plus
   `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`,
-  `CancelReceiptOnlyPlan`, `CancelRunningPlan` added in Wave 3).
-- `AwaStorageLockOrderDeadlockDemo.cfg`: still trips `NoDeadlock` in 5
+  `CancelReceiptOnlyPlan`, and `CancelRunningPlan`.
+- `AwaStorageLockOrderDeadlockDemo.cfg`: trips `NoDeadlock` in 5
   steps, confirming the detector works.
 - `AwaDeadTupleContract.cfg`: 1 distinct state, clean. The four
   ASSUME-style architectural-contract checks
   (`HotPartitionedTablesUseTruncate`,
   `PartitionTruncateTablesAreReclaimed`,
   `AppendOnlyAcceptsOnlyInsert`,
-  `RowVacuumTablesNotTruncated`) all hold for the post-Wave-3 schema
+  `RowVacuumTablesNotTruncated`) all hold for the current schema
   and transaction list. Workflow: when adding a new table to
   `prepare_schema()` or a new SQL site to queue_storage.rs, register
   it in `AwaDeadTupleContract.tla` with the correct reclaim kind /
-  hotness / mutation list. A future `open_receipt_claims`-style
-  proposal (hot table, RowVacuum reclaim, INSERT+DELETE traffic)
-  would fire `HotPartitionedTablesUseTruncate` at parse time —
-  verified by adding the row temporarily and watching TLC report
+  hotness / mutation list. An `open_receipt_claims`-style proposal
+  (hot table, RowVacuum reclaim, INSERT+DELETE traffic) would fire
+  `HotPartitionedTablesUseTruncate` at parse time — verified by
+  adding the row temporarily and watching TLC report
   the assumption violation, then removing it.
 
-Phases 1–4 of ADR-023 have all landed. The action/variable tables
-above are now in their post-Phase-4 form (Phase 5 deletes
-`open_receipt_claims`; Phase 6 flips the receipts default).
-
-### Phase 4 — every read derives "currently open" from lease_claims anti-join closures (landed)
-
-After Phase 4 the runtime never reads or writes `open_receipt_claims`
-on the hot path. The partitioned `lease_claims` table is the
-authoritative record of "currently open"; every query that used to
-target `open_receipt_claims` now does a bounded anti-join against
-`lease_claim_closures` over the active partitions.
-
-Seven SQL sites rewritten:
-
-1. `queue_counts_exact` (`awa-model/src/queue_storage.rs`,
-   `live_running` CTE): running count of receipt-backed attempts
-   derives from the anti-join.
-2. `ensure_running_leases_from_receipts_tx` (claim → lease
-   materialization): `claim_refs` CTE now selects from lease_claims
-   anti-joined with closures; `removed_open` DELETE is dropped.
-3. `upsert_attempt_state_heartbeat_from_receipts_tx`: same pattern for
-   the heartbeat-only upsert path.
-4. `upsert_attempt_state_progress_from_receipts_tx`: same for the
-   progress-flush upsert.
-5. `close_open_receipt_claim_tx`: `target` CTE now sources the open
-   claim from lease_claims anti-joined with closures; the closure INSERT
-   targets the matching partition via `claim_slot`.
-6. `rescue_stale_receipt_claims_tx`: `stale_claims` CTE similarly
-   rewritten; `removed_open` DELETE removed.
-7. `complete_runtime_batch` receipt branch: the `completed` CTE now
-   carries `(claim_slot, job_id, run_lease)` triples directly from
-   `ClaimedEntry`, so the closure INSERT routes by partition key
-   without reading open_receipt_claims at all.
-8. `load_job` receipt branch: reports receipt-backed attempts as
-   Running by anti-joining lease_claims with closures and excluding
-   any that already have a materialized lease row.
-
-Phase 4f: the claim CTE no longer emits the `opened AS (INSERT INTO
-open_receipt_claims ...)` sibling. The partitioned `lease_claims`
-insert is the authoritative claim record.
-
-The `open_receipt_claims` table still exists (to be dropped in Phase
-5) but is untouched by the hot path. ADR-023 Phase 4 regression test
-`test_phase4_no_writes_to_open_receipt_claims` locks this in by
-running a full claim + complete cycle and asserting
-`open_receipt_claims` stays at zero rows throughout.
-
-### Phase 3 — partitioned lease_claims + lease_claim_closures (landed)
-
-ADR-023 Phase 3 converts both receipt-plane tables to `PARTITIONED BY
-LIST (claim_slot)` with one child per ring slot. Claims and their
-closures co-locate in the same partition, so Phase 5 prune can truncate
-both children in lock-step.
+### Receipt-plane shape
 
 - `lease_claims` and `lease_claim_closures` are partitioned parents
   (`relkind = 'p'`); `lease_claims_0..N-1` and
-  `lease_claim_closures_0..N-1` are the children.
-- PK on both is `(claim_slot, job_id, run_lease)` to satisfy the
-  "partition key must be in the PK" Postgres rule; a secondary
-  non-unique index on `(job_id, run_lease)` keeps completion / rescue /
-  materialize paths that don't carry `claim_slot` efficient.
-- The existing `idx_..._lease_claims_stale (materialized_at,
-  claimed_at, job_id)` index is recreated on the partitioned parent
-  and propagates to every child.
-- `ClaimedEntry` gains `claim_slot: i32`; the claim CTE reads
-  `claim_ring_state.current_slot` alongside the lease-ring cursor and
-  `RETURNS`  it; `open_receipt_claims` gains a `claim_slot` column so
-  close / rescue paths know which partition to write closures into.
-- In-place migration: `prepare_schema()` detects pre-Phase-3 regular
-  tables, renames them `_legacy`, creates the partitioned parents and
-  children, rewrites rows into the current `claim_ring_state.current_slot`,
-  then drops the legacy tables. Idempotent on re-run.
-- Three runtime tests lock this in:
-  `test_lease_claim_partition_routing` (claim + closure both land in
-  the current ring slot), `test_lease_claim_rotation_isolation`
-  (post-rotation claims land in a different partition; existing rows
-  are not moved), `test_lease_claim_migration_preserves_rows` (legacy
-  data migrates cleanly, `prepare_schema` stays idempotent after).
-- Full `queue_storage_runtime_test` suite: all 45 tests pass (42
-  pre-existing receipt-mode tests + 3 Phase 3 additions).
+  `lease_claim_closures_0..N-1` are the children. PK on both is
+  `(claim_slot, job_id, run_lease)` (partition-key-in-PK), with a
+  secondary `(job_id, run_lease)` index for completion / rescue /
+  materialize paths that don't carry `claim_slot` in hand.
+- The "currently open" set is derived at query time as
+  `lease_claims` ⨝̸ `lease_claim_closures` over the active partitions.
+  Sites: the running-count CTE in `queue_counts_exact`,
+  `ensure_running_leases_from_receipts_tx`, the heartbeat / progress
+  upsert paths, `close_receipt_tx`, `rescue_stale_receipt_claims_tx`,
+  `complete_runtime_batch`'s receipt branch, and `load_job`. None of
+  these touch `open_receipt_claims`.
+- `ClaimedEntry` carries `claim_slot: i32` so completion can route
+  the closure INSERT to the matching partition without an extra
+  lookup.
+- `prepare_schema()` drops `open_receipt_claims` on every install
+  (refusing if it has rows). `reset()` does the same and clears any
+  `_legacy` tables left over from a partial migration.
+- `claim_slot_count` (default 8, minimum 2) sets the partition count.
+  `claim_rotate_interval` (defaulting to `queue_rotate_interval`)
+  drives the rotation cadence; `ClientBuilder::claim_rotate_interval`
+  overrides per-test or per-bench.
+- `rotate_claims` advances the cursor with a `FOR UPDATE` on
+  `claim_ring_state` and a busy-check on both child partitions of the
+  next slot — the rotation invariant is "the slot we're flipping
+  onto must be empty". `prune_oldest_claims` walks the full
+  ring-state → slot-row → child `ACCESS EXCLUSIVE` lock sequence and
+  refuses to TRUNCATE while any claim in the partition lacks a
+  matching closure (`PartitionTruncateSafety`).
 
-### Phase 2 — claim-ring control plane (landed)
+### Coverage
 
-The claim-ring control plane is live in the Rust runtime as additive,
-data-plane-quiescent infrastructure:
+`queue_storage_runtime_test` (49 tests) covers the lifecycle:
+partition routing, rotation isolation, partition migration on schema
+upgrade, the rotate / prune busy-and-safety predicates, admin cancel
+of running attempts, the open-receipt-claims absence invariant, the
+full short-job lifecycle, and the rescue paths for
+heartbeat / deadline / receipt-only attempts.
 
-- `QueueStorageConfig::claim_slot_count` (default `8`, minimum `2`).
-- `prepare_schema()` creates `{schema}.claim_ring_state` and
-  `{schema}.claim_ring_slots` with the same fillfactor and autovacuum
-  knobs the ADR-023 small ring-state tables already use, seeds the
-  singleton row at `(0, 0, claim_slot_count)`, and seeds one open slot
-  plus `slot_count - 1` uninitialized slots. `reset()` re-seeds the
-  same shape.
-- `QueueStorage::rotate_claims(pool)` and
-  `QueueStorage::prune_oldest_claims(pool)` mirror `rotate_leases` and
-  `prune_oldest_leases`. Phase 2 stubbed `prune_oldest_claims` as a
-  noop; ADR-023 Wave 1 (commit `137e9ef`) replaced both with the real
-  ring-state CAS busy-check and rescue-before-truncate prune body
-  described under `RotateClaimSegments` / `PruneClaimSegment` above.
-- The maintenance leader schedules the claim-ring tick alongside the
-  queue and lease rings. `claim_rotate_interval` defaults to
-  `queue_rotate_interval`; tests and benches can override via
-  `ClientBuilder::claim_rotate_interval`.
-
-Unit coverage: `test_claim_ring_rotates_and_prunes_empty` drives the
-claim ring through one full cycle (current_slot 0→1→2→3→0, generation
-0→4) on an empty schema. Wave 1 added
-`test_claim_ring_rotate_and_prune_under_load` (claim a job, complete
-it, rotate, prune actually TRUNCATEs both children) and
-`test_prune_oldest_claims_refuses_to_truncate_open_claim` (the
-`PartitionTruncateSafety` precondition holds when an open claim is
-present).
-
-The full `queue_storage_runtime_test` suite (49 tests as of Wave 2)
-passes.
+`receipt_plane_chaos_test` (4 `#[ignore]`-d nightly tests) covers
+flood / concurrency / lock-order scenarios: rescue throughput under
+overload, prune-skips-active under concurrent traffic, the
+`ACCESS EXCLUSIVE` barrier between TRUNCATE and concurrent inserts,
+and admin-cancel-during-materialize orphan-lease cleanup.

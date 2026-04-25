@@ -490,13 +490,12 @@ async fn test_prune_claims_blocked_by_concurrent_reader() {
 ///   3. Inject a synthetic `leases` row for the same (job_id,
 ///      run_lease) — simulating a materialize that committed in the
 ///      gap.
-///   4. Issue `admin::cancel(job_id)`. This takes the cancel path
-///      that walks: DELETE leases (sees the synthetic lease, takes
-///      the lease branch and runs successfully), insert done,
-///      close_receipt. Wave 2d's defensive DELETE in the receipt-
-///      only branch is the protection for the case where cancel
-///      misses the lease in the first DELETE; this test exercises
-///      the path where the lease is seen.
+///   4. Issue `admin::cancel(job_id)`. This walks the cancel path:
+///      DELETE leases (sees the synthetic lease, takes the lease
+///      branch and runs successfully), insert done, close_receipt.
+///      The defensive DELETE in the receipt-only branch protects
+///      the case where cancel misses the lease in the first DELETE;
+///      this test exercises the path where the lease is seen.
 ///   5. Assert `leases` is empty for that pair, the closure was
 ///      written, and the job state is `Cancelled`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
