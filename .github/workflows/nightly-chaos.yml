@@ -77,6 +77,8 @@ jobs:
           fi
           cat /tmp/tlc-deadlock.log
           exit 1
+      - name: AwaDeadTupleContract (architectural reclaim contract)
+        run: ./correctness/run-tlc.sh storage/AwaDeadTupleContract.tla storage/AwaDeadTupleContract.cfg
 
   postgres-failover-smoke:
     name: Postgres failover smoke
@@ -154,6 +156,13 @@ jobs:
           cargo test --package awa --test chaos_suite_test \
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-chaos.txt
+      - name: Run receipt-plane chaos suite
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          cargo test --package awa --test receipt_plane_chaos_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-receipt-plane-chaos.txt
       - name: Run sustained deferred benchmark
         if: always()
         timeout-minutes: 15

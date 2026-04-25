@@ -71,24 +71,5 @@
   },
   "python/mixed_50pct": {
     "handler_per_s": 216.0
-  },
-  "_doc": {
-    "rust/receipt_plane_steady": "ADR-023 receipt-plane steady-state thresholds. Numbers are upper bounds; the next 4x8 long_horizon run with receipts on populates real values, set with margin so healthy runs don't trip. Treat as placeholders until the Phase-6 validation artifact lands.",
-    "rust/receipt_plane_rotate": "ADR-023 claim-ring rotate/prune cadence and lap time. Used to detect a stalled prune cycle (ring laps without truncating)."
-  },
-  "rust/receipt_plane_steady": {
-    "lease_claims_max_rows": 50000,
-    "lease_claim_closures_max_rows": 50000,
-    "lease_claims_dead_tup_peak": 5000,
-    "lease_claim_closures_dead_tup_peak": 5000,
-    "open_receipt_claims_dead_tup_peak": 0,
-    "queue_counts_cached_p99_ms": 50.0,
-    "queue_counts_cached_hit_rate": 0.80
-  },
-  "rust/receipt_plane_rotate": {
-    "rotate_claims_per_min": 60.0,
-    "prune_claims_per_min": 60.0,
-    "claim_ring_lap_seconds_p50": 30.0,
-    "claim_ring_skipped_busy_per_min": 5.0
   }
 }
