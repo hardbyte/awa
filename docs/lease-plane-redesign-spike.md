@@ -1,12 +1,17 @@
 # Lease Plane Redesign Spike
 
 > **Status: superseded for the receipt plane by [ADR-023](adr/023-receipt-plane-ring-partitioning.md).**
-> The narrow-implementation-spike portion of this doc that covered
-> `open_receipt_claims` as a bounded live-frontier table is now replaced
-> by the partitioned `lease_claims` / `lease_claim_closures` ring. Read
-> the rest of this doc as a snapshot of the lease-plane investigation
-> that triggered ADR-023; the sections on the long-running lease plane
-> (heartbeat, callback, `attempt_state`) are unchanged.
+> The narrow-implementation-spike portion of this doc that proposed
+> `open_receipt_claims` as a bounded live-frontier table has been
+> replaced by the partitioned `lease_claims` / `lease_claim_closures`
+> ring; the table itself was deleted in the post-Phase-4 cleanup
+> (`prepare_schema` now drops it on every install). Read the rest of
+> this doc as a snapshot of the lease-plane investigation that
+> triggered ADR-023; the sections on the long-running lease plane
+> (heartbeat, callback, `attempt_state`) are unchanged. References
+> to `open_receipt_claims` in the body below are kept verbatim as
+> historical context — they describe the design that motivated
+> ADR-023, not the shipping architecture.
 
 ## Why this exists
 

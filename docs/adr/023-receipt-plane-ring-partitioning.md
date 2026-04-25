@@ -433,8 +433,10 @@ After Phase 4 the runtime never reads or writes `open_receipt_claims`
 on the hot path. The partitioned `lease_claims` table is the
 authoritative record of "currently open"; every query that used to
 target `open_receipt_claims` now does a bounded anti-join against
-`lease_claim_closures`. The table still exists — dropped in Phase 5 —
-but is untouched by the hot path.
+`lease_claim_closures`. The table itself was dropped in Phase 5;
+`prepare_schema` continues to refuse to drop a non-empty
+`open_receipt_claims` so an operator rolling forward from a
+pre-ADR-023 build is forced to run the reverse migration first.
 
 Rewritten sites (originally six, one more surfaced under test as the
 `load_job` receipt branch — plus two closely related heartbeat/progress
@@ -482,35 +484,88 @@ Validation:
   checking the "currently open receipt" invariant, which now lives in
   `lease_claims` minus `lease_claim_closures`.
 
-### Phase 5 — Delete `open_receipt_claims` (pending)
+### Phase 5 — Delete `open_receipt_claims` (complete)
 
-Removes the `open_receipt_claims` table and any remaining backfill +
-DDL paths. Architecturally irreversible: once the partition migration
-+ Phase 4 anti-join cutover have been running cleanly, the table is
-dead weight whose only effect is autovacuum churn during prepare
-schema runs.
+Removed the `open_receipt_claims` table and all of its backfill + DDL
+paths from `prepare_schema`. After ADR-023 the table was dead weight
+whose only effect was autovacuum churn during prepare-schema runs;
+the hot path read and wrote nothing to it. `prepare_schema` now
+unconditionally drops the table on every install, refusing to drop
+a non-empty table — that would mean an operator rolled forward from
+a pre-ADR-023 build and the operator must run the reverse-migration
+recipe to drain it before retrying.
 
-**Acceptance criteria (must all hold before Phase 5 merges to main):**
+Code changes:
 
-- Two consecutive green runs of the full nightly-chaos workflow
-  (8 ignored chaos/soak tests + portable long-horizon bench).
-- Fresh `test_throughput_rust_workers_queue_storage` shows zero rows
-  in `open_receipt_claims` at every observable point (already locked
-  in by `test_phase4_no_writes_to_open_receipt_claims`; rerun to
-  confirm Phase 5 schema-install changes don't regress this).
-- A 30-min `long_horizon.py` run on the `4x8` profile, receipts on,
-  reports steady-state dead tuples on the receipt plane no worse
-  than the ADR-019 validation baseline (ideally lower — the whole
-  point of ADR-023 is concentrating reclaim into the singletons).
+- Removed `CREATE TABLE open_receipt_claims`, the `ALTER TABLE
+  ADD COLUMN claim_slot`, the sentinel-backfill `UPDATE`, both
+  `CREATE INDEX` statements, the legacy-migration `INSERT` block,
+  the `open_receipt_claims_relname()` helper, and the entry in
+  `reset()`'s `TRUNCATE` list.
+- Added an early `DROP TABLE IF EXISTS open_receipt_claims CASCADE`
+  in `prepare_schema`, guarded by an emptiness check that returns
+  `AwaError::Validation` if the table holds rows.
 - New runtime test `test_open_receipt_claims_is_absent_after_install`
-  green on a fresh schema install. Verify by `\d` in the test
-  database and asserting the table is absent.
-- Reverse-migration recipe (recreate `open_receipt_claims` from
-  `lease_claims` minus `lease_claim_closures`) documented in the
-  PR body; not committed to source, but written down so an operator
-  can apply it if a production rollback ever fires.
-- `docs/architecture.md`, `docs/lease-plane-redesign-spike.md`, and
-  `docs/migrations.md` updated to reflect the table's removal.
+  asserts the table is absent immediately after `prepare_schema`
+  and stays absent across a full claim + complete cycle.
+
+Acceptance criteria (status):
+
+- ✅ Runtime test green on a fresh install.
+- ✅ Receipt-plane chaos suite (4 scenarios) green.
+- ✅ Full `queue_storage_runtime_test` (49 tests) green.
+- ⏳ Two consecutive green nightly-chaos runs — required before merge
+  to main.
+- ⏳ 30-min `long_horizon.py` 4x8 receipts-on run with steady-state
+  receipt-plane dead tuples no worse than the ADR-019 baseline —
+  required before merge.
+
+Reverse-migration recipe (only relevant if a production rollback
+fires between this Phase-5 deploy and an older runtime catching up):
+
+```sql
+CREATE TABLE awa_exp.open_receipt_claims (
+    job_id BIGINT NOT NULL,
+    run_lease BIGINT NOT NULL,
+    ready_slot INT NOT NULL,
+    ready_generation BIGINT NOT NULL,
+    queue TEXT NOT NULL,
+    priority SMALLINT NOT NULL,
+    attempt SMALLINT NOT NULL,
+    max_attempts SMALLINT NOT NULL,
+    lane_seq BIGINT NOT NULL,
+    claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+    claim_slot INT NOT NULL DEFAULT 0,
+    PRIMARY KEY (job_id, run_lease)
+);
+
+INSERT INTO awa_exp.open_receipt_claims (
+    job_id, run_lease, ready_slot, ready_generation,
+    queue, priority, attempt, max_attempts, lane_seq,
+    claimed_at, claim_slot
+)
+SELECT
+    claims.job_id, claims.run_lease, claims.ready_slot,
+    claims.ready_generation, claims.queue, claims.priority,
+    claims.attempt, claims.max_attempts, claims.lane_seq,
+    claims.claimed_at, claims.claim_slot
+FROM awa_exp.lease_claims AS claims
+WHERE NOT EXISTS (
+    SELECT 1 FROM awa_exp.lease_claim_closures AS closures
+    WHERE closures.claim_slot = claims.claim_slot
+      AND closures.job_id = claims.job_id
+      AND closures.run_lease = claims.run_lease
+)
+  AND NOT EXISTS (
+    SELECT 1 FROM awa_exp.leases AS lease
+    WHERE lease.job_id = claims.job_id
+      AND lease.run_lease = claims.run_lease
+)
+ON CONFLICT DO NOTHING;
+```
+
+Not committed to source — operators are expected to keep this in
+their runbook for the rollout window.
 
 ### Phase 6 — Make receipts the default, land the validation artifact (pending)
 

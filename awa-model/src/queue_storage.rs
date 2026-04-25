@@ -1246,10 +1246,6 @@ impl QueueStorage {
         "lease_claims"
     }
 
-    pub fn open_receipt_claims_relname(&self) -> &'static str {
-        "open_receipt_claims"
-    }
-
     pub fn lease_claim_closures_relname(&self) -> &'static str {
         "lease_claim_closures"
     }
@@ -1382,6 +1378,51 @@ impl QueueStorage {
                 .execute(pool)
                 .await
                 .map_err(map_sqlx_error)?;
+
+            // ADR-023 made `open_receipt_claims` dead weight after the
+            // hot path moved to anti-joins over the partitioned
+            // `lease_claims` / `lease_claim_closures` pair. Drop it
+            // here on every install. We refuse to drop a non-empty
+            // table — that would mean the operator has rolled forward
+            // from a pre-anti-join build that still wrote rows we
+            // don't want to silently delete. Treat that as an error
+            // the operator must resolve (typically by running the
+            // ADR-023 reverse-migration recipe and re-trying).
+            let open_receipt_claims_exists: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM pg_class c
+                    JOIN pg_namespace n ON n.oid = c.relnamespace
+                    WHERE n.nspname = $1 AND c.relname = 'open_receipt_claims'
+                )
+                "#,
+            )
+            .bind(schema)
+            .fetch_one(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+            if open_receipt_claims_exists {
+                let row_count: i64 = sqlx::query_scalar(&format!(
+                    "SELECT count(*)::bigint FROM {schema}.open_receipt_claims"
+                ))
+                .fetch_one(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+                if row_count > 0 {
+                    return Err(AwaError::Validation(format!(
+                        "{schema}.open_receipt_claims has {row_count} rows but the runtime no \
+                         longer reads or writes this table. Run the ADR-023 reverse migration \
+                         (recreate from lease_claims minus lease_claim_closures) to drain it, \
+                         then re-run prepare_schema."
+                    )));
+                }
+                sqlx::query(&format!(
+                    "DROP TABLE IF EXISTS {schema}.open_receipt_claims CASCADE"
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+            }
 
             let claimed_cte = if self.experimental_lease_claim_receipts() {
                 format!(
@@ -2165,82 +2206,6 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
-            CREATE TABLE IF NOT EXISTS {schema}.open_receipt_claims (
-                job_id            BIGINT NOT NULL,
-                run_lease         BIGINT NOT NULL,
-                ready_slot        INT NOT NULL,
-                ready_generation  BIGINT NOT NULL,
-                queue             TEXT NOT NULL,
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL,
-                max_attempts      SMALLINT NOT NULL,
-                lane_seq          BIGINT NOT NULL,
-                claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                claim_slot        INT NOT NULL DEFAULT 0,
-                PRIMARY KEY (job_id, run_lease)
-            )
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Existing installs that already have `open_receipt_claims`
-            // without the `claim_slot` column gain it here. The default
-            // is `-1` (a sentinel: valid slots are `0..claim_slot_count`),
-            // so legacy rows are unambiguously distinguishable from
-            // claim-CTE-written rows that legitimately landed at
-            // `claim_slot = 0`. The UPDATE that follows backfills only
-            // the sentinel rows.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.open_receipt_claims
-                ADD COLUMN IF NOT EXISTS claim_slot INT NOT NULL DEFAULT -1
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Backfill sentinel rows to the current ring slot so their
-            // close path writes closures into the matching
-            // `lease_claim_closures` partition. The previous version
-            // gated on `current_slot <> 0`, which conflated "I'm at
-            // slot 0 legitimately" with "I haven't been backfilled
-            // yet" — fixed by the sentinel above.
-            sqlx::query(&format!(
-                r#"
-            UPDATE {schema}.open_receipt_claims
-            SET claim_slot = (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton)
-            WHERE claim_slot = -1
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_open_receipt_claims_queue
-                ON {schema}.open_receipt_claims (queue, priority, lane_seq)
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_open_receipt_claims_stale
-                ON {schema}.open_receipt_claims (claimed_at, job_id)
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
             CREATE TABLE IF NOT EXISTS {schema}.lease_claim_closures (
                 claim_slot        INT NOT NULL,
                 job_id            BIGINT NOT NULL,
@@ -2325,70 +2290,6 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
 
                 migrate_tx.commit().await.map_err(map_sqlx_error)?;
-            }
-
-            // One-shot mirror of the still-open receipt set into
-            // `open_receipt_claims` during the legacy migration so a
-            // worker still running pre-ADR-023 SQL can see the live
-            // frontier. Steady-state runs skip this entirely; the
-            // hot path reads the partitioned `lease_claims` /
-            // `lease_claim_closures` directly via anti-join, and the
-            // `open_receipt_claims` table is dead weight scheduled
-            // for deletion (see ADR-023).
-            //
-            // The `NOT EXISTS` against `lease_claim_closures` joins on
-            // the full `(claim_slot, job_id, run_lease)` PK — without
-            // the `claim_slot` match we'd treat a closure in
-            // partition X as also closing a hypothetical re-claim in
-            // partition Y, which the partition-key invariant disallows.
-            if lease_claims_legacy_exists || closures_legacy_exists {
-                sqlx::query(&format!(
-                    r#"
-                INSERT INTO {schema}.open_receipt_claims (
-                    claim_slot,
-                    job_id,
-                    run_lease,
-                    ready_slot,
-                    ready_generation,
-                    queue,
-                    priority,
-                    attempt,
-                    max_attempts,
-                    lane_seq,
-                    claimed_at
-                )
-                SELECT
-                    claims.claim_slot,
-                    claims.job_id,
-                    claims.run_lease,
-                    claims.ready_slot,
-                    claims.ready_generation,
-                    claims.queue,
-                    claims.priority,
-                    claims.attempt,
-                    claims.max_attempts,
-                    claims.lane_seq,
-                    claims.claimed_at
-                FROM {schema}.lease_claims AS claims
-                WHERE NOT EXISTS (
-                    SELECT 1
-                    FROM {schema}.lease_claim_closures AS closures
-                    WHERE closures.claim_slot = claims.claim_slot
-                      AND closures.job_id = claims.job_id
-                      AND closures.run_lease = claims.run_lease
-                )
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM {schema}.leases AS lease
-                    WHERE lease.job_id = claims.job_id
-                      AND lease.run_lease = claims.run_lease
-                )
-                ON CONFLICT ON CONSTRAINT open_receipt_claims_pkey DO NOTHING
-                "#
-                ))
-                .execute(pool)
-                .await
-                .map_err(map_sqlx_error)?;
             }
 
             sqlx::query(&format!(
@@ -3159,7 +3060,6 @@ impl QueueStorage {
                 {schema}.dlq_entries,
                 {schema}.leases,
                 {schema}.lease_claims,
-                {schema}.open_receipt_claims,
                 {schema}.lease_claim_closures,
                 {schema}.attempt_state,
                 {schema}.deferred_jobs,

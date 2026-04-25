@@ -1235,20 +1235,20 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
     client.shutdown(Duration::from_secs(5)).await;
 }
 
-/// Regression test for the ADR-023 invariant that the hot path never
-/// writes to `open_receipt_claims`. The partitioned `lease_claims` is
-/// the authoritative record of "currently open" and every read site
-/// derives that set via an anti-join with `lease_claim_closures`. Run
-/// a full claim + complete cycle on a receipt-backed short job and
-/// assert `open_receipt_claims` stays at zero rows at every observable
-/// point, while `lease_claims` and `lease_claim_closures` reflect the
-/// lifecycle.
+/// `open_receipt_claims` was the live-frontier table from the
+/// pre-ADR-023 design. After the receipt plane moved to anti-joins
+/// over the partitioned `lease_claims` / `lease_claim_closures`, the
+/// table became dead weight; `prepare_schema` now drops it on every
+/// install (refusing to drop a non-empty table — see ADR-023). This
+/// test asserts the table is absent on a fresh schema and stays
+/// absent across a full claim + complete cycle, while `lease_claims`
+/// and `lease_claim_closures` reflect the lifecycle.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_phase4_no_writes_to_open_receipt_claims() {
+async fn test_open_receipt_claims_is_absent_after_install() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(4).await;
-    let schema = "awa_qs_phase4_no_orc";
-    let queue = "qs_phase4_no_orc";
+    let schema = "awa_qs_open_receipt_claims_absent";
+    let queue = "qs_open_receipt_claims_absent";
     let store = create_store_with_config(
         &pool,
         QueueStorageConfig {
@@ -1262,6 +1262,27 @@ async fn test_phase4_no_writes_to_open_receipt_claims() {
     )
     .await;
 
+    async fn open_receipt_claims_present(pool: &sqlx::PgPool, schema: &str) -> bool {
+        sqlx::query_scalar::<_, bool>(
+            r#"
+            SELECT EXISTS (
+                SELECT 1 FROM pg_class c
+                JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = $1 AND c.relname = 'open_receipt_claims'
+            )
+            "#,
+        )
+        .bind(schema)
+        .fetch_one(pool)
+        .await
+        .expect("probe open_receipt_claims existence")
+    }
+
+    assert!(
+        !open_receipt_claims_present(&pool, schema).await,
+        "open_receipt_claims must not exist after a fresh prepare_schema"
+    );
+
     let job_id = enqueue_job(
         &pool,
         &store,
@@ -1272,22 +1293,6 @@ async fn test_phase4_no_writes_to_open_receipt_claims() {
         },
     )
     .await;
-
-    // Raw-table count (not the derived helper) — this is what must
-    // stay zero on the hot path.
-    async fn raw_open_receipt_count(pool: &sqlx::PgPool, schema: &str) -> i64 {
-        let sql = format!("SELECT count(*)::bigint FROM {schema}.open_receipt_claims");
-        sqlx::query_scalar::<_, i64>(&sql)
-            .fetch_one(pool)
-            .await
-            .expect("count open_receipt_claims")
-    }
-
-    assert_eq!(
-        raw_open_receipt_count(&pool, schema).await,
-        0,
-        "open_receipt_claims must be empty on a fresh schema"
-    );
 
     let client = queue_storage_client(
         &pool,
@@ -1314,7 +1319,6 @@ async fn test_phase4_no_writes_to_open_receipt_claims() {
     .await;
     assert_eq!(completed.state, JobState::Completed);
 
-    // The lifecycle left trace in the partitioned tables...
     assert_eq!(
         lease_claim_count(&pool, &store).await,
         1,
@@ -1325,12 +1329,9 @@ async fn test_phase4_no_writes_to_open_receipt_claims() {
         1,
         "the completion must have written a closure row"
     );
-
-    // ...but never in open_receipt_claims.
-    assert_eq!(
-        raw_open_receipt_count(&pool, schema).await,
-        0,
-        "ADR-023 invariant: open_receipt_claims must never receive writes on the hot path"
+    assert!(
+        !open_receipt_claims_present(&pool, schema).await,
+        "open_receipt_claims must remain absent across the full lifecycle"
     );
 
     client.shutdown(Duration::from_secs(5)).await;
