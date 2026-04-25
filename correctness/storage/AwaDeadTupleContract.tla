@@ -10,15 +10,24 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 \* *architectural contract* that bounds dead tuples in production:
 \*
 \*   1. Every hot-path table has a declared reclaim kind:
-\*      `PartitionTruncate` (rotate + TRUNCATE child),
-\*      `RowVacuum` (autovacuum reclaims dead tuples),
-\*      `AppendOnly` (never reclaimed; archive shape).
+\*      `PartitionTruncate` — rotate + TRUNCATE child. Suitable for
+\*        hot append workloads where row count scales with traffic.
+\*      `Warm` — autovacuum reclaims dead tuples, but the LIVE row
+\*        count is bounded by something that does NOT scale with
+\*        traffic (e.g. worker fleet size, queue lane count). Dead
+\*        tuples accumulate at mutation rate but the heap stays
+\*        small, so autovacuum keeps up cheaply. Requires a declared
+\*        `bounded_by` field naming what bounds the row count.
+\*      `RowVacuum` — autovacuum reclaims dead tuples on a low-
+\*        mutation-rate cold table. Storage-side metadata only.
+\*      `AppendOnly` — never reclaimed; archive / audit shape.
 \*
-\*   2. Hot tables MUST be `PartitionTruncate`. RowVacuum on a
-\*      hot-mutation table means autovacuum has to keep up with
-\*      production traffic — which it can't past a certain rate. The
-\*      ADR-019/023 redesign existed because `open_receipt_claims`
-\*      violated this contract.
+\*   2. Hot tables MUST NOT be `RowVacuum`. Either they grow with
+\*      traffic and need partition-truncate reclaim, or their row
+\*      count is bounded by something traffic-independent and they're
+\*      `Warm`. The ADR-019/023 redesign existed because
+\*      `open_receipt_claims` violated this contract — flat, hot
+\*      mutation, unbounded row count.
 \*
 \*   3. Every `PartitionTruncate` table must have at least one
 \*      transaction in `Transactions` that performs `Truncate` on it.
@@ -26,7 +35,13 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 \*      grows monotonically — same failure mode as RowVacuum-on-hot,
 \*      different mechanism.
 \*
-\*   4. `AppendOnly` tables forbid Update and Delete. They're for
+\*   4. Every `Warm` table must declare its `bounded_by` and must be
+\*      hot. The `bounded_by` is a free-text label (e.g.
+\*      "worker_fleet_size") whose meaning the operator commits to —
+\*      breaking that bound makes the table effectively unbounded
+\*      and graduates it to `PartitionTruncate`.
+\*
+\*   5. `AppendOnly` tables forbid Update and Delete. They're for
 \*      audit / archive shapes; if a tx mutates one, that's either
 \*      the wrong op or the wrong reclaim kind.
 \*
@@ -34,21 +49,20 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 \* does INSERT+DELETE on an unpartitioned hot table, the
 \* corresponding addition to this spec will fire one of these
 \* invariants at TLC time. The historical case in point: the original
-\* `open_receipt_claims` design — flat, RowVacuum, hot — would fire
-\* `HotTablesAreNotRowVacuum`. The fix (ADR-023) replaces it with
-\* partition-rotated `lease_claims` + `lease_claim_closures`, which
-\* satisfies the contract.
+\* `open_receipt_claims` design — flat, RowVacuum, hot, unbounded
+\* row count — would fire `HotTablesAreNotRowVacuum`. The fix
+\* (ADR-023) replaces it with partition-rotated `lease_claims` +
+\* `lease_claim_closures`, which satisfies the contract.
 \*
 \* The spec only catches what is ENCODED in `TableSpec` and
 \* `Transactions`. Drift between the spec and the Rust source is the
 \* operator's responsibility — when adding a new table, add it here
 \* with the correct kind. When adding a new SQL site, add the
-\* mutation list here. The pre-merge checklist in
-\* `docs/adr/023-receipt-plane-ring-partitioning.md` calls this out.
+\* mutation list here.
 
 \* ---- Reclaim kinds and operations ----
 
-ReclaimKinds == {"PartitionTruncate", "RowVacuum", "AppendOnly"}
+ReclaimKinds == {"PartitionTruncate", "Warm", "RowVacuum", "AppendOnly"}
 Hotness == {"hot", "cold"}
 Operations == {"Insert", "Update", "Delete", "Truncate"}
 
@@ -66,68 +80,81 @@ Operations == {"Insert", "Update", "Delete", "Truncate"}
 \* dimension that lets the spec catch ADR-023-style accumulation
 \* bugs; if you can't tell, lean toward marking `hot` and the spec
 \* will force you to think about reclaim.
+\*
+\* `bounded_by` is meaningful for `Warm` tables only — it names the
+\* operational quantity that bounds the table's live row count
+\* (e.g. "worker_fleet_size", "queue_lane_count"). For other kinds
+\* it must be the empty string. The invariant
+\* `WarmTablesDocumentTheirBound` enforces this.
 
 TableSpec == [
     \* ---- Hot path: every row visited per claim/complete ----
     \* All partitioned by their respective ring slot, reclaimed by
     \* TRUNCATE on partition prune.
-    ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
-    done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
-    leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
-    lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
-    lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
+    ready_entries          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    done_entries           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    leases                 |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
 
     \* ---- Hot path, partitioned but lower volume ----
     \* deferred_jobs / waiting_state / dlq_entries are partitioned
     \* but only see traffic on the slow paths (snooze, callback,
     \* terminal failure). Still PartitionTruncate so traffic-driven
     \* growth is bounded.
-    deferred_jobs          |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
-    waiting_entries        |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
-    dlq_entries            |-> [kind |-> "PartitionTruncate", hot |-> "hot"],
+    deferred_jobs          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    waiting_entries        |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    dlq_entries            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
 
-    \* ---- Hot path, RowVacuum but bounded ----
-    \* attempt_state and queue_claim_heads / queue_enqueue_heads
-    \* see one mutation per attempt / per enqueue / per claim. They
-    \* are NOT partitioned. The contract assumption is that their
-    \* row count is bounded (one row per running attempt; one row
-    \* per (queue, priority) lane), so autovacuum churn is local
-    \* to a small working set rather than scaling with traffic.
+    \* ---- Warm: hot mutation rate, bounded live row count ----
+    \* These tables receive UPDATEs at traffic rate but their LIVE
+    \* row count is bounded by something traffic-independent, so
+    \* autovacuum scans a small heap and keeps up cheaply.
+    \* All three have aggressive autovacuum knobs in DDL
+    \* (autovacuum_vacuum_scale_factor=0, autovacuum_vacuum_threshold
+    \* in the low hundreds, autovacuum_vacuum_cost_limit=2000).
     \*
-    \* Caveat: this is the riskier shape. If their row counts ever
-    \* scale linearly with traffic (e.g. attempt_state retaining
-    \* terminated rows, or queue_claim_heads gaining a per-attempt
-    \* index), they would graduate to "hot mutation rate
-    \* unbounded", and the contract here would be a lie. The
-    \* bench harness's per-table dead-tuple report is the
-    \* numerical sanity check.
-    attempt_state          |-> [kind |-> "RowVacuum", hot |-> "hot"],
-    queue_claim_heads      |-> [kind |-> "RowVacuum", hot |-> "hot"],
-    queue_enqueue_heads    |-> [kind |-> "RowVacuum", hot |-> "hot"],
+    \* Risk profile: if a `bounded_by` ever becomes false in
+    \* production (e.g. attempt_state retains terminated rows;
+    \* queue_claim_heads grows a per-attempt index), the table
+    \* effectively grows with traffic and graduates to
+    \* `PartitionTruncate`. The bench harness's per-table
+    \* dead-tuple peak is the numerical check; a
+    \* steadily-growing peak across phases means the bound has
+    \* been broken.
+    attempt_state |->
+        [kind |-> "Warm", hot |-> "hot",
+         bounded_by |-> "worker_fleet_size"],
+    queue_claim_heads |->
+        [kind |-> "Warm", hot |-> "hot",
+         bounded_by |-> "queue_lane_count"],
+    queue_enqueue_heads |->
+        [kind |-> "Warm", hot |-> "hot",
+         bounded_by |-> "queue_lane_count"],
 
     \* ---- Cold metadata: small singletons / per-queue rows ----
     \* Mutation rate scales with operator activity (queue creation,
     \* schema changes), not job throughput. RowVacuum is fine.
-    queue_lanes            |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    queue_terminal_rollups |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    queue_count_snapshots  |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    queue_claimer_leases   |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    queue_claimer_state    |-> [kind |-> "RowVacuum", hot |-> "cold"],
+    queue_lanes            |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    queue_terminal_rollups |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    queue_count_snapshots  |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    queue_claimer_leases   |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    queue_claimer_state    |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
     \* ---- Ring-state singletons ----
     \* One row per ring; updated O(seconds) by maintenance. Pure
     \* singletons — UPDATE in place forever, autovacuum trivially
     \* keeps up. Listed for completeness.
-    queue_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    lease_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    claim_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold"],
+    queue_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    lease_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    claim_ring_state       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
     \* ---- Ring-slot rows ----
     \* One row per slot, ~handful of slots. Generation is the only
     \* mutating column.
-    queue_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    lease_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold"],
-    claim_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold"]
+    queue_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    lease_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
+    claim_ring_slots       |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""]
 ]
 
 Tables == DOMAIN TableSpec
@@ -300,18 +327,10 @@ Transactions == {
 \* up before merge) or the hotness is wrong (and the bench harness
 \* should confirm this empirically).
 \*
-\* Exception: tables marked `hot` but explicitly RowVacuum here
-\* (attempt_state, queue_claim_heads, queue_enqueue_heads) are
-\* allowed because their row count is bounded by working-set size,
-\* not by traffic — the dead tuples are concentrated in a small
-\* hot footprint that autovacuum CAN keep up with. The
-\* documentation field below names the bounded-row constraint each
-\* relies on.
-HotPartitionedTablesUseTruncate ==
+HotTablesAreNotRowVacuum ==
     \A t \in Tables :
-        TableSpec[t].hot = "hot" /\ t \notin
-            { "attempt_state", "queue_claim_heads", "queue_enqueue_heads" }
-        => TableSpec[t].kind = "PartitionTruncate"
+        TableSpec[t].hot = "hot" =>
+            TableSpec[t].kind \in {"PartitionTruncate", "Warm"}
 
 \* Every PartitionTruncate table must have at least one transaction
 \* registered that performs `Truncate` on it. A PartitionTruncate
@@ -326,6 +345,27 @@ PartitionTruncateTablesAreReclaimed ==
                 \E i \in 1..Len(tx) :
                     tx[i].op = "Truncate" /\ tx[i].table = t
 
+\* Every Warm table must declare what bounds its live row count and
+\* must be marked `hot` (Warm only makes sense for hot mutation
+\* rates — at low mutation rate, RowVacuum is the right kind).
+\* If `bounded_by` is empty, the operator hasn't committed to a
+\* bound and the table's "Warm" claim is unfounded. This invariant
+\* fires at parse time and forces the operator to either name the
+\* bound or pick a different kind.
+WarmTablesDocumentTheirBound ==
+    \A t \in Tables :
+        TableSpec[t].kind = "Warm" =>
+            (TableSpec[t].hot = "hot" /\ TableSpec[t].bounded_by # "")
+
+\* Conversely, only Warm tables may declare a `bounded_by`. The
+\* field is dead weight on every other kind, and a non-empty
+\* `bounded_by` on a non-Warm row is a hint that the operator
+\* meant Warm.
+OnlyWarmTablesHaveBoundedBy ==
+    \A t \in Tables :
+        TableSpec[t].kind # "Warm" =>
+            TableSpec[t].bounded_by = ""
+
 \* AppendOnly tables forbid mutation. Insert is fine; Update and
 \* Delete create dead tuples that will never be reclaimed (since
 \* AppendOnly explicitly opts out of all reclaim mechanisms).
@@ -337,14 +377,14 @@ AppendOnlyAcceptsOnlyInsert ==
             TableSpec[tx[i].table].kind = "AppendOnly" =>
                 tx[i].op = "Insert"
 
-\* No transaction may TRUNCATE a RowVacuum table. TRUNCATE is the
-\* PartitionTruncate reclaim mechanism; using it on a RowVacuum
-\* table either contradicts the table's contract or means the
-\* contract is wrong.
-RowVacuumTablesNotTruncated ==
+\* No transaction may TRUNCATE a RowVacuum or Warm table. TRUNCATE
+\* is the PartitionTruncate reclaim mechanism; using it on a row-
+\* level-vacuum table either contradicts the table's contract or
+\* means the contract is wrong.
+VacuumKindTablesNotTruncated ==
     \A tx \in Transactions :
         \A i \in 1..Len(tx) :
-            TableSpec[tx[i].table].kind = "RowVacuum" =>
+            TableSpec[tx[i].table].kind \in {"RowVacuum", "Warm"} =>
                 tx[i].op # "Truncate"
 
 \* ---- Spec wiring ----
@@ -358,10 +398,12 @@ RowVacuumTablesNotTruncated ==
 \* the model-check loop. The accompanying `.cfg` lists no
 \* invariants because there is no model state to check.
 
-ASSUME HotPartitionedTablesUseTruncate
+ASSUME HotTablesAreNotRowVacuum
 ASSUME PartitionTruncateTablesAreReclaimed
+ASSUME WarmTablesDocumentTheirBound
+ASSUME OnlyWarmTablesHaveBoundedBy
 ASSUME AppendOnlyAcceptsOnlyInsert
-ASSUME RowVacuumTablesNotTruncated
+ASSUME VacuumKindTablesNotTruncated
 
 \* TLC still wants a Spec / Init / Next. Provide the smallest
 \* possible ones. The check has happened by the time these are

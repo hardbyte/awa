@@ -246,16 +246,31 @@ lock-interaction analysis.
 [`AwaDeadTupleContract.tla`](./AwaDeadTupleContract.tla) is the
 companion to ADR-023 that catches dead-tuple regressions at design
 time, before they show up as autovacuum running behind in production.
-Each table declares a `kind` (`PartitionTruncate`, `RowVacuum`,
-`AppendOnly`) and a `hot` flag; each transaction declares the
-`Insert` / `Update` / `Delete` / `Truncate` operations it performs.
+Each table declares a `kind` and a `hot` flag; each transaction
+declares the `Insert` / `Update` / `Delete` / `Truncate` operations
+it performs.
 
-The four invariants:
+Reclaim kinds:
 
-- `HotPartitionedTablesUseTruncate`: a hot-mutation table must use
-  partition rotation + TRUNCATE for reclaim, not row-level vacuum.
-  This is the rule that the original `open_receipt_claims` design
-  violated. A new entry like
+- `PartitionTruncate`: partition rotation + `TRUNCATE` reclaims an
+  entire child child at a time. Suitable for hot tables whose row
+  count grows with traffic.
+- `Warm`: row count is high-mutation but **bounded** by something
+  that does not scale with traffic (worker fleet size, queue lane
+  count, etc.). Autovacuum scans a small heap and keeps up cheaply.
+  Requires a non-empty `bounded_by` field naming the bound — that
+  bound is the operator's commitment, and breaking it (e.g. letting
+  `attempt_state` retain terminated rows) graduates the table to
+  `PartitionTruncate`.
+- `RowVacuum`: low mutation rate; cold metadata. Autovacuum trivially
+  keeps up.
+- `AppendOnly`: never reclaimed; archive shape.
+
+The six invariants:
+
+- `HotTablesAreNotRowVacuum`: a hot-mutation table must be
+  `PartitionTruncate` or `Warm`. This is the rule the original
+  `open_receipt_claims` design violated. A new entry like
   `open_receipt_claims |-> [kind |-> "RowVacuum", hot |-> "hot"]`
   fires this assumption.
 - `PartitionTruncateTablesAreReclaimed`: every partitioned hot table
@@ -263,13 +278,20 @@ The four invariants:
   `Truncate` on it (i.e. a `prune_*` maintenance path is wired).
   Without this, partitions never get reclaimed and the table grows
   monotonically.
+- `WarmTablesDocumentTheirBound`: every `Warm` table must declare a
+  non-empty `bounded_by` and be marked `hot`. Forces the operator
+  to name the bound rather than wave it through with a comment.
+- `OnlyWarmTablesHaveBoundedBy`: only `Warm` tables may set
+  `bounded_by`; on every other kind the field is dead weight, and
+  a non-empty value is a hint the operator meant `Warm`.
 - `AppendOnlyAcceptsOnlyInsert`: archive / never-reclaimed tables
   forbid `Update` and `Delete`.
-- `RowVacuumTablesNotTruncated`: TRUNCATE is the
+- `VacuumKindTablesNotTruncated`: `TRUNCATE` is the
   `PartitionTruncate` reclaim mechanism; using it on a `RowVacuum`
-  table either contradicts the kind or means the kind is wrong.
+  or `Warm` table either contradicts the kind or means the kind is
+  wrong.
 
-The four checks are TLA+ `ASSUME` declarations evaluated during
+The six checks are TLA+ `ASSUME` declarations evaluated during
 semantic analysis, so a violation surfaces as a parse-time error
 rather than a model-checker counterexample. Workflow when adding a
 new SQL site or a new table:

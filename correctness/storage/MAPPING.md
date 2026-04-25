@@ -361,20 +361,19 @@ Model checking results:
   `CancelReceiptOnlyPlan`, and `CancelRunningPlan`.
 - `AwaStorageLockOrderDeadlockDemo.cfg`: trips `NoDeadlock` in 5
   steps, confirming the detector works.
-- `AwaDeadTupleContract.cfg`: 1 distinct state, clean. The four
+- `AwaDeadTupleContract.cfg`: 1 distinct state, clean. The six
   ASSUME-style architectural-contract checks
-  (`HotPartitionedTablesUseTruncate`,
-  `PartitionTruncateTablesAreReclaimed`,
-  `AppendOnlyAcceptsOnlyInsert`,
-  `RowVacuumTablesNotTruncated`) all hold for the current schema
-  and transaction list. Workflow: when adding a new table to
-  `prepare_schema()` or a new SQL site to queue_storage.rs, register
-  it in `AwaDeadTupleContract.tla` with the correct reclaim kind /
-  hotness / mutation list. An `open_receipt_claims`-style proposal
-  (hot table, RowVacuum reclaim, INSERT+DELETE traffic) would fire
-  `HotPartitionedTablesUseTruncate` at parse time — verified by
-  adding the row temporarily and watching TLC report
-  the assumption violation, then removing it.
+  (`HotTablesAreNotRowVacuum`, `PartitionTruncateTablesAreReclaimed`,
+  `WarmTablesDocumentTheirBound`, `OnlyWarmTablesHaveBoundedBy`,
+  `AppendOnlyAcceptsOnlyInsert`, `VacuumKindTablesNotTruncated`) all
+  hold for the current schema and transaction list. Workflow: when
+  adding a new table to `prepare_schema()` or a new SQL site to
+  queue_storage.rs, register it in `AwaDeadTupleContract.tla` with
+  the correct reclaim kind, hotness, optional `bounded_by`, and
+  mutation list. An `open_receipt_claims`-style proposal (hot table,
+  RowVacuum reclaim, INSERT+DELETE traffic) fires
+  `HotTablesAreNotRowVacuum` at parse time; a `Warm` table without a
+  declared `bounded_by` fires `WarmTablesDocumentTheirBound`.
 
 ### Receipt-plane shape
 
