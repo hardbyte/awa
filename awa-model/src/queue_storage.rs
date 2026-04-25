@@ -2125,6 +2125,16 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             if lease_claims_legacy_exists {
+                // Wrap the copy + drop in a single transaction so a
+                // crash between the two leaves the schema in one of
+                // exactly two states: pre-migration (legacy still
+                // there, partitioned parent empty) or post-migration
+                // (legacy gone, partitioned parent populated).
+                // Otherwise a crash window can leave both populated,
+                // and the next prepare_schema's
+                // `ON CONFLICT DO NOTHING` masks the inconsistency
+                // without surfacing it.
+                let mut migrate_tx = pool.begin().await.map_err(map_sqlx_error)?;
                 sqlx::query(&format!(
                     r#"
                 INSERT INTO {schema}.lease_claims (
@@ -2141,16 +2151,18 @@ impl QueueStorage {
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 "#
                 ))
-                .execute(pool)
+                .execute(migrate_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
 
                 sqlx::query(&format!(
                     "DROP TABLE {schema}.lease_claims_legacy"
                 ))
-                .execute(pool)
+                .execute(migrate_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
+
+                migrate_tx.commit().await.map_err(map_sqlx_error)?;
             }
 
             sqlx::query(&format!(
@@ -2176,27 +2188,33 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             // Existing installs that already have `open_receipt_claims`
-            // without the `claim_slot` column gain it here. New rows will
-            // carry the claim_slot the claim CTE sees; legacy rows are
-            // backfilled to the current claim_ring_state.current_slot so
-            // their close path writes closures into the matching
-            // lease_claim_closures partition.
+            // without the `claim_slot` column gain it here. The default
+            // is `-1` (a sentinel: valid slots are `0..claim_slot_count`),
+            // so legacy rows are unambiguously distinguishable from
+            // claim-CTE-written rows that legitimately landed at
+            // `claim_slot = 0`. The UPDATE that follows backfills only
+            // the sentinel rows.
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.open_receipt_claims
-                ADD COLUMN IF NOT EXISTS claim_slot INT NOT NULL DEFAULT 0
+                ADD COLUMN IF NOT EXISTS claim_slot INT NOT NULL DEFAULT -1
             "#
             ))
             .execute(pool)
             .await
             .map_err(map_sqlx_error)?;
 
+            // Backfill sentinel rows to the current ring slot so their
+            // close path writes closures into the matching
+            // `lease_claim_closures` partition. The previous version
+            // gated on `current_slot <> 0`, which conflated "I'm at
+            // slot 0 legitimately" with "I haven't been backfilled
+            // yet" — fixed by the sentinel above.
             sqlx::query(&format!(
                 r#"
             UPDATE {schema}.open_receipt_claims
             SET claim_slot = (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton)
-            WHERE claim_slot = 0
-              AND EXISTS (SELECT 1 FROM {schema}.claim_ring_state WHERE singleton AND current_slot <> 0)
+            WHERE claim_slot = -1
             "#
             ))
             .execute(pool)
@@ -2280,6 +2298,11 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             if closures_legacy_exists {
+                // See the matching `lease_claims_legacy` migration
+                // above for the rationale: copy + drop must be atomic
+                // so a crash leaves the schema either fully migrated
+                // or fully not.
+                let mut migrate_tx = pool.begin().await.map_err(map_sqlx_error)?;
                 sqlx::query(&format!(
                     r#"
                 INSERT INTO {schema}.lease_claim_closures (
@@ -2292,67 +2315,92 @@ impl QueueStorage {
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 "#
                 ))
-                .execute(pool)
+                .execute(migrate_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
 
                 sqlx::query(&format!(
                     "DROP TABLE {schema}.lease_claim_closures_legacy"
                 ))
+                .execute(migrate_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                migrate_tx.commit().await.map_err(map_sqlx_error)?;
+            }
+
+            // Backfill the bounded live frontier so schema upgrades do
+            // not strand already-running receipt-backed claims on the
+            // historical claim tables.
+            //
+            // After ADR-023 Phase 4, the runtime never reads from
+            // `open_receipt_claims` — every receipt query is an
+            // anti-join over the partitioned `lease_claims` /
+            // `lease_claim_closures`. The backfill only matters during
+            // the one-shot legacy migration: if we just renamed the
+            // pre-Phase-3 `lease_claims` to `lease_claims_legacy` and
+            // copied its rows into the partitioned table, we mirror
+            // the still-open subset into `open_receipt_claims` so any
+            // worker that hasn't yet been redeployed onto Phase 4 SQL
+            // can still see the live frontier. Steady-state runs of
+            // `prepare_schema` skip this entirely. Phase 5 deletes the
+            // table.
+            //
+            // The `NOT EXISTS` against `lease_claim_closures` joins on
+            // the full `(claim_slot, job_id, run_lease)` PK — without
+            // the `claim_slot` match we'd treat a closure in
+            // partition X as also closing a hypothetical re-claim in
+            // partition Y, which the partition-key invariant from
+            // ADR-023 disallows.
+            if lease_claims_legacy_exists || closures_legacy_exists {
+                sqlx::query(&format!(
+                    r#"
+                INSERT INTO {schema}.open_receipt_claims (
+                    claim_slot,
+                    job_id,
+                    run_lease,
+                    ready_slot,
+                    ready_generation,
+                    queue,
+                    priority,
+                    attempt,
+                    max_attempts,
+                    lane_seq,
+                    claimed_at
+                )
+                SELECT
+                    claims.claim_slot,
+                    claims.job_id,
+                    claims.run_lease,
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.queue,
+                    claims.priority,
+                    claims.attempt,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.claimed_at
+                FROM {schema}.lease_claims AS claims
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM {schema}.lease_claim_closures AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM {schema}.leases AS lease
+                    WHERE lease.job_id = claims.job_id
+                      AND lease.run_lease = claims.run_lease
+                )
+                ON CONFLICT ON CONSTRAINT open_receipt_claims_pkey DO NOTHING
+                "#
+                ))
                 .execute(pool)
                 .await
                 .map_err(map_sqlx_error)?;
             }
-
-            // Backfill the bounded live frontier so schema upgrades do not
-            // strand already-running receipt-backed claims on the historical
-            // claim tables.
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.open_receipt_claims (
-                claim_slot,
-                job_id,
-                run_lease,
-                ready_slot,
-                ready_generation,
-                queue,
-                priority,
-                attempt,
-                max_attempts,
-                lane_seq,
-                claimed_at
-            )
-            SELECT
-                claims.claim_slot,
-                claims.job_id,
-                claims.run_lease,
-                claims.ready_slot,
-                claims.ready_generation,
-                claims.queue,
-                claims.priority,
-                claims.attempt,
-                claims.max_attempts,
-                claims.lane_seq,
-                claims.claimed_at
-            FROM {schema}.lease_claims AS claims
-            WHERE NOT EXISTS (
-                SELECT 1
-                FROM {schema}.lease_claim_closures AS closures
-                WHERE closures.job_id = claims.job_id
-                  AND closures.run_lease = claims.run_lease
-            )
-              AND NOT EXISTS (
-                SELECT 1
-                FROM {schema}.leases AS lease
-                WHERE lease.job_id = claims.job_id
-                  AND lease.run_lease = claims.run_lease
-            )
-            ON CONFLICT ON CONSTRAINT open_receipt_claims_pkey DO NOTHING
-            "#
-            ))
-            .execute(pool)
-            .await
-            .map_err(map_sqlx_error)?;
 
             sqlx::query(&format!(
                 r#"
@@ -3092,6 +3140,27 @@ impl QueueStorage {
     pub async fn reset(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        // Drop any partial-migration leftover tables before the main
+        // TRUNCATE. If `prepare_schema` crashed mid-migration, the
+        // schema may contain `lease_claims_legacy` /
+        // `lease_claim_closures_legacy` alongside the partitioned
+        // parents. `reset()` must clean these out, otherwise the next
+        // `prepare_schema()` runs the legacy migration again on top of
+        // the freshly-emptied parent and silently re-inserts old rows.
+        sqlx::query(&format!(
+            "DROP TABLE IF EXISTS {schema}.lease_claims_legacy"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            "DROP TABLE IF EXISTS {schema}.lease_claim_closures_legacy"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         sqlx::query(&format!(
             r#"
@@ -5363,11 +5432,21 @@ impl QueueStorage {
         Ok(rows)
     }
 
-    /// Write a `cancelled` closure row for any matching open receipt.
+    /// Write a `<outcome>` closure row for any matching open receipt.
     /// Idempotent: no-op if no lease_claims row exists for the
     /// `(job_id, run_lease)` pair, or if a closure already exists. Used
     /// by the admin cancel path to keep the receipt plane consistent
     /// with the job's new terminal state so rescue doesn't revive it.
+    ///
+    /// `FOR UPDATE` on the inner SELECT serialises the closure write
+    /// against `ensure_running_leases_from_receipts_tx`
+    /// (which also takes `FOR UPDATE OF claims` on the same row) and
+    /// against concurrent rescue / re-close paths that might race the
+    /// same `(job_id, run_lease)`. Without it, materialization could
+    /// see the claim row, decide to materialize, and a concurrent
+    /// admin cancel could write the closure between materialization's
+    /// SELECT and the lease INSERT — leaving a `running` lease for a
+    /// closed claim that admin cancel believes is fully shut down.
     async fn close_receipt_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -5378,10 +5457,15 @@ impl QueueStorage {
         let schema = self.schema();
         sqlx::query(&format!(
             r#"
+            WITH locked_claim AS (
+                SELECT claim_slot, job_id, run_lease
+                FROM {schema}.lease_claims AS claims
+                WHERE claims.job_id = $1 AND claims.run_lease = $2
+                FOR UPDATE
+            )
             INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-            SELECT claims.claim_slot, claims.job_id, claims.run_lease, $3, clock_timestamp()
-            FROM {schema}.lease_claims AS claims
-            WHERE claims.job_id = $1 AND claims.run_lease = $2
+            SELECT claim_slot, job_id, run_lease, $3, clock_timestamp()
+            FROM locked_claim
             ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
             "#
         ))
@@ -5671,6 +5755,24 @@ impl QueueStorage {
                     "#
                 ))
                 .bind(claim_slot)
+                .bind(job_id)
+                .bind(run_lease)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                // Defensive: between the leases DELETE at the top of
+                // this function and the FOR UPDATE on claims above, a
+                // concurrent `ensure_running_leases_from_receipts_tx`
+                // can have materialized a `leases` row for this
+                // (job_id, run_lease). Materialize and we both lock the
+                // same claim row; whichever ran first commits, the
+                // other replays under the new snapshot. If materialize
+                // committed first, that lease is now an orphan pointing
+                // at a job we're about to mark `cancelled`. Sweep it
+                // defensively. If no race occurred this is a no-op.
+                sqlx::query(&format!(
+                    "DELETE FROM {schema}.leases WHERE job_id = $1 AND run_lease = $2"
+                ))
                 .bind(job_id)
                 .bind(run_lease)
                 .execute(tx.as_mut())
@@ -6602,6 +6704,18 @@ impl QueueStorage {
                       WHERE closures.claim_slot = claims.claim_slot
                         AND closures.job_id = claims.job_id
                         AND closures.run_lease = claims.run_lease
+                  )
+                  -- A claim that already materialized into `leases` is
+                  -- on the lease-side heartbeat-rescue path (see
+                  -- `rescue_stale_heartbeats`). Rescuing it again here
+                  -- would write a second closure for an attempt the
+                  -- runtime is still tracking via its lease row, and on
+                  -- commit produce a double-failure transition. Mirror
+                  -- the same anti-join `load_job` uses to disambiguate.
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = claims.job_id
+                        AND lease.run_lease = claims.run_lease
                   )
                 ORDER BY COALESCE(attempt.heartbeat_at, claims.claimed_at) ASC
                 LIMIT 500
@@ -8898,11 +9012,18 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
+        // FOR UPDATE serialises with prune_oldest_leases and parallel
+        // rotators. Without it two rotators can both pass the busy-check,
+        // both compute the same next_slot, and the loser's CAS update
+        // wastes work. `RotateLeasesPlan` in
+        // `correctness/storage/AwaStorageLockOrder.tla` requires this
+        // lock as the first acquired resource for the rotation tx.
         let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
             SELECT current_slot, generation, slot_count
             FROM {schema}.lease_ring_state
             WHERE singleton = TRUE
+            FOR UPDATE
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -9088,11 +9209,20 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
+        // `PruneLeasesPlan` in
+        // `correctness/storage/AwaStorageLockOrder.tla` requires the
+        // sequence `lease_ring_state FOR UPDATE` →
+        // `lease_ring_slots[slot] FOR UPDATE` → `ACCESS EXCLUSIVE` on
+        // the child. Without these locks a concurrent rotator can flip
+        // the cursor under the prune's liveness check (current_slot
+        // recheck races a CAS update) and prune what should be the
+        // active partition.
         let state: (i32, i64, i32) = sqlx::query_as(&format!(
             r#"
             SELECT current_slot, generation, slot_count
             FROM {schema}.lease_ring_state
             WHERE singleton = TRUE
+            FOR UPDATE
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -9104,6 +9234,23 @@ impl QueueStorage {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(PruneOutcome::Noop);
         };
+
+        let slot_locked: Option<i32> = sqlx::query_scalar(&format!(
+            r#"
+            SELECT slot FROM {schema}.lease_ring_slots
+            WHERE slot = $1
+            FOR UPDATE
+            "#
+        ))
+        .bind(slot)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if slot_locked.is_none() {
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(PruneOutcome::Noop);
+        }
 
         let lease_child = lease_child_name(schema, slot as usize);
 

@@ -259,8 +259,24 @@ children, TRUNCATE both) plus a busy-check in `rotate_claims` that mirrors
 
 ## Fix tracking
 
-- **Wave 1:** fixed in commits following this review.
-- **Wave 2–4:** separate follow-up PRs before Phase 5 merges to main. Each
-  wave closes a finding; this file is updated as findings resolve. Delete
-  this file (or fold it into an ADR-023 validation artifact) before the
-  0.6 release.
+- **Wave 1:** fixed in commit `137e9ef` (real rotate-busy + prune-truncate).
+- **Wave 2:** fixed in the commit alongside this update.
+  - 2a: `FOR UPDATE` on `lease_ring_state` in `rotate_leases`; full
+    `state → slot row → child` lock sequence in `prune_oldest_leases`.
+  - 2b: `close_receipt_tx` now serialises via a `FOR UPDATE` CTE on the
+    target `lease_claims` row, blocking concurrent materialization.
+  - 2c: `rescue_stale_receipt_claims_tx` excludes claims already
+    materialized into `leases`.
+  - 2d: `cancel_job_tx` receipt-only branch defensively `DELETE`s any
+    `leases` row that materialized between the top-of-function leases
+    check and the FOR UPDATE on claims.
+  - 2e: `prepare_schema` legacy migration (claims and closures) wraps
+    copy + drop in a transaction; the `open_receipt_claims` backfill is
+    gated on `legacy_exists`, the anti-join now matches on
+    `claim_slot`, and the `claim_slot` ALTER uses `-1` as an
+    unambiguous sentinel rather than conflating with a legitimate
+    slot 0. `reset()` drops legacy tables before TRUNCATE.
+- **Wave 3–4:** separate follow-up PRs before Phase 5 merges to main.
+  Each wave closes a finding; this file is updated as findings resolve.
+  Delete this file (or fold it into an ADR-023 validation artifact)
+  before the 0.6 release.
