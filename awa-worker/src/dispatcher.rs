@@ -655,6 +655,12 @@ impl Dispatcher {
 
         // Phase 7: Dispatch (each job takes one pre-acquired permit)
         let mut set = self.job_set.lock().await;
+        // Reap completed task handles. JoinSet retains JoinHandles (and the
+        // task Cell they keep alive) until join_next() consumes them; under
+        // steady-state load that pins the entire execute_task closure
+        // captures and leaks ~3 GB/h/replica. Drain here so the set only
+        // holds in-flight tasks.
+        while set.try_join_next().is_some() {}
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let task = self.executor.execute_task(job, cancel_flag);
