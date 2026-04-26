@@ -305,15 +305,23 @@ fn queue_storage_event_tables(
     schema: &str,
     queue_slot_count: usize,
     lease_slot_count: usize,
+    claim_slot_count: usize,
 ) -> Vec<String> {
+    // Only register child partitions and unpartitioned tables.
+    // pgstattuple cannot operate on partitioned parents
+    // (`lease_claims`, `lease_claim_closures`, `ready_entries`,
+    // `done_entries`, `leases`), so registering parents would just
+    // spam the collector with errors and never produce a row.
+    // `deferred_jobs`, `dlq_entries`, `attempt_state`, and the
+    // queue/lease/claim ring state/slot tables are unpartitioned —
+    // pgstattuple works on them directly.
     let mut tables = vec![
         format!("{schema}.queue_ring_state"),
         format!("{schema}.queue_ring_slots"),
         format!("{schema}.lease_ring_state"),
         format!("{schema}.lease_ring_slots"),
-        format!("{schema}.lease_claims"),
-        format!("{schema}.open_receipt_claims"),
-        format!("{schema}.lease_claim_closures"),
+        format!("{schema}.claim_ring_state"),
+        format!("{schema}.claim_ring_slots"),
         format!("{schema}.queue_lanes"),
         format!("{schema}.attempt_state"),
         format!("{schema}.deferred_jobs"),
@@ -325,6 +333,10 @@ fn queue_storage_event_tables(
     }
     for slot in 0..lease_slot_count {
         tables.push(format!("{schema}.leases_{slot}"));
+    }
+    for slot in 0..claim_slot_count {
+        tables.push(format!("{schema}.lease_claims_{slot}"));
+        tables.push(format!("{schema}.lease_claim_closures_{slot}"));
     }
     tables
 }
@@ -391,7 +403,13 @@ pub async fn run() {
     let latency_window = Duration::from_millis(env_u64("LATENCY_WINDOW_MS", 30_000).max(1));
     let producer_batch_ms = env_u64("PRODUCER_BATCH_MS", 25).max(1);
     let producer_batch_max = env_u64("PRODUCER_BATCH_MAX", 128).max(1) as usize;
-    let default_max_connections = (worker_count.saturating_mul(2)).saturating_add(16).max(40);
+    // Per-replica connection pool. Sized to cover the steady-state
+    // demand: 8 workers × concurrent in-flight + dispatcher + 4 batcher
+    // shards + heartbeat + maintenance + producer + depth poller +
+    // sampler. Under-sizing surfaces as `pool timed out` errors and a
+    // memory build-up because spawned `complete_job` futures pile up
+    // holding their captured (job, result, progress_snapshot) state.
+    let default_max_connections = (worker_count.saturating_mul(4)).saturating_add(48).max(80);
     let max_connections = env_u32("MAX_CONNECTIONS", default_max_connections);
     let db_name = database_url
         .rsplit('/')
@@ -418,6 +436,7 @@ pub async fn run() {
                     store.schema(),
                     store.queue_slot_count(),
                     store.lease_slot_count(),
+                    store.claim_slot_count(),
                 ),
             );
             Some((store, storage))
