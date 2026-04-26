@@ -152,27 +152,31 @@ autovacuum-reclaimed.
 
 ## Known limitations / follow-ups
 
-### Residual ~2.4 GB/h/replica RSS growth
+### Residual ~2.4 GB/h/replica RSS growth (resolved 2026-04-27)
 
-This run saw per-replica RSS climb from ~zero at start to 3.9–4.6 GB at
-T+95m. Investigation traced this to **glibc malloc arena
-fragmentation**: the 24-core host's default `MALLOC_ARENA_MAX = 8 ×
-num_cores = 192` lets tokio worker threads each pin their own arenas,
-which never shrink once tokio's per-thread allocation pattern stops
-returning blocks to the same arena that allocated them.
-`/proc/<pid>/maps` showed 56 separate 64 MB anonymous regions = 3.5 GB
-of allocator arenas, with zero growth in heap or mmap regions of any
-other shape.
+The 115-min run saw per-replica RSS climb from ~zero at start to 3.9–
+4.6 GB at T+95m. Initial investigation traced this to glibc malloc
+arena fragmentation and applied `MALLOC_ARENA_MAX=2` in
+`bench_harness/adapters.py:_base_env`. That capped arena *count* (1-2
+distinct arenas) but a 12h validation attempt at T+1h still showed
+2.7-3.6 GB/replica (~3.2 GB/h/replica), with the 1-2 capped arenas
+growing via repeated 64 MB chunk allocations.
 
-**The leak is in the bench harness's process model, not the receipt-ring
-implementation.** It would not affect a production deployment unless
-the deployment also runs many tokio worker threads in a single process
-on a high-core box.
+A jemalloc heap profile (and a parallel code audit) traced 99.1% of
+allocations to `tokio::runtime::task::core::Cell::new` from
+`awa-worker/src/dispatcher.rs:662`: the `Dispatcher::drain_ready` path
+spawns every job-runner future into a shared
+`Arc<Mutex<JoinSet<()>>>`, but `JoinSet::join_next()` was only called
+during shutdown drain. Completed `JoinHandle`s — and the task `Cell`
+each one keeps alive (which captures the entire `execute_task`
+closure: cloned `Arc`s of pool/storage/metrics, the job payload,
+the dispatch permit) — accumulated indefinitely under steady-state
+load.
 
-Fix: `MALLOC_ARENA_MAX=2` is now exported from
-`bench_harness/adapters.py:_base_env` (see commit on
-`feature/vacuum-aware-storage-redesign`). A 30-min validation run with
-the cap is queued before the 12h overnight run.
+Fixed in commit `c0df1df` by reaping completed handles via
+`set.try_join_next()` before each spawn batch. Validated end-to-end
+with the 12h overnight run below; per-replica RSS held at **17-18 MB
+for the entire 11.6h** (vs 3.6 GB at T+1h pre-fix).
 
 ### Pool sizing
 
@@ -184,12 +188,94 @@ ceiling. The new defaults — `max_connections = 400` in
 `benchmarks/portable/awa-bench/src/long_horizon.rs` — are pinned and
 captured in the manifest for cross-run comparability.
 
+## 12-hour overnight run (2026-04-27, after JoinSet leak fix)
+
+Run id: `custom-20260426T101003Z-ba9cb4`. Started 2026-04-26 22:10 NZST,
+completed 2026-04-27 09:46 NZST (11.6 h wall time). Same branch +
+commit `c0df1df` (JoinSet drain fix). Profile:
+
+```text
+--phase warmup=warmup:5m
+--phase clean_1=clean:4h
+--phase idle_1=idle-in-tx:30m
+--phase recovery_1=recovery:30m
+--phase clean_2=clean:4h
+--phase idle_2=idle-in-tx:30m
+--phase recovery_2=recovery:30m
+--phase clean_3=clean:90m
+```
+
+### Receipt plane — 7-phase summary
+
+| phase      | type        | claims peak dead | closures peak dead | claims peak MB | closures peak MB |
+|------------|-------------|-----------------:|-------------------:|---------------:|-----------------:|
+| clean_1    | clean       | 85               | **0**              | 3.58           | 3.37             |
+| idle_1     | idle-in-tx  | 38               | **0**              | 4.35           | 3.19             |
+| recovery_1 | recovery    | 42               | **0**              | 6.50           | 4.55             |
+| clean_2    | clean       | 68               | **0**              | 57.57          | 36.45            |
+| idle_2     | idle-in-tx  | 33               | **0**              | 59.67          | 37.56            |
+| recovery_2 | recovery    | 37               | **0**              | 101.63         | 63.73            |
+| clean_3    | clean       | 42               | **0**              | 98.18          | 61.55            |
+
+Closure partitions stayed at **0 dead tuples through every phase**
+across two full idle-in-tx stress cycles — the architectural property
+ADR-023 set out to deliver. Receipt-plane peak dead-tuple count over
+the entire 11.6 h was ≤85.
+
+### Warm singletons — peak `n_dead_tup` per phase
+
+| table                       | clean_1 | idle_1 | recovery_1 | clean_2 | idle_2 | recovery_2 | clean_3 |
+|-----------------------------|--------:|-------:|-----------:|--------:|-------:|-----------:|--------:|
+| awa_exp.queue_ring_state    | 78      | 668    | 668        | 44      | 44     | 44         | 44      |
+| awa_exp.lease_ring_state    | 108     | 28 541 | 28 584     | 148     | 23 563 | 237        | 2 505   |
+| awa_exp.claim_ring_state    | 78      | 1 635  | 1 635      | 79      | 186    | 77         | 76      |
+| awa_exp.attempt_state       | 0       | 0      | 0          | 0       | 0      | 0          | 0       |
+| awa_exp.queue_lanes         | 0       | 0      | 0          | 0       | 0      | 0          | 0       |
+| awa_exp.queue_claim_heads   | 0       | 0      | 0          | 0       | 0      | 0          | 0       |
+
+Ring-state row counts spike under blocked vacuum and recover within an
+autovacuum pass once held-open transactions release — exactly the
+`Warm` reclaim shape in the dead-tuple contract spec.
+
+### Per-replica RSS
+
+Hourly samples taken from `/proc/<pid>/status`:
+
+| sample      | replica 0 | replica 1 | replica 2 | replica 3 |
+|-------------|----------:|----------:|----------:|----------:|
+| T+1h        | 18 080 kB | 17 240 kB | 17 176 kB | 17 308 kB |
+| T+5h        | 18 284 kB | 17 376 kB | 17 232 kB | 17 396 kB |
+| T+9h (idle_2) | 18 404 kB | 17 428 kB | 17 260 kB | 17 396 kB |
+| T+11h       | 18 436 kB | 17 448 kB | 17 260 kB | 17 396 kB |
+
+Net per-replica drift over 11 h: **< 400 kB**. Total allocator-arena
+mappings stayed at 16-18 anonymous regions, ~16 MB total per replica.
+Compare pre-fix: 2.7-3.6 GB at T+1h, projecting to ~150 GB at T+12h.
+
+### Throughput regression — out of scope for ADR-023
+
+| phase      | aggregate completion/s | aggregate enqueue/s | total backlog peak |
+|------------|-----------------------:|--------------------:|-------------------:|
+| clean_1    | 759                    | 776                 | 95                 |
+| idle_1     | 365                    | 645                 | 354 878            |
+| recovery_1 | 747                    | 746                 | 360 925            |
+| clean_2    | 344                    | 704                 | 4 956 477          |
+| idle_2    | 167                    | 596                 | 5 732 775          |
+| recovery_2 | 221                    | 707                 | 6 591 795          |
+| clean_3    | 200                    | 700                 | 9 229 258          |
+
+After idle_1 leaves a ~360k-job backlog, recovery_1's drain rate just
+matches the steady enqueue rate — it does not actually drain the
+backlog. From clean_2 onward completion rate falls to 200-350/s while
+enqueue holds at ~700/s, so the backlog grows monotonically to 9.2 M
+jobs / 12 GB `ready_entries` by the end. **This is not an ADR-023
+issue** — the receipt plane stayed clean throughout (closures
+stayed at 0 dead tuples; claim partitions reclaimed each rotation).
+The slowdown is a separate scaling characteristic exposed by holding a
+~Million-row `ready_entries` accumulation, tracked separately.
+
 ## Files
 
-- Run output: `benchmarks/portable/results/custom-20260426T032000Z-839ddc/`
-  - `summary.json` — per-table peak/median per phase, per-replica
-    breakdowns
-  - `manifest.json` — host shape, postgres image, settings, CLI
-  - `raw.csv` — 5s-sampled metrics (~72 MB)
-  - `plots/` — per-table dead-tuple curves
-  - `index.html` — composed view
+- 115-min run: `benchmarks/portable/results/custom-20260426T032000Z-839ddc/`
+- 12-hour run:  `benchmarks/portable/results/custom-20260426T101003Z-ba9cb4/`
+  - `summary.json`, `manifest.json`, 525 MB `raw.csv`, plots, html

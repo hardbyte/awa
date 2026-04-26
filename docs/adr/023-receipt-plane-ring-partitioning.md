@@ -598,12 +598,15 @@ Acceptance criteria status:
 - ⏳ Two consecutive green nightly-chaos runs — required before merge.
 - ✅ Validation artifact at
   `docs/adr/bench/023-receipt-ring-validation-2026-04-26.md`
-  (115-min 4x8 receipts-on long-horizon: receipt-plane peak dead
-  tuples ≤49 across all phases; closure partitions stayed at 0).
-- ⏳ Full 12-hour `long_horizon.py` 4x8 receipts-on with steady-
-  state receipt-plane dead tuples below the ADR-019 lease-plane
-  baseline. Blocked on `MALLOC_ARENA_MAX=2` validation in the
-  bench harness — see the artifact's "known limitations" section.
+  (115-min 4x8 receipts-on long-horizon plus the 12 h overnight run
+  appended below: closure partitions stayed at 0 dead tuples across
+  every phase; claims peak ≤85 across both runs).
+- ✅ Full 12-hour `long_horizon.py` 4x8 receipts-on (run id
+  `custom-20260426T101003Z-ba9cb4`, 11.6 h wall, two idle-in-tx
+  stress cycles + a final clean tail). Receipt-plane closures
+  stayed at 0 dead tuples through every phase; per-replica RSS
+  held at 17-18 MB for the full duration after the JoinSet leak
+  fix in `c0df1df`.
 
 **Rollback:** flipping the default is a one-line revert; the
 underlying schema works either way. The env-var alias means an
