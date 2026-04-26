@@ -1802,12 +1802,16 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             // Updated once per enqueue batch to advance next_seq. The primary
-            // key is the only index, and next_seq is not part of it, so a
-            // reduced fillfactor keeps the update HOT on the same page.
+            // key is the only index, and next_seq is not part of it, so the
+            // updates are 99.9% HOT. fillfactor=50 (matching the ring-state
+            // singletons) reserves enough per-page slack that HOT updates
+            // stay in-page during autovacuum-blocked windows; fillfactor=70
+            // bloated the heap to ~90 pages for a single live row in a
+            // 30-min run with idle-in-tx pressure.
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.queue_enqueue_heads SET (
-                fillfactor = 70,
+                fillfactor = 50,
                 autovacuum_vacuum_scale_factor = 0.0,
                 autovacuum_vacuum_threshold = 200,
                 autovacuum_vacuum_cost_limit = 2000,
@@ -1836,7 +1840,7 @@ impl QueueStorage {
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.queue_claim_heads SET (
-                fillfactor = 70,
+                fillfactor = 50,
                 autovacuum_vacuum_scale_factor = 0.0,
                 autovacuum_vacuum_threshold = 200,
                 autovacuum_vacuum_cost_limit = 2000,
