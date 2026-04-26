@@ -155,6 +155,9 @@ def start_postgres(pg_image: str) -> None:
 
 
 def stop_postgres(pg_image: str) -> None:
+    if os.environ.get("KEEP_DB"):
+        print("[harness] KEEP_DB set — leaving postgres running for inspection")
+        return
     _run_cmd(
         ["docker", "compose", "down", "-v"],
         cwd=SCRIPT_DIR,
