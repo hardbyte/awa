@@ -217,6 +217,13 @@ def _base_env(manifest: AdapterManifest, overrides: dict[str, str]) -> dict[str,
         # (the only mode today); the multi-replica spawner (follow-up
         # commit for #174) supplies distinct ids per subprocess.
         "BENCH_INSTANCE_ID": "0",
+        # Cap glibc malloc arenas. Default is 8 × num_cores (= ~192 on
+        # the 24-core dev box), and tokio's per-thread allocation
+        # patterns spawn arenas that don't shrink, manifesting as
+        # ~2.4 GB/h/replica anonymous-mapping growth in long runs.
+        # Two arenas keeps fragmentation bounded with negligible
+        # allocator-contention impact at our thread counts.
+        "MALLOC_ARENA_MAX": "2",
     }
     env.update(
         {

@@ -596,13 +596,14 @@ Acceptance criteria status:
 - ✅ `docs/configuration.md` documents the new default and the
   deprecation alias.
 - ⏳ Two consecutive green nightly-chaos runs — required before merge.
-- ⏳ Validation artifact under
-  `docs/adr/bench/023-receipt-ring-validation-<date>.md` — see the
-  separate Phase-6 task for the bench-run shape; pairs with the
-  receipt-plane regression-gate task.
+- ✅ Validation artifact at
+  `docs/adr/bench/023-receipt-ring-validation-2026-04-26.md`
+  (115-min 4x8 receipts-on long-horizon: receipt-plane peak dead
+  tuples ≤49 across all phases; closure partitions stayed at 0).
 - ⏳ Full 12-hour `long_horizon.py` 4x8 receipts-on with steady-
   state receipt-plane dead tuples below the ADR-019 lease-plane
-  baseline.
+  baseline. Blocked on `MALLOC_ARENA_MAX=2` validation in the
+  bench harness — see the artifact's "known limitations" section.
 
 **Rollback:** flipping the default is a one-line revert; the
 underlying schema works either way. The env-var alias means an
