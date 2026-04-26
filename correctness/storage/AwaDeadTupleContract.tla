@@ -131,6 +131,17 @@ TableSpec == [
     queue_enqueue_heads |->
         [kind |-> "Warm", hot |-> "hot",
          bounded_by |-> "queue_lane_count"],
+    \* Mutation rate is claimer-heartbeat × claimer_slot_count, which
+    \* scales with the worker fleet (one heartbeat per active claimer
+    \* per heartbeat tick). Live row count is bounded by claimer_slots
+    \* per queue, which is itself operator-set. The Warm contract holds
+    \* iff updates are HOT — see the INCLUDE-clause index in
+    \* `queue_storage.rs:idx_*_queue_claimer_leases_owner` which keeps
+    \* expires_at out of the indexed-key set so heartbeat updates stay
+    \* HOT-eligible.
+    queue_claimer_leases |->
+        [kind |-> "Warm", hot |-> "hot",
+         bounded_by |-> "claimer_slot_count"],
 
     \* ---- Cold metadata: small singletons / per-queue rows ----
     \* Mutation rate scales with operator activity (queue creation,
@@ -138,7 +149,6 @@ TableSpec == [
     queue_lanes            |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_terminal_rollups |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_count_snapshots  |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
-    queue_claimer_leases   |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_claimer_state    |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
     \* ---- Ring-state singletons ----

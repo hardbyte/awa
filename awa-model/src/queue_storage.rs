@@ -1912,10 +1912,28 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // expires_at is updated on every heartbeat (mark_queue_claimer_active
+            // → SET expires_at = $now + ttl). Including it as an indexed key
+            // column blocks HOT updates: every heartbeat allocates a new heap
+            // tuple in a fresh page, observed as 0% HOT update ratio with
+            // ~116 updates/sec. Postgres exempts INCLUDE columns from the
+            // HOT-blocking set, so the SELECT at acquire_queue_claimer (which
+            // filters `expires_at > now()`) stays index-covered while updates
+            // become HOT-eligible.
+            sqlx::query(&format!(
+                r#"
+            DROP INDEX IF EXISTS {schema}.idx_{schema}_queue_claimer_leases_owner
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             CREATE INDEX IF NOT EXISTS idx_{schema}_queue_claimer_leases_owner
-                ON {schema}.queue_claimer_leases (queue, owner_instance_id, expires_at)
+                ON {schema}.queue_claimer_leases (queue, owner_instance_id)
+                INCLUDE (expires_at)
             "#
             ))
             .execute(pool)
