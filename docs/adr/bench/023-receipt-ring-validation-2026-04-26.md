@@ -274,8 +274,82 @@ stayed at 0 dead tuples; claim partitions reclaimed each rotation).
 The slowdown is a separate scaling characteristic exposed by holding a
 ~Million-row `ready_entries` accumulation, tracked separately.
 
+## Three 30-minute regression-confirmation runs (2026-04-27)
+
+After the 12 h validation surfaced the post-idle throughput regression
+fixed in `c0df1df` / `ab99a31` / `d21e5db`, three short bench runs
+were taken at the same 4×8×200/s topology to confirm the regression
+stays gone under different pressure shapes. All three runs stream
+metrics through the OTel side-stack at `docker/observability/`
+(commit `7905c74`), so the dashboard is the canonical operator view
+and these tables are the textual record.
+
+### Run 1 — clean baseline
+
+`custom-20260427T043422Z-ab7901`. 4×8×200/s, warmup 2m + clean 28m.
+Headline: completion 783/s vs enqueue 792/s, claim peak 25, closures
+**0**. Steady-state shape; no surprises.
+
+### Run 2 — single-cycle idle-in-tx stress (the original regression scenario)
+
+`custom-20260427T051026Z-5bc479`. warmup 2m + clean_pre 8m +
+idle-in-tx 5m + clean_post 15m.
+
+| phase      | comp/s | enq/s | claim peak | closure peak |
+|------------|-------:|------:|-----------:|-------------:|
+| clean_pre  | 787    | 800   | 16         | **0**        |
+| idle_1     | 779    | 781   | 3          | **0**        |
+| clean_post | 784    | 792   | 36         | **0**        |
+
+The original 12 h regression had clean_pre 759 → idle_1 365 →
+clean_post 344. This run is the post-fix shape: clean_post within
+3/s of clean_pre, and within 8/s of enqueue. The post-idle drop is
+gone.
+
+### Run 3 — two-cycle stress (most informative)
+
+`custom-20260427T054607Z-6a8f52`. warmup 2m + clean_1 5m + idle_1
+5m + recovery_1 5m + clean_2 5m + idle_2 3m + recovery_2 3m + clean_3
+2m. Two full stress cycles in 30 minutes.
+
+| phase      | comp/s | enq/s | gap | claim peak | closure peak |
+|------------|-------:|------:|----:|-----------:|-------------:|
+| clean_1    | 783    | 800   | 17  | 15         | **0**        |
+| idle_1     | 755    | 757   | 3   | 15         | **0**        |
+| recovery_1 | 798    | 800   | 2   | 1          | **0**        |
+| clean_2    | 790    | 792   | 2   | 21         | **0**        |
+| idle_2     | 773    | 785   | 12  | 3          | **0**        |
+| recovery_2 | 773    | 787   | 14  | 8          | **0**        |
+| clean_3    | 774    | 788   | 14  | 13         | **0**        |
+
+Receipt-plane closure peak: **0** across every one of the seven
+phases, including two full idle-in-tx stress cycles. Claim peak
+≤21 across the entire run. Throughput keeps within 2% of the
+producer rate in all phases — the post-idle regression does not
+re-emerge across repeated stress cycles.
+
+Warm singleton (`lease_ring_state`) dead-tuple peaks per phase, for
+the dead-tuple contract spec's `Warm` reclaim shape:
+
+| phase      | lease_ring_state | queue_ring_state | claim_ring_state |
+|------------|-----------------:|-----------------:|-----------------:|
+| clean_1    | 101              | 68               | 69               |
+| idle_1     | 5 909            | 296              | 296              |
+| recovery_1 | 6 010            | 75               | 301              |
+| clean_2    | 93               | 72               | 79               |
+| idle_2     | 3 510            | 176              | 175              |
+| recovery_2 | 3 608            | 181              | 181              |
+| clean_3    | 93               | 65               | 66               |
+
+Spikes under held-tx, full recovery within one clean phase. Exactly
+the `Warm`/`bounded-by-row-count` shape declared in
+`correctness/storage/AwaDeadTupleContract.tla`.
+
 ## Files
 
 - 115-min run: `benchmarks/portable/results/custom-20260426T032000Z-839ddc/`
 - 12-hour run:  `benchmarks/portable/results/custom-20260426T101003Z-ba9cb4/`
-  - `summary.json`, `manifest.json`, 525 MB `raw.csv`, plots, html
+- Run 1 (clean baseline): `benchmarks/portable/results/custom-20260427T043422Z-ab7901/`
+- Run 2 (single-cycle stress): `benchmarks/portable/results/custom-20260427T051026Z-5bc479/`
+- Run 3 (two-cycle stress): `benchmarks/portable/results/custom-20260427T054607Z-6a8f52/`
+  - All include `summary.json`, `manifest.json`, `raw.csv`, plots, html
