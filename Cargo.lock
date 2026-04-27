@@ -171,7 +171,7 @@ checksum = "c08606f8c3cbf4ce6ec8e28fb0014a2c086708fe954eaa885384a6165172e7e8"
 
 [[package]]
 name = "awa"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "awa-macros",
@@ -196,7 +196,7 @@ dependencies = [
 
 [[package]]
 name = "awa-cli"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "assert_cmd",
  "awa-model",
@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "awa-macros"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -227,7 +227,7 @@ dependencies = [
 
 [[package]]
 name = "awa-model"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "awa-macros",
  "blake3",
@@ -248,7 +248,7 @@ dependencies = [
 
 [[package]]
 name = "awa-testing"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "async-trait",
  "awa-model",
@@ -263,7 +263,7 @@ dependencies = [
 
 [[package]]
 name = "awa-ui"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "awa-model",
  "awa-testing",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "awa-worker"
-version = "0.5.5"
+version = "0.5.6"
 dependencies = [
  "anyhow",
  "async-trait",
