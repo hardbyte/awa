@@ -385,18 +385,50 @@ If Awa ever needs a non-additive schema change, the intended contract is a major
 
 ## Recommended Production Flow
 
+The shape depends on whether you're doing a **fresh install** or
+**upgrading from `0.5.x`**.
+
+### Fresh install (no prior canonical data)
+
+A new cluster can install queue storage directly without going through
+the staged transition.
+
 ```bash
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Optional: record and verify future storage prep state
-awa --database-url "$DATABASE_URL" storage status
+# 2. Materialize the queue-storage schema before workers start.
+#    Skipping this means the first worker pays the schema-install
+#    cost on its first claim attempt.
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
 
-# 3. Roll out workers
-#    (On the queue-storage branch, Rust and Python worker runtimes default to queue storage.)
-# 4. Verify runtime health / queue stats
+# 3. Activate queue storage. Without prior canonical work, this can
+#    move directly to active without a mixed-transition phase.
+awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
+awa --database-url "$DATABASE_URL" storage enter-mixed-transition
+awa --database-url "$DATABASE_URL" storage finalize
+
+# 4. Roll out workers (Rust or Python). Each runtime is queue-storage
+#    capable by default; transition_role="auto" follows storage_status.
+
+# 5. Verify routing + worker health
+awa --database-url "$DATABASE_URL" storage status
 awa --database-url "$DATABASE_URL" queue stats
 ```
+
+### Upgrading from `0.5.x`
+
+**Do not use the fresh-install recipe.** Live canonical data and
+canonical-only `0.5.x` workers must drain through `mixed_transition`
+before queue storage can take over. Follow the staged transition flow
+documented above under
+[Preview: `0.5.x` → `0.6` Queue-Storage Rollout](#preview-05x---06-queue-storage-rollout):
+
+1. Phase 1 — last `0.5.x` release everywhere with `awa migrate` applied.
+2. Phase 2 — roll out `0.6` binaries, then `prepare → enter-mixed-transition → finalize`.
+
+Rollback boundaries and `storage abort` semantics are documented in
+[Rollback Strategy](#rollback-strategy) below.
 
 ## Next
 
