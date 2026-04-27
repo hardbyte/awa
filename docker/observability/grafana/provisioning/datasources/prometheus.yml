@@ -1,0 +1,18 @@
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    # The dashboard JSON refers to the datasource via ${DS_PROMETHEUS}.
+    # `editable: false` plus this fixed UID lets the dashboard
+    # provisioning step (./grafana/provisioning/dashboards) load the
+    # JSON directly without needing the import-time variable
+    # substitution wizard.
+    uid: prometheus_default
+    editable: false
+    jsonData:
+      httpMethod: POST
+      timeInterval: 5s

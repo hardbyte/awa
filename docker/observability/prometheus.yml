@@ -1,0 +1,25 @@
+global:
+  scrape_interval: 5s
+  scrape_timeout: 4s
+  # External labels apply to every series exported via federation /
+  # remote_write. Helpful when stacking multiple bench profiles into
+  # one Prometheus over time; does not affect the awa-bench dashboard's
+  # local-only PromQL.
+  external_labels:
+    stack: awa-bench
+
+scrape_configs:
+  - job_name: awa-bench
+    # The OTel collector exposes a Prometheus scrape endpoint at :8889.
+    # Service name is set in the bench env (OTEL_SERVICE_NAME) and
+    # appears as `service_name` once resource_to_telemetry_conversion
+    # promotes it.
+    static_configs:
+      - targets:
+          - otel-collector:8889
+    # OTel resource attributes lift to labels with their dotted path
+    # un-sanitised (service.name → service_name); Prometheus accepts
+    # those out of the box but the dashboard PromQL keys off Awa's
+    # native attributes (awa.ring, awa.job.queue) which the OTel SDK
+    # already converts to the underscore form.
+    metric_relabel_configs: []

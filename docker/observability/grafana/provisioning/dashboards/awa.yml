@@ -1,0 +1,16 @@
+apiVersion: 1
+
+providers:
+  - name: awa
+    orgId: 1
+    folder: Awa
+    type: file
+    disableDeletion: false
+    # Grafana refreshes the dashboard from disk every 10s. Edits to
+    # docs/grafana/awa-dashboard.json (which the symlink points at) get
+    # picked up live.
+    updateIntervalSeconds: 10
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false
