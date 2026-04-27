@@ -996,10 +996,15 @@ struct SelfHealSingleJob {
 }
 
 async fn delete_storage_transition_singleton(pool: &PgPool) {
-    sqlx::query("DELETE FROM awa.storage_transition_state WHERE singleton")
+    let result = sqlx::query("DELETE FROM awa.storage_transition_state WHERE singleton")
         .execute(pool)
         .await
         .expect("failed to delete storage_transition_state singleton");
+    assert_eq!(
+        result.rows_affected(),
+        1,
+        "expected to delete exactly one singleton row; the v010 seed must run before this helper or the test is not exercising the missing-row path"
+    );
 }
 
 #[tokio::test]
@@ -1100,10 +1105,7 @@ async fn test_v011_reseeds_singleton_when_upgrading_from_v010() {
     // Simulate a database that received v010 but lost its singleton row
     // and is being re-migrated from v10 → current. Roll the recorded
     // schema_version back to 10 so v011 re-runs.
-    sqlx::query("DELETE FROM awa.storage_transition_state WHERE singleton")
-        .execute(&pool)
-        .await
-        .unwrap();
+    delete_storage_transition_singleton(&pool).await;
     sqlx::query("DELETE FROM awa.schema_version WHERE version > 10")
         .execute(&pool)
         .await
