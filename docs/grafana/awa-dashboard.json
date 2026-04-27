@@ -389,13 +389,13 @@
       "collapsed": true,
       "id": 500,
       "type": "row",
-      "title": "Descriptor catalogs · full tables live in awa-ui",
+      "title": "Descriptor catalogs (summary; full tables in awa-ui)",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
       "panels": [
         {
           "id": 501,
           "type": "table",
-          "title": "Queue Descriptor Catalog",
+          "title": "Declared queues · joins to runtime metrics via awa_queue_info",
           "description": "awa_queue_info is always 1; it's a label-join target. Full queue table (with pause/drain actions) lives at /queues in awa-ui.",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
           "fieldConfig": {
@@ -421,7 +421,7 @@
         {
           "id": 502,
           "type": "table",
-          "title": "Job Kind Descriptor Catalog",
+          "title": "Declared job kinds · joins to runtime metrics via awa_job_kind_info",
           "description": "awa_job_kind_info is always 1; it's a label-join target for per-kind panels. Full kind table with per-kind metadata lives at /kinds in awa-ui.",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
           "fieldConfig": {
@@ -565,7 +565,7 @@
     }
   ,
     {
-      "id": 600,
+      "id": 700,
       "type": "row",
       "title": "Ring rotation & prune (queue-storage)",
       "collapsed": false,
@@ -577,13 +577,13 @@
       },
       "panels": [
         {
-          "id": 601,
+          "id": 701,
           "type": "timeseries",
           "title": "Rotation rate by ring + outcome",
           "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Healthy rings show non-zero `rotated` on a regular cadence; pinned rings dominate `skipped_busy`.",
           "gridPos": {
             "x": 0,
-            "y": 0,
+            "y": 26,
             "w": 12,
             "h": 8
           },
@@ -608,13 +608,13 @@
           }
         },
         {
-          "id": 602,
+          "id": 702,
           "type": "timeseries",
           "title": "Rotation skip blockers (queue ring)",
           "description": "When queue rotation is SkippedBusy, which side held it: ready_entries rows or done_entries rows on the next slot? `queue.ready_rows` dominating = producer faster than consumer (real backlog). `queue.done_rows` dominating = completion truncate falling behind.",
           "gridPos": {
             "x": 12,
-            "y": 0,
+            "y": 26,
             "w": 12,
             "h": 8
           },
@@ -639,13 +639,13 @@
           }
         },
         {
-          "id": 603,
+          "id": 703,
           "type": "timeseries",
           "title": "Rotation skip magnitudes p95",
           "description": "p95 row count seen at the blocker side when rotation is SkippedBusy. Distinguishes 'pinned by handful of stragglers' (transient race) from 'pinned by backlog mountain' (real saturation).",
           "gridPos": {
             "x": 0,
-            "y": 8,
+            "y": 34,
             "w": 12,
             "h": 8
           },
@@ -670,13 +670,13 @@
           }
         },
         {
-          "id": 604,
+          "id": 704,
           "type": "timeseries",
           "title": "Prune rate by ring + outcome",
           "description": "Ring prune attempts/sec by outcome. `pruned` advancing = ring reclaiming partitions. `skipped_active` rising = target slot still has live state. `blocked` = lock contention (held-tx, autovacuum).",
           "gridPos": {
             "x": 12,
-            "y": 8,
+            "y": 34,
             "w": 12,
             "h": 8
           },
@@ -701,13 +701,13 @@
           }
         },
         {
-          "id": 605,
+          "id": 705,
           "type": "timeseries",
           "title": "Prune skip reasons (all rings)",
           "description": "When prune returns SkippedActive, which gate fired? `queue.active_leases` = leases on prior generation. `queue.pending_ready` = ready rows without matching done. `claim.open` = open receipt-plane claims. `lease.current`/`claim.current` = rotator race (benign if rare).",
           "gridPos": {
             "x": 0,
-            "y": 16,
+            "y": 42,
             "w": 12,
             "h": 8
           },
@@ -732,13 +732,13 @@
           }
         },
         {
-          "id": 606,
+          "id": 706,
           "type": "timeseries",
           "title": "Rotations per minute (generation derivative)",
           "description": "Rate of ring generation advance. Headline 'is rotation working' signal \u2014 flat at zero with non-zero `skipped_busy` traffic above means the ring is pinned.",
           "gridPos": {
             "x": 12,
-            "y": 16,
+            "y": 42,
             "w": 12,
             "h": 8
           },

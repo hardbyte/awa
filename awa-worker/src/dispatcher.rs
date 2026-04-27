@@ -608,13 +608,24 @@ impl Dispatcher {
         if !jobs.is_empty() {
             self.metrics
                 .record_job_claimed(&self.queue, jobs.len() as u64);
+            // Wait duration = created_at → now() (claim moment).
+            //
+            // Earlier this used `attempted_at - created_at`, but the
+            // queue_storage claim path only populates `attempted_at`
+            // when deadline_duration > 0. Receipt-plane jobs (zero
+            // deadline, the 0.6 default) get NULL attempted_at on the
+            // ClaimedRuntimeJob, so the previous version silently
+            // skipped the metric — it never appeared on the
+            // dashboard. Falling back to `Utc::now()` measures the
+            // same operator-visible quantity ("time from enqueue to
+            // claim") regardless of whether the receipt-plane
+            // optimisation skipped the attempted_at write.
+            let now = chrono::Utc::now();
             for job in &jobs {
-                if let Some(attempted_at) = job.job.attempted_at {
-                    let wait_secs =
-                        (attempted_at - job.job.created_at).num_milliseconds() as f64 / 1000.0;
-                    if wait_secs >= 0.0 {
-                        self.metrics.record_wait_duration(&self.queue, wait_secs);
-                    }
+                let claim_at = job.job.attempted_at.unwrap_or(now);
+                let wait_secs = (claim_at - job.job.created_at).num_milliseconds() as f64 / 1000.0;
+                if wait_secs >= 0.0 {
+                    self.metrics.record_wait_duration(&self.queue, wait_secs);
                 }
             }
         }
