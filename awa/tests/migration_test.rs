@@ -1549,3 +1549,147 @@ async fn test_legacy_v3_only_upgrade() {
 
     migrations::run(&pool).await.unwrap();
 }
+
+/// Auto-finalize fast-path for fresh installs.
+///
+/// When state=canonical, prepared_engine=NULL, no canonical jobs ever, and
+/// no live workers, awa.storage_auto_finalize_if_fresh skips the staged
+/// transition and lands directly in active. This is the entry point that
+/// closes the 0.6 fresh-install UX gap (issue #197).
+#[tokio::test]
+async fn test_auto_finalize_promotes_fresh_install() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let baseline = storage::status(&pool).await.unwrap();
+    assert_eq!(baseline.state, "canonical");
+    assert_eq!(baseline.prepared_engine, None);
+
+    let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+        .bind("awa_exp")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(promoted, "fresh DB should promote on first call");
+
+    let after = storage::status(&pool).await.unwrap();
+    assert_eq!(after.state, "active");
+    assert_eq!(after.current_engine, "queue_storage");
+    assert_eq!(after.active_engine, "queue_storage");
+    assert_eq!(after.prepared_engine, None);
+    let auto_finalized = after
+        .details
+        .get("auto_finalized")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    assert!(
+        auto_finalized,
+        "auto_finalized=true should be in details: {:?}",
+        after.details
+    );
+
+    // Idempotent: second call from active state returns false.
+    let promoted_again: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+        .bind("awa_exp")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !promoted_again,
+        "auto-finalize from active should be a no-op"
+    );
+}
+
+/// Auto-finalize must refuse to skip the staged transition once any
+/// canonical work has touched the DB. Operators with existing 0.5.x
+/// data must go through prepare → enter-mixed-transition → finalize so
+/// canonical drain is observable.
+#[tokio::test]
+async fn test_auto_finalize_refuses_when_canonical_jobs_exist() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    sqlx::query(
+        "INSERT INTO awa.jobs_hot (kind, queue, args, state, priority) \
+         VALUES ('legacy_job', 'legacy_queue', '{}'::jsonb, 'completed', 2)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+        .bind("awa_exp")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(!promoted, "DB with canonical jobs should not auto-finalize");
+
+    let after = storage::status(&pool).await.unwrap();
+    assert_eq!(after.state, "canonical");
+}
+
+/// Auto-finalize must respect an in-progress staged transition. If an
+/// operator has already run `storage prepare`, the prepared_engine is
+/// set and auto-finalize must defer to the staged path.
+#[tokio::test]
+async fn test_auto_finalize_refuses_when_prepared_engine_is_set() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    storage::prepare(
+        &pool,
+        "queue_storage",
+        serde_json::json!({ "schema": "awa_exp" }),
+    )
+    .await
+    .unwrap();
+
+    let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+        .bind("awa_exp")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !promoted,
+        "DB with explicit prepared_engine should not auto-finalize"
+    );
+
+    let after = storage::status(&pool).await.unwrap();
+    assert_eq!(after.state, "prepared");
+    assert_eq!(after.prepared_engine.as_deref(), Some("queue_storage"));
+}
+
+/// Auto-finalize must refuse when a worker is already heartbeating;
+/// this prevents quietly skipping the canonical-drain interlock if a
+/// worker fleet is already live during what was thought to be a fresh
+/// install.
+#[tokio::test]
+async fn test_auto_finalize_refuses_when_runtime_is_live() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    insert_runtime_instance(&pool, "canonical").await;
+
+    let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+        .bind("awa_exp")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        !promoted,
+        "DB with live runtime instances should not auto-finalize"
+    );
+
+    let after = storage::status(&pool).await.unwrap();
+    assert_eq!(after.state, "canonical");
+}

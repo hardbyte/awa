@@ -899,6 +899,44 @@ impl Client {
                     }
                 }
 
+                // Fresh-install auto-finalize: state=canonical with no
+                // operator commands run yet means a brand-new cluster
+                // shouldn't have to step through prepare → enter-mixed-
+                // transition → finalize manually. Install the queue-
+                // storage schema (idempotent — concurrent workers are
+                // safe), then ask the SQL gate to advance state directly
+                // to `active` if the fresh-install conditions hold (no
+                // canonical jobs, no live workers, prepared_engine
+                // still NULL). Returns FALSE on any non-fresh DB; the
+                // caller then falls back to the canonical-storage path
+                // and the staged transition is unaffected.
+                if status.state == "canonical" && status.prepared_engine.is_none() {
+                    let configured_schema = runtime.store.schema().to_string();
+                    runtime.store.prepare_schema(&self.pool).await?;
+                    let promoted: bool =
+                        sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
+                            .bind(&configured_schema)
+                            .fetch_one(&self.pool)
+                            .await?;
+                    if promoted {
+                        return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
+                    }
+                    // Another worker promoted concurrently while we
+                    // were installing the schema — re-fetch and use
+                    // the now-current state.
+                    let refetched = transition::status(&self.pool).await?;
+                    if matches!(refetched.state.as_str(), "mixed_transition" | "active")
+                        && refetched.active_engine == "queue_storage"
+                    {
+                        return Ok(RuntimeStorage::QueueStorage(runtime.clone()));
+                    }
+                    // Function returned FALSE because conditions weren't
+                    // met (canonical jobs exist, or another runtime is
+                    // live but in canonical-only mode). Fall through to
+                    // the canonical path; operators will need the
+                    // staged transition.
+                }
+
                 if matches!(status.state.as_str(), "mixed_transition" | "active")
                     && status.active_engine == "queue_storage"
                 {

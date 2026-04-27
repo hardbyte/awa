@@ -390,33 +390,32 @@ The shape depends on whether you're doing a **fresh install** or
 
 ### Fresh install (no prior canonical data)
 
-The intended fresh-install experience is a single step:
-
 ```bash
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Start workers. queue-storage runs by default.
+# 2. Start workers (Rust or Python). queue-storage runs by default.
 ```
 
-**Current 0.6 caveat (release-readiness gap):** the `auto` worker
-role checks `awa.storage_status()` at startup and stays canonical
-unless `state ∈ {mixed_transition, active}` — even on a fresh DB
-where no canonical work exists. Until the auto-finalize path is
-implemented, fresh installs need the staged transition commands
-once at first install:
+That's the whole flow. The first worker that comes up in `auto` mode
+detects the DB is fresh — `state=canonical`, `prepared_engine=NULL`,
+no canonical jobs ever, no other live workers — and atomically
+installs the queue-storage schema and advances state directly to
+`active` via `awa.storage_auto_finalize_if_fresh()` (added in
+migration v012). Subsequent workers see `state=active` and run as
+queue-storage straight away.
 
-```bash
-# Run these once after the first `awa migrate`. Subsequent worker
-# starts pick up state=active automatically.
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
-awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
-awa --database-url "$DATABASE_URL" storage enter-mixed-transition
-awa --database-url "$DATABASE_URL" storage finalize
-```
+The auto-finalize fast-path **only** fires on a truly fresh DB. Any
+of these conditions disqualify it and force the operator down the
+staged `prepare → enter-mixed-transition → finalize` path:
 
-Tracking the auto-finalize UX gap in
-[issue #197](https://github.com/hardbyte/awa/issues/197).
+- canonical jobs exist in `awa.jobs` (even terminal-state)
+- `prepared_engine` is already set (operator started the staged path)
+- another runtime is heartbeating in `awa.runtime_instances`
+
+If you specifically want the staged path on a fresh cluster (e.g.,
+to rehearse the transition flow), insert one canonical job before
+starting any worker, then follow the upgrade-from-0.5.x path.
 
 ### Upgrading from `0.5.x`
 

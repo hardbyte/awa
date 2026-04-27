@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 11;
+pub const CURRENT_VERSION: i32 = 12;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -47,6 +47,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Queue storage compatibility layer and active backend selection",
         &[V11_UP],
     ),
+    (12, "Storage auto-finalize for fresh installs", &[V12_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -59,6 +60,7 @@ const V7_UP: &str = include_str!("../migrations/v007_backoff_interval_fix.sql");
 const V9_UP: &str = include_str!("../migrations/v009_descriptors.sql");
 const V10_UP: &str = include_str!("../migrations/v010_storage_transition_prep.sql");
 const V11_UP: &str = include_str!("../migrations/v011_queue_storage_compat.sql");
+const V12_UP: &str = include_str!("../migrations/v012_storage_auto_finalize.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

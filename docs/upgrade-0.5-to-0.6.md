@@ -6,15 +6,13 @@ explanation is in [migrations.md](migrations.md). This file is the
 short version: one-screen pre-flight, two phases, an explicit rollback
 boundary, and the health checks to run at each step.
 
-> **Fresh installs should not need this file.** A new cluster's
-> intended experience is `awa migrate` + start workers. A current 0.6
-> caveat means fresh installs run the same `prepare → enter-mixed-
-> transition → finalize` sequence once at first install (the `auto`
-> role does not yet auto-promote a fresh DB through to `active`); see
+> **Fresh installs do not need this file.** A new cluster runs
+> `awa migrate` and starts workers; the first worker auto-finalizes
+> via `awa.storage_auto_finalize_if_fresh()` (migration v012). See
 > migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data).
-> Tracking the auto-finalize gap in [issue #197](https://github.com/hardbyte/awa/issues/197).
-> This checklist proper is for **upgrading existing 0.5.x clusters**,
-> where canonical drain is unavoidable.
+> This checklist is for **upgrading existing 0.5.x clusters**, where
+> canonical drain is unavoidable and auto-finalize correctly defers to
+> the staged path.
 
 ## Pre-flight
 
