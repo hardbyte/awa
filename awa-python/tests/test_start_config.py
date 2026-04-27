@@ -460,3 +460,33 @@ async def test_install_queue_storage_rejected_while_runtime_is_running(client):
         await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
         await tx.execute(f"DROP SCHEMA IF EXISTS {schema}_other CASCADE")
         await tx.commit()
+
+
+@pytest.mark.asyncio
+async def test_queue_storage_claim_ring_knobs_validate(client):
+    """ADR-023 claim-ring sizing/cadence parameters reach the Rust binding.
+
+    Negative values for the new claim_slot_count / claim_rotate_interval_ms
+    knobs must be rejected before any partial worker setup runs. This is the
+    counterpart to the existing queue/lease validation; without this test, a
+    stub default could silently mask the parameter wiring breaking.
+    """
+    queue = "cfg_claim_ring_validation"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    with pytest.raises(ValueError, match="queue_storage_claim_slot_count must be > 0"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_claim_slot_count=0,
+        )
+
+    with pytest.raises(ValueError, match="queue_storage_claim_rotate_interval_ms must be > 0"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_claim_rotate_interval_ms=0,
+        )

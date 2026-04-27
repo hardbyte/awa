@@ -465,8 +465,10 @@ class Client:
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = 16,
         queue_storage_lease_slot_count: int = 8,
+        queue_storage_claim_slot_count: int = 8,
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 50,
+        queue_storage_claim_rotate_interval_ms: int | None = None,
         storage_transition_role: str | None = None,
     ) -> None: ...
     async def shutdown(self, timeout_ms: int = 2000) -> None: ...

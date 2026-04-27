@@ -31,6 +31,7 @@ T = TypeVar("T")
 DEFAULT_QUEUE_STORAGE_SCHEMA = "awa_exp"
 DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT = 16
 DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT = 8
+DEFAULT_QUEUE_STORAGE_CLAIM_SLOT_COUNT = 8
 
 
 class AsyncClient:
@@ -600,8 +601,10 @@ class AsyncClient:
         queue_storage_schema: str | None = None,
         queue_storage_queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
         queue_storage_lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
+        queue_storage_claim_slot_count: int = DEFAULT_QUEUE_STORAGE_CLAIM_SLOT_COUNT,
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 50,
+        queue_storage_claim_rotate_interval_ms: int | None = None,
         storage_transition_role: Literal[
             "auto", "canonical_drain", "queue_storage_target"
         ] = "auto",
@@ -648,8 +651,10 @@ class AsyncClient:
             queue_storage_schema=queue_storage_schema,
             queue_storage_queue_slot_count=queue_storage_queue_slot_count,
             queue_storage_lease_slot_count=queue_storage_lease_slot_count,
+            queue_storage_claim_slot_count=queue_storage_claim_slot_count,
             queue_storage_queue_rotate_interval_ms=queue_storage_queue_rotate_interval_ms,
             queue_storage_lease_rotate_interval_ms=queue_storage_lease_rotate_interval_ms,
+            queue_storage_claim_rotate_interval_ms=queue_storage_claim_rotate_interval_ms,
             storage_transition_role=storage_transition_role,
         )
 
