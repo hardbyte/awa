@@ -175,6 +175,20 @@ jobs:
           cargo test --package awa --test receipt_plane_regression_gate \
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-receipt-plane-regression-gate.txt
+      - name: Run real-PG-restart chaos
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          # Issue #197 release-readiness item: spins up a dedicated
+          # postgres container, drives a workload, runs `docker
+          # restart` mid-flight (real process death + restart, not
+          # `pg_terminate_backend` TCP drop), asserts every enqueued
+          # job survives the restart. Two scenarios cover queue_storage
+          # default and receipt_plane fast-path; canonical-engine
+          # connection-loss is already in chaos_suite_test.
+          cargo test --package awa --test pg_restart_chaos_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-pg-restart-chaos.txt
       - name: Run sustained deferred benchmark
         if: always()
         timeout-minutes: 15
