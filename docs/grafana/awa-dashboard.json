@@ -571,7 +571,7 @@
       "collapsed": false,
       "gridPos": {
         "x": 0,
-        "y": 25,
+        "y": 41,
         "w": 24,
         "h": 1
       },
@@ -583,7 +583,7 @@
           "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Healthy rings show non-zero `rotated` on a regular cadence; pinned rings dominate `skipped_busy`.",
           "gridPos": {
             "x": 0,
-            "y": 26,
+            "y": 42,
             "w": 12,
             "h": 8
           },
@@ -614,7 +614,7 @@
           "description": "When queue rotation is SkippedBusy, which side held it: ready_entries rows or done_entries rows on the next slot? `queue.ready_rows` dominating = producer faster than consumer (real backlog). `queue.done_rows` dominating = completion truncate falling behind.",
           "gridPos": {
             "x": 12,
-            "y": 26,
+            "y": 42,
             "w": 12,
             "h": 8
           },
@@ -645,7 +645,7 @@
           "description": "p95 row count seen at the blocker side when rotation is SkippedBusy. Distinguishes 'pinned by handful of stragglers' (transient race) from 'pinned by backlog mountain' (real saturation).",
           "gridPos": {
             "x": 0,
-            "y": 34,
+            "y": 50,
             "w": 12,
             "h": 8
           },
@@ -676,7 +676,7 @@
           "description": "Ring prune attempts/sec by outcome. `pruned` advancing = ring reclaiming partitions. `skipped_active` rising = target slot still has live state. `blocked` = lock contention (held-tx, autovacuum).",
           "gridPos": {
             "x": 12,
-            "y": 34,
+            "y": 50,
             "w": 12,
             "h": 8
           },
@@ -707,7 +707,7 @@
           "description": "When prune returns SkippedActive, which gate fired? `queue.active_leases` = leases on prior generation. `queue.pending_ready` = ready rows without matching done. `claim.open` = open receipt-plane claims. `lease.current`/`claim.current` = rotator race (benign if rare).",
           "gridPos": {
             "x": 0,
-            "y": 42,
+            "y": 58,
             "w": 12,
             "h": 8
           },
@@ -738,7 +738,7 @@
           "description": "Rate of ring generation advance. Headline 'is rotation working' signal \u2014 flat at zero with non-zero `skipped_busy` traffic above means the ring is pinned.",
           "gridPos": {
             "x": 12,
-            "y": 42,
+            "y": 58,
             "w": 12,
             "h": 8
           },
