@@ -390,31 +390,33 @@ The shape depends on whether you're doing a **fresh install** or
 
 ### Fresh install (no prior canonical data)
 
-A new cluster can install queue storage directly without going through
-the staged transition.
+The intended fresh-install experience is a single step:
 
 ```bash
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Materialize the queue-storage schema before workers start.
-#    Skipping this means the first worker pays the schema-install
-#    cost on its first claim attempt.
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
+# 2. Start workers. queue-storage runs by default.
+```
 
-# 3. Activate queue storage. Without prior canonical work, this can
-#    move directly to active without a mixed-transition phase.
+**Current 0.6 caveat (release-readiness gap):** the `auto` worker
+role checks `awa.storage_status()` at startup and stays canonical
+unless `state ∈ {mixed_transition, active}` — even on a fresh DB
+where no canonical work exists. Until the auto-finalize path is
+implemented, fresh installs need the staged transition commands
+once at first install:
+
+```bash
+# Run these once after the first `awa migrate`. Subsequent worker
+# starts pick up state=active automatically.
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
 awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
 awa --database-url "$DATABASE_URL" storage enter-mixed-transition
 awa --database-url "$DATABASE_URL" storage finalize
-
-# 4. Roll out workers (Rust or Python). Each runtime is queue-storage
-#    capable by default; transition_role="auto" follows storage_status.
-
-# 5. Verify routing + worker health
-awa --database-url "$DATABASE_URL" storage status
-awa --database-url "$DATABASE_URL" queue stats
 ```
+
+Tracking the auto-finalize UX gap in
+[issue #197](https://github.com/hardbyte/awa/issues/197).
 
 ### Upgrading from `0.5.x`
 
