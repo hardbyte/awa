@@ -15,11 +15,11 @@ onto the current Rust / SQL implementation.
 | TLA+ variable | Rust / SQL equivalent |
 |---|---|
 | `readyEntries` | `{schema}.ready_entries` parent partitioned table |
-| `deferredEntries` | `{schema}.deferred_entries` |
-| `waitingEntries` | `{schema}.waiting_entries` |
+| `deferredEntries` | `{schema}.deferred_jobs` |
+| `waitingLeases` | subset of `{schema}.leases` rows with `state = 'waiting_external'`; there is no waiting table |
 | `terminalEntries` | `{schema}.done_entries` (ADR-019 target name: `terminal_entries`) |
 | `dlqEntries` | `{schema}.dlq_entries` |
-| `activeLeases` | `{schema}.leases` (ADR-019: `active_leases`) |
+| `activeLeases` | live rows in `{schema}.leases`, including both `running` and `waiting_external` |
 | `attemptState` | `{schema}.attempt_state` |
 | `runLease[j]` | `run_lease` column on the lease/ready/deferred row |
 | `taskLease[w][j]` | `ctx.job.run_lease` snapshot captured at claim time in `awa-worker/src/executor.rs` |
@@ -43,32 +43,32 @@ for backfill / fallback reads during upgrades.
 | TLA+ action | Rust function | SQL / DDL |
 |---|---|---|
 | `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` (`queue_storage.rs:3470`); producer entry points are `enqueue_batch` / `enqueue_runtime_rows` (`:3937, 3965`) | `INSERT INTO {schema}.ready_entries ... UPSERT {schema}.queue_enqueue_heads` (single tx) |
-| `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` (`queue_storage.rs:3625`) | `INSERT INTO {schema}.deferred_entries ...` |
-| `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_state` | `DELETE FROM deferred_entries ... INSERT INTO ready_entries ...` in one tx |
+| `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` (`queue_storage.rs:3625`) | `INSERT INTO {schema}.deferred_jobs ...` |
+| `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_state` | `DELETE FROM deferred_jobs ... INSERT INTO ready_entries ...` in one tx |
 | `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside the inline claim CTE; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
 | `Claim(w, j)` | `QueueStorage::claim_runtime_batch` (`queue_storage.rs:4145`) → `claim_runtime_batch_with_aging_for_instance` (`:4504`) → dispatcher (`awa-worker/src/dispatcher.rs`) | inline claim CTE: lane selection via `FOR UPDATE OF queue_claim_heads SKIP LOCKED`; bare reads of `lease_ring_state` and `claim_ring_state` (no FOR SHARE/UPDATE — rotate's CAS UPDATE on `(current_slot, generation)` plus the partition busy-check provides the conflict detection); INSERT into `lease_claims_<claim_slot>` (receipts mode) or `leases_<lease_slot>` (legacy mode); UPDATE `queue_claim_heads` |
 | `MaterializeAttemptState(j)` | `QueueStorage::upsert_attempt_state_from_receipts_tx` (`queue_storage.rs:6243`) and `upsert_attempt_state_progress_from_receipts_tx` (`:6307`) | `INSERT INTO attempt_state ... ON CONFLICT (job_id, run_lease) DO NOTHING` |
 | `Heartbeat(j)` | `heartbeat_tick` in `awa-worker/src/heartbeat.rs` | `UPDATE leases SET heartbeat_at = now() WHERE job_id = $1 AND run_lease = $2` |
 | `LoseHeartbeat(j)` | implicit — time passes without a heartbeat UPDATE; maintenance rescue sees a stale cutoff | (no action in real code; represents age) |
 | `ProgressFlush(j)` | `QueueStorage::flush_progress` (`queue_storage.rs:7802`) | `UPDATE attempt_state SET progress = ... WHERE job_id = $1 AND run_lease = $2` guarded by running/waiting_external state |
-| `ParkToWaiting(w, j)` | `QueueStorage::enter_callback_wait` (`queue_storage.rs:7291`) from executor `WaitForCallback` | delete from leases, insert into waiting_entries, preserve attempt_state |
-| `ResumeWaitingToReady(j)` | admin / callback resume (lives in `awa-model/src/admin.rs:2695`) on callback success | `DELETE FROM waiting_entries`, `INSERT INTO ready_entries`, clear attempt_state |
-| `TimeoutWaitingToReady(j)` | maintenance callback rescue with attempts remaining (`awa-worker/src/maintenance.rs::rescue_expired_callbacks`) | rescue SQL with attempt increment |
-| `TimeoutWaitingToDlq(j)` | maintenance callback rescue with exhausted attempts | rescue SQL routes to `dlq_entries` instead of re-enqueue |
+| `ParkToWaiting(w, j)` | `QueueStorage::enter_callback_wait` (`queue_storage.rs:7291`) from executor `WaitForCallback` | `UPDATE leases SET state = 'waiting_external', heartbeat_at = NULL, deadline_at = NULL`; attempt_state is preserved |
+| `ResumeWaitingToRunning(j)` | `QueueStorage::complete_external(..., resume = true)` (`queue_storage.rs:7444`) | `UPDATE leases SET state = 'running', callback_id = NULL, callback_timeout_at = NULL, heartbeat_at = clock_timestamp()` plus callback result upsert in `attempt_state` |
+| `TimeoutWaitingToReady(j)` | maintenance callback rescue with attempts remaining (`awa-worker/src/maintenance.rs::rescue_expired_callbacks`) | delete the waiting lease and append a fresh `ready_entries` row |
+| `TimeoutWaitingToDlq(j)` | maintenance callback rescue with exhausted attempts | delete the waiting lease and insert `dlq_entries` |
 | `FastComplete(w, j)` | `QueueStorage::complete_runtime_batch` (`queue_storage.rs:4677`) short path (no attempt_state hydrate) | receipts mode: `INSERT INTO lease_claim_closures` (no `DELETE FROM leases`); legacy mode: `DELETE FROM leases` + `INSERT INTO done_entries` carrying the claim-time snapshot |
 | `StatefulComplete(w, j)` | `QueueStorage::complete_runtime_batch` + `DELETE FROM attempt_state` | same as above plus `DELETE FROM attempt_state` |
 | `FailToDlq(w, j)` | `QueueStorage::fail_to_dlq` (`queue_storage.rs:8088`) / `fail_terminal` (`:8055`) via executor terminal failure path | `DELETE FROM leases`, `DELETE FROM attempt_state`, `INSERT INTO dlq_entries` in one tx |
-| `RetryToDeferred(w, j)` | `QueueStorage::retry_after` (`queue_storage.rs:7945`) / `snooze` (`:7981`) on `JobError::RetryAfter` / `Snooze` | `DELETE FROM leases`, `INSERT INTO deferred_entries` |
+| `RetryToDeferred(w, j)` | `QueueStorage::retry_after` (`queue_storage.rs:7945`) / `snooze` (`:7981`) on `JobError::RetryAfter` / `Snooze` | `DELETE FROM leases`, `INSERT INTO deferred_jobs` |
 | `RescueToReady(j)` | `rescue_stale_heartbeats` (`queue_storage.rs:8575`) / `rescue_expired_deadlines` (`:8688`) in maintenance | `DELETE FROM leases ... RETURNING ...; INSERT INTO ready_entries ...` |
-| `CancelWaitingToTerminal(j)` | admin cancel path in `awa-model/src/admin.rs` for a waiting job; receipt-only and running-lease branches in `cancel_job_tx` (`queue_storage.rs:5501`) | waiting branch: `DELETE FROM waiting_entries` + `INSERT INTO done_entries` with cancel reason. See also `CancelRunningToTerminal`, `CancelReceiptOnlyToTerminal` for the running-job branches. |
+| `CancelWaitingToTerminal(j)` | waiting branch in `cancel_job_tx` (`queue_storage.rs:5501`) | `DELETE FROM leases WHERE state IN ('running', 'waiting_external')`, hydrate from `ready_entries`, insert `done_entries`, close the matching receipt |
 | `StaleCompleteRejected(w, j)` | `complete_runtime_batch` returning `CompletionOutcome::IgnoredStale` | `UPDATE leases ... WHERE run_lease = $2` matching 0 rows |
 | `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (`queue_storage.rs:8127`); admin entry in `awa-model/src/dlq.rs:170` | `DELETE FROM done_entries ... INSERT INTO dlq_entries ...` guarded by state=failed |
 | `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:8254`) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` with `run_lease = 0`; unique-conflict handled by `sync_unique_claim` |
 | `PurgeDlq(j)` | `purge_dlq_job` / `purge_dlq` in `awa-model/src/dlq.rs:382, 423` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
-| `RotateDeferredSegments` / `RotateWaitingSegments` / `RotateLeaseSegments` / `RotateDlqSegments` | parallel maintenance rotate functions per family | analogous `UPDATE *_ring_state` |
+| `RotateLeaseSegments` | `QueueStorage::rotate_leases` | `UPDATE lease_ring_state` with child-partition busy check |
 | `PruneReadySegment(seg)` | maintenance `prune_oldest` for the ready family (`queue_storage.rs:9080`) | `FOR UPDATE` on `queue_ring_state` and `queue_ring_slots[slot]`, then `LOCK TABLE ... ACCESS EXCLUSIVE`, recheck active rows, then `TRUNCATE`; Rust also updates `{schema}.queue_terminal_rollups` after a successful terminal-segment prune |
-| `PruneDeferredSegment` / `PruneWaitingSegment` / `PruneLeaseSegment` / `PruneDlqSegment` | parallel prune paths per family (lease prune at `queue_storage.rs:9208`) | `TRUNCATE {schema}.X_segment_N` with active-row check |
+| `PruneLeaseSegment` | `QueueStorage::prune_oldest_leases` (`queue_storage.rs:9208`) | `TRUNCATE` the selected `leases_N` child only after active-row checks |
 | `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`queue_storage.rs:9333`), wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `FOR UPDATE` on `claim_ring_state`, busy-check both child partitions, then `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
 | `PruneClaimSegment(seg)` | `QueueStorage::prune_oldest_claims` (`queue_storage.rs:9433`) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `SET LOCAL lock_timeout = '50ms'`, `LOCK TABLE` `lease_claims_N` and `lease_claim_closures_N` `IN ACCESS EXCLUSIVE MODE`, recheck not-current, anti-join check that every claim has a closure (`PartitionTruncateSafety`), then `TRUNCATE` both children |
 | `RescueStaleReceipt(j)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` so the lease-side rescue path owns those. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
@@ -80,20 +80,52 @@ for backfill / fallback reads during upgrades.
 | TLA+ invariant | Rust enforcement |
 |---|---|
 | `ActiveLeasesSubsetReadyEntries` | every `leases` row FK-references `ready_entries(queue, priority, lane_seq)` (check the CREATE TABLE DDL in the `install` fn) |
-| `WaitingHasNoLiveLease` | `wait_external` path deletes the lease before inserting into waiting_entries |
-| `AttemptStateRequiresLeaseOrWaiting` | `attempt_state` is only upserted inside `upsert_attempt_state` which asserts the lease/waiting row exists |
-| `FreshHeartbeatRequiresLease` | `heartbeat_at` is a column on `leases`; once the lease row is deleted (retry/complete/rescue/park), the heartbeat is gone too |
+| `WaitingIsLeaseState` | `waiting_external` is represented by a row in `leases`, not by a separate waiting table |
+| `AttemptStateRequiresLiveLease` | callback/progress attempt state is associated with a live lease row and is deleted on terminal/retry/rescue paths |
+| `FreshHeartbeatRequiresLease` | `heartbeat_at` is a column on `leases`; `enter_callback_wait` clears it for waiting leases |
 | `TerminalHasNoLiveRuntime` | `complete_runtime_batch` / `fail_to_dlq` clear every other family in the same tx before inserting terminal/dlq |
 | `DlqHasNoLiveRuntime` | same, for dlq path |
 | `DlqAndTerminalDisjoint` | `move_failed_to_dlq` uses `DELETE FROM done_entries ... RETURNING` then `INSERT INTO dlq_entries` in one tx; no intermediate state where both hold the same job_id |
 | `StaleCompleteRejected` precondition | `WHERE run_lease = $2 AND state = 'running'` clauses on every completion UPDATE |
 | `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
-| `PrunedXSegmentsAreEmpty` | per-family prune requires no live-row precondition before TRUNCATE |
+| `PrunedXSegmentsAreEmpty` | ready, lease, terminal, and claim prune require no-live-row preconditions before TRUNCATE; `deferred_jobs` and `dlq_entries` are unpartitioned backlog row-vacuum tables and are covered by `AwaDeadTupleContract` |
 | `PrunedClaimSegmentsAreEmpty` (ADR-023) | `prune_oldest_claims` requires no open claim in the partition before TRUNCATE; rescue-before-truncate closes stragglers in the same transaction |
 | `NoLostClaim` (ADR-023) | receipts and their closures both live in `claim_slot`-partitioned tables; partitions only truncate once all their receipts are closed, so no open claim is physically dropped |
 | `ClaimOpenAndClosedDisjoint` (ADR-023) | closure insertion and receipt-clearing are a single transaction; a partition's receipt+closure pair is either both present or both dropped by `TRUNCATE` |
 | `LaneStateConsistent` | live availability is derived from `{schema}.ready_entries` plus `{schema}.queue_claim_heads`; completed totals are *not* maintained as hot counters. Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
+
+## Storage-transition model mapping
+
+`AwaStorageTransition.tla` maps to the transition SQL in
+`awa-model/migrations/v010_storage_transition_prep.sql` and
+`awa-model/migrations/v011_queue_storage_compat.sql`, plus the worker
+role/effective-storage resolution in `awa-worker/src/client.rs`.
+
+| TLA+ variable / action | Rust / SQL equivalent |
+|---|---|
+| `state`, `currentEngine`, `preparedEngine` | `awa.storage_transition_state.state`, `current_engine`, `prepared_engine` |
+| `preparedSchemaReady` | `queue_storage_schema_ready()` / SQL checks for `{schema}.queue_ring_state`, `ready_entries`, and `leases` |
+| `oldCanonicalLive` | live `awa.runtime_instances` rows with `storage_capability = 'canonical'` |
+| `autoPreMixedLive` | a 0.6 `TransitionWorkerRole::Auto` runtime that resolved effective storage to canonical before mixed transition; it reports `queue_storage` while prepared and `canonical_drain_only` once routing flips |
+| `queueTargetLive` | `TransitionWorkerRole::QueueStorageTarget`; the only modeled runtime population that can execute queue-storage work immediately after mixed transition |
+| `canonicalBacklog` | `awa.canonical_live_backlog()` over `jobs_hot` and `scheduled_jobs` |
+| `queueRows` | queue-storage row existence checks in `storage_abort()` across `ready_entries`, `deferred_jobs`, `leases`, `attempt_state`, `done_entries`, and `dlq_entries` |
+| `PrepareQueueStorage` | `awa.storage_prepare('queue_storage', details)` |
+| `PrepareSchema` | `QueueStorage::prepare_schema()` plus transition details naming the schema |
+| `EnterMixedTransition` | `awa.storage_enter_mixed_transition()` and insertion of `runtime_storage_backends('queue_storage', schema)` |
+| `ProducerEnqueueCanonical` | `insert_job_compat()` path before `active_queue_storage_schema()` is set |
+| `ProducerEnqueueQueueStorage` | `insert_job_compat()` path after mixed transition activates the queue-storage backend |
+| `DrainCanonical` | canonical-drain workers continuing to complete `jobs_hot` / `scheduled_jobs` backlog |
+| `Finalize` | `awa.storage_finalize()`: requires `canonical_live_backlog() = 0` and no live `canonical` / `canonical_drain_only` runtimes |
+| `AbortMixed` | `awa.storage_abort()`: rejects rollback while live `queue_storage` runtimes or queue-storage rows exist |
+
+The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property,
+not a permanent liveness invariant: a queue-storage target can stop after the
+transition. The current SQL gate checks `storage_capability = 'queue_storage'`,
+which is enough to prove queue-storage capability but not enough to prove that
+the live runtime is an explicit queue-storage executor. The
+`AwaStorageTransitionCurrentGate.cfg` witness captures that gap.
 
 ## Local runtime note
 
@@ -253,6 +285,15 @@ optionally a retry-from-deferred or retry-from-dlq round trip.
   PromoteDeferred → Claim → FastComplete. Accepts cleanly with 7
   states (1 init + 6 steps). Transcribed from
   `test_queue_storage_runtime_snooze`.
+- `ReceiptRescueTrace`: 3 events — EnqueueReady →
+  SeedOpenReceiptOnlyClaim → RescueStaleReceipt. Accepts cleanly with
+  4 states. `SeedOpenReceiptOnlyClaim` is trace-only scaffolding for
+  the implementation's receipt-only window before lease materialization;
+  the base storage spec's `Claim` action materializes a lease immediately.
+- `RunningCancelTrace`: 3 events — EnqueueReady → Claim →
+  CancelRunningToTerminal. Accepts cleanly with 4 states.
+- `DlqRetryTrace`: 6 events — EnqueueReady → Claim → FailToDlq →
+  RetryFromDlq → Claim → FastComplete. Accepts cleanly with 7 states.
 - `BrokenTrace`: same 6 events but with steps 3 and 4 swapped so
   PromoteDeferred fires before RetryToDeferred. TLC reports deadlock
   at traceIdx = 2 (after EnqueueReady + Claim, before the
@@ -303,10 +344,11 @@ the base spec and the race / lock specs:
   Attempt-ending transitions (`FastComplete`, `StatefulComplete`,
   `FailToDlq`, `RetryToDeferred`, `RescueToReady`,
   `CancelWaitingToTerminal`, `TimeoutWaitingToDlq`,
-  `TimeoutWaitingToReady`, `ResumeWaitingToReady`) append a closure row
+  `TimeoutWaitingToReady`) append a closure row
   in the same partition.
 - `ParkToWaiting` does NOT close the receipt — the attempt is still
-  alive in callback wait; resume/timeout/cancel close it.
+  alive in callback wait. `ResumeWaitingToRunning` keeps the same receipt
+  open; timeout/cancel/terminal resolution close it.
 - `RescueStaleReceipt(j)` models Tier-A receipt rescue: force-close a
   straggler receipt whose attempt is no longer on the ready / leased /
   waiting lifecycle. This is the rescue-before-truncate precondition
@@ -337,12 +379,12 @@ Invariants added:
 
 Model checking results:
 
-- `AwaSegmentedStorage.cfg`: 2,326,528 distinct states, clean. Admin
+- `AwaSegmentedStorage.cfg`: 33,152 distinct states, clean. Admin
   cancel actions (`CancelRunningToTerminal`,
   `CancelReceiptOnlyToTerminal`) clear all workers' `taskLease`
   snapshots since admin cancel has no worker context, preserving
   `TaskLeaseBounded`.
-- `AwaSegmentedStorageInterleavings.cfg` (2 workers): 4.7M distinct
+- `AwaSegmentedStorageInterleavings.cfg` (2 workers): 74,432 distinct
   states, clean.
 - `AwaSegmentedStorageTrace.cfg`: snooze trace accepted cleanly.
 - `AwaSegmentedStorageTraceBroken.cfg`: broken trace rejected with the
@@ -361,10 +403,12 @@ Model checking results:
   `CancelReceiptOnlyPlan`, and `CancelRunningPlan`.
 - `AwaStorageLockOrderDeadlockDemo.cfg`: trips `NoDeadlock` in 5
   steps, confirming the detector works.
-- `AwaDeadTupleContract.cfg`: 1 distinct state, clean. The six
+- `AwaDeadTupleContract.cfg`: 1 distinct state, clean. The
   ASSUME-style architectural-contract checks
   (`HotTablesAreNotRowVacuum`, `PartitionTruncateTablesAreReclaimed`,
-  `WarmTablesDocumentTheirBound`, `OnlyWarmTablesHaveBoundedBy`,
+  `WarmTablesDocumentTheirBound`,
+  `BacklogRowVacuumTablesDocumentTheirBound`,
+  `OnlyBoundedKindsHaveBoundedBy`,
   `AppendOnlyAcceptsOnlyInsert`, `VacuumKindTablesNotTruncated`) all
   hold for the current schema and transaction list. Workflow: when
   adding a new table to `prepare_schema()` or a new SQL site to

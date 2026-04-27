@@ -20,6 +20,11 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 \*        `bounded_by` field naming what bounds the row count.
 \*      `RowVacuum` — autovacuum reclaims dead tuples on a low-
 \*        mutation-rate cold table. Storage-side metadata only.
+\*      `BacklogRowVacuum` — autovacuum reclaims dead tuples on an
+\*        unpartitioned backlog/retention table whose live row count is
+\*        workload- or operator-policy-bounded rather than structurally
+\*        constant. This is not a formal bounded-dead-tuple proof; it is
+\*        a declaration that the release gate must use runtime bench data.
 \*      `AppendOnly` — never reclaimed; archive / audit shape.
 \*
 \*   2. Hot tables MUST NOT be `RowVacuum`. Either they grow with
@@ -62,7 +67,7 @@ EXTENDS TLC, FiniteSets, Sequences, Naturals
 
 \* ---- Reclaim kinds and operations ----
 
-ReclaimKinds == {"PartitionTruncate", "Warm", "RowVacuum", "AppendOnly"}
+ReclaimKinds == {"PartitionTruncate", "Warm", "BacklogRowVacuum", "RowVacuum", "AppendOnly"}
 Hotness == {"hot", "cold"}
 Operations == {"Insert", "Update", "Delete", "Truncate"}
 
@@ -97,14 +102,19 @@ TableSpec == [
     lease_claims           |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
     lease_claim_closures   |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
 
-    \* ---- Hot path, partitioned but lower volume ----
-    \* deferred_jobs / waiting_state / dlq_entries are partitioned
-    \* but only see traffic on the slow paths (snooze, callback,
-    \* terminal failure). Still PartitionTruncate so traffic-driven
-    \* growth is bounded.
-    deferred_jobs          |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
-    waiting_entries        |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
-    dlq_entries            |-> [kind |-> "PartitionTruncate", hot |-> "hot", bounded_by |-> ""],
+    \* ---- Backlog / retention tables ----
+    \* deferred_jobs and dlq_entries are unpartitioned in the current Rust
+    \* schema. They are reclaimed by row-level DELETE + autovacuum, not by
+    \* partition TRUNCATE. Their live rows are bounded by backlog/retention
+    \* policy rather than by a traffic-independent constant, so the static
+    \* contract cannot prove them bounded; the release gate must verify dead
+    \* tuple behavior with the long-horizon bench harness.
+    deferred_jobs |->
+        [kind |-> "BacklogRowVacuum", hot |-> "hot",
+         bounded_by |-> "scheduled_retry_backlog_and_promotion_rate"],
+    dlq_entries |->
+        [kind |-> "BacklogRowVacuum", hot |-> "hot",
+         bounded_by |-> "dlq_retention_policy_and_operator_drain_rate"],
 
     \* ---- Warm: hot mutation rate, bounded live row count ----
     \* These tables receive UPDATEs at traffic rate but their LIVE
@@ -265,6 +275,52 @@ RetryToDeferredTx == <<
     Mut("Insert", "deferred_jobs")
 >>
 
+\* promote_due_state — DELETE deferred_jobs, INSERT ready_entries
+PromoteDeferredTx == <<
+    Mut("Delete", "deferred_jobs"),
+    Mut("Insert", "ready_entries")
+>>
+
+\* enter_callback_wait — waiting_external is a state on the leases row.
+EnterCallbackWaitTx == <<
+    Mut("Update", "leases")
+>>
+
+\* complete_external(..., resume=true) — resume waiting_external to running
+\* and store the callback result on attempt_state.
+ResumeWaitingTx == <<
+    Mut("Update", "leases"),
+    Mut("Insert", "attempt_state"),
+    Mut("Update", "attempt_state")
+>>
+
+\* complete_external / fail_external — terminal callback resolution.
+ResolveExternalTerminalTx == <<
+    Mut("Delete", "leases"),
+    Mut("Insert", "done_entries")
+>>
+
+\* retry_external — delete the waiting lease and park in deferred_jobs.
+RetryExternalTx == <<
+    Mut("Delete", "leases"),
+    Mut("Insert", "deferred_jobs")
+>>
+
+\* DLQ admin lifecycle.
+MoveFailedToDlqTx == <<
+    Mut("Delete", "done_entries"),
+    Mut("Insert", "dlq_entries")
+>>
+
+RetryFromDlqTx == <<
+    Mut("Delete", "dlq_entries"),
+    Mut("Insert", "ready_entries")
+>>
+
+PurgeDlqTx == <<
+    Mut("Delete", "dlq_entries")
+>>
+
 \* Heartbeat — UPDATE leases SET heartbeat_at = now()
 \* Receipts-mode short jobs don't materialize a lease, so no UPDATE
 \* fires for them. Legacy-mode and long-running receipts both go
@@ -302,26 +358,18 @@ PruneClaimsTx  == <<
     Mut("Truncate", "lease_claim_closures")
 >>
 
-\* Hot tables `deferred_jobs`, `waiting_entries`, `dlq_entries` also
-\* need TRUNCATE registered to satisfy
-\* `PartitionTruncateTablesAreReclaimed`. These run at the same
-\* maintenance cadence as the others; modelled as bare prune
-\* transactions for the contract check.
-PruneDeferredTx == << Mut("Truncate", "deferred_jobs") >>
-PruneWaitingTx  == << Mut("Truncate", "waiting_entries") >>
-PruneDlqTx      == << Mut("Truncate", "dlq_entries") >>
-
 Transactions == {
     ClaimReceiptsTx, ClaimLegacyTx,
     CompleteReceiptsTx, CompleteLegacyTx,
     CloseReceiptTx, RescueReceiptsTx, EnsureRunningTx,
     CancelReceiptOnlyTx, CancelRunningTx,
-    FailToDlqTx, RetryToDeferredTx,
+    FailToDlqTx, RetryToDeferredTx, PromoteDeferredTx,
+    EnterCallbackWaitTx, ResumeWaitingTx, ResolveExternalTerminalTx,
+    RetryExternalTx, MoveFailedToDlqTx, RetryFromDlqTx, PurgeDlqTx,
     HeartbeatTx, ProgressFlushTx,
     RotateLeasesTx, PruneLeasesTx,
     RotateReadyTx, PruneReadyTx,
-    RotateClaimsTx, PruneClaimsTx,
-    PruneDeferredTx, PruneWaitingTx, PruneDlqTx
+    RotateClaimsTx, PruneClaimsTx
 }
 
 \* ---- Invariants ----
@@ -340,7 +388,7 @@ Transactions == {
 HotTablesAreNotRowVacuum ==
     \A t \in Tables :
         TableSpec[t].hot = "hot" =>
-            TableSpec[t].kind \in {"PartitionTruncate", "Warm"}
+            TableSpec[t].kind \in {"PartitionTruncate", "Warm", "BacklogRowVacuum"}
 
 \* Every PartitionTruncate table must have at least one transaction
 \* registered that performs `Truncate` on it. A PartitionTruncate
@@ -367,13 +415,18 @@ WarmTablesDocumentTheirBound ==
         TableSpec[t].kind = "Warm" =>
             (TableSpec[t].hot = "hot" /\ TableSpec[t].bounded_by # "")
 
+BacklogRowVacuumTablesDocumentTheirBound ==
+    \A t \in Tables :
+        TableSpec[t].kind = "BacklogRowVacuum" =>
+            (TableSpec[t].hot = "hot" /\ TableSpec[t].bounded_by # "")
+
 \* Conversely, only Warm tables may declare a `bounded_by`. The
 \* field is dead weight on every other kind, and a non-empty
 \* `bounded_by` on a non-Warm row is a hint that the operator
 \* meant Warm.
-OnlyWarmTablesHaveBoundedBy ==
+OnlyBoundedKindsHaveBoundedBy ==
     \A t \in Tables :
-        TableSpec[t].kind # "Warm" =>
+        TableSpec[t].kind \notin {"Warm", "BacklogRowVacuum"} =>
             TableSpec[t].bounded_by = ""
 
 \* AppendOnly tables forbid mutation. Insert is fine; Update and
@@ -394,7 +447,7 @@ AppendOnlyAcceptsOnlyInsert ==
 VacuumKindTablesNotTruncated ==
     \A tx \in Transactions :
         \A i \in 1..Len(tx) :
-            TableSpec[tx[i].table].kind \in {"RowVacuum", "Warm"} =>
+            TableSpec[tx[i].table].kind \in {"RowVacuum", "Warm", "BacklogRowVacuum"} =>
                 tx[i].op # "Truncate"
 
 \* ---- Spec wiring ----
@@ -411,7 +464,8 @@ VacuumKindTablesNotTruncated ==
 ASSUME HotTablesAreNotRowVacuum
 ASSUME PartitionTruncateTablesAreReclaimed
 ASSUME WarmTablesDocumentTheirBound
-ASSUME OnlyWarmTablesHaveBoundedBy
+ASSUME BacklogRowVacuumTablesDocumentTheirBound
+ASSUME OnlyBoundedKindsHaveBoundedBy
 ASSUME AppendOnlyAcceptsOnlyInsert
 ASSUME VacuumKindTablesNotTruncated
 

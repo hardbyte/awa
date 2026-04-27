@@ -1,11 +1,32 @@
-# Bounded Claimers Per Queue Plan
+# Bounded Claimers Per Queue
 
-> **Status: shipped (current design).** Bounded claimers are live in
-> 0.6 — `QueueConfig::max_claimers` plus the `queue_claimer_state` /
-> `queue_claimer_leases` tables coordinate which replicas may actively
-> claim from a queue at any moment. The
-> `test_queue_storage_bounded_claimers_*` runtime tests exercise the
-> behaviour. This doc remains as the design rationale.
+> **Status: shipped as internal 0.6 queue-storage claim control.** The
+> release shape uses `queue_claimer_state` / `queue_claimer_leases` inside
+> the queue-storage engine to bound and adapt the number of active claimers
+> per hot queue. There is no public `QueueConfig::max_claimers` knob in the
+> 0.6 API; the dispatcher currently uses internal constants
+> (`MAX_CLAIMERS_PER_QUEUE = 4`, short lease/idle windows) and tests exercise
+> the storage-level lease behavior. The planning notes below are retained as
+> rationale and experiment history.
+
+## Release shape
+
+Bounded claimers are a queue-level claim-authority control plane:
+
+- Jobs still move directly from `ready_entries` to the existing receipt/lease
+  execution path; there is no reservation or pre-start job state.
+- At most a bounded number of runtime instances actively hit a hot queue's
+  claim path at one time.
+- Claim authority is time-bounded and can be reacquired or stolen when idle.
+- A shared `queue_claimer_state` target lets the runtime expand active claimers
+  when queue pressure proves one claimer is not enough, then contract toward
+  the cheap path when pressure falls.
+- Claimer ownership never owns jobs. If a claimer process dies, already-claimed
+  attempts are recovered by the existing receipt / lease rescue paths.
+
+This mechanism is complementary to queue striping. Bounded claimers reduce
+cross-replica contention; striping reduces the amount of work funneled through
+one physical queue coordination path.
 
 ## Why this exists
 
@@ -17,8 +38,8 @@ The queue-storage engine is now in a good place for:
 - low hot-path dead tuples
 - single large runtime shapes like `1x32`
 
-The remaining blocker for `0.6` is the realistic many-small-replica shape on
-one hot queue:
+The investigation focused on the realistic many-small-replica shape on one
+hot queue:
 
 - `2x16`
 - `4x8`
@@ -39,9 +60,9 @@ The common failure mode is now clear:
 - any design that lies about `running_depth` or starts rescue semantics early
   is unacceptable even if it benchmarks well
 
-So the next proposal is to reduce many-small-replica contention by limiting
-**how many replicas are allowed to claim from a queue at once**, while keeping
-job lifecycle semantics unchanged.
+The proposal that shipped in simplified/internal form reduces
+many-small-replica contention by limiting **how many replicas are allowed to
+claim from a queue at once**, while keeping job lifecycle semantics unchanged.
 
 ## Design summary
 
@@ -83,7 +104,7 @@ That preserves:
 - no early rescue clock
 - no second promotion transaction
 
-## Design goals
+## Historical Design Goals
 
 This design should:
 
@@ -94,7 +115,7 @@ This design should:
 - prefer strong fairness over time, not globally optimal fairness on every
   single claim
 
-## Non-goals
+## Historical Non-goals
 
 This design should **not**:
 
@@ -529,7 +550,7 @@ These are the non-negotiables.
 10. Contraction is safe because allowing a claimer lease to expire does not
     revoke already-claimed jobs.
 
-## Measurement plan
+## Historical Measurement Plan
 
 This should be judged with the realistic gate, not the direct burst benchmark.
 
@@ -641,7 +662,7 @@ Especially for:
 That will tell us whether the new engine is now good enough in the deployment
 shape that still blocks shipping confidence.
 
-## Implementation phases
+## Historical Implementation Phases
 
 ### Phase 1: schema and config
 

@@ -87,6 +87,27 @@ truth when this overview needs more detail.
 - maintenance leader: promotion, rescue, rotation, prune, DLQ retention, and
   queue-health publication
 
+### Queue Striping and Claim Authority
+
+Two 0.6 control mechanisms keep hot logical queues from turning into one
+coordination point for every replica:
+
+- **Queue striping** is optional and static. `QueueStorageConfig::queue_stripe_count`
+  defaults to `1`; setting it above `1` maps a logical queue to internal
+  physical queues named `queue#0`, `queue#1`, and so on. Enqueue chooses one
+  stripe, while claim probes stripes cyclically from a per-runtime hint. Admin
+  and metrics surfaces should continue to reason in terms of the logical queue,
+  with stripe names reserved for diagnosis.
+- **Bounded claimers** are internal claim-authority control. The
+  `queue_claimer_state` and `queue_claimer_leases` tables limit how many
+  runtime instances actively claim from a hot queue at one time. Ownership is
+  time-bounded, can be stolen when idle, and never owns jobs; already-claimed
+  work is still recovered through the normal receipt / lease rescue paths.
+
+These mechanisms do not change the job lifecycle. They only decide which
+coordination path receives a ready row and which runtime instances are allowed
+to hit the claim path concurrently.
+
 ## Control-plane descriptors
 
 Awa keeps two operator-facing descriptor catalogs, distinct from per-job payload metadata:

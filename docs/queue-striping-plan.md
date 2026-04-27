@@ -1,11 +1,34 @@
-# Queue Striping Plan
+# Queue Striping
 
-> **Status: shipped (current design).** Queue striping is in production
-> in 0.6 — `QueueStorageConfig::queue_stripe_count` plus the `queue#N`
-> stripe naming routes a logical queue across multiple physical
-> coordination paths. This doc remains as the design rationale; the
-> implementation lives in `awa-model/src/queue_storage.rs` (search for
-> `queue_stripe_count`).
+> **Status: shipped as an optional 0.6 queue-storage mode.** The release
+> shape is static striping via `QueueStorageConfig::queue_stripe_count`
+> (default `1`, disabled). Physical stripe queues use the internal
+> `queue#N` naming convention; users still configure and observe the
+> logical queue. The dynamic striping controller experiments below were
+> not kept for 0.6.
+
+## Release shape
+
+Queue striping is now a queue-storage tuning knob, not a separate engine.
+
+- Default: `queue_stripe_count = 1`, preserving the unstriped path.
+- Hot-queue candidate: `queue_stripe_count = 2` based on the best measured
+  `4x8` results in this investigation.
+- Higher stripe counts are not generally recommended from the current data:
+  `4` helped some pressure phases but hurt other shapes, and `8` regressed.
+- Enqueue chooses one physical stripe deterministically. Unique-keyed jobs hash
+  by `unique_key`; otherwise the insert sequence/salt spreads work.
+- Claim probes the physical stripes cyclically from a per-runtime round-robin
+  hint.
+- Stats aggregate back to the logical queue; stripe names are an internal
+  diagnostic surface.
+- Maintenance rotates/prunes the existing queue-storage table families; striping
+  does not add a new job lifecycle state.
+
+The implementation lives in `awa-model/src/queue_storage.rs` (search for
+`queue_stripe_count`). Operator-facing configuration is documented in
+[`configuration.md`](configuration.md#queue-storage-tuning), and the runtime
+architecture is summarized in [`architecture.md`](architecture.md#queue-striping-and-claim-authority).
 
 ## Why this exists
 
@@ -80,7 +103,7 @@ ready -> active_receipt -> attempt_state -> active_lease
 
 The only change is that one hot logical queue no longer funnels every claimer through one coordination path.
 
-## Goals
+## Historical Design Goals
 
 Queue striping should:
 
@@ -93,7 +116,7 @@ Queue striping should:
 - avoid a second start transaction
 - remain compatible with bounded claimers as a later or optional enhancement
 
-## Non-goals
+## Historical Non-goals
 
 Queue striping should **not**:
 
@@ -232,7 +255,9 @@ Global fairness is approximate, but claim-time aging should still guarantee even
 
 ## Operational model
 
-The first implementation should treat striping as an internal engine mode for experimentation.
+The first implementation treated striping as an internal engine mode for
+experimentation. In the release shape, static striping remains optional and
+off by default.
 
 That means:
 
@@ -240,13 +265,14 @@ That means:
 - metrics and admin views still show one logical queue
 - stripe breakdown is available for debugging/benchmarking
 
-Later we can decide whether the final product shape is:
+The investigated product shapes were:
 
 - always-on striping
 - automatic striping for hot queues
 - or a visible queue-level policy
 
-That decision should come **after** measurement.
+Measurement selected static optional striping for 0.6; the dynamic controller
+experiment below was not kept.
 
 ## Observability
 
@@ -276,7 +302,7 @@ Important metrics:
 6. Queue striping must not change the at-least-once contract.
 7. Queue striping must not reintroduce a new hot mutable jobs table.
 
-## Measurement plan
+## Historical Measurement Plan
 
 This should be judged against the current `4x8` blocker.
 
@@ -341,7 +367,7 @@ Especially at:
 - `1x32`
 - `4x8`
 
-## Implementation phases
+## Historical Implementation Phases
 
 ### Phase 1: queue identity and enqueue
 

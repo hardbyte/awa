@@ -169,7 +169,7 @@ ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
 \* complete_runtime_batch receipt branch (ADR-023)
 \*   No queue_lanes lock (completion does not gate on a lane row)
 \*   INSERT INTO lease_claim_closures (routed to the originating claim_slot)
-\*   INSERT INTO done_entries / dlq_entries / deferred_entries
+\*   INSERT INTO done_entries / dlq_entries / deferred_jobs
 CompletePlan(claimSlot, readySlot) ==
     << Step(ClosureChildResource(claimSlot), ModeShared),
        Step(DoneChildResource(readySlot), ModeShared) >>

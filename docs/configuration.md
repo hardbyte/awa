@@ -172,6 +172,7 @@ let client = Client::builder(pool.clone())
             queue_slot_count: 16,
             lease_slot_count: 8,
             claim_slot_count: 8,
+            queue_stripe_count: 1,
             ..Default::default()
         },
         Duration::from_millis(1_000),
@@ -203,15 +204,16 @@ await client.start(
 | `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
+| `queue_stripe_count` | `1` | Rust `QueueStorageConfig` only in the current API. Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current release-shape candidate; higher values should be benchmarked before use. |
 | `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Set to `false` to force every claim through the legacy `leases` materialization path. The default flipped from `false` to `true` in 0.6 — see ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Tests that pin claim-ring layout for a deterministic count assertion can push this past their wall-clock window (see `queue_storage_runtime_test.rs::queue_storage_client` helper). |
 
-The corresponding env vars (`QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`,
-`CLAIM_SLOT_COUNT`, `LEASE_CLAIM_RECEIPTS`) override the same fields
-when set; useful for benchmark adapters that pull configuration
-from the environment.
+The portable benchmark adapters also read `QUEUE_SLOT_COUNT`,
+`LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and
+`LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark
+configuration, not general worker-runtime configuration.
 
 > **Deprecation:** `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` is still
 > read as an alias for `LEASE_CLAIM_RECEIPTS`, with a deprecation
@@ -223,8 +225,17 @@ Use the defaults unless you have a reason not to:
 - Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers or retention keep old segments live.
 - Increase `lease_slot_count` if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.
 - Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
+- Increase `queue_stripe_count` only for measured hot logical queues where many small replicas contend on the same queue. Striping spreads that one logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused.
 - Increase rotation intervals to reduce partition churn and metadata activity.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
+
+### Internal hot-queue claim control
+
+Queue storage also uses an internal bounded-claimer control plane
+(`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a
+hot queue's claim path at once. This is not a public `QueueConfig` knob in
+0.6; tune queue pressure first with ordinary worker counts and, for extreme
+single-queue workloads, `queue_stripe_count`.
 
 ## Dead Letter Queue
 
