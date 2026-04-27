@@ -353,3 +353,159 @@ the `Warm`/`bounded-by-row-count` shape declared in
 - Run 2 (single-cycle stress): `benchmarks/portable/results/custom-20260427T051026Z-5bc479/`
 - Run 3 (two-cycle stress): `benchmarks/portable/results/custom-20260427T054607Z-6a8f52/`
   - All include `summary.json`, `manifest.json`, `raw.csv`, plots, html
+
+## Second 12-hour overnight run (2026-04-27 → 2026-04-28)
+
+Run id: `custom-20260427T081444Z-2471c6`. Started 2026-04-27 20:14 NZST,
+completed 2026-04-28 07:56 NZST (11h 35m wall). Branch tip
+`a45dca6` (post-doc-consolidation). Same 7-phase profile as the prior
+12h run (4 replicas × 8 workers × 200/s producer = 800/s aggregate;
+`warmup:5m → clean_1:4h → idle_1:30m → recovery_1:30m → clean_2:4h
+→ idle_2:30m → recovery_2:30m → clean_3:90m`).
+
+### Headline
+
+Receipt-plane invariant **held across the entire 11.6 h** including
+two full idle-in-tx stress cycles:
+
+- `lease_claim_closures_0..7` peak `n_dead_tup` = **0** in **every** phase.
+- `lease_claims_0..7` peak `n_dead_tup` = **24** across the run
+  (well under the 200 threshold).
+
+Per-replica RSS: held at **17184–17552 kB** across 5 sampled checkpoints
+spanning 8 hours of the run. Net drift ~150 kB. The JoinSet leak fix
+from `c0df1df` continues to hold.
+
+Run log: 0 ERROR/FATAL/panic. 474 sqlx WARN slow-statement events,
+all on the queue_counts query during high-backlog phases — see
+"queue_counts perf characterisation" below.
+
+### Receipt plane — 8-phase summary
+
+Peak `n_dead_tup` per partition family per phase. Dashes mean the
+metric was not sampled in that phase (no events fell within the
+sample window).
+
+| phase      | claims peak | closures peak |
+|------------|------------:|--------------:|
+| warmup     | 0           | 0             |
+| clean_1    | 16          | 0             |
+| idle_1     | 14          | 0             |
+| recovery_1 | 8           | 0             |
+| clean_2    | 9           | 0             |
+| idle_2     | 4           | 0             |
+| recovery_2 | 8           | 0             |
+| clean_3    | 0           | 0             |
+
+### Warm singletons — peak `n_dead_tup` per phase
+
+| table             | clean_1 | idle_1 | recovery_1 | clean_2 | idle_2 | recovery_2 | clean_3 |
+|-------------------|--------:|-------:|-----------:|--------:|-------:|-----------:|--------:|
+| lease_ring_state  | 105     | 28 563 | (≤ 132)    | 132     | 26 686 | (≤ 88)     | 88      |
+| claim_ring_state  | 78      | 1 616  | (≤ 79)     | 79      | 323    | (≤ 76)     | 76      |
+| queue_ring_state  | 78      | 633    | (≤ 9)      | 9       | 9      | (≤ 9)      | 9       |
+
+Same `Warm`/`bounded-by-row-count` reclaim shape as the first 12h
+run. Spike under held-tx, full reclaim within one clean phase.
+
+### Throughput by phase
+
+Per-replica completion / enqueue rates (median over the 5s sample
+window). Multiply by 4 for aggregate.
+
+| phase      | completion/s | enqueue/s |
+|------------|-------------:|----------:|
+| warmup     | 198.5        | 198.5     |
+| clean_1    | 190.2        | 190.2     |
+| idle_1     | 118.1        | 164.9     |
+| recovery_1 | 184.5        | 183.4     |
+| clean_2    |  95.7        | 174.0     |
+| idle_2    |  42.8        | 158.3     |
+| recovery_2 |  52.0        | 175.4     |
+| clean_3    |  31.5        | 175.8     |
+
+Same post-idle backlog-growth shape as the first 12h run. Receipt
+plane stayed clean throughout, so the slowdown is not an ADR-023
+property — it is the queue_counts hot-path described next.
+
+### queue_counts perf characterisation (targeted bench, off-pool)
+
+Driven by a fresh-postgres microbench
+(`artifacts/queue_counts_bench/run.sh`) that seeds N rows into a
+single `ready_entries` partition for one queue and runs
+`EXPLAIN (ANALYZE, BUFFERS)` on the exact-count CTE used by
+`QueueStorage::queue_counts_exact`. Three repeats per size; the run
+isolates the count from concurrent enqueue/claim traffic.
+
+| backlog rows | execution_ms (median) | total_ms (median) |
+|-------------:|----------------------:|------------------:|
+|      100 000 |                  14.1 |              29.6 |
+|    1 000 000 |                 116.1 |             134.7 |
+|    5 000 000 |                 460.2 |             475.1 |
+|   10 000 000 |                 845.9 |             860.9 |
+
+Linear in the backlog. The cost is dominated by a single sub-CTE,
+`lane_counts`, which scans every row in `ready_entries` and joins
+against `queue_claim_heads` to filter by `lane_seq >= claim_seq`.
+At 10 M rows the EXPLAIN plan reports 877 ms in `Finalize Aggregate`
+over a Parallel Seq Scan + Hash Join across `ready_entries_0`
+partition, with the parallel workers each reading ~55 k buffer
+pages (3 × 8 GB residency across the partition heap).
+
+Every other sub-CTE finishes in under a millisecond:
+
+| sub-CTE          | actual time (10 M backlog) |
+|------------------|----------------------------|
+| `lane_counts`    | **877 ms** (full ready_entries scan) |
+| `live_running` (leases) | 0.04 ms (8 partitions, all empty) |
+| `live_running` (lease_claims anti-join) | 0.04 ms (claim ring TRUNCATE'd hot) |
+| `live_terminal` (done_entries) | 0.08 ms |
+| `pruned_terminal` (queue_lanes ⨝ rollups) | 0.13 ms |
+
+The dispatcher caches `queue_counts` for `CLAIMER_QUEUE_COUNTS_MAX_AGE
+= 250 ms` (`awa-worker/src/dispatcher.rs:20`). Once the backlog
+crosses ~3 M rows the exact query takes longer than the cache
+window, so every replica's claim batch ends up waiting on a fresh
+exact count. Across 4 replicas this saturates one connection per
+replica with the count query alone, which is why throughput
+collapses from ~750/s aggregate in `clean_1` to ~125/s in `clean_3`.
+
+### Fix direction (not landed in this branch)
+
+The receipt-plane numbers tell us this is **not** an ADR-023 issue;
+the partitioned receipt tables are doing exactly what they were
+designed to do. The fix space is:
+
+1. **Replace the ready_entries scan with a counter read.**
+   `queue_lanes.available_count` already tracks per-(queue, priority)
+   available entries and is updated transactionally by
+   enqueue/claim/rotate. Summing that column over the matching
+   logical-queue physical stripes is O(few rows) regardless of
+   backlog size and gives the same semantic answer as the current
+   row-count scan.
+2. **Lift queue_counts out of the dispatcher claim hot path.** The
+   dispatcher only uses queue_counts to size `target_claimers`. That
+   is a slow-moving control-loop input — a 1–5 second cache window
+   would be safe and would absorb the worst-case query cost without
+   visible impact.
+3. **(Already done in this branch)** the cached `queue_counts_cached`
+   path exists and is what the dispatcher calls; the bug is purely
+   that the underlying exact query is too slow once the backlog
+   crosses the cache window.
+
+A fix in either direction (or both) is tracked separately from the
+ADR-023 release gate. The receipt-plane validation in this artifact
+holds independently of throughput regression on the dispatcher
+side.
+
+### Files
+
+- Long-horizon results bundle:
+  `benchmarks/portable/results/custom-20260427T081444Z-2471c6/`
+  (`summary.json`, `manifest.json`, `raw.csv`, `index.html`, `plots/`).
+  `raw.csv` is 529 MB and is gitignored — the bundle is local-only
+  archive evidence; this artifact captures the derived numbers.
+- Overnight check log: `artifacts/overnight/checks.log`
+  (5 sampled health checkpoints from the autonomous cron).
+- queue_counts microbench: `artifacts/queue_counts_bench/`
+  (`run.sh`, `timings.csv`, four `explain_<N>_<r>.txt` per repeat).
