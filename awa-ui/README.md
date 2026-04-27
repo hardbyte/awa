@@ -10,7 +10,7 @@ Provides an axum router with:
 
 The frontend is React/TypeScript with [IntentUI](https://intentui.com) components, compiled to static assets and embedded via `rust-embed`.
 
-Used by `awa-cli` to serve the UI via `awa serve`. See the [UI design doc](https://github.com/hardbyte/awa/blob/main/docs/ui-design.md) for API endpoints and component details.
+Used by `awa-cli` to serve the UI via `awa serve`. See the [UI design doc](../docs/ui-design.md) for API endpoints and component details.
 
 ## License
 

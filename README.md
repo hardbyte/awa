@@ -77,8 +77,8 @@ the event-delivery scenarios, while PgQue still keeps a lower dead-tuple
 profile.
 
 Methodology and caveats live in
-[benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md)
-and [ADR-019 validation](https://github.com/hardbyte/awa/blob/main/docs/adr/bench/019-queue-storage-validation-2026-04-19.md).
+[benchmarking notes](docs/benchmarking.md) and
+[ADR-019 validation](docs/adr/bench/019-queue-storage-validation-2026-04-19.md).
 
 ## Where Awa Fits
 
@@ -92,7 +92,7 @@ just a stream or a framework tied to one host language.
 - Choose River or Oban Pro when you want a job framework tightly shaped around
   one surrounding language ecosystem.
 
-See [docs/positioning.md](https://github.com/hardbyte/awa/blob/main/docs/positioning.md) for the category map and messaging guidance.
+See [docs/positioning.md](docs/positioning.md) for the category map and messaging guidance.
 
 ## Getting Started
 
@@ -122,8 +122,8 @@ state through the CLI or the built-in UI.
 
 Language-specific guides:
 
-- [Rust getting started](https://github.com/hardbyte/awa/blob/main/docs/getting-started-rust.md)
-- [Python getting started](https://github.com/hardbyte/awa/blob/main/docs/getting-started-python.md)
+- [Rust getting started](docs/getting-started-rust.md)
+- [Python getting started](docs/getting-started-python.md)
 
 ## Python Example
 
@@ -330,9 +330,8 @@ awa --database-url $DATABASE_URL job dump-run 123
 
 All coordination through Postgres. The Rust runtime owns dispatch, leases,
 heartbeats, rescue, rotation, prune, and shutdown for both languages. Mixed
-Rust and Python workers coexist on the same queues. See [architecture
-overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) for
-full details.
+Rust and Python workers coexist on the same queues. See
+[architecture overview](docs/architecture.md) for full details.
 
 ## Workspace
 
@@ -351,48 +350,48 @@ full details.
 
 | Doc | Description |
 |---|---|
-| [Rust getting started](https://github.com/hardbyte/awa/blob/main/docs/getting-started-rust.md) | From `cargo add` to a job reaching `completed` |
-| [Python getting started](https://github.com/hardbyte/awa/blob/main/docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
-| [Deployment guide](https://github.com/hardbyte/awa/blob/main/docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
-| [Migration guide](https://github.com/hardbyte/awa/blob/main/docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
-| [Configuration reference](https://github.com/hardbyte/awa/blob/main/docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
-| [Security & Postgres roles](https://github.com/hardbyte/awa/blob/main/docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
-| [Troubleshooting](https://github.com/hardbyte/awa/blob/main/docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
-| [Architecture overview](https://github.com/hardbyte/awa/blob/main/docs/architecture.md) | System design, data flow, state machine, crash recovery |
-| [Web UI design](https://github.com/hardbyte/awa/blob/main/docs/ui-design.md) | API endpoints, pages, component library |
-| [Benchmarking notes](https://github.com/hardbyte/awa/blob/main/docs/benchmarking.md) | Methodology, headline numbers, how to run |
-| [Validation test plan](https://github.com/hardbyte/awa/blob/main/docs/test-plan.md) | Full test matrix with 100+ test cases |
-| [TLA+ correctness models](https://github.com/hardbyte/awa/blob/main/correctness/README.md) | Formal verification of core invariants |
-| [Grafana dashboards](https://github.com/hardbyte/awa/blob/main/docs/grafana/README.md) | Pre-built Prometheus dashboards for monitoring |
+| [Rust getting started](docs/getting-started-rust.md) | From `cargo add` to a job reaching `completed` |
+| [Python getting started](docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
+| [Deployment guide](docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
+| [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
+| [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
+| [Security & Postgres roles](docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
+| [Troubleshooting](docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
+| [Architecture overview](docs/architecture.md) | System design, data flow, state machine, crash recovery |
+| [Web UI design](docs/ui-design.md) | API endpoints, pages, component library |
+| [Benchmarking notes](docs/benchmarking.md) | Methodology, headline numbers, how to run |
+| [Validation test plan](docs/test-plan.md) | Full test matrix with 100+ test cases |
+| [TLA+ correctness models](correctness/README.md) | Formal verification of core invariants |
+| [Grafana dashboards](docs/grafana/README.md) | Pre-built Prometheus dashboards for monitoring |
 
 <details>
 <summary>Architecture Decision Records (ADRs)</summary>
 
-- [001: Postgres-only](https://github.com/hardbyte/awa/blob/main/docs/adr/001-postgres-only.md)
-- [002: BLAKE3 uniqueness](https://github.com/hardbyte/awa/blob/main/docs/adr/002-blake3-uniqueness.md)
-- [003: Heartbeat + deadline hybrid](https://github.com/hardbyte/awa/blob/main/docs/adr/003-heartbeat-deadline-hybrid.md)
-- [004: PyO3 async bridge](https://github.com/hardbyte/awa/blob/main/docs/adr/004-pyo3-async-bridge.md)
-- [005: Priority aging](https://github.com/hardbyte/awa/blob/main/docs/adr/005-priority-aging.md)
-- [006: AwaTransaction as narrow SQL surface](https://github.com/hardbyte/awa/blob/main/docs/adr/006-awa-transaction.md)
-- [007: Periodic cron jobs](https://github.com/hardbyte/awa/blob/main/docs/adr/007-periodic-cron-jobs.md)
-- [008: COPY batch ingestion](https://github.com/hardbyte/awa/blob/main/docs/adr/008-copy-batch-ingestion.md)
-- [009: Python sync support](https://github.com/hardbyte/awa/blob/main/docs/adr/009-python-sync-support.md)
-- [010: Per-queue rate limiting](https://github.com/hardbyte/awa/blob/main/docs/adr/010-rate-limiting.md)
-- [011: Weighted concurrency](https://github.com/hardbyte/awa/blob/main/docs/adr/011-weighted-concurrency.md)
-- [012: Split hot and deferred job storage](https://github.com/hardbyte/awa/blob/main/docs/adr/012-hot-deferred-job-storage.md)
-- [013: Durable run leases and guarded finalization](https://github.com/hardbyte/awa/blob/main/docs/adr/013-run-lease-and-guarded-finalization.md)
-- [014: Structured progress and metadata](https://github.com/hardbyte/awa/blob/main/docs/adr/014-structured-progress.md)
-- [015: Builder-side post-commit lifecycle hooks](https://github.com/hardbyte/awa/blob/main/docs/adr/015-post-commit-lifecycle-hooks.md)
-- [016: Shared insert preparation and tokio-postgres adapter](https://github.com/hardbyte/awa/blob/main/docs/adr/016-bridge-adapters.md)
-- [017: Python insert-only transaction bridging](https://github.com/hardbyte/awa/blob/main/docs/adr/017-python-transaction-bridging.md)
-- [018: HTTP Worker for serverless job dispatch](https://github.com/hardbyte/awa/blob/main/docs/adr/018-http-worker.md)
-- [019: Queue Storage Engine](https://github.com/hardbyte/awa/blob/main/docs/adr/019-queue-storage-redesign.md)
-- [020: Dead Letter Queue](https://github.com/hardbyte/awa/blob/main/docs/adr/020-dead-letter-queue.md)
-- [021: Sequential callbacks and callback heartbeats](https://github.com/hardbyte/awa/blob/main/docs/adr/021-enhanced-external-wait.md)
-- [022: Descriptor catalog](https://github.com/hardbyte/awa/blob/main/docs/adr/022-descriptor-catalog.md)
-- [023: Receipt plane ring partitioning](https://github.com/hardbyte/awa/blob/main/docs/adr/023-receipt-plane-ring-partitioning.md)
+- [001: Postgres-only](docs/adr/001-postgres-only.md)
+- [002: BLAKE3 uniqueness](docs/adr/002-blake3-uniqueness.md)
+- [003: Heartbeat + deadline hybrid](docs/adr/003-heartbeat-deadline-hybrid.md)
+- [004: PyO3 async bridge](docs/adr/004-pyo3-async-bridge.md)
+- [005: Priority aging](docs/adr/005-priority-aging.md)
+- [006: AwaTransaction as narrow SQL surface](docs/adr/006-awa-transaction.md)
+- [007: Periodic cron jobs](docs/adr/007-periodic-cron-jobs.md)
+- [008: COPY batch ingestion](docs/adr/008-copy-batch-ingestion.md)
+- [009: Python sync support](docs/adr/009-python-sync-support.md)
+- [010: Per-queue rate limiting](docs/adr/010-rate-limiting.md)
+- [011: Weighted concurrency](docs/adr/011-weighted-concurrency.md)
+- [012: Split hot and deferred job storage](docs/adr/012-hot-deferred-job-storage.md)
+- [013: Durable run leases and guarded finalization](docs/adr/013-run-lease-and-guarded-finalization.md)
+- [014: Structured progress and metadata](docs/adr/014-structured-progress.md)
+- [015: Builder-side post-commit lifecycle hooks](docs/adr/015-post-commit-lifecycle-hooks.md)
+- [016: Shared insert preparation and tokio-postgres adapter](docs/adr/016-bridge-adapters.md)
+- [017: Python insert-only transaction bridging](docs/adr/017-python-transaction-bridging.md)
+- [018: HTTP Worker for serverless job dispatch](docs/adr/018-http-worker.md)
+- [019: Queue Storage Engine](docs/adr/019-queue-storage-redesign.md)
+- [020: Dead Letter Queue](docs/adr/020-dead-letter-queue.md)
+- [021: Sequential callbacks and callback heartbeats](docs/adr/021-enhanced-external-wait.md)
+- [022: Descriptor catalog](docs/adr/022-descriptor-catalog.md)
+- [023: Receipt plane ring partitioning](docs/adr/023-receipt-plane-ring-partitioning.md)
 
-See [docs/adr/README.md](https://github.com/hardbyte/awa/blob/main/docs/adr/README.md) for the index with status and supersession.
+See [docs/adr/README.md](docs/adr/README.md) for the index with status and supersession.
 
 </details>
 

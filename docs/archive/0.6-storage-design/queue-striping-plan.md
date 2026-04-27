@@ -27,8 +27,8 @@ Queue striping is now a queue-storage tuning knob, not a separate engine.
 
 The implementation lives in `awa-model/src/queue_storage.rs` (search for
 `queue_stripe_count`). Operator-facing configuration is documented in
-[`configuration.md`](configuration.md#queue-storage-tuning), and the runtime
-architecture is summarized in [`architecture.md`](architecture.md#queue-striping-and-claim-authority).
+[`configuration.md`](../../configuration.md#queue-storage-tuning), and the runtime
+architecture is summarized in [`architecture.md`](../../architecture.md#queue-striping-and-claim-authority).
 
 ## Why this exists
 

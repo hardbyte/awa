@@ -35,12 +35,17 @@ in-place as historical context.
 | 020 | [Dead Letter Queue](020-dead-letter-queue.md) | Accepted | First-class DLQ storage family with per-queue opt-in, retention, and operator retry/purge | Lives inside ADR-019 |
 | 021 | [Sequential callbacks and callback heartbeats](021-enhanced-external-wait.md) | Accepted | `wait_for_callback()` + `resume_external()` for multi-step orchestration; `heartbeat_callback` for long-running externals | Callback state moved to `active_leases` per ADR-019 |
 | 022 | [Descriptor catalog](022-descriptor-catalog.md) | Accepted | `queue_descriptors` / `job_kind_descriptors` tables, BLAKE3-hashed, code-declared, off the hot path | Off the queue-storage hot path |
+| 023 | [Receipt plane ring partitioning](023-receipt-plane-ring-partitioning.md) | Accepted | Partitioned `lease_claims` / `lease_claim_closures` ring replaces `open_receipt_claims`; receipts default on in 0.6 | Refines ADR-019 receipt plane |
 
 ## Validation artifacts
 
 Runtime validation for ADR-019 is recorded in
 [`bench/019-queue-storage-validation-2026-04-19.md`](bench/019-queue-storage-validation-2026-04-19.md)
 (exact commands, raw output, measured numbers).
+
+Runtime validation for ADR-023 is recorded in
+[`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md)
+(receipt-ring long-horizon and overnight evidence).
 
 TLA+ correctness models that pin spec-level invariants are under
 [`../../correctness/`](../../correctness/) — the segmented-storage family

@@ -25,25 +25,32 @@ In production, treat these as separate concerns:
 
 ## Queue Storage Cutover
 
-Treat queue storage as the worker runtime and the canonical tables as upgrade
-compatibility only.
+Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x
+clusters must use the staged storage-transition flow documented in
+[migrations.md](migrations.md) and the short operator checklist in
+[upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md).
 
-- queue storage is the worker engine
-- canonical tables remain in the schema for migration, rollback, and
-  compatibility SQL surfaces
-- mixed canonical and queue-storage worker fleets on the same database are not
-  supported
+Operationally:
 
-When cutting over a database to queue storage:
+- queue storage is the 0.6 worker engine
+- canonical tables remain in the schema for migration, rollback boundaries,
+  and compatibility SQL surfaces
+- while state is `canonical` or `prepared`, 0.5.x and 0.6 pods may coexist and
+  all writes/execution remain canonical
+- after `enter-mixed-transition`, new writes route to queue storage while 0.6
+  drain workers finish the canonical backlog
+- once queue-storage rows exist, rollback to a 0.5.x-only fleet is not
+  supported; finish the transition or restore from backup
 
-1. apply schema migrations first
-2. drain and stop the existing workers
-3. start only queue-storage workers
-4. verify `awa.runtime_storage_backends` and queue health before scaling out
+For a 0.5.x cluster, do not stop canonical workers and start queue-storage
+workers as a separate manual cutover. Use the storage commands so producer
+routing, canonical drain, queue-storage executor readiness, and rollback
+interlocks move together.
 
-Current Rust and Python worker starts already default to queue storage. Only
-set `queue_storage_schema` / `ClientBuilder::queue_storage(...)` when you need
-to override the default schema name or segment sizing.
+Current Rust and Python worker starts default to the correct effective engine
+for the storage-transition state. Only set `queue_storage_schema` /
+`ClientBuilder::queue_storage(...)` when you need to override the default
+schema name or segment sizing.
 
 ## Connection Pool Sizing
 
@@ -211,9 +218,10 @@ For smooth rollouts:
 Code-only releases can roll normally because the schema migrations are
 additive-only.
 
-Storage-engine cutovers are different: drain the old fleet completely, then
-start the queue-storage fleet. Do not run both worker engines during the same
-rollout window.
+Storage-engine cutovers are different from normal code-only releases. Follow
+the staged `prepare -> enter-mixed-transition -> finalize` flow in
+[upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md) so the database state, producer
+routing, and runtime roles remain aligned.
 
 ## Queue Isolation Patterns
 

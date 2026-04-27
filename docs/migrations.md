@@ -56,9 +56,9 @@ Because migrations are additive-only, old workers should continue to function du
 This release introduces a generic storage-transition framework that future
 storage-engine upgrades can build on.
 
-The prep-release migration on `main` does **not** change the current execution
-engine. On this rebased queue-storage branch, the later compatibility migration
-builds on that foundation and also adds:
+The 0.5.x prep-release migration does **not** change the current execution
+engine. The 0.6 compatibility migration builds on that foundation and also
+adds:
 
 - the queue-storage compatibility layer
 - the active-backend selector in `awa.runtime_storage_backends`
@@ -123,10 +123,10 @@ This is intentional. The `0.5.x` prep release is only adding the reusable
 tables, status APIs, capability metadata, and compat-routing seam needed for a
 later engine migration. It is not activating queue storage.
 
-### Preview: `0.5.x` -> `0.6` Queue-Storage Rollout
+### `0.5.x` -> `0.6` Queue-Storage Rollout
 
-This release is laying the protocol surface for the planned `0.6` storage-engine
-upgrade. The intended operator sequence has two phases.
+The 0.6 storage-engine upgrade uses the transition protocol introduced in the
+0.5.x prep release. The intended operator sequence has two phases.
 
 #### Phase 1: last `0.5.x` release everywhere
 
@@ -423,7 +423,7 @@ starting any worker, then follow the upgrade-from-0.5.x path.
 canonical-only `0.5.x` workers must drain through `mixed_transition`
 before queue storage can take over. Follow the staged transition flow
 documented above under
-[Preview: `0.5.x` → `0.6` Queue-Storage Rollout](#preview-05x---06-queue-storage-rollout):
+[`0.5.x` -> `0.6` Queue-Storage Rollout](#05x---06-queue-storage-rollout):
 
 1. Phase 1 — last `0.5.x` release everywhere with `awa migrate` applied.
 2. Phase 2 — roll out `0.6` binaries, then `prepare → enter-mixed-transition → finalize`.

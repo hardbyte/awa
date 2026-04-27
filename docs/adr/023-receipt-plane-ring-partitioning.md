@@ -71,9 +71,10 @@ Non-goals:
   contract. Those continue to live on `attempt_state` and `active_leases`.
 - Do not change the external API or the `(job_id, run_lease)` stale-writer
   guard.
-- Do not introduce any new reservation or pre-start state. The
-  `lease-plane-redesign-spike` record shows that direction has been tried
-  and rejected repeatedly on cost grounds.
+- Do not introduce any new reservation or pre-start state. The archived
+  [`lease-plane-redesign-spike`](../archive/0.6-storage-design/lease-plane-redesign-spike.md)
+  record shows that direction has been tried and rejected repeatedly on cost
+  grounds.
 
 ## Decision
 
@@ -258,10 +259,11 @@ persists.
 
 Rejected. Shipping with receipts off lets 0.6 hit the dead-tuple budget
 today, but it leaves the short-job path on the mutable `leases` ring and
-defers the work tracked in `lease-plane-redesign-spike.md`. ADR-019's
-vacuum-aware intent is only satisfied when receipts are on by default and
-do not regress the dead-tuple budget. This ADR is the path to that
-posture.
+defers the work tracked in the archived
+[`lease-plane-redesign-spike`](../archive/0.6-storage-design/lease-plane-redesign-spike.md).
+ADR-019's vacuum-aware intent is only satisfied when receipts are on by
+default and do not regress the dead-tuple budget. This ADR is the path to
+that posture.
 
 ## Relationship to Earlier ADRs
 
@@ -271,343 +273,39 @@ posture.
   authoritative record for `(job_id, run_lease)` staleness moves from a
   bounded mutable frontier to partitioned append-only tables; the
   guarantee does not.
-- `lease-plane-redesign-spike.md` identifies `open_receipt_claims` as the
-  compromise that unblocked the receipt-backed path. This ADR is the
-  follow-through that the spike anticipated.
+- The archived
+  [`lease-plane-redesign-spike`](../archive/0.6-storage-design/lease-plane-redesign-spike.md)
+  identifies `open_receipt_claims` as the compromise that unblocked the
+  receipt-backed path. This ADR is the follow-through that the spike
+  anticipated.
 
-## Implementation status
+## Implementation and Validation Status
 
-### Phase 1 — TLA+ spec ahead of code (complete)
+This ADR has been implemented for 0.6:
 
-The TLA+ storage model now covers the claim-ring redesign in advance of
-any Rust changes. Additions:
+- `lease_claims` and `lease_claim_closures` are partitioned by `claim_slot`.
+- `claim_ring_state` and `claim_ring_slots` control rotation and prune.
+- `open_receipt_claims` is removed from fresh installs and is no longer a hot
+  path table.
+- `lease_claim_receipts` defaults to `true`.
+- `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` is kept as a deprecated alias for
+  `LEASE_CLAIM_RECEIPTS` for one release.
 
-- `AwaSegmentedStorage.tla` variables: `claimSegmentOf`, `claimOpen`,
-  `claimClosed`, `claimSegments`, `claimSegmentCursor`.
-- `AwaSegmentedStorage.tla` actions: `Claim` opens a receipt; every
-  attempt-ending transition closes one; `ParkToWaiting` keeps receipts
-  open; `RescueStaleReceipt` models Tier-A force-close;
-  `RotateClaimSegments` and `PruneClaimSegment(seg)` mirror the
-  lease-ring rotation/prune pattern.
-- `AwaSegmentedStorage.tla` invariants added: `OneOpenClaimSegment`,
-  `ClaimCursorIsOpen`, `PrunedClaimSegmentsAreEmpty`, `NoLostClaim`,
-  `ClaimOpenAndClosedDisjoint`, `OpenClaimHasSegment`,
-  `ClosedClaimHasSegment`.
-- `AwaSegmentedStorageRaces.tla` extended with a claim-segment snapshot
-  in `claimIntent`, matching rotate/prune actions, and a
-  `PrunedClaimSegmentsAreEmpty` invariant — the race-exposing config
-  still trips (naive commit exposes claim/rotate/prune race), and both
-  safe-commit configs stay clean.
-- `AwaStorageLockOrder.tla` adds `ClaimRingStateResource`,
-  `ClaimRingSlotResource`, `ClaimChildResource`,
-  `ClosureChildResource`; the claim path's `ClaimPlan` takes a `FOR
-  SHARE` on `claim_ring_state` and a `RowExclusive` on the claim child;
-  `CompletePlan`, `RotateClaimsPlan`, and `PruneClaimsPlan` are added.
-  `NoDeadlock` remains clean at 9,680 distinct states (up from 2,076 —
-  reflecting the new transaction kinds and slots).
+Validation evidence is split by purpose:
 
-TLC runs recorded at Phase 1:
+- Runtime and long-horizon evidence lives in
+  [`bench/023-receipt-ring-validation-2026-04-26.md`](bench/023-receipt-ring-validation-2026-04-26.md).
+  The recorded runs include the 115-minute 4x8 receipts-on long-horizon run and
+  the 12-hour overnight run; receipt closure partitions stayed at 0 dead tuples
+  across every phase, and receipt claims remained bounded.
+- Spec and implementation mapping lives in
+  [`../../correctness/storage/MAPPING.md`](../../correctness/storage/MAPPING.md).
+  The storage TLA+ family models claim-ring rotation, partition prune safety,
+  receipt rescue, running cancel, and DLQ retry trace witnesses.
+- Operator-facing tuning and defaults live in
+  [`../configuration.md`](../configuration.md#queue-storage-tuning).
 
-- `AwaSegmentedStorage.cfg`: 2.3M distinct states, all invariants pass.
-- `AwaSegmentedStorageInterleavings.cfg` (2 workers): 4.7M distinct
-  states, all invariants pass.
-- `AwaSegmentedStorageTrace.cfg`: snooze trace accepted cleanly.
-- `AwaSegmentedStorageTraceBroken.cfg`: broken trace rejected with
-  expected deadlock at `traceIdx = 2`.
-- `AwaSegmentedStorageRaces.cfg`: race exposed
-  (`PrunedLeaseSegmentsAreEmpty` violated; the claim-ring invariant is
-  at parallel risk and would trip with a different state-space order).
-- `AwaSegmentedStorageRacesSafe.cfg`: safe commit, clean.
-- `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers,
-  clean.
-- `AwaStorageLockOrder.cfg`: 9,680 distinct states, clean.
-- `AwaStorageLockOrderDeadlockDemo.cfg`: still trips `NoDeadlock` in 5
-  steps.
-
-All nine runs are wired into `.github/workflows/nightly-chaos.yml` as a
-dedicated `tla-storage` job that gates nightly runs and is added to the
-failure-notification list. Running locally: `./correctness/run-tlc.sh
-storage/<Spec>.tla [<Cfg>.cfg]`.
-
-`correctness/storage/MAPPING.md` records the action → Rust-function
-correspondence; claim-ring rows are marked "pending Phase N" until the
-matching code lands.
-
-### Phase 2 — Claim-ring control plane (complete)
-
-Additive, data-plane-quiescent infrastructure that gives the runtime the
-control surface the Phase 3+ migration will attach data to. At end of
-Phase 2 the claim ring exists, rotates, and is scheduled by maintenance,
-but nothing is written to it on the hot path yet.
-
-Shipped:
-
-- `QueueStorageConfig::claim_slot_count` (default `8`, minimum `2`).
-  Thread through to `awa-bench` via `CLAIM_SLOT_COUNT`.
-- `prepare_schema()` adds `{schema}.claim_ring_state` and
-  `{schema}.claim_ring_slots` with the same fillfactor and autovacuum
-  knobs already applied to the lease-ring control plane, seeds the
-  singleton at `(0, 0, claim_slot_count)`, and seeds one open slot plus
-  `slot_count - 1` uninitialized slots.
-- `reset()` re-seeds the ring and includes the new tables in its
-  `TRUNCATE` list so test-cycle resets are clean.
-- `QueueStorage::rotate_claims(pool)` and
-  `QueueStorage::prune_oldest_claims(pool)` mirror the existing
-  `rotate_leases` / `prune_oldest_leases` methods. Phase 2
-  `prune_oldest_claims` deliberately returns `PruneOutcome::Noop`
-  because the data partitions don't exist yet; Phase 3 swaps in the
-  real partition-truncate body.
-- Maintenance leader wires `claim_rotate_interval` into the `select!`
-  loop and invokes `rotate_queue_storage_claims` alongside the queue
-  and lease rotation ticks. Default cadence is `queue_rotate_interval`;
-  tests and benches override via
-  `ClientBuilder::claim_rotate_interval`.
-
-Validation:
-
-- `cargo fmt --all --check` clean.
-- `cargo build --workspace` on `awa-model`, `awa-worker`, `awa`, and
-  `awa-testing` passes. (`awa-cli` has a pre-existing compile error
-  unrelated to ADR-023.)
-- `test_claim_ring_rotates_and_prunes_empty` drives the full Phase 2
-  contract: one rotation cycle through every slot (0→1→2→3→0,
-  generation 0→4), `prune_oldest_claims` stays a `Noop`, `reset()` and
-  `prepare_schema()` stay idempotent.
-- Full `cargo test --test queue_storage_runtime_test` — all 42 tests
-  pass, confirming the additive posture didn't regress any existing
-  lifecycle path.
-- TLC unchanged from Phase 1; the data-plane specs still describe the
-  invariants the Rust code will take on in Phase 3+.
-
-### Phase 3 — Partition `lease_claims` + `lease_claim_closures`; propagate `claim_slot` (complete)
-
-Both receipt-plane tables are now `PARTITIONED BY LIST (claim_slot)`
-with one child per ring slot. Claims and their matching closures
-co-locate in the same partition, so Phase 5's prune-and-truncate will
-reclaim both children together.
-
-Shipped:
-
-- `lease_claims` and `lease_claim_closures` are partitioned parents
-  with `lease_claims_0..N-1` and `lease_claim_closures_0..N-1`
-  children.
-- PK on both is `(claim_slot, job_id, run_lease)`; a secondary
-  non-unique `(job_id, run_lease)` index keeps completion / rescue /
-  materialize paths fast when `claim_slot` isn't in hand.
-- The existing stale-receipt index is recreated on the partitioned
-  parent and cascades to every child.
-- `ClaimedEntry::claim_slot: i32` is now populated by the claim CTE,
-  which reads `claim_ring_state.current_slot` alongside the lease-ring
-  cursor. `claim_slot` rides along through `ClaimedRuntimeJob` to the
-  completion path, which writes closures into the matching partition.
-- `open_receipt_claims` gains a `claim_slot` column so the
-  completion / rescue paths know which closure partition to target.
-  (Dropped entirely in Phase 5; Phase 4 already eliminates reads from
-  it.)
-- Idempotent in-place migration: `prepare_schema()` detects
-  pre-Phase-3 regular tables, renames them `_legacy`, creates the
-  partitioned parents + children, rewrites rows into the current
-  `claim_ring_state.current_slot`, then drops the legacy tables.
-
-Validation:
-
-- `cargo fmt --all --check`, `cargo build --workspace`, `cargo clippy`
-  all clean (the two pre-existing clippy warnings unrelated to this
-  work are unchanged).
-- Three new runtime tests land the partition invariants:
-  `test_lease_claim_partition_routing`,
-  `test_lease_claim_rotation_isolation`,
-  `test_lease_claim_migration_preserves_rows`.
-- Full `queue_storage_runtime_test` suite: 45 tests pass (all 42
-  pre-existing receipt-mode tests + Phase 2's claim-ring smoke + 3
-  Phase 3 additions).
-- Runtime inspection confirms the partition shape: `pg_class` shows
-  `relkind='p'` on the parents and `relkind='r'` on each numbered
-  child, with `lease_claims_N_pkey`,
-  `lease_claims_N_materialized_at_claimed_at_job_id_idx`, and
-  `lease_claims_N_job_id_run_lease_idx` (plus the closure pair) on
-  every child partition.
-
-### Phase 4 — Rewrite the `open_receipt_claims` SQL sites (complete)
-
-After Phase 4 the runtime never reads or writes `open_receipt_claims`
-on the hot path. The partitioned `lease_claims` table is the
-authoritative record of "currently open"; every query that used to
-target `open_receipt_claims` now does a bounded anti-join against
-`lease_claim_closures`. The table itself was dropped in Phase 5;
-`prepare_schema` continues to refuse to drop a non-empty
-`open_receipt_claims` so an operator rolling forward from a
-pre-ADR-023 build is forced to run the reverse migration first.
-
-Rewritten sites (originally six, one more surfaced under test as the
-`load_job` receipt branch — plus two closely related heartbeat/progress
-upsert paths):
-
-- `queue_counts_exact` `live_running` CTE: anti-join-based count of
-  receipt-backed attempts instead of a `count(*) FROM
-  open_receipt_claims` subquery.
-- `ensure_running_leases_from_receipts_tx`: `claim_refs` CTE now
-  selects from `lease_claims` anti-joined with
-  `lease_claim_closures`; the trailing `removed_open` DELETE is
-  dropped.
-- `upsert_attempt_state_heartbeat_from_receipts_tx` and
-  `upsert_attempt_state_progress_from_receipts_tx`: same anti-join
-  pattern for the upsert paths that materialize `attempt_state`.
-- `close_open_receipt_claim_tx`: `target` CTE sources the open claim
-  from `lease_claims` anti-joined with closures, routes the closure
-  INSERT to the matching partition via `claim_slot`.
-- `rescue_stale_receipt_claims_tx`: `stale_claims` CTE similarly
-  rewritten; `removed_open` DELETE dropped.
-- `complete_runtime_batch` receipt branch: the `completed` CTE now
-  carries `(claim_slot, job_id, run_lease)` triples directly from
-  `ClaimedEntry`, so the closure INSERT routes by partition key
-  without reading `open_receipt_claims` at all. Strictly cheaper than
-  the pre-Phase-4 path.
-- `load_job` receipt branch: reports receipt-backed attempts as
-  Running by anti-joining `lease_claims` with closures and excluding
-  any that already have a materialized lease row.
-
-Phase 4f: the claim CTE no longer emits the `opened AS (INSERT INTO
-open_receipt_claims ...)` sibling. The partitioned `lease_claims`
-insert is the sole authoritative claim record.
-
-Validation:
-
-- `cargo fmt --all --check`, `cargo build`, `cargo test` clean.
-- `test_phase4_no_writes_to_open_receipt_claims` locks in the
-  invariant: a full claim + complete cycle on a receipt-backed short
-  job leaves `open_receipt_claims` at zero rows throughout.
-- Full `queue_storage_runtime_test` suite: 46/46 pass (Phase 3's 45 +
-  the new Phase 4 regression test).
-- The test helper `open_receipt_claim_count` is now a derived
-  anti-join query — all existing assertions that used to count
-  `open_receipt_claims` rows continue to pass because they were really
-  checking the "currently open receipt" invariant, which now lives in
-  `lease_claims` minus `lease_claim_closures`.
-
-### Phase 5 — Delete `open_receipt_claims` (complete)
-
-Removed the `open_receipt_claims` table and all of its backfill + DDL
-paths from `prepare_schema`. After ADR-023 the table was dead weight
-whose only effect was autovacuum churn during prepare-schema runs;
-the hot path read and wrote nothing to it. `prepare_schema` now
-unconditionally drops the table on every install, refusing to drop
-a non-empty table — that would mean an operator rolled forward from
-a pre-ADR-023 build and the operator must run the reverse-migration
-recipe to drain it before retrying.
-
-Code changes:
-
-- Removed `CREATE TABLE open_receipt_claims`, the `ALTER TABLE
-  ADD COLUMN claim_slot`, the sentinel-backfill `UPDATE`, both
-  `CREATE INDEX` statements, the legacy-migration `INSERT` block,
-  the `open_receipt_claims_relname()` helper, and the entry in
-  `reset()`'s `TRUNCATE` list.
-- Added an early `DROP TABLE IF EXISTS open_receipt_claims CASCADE`
-  in `prepare_schema`, guarded by an emptiness check that returns
-  `AwaError::Validation` if the table holds rows.
-- New runtime test `test_open_receipt_claims_is_absent_after_install`
-  asserts the table is absent immediately after `prepare_schema`
-  and stays absent across a full claim + complete cycle.
-
-Acceptance criteria (status):
-
-- ✅ Runtime test green on a fresh install.
-- ✅ Receipt-plane chaos suite (4 scenarios) green.
-- ✅ Full `queue_storage_runtime_test` (49 tests) green.
-- ⏳ Two consecutive green nightly-chaos runs — required before merge
-  to main.
-- ⏳ 30-min `long_horizon.py` 4x8 receipts-on run with steady-state
-  receipt-plane dead tuples no worse than the ADR-019 baseline —
-  required before merge.
-
-Reverse-migration recipe (only relevant if a production rollback
-fires between this Phase-5 deploy and an older runtime catching up):
-
-```sql
-CREATE TABLE awa_exp.open_receipt_claims (
-    job_id BIGINT NOT NULL,
-    run_lease BIGINT NOT NULL,
-    ready_slot INT NOT NULL,
-    ready_generation BIGINT NOT NULL,
-    queue TEXT NOT NULL,
-    priority SMALLINT NOT NULL,
-    attempt SMALLINT NOT NULL,
-    max_attempts SMALLINT NOT NULL,
-    lane_seq BIGINT NOT NULL,
-    claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-    claim_slot INT NOT NULL DEFAULT 0,
-    PRIMARY KEY (job_id, run_lease)
-);
-
-INSERT INTO awa_exp.open_receipt_claims (
-    job_id, run_lease, ready_slot, ready_generation,
-    queue, priority, attempt, max_attempts, lane_seq,
-    claimed_at, claim_slot
-)
-SELECT
-    claims.job_id, claims.run_lease, claims.ready_slot,
-    claims.ready_generation, claims.queue, claims.priority,
-    claims.attempt, claims.max_attempts, claims.lane_seq,
-    claims.claimed_at, claims.claim_slot
-FROM awa_exp.lease_claims AS claims
-WHERE NOT EXISTS (
-    SELECT 1 FROM awa_exp.lease_claim_closures AS closures
-    WHERE closures.claim_slot = claims.claim_slot
-      AND closures.job_id = claims.job_id
-      AND closures.run_lease = claims.run_lease
-)
-  AND NOT EXISTS (
-    SELECT 1 FROM awa_exp.leases AS lease
-    WHERE lease.job_id = claims.job_id
-      AND lease.run_lease = claims.run_lease
-)
-ON CONFLICT DO NOTHING;
-```
-
-Not committed to source — operators are expected to keep this in
-their runbook for the rollout window.
-
-### Phase 6 — Make receipts the default, land the validation artifact
-
-Flipped `lease_claim_receipts` from `false` to `true` in
-`QueueStorageConfig::default()` and renamed the field from
-`experimental_lease_claim_receipts`. The old env var
-`EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` stays as a deprecated alias for
-`LEASE_CLAIM_RECEIPTS`, with a deprecation warning logged on first
-read; the alias will be removed in a future release.
-
-Code changes:
-
-- `awa-model/src/queue_storage.rs`: field rename + default flip.
-- `awa-bench/src/main.rs`: env-var read prefers `LEASE_CLAIM_RECEIPTS`,
-  falls back to `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` with a one-line
-  deprecation warning to stderr.
-- All test sites that previously got `false` via `..Default::default()`
-  now pin `lease_claim_receipts: false` explicitly so they stay
-  pinned across this and any future default flip. Tests that
-  exercise receipts mode already set the field to `true` explicitly
-  and were unchanged.
-
-Acceptance criteria status:
-
-- ✅ `cargo test -p awa --test queue_storage_runtime_test`: 49/49.
-- ✅ Receipt-plane chaos suite (4 scenarios): green.
-- ✅ `docs/configuration.md` documents the new default and the
-  deprecation alias.
-- ⏳ Two consecutive green nightly-chaos runs — required before merge.
-- ✅ Validation artifact at
-  `docs/adr/bench/023-receipt-ring-validation-2026-04-26.md`
-  (115-min 4x8 receipts-on long-horizon plus the 12 h overnight run
-  appended below: closure partitions stayed at 0 dead tuples across
-  every phase; claims peak ≤85 across both runs).
-- ✅ Full 12-hour `long_horizon.py` 4x8 receipts-on (run id
-  `custom-20260426T101003Z-ba9cb4`, 11.6 h wall, two idle-in-tx
-  stress cycles + a final clean tail). Receipt-plane closures
-  stayed at 0 dead tuples through every phase; per-replica RSS
-  held at 17-18 MB for the full duration after the JoinSet leak
-  fix in `c0df1df`.
-
-**Rollback:** flipping the default is a one-line revert; the
-underlying schema works either way. The env-var alias means an
-operator can pin behaviour explicitly without touching code.
+The detailed phase-by-phase implementation notes were intentionally kept out of
+this ADR. ADRs record the decision and its consequences; dated build logs,
+benchmark output, and branch-era investigation notes belong in validation
+artifacts or the 0.6 storage-design archive.

@@ -1,6 +1,6 @@
 # Lease Plane Redesign Spike
 
-> **Status: superseded for the receipt plane by [ADR-023](adr/023-receipt-plane-ring-partitioning.md).**
+> **Status: superseded for the receipt plane by [ADR-023](../../adr/023-receipt-plane-ring-partitioning.md).**
 > The narrow-implementation-spike portion of this doc that proposed
 > `open_receipt_claims` as a bounded live-frontier table has been
 > replaced by the partitioned `lease_claims` / `lease_claim_closures`

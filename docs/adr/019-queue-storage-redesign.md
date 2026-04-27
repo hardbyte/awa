@@ -333,14 +333,18 @@ this; ADR-023 replaces it with partitioned `lease_claims` / `lease_claim_closure
 where "currently open" is derived at query time as an anti-join over the
 active partitions, eliminating the last MVCC churn source on the receipt
 plane. Further lease-plane work is still
-tracked in [`lease-plane-redesign-spike.md`](../lease-plane-redesign-spike.md).
+tracked in
+[`lease-plane-redesign-spike.md`](../archive/0.6-storage-design/lease-plane-redesign-spike.md).
 The current queue-level coordination track for the remaining many-small-replica
-blocker is [`bounded-claimers-plan.md`](../bounded-claimers-plan.md): bound how
+blocker is
+[`bounded-claimers-plan.md`](../archive/0.6-storage-design/bounded-claimers-plan.md):
+bound how
 many replicas may actively claim from a hot queue at once, keep direct
 short-job starts, and avoid a second start-phase transaction. Because that
 controller still leaves hot-queue tails and crash/recovery behavior above the
 shipping bar, the next serious complementary design is now
-[`queue-striping-plan.md`](../queue-striping-plan.md): reduce single-queue
+[`queue-striping-plan.md`](../archive/0.6-storage-design/queue-striping-plan.md):
+reduce single-queue
 coordination pressure by striping one logical queue across multiple physical
 coordination paths while preserving the existing attempt lifecycle.
 
