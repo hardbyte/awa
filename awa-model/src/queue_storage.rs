@@ -1974,6 +1974,28 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // mark_queue_claimer_active updates last_claimed_at + expires_at
+            // every heartbeat (~30/sec/row at 4-replica scale). HOT updates
+            // require free space on the same page as the old tuple, which
+            // default fillfactor=100% denies. Without explicit fillfactor the
+            // 30-min repro saw n_tup_hot_upd=2 / n_tup_upd=266116 — every
+            // heartbeat spilled to a fresh page. Match the pattern of the
+            // other 1-row-per-(queue, slot) hot Warm tables.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.queue_claimer_leases SET (
+                fillfactor = 50,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             CREATE TABLE IF NOT EXISTS {schema}.queue_claimer_state (
@@ -1988,13 +2010,20 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
             // expires_at is updated on every heartbeat (mark_queue_claimer_active
-            // → SET expires_at = $now + ttl). Including it as an indexed key
-            // column blocks HOT updates: every heartbeat allocates a new heap
-            // tuple in a fresh page, observed as 0% HOT update ratio with
-            // ~116 updates/sec. Postgres exempts INCLUDE columns from the
-            // HOT-blocking set, so the SELECT at acquire_queue_claimer (which
-            // filters `expires_at > now()`) stays index-covered while updates
-            // become HOT-eligible.
+            // → SET expires_at = $now + ttl). Any column referenced by an
+            // index — INCLUDE columns count for HOT-blocking purposes on
+            // PG 17 — disqualifies the update from HOT. Empirically observed
+            // 0% HOT ratio at 4×8 with both `(queue, owner_instance_id,
+            // expires_at)` and `(queue, owner_instance_id) INCLUDE
+            // (expires_at)` index shapes.
+            //
+            // Drop expires_at from the index entirely. The SELECT at
+            // acquire_queue_claimer that filters `expires_at > $now` falls
+            // back to a heap recheck per matching row, but the candidate
+            // set per (queue, owner_instance_id) is bounded by
+            // claimer_slots-per-queue (single digits in practice), so the
+            // recheck is cheap. fillfactor=50 (set on the table above)
+            // pairs with this to give HOT updates room to land in-page.
             sqlx::query(&format!(
                 r#"
             DROP INDEX IF EXISTS {schema}.idx_{schema}_queue_claimer_leases_owner
@@ -2008,7 +2037,6 @@ impl QueueStorage {
                 r#"
             CREATE INDEX IF NOT EXISTS idx_{schema}_queue_claimer_leases_owner
                 ON {schema}.queue_claimer_leases (queue, owner_instance_id)
-                INCLUDE (expires_at)
             "#
             ))
             .execute(pool)
