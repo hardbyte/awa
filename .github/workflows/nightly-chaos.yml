@@ -163,6 +163,18 @@ jobs:
           cargo test --package awa --test receipt_plane_chaos_test \
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-receipt-plane-chaos.txt
+      - name: Run receipt-plane regression gate
+        timeout-minutes: 6
+        run: |
+          set -o pipefail
+          # ADR-023 invariant gate: enforces closure-partition n_dead_tup=0,
+          # bounded claim-partition churn, and ring rotation actually
+          # advancing under sustained load. Distinct from the chaos
+          # suite (which tests adversarial scenarios) — this gate
+          # asserts steady-state architectural bounds.
+          cargo test --package awa --test receipt_plane_regression_gate \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-receipt-plane-regression-gate.txt
       - name: Run sustained deferred benchmark
         if: always()
         timeout-minutes: 15
