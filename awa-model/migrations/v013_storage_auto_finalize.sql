@@ -649,5 +649,5 @@ END;
 $$;
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (12, 'Storage auto-finalize and queue-storage count maintenance')
+VALUES (13, 'Storage auto-finalize and queue-storage count maintenance')
 ON CONFLICT (version) DO NOTHING;

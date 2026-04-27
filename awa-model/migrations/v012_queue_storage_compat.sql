@@ -1353,5 +1353,5 @@ CREATE TRIGGER trg_awa_jobs_view_delete
     EXECUTE FUNCTION awa.write_jobs_view();
 
 INSERT INTO awa.schema_version (version, description)
-VALUES (11, 'Queue storage compatibility layer and active backend selection')
+VALUES (12, 'Queue storage compatibility layer and active backend selection')
 ON CONFLICT (version) DO NOTHING;

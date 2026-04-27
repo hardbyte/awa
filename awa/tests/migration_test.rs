@@ -7,7 +7,8 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
-use awa::{InsertOpts, InsertParams, UniqueOpts};
+use awa::{InsertOpts, InsertParams, JobArgs, UniqueOpts};
+use serde::{Deserialize, Serialize};
 use sqlx::postgres::{PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
 use std::sync::OnceLock;
@@ -1477,6 +1478,165 @@ async fn test_insert_many_copy_preserves_unique_skip_after_non_canonical_activat
     .await
     .unwrap();
     assert_eq!(stored, vec![1, 2, 3]);
+}
+
+// ── v011 self-heal regression tests ──────────────
+//
+// The 0.5.5 release shipped v010, which seeded the singleton row in
+// awa.storage_transition_state via `INSERT … ON CONFLICT DO NOTHING`.
+// The row could go missing in the wild — e.g. test fixtures that truncate
+// awa tables between runs, partial v010 application that wrote the table
+// but not the seed row, or logical dump/restore that omitted the table.
+// When the row was missing, awa.active_storage_engine() returned NULL,
+// which surfaced two user-visible bugs:
+//
+//   1. Single inserts (via awa.insert_job_compat) raised
+//      `storage engine "<NULL>" is not writable in this release`.
+//   2. insert_many silently inserted zero rows (NULL fails both
+//      `engine = 'canonical'` and `engine <> 'canonical'`).
+//
+// v011 makes active_storage_engine() coalesce a missing/blank row to
+// 'canonical', re-seeds the singleton, and hardens the assertion. The
+// tests below exercise the two failure modes.
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+#[awa(kind = "self_heal_single_test")]
+struct SelfHealSingleJob {
+    pub value: String,
+}
+
+async fn delete_storage_transition_singleton(pool: &PgPool) {
+    sqlx::query("DELETE FROM awa.storage_transition_state WHERE singleton")
+        .execute(pool)
+        .await
+        .expect("failed to delete storage_transition_state singleton");
+}
+
+#[tokio::test]
+async fn test_active_storage_engine_defaults_to_canonical_when_singleton_missing() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    delete_storage_transition_singleton(&pool).await;
+
+    let active: String = sqlx::query_scalar("SELECT awa.active_storage_engine()")
+        .fetch_one(&pool)
+        .await
+        .expect("active_storage_engine should be NULL-safe after v011");
+    assert_eq!(active, "canonical");
+
+    let assert_ok: bool = sqlx::query_scalar("SELECT awa.assert_writable_canonical_storage()")
+        .fetch_one(&pool)
+        .await
+        .expect("assert_writable_canonical_storage should treat missing singleton as canonical");
+    assert!(assert_ok);
+}
+
+#[tokio::test]
+async fn test_inserts_succeed_when_singleton_missing() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+    delete_storage_transition_singleton(&pool).await;
+
+    // Single insert path goes through awa.insert_job_compat, which calls
+    // assert_writable_canonical_storage. Pre-v011 this raised <NULL>.
+    let single = awa::model::insert(
+        &pool,
+        &SelfHealSingleJob {
+            value: "self_heal_single".to_string(),
+        },
+    )
+    .await
+    .expect("single insert must not fail when singleton row is missing");
+    assert_eq!(single.kind, "self_heal_single_test");
+
+    // insert_many uses the multi-row CTE that branches on the engine value.
+    // Pre-v011 a NULL engine made both branches false and silently inserted
+    // zero rows.
+    let queue = "self_heal_many";
+    let jobs = vec![
+        InsertParams {
+            kind: "self_heal_batch".to_string(),
+            args: serde_json::json!({"seq": 1}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        },
+        InsertParams {
+            kind: "self_heal_batch".to_string(),
+            args: serde_json::json!({"seq": 2}),
+            opts: InsertOpts {
+                queue: queue.to_string(),
+                ..Default::default()
+            },
+        },
+    ];
+    let inserted = insert_many(&pool, &jobs)
+        .await
+        .expect("insert_many must not silently drop rows when singleton row is missing");
+    assert_eq!(inserted.len(), 2);
+
+    // insert_many_copy reads active_storage_engine() into a Rust String,
+    // which would error on NULL pre-v011.
+    let copy_queue = "self_heal_copy";
+    let copy_jobs = vec![InsertParams {
+        kind: "self_heal_copy_job".to_string(),
+        args: serde_json::json!({"seq": 100}),
+        opts: InsertOpts {
+            queue: copy_queue.to_string(),
+            ..Default::default()
+        },
+    }];
+    let copy_inserted = insert_many_copy_from_pool(&pool, &copy_jobs)
+        .await
+        .expect("insert_many_copy must not fail when singleton row is missing");
+    assert_eq!(copy_inserted.len(), 1);
+}
+
+#[tokio::test]
+async fn test_v011_reseeds_singleton_when_upgrading_from_v010() {
+    let _guard = test_mutex().lock().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    // Simulate a database that received v010 but lost its singleton row
+    // and is being re-migrated from v10 → current. Roll the recorded
+    // schema_version back to 10 so v011 re-runs.
+    sqlx::query("DELETE FROM awa.storage_transition_state WHERE singleton")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.schema_version WHERE version > 10")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    migrations::run(&pool).await.unwrap();
+
+    let row_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.storage_transition_state WHERE singleton")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        row_count, 1,
+        "v011 should re-seed the singleton row when missing"
+    );
+
+    let status = storage::status(&pool)
+        .await
+        .expect("storage_status should succeed after re-seed");
+    assert_eq!(status.current_engine, "canonical");
+    assert_eq!(status.active_engine, "canonical");
+    assert_eq!(status.state, "canonical");
 }
 
 // ── Legacy V3-only upgrade (0.3.0 exact, no V4/V5) ──────────────
