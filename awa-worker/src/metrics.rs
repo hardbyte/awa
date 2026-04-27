@@ -102,6 +102,34 @@ pub struct AwaMetrics {
     pub storage_live_runtime_capability: Gauge<i64>,
     /// One-hot info gauge for the current storage transition state and engines.
     pub storage_state: Gauge<i64>,
+    /// Maintenance ring rotation attempts, attributed to (ring, outcome,
+    /// blocker). For Rotated outcomes the `awa.ring.blocker` attribute is
+    /// "none"; for SkippedBusy it carries the per-ring blocker label
+    /// ("queue.ready_rows", "queue.done_rows", "lease.rows", "claim.rows",
+    /// "claim.closure_rows"). One increment per non-zero blocker means a
+    /// single SkippedBusy with both queue_ready and queue_done populated
+    /// emits two events — that's intentional so dashboards can attribute
+    /// blame independently per side.
+    pub maintenance_rotate_attempts: Counter<u64>,
+    /// Magnitudes of the per-blocker row counts when a rotation is
+    /// SkippedBusy. Histogram so dashboards can show whether the ring is
+    /// pinned by handfuls of stragglers or by mountains of unfinished work.
+    pub maintenance_rotate_skipped_rows: Histogram<u64>,
+    /// Maintenance ring prune attempts, attributed to (ring, outcome, reason).
+    /// reason="none" for Pruned/Noop/Blocked; otherwise carries the
+    /// SkipReason discriminator (e.g. "queue.active_leases",
+    /// "queue.pending_ready", "claim.open").
+    pub maintenance_prune_attempts: Counter<u64>,
+    /// Magnitude of the reason count when prune returns SkippedActive.
+    pub maintenance_prune_skipped_rows: Histogram<u64>,
+    /// Current ring `current_slot` per ring, sampled from each rotate call.
+    /// The slot number itself isn't meaningful but the rate of advance is —
+    /// dashboards plot `rate(slot_changes)` to see whether rotation is
+    /// healthy or pinned.
+    pub ring_current_slot: Gauge<i64>,
+    /// Current ring `generation` per ring. Always-increasing; dashboards
+    /// show its derivative as "rotations per minute".
+    pub ring_generation: Gauge<i64>,
 }
 
 impl AwaMetrics {
@@ -308,6 +336,40 @@ impl AwaMetrics {
                     "Current storage transition state and engine combination (always 1)",
                 )
                 .with_unit("{state}")
+                .build(),
+            maintenance_rotate_attempts: meter
+                .u64_counter("awa.maintenance.rotate.attempts")
+                .with_description(
+                    "Ring rotation attempts by ring/outcome/blocker. Multiple increments per call when SkippedBusy has multiple non-zero blockers.",
+                )
+                .with_unit("{attempt}")
+                .build(),
+            maintenance_rotate_skipped_rows: meter
+                .u64_histogram("awa.maintenance.rotate.skipped_rows")
+                .with_description(
+                    "Row count for the blocker side of a SkippedBusy rotation",
+                )
+                .with_unit("{row}")
+                .build(),
+            maintenance_prune_attempts: meter
+                .u64_counter("awa.maintenance.prune.attempts")
+                .with_description("Ring prune attempts by ring/outcome/reason")
+                .with_unit("{attempt}")
+                .build(),
+            maintenance_prune_skipped_rows: meter
+                .u64_histogram("awa.maintenance.prune.skipped_rows")
+                .with_description("Magnitude of the reason count on a SkippedActive prune")
+                .with_unit("{row}")
+                .build(),
+            ring_current_slot: meter
+                .i64_gauge("awa.ring.current_slot")
+                .with_description("Current slot index per ring (queue/lease/claim)")
+                .with_unit("{slot}")
+                .build(),
+            ring_generation: meter
+                .i64_gauge("awa.ring.generation")
+                .with_description("Current ring generation per ring; derivative is rotations/sec")
+                .with_unit("{generation}")
                 .build(),
         }
     }
@@ -689,6 +751,86 @@ impl AwaMetrics {
             ));
         }
         self.storage_state.record(1, &attrs);
+    }
+
+    /// Record a ring rotation outcome.
+    ///
+    /// `ring` is one of "queue" / "lease" / "claim" — set by the caller based on
+    /// which rotate fn returned the outcome. For SkippedBusy, every non-zero
+    /// blocker count emits its own counter increment plus a histogram sample,
+    /// so a queue rotate skipped on (ready=42, done=17) produces two events
+    /// with different `awa.ring.blocker` labels. This makes
+    /// `sum by (awa.ring.blocker) (rate(...))` work cleanly in Grafana.
+    pub fn record_rotate_outcome(&self, ring: &'static str, outcome: &awa_model::RotateOutcome) {
+        match outcome {
+            awa_model::RotateOutcome::Rotated { slot, generation } => {
+                let attrs = [
+                    opentelemetry::KeyValue::new("awa.ring", ring),
+                    opentelemetry::KeyValue::new("awa.ring.outcome", "rotated"),
+                    opentelemetry::KeyValue::new("awa.ring.blocker", "none"),
+                ];
+                self.maintenance_rotate_attempts.add(1, &attrs);
+                let slot_attrs = [opentelemetry::KeyValue::new("awa.ring", ring)];
+                self.ring_current_slot.record(*slot as i64, &slot_attrs);
+                self.ring_generation.record(*generation, &slot_attrs);
+            }
+            awa_model::RotateOutcome::SkippedBusy { slot: _, busy } => {
+                let blockers: &[(&str, i64)] = &[
+                    ("queue.ready_rows", busy.queue_ready),
+                    ("queue.done_rows", busy.queue_done),
+                    ("lease.rows", busy.leases),
+                    ("claim.rows", busy.claims),
+                    ("claim.closure_rows", busy.closures),
+                ];
+                let mut emitted_any = false;
+                for (label, count) in blockers {
+                    if *count > 0 {
+                        emitted_any = true;
+                        let attrs = [
+                            opentelemetry::KeyValue::new("awa.ring", ring),
+                            opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_busy"),
+                            opentelemetry::KeyValue::new("awa.ring.blocker", *label),
+                        ];
+                        self.maintenance_rotate_attempts.add(1, &attrs);
+                        self.maintenance_rotate_skipped_rows
+                            .record(*count as u64, &attrs);
+                    }
+                }
+                // Lost-CAS path can return SkippedBusy with all-zero counts
+                // (the row counts we sampled before were stale by the time
+                // we lost the race). Emit a single attempt event so the
+                // counter still reflects the call.
+                if !emitted_any {
+                    let attrs = [
+                        opentelemetry::KeyValue::new("awa.ring", ring),
+                        opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_busy"),
+                        opentelemetry::KeyValue::new("awa.ring.blocker", "lost_cas"),
+                    ];
+                    self.maintenance_rotate_attempts.add(1, &attrs);
+                }
+            }
+        }
+    }
+
+    /// Record a ring prune outcome.
+    pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
+        let (label, reason, count) = match outcome {
+            awa_model::PruneOutcome::Noop => ("noop", "none", None),
+            awa_model::PruneOutcome::Pruned { .. } => ("pruned", "none", None),
+            awa_model::PruneOutcome::Blocked { .. } => ("blocked", "none", None),
+            awa_model::PruneOutcome::SkippedActive { reason, count, .. } => {
+                ("skipped_active", reason.as_str(), Some(*count))
+            }
+        };
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", ring),
+            opentelemetry::KeyValue::new("awa.ring.outcome", label),
+            opentelemetry::KeyValue::new("awa.ring.reason", reason),
+        ];
+        self.maintenance_prune_attempts.add(1, &attrs);
+        if let Some(c) = count {
+            self.maintenance_prune_skipped_rows.record(c as u64, &attrs);
+        }
     }
 }
 

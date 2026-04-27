@@ -1014,7 +1014,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
         .await
         .expect("rotate_claims attempt -> slot 0 (busy)");
     assert!(
-        matches!(busy_outcome, RotateOutcome::SkippedBusy { slot: 0 }),
+        matches!(busy_outcome, RotateOutcome::SkippedBusy { slot: 0, .. }),
         "rotate onto slot 0 with live rows must SkippedBusy, got {busy_outcome:?}"
     );
 
@@ -1110,7 +1110,7 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
         .await
         .expect("prune_oldest_claims with open claim");
     assert!(
-        matches!(outcome, PruneOutcome::SkippedActive { slot: 0 }),
+        matches!(outcome, PruneOutcome::SkippedActive { slot: 0, .. }),
         "prune must refuse to truncate a partition with an open claim, got {outcome:?}"
     );
 
@@ -3369,7 +3369,10 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
         .await
         .expect("Failed to prune oldest live slot");
     assert!(
-        matches!(prune_while_running, PruneOutcome::SkippedActive { slot: 0 }),
+        matches!(
+            prune_while_running,
+            PruneOutcome::SkippedActive { slot: 0, .. }
+        ),
         "unexpected prune outcome while lease is live: {prune_while_running:?}"
     );
 

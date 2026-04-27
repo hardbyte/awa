@@ -366,7 +366,7 @@ async fn test_prune_skips_active_under_concurrent_traffic() {
     let mut pruned_count = 0;
     for handle in handles {
         match handle.await.expect("prune task") {
-            PruneOutcome::SkippedActive { slot: 0 } => skipped_count += 1,
+            PruneOutcome::SkippedActive { slot: 0, .. } => skipped_count += 1,
             PruneOutcome::Pruned { .. } => pruned_count += 1,
             other => panic!("unexpected prune outcome: {other:?}"),
         }

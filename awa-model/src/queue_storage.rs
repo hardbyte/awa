@@ -131,16 +131,91 @@ pub struct QueueCounts {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotateOutcome {
-    Rotated { slot: i32, generation: i64 },
-    SkippedBusy { slot: i32 },
+    Rotated {
+        slot: i32,
+        generation: i64,
+    },
+    /// Target slot has live state; rotation deferred. `busy` carries the
+    /// per-table row counts observed at the gate (only fields relevant to
+    /// the ring being rotated are populated).
+    SkippedBusy {
+        slot: i32,
+        busy: BusyCounts,
+    },
+}
+
+/// Per-table row counts observed at a rotation gate. Each ring populates
+/// only the fields meaningful for it; unused fields stay zero. The
+/// maintenance loop emits one OTel metric label per non-zero field so
+/// dashboards can attribute "rotation pinned" to the responsible side.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BusyCounts {
+    /// Queue ring: rows in the next `ready_entries` child.
+    pub queue_ready: i64,
+    /// Queue ring: rows in the next `done_entries` child.
+    pub queue_done: i64,
+    /// Lease ring: rows in the next `leases` child.
+    pub leases: i64,
+    /// Claim ring: rows in the next `lease_claims` child.
+    pub claims: i64,
+    /// Claim ring: rows in the next `lease_claim_closures` child.
+    pub closures: i64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PruneOutcome {
     Noop,
-    Pruned { slot: i32 },
-    Blocked { slot: i32 },
-    SkippedActive { slot: i32 },
+    Pruned {
+        slot: i32,
+    },
+    /// Lock acquisition timed out (held-tx, lock contention).
+    Blocked {
+        slot: i32,
+    },
+    /// Target slot still has live state. `reason` discriminates which gate
+    /// fired and `count` gives its magnitude.
+    SkippedActive {
+        slot: i32,
+        reason: SkipReason,
+        count: i64,
+    },
+}
+
+/// Discriminator for [`PruneOutcome::SkippedActive`].
+///
+/// Multiple gates can fire `SkippedActive` for the same ring (e.g. queue
+/// prune checks both `active_leases` and `pending_ready`). Carrying the
+/// reason separately from `count` lets dashboards split out "ring saturated
+/// because backlog never drained" from "leases lingering on prior
+/// generation" without re-parsing log lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkipReason {
+    /// Queue prune: leases on the prior generation persist.
+    QueueActiveLeases,
+    /// Queue prune: ready rows without a matching done row.
+    QueuePendingReady,
+    /// Lease prune: target slot equals the current slot (rotator race).
+    LeaseCurrent,
+    /// Lease prune: pending leases on target slot.
+    LeaseActive,
+    /// Claim prune: target slot equals the current slot (rotator race).
+    ClaimCurrent,
+    /// Claim prune: open claims on target slot (no matching closure).
+    ClaimOpen,
+}
+
+impl SkipReason {
+    /// Stable, low-cardinality label suitable for OTel metric attributes.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::QueueActiveLeases => "queue.active_leases",
+            Self::QueuePendingReady => "queue.pending_ready",
+            Self::LeaseCurrent => "lease.current",
+            Self::LeaseActive => "lease.active",
+            Self::ClaimCurrent => "claim.current",
+            Self::ClaimOpen => "claim.open",
+        }
+    }
 }
 
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
@@ -8878,7 +8953,14 @@ impl QueueStorage {
 
         if ready_count > 0 || done_count > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: next_slot,
+                busy: BusyCounts {
+                    queue_ready: ready_count,
+                    queue_done: done_count,
+                    ..Default::default()
+                },
+            });
         }
 
         let next_generation = state.1 + 1;
@@ -8951,7 +9033,13 @@ impl QueueStorage {
 
         if lease_count > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: next_slot,
+                busy: BusyCounts {
+                    leases: lease_count,
+                    ..Default::default()
+                },
+            });
         }
 
         let next_generation = state.1 + 1;
@@ -8975,8 +9063,17 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if rotated.rows_affected() == 0 {
+            // Another rotator beat us to the CAS; the row count we sampled
+            // before is stale. Report the count we did see — it's still the
+            // best evidence available about what made this attempt give up.
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: next_slot,
+                busy: BusyCounts {
+                    leases: lease_count,
+                    ..Default::default()
+                },
+            });
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
@@ -9059,7 +9156,11 @@ impl QueueStorage {
 
         if active_leases > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive { slot });
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueueActiveLeases,
+                count: active_leases,
+            });
         }
 
         let pending: i64 = sqlx::query_scalar(&format!(
@@ -9080,7 +9181,11 @@ impl QueueStorage {
 
         if pending > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive { slot });
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::QueuePendingReady,
+                count: pending,
+            });
         }
 
         let pruned_terminal_counts: Vec<(String, i16, i64)> = sqlx::query_as(&format!(
@@ -9193,7 +9298,11 @@ impl QueueStorage {
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive { slot });
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::LeaseCurrent,
+                count: 0,
+            });
         }
 
         let active_leases: i64 =
@@ -9204,7 +9313,11 @@ impl QueueStorage {
 
         if active_leases > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive { slot });
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::LeaseActive,
+                count: active_leases,
+            });
         }
 
         let truncate = sqlx::query(&format!("TRUNCATE TABLE {lease_child}"))
@@ -9282,7 +9395,14 @@ impl QueueStorage {
 
         if claim_count > 0 || closure_count > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: next_slot,
+                busy: BusyCounts {
+                    claims: claim_count,
+                    closures: closure_count,
+                    ..Default::default()
+                },
+            });
         }
 
         let next_generation = state.1 + 1;
@@ -9306,8 +9426,18 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if rotated.rows_affected() == 0 {
+            // Lost the CAS race; the row counts we sampled may now be
+            // stale, but they're the best evidence about why this attempt
+            // gave up.
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(RotateOutcome::SkippedBusy { slot: next_slot });
+            return Ok(RotateOutcome::SkippedBusy {
+                slot: next_slot,
+                busy: BusyCounts {
+                    claims: claim_count,
+                    closures: closure_count,
+                    ..Default::default()
+                },
+            });
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
@@ -9414,7 +9544,11 @@ impl QueueStorage {
 
         if current_slot == slot {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive { slot });
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::ClaimCurrent,
+                count: 0,
+            });
         }
 
         // `PartitionTruncateSafety`: every claim in this partition must
@@ -9439,7 +9573,11 @@ impl QueueStorage {
 
         if open_claims > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(PruneOutcome::SkippedActive { slot });
+            return Ok(PruneOutcome::SkippedActive {
+                slot,
+                reason: SkipReason::ClaimOpen,
+                count: open_claims,
+            });
         }
 
         let truncate = sqlx::query(&format!("TRUNCATE TABLE {claim_child}, {closure_child}"))

@@ -1001,11 +1001,21 @@ impl MaintenanceService {
         };
 
         match runtime.store.rotate(&self.pool).await {
-            Ok(RotateOutcome::Rotated { slot, generation }) => {
-                debug!(slot, generation, "Rotated queue storage queue segment");
-            }
-            Ok(RotateOutcome::SkippedBusy { slot }) => {
-                debug!(slot, "Skipped busy queue storage queue segment");
+            Ok(outcome) => {
+                self.metrics.record_rotate_outcome("queue", &outcome);
+                match outcome {
+                    RotateOutcome::Rotated { slot, generation } => {
+                        debug!(slot, generation, "Rotated queue storage queue segment");
+                    }
+                    RotateOutcome::SkippedBusy { slot, busy } => {
+                        debug!(
+                            slot,
+                            ready_rows = busy.queue_ready,
+                            done_rows = busy.queue_done,
+                            "Skipped busy queue storage queue segment",
+                        );
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage queue segments");
@@ -1014,15 +1024,29 @@ impl MaintenanceService {
         }
 
         match runtime.store.prune_oldest(&self.pool).await {
-            Ok(PruneOutcome::Noop) => {}
-            Ok(PruneOutcome::Pruned { slot }) => {
-                debug!(slot, "Pruned queue storage queue segment");
-            }
-            Ok(PruneOutcome::Blocked { slot }) => {
-                debug!(slot, "Queue storage queue segment prune blocked");
-            }
-            Ok(PruneOutcome::SkippedActive { slot }) => {
-                debug!(slot, "Queue storage queue segment still active");
+            Ok(outcome) => {
+                self.metrics.record_prune_outcome("queue", &outcome);
+                match outcome {
+                    PruneOutcome::Noop => {}
+                    PruneOutcome::Pruned { slot } => {
+                        debug!(slot, "Pruned queue storage queue segment");
+                    }
+                    PruneOutcome::Blocked { slot } => {
+                        debug!(slot, "Queue storage queue segment prune blocked");
+                    }
+                    PruneOutcome::SkippedActive {
+                        slot,
+                        reason,
+                        count,
+                    } => {
+                        debug!(
+                            slot,
+                            reason = reason.as_str(),
+                            count,
+                            "Queue storage queue segment still active",
+                        );
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to prune queue storage queue segments");
@@ -1036,11 +1060,20 @@ impl MaintenanceService {
         };
 
         match runtime.store.rotate_leases(&self.pool).await {
-            Ok(RotateOutcome::Rotated { slot, generation }) => {
-                debug!(slot, generation, "Rotated queue storage lease segment");
-            }
-            Ok(RotateOutcome::SkippedBusy { slot }) => {
-                debug!(slot, "Skipped busy queue storage lease segment");
+            Ok(outcome) => {
+                self.metrics.record_rotate_outcome("lease", &outcome);
+                match outcome {
+                    RotateOutcome::Rotated { slot, generation } => {
+                        debug!(slot, generation, "Rotated queue storage lease segment");
+                    }
+                    RotateOutcome::SkippedBusy { slot, busy } => {
+                        debug!(
+                            slot,
+                            lease_rows = busy.leases,
+                            "Skipped busy queue storage lease segment",
+                        );
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage lease segments");
@@ -1049,15 +1082,29 @@ impl MaintenanceService {
         }
 
         match runtime.store.prune_oldest_leases(&self.pool).await {
-            Ok(PruneOutcome::Noop) => {}
-            Ok(PruneOutcome::Pruned { slot }) => {
-                debug!(slot, "Pruned queue storage lease segment");
-            }
-            Ok(PruneOutcome::Blocked { slot }) => {
-                debug!(slot, "Queue storage lease segment prune blocked");
-            }
-            Ok(PruneOutcome::SkippedActive { slot }) => {
-                debug!(slot, "Queue storage lease segment still active");
+            Ok(outcome) => {
+                self.metrics.record_prune_outcome("lease", &outcome);
+                match outcome {
+                    PruneOutcome::Noop => {}
+                    PruneOutcome::Pruned { slot } => {
+                        debug!(slot, "Pruned queue storage lease segment");
+                    }
+                    PruneOutcome::Blocked { slot } => {
+                        debug!(slot, "Queue storage lease segment prune blocked");
+                    }
+                    PruneOutcome::SkippedActive {
+                        slot,
+                        reason,
+                        count,
+                    } => {
+                        debug!(
+                            slot,
+                            reason = reason.as_str(),
+                            count,
+                            "Queue storage lease segment still active",
+                        );
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to prune queue storage lease segments");
@@ -1074,11 +1121,21 @@ impl MaintenanceService {
         };
 
         match runtime.store.rotate_claims(&self.pool).await {
-            Ok(RotateOutcome::Rotated { slot, generation }) => {
-                debug!(slot, generation, "Rotated queue storage claim segment");
-            }
-            Ok(RotateOutcome::SkippedBusy { slot }) => {
-                debug!(slot, "Skipped busy queue storage claim segment");
+            Ok(outcome) => {
+                self.metrics.record_rotate_outcome("claim", &outcome);
+                match outcome {
+                    RotateOutcome::Rotated { slot, generation } => {
+                        debug!(slot, generation, "Rotated queue storage claim segment");
+                    }
+                    RotateOutcome::SkippedBusy { slot, busy } => {
+                        debug!(
+                            slot,
+                            claim_rows = busy.claims,
+                            closure_rows = busy.closures,
+                            "Skipped busy queue storage claim segment",
+                        );
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to rotate queue storage claim segments");
@@ -1087,15 +1144,29 @@ impl MaintenanceService {
         }
 
         match runtime.store.prune_oldest_claims(&self.pool).await {
-            Ok(PruneOutcome::Noop) => {}
-            Ok(PruneOutcome::Pruned { slot }) => {
-                debug!(slot, "Pruned queue storage claim segment");
-            }
-            Ok(PruneOutcome::Blocked { slot }) => {
-                debug!(slot, "Queue storage claim segment prune blocked");
-            }
-            Ok(PruneOutcome::SkippedActive { slot }) => {
-                debug!(slot, "Queue storage claim segment still active");
+            Ok(outcome) => {
+                self.metrics.record_prune_outcome("claim", &outcome);
+                match outcome {
+                    PruneOutcome::Noop => {}
+                    PruneOutcome::Pruned { slot } => {
+                        debug!(slot, "Pruned queue storage claim segment");
+                    }
+                    PruneOutcome::Blocked { slot } => {
+                        debug!(slot, "Queue storage claim segment prune blocked");
+                    }
+                    PruneOutcome::SkippedActive {
+                        slot,
+                        reason,
+                        count,
+                    } => {
+                        debug!(
+                            slot,
+                            reason = reason.as_str(),
+                            count,
+                            "Queue storage claim segment still active",
+                        );
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to prune queue storage claim segments");

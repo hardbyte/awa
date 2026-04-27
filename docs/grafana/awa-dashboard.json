@@ -563,6 +563,207 @@
         }
       ]
     }
+  ,
+    {
+      "id": 600,
+      "type": "row",
+      "title": "Ring rotation & prune (queue-storage)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 25,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 601,
+          "type": "timeseries",
+          "title": "Rotation rate by ring + outcome",
+          "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Healthy rings show non-zero `rotated` on a regular cadence; pinned rings dominate `skipped_busy`.",
+          "gridPos": {
+            "x": 0,
+            "y": 0,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring, awa_ring_outcome) (rate(awa_maintenance_rotate_attempts_total[1m]))",
+              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_outcome}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 602,
+          "type": "timeseries",
+          "title": "Rotation skip blockers (queue ring)",
+          "description": "When queue rotation is SkippedBusy, which side held it: ready_entries rows or done_entries rows on the next slot? `queue.ready_rows` dominating = producer faster than consumer (real backlog). `queue.done_rows` dominating = completion truncate falling behind.",
+          "gridPos": {
+            "x": 12,
+            "y": 0,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring_blocker) (rate(awa_maintenance_rotate_attempts_total{awa_ring=\"queue\", awa_ring_outcome=\"skipped_busy\"}[1m]))",
+              "legendFormat": "{{awa_ring_blocker}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 603,
+          "type": "timeseries",
+          "title": "Rotation skip magnitudes p95",
+          "description": "p95 row count seen at the blocker side when rotation is SkippedBusy. Distinguishes 'pinned by handful of stragglers' (transient race) from 'pinned by backlog mountain' (real saturation).",
+          "gridPos": {
+            "x": 0,
+            "y": 8,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "short"
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by(le, awa_ring, awa_ring_blocker) (rate(awa_maintenance_rotate_skipped_rows_bucket[5m])))",
+              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_blocker}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 604,
+          "type": "timeseries",
+          "title": "Prune rate by ring + outcome",
+          "description": "Ring prune attempts/sec by outcome. `pruned` advancing = ring reclaiming partitions. `skipped_active` rising = target slot still has live state. `blocked` = lock contention (held-tx, autovacuum).",
+          "gridPos": {
+            "x": 12,
+            "y": 8,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring, awa_ring_outcome) (rate(awa_maintenance_prune_attempts_total[1m]))",
+              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_outcome}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 605,
+          "type": "timeseries",
+          "title": "Prune skip reasons (all rings)",
+          "description": "When prune returns SkippedActive, which gate fired? `queue.active_leases` = leases on prior generation. `queue.pending_ready` = ready rows without matching done. `claim.open` = open receipt-plane claims. `lease.current`/`claim.current` = rotator race (benign if rare).",
+          "gridPos": {
+            "x": 0,
+            "y": 16,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring_reason) (rate(awa_maintenance_prune_attempts_total{awa_ring_outcome=\"skipped_active\"}[1m]))",
+              "legendFormat": "{{awa_ring_reason}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 606,
+          "type": "timeseries",
+          "title": "Rotations per minute (generation derivative)",
+          "description": "Rate of ring generation advance. Headline 'is rotation working' signal \u2014 flat at zero with non-zero `skipped_busy` traffic above means the ring is pinned.",
+          "gridPos": {
+            "x": 12,
+            "y": 16,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "opm"
+            }
+          },
+          "targets": [
+            {
+              "expr": "60 * deriv(awa_ring_generation[1m])",
+              "legendFormat": "{{awa_ring}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
+    }
   ],
   "schemaVersion": 39,
   "tags": ["awa", "job-queue"],
