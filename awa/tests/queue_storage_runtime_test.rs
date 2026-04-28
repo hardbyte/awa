@@ -2524,12 +2524,18 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
     client.shutdown(Duration::from_secs(5)).await;
 }
 
+/// Receipts mode + non-zero deadline_duration: the claim path writes
+/// the deadline onto `lease_claims.deadline_at`, and the deadline-rescue
+/// maintenance path force-closes claims whose deadline has passed
+/// without a closure or materialized lease. This exercises the
+/// receipts-side counterpart that `rescue_expired_receipt_deadlines_tx`
+/// adds alongside the lease-side `rescue_expired_deadlines` scan.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration() {
+async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
-    let queue = "qs_lease_claim_deadline_guard";
-    let schema = "awa_qs_runtime_lease_claim_deadline_guard";
+    let queue = "qs_lease_claim_deadline_rescue";
+    let schema = "awa_qs_runtime_lease_claim_deadline_rescue";
     let store = create_store_with_config(
         &pool,
         QueueStorageConfig {
@@ -2543,7 +2549,7 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
     )
     .await;
 
-    let _job_id = enqueue_job(
+    let job_id = enqueue_job(
         &pool,
         &store,
         &CompleteJob { id: 3 },
@@ -2554,19 +2560,54 @@ async fn test_queue_storage_lease_claim_receipts_require_zero_deadline_duration(
     )
     .await;
 
-    let err = store
-        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(1))
+    // Sub-second deadline: rescue should sweep this claim on the next
+    // maintenance tick. The claim write path stores deadline_at on
+    // lease_claims directly; receipts mode no longer rejects
+    // deadline > 0.
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_millis(100))
         .await
-        .expect_err("receipt-backed claims must reject non-zero deadlines");
-    match err {
-        AwaError::Validation(msg) => {
-            assert!(
-                msg.contains("require queue deadline_duration=0"),
-                "unexpected validation message: {msg}"
-            );
-        }
-        other => panic!("expected Validation error, got {other:?}"),
-    }
+        .expect("receipts-mode claim with deadline_duration > 0 should succeed");
+    assert_eq!(claimed.len(), 1, "expected one claimed job");
+    assert!(
+        claimed[0].claim.lease_claim_receipt,
+        "claim should be on the receipts path"
+    );
+
+    // Verify deadline_at landed on lease_claims.
+    let deadline_at: Option<chrono::DateTime<chrono::Utc>> = sqlx::query_scalar(&format!(
+        "SELECT deadline_at FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(claimed[0].job.run_lease)
+    .fetch_one(&pool)
+    .await
+    .expect("lease_claims row should exist");
+    assert!(
+        deadline_at.is_some(),
+        "deadline_at must be set on the claim when deadline_duration > 0"
+    );
+
+    // Wait for the deadline to pass, then run the rescue path.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let rescued = store
+        .rescue_expired_deadlines(&pool)
+        .await
+        .expect("rescue_expired_deadlines should succeed");
+    assert_eq!(rescued.len(), 1, "exactly one claim should be rescued");
+    assert_eq!(rescued[0].id, job_id);
+
+    // Closure is recorded with outcome='deadline_expired'.
+    let outcome: String = sqlx::query_scalar(&format!(
+        "SELECT outcome FROM {schema}.lease_claim_closures \
+         WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(claimed[0].job.run_lease)
+    .fetch_one(&pool)
+    .await
+    .expect("closure row should exist after rescue");
+    assert_eq!(outcome, "deadline_expired");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -286,6 +286,15 @@ This ADR has been implemented for 0.6:
 - `open_receipt_claims` is removed from fresh installs and is no longer a hot
   path table.
 - `lease_claim_receipts` defaults to `true`.
+- Receipts mode supports per-claim deadlines. The claim path writes
+  `deadline_at` onto the `lease_claims` row when
+  `QueueConfig.deadline_duration > 0`, and a sibling rescue scan
+  (`rescue_expired_receipt_deadlines_tx`) force-closes claims whose
+  `deadline_at` has passed without a closure or materialized lease,
+  writing a `'deadline_expired'` closure. The maintenance entry point
+  (`rescue_expired_deadlines`) merges the lease-side and receipt-side
+  scans into one batch per tick, so receipts mode and the existing
+  hard-deadline behaviour compose without operator intervention.
 
 Validation evidence is split by purpose:
 

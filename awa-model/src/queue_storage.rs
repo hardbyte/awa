@@ -1323,8 +1323,13 @@ impl QueueStorage {
         self.physical_queue_for_stripe(queue, stripe)
     }
 
-    fn use_lease_claim_receipts_for_runtime(&self, deadline_duration: Duration) -> bool {
-        self.lease_claim_receipts() && deadline_duration.is_zero()
+    fn use_lease_claim_receipts_for_runtime(&self, _deadline_duration: Duration) -> bool {
+        // Receipts mode now supports per-claim deadlines via
+        // `lease_claims.deadline_at` (rescued by
+        // `rescue_expired_receipt_deadlines_tx`), so receipts is the
+        // live path whenever the engine is configured for receipts —
+        // the queue's `deadline_duration` no longer disqualifies it.
+        self.lease_claim_receipts()
     }
 
     pub fn ready_child_relname(&self, slot: usize) -> String {
@@ -1540,7 +1545,8 @@ impl QueueStorage {
                             priority,
                             attempt,
                             max_attempts,
-                            lane_seq
+                            lane_seq,
+                            deadline_at
                         )
                         SELECT
                             claim_ring.claim_slot,
@@ -1552,7 +1558,12 @@ impl QueueStorage {
                             selected.effective_priority,
                             selected.attempt + 1,
                             selected.max_attempts,
-                            selected.lane_seq
+                            selected.lane_seq,
+                            CASE
+                                WHEN p_deadline_secs > 0
+                                    THEN clock_timestamp() + make_interval(secs => p_deadline_secs)
+                                ELSE NULL::timestamptz
+                            END
                         FROM selected
                         CROSS JOIN claim_ring
                         RETURNING
@@ -1570,7 +1581,12 @@ impl QueueStorage {
                     -- The partitioned lease_claims row above is the
                     -- authoritative record of "currently open"; every
                     -- other receipt-plane query reads it anti-joined
-                    -- with lease_claim_closures.
+                    -- with lease_claim_closures. `deadline_at` is the
+                    -- per-claim deadline when the queue has a non-zero
+                    -- `deadline_duration`; the deadline-rescue path
+                    -- scans expired rows (anti-joined with closures
+                    -- and leases — same disambiguation as the
+                    -- heartbeat-rescue path) and force-closes them.
                     "#
                 )
             } else {
@@ -2295,8 +2311,22 @@ impl QueueStorage {
                 lane_seq          BIGINT NOT NULL,
                 claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 materialized_at   TIMESTAMPTZ,
+                deadline_at       TIMESTAMPTZ,
                 PRIMARY KEY (claim_slot, job_id, run_lease)
             ) PARTITION BY LIST (claim_slot)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Upgrade path for clusters that prepared the schema before
+            // deadline_at was introduced. ADD COLUMN IF NOT EXISTS on a
+            // partitioned parent propagates to every child partition.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.lease_claims
+                ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ
             "#
             ))
             .execute(pool)
@@ -2320,6 +2350,22 @@ impl QueueStorage {
                 r#"
             CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_stale
                 ON {schema}.lease_claims (materialized_at, claimed_at, job_id)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Partial index for the deadline-rescue scan. Receipt-mode
+            // claims with non-NULL deadline_at represent the population
+            // of in-flight short-path attempts that can still time out;
+            // the index keeps the rescue scan O(expired) rather than
+            // O(all-open-claims).
+            sqlx::query(&format!(
+                r#"
+            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_deadline
+                ON {schema}.lease_claims (deadline_at)
+                WHERE deadline_at IS NOT NULL
             "#
             ))
             .execute(pool)
@@ -4300,12 +4346,6 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
-        if self.lease_claim_receipts() && !deadline_duration.is_zero() {
-            return Err(AwaError::Validation(
-                "experimental lease-claim receipts require queue deadline_duration=0".to_string(),
-            ));
-        }
-
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
         let stripe_queues = self.physical_queues_for_logical(queue);
@@ -6213,7 +6253,8 @@ impl QueueStorage {
                     claims.attempt,
                     claims.max_attempts,
                     claims.lane_seq,
-                    claims.claimed_at
+                    claims.claimed_at,
+                    claims.deadline_at
                 FROM {schema}.lease_claims AS claims
                 JOIN inflight
                   ON inflight.job_id = claims.job_id
@@ -6268,7 +6309,12 @@ impl QueueStorage {
                     claim_refs.max_attempts,
                     claim_refs.lane_seq,
                     clock_timestamp(),
-                    NULL::timestamptz,
+                    -- Preserve the per-claim deadline so the lease-side
+                    -- deadline rescue path picks up materialized claims
+                    -- without an extra hop. NULL when receipts mode is
+                    -- on with `deadline_duration = 0` (the short-job
+                    -- shape that needs no deadline at all).
+                    claim_refs.deadline_at,
                     claim_refs.claimed_at
                 FROM claim_refs
                 CROSS JOIN lease_ring
@@ -6819,6 +6865,92 @@ impl QueueStorage {
             "#
         ))
         .bind(cutoff)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(rescued)
+    }
+
+    /// Receipt-side counterpart to `rescue_expired_deadlines`: scans
+    /// `lease_claims` for rows whose per-claim `deadline_at` has
+    /// passed but which still don't have a closure or a materialized
+    /// lease row. Each match gets a `'deadline_expired'` closure
+    /// written and is returned for the maintenance caller to convert
+    /// into a deferred / DLQ row, exactly as the lease-side path does.
+    ///
+    /// The two anti-joins mirror `rescue_stale_receipt_claims_tx`'s
+    /// disambiguation: a claim that has already materialized into
+    /// `leases` is on the lease-side deadline-rescue path, and
+    /// rescuing it here would double-close it.
+    async fn rescue_expired_receipt_deadlines_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+    ) -> Result<Vec<DeletedLeaseRow>, AwaError> {
+        let schema = self.schema();
+        let rescued: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            WITH expired_claims AS (
+                SELECT
+                    claims.claim_slot,
+                    claims.ready_slot,
+                    claims.ready_generation,
+                    claims.job_id,
+                    claims.queue,
+                    'running'::awa.job_state AS state,
+                    claims.priority,
+                    claims.attempt,
+                    claims.run_lease,
+                    claims.max_attempts,
+                    claims.lane_seq,
+                    claims.claimed_at AS attempted_at
+                FROM {schema}.lease_claims AS claims
+                WHERE claims.deadline_at IS NOT NULL
+                  AND claims.deadline_at < clock_timestamp()
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                      WHERE closures.claim_slot = claims.claim_slot
+                        AND closures.job_id = claims.job_id
+                        AND closures.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                      SELECT 1 FROM {schema}.leases AS lease
+                      WHERE lease.job_id = claims.job_id
+                        AND lease.run_lease = claims.run_lease
+                  )
+                ORDER BY claims.deadline_at ASC
+                LIMIT 500
+                FOR UPDATE OF claims SKIP LOCKED
+            ),
+            inserted AS (
+                INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                SELECT
+                    expired_claims.claim_slot,
+                    expired_claims.job_id,
+                    expired_claims.run_lease,
+                    'deadline_expired',
+                    clock_timestamp()
+                FROM expired_claims
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING job_id, run_lease
+            )
+            SELECT
+                expired_claims.ready_slot,
+                expired_claims.ready_generation,
+                expired_claims.job_id,
+                expired_claims.queue,
+                expired_claims.state,
+                expired_claims.priority,
+                expired_claims.attempt,
+                expired_claims.run_lease,
+                expired_claims.max_attempts,
+                expired_claims.lane_seq,
+                expired_claims.attempted_at
+            FROM expired_claims
+            JOIN inserted
+              ON inserted.job_id = expired_claims.job_id
+             AND inserted.run_lease = expired_claims.run_lease
+            "#
+        ))
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -8794,12 +8926,27 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        if deleted.is_empty() {
+        // Receipts-mode short-path claims hold their deadline on
+        // `lease_claims.deadline_at` rather than on a `leases` row, so
+        // the receipt-plane needs its own scan; merge both populations
+        // into one `moved` set so the maintenance caller observes a
+        // single rescue batch per tick.
+        let receipt_deleted = if self.lease_claim_receipts() {
+            self.rescue_expired_receipt_deadlines_tx(&mut tx).await?
+        } else {
+            Vec::new()
+        };
+
+        if deleted.is_empty() && receipt_deleted.is_empty() {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let mut moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        moved.extend(
+            self.hydrate_deleted_leases_tx(&mut tx, receipt_deleted)
+                .await?,
+        );
 
         let mut rescued = Vec::with_capacity(moved.len());
         for row in moved {
