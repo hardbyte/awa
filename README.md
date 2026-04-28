@@ -77,8 +77,9 @@ the event-delivery scenarios, while PgQue still keeps a lower dead-tuple
 profile.
 
 Methodology and caveats live in
-[benchmarking notes](docs/benchmarking.md) and
-[ADR-019 validation](docs/adr/bench/019-queue-storage-validation-2026-04-19.md).
+[benchmarking notes](docs/benchmarking.md). Validation artifacts:
+[ADR-019 (queue storage)](docs/adr/bench/019-queue-storage-validation-2026-04-19.md)
+and [ADR-023 (receipt-plane ring partitioning)](docs/adr/bench/023-receipt-ring-validation-2026-04-26.md).
 
 ## Where Awa Fits
 
@@ -124,6 +125,11 @@ Language-specific guides:
 
 - [Rust getting started](docs/getting-started-rust.md)
 - [Python getting started](docs/getting-started-python.md)
+
+Already running 0.5? Read the [0.5 → 0.6 upgrade guide](docs/upgrade-0.5-to-0.6.md)
+before you bump — 0.6 introduces a staged storage transition (canonical →
+prepared → mixed_transition → active) with a refused-by-default gate that
+expects the operator to roll out queue-storage-capable workers first.
 
 ## Python Example
 
@@ -354,6 +360,7 @@ Rust and Python workers coexist on the same queues. See
 | [Python getting started](docs/getting-started-python.md) | From `pip install` to a job reaching `completed` |
 | [Deployment guide](docs/deployment.md) | Docker, Kubernetes, pool sizing, graceful shutdown |
 | [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
+| [0.5 → 0.6 upgrade](docs/upgrade-0.5-to-0.6.md) | Step-by-step operator checklist for the staged storage transition |
 | [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
 | [Security & Postgres roles](docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
 | [Troubleshooting](docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
