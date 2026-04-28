@@ -110,10 +110,6 @@ async fn setup_pool(test_database_name: &str) -> sqlx::PgPool {
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
     reset_runtime_backend(&pool).await;
-    sqlx::query("DROP SCHEMA IF EXISTS awa_exp CASCADE")
-        .execute(&pool)
-        .await
-        .expect("Failed to drop stale queue storage schema");
     pool
 }
 
@@ -150,16 +146,16 @@ async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> 
     }
 
     let default_exists: bool = sqlx::query_scalar(
-        "SELECT to_regclass('awa_exp.ready_entries') IS NOT NULL \
-         AND to_regclass('awa_exp.deferred_jobs') IS NOT NULL \
-         AND to_regclass('awa_exp.leases') IS NOT NULL \
-         AND to_regclass('awa_exp.done_entries') IS NOT NULL",
+        "SELECT to_regclass('awa.ready_entries') IS NOT NULL \
+         AND to_regclass('awa.deferred_jobs') IS NOT NULL \
+         AND to_regclass('awa.leases') IS NOT NULL \
+         AND to_regclass('awa.done_entries') IS NOT NULL",
     )
     .fetch_one(pool)
     .await
     .expect("Failed to probe default queue storage schema");
 
-    default_exists.then_some("awa_exp".to_string())
+    default_exists.then_some("awa".to_string())
 }
 
 async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {

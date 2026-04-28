@@ -42,7 +42,7 @@ DECLARE
     v_prepared_engine TEXT;
     v_canonical_count BIGINT;
     v_runtime_count   BIGINT;
-    v_schema          TEXT := COALESCE(NULLIF(btrim(p_schema), ''), 'awa_exp');
+    v_schema          TEXT := COALESCE(NULLIF(btrim(p_schema), ''), 'awa');
 BEGIN
     SELECT state, prepared_engine
     INTO v_state, v_prepared_engine

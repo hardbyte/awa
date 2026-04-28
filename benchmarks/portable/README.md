@@ -123,7 +123,7 @@ The Awa adapters now have two Rust-native variants:
 `awa-python` continues to benchmark the queue-storage engine. The Rust-native
 adapters also accept:
 
-- `QUEUE_STORAGE_SCHEMA` (default `awa_exp`)
+- `QUEUE_STORAGE_SCHEMA` (default `awa` — queue-storage tables share the canonical schema as of 0.6)
 - `QUEUE_SLOT_COUNT` / `LEASE_SLOT_COUNT` (defaults `16` / `8`)
 - `QUEUE_COUNT_MAX_AGE_MS` (default `SAMPLE_EVERY_S * 1000`; lower values make
   observer queue-depth/running-depth samples more exact at the cost of more

@@ -64,10 +64,6 @@ async fn setup() -> sqlx::PgPool {
         .execute(&pool)
         .await
         .expect("Failed to clear runtime snapshots");
-    sqlx::query("DROP SCHEMA IF EXISTS awa_exp CASCADE")
-        .execute(&pool)
-        .await
-        .expect("Failed to drop stale queue storage schema");
     pool
 }
 

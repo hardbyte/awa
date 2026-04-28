@@ -1569,7 +1569,7 @@ async fn test_auto_finalize_promotes_fresh_install() {
     assert_eq!(baseline.prepared_engine, None);
 
     let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-        .bind("awa_exp")
+        .bind("awa")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1593,7 +1593,7 @@ async fn test_auto_finalize_promotes_fresh_install() {
 
     // Idempotent: second call from active state returns false.
     let promoted_again: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-        .bind("awa_exp")
+        .bind("awa")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1624,7 +1624,7 @@ async fn test_auto_finalize_refuses_when_canonical_jobs_exist() {
     .unwrap();
 
     let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-        .bind("awa_exp")
+        .bind("awa")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1647,13 +1647,13 @@ async fn test_auto_finalize_refuses_when_prepared_engine_is_set() {
     storage::prepare(
         &pool,
         "queue_storage",
-        serde_json::json!({ "schema": "awa_exp" }),
+        serde_json::json!({ "schema": "awa" }),
     )
     .await
     .unwrap();
 
     let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-        .bind("awa_exp")
+        .bind("awa")
         .fetch_one(&pool)
         .await
         .unwrap();
@@ -1681,7 +1681,7 @@ async fn test_auto_finalize_refuses_when_runtime_is_live() {
     insert_runtime_instance(&pool, "canonical").await;
 
     let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
-        .bind("awa_exp")
+        .bind("awa")
         .fetch_one(&pool)
         .await
         .unwrap();

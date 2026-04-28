@@ -159,8 +159,9 @@ All intervals have `_ms` suffixed kwargs in Python (e.g. `heartbeat_interval_ms=
 ## Queue storage tuning
 
 Queue storage is the runtime engine in `0.6`, and most deployments can keep
-the defaults. The main knobs are there for large fleets, very bursty queues, or
-operators who want to trade off retention-window size against rotation churn.
+the defaults. Queue-storage tables live in the canonical `awa` schema; the
+main knobs are there for large fleets, very bursty queues, or operators who
+want to trade off retention-window size against rotation churn.
 
 ### Rust
 
@@ -187,7 +188,7 @@ let client = Client::builder(pool.clone())
 ```python
 await client.start(
     [("email", 8)],
-    queue_storage_schema="awa_exp",
+    queue_storage_schema="awa",
     queue_storage_queue_slot_count=16,
     queue_storage_lease_slot_count=8,
     queue_storage_claim_slot_count=8,

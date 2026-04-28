@@ -84,7 +84,7 @@ def read_producer_rate(default: int) -> int:
 
 
 def queue_storage_schema() -> str:
-    return os.environ.get("QUEUE_STORAGE_SCHEMA", "awa_exp")
+    return os.environ.get("QUEUE_STORAGE_SCHEMA", "awa")
 
 
 def queue_slot_count() -> int:

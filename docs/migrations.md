@@ -71,7 +71,7 @@ New operator surfaces:
 ```bash
 awa --database-url "$DATABASE_URL" storage status
 awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa
 awa --database-url "$DATABASE_URL" storage abort
 ```
 
@@ -196,16 +196,15 @@ The 0.6 storage-engine upgrade uses the transition protocol introduced in the
    - Rust: `Client::builder(...).transition_role(TransitionWorkerRole::QueueStorageTarget)`
    - Python: `AsyncClient.start(..., storage_transition_role="queue_storage_target")`
 
-5. Planned `0.6` behavior is then:
+5. From here, the `0.6` sequence is:
 
    - `awa storage enter-mixed-transition` flips new writes and cron enqueues to
      queue storage
-   - queue-storage-capable workers begin reporting capability for the new
-     engine, while canonical drain work is handled by `0.6` workers in
-     drain-only mode
+   - queue-storage-capable workers report capability for the new engine, while
+     canonical drain work is handled by `0.6` workers in drain-only mode
    - canonical backlog drains while new work lands in queue storage
-   - `awa storage finalize` (or an assisted automatic equivalent) advances the
-     state to `active` once live capability and backlog checks pass
+   - `awa storage finalize` advances the state to `active` once live capability
+     and backlog checks pass
 
 Expected status progression during that rollout:
 

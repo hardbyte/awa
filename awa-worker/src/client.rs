@@ -833,7 +833,7 @@ impl Client {
                 .details
                 .get("schema")
                 .and_then(serde_json::Value::as_str)
-                .unwrap_or("awa_exp")
+                .unwrap_or("awa")
                 .to_string()
         };
 
@@ -2113,7 +2113,9 @@ mod tests {
         migrations::run(&pool)
             .await
             .expect("migrations should succeed");
-        drop_queue_storage_schema(&pool, "awa_exp").await;
+        // After folding queue-storage into the `awa` schema, migrations
+        // don't create queue-storage tables — those are added by
+        // `store.install()` below. No separate schema-drop step needed.
 
         let queue = "health_queue_storage";
         let client = Client::builder(pool.clone())

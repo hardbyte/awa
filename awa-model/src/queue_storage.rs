@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use uuid::Uuid;
 
-const DEFAULT_SCHEMA: &str = "awa_exp";
+const DEFAULT_SCHEMA: &str = "awa";
 const DEFAULT_QUEUE_SLOT_COUNT: usize = 16;
 const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
 const DEFAULT_CLAIM_SLOT_COUNT: usize = 8;

@@ -63,10 +63,13 @@ behavior is unchanged. You can sit here indefinitely.
 
 # 2. Materialize the queue-storage schema before the routing flip.
 #    Skipping this means the first queue-storage write pays the
-#    schema-install cost.
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa_exp
+#    schema-install cost. The default is the `awa` schema (shared
+#    with canonical metadata); if you want an isolated schema name
+#    for queue-storage tables, pass it here AND in step 3's --details.
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa
 
-# 3. Record the prepared engine.
+# 3. Record the prepared engine. Default schema is `awa`; pass
+#    --details '{"schema":"<name>"}' to record a different name.
 awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
 
 # 4. Verify prepared state.
@@ -86,13 +89,11 @@ psql "$DATABASE_URL" -c "
 # 6. Flip routing. New writes and cron enqueues go to queue storage.
 awa --database-url "$DATABASE_URL" storage enter-mixed-transition
 
-# 7. Watch canonical drain.
-watch -n 5 'psql "$DATABASE_URL" -c "
-  SELECT state, count(*) FROM awa.jobs WHERE NOT EXISTS (
-    SELECT 1 FROM awa.runtime_storage_backends WHERE backend = '\''queue_storage'\''
-  ) GROUP BY state;
-"'
-#    → wait for the canonical backlog to reach 0
+# 7. Watch canonical drain. `canonical_live_backlog()` sums non-terminal
+#    `jobs_hot` rows plus everything still in `scheduled_jobs` — the
+#    same number the gate uses internally.
+watch -n 5 'psql "$DATABASE_URL" -c "SELECT awa.canonical_live_backlog() AS canonical_backlog;"'
+#    → wait for canonical_backlog to reach 0
 
 # 8. Finalize once canonical backlog is empty.
 awa --database-url "$DATABASE_URL" storage finalize
@@ -107,7 +108,7 @@ awa --database-url "$DATABASE_URL" storage status
 | After step | Watch for |
 |------------|-----------|
 | migrate | `SELECT MAX(version) FROM awa.schema_version` advances |
-| prepare-queue-storage-schema | `\dn awa_exp` shows the schema; tables created |
+| prepare-queue-storage-schema | `\dt awa.ready_entries` (and other queue-storage tables) exist in the `awa` schema |
 | prepare | `awa storage status` reports `state=prepared` |
 | enter-mixed-transition | `awa.maintenance.rotate.attempts{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
 | watch canonical drain | `awa.queue_depth{awa_job_state="available"}` on the canonical side trending to 0 |

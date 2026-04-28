@@ -99,7 +99,7 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
             .details
             .get("schema")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("awa_exp")
+            .unwrap_or("awa")
             .to_string(),
     )
 }

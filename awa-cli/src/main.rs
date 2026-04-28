@@ -244,7 +244,7 @@ enum StorageCommands {
     },
     /// Materialize the queue-storage schema without activating routing
     PrepareQueueStorageSchema {
-        #[arg(long, default_value = "awa_exp")]
+        #[arg(long, default_value = "awa")]
         schema: String,
         #[arg(long, default_value_t = 16)]
         queue_slot_count: u32,
@@ -411,12 +411,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
         }
 
-        // All remaining CLI commands are single-shot (one query, then exit)
-        // so a single connection is sufficient.
+        // Most remaining CLI commands are single-shot (one query, then exit)
+        // so a small pool is sufficient. `storage prepare-queue-storage-schema`
+        // is the exception: it acquires an advisory-lock connection and then
+        // runs DDL via the same pool, which deadlocks at max_connections=1.
+        // Allow up to 4 connections so the lock connection and the DDL
+        // executor coexist.
         command => {
             let db_url = require_pool(&cli.database_url)?;
             let pool = PgPoolOptions::new()
-                .max_connections(1)
+                .max_connections(4)
                 .connect(&db_url)
                 .await?;
 
@@ -685,8 +689,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     StorageCommands::Prepare { engine, details } => {
+                        // Auto-fill `details.schema` for queue-storage when the
+                        // operator didn't pass --details. Without this, v011's
+                        // SQL fallback would resolve to the historical
+                        // `awa_exp` default, mismatching the runtime's
+                        // configured schema (`awa` in 0.6) and breaking
+                        // `enter-mixed-transition`. Operators who pass
+                        // --details with their own schema name override.
                         let details = match details {
                             Some(raw) => serde_json::from_str(&raw)?,
+                            None if engine == "queue_storage" => serde_json::json!({
+                                "schema": awa_model::QueueStorageConfig::default().schema,
+                            }),
                             None => serde_json::json!({}),
                         };
                         awa_model::storage::prepare(&pool, &engine, details).await?;

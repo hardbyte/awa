@@ -36,7 +36,6 @@ async def client():
     c = awa.AsyncClient(DATABASE_URL)
     tx = await c.transaction()
     await tx.execute("DROP SCHEMA IF EXISTS awa CASCADE")
-    await tx.execute("DROP SCHEMA IF EXISTS awa_exp CASCADE")
     await tx.commit()
     await c.migrate()
     tx = await c.transaction()

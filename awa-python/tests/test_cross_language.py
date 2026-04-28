@@ -24,7 +24,6 @@ async def client():
     await c.migrate()
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-    await tx.execute("DROP SCHEMA IF EXISTS awa_exp CASCADE")
     await tx.execute("DELETE FROM awa.jobs")
     await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
