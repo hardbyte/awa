@@ -160,7 +160,7 @@ def test_interactive_report_written(tmp_path: Path):
         "run_id": "fixture-run",
         "scenario": "idle_in_tx_saturation",
         "pg_image": "postgres:17.2-alpine",
-        "cli": ["long_horizon.py", "--scenario", "idle_in_tx_saturation"],
+        "cli": ["long_horizon.py", "run", "--scenario", "idle_in_tx_saturation"],
     }
     report = write_interactive_report(
         run_dir=out,
@@ -466,10 +466,10 @@ def test_argparse_replicas_flag():
     from bench_harness.orchestrator import build_parser
 
     p = build_parser()
-    ns = p.parse_args(["--scenario", "idle_in_tx_saturation", "--replicas", "3"])
+    ns = p.parse_args(["run", "--scenario", "idle_in_tx_saturation", "--replicas", "3"])
     assert ns.replicas == 3
     # Default survives when flag is absent.
-    ns = p.parse_args(["--scenario", "idle_in_tx_saturation"])
+    ns = p.parse_args(["run", "--scenario", "idle_in_tx_saturation"])
     assert ns.replicas == 1
 
 

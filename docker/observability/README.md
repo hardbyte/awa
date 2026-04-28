@@ -18,7 +18,7 @@ Then run the bench with the OTLP endpoint set:
 cd ../../benchmarks/portable
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
   OTEL_SERVICE_NAME=awa-portable-bench \
-  uv run python long_horizon.py \
+  uv run python long_horizon.py run \
     --systems awa --replicas 4 --worker-count 8 --producer-rate 200 \
     --phase warmup=warmup:5m --phase clean_1=clean:25m \
     --skip-build

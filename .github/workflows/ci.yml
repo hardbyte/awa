@@ -411,8 +411,11 @@ jobs:
           "
       - name: Smoke — plots render from fixture CSV
         run: uv run pytest tests/ -v
-      - name: Smoke — long_horizon.py --help
-        run: uv run python long_horizon.py --help >/dev/null
+      - name: Smoke — long_horizon.py CLI surface
+        run: |
+          uv run python long_horizon.py --help >/dev/null
+          uv run python long_horizon.py run --help >/dev/null
+          uv run python long_horizon.py combine --help >/dev/null
 
   # ─── Telemetry validation ─────────────────────────────────────
   telemetry-validation:

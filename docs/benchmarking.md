@@ -183,7 +183,7 @@ The two tracks are deliberately separate:
 | Question | Authoritative benchmark |
 |---|---|
 | Did awa regress overnight? | `test_mvcc_horizon_overlap_benchmark` (nightly) / `test_mvcc_horizon_planetscale_soak` (weekly) |
-| How does awa compare to other systems under sustained pressure and event-delivery workloads? | `long_horizon.py`, named scenarios (`event_delivery_matrix`, `event_delivery_burst`, `fleet_steady_state`, `idle_in_tx_saturation`, `long_horizon`) |
+| How does awa compare to other systems under sustained pressure and event-delivery workloads? | `long_horizon.py run`, named scenarios (`event_delivery_matrix`, `event_delivery_burst`, `fleet_steady_state`, `idle_in_tx_saturation`, `long_horizon`) |
 
 If the two ever diverge on workload shape or thresholds, the awa-only
 benches are canonical for awa's own numbers and the long-horizon runner

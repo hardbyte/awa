@@ -67,7 +67,7 @@ jobs:
           SYSTEMS="${{ github.event.inputs.systems || 'awa' }}"
           PRODUCER_RATE="${{ github.event.inputs.producer_rate || '100' }}"
           WORKER_COUNT="${{ github.event.inputs.worker_count || '8' }}"
-          uv run python long_horizon.py \
+          uv run python long_horizon.py run \
             --phase warmup=warmup:30s \
             --phase clean_1=clean:30s \
             --phase idle_1=idle-in-tx:30s \
@@ -104,7 +104,7 @@ jobs:
         working-directory: benchmarks/portable
         env:
           SQLX_OFFLINE: "true"
-        run: uv run python long_horizon.py --scenario long_horizon
+        run: uv run python long_horizon.py run --scenario long_horizon
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4

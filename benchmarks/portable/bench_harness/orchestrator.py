@@ -784,10 +784,12 @@ def drive(
 # ────────────────────────────────────────────────────────────────────────
 
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Long-horizon benchmark runner for the portable queue suite",
-    )
+def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
+    """Run-mode arguments. Shared by `run` and any future runner subcommands.
+
+    See `build_parser()` for the unified CLI surface (#174). This factor-out
+    keeps the option list in one place so it doesn't drift between callers.
+    """
     parser.add_argument(
         "--scenario",
         default=None,
@@ -869,29 +871,67 @@ def build_parser() -> argparse.ArgumentParser:
         "aggregate. Divide --producer-rate by --replicas to hold total "
         "offered load constant across replica counts.",
     )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    """Top-level CLI for the portable benchmarking harness.
+
+    Subcommand-shaped (#174) so the harness has one entry point even as
+    new actions land. Today: `run` (drive a benchmark) and `combine`
+    (merge already-completed single-system runs into one consolidated
+    report). Once `chaos.py` folds in (UNIFIED_DRIVER_DESIGN.md), its
+    scenarios become named phase sequences invoked through `run`; no
+    new subcommand is expected to land at the CLI level.
+    """
+    from . import combine
+
+    parser = argparse.ArgumentParser(
+        prog="long_horizon.py",
+        description="Portable benchmarking harness: drive runs and combine reports.",
+    )
+    subparsers = parser.add_subparsers(
+        dest="command",
+        required=True,
+        metavar="{run,combine}",
+    )
+
+    run_parser = subparsers.add_parser(
+        "run",
+        help="Run a benchmark scenario or custom phase sequence.",
+        description=(
+            "Drive one or more adapters through a scenario or custom phase "
+            "sequence. Pass every system you want to overlay in `index.html` "
+            "as a comma-separated list to `--systems` *in this single "
+            "invocation*; the cross-system overlays are produced from the "
+            "merged samples in one `raw.csv`. To consolidate runs that were "
+            "started separately, use the `combine` subcommand instead."
+        ),
+    )
+    _add_run_arguments(run_parser)
+    run_parser.set_defaults(func=_cmd_run)
+
+    combine.add_subparser(subparsers)
+
     return parser
 
 
-def main(argv: list[str] | None = None) -> int:
+def _cmd_run(args: argparse.Namespace) -> int:
     from pydantic import ValidationError
 
     from .config import CliConfig, format_validation_error
 
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    # All validation flows through one pydantic model so rules stay in
-    # one place and bad combinations produce structured, readable CLI
-    # errors. See bench_harness/config.py.
     try:
         config = CliConfig.from_namespace(args)
         phases = config.resolve_phases()
     except ValidationError as exc:
-        parser.error(format_validation_error(exc))
+        # All validation flows through one pydantic model so rules stay
+        # in one place and bad combinations produce structured, readable
+        # CLI errors. See bench_harness/config.py.
+        raise SystemExit(format_validation_error(exc))
     except ValueError as exc:
         # resolve_scenario (and anything else that raises ValueError
-        # downstream) is already CLI-friendly; route it through the same
-        # parser.error so the user sees consistent framing.
-        parser.error(str(exc))
+        # downstream) is already CLI-friendly; surface it consistently.
+        raise SystemExit(str(exc))
 
     drive(
         systems=config.systems,
@@ -907,9 +947,15 @@ def main(argv: list[str] | None = None) -> int:
         worker_count=config.worker_count,
         high_load_multiplier=config.high_load_multiplier,
         replicas=config.replicas,
-        cli_args=list(sys.argv) if argv is None else list(argv),
+        cli_args=list(sys.argv),
     )
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
 
 
 if __name__ == "__main__":

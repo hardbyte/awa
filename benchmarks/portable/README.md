@@ -190,18 +190,26 @@ publication-quality plots. Use this to compare awa to peer systems on slow
 failure modes (idle-in-tx bloat, sustained high load, soak drift) that the
 short-horizon suite above cannot see.
 
+The CLI is subcommand-shaped (#174). Today's subcommands are `run`
+(drive a benchmark) and `combine` (merge already-completed
+single-system runs into one consolidated report). When `chaos.py`
+folds in (see [`UNIFIED_DRIVER_DESIGN.md`](UNIFIED_DRIVER_DESIGN.md)),
+its scenarios become named phase sequences invoked through `run` —
+no new subcommand is expected to land at the CLI level.
+
 ```bash
 # Named scenario (idle_in_tx_saturation ≈ 2h40m; long_horizon ≈ 6h10m):
-uv run python benchmarks/portable/long_horizon.py --scenario idle_in_tx_saturation
+uv run python benchmarks/portable/long_horizon.py run \
+    --scenario idle_in_tx_saturation
 
 # Event/message delivery comparison profile:
-uv run python benchmarks/portable/long_horizon.py \
+uv run python benchmarks/portable/long_horizon.py run \
     --scenario event_delivery_matrix \
     --systems awa,pgque,pgboss,pgmq \
     --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0
 
 # Custom phases (label=type:duration):
-uv run python benchmarks/portable/long_horizon.py \
+uv run python benchmarks/portable/long_horizon.py run \
     --phase warmup=warmup:10m \
     --phase clean_1=clean:60m \
     --phase idle_1=idle-in-tx:60m \
@@ -209,7 +217,7 @@ uv run python benchmarks/portable/long_horizon.py \
     --systems awa,river
 
 # Developer fast path — single PG, DB-only recreation, short phases:
-uv run python benchmarks/portable/long_horizon.py \
+uv run python benchmarks/portable/long_horizon.py run \
     --scenario idle_in_tx_saturation --fast
 ```
 
@@ -217,6 +225,47 @@ Phase types: `warmup`, `clean`, `idle-in-tx`, `recovery`, `active-readers`,
 `high-load`. `warmup` samples are kept in `raw.csv` but excluded from
 `summary.json` and hidden by default in the interactive report. New phase
 types plug in via `bench_harness.phases` + `bench_harness.hooks`.
+
+### Run all systems in **one** invocation
+
+The cross-system overlays in `index.html` (per-system traces on the same
+plot, side-by-side phase tables, comparable-x-axis timeline) are
+produced inside a single `run` invocation against the merged samples in
+that run's `raw.csv`. Pass every system you want to compare to
+`--systems` *as a comma-separated list*:
+
+```bash
+# CORRECT — one consolidated index.html with all systems overlaid.
+uv run python benchmarks/portable/long_horizon.py run \
+    --systems awa,awa-canonical,awa-python,procrastinate,river,oban,pgque,pgboss \
+    --phase warmup=warmup:2m --phase clean_1=clean:13m
+
+# WRONG — looping the harness once per system produces N independent run
+# directories with N independent single-system index.htmls. There's no
+# consolidation step; the comparison report doesn't exist.
+for sys in awa awa-canonical ... ; do
+    uv run python benchmarks/portable/long_horizon.py run --systems "$sys" ...
+done
+```
+
+Why it's structured this way: the harness shares one Postgres container
+and one timeline across the whole invocation so phases line up exactly
+across systems. Splitting that across N invocations also splits the
+timeline.
+
+If you've already produced N separate single-system runs and don't want
+to redo them, the `combine` subcommand merges them after the fact
+(concatenates `raw.csv`, joins `summary.json` system blocks, and
+re-renders `index.html`):
+
+```bash
+uv run python benchmarks/portable/long_horizon.py combine \
+    --out results/comparison-2026-04-29 \
+    results/custom-...-A results/custom-...-B ...
+```
+
+Inputs must share the same phase shape (label, type, duration). Each
+system may appear in only one input run.
 
 ### Recommended comparison scenarios
 
@@ -345,7 +394,7 @@ Docker packaging under long-horizon pressure.
 than the stock pinned `postgres:17.2-alpine` image. Use:
 
 ```bash
-uv run python benchmarks/portable/long_horizon.py \
+uv run python benchmarks/portable/long_horizon.py run \
   --systems pgmq \
   --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0
 ```

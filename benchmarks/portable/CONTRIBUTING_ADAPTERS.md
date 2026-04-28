@@ -197,7 +197,7 @@ DATABASE_URL=postgres://bench:bench@localhost:15555/<name>_bench \
   ./your-adapter 2>&1 | head -50
 
 # Integrate with the harness at reduced scale
-uv run python benchmarks/portable/long_horizon.py \
+uv run python benchmarks/portable/long_horizon.py run \
   --phase warmup=warmup:30s \
   --phase clean_1=clean:30s \
   --phase idle_1=idle-in-tx:30s \

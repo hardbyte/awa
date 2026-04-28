@@ -13,7 +13,7 @@
 #
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 #   OTEL_SERVICE_NAME=awa-portable-bench \
-#   uv run python ../../benchmarks/portable/long_horizon.py ...
+#   uv run python ../../benchmarks/portable/long_horizon.py run ...
 #
 # Grafana lands at http://localhost:13000 (admin/admin), with the
 # Awa dashboard pre-loaded under "Awa / Awa Job Queue".

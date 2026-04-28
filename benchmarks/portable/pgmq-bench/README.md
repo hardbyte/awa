@@ -12,7 +12,7 @@ This adapter is opt-in rather than part of the default long-horizon matrix
 because it requires a pgmq-enabled Postgres image. Example:
 
 ```bash
-uv run python benchmarks/portable/long_horizon.py \
+uv run python benchmarks/portable/long_horizon.py run \
   --systems pgmq \
   --pg-image ghcr.io/pgmq/pg18-pgmq:v1.10.0 \
   --fast

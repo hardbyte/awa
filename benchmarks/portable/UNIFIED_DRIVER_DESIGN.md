@@ -194,6 +194,16 @@ Sized so each commit compiles, passes tests, and is useful on its
 own.
 
 1. **Design doc** (this file). Lets reviewers react before code moves.
+1a. **Subcommand-shaped CLI surface.** *Landed.* `long_horizon.py`
+   becomes the umbrella entry point with two subcommands: `run`
+   (drive a benchmark, the existing flow) and `combine` (merge
+   already-completed single-system runs into one report). When
+   `chaos.py` folds in below, its scenarios become named phase
+   sequences invoked through `run` — the CLI surface doesn't grow.
+   Direct-args invocations like `long_horizon.py --scenario X` are
+   gone; callers prefix with `run` or `combine`. README,
+   `awa_semantics.py`, `worker_scale.py`, the nightly bench
+   workflow, and CI smoke have been updated.
 2. **`replicas` plumbing + `instance_id` column.** Non-destructive
    addition: launcher takes optional replica count, Rust/Python/Go/Elixir
    adapters get a `BENCH_INSTANCE_ID` env var and emit it on every

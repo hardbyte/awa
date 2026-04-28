@@ -66,6 +66,7 @@ def run_once(
         "run",
         "python",
         str(LONG_HORIZON),
+        "run",
         "--systems",
         "awa",
         "--replicas",
