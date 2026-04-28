@@ -23,6 +23,73 @@ AWA has three configuration surfaces: the **Rust runtime** (`ClientBuilder` + `Q
 
 Workers and the UI server are separate processes. Workers own all queue machinery — the UI is a read-mostly dashboard with optional admin actions.
 
+## Worker scope: which queues and which kinds
+
+A single worker process handles work for the **set of queues it was
+configured with** and the **set of job kinds it registered handlers
+for**. There is no implicit fan-out across queues, and no implicit
+filter on kinds within a queue — these are two separate concerns.
+
+### Targeting specific queues
+
+A worker only claims jobs from queues passed to its builder; everything
+else on the database is invisible to it. To run a worker dedicated to
+one queue, only declare that queue:
+
+```rust
+// Rust: this worker only ever processes the "email" queue.
+let client = Client::builder(pool)
+    .queue("email", QueueConfig::default())
+    .register::<SendEmail, _, _>(handle_email)
+    .build()?;
+client.start().await?;
+```
+
+```python
+# Python: same idea — only "email" is in the start list.
+@client.task(SendEmail, queue="email")
+async def handle(job): ...
+
+await client.start([("email", 8)])
+```
+
+Run separate worker processes (or separate fleets) per queue when you
+want **isolation**: a stuck `etl` queue can't starve `email`,
+deployment of a slow handler doesn't pause unrelated queues, and per-
+queue scaling is just a deployment knob. Run **one worker process
+across multiple queues** with `global_max_workers` and weighted mode
+when you want elastic capacity sharing — see [Weighted
+mode](#weighted-mode).
+
+### Targeting specific job kinds within a queue
+
+`register::<SomeJob, _, _>` (Rust) or `@client.task(SomeJob, ...)`
+(Python) tells the worker how to execute one specific job kind. At
+execute time the worker looks up the kind on the claimed job and runs
+the matching handler.
+
+**Sharp edge:** the claim path is per-queue, not per-kind. If a queue
+holds jobs of kinds the worker didn't register, the worker still
+claims those jobs (it can't tell ahead of time) and then **fails them
+terminally** with `unknown job kind: <name>`. There is no soft re-
+enqueue. So the supported patterns for "this worker only handles a
+subset of kinds" are:
+
+1. **Recommended: put each kind set on its own queue.** Queues are
+   cheap; this is the operator-shaped boundary. Workers with
+   different kind responsibilities subscribe to different queues, and
+   the queue boundary becomes the routing decision.
+2. **Acceptable: every worker on the queue registers handlers for
+   every kind that lands there.** Heterogeneous workloads on a single
+   queue work fine as long as no worker is missing a registration.
+3. **Not supported: have some workers on a queue claim jobs and
+   silently leave kinds they don't know for someone else.** This will
+   terminal-fail or DLQ jobs.
+
+If kinds drift out of sync (e.g. a deploy lags), the descriptor
+catalog in the admin UI flags missing handlers; see [Queue and
+job-kind descriptors](#queue-and-job-kind-descriptors) below.
+
 ## Queue configuration
 
 Every queue needs a `QueueConfig`. The two fundamental choices are:
@@ -89,6 +156,84 @@ await client.start(
 
 Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Each queue's `min_workers` is guaranteed; remaining capacity is distributed by `weight`. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.
 
+## Job priority and aging
+
+Every job carries a **priority** (`i16`, lower number = higher
+priority). The default is `2`. Conventional usage:
+
+| Priority | Typical meaning |
+|---|---|
+| `1` | Urgent / customer-facing / SLA-critical |
+| `2` | Default |
+| `3` | Background work |
+| `4`+ | Batch / catch-up / bulk reprocess |
+
+Priority enters the queue at insert time:
+
+```rust
+// Rust
+awa::insert_with(
+    &pool,
+    &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() },
+    awa::InsertOpts {
+        queue: "email".into(),
+        priority: 1, // urgent
+        ..Default::default()
+    },
+).await?;
+```
+
+```python
+# Python — kwargs on insert
+await client.insert(
+    SendEmail(to="alice@example.com", subject="Welcome"),
+    queue="email",
+    priority=1,
+)
+```
+
+### Priority aging (escalation for fairness)
+
+Without aging, a steady stream of priority-1 work can starve every
+priority-2 job behind it. AWA escalates priority over time — the
+longer a job has been waiting, the higher (numerically lower) its
+**effective priority** becomes at claim time. A priority-4 job that
+has waited `4 × aging_interval` ages all the way down to priority 1
+and is no longer starvable.
+
+The cadence is per-queue via `QueueConfig.priority_aging_interval`
+(default `60s`) on the Rust side:
+
+```rust
+.queue("etl", QueueConfig {
+    max_workers: 8,
+    // Drop one priority level every 30 seconds of waiting.
+    priority_aging_interval: Duration::from_secs(30),
+    ..Default::default()
+})
+```
+
+Aging is computed at claim time on queue-storage runtimes — the stored
+priority does not change, only the effective priority used for
+ordering. The admin UI surfaces both the original priority (so you can
+still see "this was enqueued as priority 4") and the current effective
+priority. Set `priority_aging_interval = Duration::ZERO` to disable
+escalation entirely (strict static priority).
+
+There is a separate top-level `ClientBuilder::priority_aging_interval`
+that controls the legacy canonical-storage maintenance pass that
+physically rewrites stored priorities. With queue storage (the 0.6
+default) it is a no-op; the per-queue setting above is the one to
+tune.
+
+> **Python parity gap.** The Python `client.start()` queue dict
+> currently exposes `name`, `max_workers`, `min_workers`, `weight`,
+> and `rate_limit`. Per-queue `priority_aging_interval` and
+> `deadline_duration` are Rust-only knobs today — Python workers run
+> with the defaults (60s aging, 5m deadline) for every queue. The
+> top-level `priority_aging_interval_ms` kwarg on `client.start()`
+> only affects the legacy canonical maintenance pass.
+
 ## Queue and job-kind descriptors
 
 Queues and job kinds can carry operator-facing metadata: display names, descriptions, owners, docs links, tags, and arbitrary JSON `extra`. This is separate from runtime scheduling config and drives the labels the admin UI / API surface.
@@ -146,15 +291,88 @@ await client.start([("email", 8)])
 
 Both surfaces must be called before `start()` / `build()`. Declaring a descriptor for a queue the client doesn't run is an error, so dead references show up at startup instead of silently producing stale rows.
 
-## Runtime tuning
+## Reliability timings: heartbeat, deadline, rescue
 
-`ClientBuilder` (Rust) and `client.start()` kwargs (Python) control maintenance loop intervals. The defaults are sensible for most workloads — you'd typically only touch these for:
+These knobs control **how fast a stuck or crashed handler is noticed
+and rescued**. They live on `ClientBuilder` (Rust) and `client.start()`
+kwargs (Python). All of them have `_ms`-suffixed kwargs on the Python
+side (e.g. `heartbeat_interval_ms=15000`).
 
-- **Heartbeat interval** (`30s`) — lower if you need faster crash detection
-- **Retention** (`24h` completed, `72h` failed) — raise if you need longer history, lower to reduce table size
-- **Cleanup batch size** (`1000`) — raise for high-throughput systems to avoid frequent cleanup passes
+### Heartbeat — detecting crashed workers
 
-All intervals have `_ms` suffixed kwargs in Python (e.g. `heartbeat_interval_ms=15000`).
+A running job updates a heartbeat row periodically while its handler
+is alive. If the heartbeat goes stale, the maintenance leader rescues
+the job (re-enqueues it for another attempt). Three knobs participate:
+
+| Knob | Default | What it does |
+|---|---|---|
+| `heartbeat_interval` | `30s` | How often each running handler refreshes its heartbeat row. |
+| `heartbeat_staleness` | `90s` | How long the row may go un-refreshed before the maintenance leader treats the job as crashed. |
+| `heartbeat_rescue_interval` | `30s` | How often the maintenance leader scans for stale heartbeats. |
+
+Pick them in this order:
+
+1. **Decide your detection target.** "Crashes should be noticed within
+   X seconds." That target is roughly `heartbeat_staleness +
+   heartbeat_rescue_interval` in the worst case.
+2. **Set `heartbeat_staleness` to at least `3× heartbeat_interval`.**
+   The 3× rule absorbs scheduler hiccups, GC pauses, and the rescue
+   scan's own jitter; tighter ratios produce false rescues. The
+   builder logs a warning if you violate it.
+3. **`heartbeat_rescue_interval`** can match `heartbeat_interval` for
+   low-latency rescue, or be higher to reduce maintenance load on big
+   fleets.
+
+For a 5-second crash detection target: `heartbeat_interval=1s`,
+`heartbeat_staleness=4s`, `heartbeat_rescue_interval=1s`. For a
+1-minute target with the cheapest possible maintenance: keep all the
+defaults.
+
+### Deadline — bounding a single attempt
+
+Each queue has a `deadline_duration` (default `5m` on
+`QueueConfig`). At claim time the runtime stamps
+`now() + deadline_duration` onto the claim, and a maintenance scan
+force-closes attempts that pass it without completing. This bounds a
+single attempt's wall-clock time independently of heartbeats — if a
+handler is hanging, looping forever, or wedged in a sync wait,
+the deadline rescues it even if its heartbeat is fresh.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `QueueConfig.deadline_duration` | `5m` | Per-queue hard upper bound on one attempt. `Duration::ZERO` skips deadline rescue for that queue. |
+| `ClientBuilder::deadline_rescue_interval` | `30s` | How often the maintenance leader scans for expired deadlines. |
+
+Receipts mode (the 0.6 default storage) supports both shapes: the
+deadline lands on `lease_claims.deadline_at` and is rescued there for
+short claims, or carried onto `leases.deadline_at` if the claim
+materializes for a long-running attempt. See [Queue storage
+tuning](#queue-storage-tuning) and ADR-023.
+
+### Callback timeout — bounding `wait_for_callback`
+
+If you suspend a handler with `wait_for_callback()` and the external
+system never resumes, a callback-timeout rescue brings the job back to
+ready (or DLQ if attempts are exhausted).
+
+| Knob | Default | What it does |
+|---|---|---|
+| `ClientBuilder::callback_rescue_interval` | `30s` | How often the maintenance leader scans for `callback_timeout_at < now()`. The per-callback timeout itself is set when registering the callback in the handler. |
+
+### Retention and cleanup
+
+Terminal jobs and DLQ rows aren't purged synchronously; the
+maintenance leader sweeps them in batches.
+
+| Knob | Default | What it does |
+|---|---|---|
+| `completed_retention` | `24h` | How long completed jobs stay queryable before the cleanup pass deletes them. |
+| `failed_retention` | `72h` | Same for failed/cancelled jobs (excluding DLQ). |
+| `dlq_retention` | none | If unset, DLQ rows live forever. Set a duration to age them out. |
+| `descriptor_retention` | `30d` | How long stale queue/kind descriptor catalog rows survive. |
+| `cleanup_interval` | `60s` | How often the cleanup pass runs. |
+| `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
+| `dlq_cleanup_batch_size` | `1000` | DLQ-specific batch size. |
 
 ## Queue storage tuning
 
@@ -235,27 +453,64 @@ single-queue workloads, `queue_stripe_count`.
 
 ## Dead Letter Queue
 
-Queue-storage deployments can route terminal failures into the DLQ instead of
-leaving them in ordinary terminal history. The policy knobs currently live on
-the Rust runtime builder:
+The DLQ is the **separate, durable hold-table for jobs that exhausted
+retries or hit a non-retryable terminal failure**. Without it,
+terminal failures live in ordinary `terminal_entries` rotation and
+age out under the `failed_retention` window — they're observable
+briefly, then gone. With DLQ enabled, those rows land in
+`dlq_entries`, are visible to the admin UI / API as a discrete
+backlog, and can be retried or purged by an operator.
+
+### When to enable
+
+- **Enable DLQ for queues whose terminal failures need an operator
+  decision.** Payment, notification, billing — anything where you'd
+  rather a human triages a failure than have the job silently age out.
+- **Leave DLQ disabled for high-throughput queues whose failures are
+  fire-and-forget.** Logging, telemetry, ETL retries that get
+  re-driven from upstream — accumulating dead rows here is just
+  storage cost.
+- **Default to disabled** unless you've decided either way; the
+  builder's `dlq_enabled_by_default` is the global switch and
+  `queue_dlq_enabled` is the per-queue override.
+
+### Configuring
 
 ```rust
 use std::time::Duration;
 
 let client = Client::builder(pool.clone())
-    .dlq_enabled_by_default(true)
-    .queue_dlq_enabled("metrics_flush", false)
-    .dlq_retention(Duration::from_secs(60 * 60 * 24 * 30))
+    .dlq_enabled_by_default(true)            // default for every queue
+    .queue_dlq_enabled("metrics_flush", false) // exception: this one stays off
+    .dlq_retention(Duration::from_secs(60 * 60 * 24 * 30))  // 30 days
     .dlq_cleanup_batch_size(1000)
     .build()
     .await?;
 ```
 
-Per-queue retention overrides still use `RetentionPolicy.dlq`.
+DLQ policy is per-queue, not per-job-kind. If you need a single queue
+to handle some kinds with DLQ and some without, split them onto two
+queues (the same shape recommended for [worker scope by
+kind](#targeting-specific-job-kinds-within-a-queue)).
 
-Python, CLI, REST, and Web UI surfaces can inspect and operate on DLQ rows once
-the deployment is using queue storage, but queue-policy declaration is still a
-runtime-side concern. See [ADR-020](adr/020-dead-letter-queue.md).
+Per-queue retention overrides go through `RetentionPolicy.dlq` on
+`queue_retention(queue, policy)` — handy if one queue's failures need
+to live longer than the global `dlq_retention`.
+
+### Operator workflow
+
+Once DLQ is on, operators interact with it through:
+
+- **Web UI** — DLQ tab with retry, purge, and per-row failure detail.
+- **CLI** — `awa dlq list`, `awa dlq retry <id>`, `awa dlq purge`.
+- **REST** — `/api/dlq/*` endpoints (same actions as the UI).
+- **Python / Rust** — `client.dlq_*` admin methods for programmatic
+  retry / purge.
+
+Queue-policy declaration is still a runtime-side concern; the UI /
+API report state but don't toggle DLQ on/off (that's a code-level
+decision so it doesn't drift between deployments). See
+[ADR-020](adr/020-dead-letter-queue.md).
 
 ## CLI and `awa serve`
 

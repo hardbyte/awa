@@ -126,6 +126,13 @@ Language-specific guides:
 - [Rust getting started](docs/getting-started-rust.md)
 - [Python getting started](docs/getting-started-python.md)
 
+Configuring real workloads:
+
+- [Worker scope: which queues and which kinds](docs/configuration.md#worker-scope-which-queues-and-which-kinds) — running a worker against one queue, or splitting kinds across queues
+- [Job priority and aging](docs/configuration.md#job-priority-and-aging) — priority scale, escalation, the per-queue `priority_aging_interval`
+- [Reliability timings](docs/configuration.md#reliability-timings-heartbeat-deadline-rescue) — heartbeat / deadline / callback rescue, retention, the 3× heartbeat-staleness rule
+- [Dead Letter Queue](docs/configuration.md#dead-letter-queue) — when to enable, per-queue overrides, operator workflow
+
 Already running 0.5? Read the [0.5 → 0.6 upgrade guide](docs/upgrade-0.5-to-0.6.md)
 before you bump — 0.6 introduces a staged storage transition (canonical →
 prepared → mixed_transition → active) with a refused-by-default gate that
