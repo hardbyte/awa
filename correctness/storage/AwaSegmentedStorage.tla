@@ -70,6 +70,20 @@ TerminalSegments == 1..TerminalSegmentCount
 ClaimSegments == 1..ClaimSegmentCount
 SegmentStates == {"open", "sealed", "pruned"}
 
+\* Claim-receipt rows are identified by (job, run_lease) — each attempt
+\* carries a distinct run_lease, so the bookkeeping for an old attempt's
+\* receipt survives even after the same job has been re-claimed in a
+\* newer partition. This is what lets the model reach race orderings
+\* like "rescue closes the old partition's receipt *after* the next
+\* claim has fired into a newer partition" without losing track of the
+\* physical row in the old partition. The Rust implementation is atomic
+\* in that ordering today (rescue_stale_receipt_claims_tx writes the
+\* closure inside the same transaction that re-claims), but the spec
+\* needs the resolution to model concurrent rescue / re-claim races
+\* that the prior Jobs-keyed abstraction couldn't reach.
+RunLeaseValues == 1..MaxRunLease
+ClaimKeys == Jobs \X RunLeaseValues
+
 NoWorker == "none"
 NoReadySegment == 0
 NoLeaseSegment == 0
@@ -144,7 +158,7 @@ CurrentReady == ((((readyEntries \ terminalEntries) \ activeLeases) \ deferredEn
 
 JobsInReadySegment(seg) == {j \in Jobs : readySegmentOf[j] = seg}
 JobsInTerminalSegment(seg) == {j \in Jobs : terminalSegmentOf[j] = seg}
-JobsInClaimSegment(seg) == {j \in Jobs : claimSegmentOf[j] = seg}
+KeysInClaimSegment(seg) == {k \in ClaimKeys : claimSegmentOf[k] = seg}
 
 InitSegments(Range) == [s \in Range |-> IF s = 1 THEN "open" ELSE "pruned"]
 
@@ -165,7 +179,7 @@ Init ==
     /\ readySegmentOf = [j \in Jobs |-> NoReadySegment]
     /\ leaseSegmentOf = [j \in Jobs |-> NoLeaseSegment]
     /\ terminalSegmentOf = [j \in Jobs |-> NoTerminalSegment]
-    /\ claimSegmentOf = [j \in Jobs |-> NoClaimSegment]
+    /\ claimSegmentOf = [k \in ClaimKeys |-> NoClaimSegment]
     /\ claimOpen = {}
     /\ claimClosed = {}
     /\ readySegments = InitSegments(ReadySegments)
@@ -309,9 +323,13 @@ AdvanceClaimCursor ==
 \* Claim now also appends a claim receipt into the current claim segment.
 \* The receipt lives in `claim_slot = claimSegmentCursor`; the
 \* corresponding closure row (written by an attempt-ending transition)
-\* targets the same slot, which is why `claimSegmentOf[j]` is preserved
-\* across close until the whole partition is pruned.
+\* targets the same slot, which is why `claimSegmentOf[<<j, r>>]` is
+\* preserved across close until the whole partition is pruned. Each
+\* attempt has its own (j, run_lease) key so the previous attempt's
+\* receipt bookkeeping is unaffected by the next claim.
 Claim(w, j) ==
+    LET newKey == <<j, runLease[j] + 1>>
+    IN
     /\ w \in Workers
     /\ j \in CurrentReady
     /\ laneSeq[j] = laneState.claimSeq
@@ -324,13 +342,13 @@ Claim(w, j) ==
     /\ taskLease' = [taskLease EXCEPT ![w][j] = runLease[j] + 1]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = leaseSegmentCursor]
     /\ heartbeatFresh' = heartbeatFresh \cup {j}
-    /\ claimSegmentOf' = [claimSegmentOf EXCEPT ![j] = claimSegmentCursor]
-    /\ claimOpen' = claimOpen \cup {j}
-    \* Starting a new attempt cycle wipes the closure bookkeeping for
-    \* `j` left over from the previous attempt. The physical closure row
-    \* in the old partition is still counted by that partition's
-    \* claimSegmentOf mapping until prune fires.
-    /\ claimClosed' = claimClosed \ {j}
+    /\ claimSegmentOf' = [claimSegmentOf EXCEPT ![newKey] = claimSegmentCursor]
+    /\ claimOpen' = claimOpen \cup {newKey}
+    \* The previous attempt's closure bookkeeping (if any) lives under
+    \* its own (j, old_run_lease) key in claimClosed and stays put;
+    \* prune is what eventually removes it once the old partition seals
+    \* and is reclaimed.
+    /\ UNCHANGED claimClosed
     /\ laneState' = [laneState EXCEPT
                         !.claimSeq = laneState.claimSeq + 1,
                         !.readyCount = laneState.readyCount - 1,
@@ -511,8 +529,8 @@ TimeoutWaitingToReady(j) ==
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
     /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT
                         !.appendSeq = laneState.appendSeq + 1,
                         !.readyCount = laneState.readyCount + 1,
@@ -542,8 +560,8 @@ TimeoutWaitingToDlq(j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    terminalEntries,
@@ -570,8 +588,8 @@ FastComplete(w, j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
@@ -602,8 +620,8 @@ StatefulComplete(w, j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
@@ -632,8 +650,8 @@ FailToDlq(w, j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
@@ -660,8 +678,8 @@ RetryToDeferred(w, j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<waitingLeases,
                    terminalEntries,
@@ -690,8 +708,8 @@ RescueToReady(j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT
                         !.appendSeq = laneState.appendSeq + 1,
                         !.readyCount = laneState.readyCount + 1,
@@ -707,18 +725,25 @@ RescueToReady(j) ==
                    claimSegmentOf>>
     /\ UnchangedSegmentState
 
-\* ADR-023 Tier-A rescue: force-close a straggling receipt whose attempt
-\* has already been taken off the ready / leased / waiting lifecycle (so
-\* there is no live runtime to rescue-to-ready from). The receipt itself
-\* is still open, which would otherwise block prune on its partition.
+\* ADR-023 Tier-A rescue: force-close a straggling receipt whose
+\* attempt is no longer alive on this (j, run_lease). The action takes
+\* the explicit key so the spec can model rescue firing on an old
+\* attempt's receipt *concurrently with* a newer Claim having already
+\* opened a fresh receipt under (j, runLease[j]). Either of two
+\* preconditions makes the targeted receipt dead:
+\*   - `runLease[j] > r` — the job has already moved on to a newer
+\*     attempt, so the receipt under `r` is definitely abandoned.
+\*   - the job is fully off the ready / leased / waiting lifecycle —
+\*     no live runtime is processing this attempt anywhere.
 \* This models the rescue-before-truncate precondition that
 \* `prune_oldest_claims` takes before calling TRUNCATE.
-RescueStaleReceipt(j) ==
-    /\ j \in claimOpen
-    /\ j \notin activeLeases
-    /\ j \notin waitingLeases
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+RescueStaleReceipt(j, r) ==
+    /\ <<j, r>> \in claimOpen
+    /\ \/ runLease[j] > r
+       \/ /\ j \notin activeLeases
+          /\ j \notin waitingLeases
+    /\ claimOpen' = claimOpen \ {<<j, r>>}
+    /\ claimClosed' = claimClosed \cup {<<j, r>>}
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
                    waitingLeases,
@@ -755,8 +780,8 @@ CancelWaitingToTerminal(j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    dlqEntries,
@@ -795,8 +820,8 @@ CancelRunningToTerminal(j) ==
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ laneState' = [laneState EXCEPT !.leasedCount = laneState.leasedCount - 1]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
@@ -813,7 +838,7 @@ CancelRunningToTerminal(j) ==
 \* Distinct from CancelRunningToTerminal because no lease ever existed,
 \* so activeLeases is unchanged and laneState's leasedCount stays put.
 CancelReceiptOnlyToTerminal(j) ==
-    /\ j \in claimOpen
+    /\ <<j, runLease[j]>> \in claimOpen
     /\ j \notin activeLeases
     /\ j \notin waitingLeases
     /\ terminalSegments[terminalSegmentCursor] = "open"
@@ -825,8 +850,8 @@ CancelReceiptOnlyToTerminal(j) ==
     \* Same rationale as CancelRunningToTerminal: zero every worker's
     \* taskLease snapshot since admin cancel has no worker context.
     /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
-    /\ claimOpen' = claimOpen \ {j}
-    /\ claimClosed' = claimClosed \cup {j}
+    /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
+    /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
                    dlqEntries,
@@ -894,13 +919,18 @@ MoveFailedToDlq(j) ==
 
 \* Retry a DLQ row back into live queue storage. Resets run_lease to 0
 \* to match the Rust contract (`retry_from_dlq` starts a fresh attempt).
+\* DLQ retry preserves the job's run_lease counter — `retry_from_dlq`
+\* reads the DLQ row's run_lease and reinserts it into ready_entries
+\* with that value preserved, so the next claim's `run_lease + 1` is
+\* monotonic across the job's entire lifetime. Resetting it here would
+\* let the next claim collide with an old (j, run_lease) key still
+\* tracked in claimClosed for an unpruned old partition.
 RetryFromDlq(j) ==
     /\ j \in dlqEntries
     /\ laneState.appendSeq <= MaxAppendSeq
     /\ readySegments[readySegmentCursor] = "open"
     /\ dlqEntries' = dlqEntries \ {j}
     /\ readyEntries' = readyEntries \cup {j}
-    /\ runLease' = [runLease EXCEPT ![j] = 0]
     /\ laneSeq' = [laneSeq EXCEPT ![j] = laneState.appendSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = readySegmentCursor]
     /\ laneState' = [laneState EXCEPT
@@ -911,6 +941,7 @@ RetryFromDlq(j) ==
                    terminalEntries,
                    activeLeases,
                    leaseOwner,
+                   runLease,
                    taskLease,
                    attemptState,
                    heartbeatFresh,
@@ -1173,18 +1204,21 @@ PruneTerminalSegment(seg) ==
     /\ UnchangedClaimData
 
 \* ADR-023 prune of the claim ring. The precondition
-\* `\A j : claimSegmentOf[j] = seg => j \notin claimOpen` captures
-\* rescue-before-truncate: every claim in the partition must be closed
-\* (either by a terminal transition or by RescueStaleReceipt) before
-\* `prune_oldest_claims` can TRUNCATE the lease_claims / lease_claim_closures
-\* children for that slot.
+\* `\A k : claimSegmentOf[k] = seg => k \notin claimOpen` captures
+\* rescue-before-truncate: every claim row in the partition must be
+\* closed (either by a terminal transition or by RescueStaleReceipt)
+\* before `prune_oldest_claims` can TRUNCATE the lease_claims /
+\* lease_claim_closures children for that slot. Note this iterates over
+\* ClaimKeys, so an old (j, r) receipt left behind by a previous attempt
+\* is correctly counted even when the same job has been re-claimed
+\* under (j, r+1) into a newer partition.
 PruneClaimSegment(seg) ==
     /\ seg \in ClaimSegments
     /\ claimSegments[seg] = "sealed"
     /\ seg # claimSegmentCursor
-    /\ \A j \in Jobs : claimSegmentOf[j] = seg => j \notin claimOpen
-    /\ claimSegmentOf' = [j \in Jobs |-> IF claimSegmentOf[j] = seg THEN NoClaimSegment ELSE claimSegmentOf[j]]
-    /\ claimClosed' = claimClosed \ JobsInClaimSegment(seg)
+    /\ \A k \in ClaimKeys : claimSegmentOf[k] = seg => k \notin claimOpen
+    /\ claimSegmentOf' = [k \in ClaimKeys |-> IF claimSegmentOf[k] = seg THEN NoClaimSegment ELSE claimSegmentOf[k]]
+    /\ claimClosed' = claimClosed \ KeysInClaimSegment(seg)
     /\ claimSegments' = [claimSegments EXCEPT ![seg] = "pruned"]
     /\ UNCHANGED <<readyEntries,
                    deferredEntries,
@@ -1233,7 +1267,7 @@ Next ==
     \/ \E w \in Workers, j \in Jobs : FailToDlq(w, j)
     \/ \E w \in Workers, j \in Jobs : RetryToDeferred(w, j)
     \/ \E j \in Jobs : RescueToReady(j)
-    \/ \E j \in Jobs : RescueStaleReceipt(j)
+    \/ \E j \in Jobs, r \in RunLeaseValues : RescueStaleReceipt(j, r)
     \/ \E j \in Jobs : CancelWaitingToTerminal(j)
     \/ \E j \in Jobs : CancelRunningToTerminal(j)
     \/ \E j \in Jobs : CancelReceiptOnlyToTerminal(j)
@@ -1278,9 +1312,9 @@ TypeOK ==
     /\ readySegmentOf \in [Jobs -> ReadySegments \cup {NoReadySegment}]
     /\ leaseSegmentOf \in [Jobs -> LeaseSegments \cup {NoLeaseSegment}]
     /\ terminalSegmentOf \in [Jobs -> TerminalSegments \cup {NoTerminalSegment}]
-    /\ claimSegmentOf \in [Jobs -> ClaimSegments \cup {NoClaimSegment}]
-    /\ claimOpen \subseteq Jobs
-    /\ claimClosed \subseteq Jobs
+    /\ claimSegmentOf \in [ClaimKeys -> ClaimSegments \cup {NoClaimSegment}]
+    /\ claimOpen \subseteq ClaimKeys
+    /\ claimClosed \subseteq ClaimKeys
     /\ readySegments \in [ReadySegments -> SegmentStates]
     /\ leaseSegments \in [LeaseSegments -> SegmentStates]
     /\ terminalSegments \in [TerminalSegments -> SegmentStates]
@@ -1367,7 +1401,7 @@ PrunedTerminalSegmentsAreEmpty ==
     \A j \in Jobs : terminalSegmentOf[j] # NoTerminalSegment => terminalSegments[terminalSegmentOf[j]] # "pruned"
 
 PrunedClaimSegmentsAreEmpty ==
-    \A j \in Jobs : claimSegmentOf[j] # NoClaimSegment => claimSegments[claimSegmentOf[j]] # "pruned"
+    \A k \in ClaimKeys : claimSegmentOf[k] # NoClaimSegment => claimSegments[claimSegmentOf[k]] # "pruned"
 
 \* ADR-023 core safety: no open receipt is ever physically dropped. If a
 \* claim is open (claimOpen), its partition is both non-zero and in an
@@ -1375,22 +1409,22 @@ PrunedClaimSegmentsAreEmpty ==
 \* rotation-reclaim path safe: a prune can only fire once every claim in
 \* the partition has closed (or been force-closed by RescueStaleReceipt).
 NoLostClaim ==
-    \A j \in claimOpen :
-        /\ claimSegmentOf[j] # NoClaimSegment
-        /\ claimSegments[claimSegmentOf[j]] # "pruned"
+    \A k \in claimOpen :
+        /\ claimSegmentOf[k] # NoClaimSegment
+        /\ claimSegments[claimSegmentOf[k]] # "pruned"
 
 \* A claim is in at most one of the open / closed states. Moving between
 \* them is a single atomic action (Claim opens, close transitions close,
-\* prune clears); nothing leaves j in both.
+\* prune clears); nothing leaves a (j, run_lease) key in both.
 ClaimOpenAndClosedDisjoint == claimOpen \cap claimClosed = {}
 
 \* An open receipt corresponds to a bound claim segment. An untracked
 \* claim (segmentOf = 0) cannot be open.
 OpenClaimHasSegment ==
-    \A j \in Jobs : j \in claimOpen => claimSegmentOf[j] # NoClaimSegment
+    \A k \in ClaimKeys : k \in claimOpen => claimSegmentOf[k] # NoClaimSegment
 
 ClosedClaimHasSegment ==
-    \A j \in Jobs : j \in claimClosed => claimSegmentOf[j] # NoClaimSegment
+    \A k \in ClaimKeys : k \in claimClosed => claimSegmentOf[k] # NoClaimSegment
 
 LaneStateConsistent ==
     /\ laneState.readyCount = Cardinality(CurrentReady)

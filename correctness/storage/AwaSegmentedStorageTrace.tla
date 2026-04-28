@@ -47,7 +47,9 @@ SnoozeTrace == <<
 ReceiptRescueTrace == <<
     [action |-> "EnqueueReady",             job |-> "j1"],
     [action |-> "SeedOpenReceiptOnlyClaim", worker |-> "w1", job |-> "j1"],
-    [action |-> "RescueStaleReceipt",       job |-> "j1"]
+    \* SeedOpenReceiptOnlyClaim bumped runLease to 1, so the open receipt
+    \* lives under (j1, 1). Rescue closes that exact key.
+    [action |-> "RescueStaleReceipt",       job |-> "j1", run_lease |-> 1]
 >>
 
 \* Running admin-cancel trace: enqueue, claim a lease-backed running job,
@@ -59,8 +61,10 @@ RunningCancelTrace == <<
 >>
 
 \* DLQ retry trace: executor terminal failure lands in dlq_entries,
-\* retry_from_dlq re-appends to ready_entries with run_lease reset, and
-\* the revived job can be claimed and completed.
+\* retry_from_dlq re-appends to ready_entries preserving the existing
+\* run_lease counter (matching the Rust path: the DLQ row's run_lease
+\* is reinserted as-is so the next claim's `run_lease + 1` continues
+\* monotonically), and the revived job can be claimed and completed.
 DlqRetryTrace == <<
     [action |-> "EnqueueReady", job |-> "j1"],
     [action |-> "Claim",        worker |-> "w1", job |-> "j1"],
@@ -88,6 +92,8 @@ BrokenTrace == <<
 \* receipt, but has no materialized lease row. The main spec keeps this
 \* window abstract; the trace harness needs it to replay receipt rescue.
 SeedOpenReceiptOnlyClaim(w, j) ==
+    LET newKey == <<j, runLease[j] + 1>>
+    IN
     /\ w \in Workers
     /\ j \in CurrentReady
     /\ laneSeq[j] = laneState.claimSeq
@@ -97,9 +103,9 @@ SeedOpenReceiptOnlyClaim(w, j) ==
     /\ runLease' = [runLease EXCEPT ![j] = runLease[j] + 1]
     /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
     /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
-    /\ claimSegmentOf' = [claimSegmentOf EXCEPT ![j] = claimSegmentCursor]
-    /\ claimOpen' = claimOpen \cup {j}
-    /\ claimClosed' = claimClosed \ {j}
+    /\ claimSegmentOf' = [claimSegmentOf EXCEPT ![newKey] = claimSegmentCursor]
+    /\ claimOpen' = claimOpen \cup {newKey}
+    /\ UNCHANGED claimClosed
     /\ laneState' = [laneState EXCEPT
                         !.claimSeq = laneState.claimSeq + 1,
                         !.readyCount = laneState.readyCount - 1]
@@ -141,7 +147,7 @@ TraceStep(trace, n) ==
        \/ (ev.action = "TimeoutWaitingToDlq" /\ TimeoutWaitingToDlq(ev.job))
        \/ (ev.action = "FailToDlq" /\ FailToDlq(ev.worker, ev.job))
        \/ (ev.action = "RescueToReady" /\ RescueToReady(ev.job))
-       \/ (ev.action = "RescueStaleReceipt" /\ RescueStaleReceipt(ev.job))
+       \/ (ev.action = "RescueStaleReceipt" /\ RescueStaleReceipt(ev.job, ev.run_lease))
        \/ (ev.action = "CancelWaitingToTerminal" /\ CancelWaitingToTerminal(ev.job))
        \/ (ev.action = "CancelRunningToTerminal" /\ CancelRunningToTerminal(ev.job))
        \/ (ev.action = "CancelReceiptOnlyToTerminal" /\ CancelReceiptOnlyToTerminal(ev.job))

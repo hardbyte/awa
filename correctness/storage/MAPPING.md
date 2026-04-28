@@ -27,7 +27,7 @@ onto the current Rust / SQL implementation.
 | `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
-| `claimSegmentOf[j]` | the `claim_slot` column on the job's `{schema}.lease_claims` row (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. |
+| `claimSegmentOf[<<j, r>>]` | the `claim_slot` column on the `(job_id, run_lease)` claim row in `{schema}.lease_claims` (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. The spec keys claim bookkeeping by `(job, run_lease)` rather than by `job` alone so that an old attempt's receipt survives the next claim into a newer partition — Rust's `(claim_slot, job_id, run_lease)` triplet is the actual partition-side unique key, but the model abstracts the `claim_slot` half away into `claimSegmentOf`. |
 | `claimOpen` | set of `(job_id, run_lease)` pairs with a claim row but no matching closure row in the current claim-ring partitions. Derived at query time via the `lease_claims` ⨝ `lease_claim_closures` anti-join. |
 | `claimClosed` | set of `(job_id, run_lease)` pairs with a matching closure row in the current claim-ring partitions. |
 | `claimSegments[seg]` state | same semantics as other segment families; `{schema}.claim_ring_state.current_slot` identifies the open partition, `{schema}.claim_ring_slots(slot)` tracks per-partition generation. Seeded in `prepare_schema`; rotated by `rotate_claims`. |
@@ -63,7 +63,7 @@ for backfill / fallback reads during upgrades.
 | `CancelWaitingToTerminal(j)` | waiting branch in `cancel_job_tx` (`queue_storage.rs:5501`) | `DELETE FROM leases WHERE state IN ('running', 'waiting_external')`, hydrate from `ready_entries`, insert `done_entries`, close the matching receipt |
 | `StaleCompleteRejected(w, j)` | `complete_runtime_batch` returning `CompletionOutcome::IgnoredStale` | `UPDATE leases ... WHERE run_lease = $2` matching 0 rows |
 | `MoveFailedToDlq(j)` | `QueueStorage::move_failed_to_dlq` (`queue_storage.rs:8127`); admin entry in `awa-model/src/dlq.rs:170` | `DELETE FROM done_entries ... INSERT INTO dlq_entries ...` guarded by state=failed |
-| `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:8254`) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` with `run_lease = 0`; unique-conflict handled by `sync_unique_claim` |
+| `RetryFromDlq(j)` | `QueueStorage::retry_from_dlq` (`queue_storage.rs:8254`) | CTE: `DELETE FROM dlq_entries RETURNING ...` + `INSERT INTO ready_entries ...` (Rust resets `run_lease` to 0 because the new claim row will live in a different `claim_slot` partition; the spec keeps `run_lease` monotonic per-job since it abstracts away `claim_slot` from the receipt key); unique-conflict handled by `sync_unique_claim` |
 | `PurgeDlq(j)` | `purge_dlq_job` / `purge_dlq` in `awa-model/src/dlq.rs:382, 423` | `DELETE FROM dlq_entries WHERE ...` |
 | `RotateReadySegments` | maintenance `rotate_ready` (`awa-worker/src/maintenance.rs`) | `UPDATE queue_ring_state SET current_slot = next` + partition attach/detach |
 | `RotateLeaseSegments` | `QueueStorage::rotate_leases` | `UPDATE lease_ring_state` with child-partition busy check |
@@ -71,7 +71,7 @@ for backfill / fallback reads during upgrades.
 | `PruneLeaseSegment` | `QueueStorage::prune_oldest_leases` (`queue_storage.rs:9208`) | `TRUNCATE` the selected `leases_N` child only after active-row checks |
 | `RotateClaimSegments` | maintenance `QueueStorage::rotate_claims` (`queue_storage.rs:9333`), wired via `Maintenance::rotate_queue_storage_claims` at the `claim_rotate_interval` tick | `FOR UPDATE` on `claim_ring_state`, busy-check both child partitions, then `UPDATE claim_ring_state SET current_slot = next, generation = next_gen` with compare-and-swap on `(current_slot, generation)` |
 | `PruneClaimSegment(seg)` | `QueueStorage::prune_oldest_claims` (`queue_storage.rs:9433`) | `FOR UPDATE` on `claim_ring_state`, `FOR UPDATE` on `claim_ring_slots[slot]`, `SET LOCAL lock_timeout = '50ms'`, `LOCK TABLE` `lease_claims_N` and `lease_claim_closures_N` `IN ACCESS EXCLUSIVE MODE`, recheck not-current, anti-join check that every claim has a closure (`PartitionTruncateSafety`), then `TRUNCATE` both children |
-| `RescueStaleReceipt(j)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` so the lease-side rescue path owns those. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
+| `RescueStaleReceipt(j, r)` | `rescue_stale_receipt_claims_tx` (`queue_storage.rs:6672`), invoked from maintenance `rescue_stale_heartbeats`. Excludes claims already materialized into `leases` so the lease-side rescue path owns those. The spec takes the explicit `(j, r)` so concurrent rescue / re-claim races are reachable: rescue can fire on an old attempt's `(j, r_old)` receipt while `(j, r_old + 1)` already has an open receipt in a newer partition. | anti-join `lease_claims` against `lease_claim_closures` and against `leases` over the active partitions; close stragglers by appending to `lease_claim_closures` (rescue closure outcome `'rescued'`) |
 | `CancelRunningToTerminal(j)` | `cancel_job_tx` lease branch (`queue_storage.rs:5501`, ~line 5581) | `DELETE FROM leases ... RETURNING`, `insert_done_rows_tx` (state = `cancelled`), `close_receipt_tx` (writes the `'cancelled'` closure into the matching claim partition), `pg_notify('awa:cancel', ...)` |
 | `CancelReceiptOnlyToTerminal(j)` | `cancel_job_tx` receipt-only branch (`queue_storage.rs:5621`) | `SELECT ... FROM lease_claims FOR UPDATE OF claims SKIP LOCKED` → `insert_done_rows_tx` → `INSERT INTO lease_claim_closures` → defensive `DELETE FROM leases` (sweeps any concurrent materialization) → `pg_notify` |
 
@@ -358,10 +358,14 @@ the base spec and the race / lock specs:
 - `ParkToWaiting` does NOT close the receipt — the attempt is still
   alive in callback wait. `ResumeWaitingToRunning` keeps the same receipt
   open; timeout/cancel/terminal resolution close it.
-- `RescueStaleReceipt(j)` models Tier-A receipt rescue: force-close a
-  straggler receipt whose attempt is no longer on the ready / leased /
-  waiting lifecycle. This is the rescue-before-truncate precondition
-  that `prune_oldest_claims` will invoke.
+- `RescueStaleReceipt(j, r)` models Tier-A receipt rescue: force-close
+  a straggler receipt whose attempt is no longer alive — either the job
+  has moved past `r` to a newer attempt (`runLease[j] > r`) or the job
+  is fully off the ready / leased / waiting lifecycle. This is the
+  rescue-before-truncate precondition that `prune_oldest_claims` will
+  invoke. The `(j, r)` keying lets the model reach race orderings where
+  rescue closes an old attempt's receipt *concurrently with* a newer
+  Claim having already opened a fresh receipt under `(j, r+1)`.
 - `RotateClaimSegments` and `PruneClaimSegment(seg)` parallel the
   lease-ring rotation/prune pattern.
 - `AwaStorageLockOrder` includes `ClaimRingStateResource`,
