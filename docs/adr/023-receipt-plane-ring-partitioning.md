@@ -2,11 +2,9 @@
 
 ## Status
 
-Accepted (implemented). `lease_claim_receipts` is the default in 0.6;
-the `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` env var stays as a deprecated
-alias for one release. The validation artifact under
-`docs/adr/bench/` is the empirical evidence the design holds; this
-ADR is the architectural record.
+Accepted (implemented). `lease_claim_receipts` is the default in 0.6.
+The validation artifact under `docs/adr/bench/` is the empirical
+evidence the design holds; this ADR is the architectural record.
 
 ## Context
 
@@ -288,8 +286,6 @@ This ADR has been implemented for 0.6:
 - `open_receipt_claims` is removed from fresh installs and is no longer a hot
   path table.
 - `lease_claim_receipts` defaults to `true`.
-- `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` is kept as a deprecated alias for
-  `LEASE_CLAIM_RECEIPTS` for one release.
 
 Validation evidence is split by purpose:
 

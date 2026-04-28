@@ -44,17 +44,7 @@ pub(crate) fn queue_storage_config_with_receipts_default(
     }
     let lease_claim_receipts = match std::env::var("LEASE_CLAIM_RECEIPTS") {
         Ok(value) => parse_bool(value.as_str()),
-        Err(_) => match std::env::var("EXPERIMENTAL_LEASE_CLAIM_RECEIPTS") {
-            Ok(value) => {
-                eprintln!(
-                    "[awa] EXPERIMENTAL_LEASE_CLAIM_RECEIPTS is deprecated; use \
-                     LEASE_CLAIM_RECEIPTS instead. The alias will be removed in a future \
-                     release."
-                );
-                parse_bool(value.as_str())
-            }
-            Err(_) => receipts_default,
-        },
+        Err(_) => receipts_default,
     };
     QueueStorageConfig {
         schema: std::env::var("QUEUE_STORAGE_SCHEMA").unwrap_or_else(|_| "awa".into()),

@@ -216,11 +216,6 @@ The portable benchmark adapters also read `QUEUE_SLOT_COUNT`,
 `LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark
 configuration, not general worker-runtime configuration.
 
-> **Deprecation:** `EXPERIMENTAL_LEASE_CLAIM_RECEIPTS` is still
-> read as an alias for `LEASE_CLAIM_RECEIPTS`, with a deprecation
-> warning logged on first read. The alias will be removed in a
-> future release.
-
 Use the defaults unless you have a reason not to:
 
 - Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers or retention keep old segments live.
