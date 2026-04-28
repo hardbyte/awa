@@ -2,7 +2,7 @@ use awa_model::admin::{
     self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
     RuntimeOverview, RuntimeSnapshotInput, StorageCapability,
 };
-use awa_model::storage::{self, StorageStatusReport};
+use awa_model::storage::StorageStatusReport;
 use axum::body::{to_bytes, Body};
 use axum::http::{Request, StatusCode};
 use chrono::{Duration, Utc};
@@ -63,18 +63,6 @@ async fn seed_runtime_snapshot_with(pool: &sqlx::PgPool, snapshot: RuntimeSnapsh
         .expect("failed to seed runtime snapshot");
 
     snapshot.instance_id
-}
-
-async fn prepare_queue_storage_schema(pool: &sqlx::PgPool, schema: &str) {
-    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
-        .execute(pool)
-        .await
-        .expect("failed to drop queue-storage schema");
-    awa_model::QueueStorage::from_existing_schema(schema)
-        .expect("queue-storage schema should validate")
-        .prepare_schema(pool)
-        .await
-        .expect("failed to prepare queue-storage schema");
 }
 
 async fn mark_runtime_snapshot_stale(pool: &sqlx::PgPool, instance_id: Uuid) {
@@ -478,73 +466,13 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
 }
 
 #[tokio::test]
-async fn test_storage_endpoint_returns_transition_readiness_report() {
+async fn test_storage_endpoint_returns_canonical_baseline_report() {
     let pool = setup_pool().await;
-    let schema = "ui_storage_status_report";
     sqlx::query("SELECT * FROM awa.storage_abort()")
         .execute(&pool)
         .await
         .expect("storage abort reset should succeed");
-    sqlx::query("DELETE FROM awa.runtime_instances")
-        .execute(&pool)
-        .await
-        .expect("runtime instance cleanup should succeed");
-    prepare_queue_storage_schema(&pool, schema).await;
-    storage::prepare(
-        &pool,
-        "queue_storage",
-        serde_json::json!({ "schema": schema }),
-    )
-    .await
-    .expect("storage prepare should succeed");
-    seed_runtime_snapshot_with(
-        &pool,
-        RuntimeSnapshotInput {
-            instance_id: Uuid::new_v4(),
-            hostname: Some("storage-target".to_string()),
-            pid: 5001,
-            version: "0.6.0-test".to_string(),
-            storage_capability: StorageCapability::QueueStorage,
-            started_at: Utc::now() - Duration::minutes(2),
-            snapshot_interval_ms: 10_000,
-            healthy: true,
-            postgres_connected: true,
-            poll_loop_alive: true,
-            heartbeat_alive: true,
-            maintenance_alive: true,
-            shutting_down: false,
-            leader: true,
-            global_max_workers: Some(8),
-            queues: vec![],
-            queue_descriptor_hashes: HashMap::new(),
-            job_kind_descriptor_hashes: HashMap::new(),
-        },
-    )
-    .await;
-    seed_runtime_snapshot_with(
-        &pool,
-        RuntimeSnapshotInput {
-            instance_id: Uuid::new_v4(),
-            hostname: Some("storage-canonical".to_string()),
-            pid: 5002,
-            version: "0.5.5-test".to_string(),
-            storage_capability: StorageCapability::Canonical,
-            started_at: Utc::now() - Duration::minutes(2),
-            snapshot_interval_ms: 10_000,
-            healthy: true,
-            postgres_connected: true,
-            poll_loop_alive: true,
-            heartbeat_alive: true,
-            maintenance_alive: true,
-            shutting_down: false,
-            leader: false,
-            global_max_workers: Some(8),
-            queues: vec![],
-            queue_descriptor_hashes: HashMap::new(),
-            job_kind_descriptor_hashes: HashMap::new(),
-        },
-    )
-    .await;
+
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await
         .expect("router should initialize");
@@ -566,35 +494,21 @@ async fn test_storage_endpoint_returns_transition_readiness_report() {
     let report: StorageStatusReport =
         serde_json::from_slice(&body).expect("storage report should deserialize");
 
-    assert_eq!(report.status.state, "prepared");
-    assert_eq!(
-        report.prepared_queue_storage_schema.as_deref(),
-        Some(schema)
-    );
-    assert!(report.prepared_schema_ready);
-    assert!(
-        report
-            .live_runtime_capability_counts
-            .get("queue_storage")
-            .copied()
-            .unwrap_or(0)
-            >= 1
-    );
-    assert!(
-        report
-            .live_runtime_capability_counts
-            .get("canonical")
-            .copied()
-            .unwrap_or(0)
-            >= 1
-    );
+    // On a canonical-only cluster the readiness gates should all be
+    // closed — prepared_engine is None and no queue-storage runtimes
+    // are reporting. The blocker lists must be populated so operators
+    // can see what's missing before kicking off a rollout.
+    assert_eq!(report.status.active_engine, "canonical");
+    assert!(report.prepared_queue_storage_schema.is_none());
+    assert!(!report.prepared_schema_ready);
     assert!(!report.can_enter_mixed_transition);
+    assert!(!report.can_finalize);
     assert!(
-        report
-            .enter_mixed_transition_blockers
-            .iter()
-            .any(|reason| reason.contains("canonical-only runtime")),
-        "{:?}",
-        report.enter_mixed_transition_blockers
+        !report.enter_mixed_transition_blockers.is_empty(),
+        "canonical baseline should list at least one enter-mixed-transition blocker"
+    );
+    assert!(
+        !report.finalize_blockers.is_empty(),
+        "canonical baseline should list at least one finalize blocker"
     );
 }

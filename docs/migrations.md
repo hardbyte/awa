@@ -119,10 +119,6 @@ Current behavior:
   canonical / drain-only runtimes
 - workers continue to run the canonical engine before and after `prepare`
 
-This is intentional. The `0.5.x` prep release is only adding the reusable
-tables, status APIs, capability metadata, and compat-routing seam needed for a
-later engine migration. It is not activating queue storage.
-
 ### `0.5.x` -> `0.6` Queue-Storage Rollout
 
 The 0.6 storage-engine upgrade uses the transition protocol introduced in the

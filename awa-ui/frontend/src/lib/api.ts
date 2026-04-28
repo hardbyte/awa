@@ -31,22 +31,7 @@ export interface JobRow {
   original_priority: number;
   queue_descriptor: DescriptorFields | null;
   kind_descriptor: DescriptorFields | null;
-  /** Populated when the job has been moved to the Dead Letter Queue.
-   *  When set, retry/cancel actions must route through `/api/dlq/*`. */
-  dlq?: DlqMetadata;
 }
-
-export interface DlqMetadata {
-  reason: string;
-  dlq_at: string;
-  original_run_lease: number;
-}
-
-export type DlqRow = JobRow & {
-  dlq_reason: string;
-  dlq_at: string;
-  original_run_lease: number;
-};
 
 export interface DescriptorFields {
   display_name: string | null;
@@ -115,7 +100,11 @@ export interface RuntimeInstance {
   hostname: string | null;
   pid: number;
   version: string;
-  storage_capability: string;
+  /**
+   * Worker's storage capability — populated by schema v10+. On earlier
+   * deployments the field is absent; treat as "canonical" when reading.
+   */
+  storage_capability?: string | null;
   started_at: string;
   last_seen_at: string;
   snapshot_interval_ms: number;
@@ -138,29 +127,6 @@ export interface RuntimeOverview {
   healthy_instances: number;
   leader_instances: number;
   instances: RuntimeInstance[];
-}
-
-export interface StorageStatus {
-  current_engine: string;
-  active_engine: string;
-  prepared_engine: string | null;
-  state: string;
-  transition_epoch: number;
-  details: unknown;
-  entered_at: string;
-  updated_at: string;
-  finalized_at: string | null;
-}
-
-export interface StorageStatusReport extends StorageStatus {
-  canonical_live_backlog: number;
-  prepared_queue_storage_schema: string | null;
-  prepared_schema_ready: boolean;
-  live_runtime_capability_counts: Record<string, number>;
-  can_enter_mixed_transition: boolean;
-  enter_mixed_transition_blockers: string[];
-  can_finalize: boolean;
-  finalize_blockers: string[];
 }
 
 export interface QueueRuntimeSummary {
@@ -204,6 +170,26 @@ export interface Capabilities {
   read_only: boolean;
   /** Server-suggested polling interval in milliseconds. */
   poll_interval_ms: number;
+}
+
+export interface StorageStatusReport {
+  current_engine: string;
+  active_engine: string;
+  prepared_engine: string | null;
+  state: string;
+  transition_epoch: number;
+  details: unknown;
+  entered_at: string;
+  updated_at: string;
+  finalized_at: string | null;
+  canonical_live_backlog: number;
+  prepared_queue_storage_schema: string | null;
+  prepared_schema_ready: boolean;
+  live_runtime_capability_counts: Record<string, number>;
+  can_enter_mixed_transition: boolean;
+  enter_mixed_transition_blockers: string[];
+  can_finalize: boolean;
+  finalize_blockers: string[];
 }
 
 export interface ListJobsParams {
@@ -260,94 +246,6 @@ export function bulkCancel(ids: number[]): Promise<JobRow[]> {
   return apiFetch("/jobs/bulk-cancel", {
     method: "POST",
     body: JSON.stringify({ ids }),
-  });
-}
-
-// Dead Letter Queue
-export interface ListDlqParams {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-  before_id?: number;
-  /** Pair with `before_id` for a race-free `(dlq_at, id)` cursor matching
-   *  the response sort order. ISO-8601 timestamp. */
-  before_dlq_at?: string;
-  limit?: number;
-}
-
-export interface DlqDepthResponse {
-  total: number;
-  by_queue: Array<{ queue: string; count: number }>;
-}
-
-export interface DlqBulkResult {
-  count: number;
-}
-
-export function fetchDlq(params: ListDlqParams = {}): Promise<DlqRow[]> {
-  const qs = new URLSearchParams();
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== "") qs.set(k, String(v));
-  }
-  const query = qs.toString();
-  return apiFetch(`/dlq${query ? `?${query}` : ""}`);
-}
-
-export function fetchDlqDepth(): Promise<DlqDepthResponse> {
-  return apiFetch("/dlq/depth");
-}
-
-export function fetchDlqJob(id: number): Promise<DlqRow | null> {
-  return apiFetch(`/dlq/${id}`);
-}
-
-export function retryDlqJob(
-  id: number,
-  opts: { run_at?: string; priority?: number; queue?: string } = {}
-): Promise<JobRow | null> {
-  return apiFetch(`/dlq/${id}/retry`, {
-    method: "POST",
-    body: JSON.stringify(opts),
-  });
-}
-
-export function purgeDlqJob(id: number): Promise<DlqBulkResult> {
-  return apiFetch(`/dlq/${id}`, { method: "DELETE" });
-}
-
-export function bulkRetryDlq(filter: {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-  all?: boolean;
-}): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-retry", {
-    method: "POST",
-    body: JSON.stringify(filter),
-  });
-}
-
-export function bulkPurgeDlq(filter: {
-  kind?: string;
-  queue?: string;
-  tag?: string;
-  all?: boolean;
-}): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-purge", {
-    method: "POST",
-    body: JSON.stringify(filter),
-  });
-}
-
-export function bulkMoveFailedToDlq(body: {
-  kind?: string;
-  queue?: string;
-  reason?: string;
-  all?: boolean;
-}): Promise<DlqBulkResult> {
-  return apiFetch("/dlq/bulk-move", {
-    method: "POST",
-    body: JSON.stringify(body),
   });
 }
 
@@ -410,8 +308,17 @@ export function fetchRuntime(): Promise<RuntimeOverview> {
   return apiFetch("/runtime");
 }
 
-export function fetchStorage(): Promise<StorageStatusReport> {
-  return apiFetch("/storage");
+// Returns null if the backend is older than 0.5.5-alpha and lacks /storage.
+export async function fetchStorage(): Promise<StorageStatusReport | null> {
+  const res = await fetch("/api/storage", {
+    headers: { "Content-Type": "application/json" },
+  });
+  if (res.status === 404) return null;
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({ error: res.statusText }));
+    throw new Error((body as { error?: string }).error ?? res.statusText);
+  }
+  return res.json() as Promise<StorageStatusReport>;
 }
 
 export function fetchCapabilities(): Promise<Capabilities> {

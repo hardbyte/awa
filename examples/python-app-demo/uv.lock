@@ -36,7 +36,7 @@ wheels = [
 
 [[package]]
 name = "awa-cli"
-version = "0.3.0"
+version = "0.5.6"
 source = { directory = "../../awa-cli" }
 
 [[package]]
@@ -62,8 +62,22 @@ requires-dist = [
 
 [[package]]
 name = "awa-pg"
-version = "0.3.0"
+version = "0.5.6"
 source = { directory = "../../awa-python" }
+
+[package.metadata]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "asyncpg", specifier = ">=0.31.0" },
+    { name = "django", specifier = ">=5.2" },
+    { name = "greenlet", specifier = ">=3.0" },
+    { name = "psycopg", specifier = ">=3.3.3" },
+    { name = "psycopg-binary", specifier = ">=3.3.3" },
+    { name = "pytest", specifier = ">=8.0" },
+    { name = "pytest-asyncio", specifier = ">=0.23" },
+    { name = "sqlalchemy", specifier = ">=2.0" },
+]
 
 [[package]]
 name = "click"

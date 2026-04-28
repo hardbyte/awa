@@ -6,8 +6,8 @@ test.describe("Shell navigation", () => {
   }) => {
     await page.goto("/");
 
-    // Use the navbar section for nav links to avoid matching content links
-    const nav = page.locator('[data-slot="navbar-section"]').first();
+    // Scope link lookups to the sidebar so we don't match content links.
+    const nav = page.locator('[data-slot="sidebar-section"]').first();
 
     // Click Jobs nav link
     await nav.getByRole("link", { name: "Jobs" }).click();

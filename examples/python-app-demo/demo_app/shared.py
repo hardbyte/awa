@@ -103,6 +103,59 @@ async def clear_demo_data(client: awa.AsyncClient) -> None:
 
 
 def register_workers(client: awa.AsyncClient, callback_ids: list[str] | None = None) -> None:
+    # Populate queue and job-kind descriptors so the admin UI has rich
+    # metadata to render (display name, description, ownership, docs
+    # link, tags) instead of bare queue strings.
+    client.queue_descriptor(
+        EMAIL_QUEUE,
+        display_name="Outbound email",
+        description="Transactional emails to customers — order confirmations, receipts, password resets.",
+        owner="growth@demo-shop.example",
+        docs_url="https://runbook.demo-shop.example/email",
+        tags=["user-facing", "transactional"],
+    )
+    client.queue_descriptor(
+        OPS_QUEUE,
+        display_name="Operations",
+        description="Supplier-feed sync, inventory reconciliation, batch admin tasks.",
+        owner="ops@demo-shop.example",
+        docs_url="https://runbook.demo-shop.example/ops",
+        tags=["internal", "batch"],
+    )
+    client.queue_descriptor(
+        PAYMENTS_QUEUE,
+        display_name="Payment capture",
+        description="Captures authorized payments via the payment provider and waits for their callback.",
+        owner="payments@demo-shop.example",
+        docs_url="https://runbook.demo-shop.example/payments",
+        tags=["user-facing", "external", "pci"],
+    )
+    # NB: only describe queues this client claims in `client.start([...])`.
+    # The CACHE_QUEUE / REPORTS_QUEUE backlogs are populated by the seed
+    # script for UI demonstration but no handler in this demo runs them,
+    # so descriptors for those queues can't be registered here.
+
+    client.job_kind_descriptor(
+        "send_order_confirmation_email",
+        display_name="Send order-confirmation email",
+        description="Renders the order-confirmation template and hands off to SES.",
+        owner="growth@demo-shop.example",
+        tags=["email", "transactional"],
+    )
+    client.job_kind_descriptor(
+        "sync_inventory_batch",
+        display_name="Inventory sync",
+        description="Pulls supplier feeds, validates pricing, reconciles against the product catalog.",
+        owner="ops@demo-shop.example",
+        tags=["integration"],
+    )
+    client.job_kind_descriptor(
+        "capture_payment",
+        display_name="Capture payment",
+        description="Captures a previously-authorized payment with the provider; parks on their callback.",
+        owner="payments@demo-shop.example",
+        tags=["external", "pci"],
+    )
     @client.worker(SendOrderConfirmationEmail, queue=EMAIL_QUEUE)
     async def handle_confirmation(job):
         print(
