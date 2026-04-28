@@ -2119,6 +2119,56 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // The available_count backfill needs `ready_entries` to exist.
+            // On a fresh install, ready_entries is created later in this same
+            // prepare_schema run (see the DDL block ~400 lines below). Guard
+            // both backfills with a to_regclass check so this transaction
+            // works for both upgrades (table already there) and fresh installs
+            // (skip — there's nothing to backfill, queue_lanes is empty).
+            sqlx::query(&format!(
+                r#"
+            DO $$
+            BEGIN
+                IF to_regclass('{schema}.ready_entries') IS NOT NULL THEN
+                    WITH live_ready AS (
+                        SELECT
+                            ready.queue,
+                            ready.priority,
+                            count(*)::bigint AS available_count
+                        FROM {schema}.ready_entries AS ready
+                        JOIN {schema}.queue_claim_heads AS claims
+                          ON claims.queue = ready.queue
+                         AND claims.priority = ready.priority
+                        WHERE ready.lane_seq >= claims.claim_seq
+                        GROUP BY ready.queue, ready.priority
+                    )
+                    UPDATE {schema}.queue_lanes AS lanes
+                    SET available_count = COALESCE(live_ready.available_count, 0)
+                    FROM live_ready
+                    WHERE lanes.queue = live_ready.queue
+                      AND lanes.priority = live_ready.priority;
+
+                    UPDATE {schema}.queue_lanes AS lanes
+                    SET available_count = 0
+                    WHERE available_count <> 0
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM {schema}.ready_entries AS ready
+                          JOIN {schema}.queue_claim_heads AS claims
+                            ON claims.queue = ready.queue
+                           AND claims.priority = ready.priority
+                          WHERE ready.queue = lanes.queue
+                            AND ready.priority = lanes.priority
+                            AND ready.lane_seq >= claims.claim_seq
+                      );
+                END IF;
+            END $$
+            "#
+            ))
+            .execute(backfill_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             backfill_tx.commit().await.map_err(map_sqlx_error)?;
 
             sqlx::query(
@@ -2818,6 +2868,7 @@ impl QueueStorage {
                 v_lane_claim_seq BIGINT;
                 v_lane_next_seq BIGINT;
                 v_claim_limit BIGINT;
+                v_claimed_count BIGINT;
                 v_target_slot INT;
                 v_target_generation BIGINT;
             BEGIN
@@ -2985,11 +3036,18 @@ impl QueueStorage {
                  AND selected.lane_seq = claimed.lane_seq
                 ORDER BY selected.lane_seq ASC;
 
-                IF NOT FOUND THEN
+                GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
+
+                IF v_claimed_count > 0 THEN
+                    UPDATE {schema}.queue_lanes AS lanes
+                    SET available_count = GREATEST(0, lanes.available_count - v_claimed_count)
+                    WHERE lanes.queue = p_queue
+                      AND lanes.priority = v_lane_priority;
+                ELSE
                     UPDATE {schema}.queue_claim_heads AS claims
-                    SET claim_seq = GREATEST(claims.claim_seq, lane_next_seq)
+                    SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
                     WHERE claims.queue = p_queue
-                      AND claims.priority = lane_priority;
+                      AND claims.priority = v_lane_priority;
                 END IF;
             END;
             $func$
@@ -3565,6 +3623,19 @@ impl QueueStorage {
         }
 
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let mut count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        for row in &ready_rows {
+            *count_deltas
+                .entry((row.queue.clone(), row.priority))
+                .or_insert(0) += 1;
+        }
+        self.adjust_lane_counts_batch(
+            tx,
+            count_deltas
+                .into_iter()
+                .map(|((queue, priority), count)| (queue, priority, count, 0)),
+        )
+        .await?;
         Ok(total_rows)
     }
 
@@ -3640,6 +3711,19 @@ impl QueueStorage {
         }
 
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let mut count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        for row in &ready_rows {
+            *count_deltas
+                .entry((row.queue.clone(), row.priority))
+                .or_insert(0) += 1;
+        }
+        self.adjust_lane_counts_batch(
+            tx,
+            count_deltas
+                .into_iter()
+                .map(|((queue, priority), count)| (queue, priority, count, 0)),
+        )
+        .await?;
         Ok(total_rows)
     }
 
@@ -3836,12 +3920,14 @@ impl QueueStorage {
     where
         I: IntoIterator<Item = (String, i16, i64, i64)>,
     {
-        let mut grouped: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        let mut grouped: BTreeMap<(String, i16), (i64, i64)> = BTreeMap::new();
         for (queue, priority, available_delta, pruned_completed_delta) in deltas {
             if available_delta == 0 && pruned_completed_delta == 0 {
                 continue;
             }
-            *grouped.entry((queue, priority)).or_insert(0_i64) += pruned_completed_delta;
+            let entry = grouped.entry((queue, priority)).or_insert((0_i64, 0_i64));
+            entry.0 += available_delta;
+            entry.1 += pruned_completed_delta;
         }
 
         if grouped.is_empty() {
@@ -3851,26 +3937,33 @@ impl QueueStorage {
         let schema = self.schema();
         let mut queues = Vec::with_capacity(grouped.len());
         let mut priorities = Vec::with_capacity(grouped.len());
+        let mut available_deltas = Vec::with_capacity(grouped.len());
         let mut pruned_completed_deltas = Vec::with_capacity(grouped.len());
 
-        for ((queue, priority), pruned_completed_delta) in grouped {
+        for ((queue, priority), (available_delta, pruned_completed_delta)) in grouped {
             queues.push(queue);
             priorities.push(priority);
+            available_deltas.push(available_delta);
             pruned_completed_deltas.push(pruned_completed_delta);
         }
 
         sqlx::query(&format!(
             r#"
-            WITH deltas(queue, priority, pruned_completed_delta) AS (
+            WITH deltas(queue, priority, available_delta, pruned_completed_delta) AS (
                 SELECT *
                 FROM unnest(
                     $1::text[],
                     $2::smallint[],
-                    $3::bigint[]
+                    $3::bigint[],
+                    $4::bigint[]
                 )
             )
             UPDATE {schema}.queue_lanes
-            SET pruned_completed_count = GREATEST(
+            SET available_count = GREATEST(
+                    0,
+                    queue_lanes.available_count + deltas.available_delta
+                ),
+                pruned_completed_count = GREATEST(
                     0,
                     queue_lanes.pruned_completed_count + deltas.pruned_completed_delta
                 )
@@ -3881,6 +3974,7 @@ impl QueueStorage {
         ))
         .bind(&queues)
         .bind(&priorities)
+        .bind(&available_deltas)
         .bind(&pruned_completed_deltas)
         .execute(tx.as_mut())
         .await
@@ -4449,7 +4543,6 @@ impl QueueStorage {
         pool: &PgPool,
         queue: &str,
         max_claimers: i16,
-        queue_counts_max_age: Duration,
         control_interval: Duration,
     ) -> Result<i16, AwaError> {
         let schema = self.schema();
@@ -4488,9 +4581,7 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let counts = self
-            .queue_counts_cached(pool, queue, queue_counts_max_age)
-            .await?;
+        let counts = self.queue_claimer_signal_counts(pool, queue).await?;
         let desired = self.desired_queue_claimer_target(current_target, &counts, max_claimers);
 
         if let Some(updated) = sqlx::query_scalar::<_, i16>(&format!(
@@ -4520,6 +4611,32 @@ impl QueueStorage {
             .clamp(1, max_claimers.max(1)))
     }
 
+    async fn queue_claimer_signal_counts(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+    ) -> Result<QueueCounts, AwaError> {
+        let schema = self.schema();
+        let queues = self.physical_queues_for_logical(queue);
+        let available: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT COALESCE(sum(available_count), 0)::bigint
+            FROM {schema}.queue_lanes
+            WHERE queue = ANY($1)
+            "#
+        ))
+        .bind(&queues)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(QueueCounts {
+            available,
+            running: 0,
+            completed: 0,
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.claim_runtime_batch_with_aging_for_instance")]
     pub async fn claim_runtime_batch_with_aging_for_instance(
@@ -4533,16 +4650,9 @@ impl QueueStorage {
         max_claimers: i16,
         lease_ttl: Duration,
         idle_threshold: Duration,
-        queue_counts_max_age: Duration,
     ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
         let target_claimers = self
-            .queue_claimer_target(
-                pool,
-                queue,
-                max_claimers,
-                queue_counts_max_age,
-                Duration::from_millis(500),
-            )
+            .queue_claimer_target(pool, queue, max_claimers, Duration::from_millis(500))
             .await?;
 
         let Some(lease) = self
@@ -5099,13 +5209,9 @@ impl QueueStorage {
             r#"
             WITH lane_counts AS (
                 SELECT
-                    count(*)::bigint AS available
-                FROM {schema}.ready_entries AS ready
-                JOIN {schema}.queue_claim_heads AS claims
-                  ON claims.queue = ready.queue
-                 AND claims.priority = ready.priority
-                WHERE ready.queue = ANY($1)
-                  AND ready.lane_seq >= claims.claim_seq
+                    COALESCE(sum(available_count), 0)::bigint AS available
+                FROM {schema}.queue_lanes
+                WHERE queue = ANY($1)
             ),
             pruned_terminal AS (
                 SELECT COALESCE(
@@ -5574,6 +5680,8 @@ impl QueueStorage {
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
+            self.adjust_lane_counts(tx, &ready.queue, ready.priority, -1, 0)
+                .await?;
             return Ok(Some(done.into_job_row()?));
         }
 
@@ -5964,10 +6072,14 @@ impl QueueStorage {
         let mut ids = Vec::with_capacity(moved.len());
         let mut queues = BTreeSet::new();
         let mut ready_rows = Vec::with_capacity(moved.len());
+        let mut removed_count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
 
         for row in moved {
             ids.push(row.job_id);
             queues.insert(row.queue.clone());
+            *removed_count_deltas
+                .entry((row.queue.clone(), row.priority))
+                .or_insert(0) -= 1;
 
             let mut payload = RuntimePayload::from_json(row.payload)?;
             let metadata = payload.metadata.as_object_mut().ok_or_else(|| {
@@ -5997,6 +6109,13 @@ impl QueueStorage {
             });
         }
 
+        self.adjust_lane_counts_batch(
+            &mut tx,
+            removed_count_deltas
+                .into_iter()
+                .map(|((queue, priority), count)| (queue, priority, count, 0)),
+        )
+        .await?;
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
         self.notify_queues_tx(&mut tx, queues).await?;

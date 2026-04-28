@@ -3529,6 +3529,48 @@ async fn test_queue_storage_queue_counts_cached_uses_snapshot_until_stale() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_claimer_target_does_not_refresh_exact_count_snapshot() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_claimer_signal_counts";
+    let schema = "awa_qs_claimer_signal_counts";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 4)
+        .await
+        .expect("Failed to enqueue jobs for claimer signal test");
+
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            4,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("Failed to claim jobs through claimer control loop");
+    assert_eq!(claimed.len(), 4);
+
+    let snapshot_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.queue_count_snapshots WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to count queue count snapshots");
+    assert_eq!(
+        snapshot_count, 0,
+        "claimer sizing should use lane-head signals, not exact queue_counts snapshots"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;

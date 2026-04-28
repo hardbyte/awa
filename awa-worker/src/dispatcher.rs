@@ -17,7 +17,6 @@ const CLAIM_BATCH_LIMIT: usize = 128;
 const MAX_CLAIMERS_PER_QUEUE: i16 = 4;
 const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
 const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);
-const CLAIMER_QUEUE_COUNTS_MAX_AGE: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy)]
 enum WakeReason {
@@ -581,7 +580,6 @@ impl Dispatcher {
                     MAX_CLAIMERS_PER_QUEUE,
                     CLAIMER_LEASE_TTL,
                     CLAIMER_IDLE_THRESHOLD,
-                    CLAIMER_QUEUE_COUNTS_MAX_AGE,
                 )
                 .await
             {

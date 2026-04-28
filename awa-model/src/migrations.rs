@@ -47,7 +47,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Queue storage compatibility layer and active backend selection",
         &[V11_UP],
     ),
-    (12, "Storage auto-finalize for fresh installs", &[V12_UP]),
+    (
+        12,
+        "Storage auto-finalize and queue-storage count maintenance",
+        &[V12_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
