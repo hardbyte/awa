@@ -105,6 +105,11 @@ export interface RuntimeInstance {
    * deployments the field is absent; treat as "canonical" when reading.
    */
   storage_capability?: string | null;
+  /**
+   * Operator-selected execution role during a 0.5→0.6 transition. Populated
+   * by schema v14+ — older deployments report as "auto".
+   */
+  transition_role?: string | null;
   started_at: string;
   last_seen_at: string;
   snapshot_interval_ms: number;

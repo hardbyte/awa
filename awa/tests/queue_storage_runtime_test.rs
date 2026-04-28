@@ -143,6 +143,17 @@ async fn reset_shared_awa_state(pool: &sqlx::PgPool) {
 }
 
 async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid::Uuid {
+    // Default `transition_role` so the inserted runtime satisfies the
+    // tightened `enter_mixed_transition` gate (which requires a live
+    // queue_storage_target). Tests that assert on canonical-only
+    // pre-flight should pass `capability=canonical` here; the gate's
+    // canonical-blocker check fires first.
+    let role = match capability {
+        "canonical" => "auto",
+        "canonical_drain_only" => "canonical_drain",
+        "queue_storage" => "queue_storage_target",
+        _ => "auto",
+    };
     let instance_id = uuid::Uuid::new_v4();
     sqlx::query(
         r#"
@@ -152,6 +163,7 @@ async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid:
             pid,
             version,
             storage_capability,
+            transition_role,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -173,6 +185,7 @@ async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid:
             1,
             'test',
             $2,
+            $3,
             now(),
             now(),
             10000,
@@ -192,6 +205,7 @@ async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid:
     )
     .bind(instance_id)
     .bind(capability)
+    .bind(role)
     .execute(pool)
     .await
     .expect("Failed to insert runtime instance");

@@ -85,6 +85,12 @@ async fn reset_storage_transition_state(pool: &sqlx::PgPool) {
 }
 
 async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid::Uuid {
+    let role = match capability {
+        "canonical" => "auto",
+        "canonical_drain_only" => "canonical_drain",
+        "queue_storage" => "queue_storage_target",
+        _ => "auto",
+    };
     let instance_id = uuid::Uuid::new_v4();
     sqlx::query(
         r#"
@@ -94,6 +100,7 @@ async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid:
             pid,
             version,
             storage_capability,
+            transition_role,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -115,6 +122,7 @@ async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid:
             1,
             'test',
             $2,
+            $3,
             now(),
             now(),
             10000,
@@ -134,6 +142,7 @@ async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid:
     )
     .bind(instance_id)
     .bind(capability)
+    .bind(role)
     .execute(pool)
     .await
     .expect("Failed to insert benchmark runtime instance");

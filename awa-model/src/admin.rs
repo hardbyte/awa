@@ -1210,6 +1210,62 @@ impl FromStr for StorageCapability {
     }
 }
 
+/// Operator-selected execution role used during a `0.5.x → 0.6` storage
+/// transition. Persisted on `awa.runtime_instances` so the SQL gate for
+/// `enter_mixed_transition` can require a runtime that will actually
+/// execute queue-storage work after routing flips, rather than only
+/// inspecting the more permissive `storage_capability` snapshot
+/// (auto-role runtimes report `queue_storage` while in
+/// canonical/prepared but downgrade to `canonical_drain_only` post-flip).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionRole {
+    /// Default. Resolves storage at startup from `awa.storage_status()`
+    /// and follows whatever the cluster is doing. Auto runtimes started
+    /// before mixed_transition cannot satisfy the queue-storage executor
+    /// gate; they're meant to drain canonical first and then have new
+    /// auto runtimes spin up post-flip to take over queue_storage work.
+    #[default]
+    Auto,
+    /// Stay on canonical execution regardless of transition state. Used
+    /// for runtimes that should keep draining canonical even after
+    /// routing flips.
+    CanonicalDrain,
+    /// Always execute queue-storage work, including pre-flip when state
+    /// is `prepared`. At least one live runtime in this role is required
+    /// before `awa.storage_enter_mixed_transition()` will succeed.
+    QueueStorageTarget,
+}
+
+impl TransitionRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CanonicalDrain => "canonical_drain",
+            Self::QueueStorageTarget => "queue_storage_target",
+        }
+    }
+}
+
+impl fmt::Display for TransitionRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TransitionRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "canonical_drain" => Ok(Self::CanonicalDrain),
+            "queue_storage_target" => Ok(Self::QueueStorageTarget),
+            _ => Err(value.to_string()),
+        }
+    }
+}
+
 /// Data written by a worker runtime into the observability snapshot table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeSnapshotInput {
@@ -1218,6 +1274,8 @@ pub struct RuntimeSnapshotInput {
     pub pid: i32,
     pub version: String,
     pub storage_capability: StorageCapability,
+    #[serde(default)]
+    pub transition_role: TransitionRole,
     pub started_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
     pub healthy: bool,
@@ -1241,6 +1299,8 @@ pub struct RuntimeInstance {
     pub pid: i32,
     pub version: String,
     pub storage_capability: StorageCapability,
+    #[serde(default)]
+    pub transition_role: TransitionRole,
     pub started_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
@@ -1270,12 +1330,18 @@ impl RuntimeInstance {
                     "invalid storage capability in runtime_instances: {value}"
                 ))
             })?;
+        let transition_role = TransitionRole::from_str(&row.transition_role).map_err(|value| {
+            AwaError::Validation(format!(
+                "invalid transition_role in runtime_instances: {value}"
+            ))
+        })?;
         Ok(Self {
             instance_id: row.instance_id,
             hostname: row.hostname,
             pid: row.pid,
             version: row.version,
             storage_capability,
+            transition_role,
             started_at: row.started_at,
             last_seen_at: row.last_seen_at,
             snapshot_interval_ms: row.snapshot_interval_ms,
@@ -1325,6 +1391,7 @@ struct RuntimeInstanceRow {
     pid: i32,
     version: String,
     storage_capability: String,
+    transition_role: String,
     started_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
     snapshot_interval_ms: i64,
@@ -1355,6 +1422,7 @@ where
             pid,
             version,
             storage_capability,
+            transition_role,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -1371,13 +1439,14 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+            $1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
             pid = EXCLUDED.pid,
             version = EXCLUDED.version,
             storage_capability = EXCLUDED.storage_capability,
+            transition_role = EXCLUDED.transition_role,
             started_at = EXCLUDED.started_at,
             last_seen_at = now(),
             snapshot_interval_ms = EXCLUDED.snapshot_interval_ms,
@@ -1399,6 +1468,7 @@ where
     .bind(snapshot.pid)
     .bind(&snapshot.version)
     .bind(snapshot.storage_capability.as_str())
+    .bind(snapshot.transition_role.as_str())
     .bind(snapshot.started_at)
     .bind(snapshot.snapshot_interval_ms)
     .bind(snapshot.healthy)
@@ -1482,6 +1552,7 @@ where
             pid,
             version,
             storage_capability,
+            transition_role,
             started_at,
             last_seen_at,
             snapshot_interval_ms,

@@ -187,6 +187,15 @@ The 0.6 storage-engine upgrade uses the transition protocol introduced in the
      executor before the routing flip so new work can start executing
      immediately after `enter-mixed-transition`
 
+   The `enter_mixed_transition()` SQL gate (since v014) requires at least
+   one live runtime running with `transition_role = 'queue_storage_target'`
+   reporting `storage_capability = 'queue_storage'`. Auto-role runtimes
+   that pre-date the flip will downgrade to `canonical_drain_only` after
+   routing flips, so they cannot satisfy the gate on their own — there
+   would be no queue-storage executor post-flip. Auto-role runtimes
+   started *after* `enter-mixed-transition` resolve to queue storage at
+   startup and behave normally.
+
    Current APIs:
 
    - Rust: `Client::builder(...).transition_role(TransitionWorkerRole::QueueStorageTarget)`

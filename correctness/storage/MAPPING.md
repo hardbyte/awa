@@ -98,9 +98,11 @@ for backfill / fallback reads during upgrades.
 ## Storage-transition model mapping
 
 `AwaStorageTransition.tla` maps to the transition SQL in
-`awa-model/migrations/v010_storage_transition_prep.sql` and
-`awa-model/migrations/v011_queue_storage_compat.sql`, plus the worker
-role/effective-storage resolution in `awa-worker/src/client.rs`.
+`awa-model/migrations/v010_storage_transition_prep.sql`,
+`awa-model/migrations/v012_queue_storage_compat.sql`, and the executor
+gate in `awa-model/migrations/v014_storage_transition_role.sql`, plus
+the worker role/effective-storage resolution in
+`awa-worker/src/client.rs`.
 
 | TLA+ variable / action | Rust / SQL equivalent |
 |---|---|
@@ -120,12 +122,19 @@ role/effective-storage resolution in `awa-worker/src/client.rs`.
 | `Finalize` | `awa.storage_finalize()`: requires `canonical_live_backlog() = 0` and no live `canonical` / `canonical_drain_only` runtimes |
 | `AbortMixed` | `awa.storage_abort()`: rejects rollback while live `queue_storage` runtimes or queue-storage rows exist |
 
-The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate property,
-not a permanent liveness invariant: a queue-storage target can stop after the
-transition. The current SQL gate checks `storage_capability = 'queue_storage'`,
-which is enough to prove queue-storage capability but not enough to prove that
-the live runtime is an explicit queue-storage executor. The
-`AwaStorageTransitionCurrentGate.cfg` witness captures that gap.
+The model deliberately keeps `MixedHasQueueExecutor` as an entry-gate
+property, not a permanent liveness invariant: a queue-storage target can
+stop after the transition. As of v014 the SQL gate enforces
+`transition_role = 'queue_storage_target' AND storage_capability =
+'queue_storage'`, which is the same property `LiveQueueExecutor > 0`
+expresses in the model — `AwaStorageTransition.cfg` (with
+`RequireQueueExecutorOnEnter = TRUE`) is the configuration that matches
+production. `AwaStorageTransitionCurrentGate.cfg` is retained as a
+historical reproducer of the pre-v014 gap, where
+`storage_capability = 'queue_storage'` alone was used and the
+`MixedHasQueueExecutor` invariant could fail because an
+`autoPreMixedLive` runtime satisfied the gate pre-flip and downgraded to
+drain-only post-flip.
 
 ## Local runtime note
 

@@ -9,7 +9,7 @@ use crate::storage::{QueueStorageRuntime, RuntimeStorage};
 use awa_model::admin::{
     self, JobKindDescriptor, NamedJobKindDescriptor, NamedQueueDescriptor, QueueDescriptor,
     QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
-    RuntimeSnapshotInput, StorageCapability,
+    RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
 use awa_model::{storage as transition, JobArgs, PeriodicJob, QueueStorageConfig};
 use chrono::{DateTime, Utc};
@@ -99,6 +99,16 @@ pub enum TransitionWorkerRole {
     CanonicalDrain,
     /// Run queue storage immediately, even before routing flips.
     QueueStorageTarget,
+}
+
+impl From<TransitionWorkerRole> for TransitionRole {
+    fn from(role: TransitionWorkerRole) -> Self {
+        match role {
+            TransitionWorkerRole::Auto => Self::Auto,
+            TransitionWorkerRole::CanonicalDrain => Self::CanonicalDrain,
+            TransitionWorkerRole::QueueStorageTarget => Self::QueueStorageTarget,
+        }
+    }
 }
 
 /// Builder for the Awa worker client.
@@ -816,6 +826,7 @@ struct RuntimeReporterState {
     snapshot_interval: Duration,
     effective_storage: Arc<RwLock<RuntimeStorage>>,
     queue_storage_capable: bool,
+    transition_role: TransitionWorkerRole,
     metrics: crate::metrics::AwaMetrics,
 }
 
@@ -1007,6 +1018,7 @@ impl Client {
             snapshot_interval: self.runtime_snapshot_interval,
             effective_storage: self.effective_storage.clone(),
             queue_storage_capable: self.storage.queue_storage().is_some(),
+            transition_role: self.transition_role,
             metrics: self.metrics.clone(),
         }
     }
@@ -1579,6 +1591,7 @@ impl RuntimeReporterState {
             pid: self.pid,
             version: self.version.to_string(),
             storage_capability,
+            transition_role: TransitionRole::from(self.transition_role),
             started_at: self.started_at,
             snapshot_interval_ms: self.snapshot_interval.as_millis() as i64,
             healthy,
@@ -1881,6 +1894,37 @@ mod tests {
             .expect("Failed to fetch active queue storage schema")
     }
 
+    /// Insert a synthetic `transition_role=queue_storage_target` runtime
+    /// row so the mixed-transition gate is satisfied without needing a
+    /// second real client. Used by tests that only exercise the
+    /// canonical-drain side of the transition.
+    async fn insert_fake_queue_storage_target(pool: &PgPool) {
+        sqlx::query(
+            r#"
+            INSERT INTO awa.runtime_instances (
+                instance_id, hostname, pid, version,
+                started_at, last_seen_at, snapshot_interval_ms,
+                healthy, postgres_connected, poll_loop_alive,
+                heartbeat_alive, maintenance_alive, shutting_down,
+                leader, global_max_workers, queues,
+                storage_capability, transition_role
+            )
+            VALUES (
+                $1, 'fake-target', 7777, '0.6.0-test',
+                now() - interval '1 minute', now(), 1000,
+                TRUE, TRUE, TRUE,
+                TRUE, TRUE, FALSE,
+                FALSE, NULL, '[]'::jsonb,
+                'queue_storage', 'queue_storage_target'
+            )
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .execute(pool)
+        .await
+        .expect("Failed to insert fake queue_storage_target runtime row");
+    }
+
     async fn wait_for_runtime_capability(
         pool: &PgPool,
         instance_id: Uuid,
@@ -1918,15 +1962,20 @@ mod tests {
         .expect("Failed to expire runtime instance");
     }
 
-    async fn prepare_queue_storage_transition(pool: &PgPool, schema: &str) -> QueueStorage {
-        let store = QueueStorage::new(QueueStorageConfig {
-            schema: schema.to_string(),
-            queue_slot_count: 4,
-            lease_slot_count: 2,
-            ..Default::default()
-        })
-        .expect("Failed to build queue storage store");
-        drop_queue_storage_schema(pool, schema).await;
+    /// Drop and re-create the queue-storage schema using the supplied
+    /// config, then advance the storage transition state machine to the
+    /// `prepared` engine. The `lease_claim_receipts` flag must already
+    /// match what the runtime under test will use, because the
+    /// receipts-vs-legacy claim CTE is baked into `claim_ready_runtime`
+    /// at `prepare_schema` time — a later store built with a different
+    /// flag value would still hit the SQL function compiled here.
+    async fn prepare_queue_storage_transition_with_config(
+        pool: &PgPool,
+        config: QueueStorageConfig,
+    ) -> QueueStorage {
+        let schema = config.schema.clone();
+        let store = QueueStorage::new(config).expect("Failed to build queue storage store");
+        drop_queue_storage_schema(pool, &schema).await;
         store
             .prepare_schema(pool)
             .await
@@ -2260,19 +2309,29 @@ mod tests {
         canonical_client.shutdown(Duration::from_secs(5)).await;
         expire_runtime_instance(&pool, canonical_client.runtime_instance_id).await;
 
-        let _store = prepare_queue_storage_transition(&pool, queue_storage_schema).await;
+        // Pin the legacy lease-materialization path. The receipt-plane
+        // fast path (now the default since ADR-023 Phase 6) requires
+        // deadline_duration=0 on QueueConfig and would error every claim
+        // here; this test exercises the canonical-drain → cutover flow
+        // with the standard 60s deadline, so lease_claim_receipts stays
+        // off. Tests that specifically cover the receipt path opt back
+        // in and zero the deadline. The flag must be set when
+        // `prepare_schema` runs because the receipts-vs-legacy claim CTE
+        // is baked into the SQL function definition at that point.
+        let store_config = QueueStorageConfig {
+            schema: queue_storage_schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        };
+        let _store =
+            prepare_queue_storage_transition_with_config(&pool, store_config.clone()).await;
         assert_eq!(
             active_queue_storage_schema(&pool).await,
             None,
             "prepare alone must not activate queue storage routing"
         );
-
-        let store_config = QueueStorageConfig {
-            schema: queue_storage_schema.to_string(),
-            queue_slot_count: 4,
-            lease_slot_count: 2,
-            ..Default::default()
-        };
         let drain_only_client = {
             let queue_storage_short_seen = queue_storage_short_seen.clone();
             Client::builder(pool.clone())
@@ -2341,6 +2400,14 @@ mod tests {
             Duration::from_secs(5),
         )
         .await;
+
+        // The mixed-transition gate now requires at least one runtime
+        // running with `transition_role=queue_storage_target` (auto-role
+        // runtimes downgrade to drain-only after the routing flip and
+        // would leave the cluster with no queue-storage executor). This
+        // test focuses on the canonical-drain side; insert a fake target
+        // row so the gate passes without standing up a second real client.
+        insert_fake_queue_storage_target(&pool).await;
 
         storage::enter_mixed_transition(&pool)
             .await
@@ -2452,14 +2519,22 @@ mod tests {
 
         let canonical_seen = Arc::new(AtomicUsize::new(0));
         let queue_storage_seen = Arc::new(AtomicUsize::new(0));
+        // See the matching note in
+        // canonical_runtime_drains_in_flight_jobs_across_schema_upgrade_before_queue_storage_cutover:
+        // pin the legacy materialization path so a 60s deadline_duration
+        // on QueueConfig::default() doesn't collide with receipt-plane
+        // mode. The flag must be set when `prepare_schema` runs because
+        // the receipts-vs-legacy claim CTE is baked into the SQL
+        // function definition at that point.
         let store_config = QueueStorageConfig {
             schema: queue_storage_schema.to_string(),
             queue_slot_count: 4,
             lease_slot_count: 2,
+            lease_claim_receipts: false,
             ..Default::default()
         };
 
-        prepare_queue_storage_transition(&pool, queue_storage_schema).await;
+        prepare_queue_storage_transition_with_config(&pool, store_config.clone()).await;
         assert_eq!(
             active_queue_storage_schema(&pool).await,
             None,

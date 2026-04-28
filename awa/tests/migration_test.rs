@@ -227,6 +227,20 @@ async fn relation_exists(pool: &PgPool, qualified_relname: &str) -> bool {
 }
 
 async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
+    // Default each capability to a coherent operator-role pairing so existing
+    // tests don't accidentally create invalid states. Tests that exercise the
+    // pre-flip auto-role witness call `insert_runtime_instance_with_role`
+    // directly.
+    let role = match capability {
+        "canonical" => "auto",
+        "canonical_drain_only" => "canonical_drain",
+        "queue_storage" => "queue_storage_target",
+        _ => "auto",
+    };
+    insert_runtime_instance_with_role(pool, capability, role).await;
+}
+
+async fn insert_runtime_instance_with_role(pool: &PgPool, capability: &str, transition_role: &str) {
     sqlx::query(
         r#"
         INSERT INTO awa.runtime_instances (
@@ -246,7 +260,8 @@ async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
             leader,
             global_max_workers,
             queues,
-            storage_capability
+            storage_capability,
+            transition_role
         )
         VALUES (
             $1, 'test-host', 4242, '0.6.0-test',
@@ -262,16 +277,19 @@ async fn insert_runtime_instance(pool: &PgPool, capability: &str) {
             TRUE,
             NULL,
             '[]'::jsonb,
-            $2
+            $2,
+            $3
         )
         ON CONFLICT (instance_id)
         DO UPDATE SET
             last_seen_at = EXCLUDED.last_seen_at,
-            storage_capability = EXCLUDED.storage_capability
+            storage_capability = EXCLUDED.storage_capability,
+            transition_role = EXCLUDED.transition_role
         "#,
     )
     .bind(Uuid::new_v4())
     .bind(capability)
+    .bind(transition_role)
     .execute(pool)
     .await
     .expect("runtime instance insert should succeed");
@@ -1002,11 +1020,11 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
     let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
     assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
     assert!(
-        err.to_string().contains("queue-storage-capable runtime"),
+        err.to_string().contains("queue_storage_target"),
         "got {err}"
     );
 
-    insert_runtime_instance(&pool, "canonical").await;
+    insert_runtime_instance_with_role(&pool, "canonical", "auto").await;
     let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
     assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
     assert!(
@@ -1014,11 +1032,28 @@ async fn test_storage_enter_mixed_transition_requires_prepared_queue_storage_run
         "got {err}"
     );
 
+    // Auto-role 0.6 runtime that *currently* reports queue-storage capability.
+    // This is the witness from `AwaStorageTransitionCurrentGate.cfg`: pre-flip
+    // the auto runtime claims `queue_storage`, but its effective storage
+    // resolved to canonical at startup, so it will downgrade to
+    // canonical_drain_only after the routing flip and leave the cluster with
+    // no queue-storage executor. The gate must reject this.
     sqlx::query("DELETE FROM awa.runtime_instances")
         .execute(&pool)
         .await
         .unwrap();
-    insert_runtime_instance(&pool, "queue_storage").await;
+    insert_runtime_instance_with_role(&pool, "queue_storage", "auto").await;
+    let err = storage::enter_mixed_transition(&pool).await.unwrap_err();
+    assert_eq!(sqlstate_from_awa_error(&err).as_deref(), Some("55000"));
+    assert!(
+        err.to_string().contains("queue_storage_target"),
+        "got {err}"
+    );
+
+    // Add an explicit queue_storage_target runtime alongside the auto one;
+    // the gate now passes because there's a runtime that will keep executing
+    // queue_storage work after the routing flip.
+    insert_runtime_instance_with_role(&pool, "queue_storage", "queue_storage_target").await;
 
     let status = storage::enter_mixed_transition(&pool).await.unwrap();
     assert_eq!(status.state, "mixed_transition");

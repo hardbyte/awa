@@ -77,8 +77,8 @@ awa --database-url "$DATABASE_URL" storage status
 #    → current=canonical, active=canonical, prepared=queue_storage, state=prepared
 
 # 5. Confirm every live runtime is queue-storage capable BEFORE the
-#    flip. This is the gate that prevents canonical-only workers
-#    from surviving into mixed_transition.
+#    flip. This is the operator-side pre-flight that prevents
+#    canonical-only (0.5) workers from surviving into mixed_transition.
 psql "$DATABASE_URL" -c "
   SELECT count(*) FILTER (WHERE storage_capability != 'queue_storage') AS canonical_only
   FROM awa.runtime_instances
@@ -86,21 +86,56 @@ psql "$DATABASE_URL" -c "
 "
 #    → canonical_only must be 0
 
-# 6. Flip routing. New writes and cron enqueues go to queue storage.
+# 6. Start at least one runtime with `transition_role=queue_storage_target`.
+#    This is what the SQL gate (v014+) actually requires. An auto-role
+#    runtime started before mixed_transition resolves its effective
+#    storage to canonical at startup and will downgrade to
+#    `canonical_drain_only` immediately after routing flips, leaving
+#    the cluster with no queue-storage executor. A queue-storage target
+#    is the witness that someone will keep executing queue-storage work
+#    once routing flips.
+#
+#    In Rust:
+#      Client::builder(pool)
+#          .queue_storage(...)
+#          .transition_role(TransitionWorkerRole::QueueStorageTarget)
+#
+#    In Python:
+#      client.start([(queue, n)],
+#                   queue_storage_schema=schema,
+#                   storage_transition_role="queue_storage_target")
+#
+#    Verify it has registered:
+psql "$DATABASE_URL" -c "
+  SELECT count(*) AS live_targets
+  FROM awa.runtime_instances
+  WHERE transition_role = 'queue_storage_target'
+    AND storage_capability = 'queue_storage'
+    AND last_seen_at > now() - interval '90 seconds';
+"
+#    → live_targets must be ≥ 1
+
+# 7. Flip routing. New writes and cron enqueues go to queue storage.
 awa --database-url "$DATABASE_URL" storage enter-mixed-transition
 
-# 7. Watch canonical drain. `canonical_live_backlog()` sums non-terminal
+# 8. Watch canonical drain. `canonical_live_backlog()` sums non-terminal
 #    `jobs_hot` rows plus everything still in `scheduled_jobs` — the
 #    same number the gate uses internally.
 watch -n 5 'psql "$DATABASE_URL" -c "SELECT awa.canonical_live_backlog() AS canonical_backlog;"'
 #    → wait for canonical_backlog to reach 0
 
-# 8. Finalize once canonical backlog is empty.
+# 9. Finalize once canonical backlog is empty.
 awa --database-url "$DATABASE_URL" storage finalize
 
-# 9. Verify active state.
+# 10. Verify active state.
 awa --database-url "$DATABASE_URL" storage status
 #    → current=queue_storage, active=queue_storage, prepared=NULL, state=active
+
+# 11. Once state=active, the queue-storage-target runtime is no longer
+#     special — auto-role runtimes started from now on resolve to queue
+#     storage at startup. Either keep the explicit target running or
+#     redeploy it without --transition-role; behavior is identical
+#     post-flip.
 ```
 
 ## Health checks per step
@@ -110,6 +145,7 @@ awa --database-url "$DATABASE_URL" storage status
 | migrate | `SELECT MAX(version) FROM awa.schema_version` advances |
 | prepare-queue-storage-schema | `\dt awa.ready_entries` (and other queue-storage tables) exist in the `awa` schema |
 | prepare | `awa storage status` reports `state=prepared` |
+| start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
 | enter-mixed-transition | `awa.maintenance.rotate.attempts{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
 | watch canonical drain | `awa.queue_depth{awa_job_state="available"}` on the canonical side trending to 0 |
 | finalize | `awa storage status` reports `state=active`; no canonical-state runtime instances heartbeating |

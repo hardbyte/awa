@@ -151,17 +151,20 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
 
     let instances = admin::list_runtime_instances(pool).await?;
     let mut live_runtime_capability_counts = BTreeMap::new();
+    let mut live_queue_storage_targets = 0usize;
     for instance in instances.into_iter().filter(|instance| !instance.stale) {
         *live_runtime_capability_counts
             .entry(instance.storage_capability.as_str().to_string())
             .or_insert(0) += 1;
+        if instance.transition_role == admin::TransitionRole::QueueStorageTarget
+            && instance.storage_capability == admin::StorageCapability::QueueStorage
+        {
+            live_queue_storage_targets += 1;
+        }
     }
 
     let live_canonical = *live_runtime_capability_counts
         .get("canonical")
-        .unwrap_or(&0);
-    let live_queue_storage = *live_runtime_capability_counts
-        .get("queue_storage")
         .unwrap_or(&0);
     let live_drain = *live_runtime_capability_counts
         .get("canonical_drain_only")
@@ -187,9 +190,12 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
             "{live_canonical} canonical-only runtime(s) are still live"
         ));
     }
-    if live_queue_storage == 0 {
-        enter_mixed_transition_blockers
-            .push("no live queue-storage-capable runtimes are reporting".to_string());
+    if live_queue_storage_targets == 0 {
+        enter_mixed_transition_blockers.push(
+            "no live runtimes with transition_role=queue_storage_target are reporting; \
+             auto-role runtimes downgrade to drain-only after the routing flip"
+                .to_string(),
+        );
     }
 
     let mut finalize_blockers = Vec::new();

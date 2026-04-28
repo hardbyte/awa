@@ -53,13 +53,15 @@ async fn insert_gate_runtime(pool: &sqlx::PgPool) -> uuid::Uuid {
         r#"
         INSERT INTO awa.runtime_instances (
             instance_id, hostname, pid, version, storage_capability,
+            transition_role,
             started_at, last_seen_at, snapshot_interval_ms, healthy,
             postgres_connected, poll_loop_alive, heartbeat_alive,
             maintenance_alive, shutting_down, leader, global_max_workers,
             queues, queue_descriptor_hashes, job_kind_descriptor_hashes
         )
         VALUES (
-            $1, 'receipt-plane-chaos', 1, 'test', $2,
+            $1, 'receipt-plane-chaos', 1, 'test', 'queue_storage',
+            'queue_storage_target',
             now(), now(), 10000, TRUE,
             TRUE, TRUE, TRUE,
             TRUE, FALSE, FALSE, 1,
@@ -68,7 +70,6 @@ async fn insert_gate_runtime(pool: &sqlx::PgPool) -> uuid::Uuid {
         "#,
     )
     .bind(instance_id)
-    .bind("queue_storage")
     .execute(pool)
     .await
     .expect("insert gate runtime");
