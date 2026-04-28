@@ -54,6 +54,13 @@ async def main() -> None:
         leader_election_interval_ms = int(
             os.environ.get("MIXED_LEADER_ELECTION_INTERVAL_MS", "60000")
         )
+        # Optional: register as queue_storage-capable so the rolling
+        # transition rehearsal's mixed_transition gate (which counts
+        # canonical-only runtimes) is satisfied. Tests that don't need
+        # this leave MIXED_QS_SCHEMA unset and the worker stays
+        # canonical-only.
+        qs_schema = os.environ.get("MIXED_QS_SCHEMA") or None
+        transition_role = os.environ.get("MIXED_TRANSITION_ROLE") or None
 
         @client.task(SimpleChaosJob, queue=queue)
         async def handle(job):
@@ -68,11 +75,18 @@ async def main() -> None:
             )
             return None
 
-        await client.start(
-            [(queue, 1)],
+        start_kwargs = dict(
             leader_election_interval_ms=leader_election_interval_ms,
             heartbeat_interval_ms=50,
             promote_interval_ms=50,
+        )
+        if qs_schema:
+            start_kwargs["queue_storage_schema"] = qs_schema
+        if transition_role:
+            start_kwargs["storage_transition_role"] = transition_role
+        await client.start(
+            [(queue, 1)],
+            **start_kwargs,
         )
         print(
             f"READY mode={mode} pid={os.getpid()} sleep_ms={sleep_ms} "

@@ -189,6 +189,22 @@ jobs:
           cargo test --package awa --test pg_restart_chaos_test \
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-pg-restart-chaos.txt
+      - name: Run rolling transition rehearsal
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          # Issue #197 P0 release-readiness item: drives the full 0.6
+          # storage transition state machine (canonical → prepared →
+          # mixed_transition → active) end-to-end under a continuous
+          # producer with both Rust and Python workers in the fleet.
+          # Asserts no jobs are lost across the routing flip and that
+          # every engine — auto Rust canonical drain, auto Python
+          # canonical drain, queue_storage_target — actually does
+          # work. The Python helper reuses mixed_fleet_helper.py.
+          export AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python"
+          cargo test --package awa --test rolling_transition_rehearsal_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-rolling-transition-rehearsal.txt
       - name: Run sustained deferred benchmark
         if: always()
         timeout-minutes: 15
