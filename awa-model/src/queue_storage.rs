@@ -129,6 +129,21 @@ pub struct QueueCounts {
     pub completed: i64,
 }
 
+/// Cheap available-only signal used by the dispatcher's claimer-sizing
+/// control loop. Reads `sum(queue_lanes.available_count)` for the
+/// queue's physical stripes — O(few rows) regardless of backlog size.
+///
+/// This is intentionally a separate type from [`QueueCounts`]: the
+/// dispatcher claim hot path only consumes the available count, and
+/// returning a `QueueCounts` with two perpetually-zero fields would
+/// invite future code to read `.running` or `.completed` and silently
+/// get wrong answers. Code that legitimately needs the full counts
+/// should call [`QueueStorage::queue_counts`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AvailableSignal {
+    pub available: i64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RotateOutcome {
     Rotated {
@@ -4497,12 +4512,16 @@ impl QueueStorage {
     fn desired_queue_claimer_target(
         &self,
         current_target: Option<i16>,
-        counts: &QueueCounts,
+        signal: &AvailableSignal,
         max_claimers: i16,
     ) -> i16 {
-        let available = counts.available.max(0) as u64;
-        let running = counts.running.max(0) as u64;
-        let backlog = available.saturating_sub(running);
+        // The signal source (queue_lanes.available_count) tracks
+        // unclaimed lane positions, so we don't subtract a running
+        // count — claimed rows are already excluded by the counter.
+        // Keep the original `backlog` name in the threshold table so
+        // future tweaks can compare against the pre-fix shape.
+        let available = signal.available.max(0) as u64;
+        let backlog = available;
         let current = current_target.unwrap_or(1).clamp(1, max_claimers.max(1));
         let max_four = 4.min(max_claimers.max(1));
         let max_two = 2.min(max_claimers.max(1));
@@ -4581,8 +4600,8 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let counts = self.queue_claimer_signal_counts(pool, queue).await?;
-        let desired = self.desired_queue_claimer_target(current_target, &counts, max_claimers);
+        let signal = self.queue_claimer_signal(pool, queue).await?;
+        let desired = self.desired_queue_claimer_target(current_target, &signal, max_claimers);
 
         if let Some(updated) = sqlx::query_scalar::<_, i16>(&format!(
             r#"
@@ -4611,11 +4630,11 @@ impl QueueStorage {
             .clamp(1, max_claimers.max(1)))
     }
 
-    async fn queue_claimer_signal_counts(
+    async fn queue_claimer_signal(
         &self,
         pool: &PgPool,
         queue: &str,
-    ) -> Result<QueueCounts, AwaError> {
+    ) -> Result<AvailableSignal, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
         let available: i64 = sqlx::query_scalar(&format!(
@@ -4630,11 +4649,7 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        Ok(QueueCounts {
-            available,
-            running: 0,
-            completed: 0,
-        })
+        Ok(AvailableSignal { available })
     }
 
     #[allow(clippy::too_many_arguments)]
