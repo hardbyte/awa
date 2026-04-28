@@ -419,7 +419,17 @@ DECLARE
     v_state awa.job_state;
     v_unique_key BYTEA;
     v_unique_states TEXT;
+    v_rows INT;
 BEGIN
+    -- NOTE: PL/pgSQL's `FOUND` is NOT set by `EXECUTE` even when an INTO
+    -- clause captures values from a `DELETE ... RETURNING`. This is a
+    -- well-known asymmetry between static and dynamic DML in PL/pgSQL.
+    -- Every branch below uses `GET DIAGNOSTICS v_rows = ROW_COUNT` to
+    -- decide whether the delete actually happened. The previous
+    -- `IF FOUND THEN` shape silently fell through to the next branch
+    -- and made delete_job_compat return FALSE for every successful
+    -- delete — masking the available_count decrement and the unique
+    -- claim release.
     v_schema := awa.active_queue_storage_schema();
 
     IF v_schema IS NULL THEN
@@ -435,8 +445,9 @@ BEGIN
     )
     INTO v_queue, v_priority, v_lane_seq, v_state, v_unique_key, v_unique_states
     USING p_id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
 
-    IF FOUND THEN
+    IF v_rows > 0 THEN
         EXECUTE format(
             'UPDATE %I.queue_lanes
              SET available_count = GREATEST(0, available_count - 1)
@@ -469,8 +480,9 @@ BEGIN
     )
     INTO v_queue, v_priority, v_state, v_unique_key, v_unique_states
     USING p_id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
 
-    IF FOUND THEN
+    IF v_rows > 0 THEN
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,
@@ -517,8 +529,9 @@ BEGIN
     )
     INTO v_queue, v_priority, v_state, v_unique_key, v_unique_states
     USING p_id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
 
-    IF FOUND THEN
+    IF v_rows > 0 THEN
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,
@@ -536,8 +549,9 @@ BEGIN
     )
     INTO v_queue, v_priority, v_state, v_unique_key, v_unique_states
     USING p_id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
 
-    IF FOUND THEN
+    IF v_rows > 0 THEN
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,
@@ -555,8 +569,9 @@ BEGIN
     )
     INTO v_queue, v_priority, v_state, v_unique_key, v_unique_states
     USING p_id;
+    GET DIAGNOSTICS v_rows = ROW_COUNT;
 
-    IF FOUND THEN
+    IF v_rows > 0 THEN
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,

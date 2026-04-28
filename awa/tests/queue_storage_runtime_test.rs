@@ -3570,6 +3570,208 @@ async fn test_queue_storage_claimer_target_does_not_refresh_exact_count_snapshot
     );
 }
 
+/// Drift-detection guard for the queue_counts perf fix.
+///
+/// `queue_counts_exact` was migrated from a `count(*) FROM ready_entries
+/// WHERE lane_seq >= claim_seq` scan to `sum(queue_lanes.available_count)`.
+/// The two are only equivalent if every code path that adds or removes a
+/// "live" ready row maintains the counter. A missed call site would
+/// silently under-count forever — autovacuum doesn't rebuild a maintained
+/// counter, so divergence is permanent until someone runs the v012 / v013
+/// backfill.
+///
+/// This test pins the equivalence at every steady state across the
+/// lifecycle paths the production runtime exercises: enqueue, claim
+/// (with priority aging), cancel of an available row, and the canonical-
+/// side `awa.insert_job_compat` / `awa.delete_job_compat` paths. At every
+/// checkpoint, all three numbers must agree:
+///
+///   - `sum(queue_lanes.available_count)` — what queue_counts_exact reads
+///   - `count(*) FROM ready_entries WHERE lane_seq >= claim_seq` — the
+///     legacy ground-truth CTE
+///   - `store.queue_counts(...).available` — the public API
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_available_count_matches_ready_entries_scan() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_avail_count_drift";
+    let schema = "awa_qs_avail_count_drift";
+    let store = create_store(&pool, schema).await;
+
+    async fn assert_all_three_agree(
+        pool: &sqlx::PgPool,
+        store: &QueueStorage,
+        queue: &str,
+        checkpoint: &str,
+    ) {
+        let schema = store.schema();
+        // Ground-truth scan — the predicate the original CTE used.
+        let scan: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint
+             FROM {schema}.ready_entries AS ready
+             JOIN {schema}.queue_claim_heads AS claims
+               ON claims.queue = ready.queue
+              AND claims.priority = ready.priority
+             WHERE ready.queue = $1
+               AND ready.lane_seq >= claims.claim_seq"
+        ))
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to run legacy ready_entries scan");
+
+        let counter: i64 = sqlx::query_scalar(&format!(
+            "SELECT COALESCE(sum(available_count), 0)::bigint
+             FROM {schema}.queue_lanes
+             WHERE queue = $1"
+        ))
+        .bind(queue)
+        .fetch_one(pool)
+        .await
+        .expect("Failed to read queue_lanes.available_count");
+
+        let api = store
+            .queue_counts(pool, queue)
+            .await
+            .expect("Failed to call queue_counts")
+            .available;
+
+        assert_eq!(
+            scan, counter,
+            "[{checkpoint}] queue_lanes.available_count drifted from ready_entries scan: scan={scan} counter={counter}"
+        );
+        assert_eq!(
+            scan, api,
+            "[{checkpoint}] queue_counts API diverged from the legacy scan: scan={scan} api={api}"
+        );
+    }
+
+    // ── checkpoint 1: empty ──────────────────────────────────────────
+    assert_all_three_agree(&pool, &store, queue, "empty").await;
+
+    // ── checkpoint 2: enqueue 20 ─────────────────────────────────────
+    store
+        .enqueue_batch(&pool, queue, 2, 20)
+        .await
+        .expect("Failed to enqueue priority=2 jobs");
+    assert_all_three_agree(&pool, &store, queue, "after enqueue 20 @ p2").await;
+
+    // ── checkpoint 3: claim 5 (no aging) ─────────────────────────────
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            5,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("Failed to claim 5 jobs without aging");
+    assert_eq!(claimed.len(), 5);
+    assert_all_three_agree(&pool, &store, queue, "after claim 5 @ p2 no-aging").await;
+
+    // ── checkpoint 4: enqueue another 10 at a different priority ─────
+    store
+        .enqueue_batch(&pool, queue, 5, 10)
+        .await
+        .expect("Failed to enqueue priority=5 jobs");
+    assert_all_three_agree(&pool, &store, queue, "after enqueue 10 @ p5").await;
+
+    // ── checkpoint 5: cancel an available row ────────────────────────
+    // Pick a still-available job at priority 2 and cancel it.
+    let candidate: i64 = sqlx::query_scalar(&format!(
+        "SELECT job_id
+         FROM {schema}.ready_entries AS ready
+         JOIN {schema}.queue_claim_heads AS claims
+           ON claims.queue = ready.queue
+          AND claims.priority = ready.priority
+         WHERE ready.queue = $1
+           AND ready.priority = 2
+           AND ready.lane_seq >= claims.claim_seq
+         ORDER BY ready.lane_seq ASC
+         LIMIT 1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to pick a candidate job for cancellation");
+    let cancelled = store
+        .cancel_job(&pool, candidate)
+        .await
+        .expect("Failed to cancel ready job");
+    assert!(cancelled.is_some());
+    assert_all_three_agree(&pool, &store, queue, "after cancel 1 @ p2").await;
+
+    // ── checkpoint 6: claim 3 with priority aging on ─────────────────
+    // The interval is large (10s) so aging won't actually bump anything
+    // within the test's wall-clock window — the point is to take the
+    // aging branch in claim_ready_runtime where v_lane_priority is set
+    // from claims.priority (the row's stored lane), not the
+    // effective_priority computed from elapsed run_at. The counter
+    // decrement must target the original lane priority regardless of
+    // aging promotion.
+    let aged = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            3,
+            Duration::ZERO,
+            Duration::from_secs(10),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("Failed to claim with aging on");
+    assert!(!aged.is_empty(), "expected at least one aged claim");
+    assert_all_three_agree(&pool, &store, queue, "after claim 3 with aging").await;
+
+    // ── checkpoint 7: canonical-side insert_job_compat ───────────────
+    // Routes through awa.insert_job_compat → queue_storage runtime
+    // insert. Verifies the canonical compat insert path also
+    // increments the counter (v012 SQL maintains it there).
+    sqlx::query(
+        "SELECT * FROM awa.insert_job_compat(
+            'compat_kind', $1, '{}'::jsonb, 'available'::awa.job_state,
+            2::smallint, 25::smallint, NULL::timestamptz,
+            '{}'::jsonb, ARRAY[]::text[],
+            NULL::bytea, NULL::text::bit(8)
+        )",
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to insert via canonical compat path");
+    assert_all_three_agree(&pool, &store, queue, "after canonical insert_job_compat").await;
+
+    // ── checkpoint 8: canonical-side delete_job_compat ───────────────
+    // Same compat route in reverse — verifies delete_job_compat decrements
+    // the counter only for rows still satisfying lane_seq >= claim_seq
+    // (the same predicate the legacy scan used).
+    let compat_id: i64 = sqlx::query_scalar(&format!(
+        "SELECT job_id
+         FROM {schema}.ready_entries
+         WHERE queue = $1 AND kind = 'compat_kind'
+         ORDER BY lane_seq DESC
+         LIMIT 1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to find compat job");
+    sqlx::query("SELECT awa.delete_job_compat($1)")
+        .bind(compat_id)
+        .execute(&pool)
+        .await
+        .expect("Failed to call delete_job_compat");
+    assert_all_three_agree(&pool, &store, queue, "after canonical delete_job_compat").await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -4888,7 +5090,7 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
     assert_eq!(ready_after_delete, 0);
     assert_eq!(deferred_after_delete, 0);
     assert_eq!(
-        deleted, 0,
-        "Postgres reports zero rows for this INSTEAD OF DELETE view path even when the underlying queue rows are removed"
+        deleted, 2,
+        "INSTEAD OF DELETE trigger should report both deleted rows (one ready + one deferred) once delete_job_compat correctly returns TRUE"
     );
 }
