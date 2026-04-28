@@ -3472,101 +3472,36 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
     assert_eq!(counts_after_backfill.completed, 7);
 }
 
+/// Pin that prepare_schema removes the legacy queue_count_snapshots
+/// table. Runtimes upgraded from a pre-fix install used to carry the
+/// snapshot table alongside the queue-storage tables; with the
+/// dispatcher reading queue_lanes.available_count directly, the
+/// snapshot table is no longer populated and prepare_schema drops it
+/// to reclaim the storage and remove the misleading shape from psql
+/// inspections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_queue_counts_cached_uses_snapshot_until_stale() {
+async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
-    let queue = "qs_counts_cached";
-    let schema = "awa_qs_counts_cached";
-    let store = create_store(&pool, schema).await;
+    let schema = "awa_qs_legacy_snapshot_drop";
+    let _store = create_store(&pool, schema).await;
 
-    let initial = store
-        .queue_counts_cached(&pool, queue, Duration::from_secs(60))
-        .await
-        .expect("Failed to populate initial queue count snapshot");
-    assert_eq!(initial.available, 0);
-    assert_eq!(initial.running, 0);
-    assert_eq!(initial.completed, 0);
-
-    store
-        .enqueue_batch(&pool, queue, 1, 1)
-        .await
-        .expect("Failed to enqueue queued job");
-
-    let stale = store
-        .queue_counts_cached(&pool, queue, Duration::from_secs(60))
-        .await
-        .expect("Failed to read cached queue counts");
-    assert_eq!(stale.available, 0);
-    assert_eq!(stale.running, 0);
-    assert_eq!(stale.completed, 0);
-
-    sqlx::query(&format!(
-        r#"
-        UPDATE {schema}.queue_count_snapshots
-        SET refreshed_at = now() - interval '1 hour'
-        WHERE queue = $1
-        "#
-    ))
-    .bind(queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to age queue count snapshot");
-
-    let refreshed = store
-        .queue_counts_cached(&pool, queue, Duration::from_secs(60))
-        .await
-        .expect("Failed to refresh queue counts from exact query");
-    assert_eq!(refreshed.available, 1);
-    assert_eq!(refreshed.running, 0);
-    assert_eq!(refreshed.completed, 0);
-
-    let exact = store
-        .queue_counts(&pool, queue)
-        .await
-        .expect("Failed to read exact queue counts");
-    assert_eq!(exact, refreshed);
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_claimer_target_does_not_refresh_exact_count_snapshot() {
-    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
-    let pool = setup_pool(10).await;
-    let queue = "qs_claimer_signal_counts";
-    let schema = "awa_qs_claimer_signal_counts";
-    let store = create_store(&pool, schema).await;
-
-    store
-        .enqueue_batch(&pool, queue, 1, 4)
-        .await
-        .expect("Failed to enqueue jobs for claimer signal test");
-
-    let claimed = store
-        .claim_runtime_batch_with_aging_for_instance(
-            &pool,
-            queue,
-            4,
-            Duration::ZERO,
-            Duration::ZERO,
-            Uuid::new_v4(),
-            4,
-            Duration::from_secs(3),
-            Duration::from_millis(500),
-        )
-        .await
-        .expect("Failed to claim jobs through claimer control loop");
-    assert_eq!(claimed.len(), 4);
-
-    let snapshot_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT count(*)::bigint FROM {schema}.queue_count_snapshots WHERE queue = $1"
-    ))
-    .bind(queue)
+    let table_exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM pg_class c
+             JOIN pg_namespace n ON n.oid = c.relnamespace
+             WHERE n.nspname = $1 AND c.relname = 'queue_count_snapshots'
+         )",
+    )
+    .bind(schema)
     .fetch_one(&pool)
     .await
-    .expect("Failed to count queue count snapshots");
-    assert_eq!(
-        snapshot_count, 0,
-        "claimer sizing should use lane-head signals, not exact queue_counts snapshots"
+    .expect("Failed to probe queue_count_snapshots existence");
+
+    assert!(
+        !table_exists,
+        "prepare_schema should drop the legacy queue_count_snapshots table — \
+         the dispatcher reads queue_lanes.available_count directly now"
     );
 }
 

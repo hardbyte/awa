@@ -638,15 +638,6 @@ pub async fn run() {
     // ── Queue depth poller ──────────────────────────────────────────
     let depth_pool = pool.clone();
     let depth_shutdown = Arc::clone(&shutdown);
-    // For short phases, a long cache TTL makes the observer report stale
-    // running/available counts long after the queue has drained. Keep the
-    // default tied to the sampling cadence, but allow overrides for profiling.
-    let queue_count_max_age = Duration::from_millis(
-        std::env::var("QUEUE_COUNT_MAX_AGE_MS")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(sample_every_s.saturating_mul(1_000)),
-    );
     let depth_handle = {
         let queue_depth = Arc::clone(&queue_depth);
         let running_depth = Arc::clone(&running_depth);
@@ -667,8 +658,12 @@ pub async fn run() {
                             depth_storage.clone().expect("queue storage config missing"),
                         )
                         .expect("Invalid QueueStorageConfig");
+                        // queue_counts is now O(few rows) — reads from
+                        // queue_lanes.available_count / done_entries /
+                        // claim ring instead of scanning ready_entries.
+                        // No staleness window needed.
                         match depth_store
-                            .queue_counts_cached(&depth_pool, queue_name, queue_count_max_age)
+                            .queue_counts(&depth_pool, queue_name)
                             .await
                         {
                             Ok(counts) => {

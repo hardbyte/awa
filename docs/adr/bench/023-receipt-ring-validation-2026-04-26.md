@@ -488,15 +488,14 @@ designed to do. The fix space is:
    is a slow-moving control-loop input — a 1–5 second cache window
    would be safe and would absorb the worst-case query cost without
    visible impact.
-3. **(Already done in this branch)** the cached `queue_counts_cached`
-   path exists and is what the dispatcher calls; the bug is purely
-   that the underlying exact query is too slow once the backlog
-   crosses the cache window.
-
-A fix in either direction (or both) is tracked separately from the
-ADR-023 release gate. The receipt-plane validation in this artifact
-holds independently of throughput regression on the dispatcher
-side.
+**Resolution:** both directions landed before the 0.6 cut. The
+queue_counts_exact `lane_counts` CTE now reads
+`sum(queue_lanes.available_count)`; the dispatcher's claimer-target
+loop uses an `AvailableSignal` from the same lane-head counter; the
+legacy `queue_counts_cached` method, the `queue_count_snapshots`
+cache table, and the dispatcher's `CLAIMER_QUEUE_COUNTS_MAX_AGE`
+constant are gone. The receipt-plane validation in this artifact
+holds independently of those throughput-side changes.
 
 ### Files
 
