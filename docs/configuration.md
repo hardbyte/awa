@@ -202,9 +202,10 @@ has waited `4 × aging_interval` ages all the way down to priority 1
 and is no longer starvable.
 
 The cadence is per-queue via `QueueConfig.priority_aging_interval`
-(default `60s`) on the Rust side:
+(default `60s`):
 
 ```rust
+// Rust
 .queue("etl", QueueConfig {
     max_workers: 8,
     // Drop one priority level every 30 seconds of waiting.
@@ -213,26 +214,30 @@ The cadence is per-queue via `QueueConfig.priority_aging_interval`
 })
 ```
 
+```python
+# Python — same semantics, dict form
+await client.start([
+    {
+        "name": "etl",
+        "max_workers": 8,
+        "priority_aging_interval_ms": 30_000,
+    }
+])
+```
+
 Aging is computed at claim time on queue-storage runtimes — the stored
 priority does not change, only the effective priority used for
 ordering. The admin UI surfaces both the original priority (so you can
 still see "this was enqueued as priority 4") and the current effective
-priority. Set `priority_aging_interval = Duration::ZERO` to disable
-escalation entirely (strict static priority).
+priority. Set the value to `Duration::ZERO` (Rust) or
+`priority_aging_interval_ms: 0` (Python) to disable escalation
+entirely (strict static priority).
 
 There is a separate top-level `ClientBuilder::priority_aging_interval`
 that controls the legacy canonical-storage maintenance pass that
 physically rewrites stored priorities. With queue storage (the 0.6
 default) it is a no-op; the per-queue setting above is the one to
 tune.
-
-> **Python parity gap.** The Python `client.start()` queue dict
-> currently exposes `name`, `max_workers`, `min_workers`, `weight`,
-> and `rate_limit`. Per-queue `priority_aging_interval` and
-> `deadline_duration` are Rust-only knobs today — Python workers run
-> with the defaults (60s aging, 5m deadline) for every queue. The
-> top-level `priority_aging_interval_ms` kwarg on `client.start()`
-> only affects the legacy canonical maintenance pass.
 
 ## Queue and job-kind descriptors
 
@@ -340,8 +345,8 @@ the deadline rescues it even if its heartbeat is fresh.
 
 | Knob | Default | What it does |
 |---|---|---|
-| `QueueConfig.deadline_duration` | `5m` | Per-queue hard upper bound on one attempt. `Duration::ZERO` skips deadline rescue for that queue. |
-| `ClientBuilder::deadline_rescue_interval` | `30s` | How often the maintenance leader scans for expired deadlines. |
+| `QueueConfig.deadline_duration` (Rust) / `deadline_duration_ms` (Python dict form) | `5m` | Per-queue hard upper bound on one attempt. `Duration::ZERO` / `0` skips deadline rescue for that queue. |
+| `ClientBuilder::deadline_rescue_interval` (Rust) / `deadline_rescue_interval_ms` (Python kwarg) | `30s` | How often the maintenance leader scans for expired deadlines. |
 
 Receipts mode (the 0.6 default storage) supports both shapes: the
 deadline lands on `lease_claims.deadline_at` and is rescued there for

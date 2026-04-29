@@ -274,6 +274,73 @@ async def test_per_queue_retention_in_dict_config(client):
 
 
 @pytest.mark.asyncio
+async def test_per_queue_priority_aging_and_deadline_in_dict_config(client):
+    """Dict form accepts per-queue priority_aging_interval_ms and
+    deadline_duration_ms (parity with Rust QueueConfig).
+
+    Verifies the kwargs are recognised and the worker starts; the
+    actual claim-time aging arithmetic and deadline rescue are covered
+    by the Rust queue_storage_runtime_test suite, so here we only
+    assert the Python plumbing surface accepts the values and a job
+    flows through.
+    """
+    queue = "cfg_per_queue_aging_deadline"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    await client.start(
+        [
+            {
+                "name": queue,
+                "max_workers": 4,
+                "priority_aging_interval_ms": 30_000,
+                "deadline_duration_ms": 60_000,
+            }
+        ]
+    )
+    try:
+        await client.insert(ConfigTestJob(value="aged"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=5.0)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_per_queue_aging_zero_disables_escalation(client):
+    """`priority_aging_interval_ms=0` and `deadline_duration_ms=0`
+    are meaningful values (not "use default"). The worker should
+    accept them and execute jobs without applying claim-time
+    escalation or attempt-deadline rescue."""
+    queue = "cfg_per_queue_zero_aging_deadline"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    await client.start(
+        [
+            {
+                "name": queue,
+                "max_workers": 4,
+                "priority_aging_interval_ms": 0,
+                "deadline_duration_ms": 0,
+            }
+        ]
+    )
+    try:
+        await client.insert(ConfigTestJob(value="strict"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=5.0)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
 async def test_default_start_stays_canonical_until_transition_active(client):
     """Auto role stays on canonical until the transition becomes active."""
     queue = "cfg_default_canonical_runtime"

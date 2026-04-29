@@ -1151,6 +1151,7 @@ impl PyClient {
     /// enables cursor pagination (pass the smallest id from the previous
     /// page). Rows are ordered by `dlq_at DESC, id DESC`.
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
+    #[allow(clippy::too_many_arguments)]
     fn list_dlq<'py>(
         &self,
         py: Python<'py>,
@@ -1374,6 +1375,7 @@ impl PyClient {
     /// Requires at least one of `kind`, `queue`, or `tag` unless
     /// `allow_all=True`.
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[allow(clippy::too_many_arguments)]
     fn purge_dlq<'py>(
         &self,
         py: Python<'py>,
@@ -1467,17 +1469,25 @@ impl PyClient {
 
         let mut builder = awa_worker::Client::builder(self.pool.clone());
         for config in &queue_configs {
-            builder = builder.queue(
-                config.name.clone(),
-                awa_worker::QueueConfig {
-                    max_workers: config.max_workers,
-                    poll_interval: Duration::from_millis(poll_interval_ms),
-                    rate_limit: config.rate_limit.clone(),
-                    min_workers: config.min_workers,
-                    weight: config.weight,
-                    ..Default::default()
-                },
-            );
+            // The Rust QueueConfig defaults (5m deadline, 60s
+            // priority aging) carry through unless the dict form
+            // overrides them; `Some(0)` is a meaningful value
+            // (disables that knob for this queue).
+            let mut queue_config = awa_worker::QueueConfig {
+                max_workers: config.max_workers,
+                poll_interval: Duration::from_millis(poll_interval_ms),
+                rate_limit: config.rate_limit.clone(),
+                min_workers: config.min_workers,
+                weight: config.weight,
+                ..Default::default()
+            };
+            if let Some(ms) = config.priority_aging_interval_ms {
+                queue_config.priority_aging_interval = Duration::from_millis(ms);
+            }
+            if let Some(ms) = config.deadline_duration_ms {
+                queue_config.deadline_duration = Duration::from_millis(ms);
+            }
+            builder = builder.queue(config.name.clone(), queue_config);
         }
         if let Some(global_max) = global_max_workers {
             builder = builder.global_max_workers(global_max);
@@ -2362,6 +2372,7 @@ impl PyClient {
     // --- DLQ sync versions -------------------------------------------------
 
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
+    #[allow(clippy::too_many_arguments)]
     fn list_dlq_sync(
         &self,
         py: Python<'_>,
@@ -2558,6 +2569,7 @@ impl PyClient {
     }
 
     #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[allow(clippy::too_many_arguments)]
     fn purge_dlq_sync(
         &self,
         py: Python<'_>,
@@ -2665,6 +2677,14 @@ struct ParsedQueueConfig {
     min_workers: u32,
     weight: u32,
     rate_limit: Option<awa_worker::RateLimit>,
+    /// Per-queue priority-aging cadence. `None` keeps the Rust
+    /// `QueueConfig` default (60s); `Some(0)` disables claim-time
+    /// priority escalation entirely.
+    priority_aging_interval_ms: Option<u64>,
+    /// Per-queue per-attempt deadline. `None` keeps the Rust
+    /// `QueueConfig` default (5m); `Some(0)` skips the deadline
+    /// rescue path for this queue.
+    deadline_duration_ms: Option<u64>,
 }
 
 /// Parse queue configs from Python input (list of tuples or dicts).
@@ -2703,6 +2723,8 @@ fn parse_queue_configs(
                 min_workers: 0,
                 weight: 1,
                 rate_limit: None,
+                priority_aging_interval_ms: None,
+                deadline_duration_ms: None,
             });
             continue;
         }
@@ -2773,12 +2795,23 @@ fn parse_queue_configs(
             None
         };
 
+        let priority_aging_interval_ms: Option<u64> = dict
+            .get_item("priority_aging_interval_ms")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let deadline_duration_ms: Option<u64> = dict
+            .get_item("deadline_duration_ms")?
+            .map(|v| v.extract())
+            .transpose()?;
+
         configs.push(ParsedQueueConfig {
             name,
             max_workers,
             min_workers,
             weight,
             rate_limit,
+            priority_aging_interval_ms,
+            deadline_duration_ms,
         });
     }
 
@@ -2805,6 +2838,8 @@ fn normalize_queue_configs(
                     min_workers: 0,
                     weight: 1,
                     rate_limit: None,
+                    priority_aging_interval_ms: None,
+                    deadline_duration_ms: None,
                 });
             }
         }
