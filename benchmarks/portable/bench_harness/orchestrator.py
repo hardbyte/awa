@@ -694,6 +694,42 @@ def drive(
             # The database may not exist yet; connect to the admin database.
             pg_env_snapshot = writers_mod.capture_pg_env(pg_url("postgres"))
 
+        def _checkpoint_outputs(completed_systems: list[str]) -> tuple[dict, dict]:
+            """Write a manifest.json + summary.json reflecting the systems
+            that have completed so far.
+
+            Called after every successful system AND at the end. The
+            point: a mid-run abort (pgque submodule missing, OOM, kill
+            -9, power loss) leaves a durable partial result on disk
+            covering the systems that did finish, instead of throwing
+            away hours of completed work because the post-loop block
+            never ran. Each call atomically replaces the previous
+            checkpoint via `write_manifest` / `write_summary`'s
+            tempfile + rename. The final post-loop write is then just
+            the last checkpoint, naturally consistent with the loop.
+            """
+            ckpt_manifest = build_manifest(
+                run_id=run_id,
+                scenario=scenario,
+                phases=phases,
+                systems=completed_systems,
+                database_url="",
+                cli_args=cli_args,
+                adapter_versions={
+                    s: adapter_descriptors[s] for s in completed_systems
+                },
+                pg_image=pg_image,
+            )
+            if pg_env_snapshot:
+                ckpt_manifest["postgres"] = pg_env_snapshot
+            write_manifest(ckpt_manifest, run_dir / "manifest.json")
+            ckpt_summary = compute_summary(
+                raw_csv, run_id=run_id, scenario=scenario, phases=phases
+            )
+            write_summary(ckpt_summary, run_dir / "summary.json")
+            return ckpt_manifest, ckpt_summary
+
+        completed: list[str] = []
         for system in systems:
             descriptor = run_one_system(
                 system,
@@ -722,28 +758,30 @@ def drive(
             entry = dict(descriptor or {})
             entry["revision"] = capture_adapter_revision(system)
             adapter_descriptors[system] = entry
+            completed.append(system)
+            # Drain the in-flight sample queue before snapshotting so
+            # `compute_summary` sees every row this system produced.
+            # `_drain_loop` doesn't call task_done() so we can't use
+            # out_queue.join(); poll for empty + flush the writer
+            # explicitly. Bounded wall-clock so a stuck producer can't
+            # hold up the next system's startup.
+            drain_deadline = time.time() + 5.0
+            while time.time() < drain_deadline and not out_queue.empty():
+                time.sleep(0.05)
+            writer.flush()
+            _checkpoint_outputs(completed)
     finally:
         drain_stop.set()
         drain_thread.join(timeout=10)
         writer.close()
         stop_postgres(pg_image)
 
-    # Post-processing outputs.
-    manifest = build_manifest(
-        run_id=run_id,
-        scenario=scenario,
-        phases=phases,
-        systems=systems,
-        database_url="",  # captured pre-teardown into pg_env_snapshot
-        cli_args=cli_args,
-        adapter_versions=adapter_descriptors,
-        pg_image=pg_image,
-    )
-    if pg_env_snapshot:
-        manifest["postgres"] = pg_env_snapshot
-    write_manifest(manifest, run_dir / "manifest.json")
-    summary = compute_summary(raw_csv, run_id=run_id, scenario=scenario, phases=phases)
-    write_summary(summary, run_dir / "summary.json")
+    # Final post-processing outputs. Recompute against the full
+    # `completed` list to pick up any drain-loop samples that landed
+    # after the last per-system checkpoint, and so the post-loop
+    # `manifest` / `summary` locals are populated for the plot /
+    # report rendering below.
+    manifest, summary = _checkpoint_outputs(completed)
     write_run_readme(
         run_dir / "README.md",
         scenario=scenario,
