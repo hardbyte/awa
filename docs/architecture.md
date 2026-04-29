@@ -82,8 +82,13 @@ truth when this overview needs more detail.
 - `lane_state` stays off the terminal-completion hot path: live completion
   totals come from `terminal_entries`, and the cached cold rollup used to keep
   counts stable across prune lives outside `lane_state`
-- live availability is derived from `ready_entries` and `queue_claim_heads`,
-  not from a cached `available_count` field on `lane_state`
+- live availability reads `sum(queue_lanes.available_count)` — a denormalized
+  counter the queue-storage SQL functions keep in sync with `ready_entries`
+  inserts and claim head advances. The previous design derived availability
+  from a `ready_entries` row scan; long-horizon profiling showed that scan
+  collapsed under multi-million-row backlog, so the counter was reintroduced
+  as the authoritative dispatch read with a drift-detection test pinning it
+  to the live-row count
 - maintenance leader: promotion, rescue, rotation, prune, DLQ retention, and
   queue-health publication
 
@@ -718,8 +723,8 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 
 ### 2. Hard Deadline (Runaway Protection)
 
-- At claim time, `deadline_at = now() + deadline_duration` is set (default: 5 minutes).
-- The maintenance leader periodically scans for running jobs where `deadline_at < now()` and transitions them to `retryable`.
+- At claim time, `deadline_at = now() + deadline_duration` is set (default: 5 minutes per `QueueConfig`). In receipts mode (the 0.6 default) the deadline lives on `lease_claims.deadline_at`; if the attempt later materializes into a lease, the deadline is carried onto `leases.deadline_at` so the lease-side rescue path picks it up. Setting `deadline_duration = 0` skips the deadline rescue path for that queue.
+- The maintenance leader runs two complementary rescue scans on every tick: `rescue_expired_receipt_deadlines_tx` over `lease_claims` (anti-joined with closures and leases) and `rescue_expired_deadlines` over `leases`. Both write a `'deadline_expired'` closure or move the row through the lease-side hydration path; expired attempts land in `retryable` (or DLQ if attempts are exhausted).
 - After rescue, the maintenance service signals cancellation to the in-flight handler via `ctx.is_cancelled()`, so long-running handlers can observe the deadline and exit gracefully.
 - **Catches:** Infinite loops, hung I/O, deadlocks, and other runaway handlers even when the worker process is still alive and heartbeating.
 

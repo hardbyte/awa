@@ -27,16 +27,52 @@ A job staying in `running` is not automatically a bug. It usually means one of t
 
 ### Inspect Running Jobs
 
+In 0.6 with the default queue-storage backend, running attempts live
+in `{schema}.leases` (lease-materialized attempts) and unmaterialized
+short-job claims live in `{schema}.lease_claims`. The `{schema}` is
+`awa` unless the operator chose a different name; replace below as
+needed.
+
 ```sql
+-- Materialized leases. heartbeat_at and deadline_at both populated.
 SELECT
-    id,
-    kind,
+    job_id,
     queue,
     attempt,
     heartbeat_at,
     deadline_at,
     EXTRACT(EPOCH FROM (now() - heartbeat_at)) AS heartbeat_age_s,
     EXTRACT(EPOCH FROM (deadline_at - now())) AS deadline_remaining_s
+FROM awa.leases
+WHERE state = 'running'
+ORDER BY heartbeat_at ASC;
+
+-- Receipt-mode short-job claims that haven't materialized yet. No
+-- heartbeat row; deadline_at lives on the claim if deadline_duration > 0
+-- and the receipt-side deadline rescue (`rescue_expired_receipt_deadlines_tx`)
+-- is what kicks in here. Anti-join with closures to filter "still open".
+SELECT
+    c.job_id,
+    c.queue,
+    c.attempt,
+    c.claimed_at,
+    c.deadline_at,
+    EXTRACT(EPOCH FROM (now() - c.claimed_at)) AS claimed_age_s,
+    EXTRACT(EPOCH FROM (c.deadline_at - now())) AS deadline_remaining_s
+FROM awa.lease_claims c
+WHERE NOT EXISTS (
+    SELECT 1 FROM awa.lease_claim_closures cx
+    WHERE cx.claim_slot = c.claim_slot
+      AND cx.job_id = c.job_id
+      AND cx.run_lease = c.run_lease
+)
+ORDER BY c.claimed_at ASC;
+```
+
+Pre-0.6 / canonical-only deployments still query `awa.jobs` directly:
+
+```sql
+SELECT id, kind, queue, attempt, heartbeat_at, deadline_at
 FROM awa.jobs
 WHERE state = 'running'
 ORDER BY heartbeat_at ASC;
@@ -45,8 +81,8 @@ ORDER BY heartbeat_at ASC;
 Interpretation:
 
 - low `heartbeat_age_s`: the worker is still alive
-- `heartbeat_age_s` well above `90`: stale-heartbeat rescue should pick it up soon
-- very negative `deadline_remaining_s`: deadline rescue should pick it up soon
+- `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
+- very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 
 ### Inspect Runtime Health
 
