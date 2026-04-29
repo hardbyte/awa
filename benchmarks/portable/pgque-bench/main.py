@@ -149,6 +149,19 @@ async def aconnect() -> psycopg.AsyncConnection:
 def install_pgque_sync() -> None:
     """Run ``pgque.sql`` (idempotent) using a sync connection — psycopg
     handles the multi-statement script naturally with ``execute()``."""
+    if not PGQUE_SQL.exists():
+        # The vendored pgque SQL lives in a git submodule
+        # (`benchmarks/portable/pgque-bench/vendor/pgque`) that has to
+        # be initialised before this adapter runs. Surface a clear
+        # diagnostic instead of the raw FileNotFoundError so a fresh
+        # checkout doesn't leave operators chasing a path that doesn't
+        # mean anything to them yet.
+        raise RuntimeError(
+            f"pgque vendor SQL not found at {PGQUE_SQL}. The pgque adapter "
+            "uses a git submodule for the upstream vendor SQL; run "
+            "`git submodule update --init --recursive` from the repo root "
+            "before launching `long_horizon.py run --systems pgque,...`."
+        )
     sql = PGQUE_SQL.read_text()
     with psycopg.connect(database_url(), autocommit=True) as conn:
         with conn.cursor() as cur:
