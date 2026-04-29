@@ -915,22 +915,24 @@ def build_parser() -> argparse.ArgumentParser:
     """Top-level CLI for the portable benchmarking harness.
 
     Subcommand-shaped (#174) so the harness has one entry point even as
-    new actions land. Today: `run` (drive a benchmark) and `combine`
+    new actions land. Today: `run` (drive a benchmark), `combine`
     (merge already-completed single-system runs into one consolidated
-    report). Once `chaos.py` folds in (UNIFIED_DRIVER_DESIGN.md), its
-    scenarios become named phase sequences invoked through `run`; no
-    new subcommand is expected to land at the CLI level.
+    report), and `compare` (render a markdown side-by-side from a
+    combined run's summary.json). Once `chaos.py` folds in
+    (UNIFIED_DRIVER_DESIGN.md), its scenarios become named phase
+    sequences invoked through `run`; no new subcommand is expected to
+    land at the CLI level.
     """
-    from . import combine
+    from . import combine, compare
 
     parser = argparse.ArgumentParser(
         prog="long_horizon.py",
-        description="Portable benchmarking harness: drive runs and combine reports.",
+        description="Portable benchmarking harness: drive runs, combine reports, render comparisons.",
     )
     subparsers = parser.add_subparsers(
         dest="command",
         required=True,
-        metavar="{run,combine}",
+        metavar="{run,combine,compare}",
     )
 
     run_parser = subparsers.add_parser(
@@ -949,6 +951,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser.set_defaults(func=_cmd_run)
 
     combine.add_subparser(subparsers)
+    compare.add_subparser(subparsers)
 
     return parser
 
