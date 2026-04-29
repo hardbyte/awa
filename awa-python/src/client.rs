@@ -518,6 +518,38 @@ impl PyClient {
         })
     }
 
+    /// Materialize the queue-storage schema's tables / indexes /
+    /// functions without changing the storage transition state.
+    ///
+    /// Mirrors `awa storage prepare-queue-storage-schema` on the CLI:
+    /// the operator-facing prep step that pairs with
+    /// `storage_prepare(...)` for a staged 0.5 → 0.6 transition. Use
+    /// this when you want the queue-storage tables to exist before
+    /// any worker starts but do *not* want to activate the backend
+    /// yet (i.e. `state` should stay at `prepared` rather than jumping
+    /// to `active`). For the "all in one shot" path, see
+    /// [`Self::install_queue_storage`].
+    fn prepare_queue_storage_schema<'py>(
+        &self,
+        py: Python<'py>,
+        schema: String,
+        queue_slot_count: u32,
+        lease_slot_count: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let store = QueueStorage::new(QueueStorageConfig {
+                schema,
+                queue_slot_count: queue_slot_count as usize,
+                lease_slot_count: lease_slot_count as usize,
+                ..Default::default()
+            })
+            .map_err(map_awa_error)?;
+            store.prepare_schema(&pool).await.map_err(map_awa_error)?;
+            Ok(())
+        })
+    }
+
     fn install_queue_storage<'py>(
         &self,
         py: Python<'py>,

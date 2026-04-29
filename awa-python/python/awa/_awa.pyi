@@ -277,6 +277,13 @@ class Client:
         lease_slot_count: int = 8,
         reset: bool = False,
     ) -> None: ...
+    async def prepare_queue_storage_schema(
+        self,
+        *,
+        schema: str = "awa_exp",
+        queue_slot_count: int = 16,
+        lease_slot_count: int = 8,
+    ) -> None: ...
     async def transaction(self) -> Transaction: ...
     def worker(
         self,

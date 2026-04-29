@@ -149,6 +149,29 @@ class AsyncClient:
             reset=reset,
         )
 
+    async def prepare_queue_storage_schema(
+        self,
+        *,
+        schema: str = DEFAULT_QUEUE_STORAGE_SCHEMA,
+        queue_slot_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_SLOT_COUNT,
+        lease_slot_count: int = DEFAULT_QUEUE_STORAGE_LEASE_SLOT_COUNT,
+    ) -> None:
+        """Materialize the queue-storage schema's tables / indexes /
+        functions without changing the storage transition state.
+
+        Mirrors ``awa storage prepare-queue-storage-schema`` on the CLI.
+        Pairs with ``awa.storage_prepare(...)`` for a staged
+        ``0.5 → 0.6`` transition: call ``storage_prepare`` to flip the
+        transition state to ``prepared``, call this method to create
+        the actual tables, then start workers. For the all-in-one
+        "install and activate" path, see :meth:`install_queue_storage`.
+        """
+        return await self._raw.prepare_queue_storage_schema(
+            schema=schema,
+            queue_slot_count=queue_slot_count,
+            lease_slot_count=lease_slot_count,
+        )
+
     async def transaction(self) -> Transaction:
         """Start an async transaction (use as async context manager)."""
         return await self._raw.transaction()

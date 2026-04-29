@@ -341,9 +341,15 @@ async def test_per_queue_aging_zero_disables_escalation(client):
 
 
 @pytest.mark.asyncio
-async def test_default_start_stays_canonical_until_transition_active(client):
-    """Auto role stays on canonical until the transition becomes active."""
-    queue = "cfg_default_canonical_runtime"
+async def test_default_start_on_fresh_install_auto_finalizes_to_queue_storage(client):
+    """Fresh-install fast path (v013): a default `client.start(...)` on
+    a database that has never seen canonical work auto-promotes the
+    storage transition to `active=queue_storage` so the operator
+    doesn't have to run `prepare → enter-mixed-transition → finalize`
+    by hand. See `awa.storage_auto_finalize_if_fresh()` and the
+    "Fresh install" section of `docs/migrations.md`.
+    """
+    queue = "cfg_fresh_install_auto_finalize"
     seen = asyncio.Event()
 
     @client.task(ConfigTestJob, queue=queue)
@@ -353,7 +359,7 @@ async def test_default_start_stays_canonical_until_transition_active(client):
 
     try:
         await client.start([(queue, 1)], poll_interval_ms=25)
-        job = await client.insert(ConfigTestJob(value="default-canonical"), queue=queue)
+        job = await client.insert(ConfigTestJob(value="fresh-install"), queue=queue)
         await asyncio.wait_for(seen.wait(), timeout=2.0)
         fetched = await wait_for_job_state(client, job.id, awa.JobState.Completed)
         assert fetched.state == awa.JobState.Completed
@@ -368,9 +374,56 @@ async def test_default_start_stays_canonical_until_transition_active(client):
             """
         )
         await tx.commit()
-        assert status["active_schema"] is None
+        # Fresh-install conditions held (no canonical jobs, no live
+        # canonical-only workers) so the auto-finalize gate fired and
+        # the transition advanced straight to active. The schema is
+        # the default "awa" name from QueueStorageConfig::default().
+        assert status["state"] == "active"
+        assert status["active_engine"] == "queue_storage"
+        assert status["active_schema"] == "awa"
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_default_start_with_canonical_backlog_stays_canonical(client):
+    """Counterpart to the auto-finalize test: a database with
+    in-flight canonical work fails the
+    `storage_auto_finalize_if_fresh()` precondition (canonical jobs
+    exist), so the auto runtime keeps draining canonical until an
+    operator explicitly runs the staged transition.
+    """
+    queue = "cfg_canonical_backlog_no_auto_finalize"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    # Park a canonical job *before* starting the worker so the
+    # auto-finalize gate sees a non-empty backlog at start time and
+    # bails out. The job's queue isn't registered yet, but
+    # `insert` only writes the canonical row — the registration
+    # check fires at start time.
+    await client.insert(ConfigTestJob(value="canonical-pre-start"), queue=queue)
+    try:
+        await client.start([(queue, 1)], poll_interval_ms=25)
+        await asyncio.wait_for(seen.wait(), timeout=2.0)
+
+        tx = await client.transaction()
+        status = await tx.fetch_one(
+            """
+            SELECT
+                awa.active_queue_storage_schema() AS active_schema,
+                (SELECT state FROM awa.storage_status()) AS state,
+                (SELECT active_engine FROM awa.storage_status()) AS active_engine
+            """
+        )
+        await tx.commit()
         assert status["state"] == "canonical"
         assert status["active_engine"] == "canonical"
+        assert status["active_schema"] is None
     finally:
         await client.shutdown()
 
@@ -420,6 +473,13 @@ async def test_queue_storage_target_role_executes_after_mixed_transition(client)
     try:
         await target_client.migrate()
 
+        # Staged 0.5 → 0.6 transition setup: drop any leftover schema,
+        # flip the transition singleton to `prepared` with this run's
+        # schema name, and materialize the schema's tables /
+        # functions. The `resolve_effective_storage` gate refuses to
+        # start a 0.6 runtime against a `prepared`-state schema whose
+        # tables don't physically exist, so the prep step is required
+        # before either client can start.
         tx = await client.transaction()
         await tx.execute("SELECT * FROM awa.storage_abort()")
         await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
@@ -428,6 +488,7 @@ async def test_queue_storage_target_role_executes_after_mixed_transition(client)
             schema,
         )
         await tx.commit()
+        await target_client.prepare_queue_storage_schema(schema=schema)
 
         await client.start(
             [(queue, 1)],
