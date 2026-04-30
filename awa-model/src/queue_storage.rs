@@ -6584,6 +6584,42 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // Hydrate runs as part of every rescue path that DELETE'd
+        // a leases row (heartbeat / deadline / callback timeout
+        // rescue, plus admin cancel of running attempts). For
+        // receipt-backed attempts those leases came from
+        // `ensure_running_leases_from_receipts_tx`, which leaves a
+        // `lease_claims` row behind with `materialized_at` set. The
+        // rescue itself closes the lease but never wrote a closure
+        // for the original receipt, so the claim sat "open" until
+        // partition prune — `load_job` and any
+        // `lease_claims`-aware count then double-counted the
+        // attempt as `running` even after it had moved to
+        // retryable / failed / completed. Write the closure here so
+        // the receipt plane mirrors the lease plane: when the lease
+        // is gone, the receipt is gone too.
+        sqlx::query(&format!(
+            r#"
+            WITH refs(job_id, run_lease) AS (
+                SELECT * FROM unnest($1::bigint[], $2::bigint[])
+            )
+            INSERT INTO {schema}.lease_claim_closures
+                (claim_slot, job_id, run_lease, outcome, closed_at)
+            SELECT claims.claim_slot, claims.job_id, claims.run_lease,
+                   'rescue', clock_timestamp()
+            FROM {schema}.lease_claims AS claims
+            JOIN refs
+              ON refs.job_id = claims.job_id
+             AND refs.run_lease = claims.run_lease
+            ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+            "#
+        ))
+        .bind(&job_ids)
+        .bind(&run_leases)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         let ready_map: BTreeMap<(i32, i64, String, i16, i64), ReadySnapshotRow> = ready_rows
             .into_iter()
             .map(|row| {
