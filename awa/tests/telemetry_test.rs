@@ -359,6 +359,12 @@ async fn backdate_scheduled_run_at_by_ids(pool: &sqlx::PgPool, job_ids: &[i64]) 
 
 async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
     if let Some(schema) = active_queue_storage_schema(pool).await {
+        // The running job lives on `leases` if it materialized
+        // (heartbeat / progress flush / callback wait) and on
+        // `lease_claims` otherwise. Receipts mode (the 0.6 default)
+        // keeps short claims on `lease_claims` for their full
+        // lifetime. Update both so the test's deadline-rescue setup
+        // works regardless of which path the in-flight attempt is on.
         sqlx::query(&format!(
             "UPDATE {schema}.leases \
              SET deadline_at = now() - interval '1 second' \
@@ -367,7 +373,16 @@ async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
         .bind(job_id)
         .execute(pool)
         .await
-        .expect("Failed to backdate queue-storage deadline rescue job");
+        .expect("Failed to backdate queue-storage lease deadline rescue job");
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claims \
+             SET deadline_at = now() - interval '1 second' \
+             WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage receipt deadline rescue job");
         return;
     }
 
@@ -380,6 +395,12 @@ async fn backdate_running_deadline(pool: &sqlx::PgPool, job_id: i64) {
 
 async fn backdate_running_heartbeat(pool: &sqlx::PgPool, job_id: i64) {
     if let Some(schema) = active_queue_storage_schema(pool).await {
+        // Heartbeat-based rescue only applies once a claim has
+        // materialised into a `leases` row (heartbeat_at lives there,
+        // not on `lease_claims`). For receipts-mode short claims the
+        // deadline-based rescue is the analogue; backdate the
+        // receipt's deadline_at so `rescue_expired_receipt_deadlines_tx`
+        // closes it on the next tick.
         sqlx::query(&format!(
             "UPDATE {schema}.leases \
              SET heartbeat_at = now() - interval '5 minutes' \
@@ -388,7 +409,16 @@ async fn backdate_running_heartbeat(pool: &sqlx::PgPool, job_id: i64) {
         .bind(job_id)
         .execute(pool)
         .await
-        .expect("Failed to backdate queue-storage heartbeat rescue job");
+        .expect("Failed to backdate queue-storage lease heartbeat rescue job");
+        sqlx::query(&format!(
+            "UPDATE {schema}.lease_claims \
+             SET deadline_at = now() - interval '1 second' \
+             WHERE job_id = $1"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage receipt rescue job");
         return;
     }
 
