@@ -1,16 +1,65 @@
 # awa-worker
 
-Worker runtime for the [Awa](https://crates.io/crates/awa) Postgres-native job queue.
+Worker runtime for the [Awa](https://crates.io/crates/awa) Postgres-native
+job queue: dispatch, claim, heartbeat, completion-batching, maintenance,
+and lifecycle hooks.
 
-This crate provides:
-- `Client` / `ClientBuilder` — configure queues, register workers, start the runtime
-- `JobContext` — handler context with cancellation, progress tracking, callback registration
-- `JobEvent<T>` / `UntypedJobEvent` — post-commit lifecycle hooks for cleanup and notifications
-- `JobResult` / `JobError` — handler return types (completed, retry, snooze, cancel, wait-for-callback)
-- `QueueConfig` — per-queue concurrency, rate limiting, weighted mode
-- Dispatcher, heartbeat, maintenance, and completion batcher internals
+Most Rust applications depend on the [`awa`](https://crates.io/crates/awa)
+facade and never reach for this crate directly. Use `awa-worker` when
+you need the runtime types without the re-export shim — typically when
+you are building higher-level frameworks or alternate transports on
+top of Awa.
 
-You don't usually need to depend on this crate directly — [`awa`](https://crates.io/crates/awa) re-exports everything.
+## What's in here
+
+- **Client** — `Client` and `ClientBuilder` configure queues, register
+  handlers, attach lifecycle hooks, and start the runtime. `HealthCheck`,
+  `QueueHealth`, `QueueCapacity`, and `TransitionWorkerRole` expose the
+  observability and transition-aware capabilities.
+- **Job context** — `JobContext` (with cancellation, structured
+  progress, and callback registration), `CallbackToken`,
+  `CallbackGuard`.
+- **Handler results** — `JobResult` (`Completed`, `RetryAfter`,
+  `Snooze`, `Cancel`, `WaitForCallback`) and `JobError`. Implement
+  the `Worker` trait directly or register typed closures with
+  `register_handler`.
+- **Queue configuration** — `QueueConfig` (concurrency, weighted mode,
+  rate limiting, per-claim deadlines), `RateLimit`.
+- **Lifecycle hooks** — `JobEvent<T>` and `UntypedJobEvent` fire after
+  guarded finalization commits, useful for cache invalidation,
+  notifications, and metrics emission.
+- **HTTP worker** — `HttpWorker`, `HttpWorkerConfig`, `HttpWorkerMode`
+  dispatch jobs to serverless endpoints over HTTP with HMAC-BLAKE3
+  signing. See [ADR-018](../docs/adr/018-http-worker.md).
+- **Maintenance** — `RetentionPolicy` controls retention sweeps; the
+  maintenance leader also rotates the receipt-ring partitions
+  introduced in 0.6.
+- **Metrics** — `AwaMetrics` exposes the runtime metric surface for
+  Prometheus / OTel scrapers.
+
+## Capabilities
+
+- **Vacuum-aware queue storage** — workers default to the queue-storage
+  engine and rotating receipt ring described in
+  [ADR-019](../docs/adr/019-queue-storage-redesign.md) and
+  [ADR-023](../docs/adr/023-receipt-plane-ring-partitioning.md).
+- **Dead Letter Queue** — terminal failures land in `dlq_entries` for
+  any queue with `dlq_enabled` set. Per-queue policy is configured
+  through `QueueConfig` and the `dlq_enabled_by_default` builder
+  setting; see [`docs/dead-letter-queue.md`](../docs/dead-letter-queue.md).
+- **Descriptor catalog** — `ClientBuilder::queue_descriptor` and
+  `job_kind_descriptor` declare display name, owner, tags, and docs
+  URL alongside the worker. The runtime syncs these to
+  `queue_descriptors` / `job_kind_descriptors` on start
+  ([ADR-022](../docs/adr/022-descriptor-catalog.md)).
+- **Per-claim deadlines** — `QueueConfig::deadline_duration` writes
+  `lease_claims.deadline_at` on claim. Expired claims are force-closed
+  by the rescue path with `'deadline_expired'`.
+- **Priority aging** — applied at claim time on the queue-storage engine
+  ([ADR-005](../docs/adr/005-priority-aging.md)).
+- **Heartbeat + deadline rescue** — two independent rescue paths cover
+  crash and runaway failure modes
+  ([ADR-003](../docs/adr/003-heartbeat-deadline-hybrid.md)).
 
 ## Cancellation Semantics
 
@@ -40,6 +89,12 @@ There is an important distinction between:
 
 If a running job is cancelled in storage and the handler keeps running, its
 later completion/retry/cancel attempt is treated as stale and ignored.
+
+## See also
+
+- [Architecture overview](../docs/architecture.md)
+- [Configuration reference](../docs/configuration.md)
+- [Deployment](../docs/deployment.md)
 
 ## License
 
