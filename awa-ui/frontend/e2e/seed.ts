@@ -15,13 +15,6 @@ const queueStorageSchema = "awa_e2e_qs";
 const queueSlotCount = 16;
 const leaseSlotCount = 8;
 
-function ringSlotRows(count: number): string {
-  return Array.from({ length: count }, (_, slot) => {
-    const generation = slot === 0 ? 0 : -1;
-    return `(${slot}, ${generation})`;
-  }).join(",\n      ");
-}
-
 export default async function globalSetup() {
   try {
     execSync(`${awaBinary} --database-url ${databaseUrl} migrate`, {
@@ -32,192 +25,45 @@ export default async function globalSetup() {
     console.warn("Could not run migrations before E2E seed");
   }
 
+  // Build the queue-storage schema via the CLI (the same code path the
+  // runtime takes) instead of hand-rolling DDL. The hand-rolled version
+  // had drifted: `queue_claim_heads`, `queue_enqueue_heads`,
+  // `lease_claims`, `lease_claim_closures`, `claim_ring_state`, and
+  // `claim_ring_slots` all post-date it, and the dashboard's
+  // `state_counts` query JOINs `queue_claim_heads` — without the
+  // table, `/api/stats` returns 500 and every dashboard test waits
+  // 30 s for an OK response that never comes. Running the CLI keeps
+  // the test fixture in lock-step with whatever the runtime actually
+  // expects.
+  try {
+    execSync(
+      `${awaBinary} --database-url ${databaseUrl} storage prepare-queue-storage-schema ` +
+        `--schema ${queueStorageSchema} ` +
+        `--queue-slot-count ${queueSlotCount} ` +
+        `--lease-slot-count ${leaseSlotCount} ` +
+        `--reset`,
+      {
+        stdio: "pipe",
+        timeout: 30_000,
+      }
+    );
+  } catch (e) {
+    console.warn(
+      "Could not prepare queue-storage schema via CLI; falling back to seed errors:",
+      e
+    );
+  }
+
   const pgUrl = new URL(databaseUrl);
   const host = pgUrl.hostname;
   const port = pgUrl.port || "5432";
   const db = pgUrl.pathname.slice(1);
   const user = pgUrl.username;
-  const queueRingSlotRows = ringSlotRows(queueSlotCount);
-  const leaseRingSlotRows = ringSlotRows(leaseSlotCount);
 
   const sql = `
-    DROP SCHEMA IF EXISTS ${queueStorageSchema} CASCADE;
-    CREATE SCHEMA ${queueStorageSchema};
-
-    CREATE SEQUENCE ${queueStorageSchema}.job_id_seq;
-
-    CREATE TABLE ${queueStorageSchema}.queue_ring_state (
-      singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-      current_slot INT NOT NULL,
-      generation   BIGINT NOT NULL,
-      slot_count   INT NOT NULL
-    );
-
-    INSERT INTO ${queueStorageSchema}.queue_ring_state (
-      singleton, current_slot, generation, slot_count
-    )
-    VALUES (TRUE, 0, 0, ${queueSlotCount});
-
-    CREATE TABLE ${queueStorageSchema}.queue_ring_slots (
-      slot       INT PRIMARY KEY,
-      generation BIGINT NOT NULL
-    );
-
-    INSERT INTO ${queueStorageSchema}.queue_ring_slots (slot, generation)
-    VALUES
-      ${queueRingSlotRows};
-
-    CREATE TABLE ${queueStorageSchema}.lease_ring_state (
-      singleton    BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-      current_slot INT NOT NULL,
-      generation   BIGINT NOT NULL,
-      slot_count   INT NOT NULL
-    );
-
-    INSERT INTO ${queueStorageSchema}.lease_ring_state (
-      singleton, current_slot, generation, slot_count
-    )
-    VALUES (TRUE, 0, 0, ${leaseSlotCount});
-
-    CREATE TABLE ${queueStorageSchema}.lease_ring_slots (
-      slot       INT PRIMARY KEY,
-      generation BIGINT NOT NULL
-    );
-
-    INSERT INTO ${queueStorageSchema}.lease_ring_slots (slot, generation)
-    VALUES
-      ${leaseRingSlotRows};
-
-    CREATE TABLE ${queueStorageSchema}.queue_lanes (
-      queue           TEXT NOT NULL,
-      priority        SMALLINT NOT NULL,
-      next_seq        BIGINT NOT NULL DEFAULT 1,
-      claim_seq       BIGINT NOT NULL DEFAULT 1,
-      available_count BIGINT NOT NULL DEFAULT 0,
-      running_count   BIGINT NOT NULL DEFAULT 0,
-      pruned_completed_count BIGINT NOT NULL DEFAULT 0,
-      PRIMARY KEY (queue, priority)
-    );
-
-    CREATE TABLE ${queueStorageSchema}.ready_entries (
-      ready_slot        INT NOT NULL,
-      ready_generation  BIGINT NOT NULL,
-      job_id            BIGINT NOT NULL,
-      kind              TEXT NOT NULL,
-      queue             TEXT NOT NULL,
-      args              JSONB NOT NULL DEFAULT '{}'::jsonb,
-      priority          SMALLINT NOT NULL,
-      attempt           SMALLINT NOT NULL DEFAULT 0,
-      run_lease         BIGINT NOT NULL DEFAULT 0,
-      max_attempts      SMALLINT NOT NULL DEFAULT 25,
-      lane_seq          BIGINT NOT NULL,
-      run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      attempted_at      TIMESTAMPTZ,
-      created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      unique_key        BYTEA,
-      unique_states     TEXT,
-      payload           JSONB NOT NULL DEFAULT '{}'::jsonb,
-      PRIMARY KEY (ready_slot, queue, priority, lane_seq)
-    );
-
-    CREATE TABLE ${queueStorageSchema}.leases (
-      lease_slot          INT NOT NULL,
-      lease_generation    BIGINT NOT NULL,
-      ready_slot          INT NOT NULL,
-      ready_generation    BIGINT NOT NULL,
-      job_id              BIGINT NOT NULL,
-      queue               TEXT NOT NULL,
-      state               awa.job_state NOT NULL DEFAULT 'running',
-      priority            SMALLINT NOT NULL,
-      attempt             SMALLINT NOT NULL DEFAULT 1,
-      run_lease           BIGINT NOT NULL DEFAULT 1,
-      max_attempts        SMALLINT NOT NULL DEFAULT 25,
-      lane_seq            BIGINT NOT NULL,
-      heartbeat_at        TIMESTAMPTZ,
-      deadline_at         TIMESTAMPTZ,
-      attempted_at        TIMESTAMPTZ,
-      callback_id         UUID,
-      callback_timeout_at TIMESTAMPTZ,
-      PRIMARY KEY (lease_slot, queue, priority, lane_seq)
-    );
-
-    CREATE TABLE ${queueStorageSchema}.attempt_state (
-      job_id               BIGINT NOT NULL,
-      run_lease            BIGINT NOT NULL,
-      progress             JSONB,
-      callback_filter      TEXT,
-      callback_on_complete TEXT,
-      callback_on_fail     TEXT,
-      callback_transform   TEXT,
-      callback_result      JSONB,
-      updated_at           TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      PRIMARY KEY (job_id, run_lease)
-    );
-
-    CREATE TABLE ${queueStorageSchema}.done_entries (
-      ready_slot        INT NOT NULL,
-      ready_generation  BIGINT NOT NULL,
-      job_id            BIGINT NOT NULL,
-      kind              TEXT NOT NULL,
-      queue             TEXT NOT NULL,
-      args              JSONB NOT NULL DEFAULT '{}'::jsonb,
-      state             awa.job_state NOT NULL DEFAULT 'completed',
-      priority          SMALLINT NOT NULL,
-      attempt           SMALLINT NOT NULL DEFAULT 1,
-      run_lease         BIGINT NOT NULL DEFAULT 1,
-      max_attempts      SMALLINT NOT NULL DEFAULT 25,
-      lane_seq          BIGINT NOT NULL,
-      run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      attempted_at      TIMESTAMPTZ,
-      finalized_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      unique_key        BYTEA,
-      unique_states     TEXT,
-      payload           JSONB NOT NULL DEFAULT '{}'::jsonb,
-      PRIMARY KEY (ready_slot, queue, priority, lane_seq)
-    );
-
-    CREATE TABLE ${queueStorageSchema}.deferred_jobs (
-      job_id            BIGINT PRIMARY KEY,
-      kind              TEXT NOT NULL,
-      queue             TEXT NOT NULL,
-      args              JSONB NOT NULL DEFAULT '{}'::jsonb,
-      state             awa.job_state NOT NULL,
-      priority          SMALLINT NOT NULL,
-      attempt           SMALLINT NOT NULL DEFAULT 0,
-      run_lease         BIGINT NOT NULL DEFAULT 0,
-      max_attempts      SMALLINT NOT NULL DEFAULT 25,
-      run_at            TIMESTAMPTZ NOT NULL,
-      attempted_at      TIMESTAMPTZ,
-      finalized_at      TIMESTAMPTZ,
-      created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      unique_key        BYTEA,
-      unique_states     TEXT,
-      payload           JSONB NOT NULL DEFAULT '{}'::jsonb
-    );
-
-    CREATE TABLE ${queueStorageSchema}.dlq_entries (
-      job_id             BIGINT PRIMARY KEY,
-      kind               TEXT NOT NULL,
-      queue              TEXT NOT NULL,
-      args               JSONB NOT NULL DEFAULT '{}'::jsonb,
-      state              awa.job_state NOT NULL DEFAULT 'failed',
-      priority           SMALLINT NOT NULL,
-      attempt            SMALLINT NOT NULL DEFAULT 1,
-      run_lease          BIGINT NOT NULL DEFAULT 1,
-      max_attempts       SMALLINT NOT NULL DEFAULT 25,
-      run_at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      attempted_at       TIMESTAMPTZ,
-      finalized_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      created_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      unique_key         BYTEA,
-      unique_states      TEXT,
-      payload            JSONB NOT NULL DEFAULT '{}'::jsonb,
-      dlq_reason         TEXT NOT NULL,
-      dlq_at             TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-      original_run_lease BIGINT NOT NULL
-    );
-
+    -- The CLI's prepare-queue-storage-schema (above) created the
+    -- queue_storage tables. This block only seeds test data + the
+    -- control-plane catalogs that drive the dashboard tests.
     INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)
     VALUES ('queue_storage', '${queueStorageSchema}', now())
     ON CONFLICT (backend)
