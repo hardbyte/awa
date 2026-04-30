@@ -189,7 +189,10 @@ jobs:
   frontend-e2e:
     name: Frontend E2E tests
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    # 20m has been hitting the wall on slow GH-hosted runners — the
+    # full Playwright suite (8 specs) plus per-test PG seeding is on
+    # the edge at 17–19m. Give it real headroom.
+    timeout-minutes: 30
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
     services:
