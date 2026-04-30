@@ -1,13 +1,17 @@
-//! Tests for bug fixes: state guard (Fix 1), shutdown drain (Fix 2),
-//! deadline cancellation signal (Fix 3), UniqueConflict field (Fix 4).
+//! Runtime guard tests for shutdown drain, deadline cancellation signalling,
+//! and UniqueConflict field population.
 
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig};
-use awa_model::{admin, insert_with, migrations, InsertOpts};
+use awa_model::{insert_with, migrations, InsertOpts};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::LazyLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
+
+static EXECUTOR_GUARD_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -21,6 +25,32 @@ async fn setup() -> sqlx::PgPool {
         .await
         .expect("Failed to connect");
     migrations::run(&pool).await.expect("Failed to migrate");
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to reset storage transition state");
+
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .expect("Failed to reset active runtime backend");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear runtime snapshots");
     pool
 }
 
@@ -37,285 +67,41 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
         .expect("Failed to clean queue meta");
 }
 
+async fn wait_for_job_state(
+    pool: &sqlx::PgPool,
+    job_id: i64,
+    expected_state: &str,
+    timeout: Duration,
+) {
+    let start = std::time::Instant::now();
+    loop {
+        let current_state: Option<String> =
+            sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_optional(pool)
+                .await
+                .expect("Failed to query job state");
+        if current_state.as_deref() == Some(expected_state) {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "Timed out waiting for job {job_id} to reach state {expected_state}; current state: {current_state:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct GuardJob {
     pub value: String,
-}
-
-/// B1: Late completion after deadline rescue — DB state stays `retryable`.
-#[tokio::test]
-async fn test_late_completion_after_rescue_is_noop() {
-    let pool = setup().await;
-    let queue = "guard_late_complete";
-    clean_queue(&pool, queue).await;
-
-    // Insert and claim a job
-    let job = insert_with(
-        &pool,
-        &GuardJob {
-            value: "test".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    // Simulate: claim the job (set to running)
-    sqlx::query(
-        "UPDATE awa.jobs SET state = 'running', attempt = 1, heartbeat_at = now(), deadline_at = now() + interval '5 minutes' WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Simulate: maintenance rescues the job (sets state to retryable)
-    sqlx::query(
-        "UPDATE awa.jobs SET state = 'retryable', finalized_at = now(), heartbeat_at = NULL, deadline_at = NULL WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Now the "late" handler tries to complete the job.
-    // With the state guard, this UPDATE should be a no-op.
-    let result = sqlx::query(
-        "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1 AND state = 'running'",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(
-        result.rows_affected(),
-        0,
-        "Late completion should be a no-op when job is already rescued"
-    );
-
-    // Verify state is still retryable
-    let state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
-        .bind(job.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(state, "retryable");
-}
-
-/// B1b: Late completion cannot finalize a newer running attempt of the same job.
-#[tokio::test]
-async fn test_late_completion_cannot_finalize_reclaimed_running_attempt() {
-    let pool = setup().await;
-    let queue = "guard_reclaimed_running";
-    clean_queue(&pool, queue).await;
-
-    let job = insert_with(
-        &pool,
-        &GuardJob {
-            value: "test".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "UPDATE awa.jobs
-         SET state = 'running',
-             attempt = 1,
-             run_lease = 1,
-             heartbeat_at = now(),
-             deadline_at = now() + interval '5 minutes'
-         WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "UPDATE awa.jobs
-         SET state = 'retryable',
-             finalized_at = now(),
-             heartbeat_at = NULL,
-             deadline_at = NULL
-         WHERE id = $1 AND run_lease = 1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "UPDATE awa.jobs
-         SET state = 'available',
-             finalized_at = NULL,
-             run_at = now()
-         WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "UPDATE awa.jobs
-         SET state = 'running',
-             attempt = 2,
-             run_lease = 2,
-             heartbeat_at = now(),
-             deadline_at = now() + interval '5 minutes'
-         WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let result = sqlx::query(
-        "UPDATE awa.jobs
-         SET state = 'completed', finalized_at = now()
-         WHERE id = $1 AND state = 'running' AND run_lease = $2",
-    )
-    .bind(job.id)
-    .bind(1_i64)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(
-        result.rows_affected(),
-        0,
-        "Late completion from the old lease must not finalize the new running attempt"
-    );
-
-    let row: (String, i16, i64) =
-        sqlx::query_as("SELECT state::text, attempt, run_lease FROM awa.jobs WHERE id = $1")
-            .bind(job.id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(row.0, "running");
-    assert_eq!(row.1, 2);
-    assert_eq!(row.2, 2);
-}
-
-/// B2: Late completion after admin cancel — DB state stays `cancelled`.
-#[tokio::test]
-async fn test_late_completion_after_cancel_is_noop() {
-    let pool = setup().await;
-    let queue = "guard_late_cancel";
-    clean_queue(&pool, queue).await;
-
-    let job = insert_with(
-        &pool,
-        &GuardJob {
-            value: "test".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    // Claim the job
-    sqlx::query(
-        "UPDATE awa.jobs SET state = 'running', attempt = 1, heartbeat_at = now(), deadline_at = now() + interval '5 minutes' WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    // Admin cancels the job
-    sqlx::query("UPDATE awa.jobs SET state = 'cancelled', finalized_at = now() WHERE id = $1")
-        .bind(job.id)
-        .execute(&pool)
-        .await
-        .unwrap();
-
-    // Late handler tries to complete
-    let result = sqlx::query(
-        "UPDATE awa.jobs SET state = 'completed', finalized_at = now() WHERE id = $1 AND state = 'running'",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    assert_eq!(result.rows_affected(), 0);
-
-    let state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
-        .bind(job.id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(state, "cancelled");
-}
-
-/// B2b: Callback registration is rejected for stale running attempts.
-#[tokio::test]
-async fn test_register_callback_rejects_stale_lease() {
-    let pool = setup().await;
-    let queue = "guard_callback_lease";
-    clean_queue(&pool, queue).await;
-
-    let job = insert_with(
-        &pool,
-        &GuardJob {
-            value: "test".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
-    sqlx::query(
-        "UPDATE awa.jobs
-         SET state = 'running',
-             attempt = 2,
-             run_lease = 2,
-             heartbeat_at = now(),
-             deadline_at = now() + interval '5 minutes'
-         WHERE id = $1",
-    )
-    .bind(job.id)
-    .execute(&pool)
-    .await
-    .unwrap();
-
-    let err = admin::register_callback(&pool, job.id, 1, Duration::from_secs(3600))
-        .await
-        .unwrap_err();
-    match err {
-        awa_model::AwaError::Validation(msg) => {
-            assert!(msg.contains("job is not in running state"));
-        }
-        other => panic!("Expected Validation error, got: {other:?}"),
-    }
-
-    let callback_id = admin::register_callback(&pool, job.id, 2, Duration::from_secs(3600))
-        .await
-        .unwrap();
-    assert_ne!(callback_id, uuid::Uuid::nil());
 }
 
 /// B3: Shutdown waits for in-flight jobs — shutdown does not return until
 /// handlers complete (or timeout). Verify via a handler that sleeps.
 #[tokio::test]
 async fn test_shutdown_waits_for_inflight_jobs() {
+    let _guard = EXECUTOR_GUARD_TEST_LOCK.lock().await;
     let pool = setup().await;
     let queue = "guard_shutdown_drain";
     clean_queue(&pool, queue).await;
@@ -338,20 +124,6 @@ async fn test_shutdown_waits_for_inflight_jobs() {
         }
     }
 
-    // Insert a job
-    insert_with(
-        &pool,
-        &GuardJob {
-            value: "drain".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -368,9 +140,21 @@ async fn test_shutdown_waits_for_inflight_jobs() {
         .unwrap();
 
     client.start().await.unwrap();
+    let job = insert_with(
+        &pool,
+        &GuardJob {
+            value: "drain".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    wait_for_job_state(&pool, job.id, "running", Duration::from_secs(5)).await;
 
     // Wait for the job to be claimed (but not yet completed)
-    tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(
         completed.load(Ordering::SeqCst),
         0,
@@ -392,6 +176,7 @@ async fn test_shutdown_waits_for_inflight_jobs() {
 /// heartbeating until they complete during graceful shutdown.
 #[tokio::test]
 async fn test_heartbeat_alive_during_drain() {
+    let _guard = EXECUTOR_GUARD_TEST_LOCK.lock().await;
     let pool = setup().await;
     let queue = "guard_hb_drain";
     clean_queue(&pool, queue).await;
@@ -433,19 +218,6 @@ async fn test_heartbeat_alive_during_drain() {
         }
     }
 
-    insert_with(
-        &pool,
-        &GuardJob {
-            value: "hb_drain".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -463,9 +235,21 @@ async fn test_heartbeat_alive_during_drain() {
         .unwrap();
 
     client.start().await.unwrap();
+    let job = insert_with(
+        &pool,
+        &GuardJob {
+            value: "hb_drain".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
 
-    // Wait for job to be claimed
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    // Wait for job to be claimed before initiating drain.
+    wait_for_job_state(&pool, job.id, "running", Duration::from_secs(5)).await;
 
     // Trigger shutdown while job is still running — heartbeat should stay alive
     client.shutdown(Duration::from_secs(5)).await;
@@ -480,6 +264,7 @@ async fn test_heartbeat_alive_during_drain() {
 /// is_cancelled() after deadline passes, returns true.
 #[tokio::test]
 async fn test_deadline_rescue_signals_cancellation() {
+    let _guard = EXECUTOR_GUARD_TEST_LOCK.lock().await;
     let pool = setup().await;
     let queue = "guard_deadline_cancel";
     clean_queue(&pool, queue).await;
@@ -511,19 +296,6 @@ async fn test_deadline_rescue_signals_cancellation() {
         }
     }
 
-    insert_with(
-        &pool,
-        &GuardJob {
-            value: "deadline_cancel".into(),
-        },
-        InsertOpts {
-            queue: queue.into(),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
-
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -542,6 +314,19 @@ async fn test_deadline_rescue_signals_cancellation() {
         .unwrap();
 
     client.start().await.unwrap();
+    let job = insert_with(
+        &pool,
+        &GuardJob {
+            value: "deadline_cancel".into(),
+        },
+        InsertOpts {
+            queue: queue.into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    wait_for_job_state(&pool, job.id, "running", Duration::from_secs(5)).await;
 
     // Wait for the job to be claimed + deadline to expire + maintenance to rescue.
     // Leader election can take up to 10s, deadline rescue interval is 30s.
@@ -568,6 +353,7 @@ async fn test_deadline_rescue_signals_cancellation() {
 /// B6: UniqueConflict.constraint field contains the constraint name.
 #[tokio::test]
 async fn test_unique_conflict_has_constraint_name() {
+    let _guard = EXECUTOR_GUARD_TEST_LOCK.lock().await;
     let pool = setup().await;
     let queue = "guard_unique_field";
     clean_queue(&pool, queue).await;

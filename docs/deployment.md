@@ -23,6 +23,35 @@ In production, treat these as separate concerns:
 
 `awa serve` is an operator UI and admin API. It is not the worker runtime.
 
+## Queue Storage Cutover
+
+Fresh 0.6 installs use queue storage as the worker engine. Existing 0.5.x
+clusters must use the staged storage-transition flow documented in
+[migrations.md](migrations.md) and the short operator checklist in
+[upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md).
+
+Operationally:
+
+- queue storage is the 0.6 worker engine
+- canonical tables remain in the schema for migration, rollback boundaries,
+  and compatibility SQL surfaces
+- while state is `canonical` or `prepared`, 0.5.x and 0.6 pods may coexist and
+  all writes/execution remain canonical
+- after `enter-mixed-transition`, new writes route to queue storage while 0.6
+  drain workers finish the canonical backlog
+- once queue-storage rows exist, rollback to a 0.5.x-only fleet is not
+  supported; finish the transition or restore from backup
+
+For a 0.5.x cluster, do not stop canonical workers and start queue-storage
+workers as a separate manual cutover. Use the storage commands so producer
+routing, canonical drain, queue-storage executor readiness, and rollback
+interlocks move together.
+
+Current Rust and Python worker starts default to the correct effective engine
+for the storage-transition state. Only set `queue_storage_schema` /
+`ClientBuilder::queue_storage(...)` when you need to override the default
+schema name or segment sizing.
+
 ## Connection Pool Sizing
 
 Practical starting point, based on the current runtime internals:
@@ -51,22 +80,25 @@ Examples:
 
 The Python client defaults to `max_connections=10`. `awa serve` defaults to a pool of `10` connections (configurable via `--pool-max` / `AWA_POOL_MAX`). Other CLI subcommands use a single connection.
 
-## PostgreSQL Workload Discipline
+## Primary Database Hygiene
 
-Awa is tolerant of large deferred frontiers because it separates
-`awa.jobs_hot` from `awa.scheduled_jobs`, but it is still a high-churn Postgres
-workload. Operationally, the main pitfall is long-lived read transactions on
-the primary: a `REPEATABLE READ` or otherwise old snapshot can pin the MVCC
-horizon while workers continue to update and delete hot rows.
+Queue storage keeps the main ready path append-only, but Awa is still a
+high-churn Postgres workload. The main operational pitfall is no longer one
+giant mutable queue heap; it is long-lived readers or stale transactions that
+block lease or segment prune while the maintenance leader keeps rotating
+forward.
 
 Recommended practice:
 
 - keep analytical reads and admin transactions short on the primary
 - run long-lived reporting queries against a replica when possible
 - avoid leaving sessions `idle in transaction`
-- monitor `pg_stat_activity` and `pg_stat_user_tables` for long transactions
-  and rising `n_dead_tup` on `awa.jobs_hot`
-- tune autovacuum for the database if the queue is expected to churn heavily
+- monitor `pg_stat_activity` for long transactions
+- monitor `pg_stat_user_tables` on the active queue-storage schema; `ready`
+  segments should stay near zero dead tuples, lease segments may spike within
+  the rotation window but should collapse after prune, and `attempt_state`
+  should roughly track live long-running attempts
+- tune autovacuum for the database if the lease tables churn heavily
 
 The nightly MVCC benchmark exists to catch changes that make this failure mode
 worse, but it is not a substitute for keeping the primary free of stale
@@ -183,7 +215,13 @@ For smooth rollouts:
 3. Let old pods drain with `shutdown(...)`.
 4. Keep `terminationGracePeriodSeconds` slightly above that drain timeout.
 
-Because the schema migrations are additive-only, rolling upgrades are the normal path.
+Code-only releases can roll normally because the schema migrations are
+additive-only.
+
+Storage-engine cutovers are different from normal code-only releases. Follow
+the staged `prepare -> enter-mixed-transition -> finalize` flow in
+[upgrade-0.5-to-0.6.md](upgrade-0.5-to-0.6.md) so the database state, producer
+routing, and runtime roles remain aligned.
 
 ## Queue Isolation Patterns
 

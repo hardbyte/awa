@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import datetime
 from enum import IntEnum
 from typing import Any, Awaitable, Callable, Generic, TypeVar
 
@@ -45,6 +46,22 @@ class QueueStat:
 class CallbackToken:
     @property
     def id(self) -> str: ...
+
+class DlqEntry:
+    """An entry in the Dead Letter Queue.
+
+    Combines the original `Job` snapshot with DLQ-specific metadata (reason
+    for moving, timestamp, and the run_lease of the final attempt).
+    """
+
+    @property
+    def job(self) -> Job[dict[str, Any]]: ...
+    @property
+    def reason(self) -> str: ...
+    @property
+    def dlq_at(self) -> datetime.datetime: ...
+    @property
+    def original_run_lease(self) -> int: ...
 
 class Job(Generic[T]):
     @property
@@ -168,7 +185,7 @@ class Transaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def insert_many(
@@ -181,7 +198,7 @@ class Transaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     async def commit(self) -> None: ...
     async def rollback(self) -> None: ...
@@ -208,7 +225,7 @@ class SyncTransaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     def insert_many(
@@ -221,7 +238,7 @@ class SyncTransaction:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...
@@ -248,10 +265,25 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def migrate(self) -> None: ...
+    async def install_queue_storage(
+        self,
+        *,
+        schema: str = "awa_exp",
+        queue_slot_count: int = 16,
+        lease_slot_count: int = 8,
+        reset: bool = False,
+    ) -> None: ...
+    async def prepare_queue_storage_schema(
+        self,
+        *,
+        schema: str = "awa_exp",
+        queue_slot_count: int = 16,
+        lease_slot_count: int = 8,
+    ) -> None: ...
     async def transaction(self) -> Transaction: ...
     def worker(
         self,
@@ -280,6 +312,11 @@ class Client:
     async def resume_queue(self, queue: str) -> None: ...
     async def drain_queue(self, queue: str) -> int: ...
     async def flush_admin_metadata(self) -> None: ...
+    async def dump_job(self, job_id: int) -> str: ...
+    async def dump_run(self, job_id: int, attempt: int | None = None) -> str: ...
+    async def storage_status(self) -> str: ...
+    async def list_cron_jobs(self) -> str: ...
+    async def delete_cron_job(self, name: str) -> bool: ...
     async def queue_stats(self) -> list[QueueStat]: ...
     async def list_jobs(
         self,
@@ -290,6 +327,104 @@ class Client:
         limit: int = 100,
     ) -> list[Job[dict[str, Any]]]: ...
     async def get_job(self, job_id: int) -> Job[dict[str, Any]]: ...
+    async def list_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
+        limit: int = 100,
+    ) -> list[DlqEntry]: ...
+    def list_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
+        limit: int = 100,
+    ) -> list[DlqEntry]: ...
+    async def get_dlq_job(self, job_id: int) -> DlqEntry | None: ...
+    def get_dlq_job_sync(self, job_id: int) -> DlqEntry | None: ...
+    async def dlq_depth(self, *, queue: str | None = None) -> int: ...
+    def dlq_depth_sync(self, *, queue: str | None = None) -> int: ...
+    async def dlq_depth_by_queue(self) -> list[tuple[str, int]]: ...
+    def dlq_depth_by_queue_sync(self) -> list[tuple[str, int]]: ...
+    async def retry_from_dlq(
+        self,
+        job_id: int,
+        *,
+        run_at: datetime.datetime | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job[dict[str, Any]] | None: ...
+    def retry_from_dlq_sync(
+        self,
+        job_id: int,
+        *,
+        run_at: datetime.datetime | None = None,
+        priority: int | None = None,
+        queue: str | None = None,
+    ) -> Job[dict[str, Any]] | None: ...
+    async def bulk_retry_from_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
+    def bulk_retry_from_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
+    async def move_failed_to_dlq(self, job_id: int, reason: str) -> DlqEntry | None: ...
+    def move_failed_to_dlq_sync(self, job_id: int, reason: str) -> DlqEntry | None: ...
+    async def bulk_move_failed_to_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+        allow_all: bool = False,
+    ) -> int: ...
+    def bulk_move_failed_to_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        reason: str = "manual",
+        allow_all: bool = False,
+    ) -> int: ...
+    async def purge_dlq_job(self, job_id: int) -> bool: ...
+    def purge_dlq_job_sync(self, job_id: int) -> bool: ...
+    async def purge_dlq(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
+    def purge_dlq_sync(
+        self,
+        *,
+        kind: str | None = None,
+        queue: str | None = None,
+        tag: str | None = None,
+        before_id: int | None = None,
+        before_dlq_at: datetime.datetime | None = None,
+        allow_all: bool = False,
+    ) -> int: ...
     async def health_check(self) -> HealthCheck: ...
     async def insert_many_copy(
         self,
@@ -301,7 +436,7 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def periodic(
         self,
@@ -325,6 +460,7 @@ class Client:
         global_max_workers: int | None = None,
         completed_retention_hours: float | None = None,
         failed_retention_hours: float | None = None,
+        descriptor_retention_days: float | None = None,
         cleanup_batch_size: int | None = None,
         leader_election_interval_ms: int | None = None,
         heartbeat_interval_ms: int | None = None,
@@ -333,6 +469,14 @@ class Client:
         heartbeat_staleness_ms: int | None = None,
         deadline_rescue_interval_ms: int | None = None,
         callback_rescue_interval_ms: int | None = None,
+        queue_storage_schema: str | None = None,
+        queue_storage_queue_slot_count: int = 16,
+        queue_storage_lease_slot_count: int = 8,
+        queue_storage_claim_slot_count: int = 8,
+        queue_storage_queue_rotate_interval_ms: int = 1000,
+        queue_storage_lease_rotate_interval_ms: int = 50,
+        queue_storage_claim_rotate_interval_ms: int | None = None,
+        storage_transition_role: str | None = None,
     ) -> None: ...
     async def shutdown(self, timeout_ms: int = 2000) -> None: ...
     async def close(self) -> None: ...
@@ -375,11 +519,19 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
     ) -> Job[dict[str, Any]]: ...
     def close_sync(self) -> None: ...
     def migrate_sync(self) -> None: ...
+    def install_queue_storage_sync(
+        self,
+        *,
+        schema: str = "awa_exp",
+        queue_slot_count: int = 16,
+        lease_slot_count: int = 8,
+        reset: bool = False,
+    ) -> None: ...
     def transaction_sync(self) -> SyncTransaction: ...
     def retry_sync(self, job_id: int) -> Job[dict[str, Any]] | None: ...
     def cancel_sync(self, job_id: int) -> Job[dict[str, Any]] | None: ...
@@ -401,6 +553,11 @@ class Client:
     def resume_queue_sync(self, queue: str) -> None: ...
     def drain_queue_sync(self, queue: str) -> int: ...
     def flush_admin_metadata_sync(self) -> None: ...
+    def dump_job_sync(self, job_id: int) -> str: ...
+    def dump_run_sync(self, job_id: int, attempt: int | None = None) -> str: ...
+    def storage_status_sync(self) -> str: ...
+    def list_cron_jobs_sync(self) -> str: ...
+    def delete_cron_job_sync(self, name: str) -> bool: ...
     def queue_stats_sync(self) -> list[QueueStat]: ...
     def list_jobs_sync(
         self,
@@ -422,7 +579,7 @@ class Client:
         max_attempts: int = 25,
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
-        run_at: Any | None = None,
+        run_at: datetime.datetime | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     # External callback completion (sync)
     def complete_external_sync(
@@ -459,6 +616,12 @@ async def migrate(database_url: str) -> None: ...
 def migrations() -> list[tuple[int, str, str]]: ...
 def migrations_range(from_version: int, to_version: int) -> list[tuple[int, str, str]]: ...
 def current_migration_version() -> int: ...
+def init_telemetry(
+    endpoint: str,
+    service_name: str,
+    export_interval_ms: int = 5000,
+) -> bool: ...
+def shutdown_telemetry() -> None: ...
 
 # Exceptions
 class AwaError(Exception): ...

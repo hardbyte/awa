@@ -122,3 +122,12 @@ from typed args.
 Rejected as unnecessary abstraction for Awa's current scope. Lifecycle hooks
 cover the concrete post-commit use case without turning the worker runtime into
 an extensible middleware stack.
+
+## Relationship to ADR-019
+
+Hooks fire after the job's final state has been committed and its in-flight
+permit released, regardless of whether that commit targeted the canonical
+`awa.jobs_hot` row or a queue-storage `active_leases` deletion plus terminal
+append. The guarded-finalization contract that gates hook emission lives on
+`(job_id, run_lease)` and is unchanged under queue storage. See
+[ADR-019](019-queue-storage-redesign.md).

@@ -90,6 +90,7 @@ fn build_dispatch_job(
         args_instance,
         ctx.cancellation_flag(),
         ctx.pool().clone(),
+        ctx.queue_storage_store(),
         ctx.progress_buffer(),
     );
     Ok(Py::new(py, job)?.into_bound(py).into_any().unbind())

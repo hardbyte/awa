@@ -10,12 +10,76 @@ use awa_model::{insert_many, insert_with, migrations, InsertOpts, JobRow, JobSta
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
+use tokio::sync::{OnceCell, Semaphore};
 
-fn database_url() -> String {
+static SCALE_TEST_DB_INIT: OnceCell<()> = OnceCell::const_new();
+
+fn scale_test_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
+}
+
+fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
+
+fn replace_database_name(url: &str, database_name: &str) -> String {
+    let (without_query, query_suffix) = match url.split_once('?') {
+        Some((prefix, query)) => (prefix, Some(query)),
+        None => (url, None),
+    };
+    let (base, _) = without_query
+        .rsplit_once('/')
+        .expect("database URL should include a database name");
+    let mut out = format!("{base}/{database_name}");
+    if let Some(query) = query_suffix {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
+fn database_name(url: &str) -> String {
+    let without_query = url.split_once('?').map(|(prefix, _)| prefix).unwrap_or(url);
+    without_query
+        .rsplit_once('/')
+        .map(|(_, database_name)| database_name.to_string())
+        .expect("database URL should include a database name")
+}
+
+fn validate_database_name(database_name: &str) {
+    assert!(
+        !database_name.is_empty()
+            && database_name
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'),
+        "scale test database names must use only [A-Za-z0-9_]"
+    );
+}
+
+fn database_url() -> String {
+    std::env::var("DATABASE_URL_SCALE_TEST")
+        .unwrap_or_else(|_| replace_database_name(&base_database_url(), "awa_test_scale"))
+}
+
+async fn ensure_database_exists(url: &str) {
+    let database_name = database_name(url);
+    validate_database_name(&database_name);
+    let admin_url = replace_database_name(url, "postgres");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("Failed to connect to admin database for scale tests");
+    let create_sql = format!("CREATE DATABASE {database_name}");
+    match sqlx::query(&create_sql).execute(&admin_pool).await {
+        Ok(_) => {}
+        Err(sqlx::Error::Database(db_err)) if db_err.code().as_deref() == Some("42P04") => {}
+        Err(err) => panic!("Failed to create scale test database {database_name}: {err}"),
+    }
 }
 
 async fn pool() -> sqlx::PgPool {
@@ -27,8 +91,18 @@ async fn pool() -> sqlx::PgPool {
 }
 
 async fn setup() -> sqlx::PgPool {
+    let url = database_url();
+    SCALE_TEST_DB_INIT
+        .get_or_init(|| async {
+            ensure_database_exists(&url).await;
+        })
+        .await;
     let pool = pool().await;
     migrations::run(&pool).await.expect("Failed to migrate");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .expect("Failed to clear queue storage activation for scale tests");
     pool
 }
 
@@ -56,6 +130,10 @@ struct ScaleJob {
 
 #[tokio::test]
 async fn test_bulk_insert_1000_jobs() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_bulk_1000";
     clean_queue(&pool, queue).await;
@@ -97,6 +175,10 @@ async fn test_bulk_insert_1000_jobs() {
 
 #[tokio::test]
 async fn test_concurrent_claim_no_double_dispatch() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_contention";
     clean_queue(&pool, queue).await;
@@ -176,6 +258,10 @@ async fn test_concurrent_claim_no_double_dispatch() {
 
 #[tokio::test]
 async fn test_stale_candidate_cannot_reclaim_running_row() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_stale_candidate";
     clean_queue(&pool, queue).await;
@@ -258,6 +344,10 @@ async fn test_stale_candidate_cannot_reclaim_running_row() {
 
 #[tokio::test]
 async fn test_priority_aging_reorders_jobs() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_aging";
     clean_queue(&pool, queue).await;
@@ -419,6 +509,10 @@ async fn test_priority_aging_reorders_jobs() {
 
 #[tokio::test]
 async fn test_stale_heartbeat_rescue() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_stale_hb";
     clean_queue(&pool, queue).await;
@@ -475,6 +569,10 @@ async fn test_stale_heartbeat_rescue() {
 
 #[tokio::test]
 async fn test_deadline_exceeded_rescue() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_deadline";
     clean_queue(&pool, queue).await;
@@ -528,6 +626,10 @@ async fn test_deadline_exceeded_rescue() {
 
 #[tokio::test]
 async fn test_queue_isolation_under_load() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     clean_queue(&pool, "scale_iso_a").await;
     clean_queue(&pool, "scale_iso_b").await;
@@ -592,6 +694,10 @@ async fn test_queue_isolation_under_load() {
 
 #[tokio::test]
 async fn test_unique_constraint_prevents_duplicates() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     clean_queue(&pool, "scale_unique").await;
 
@@ -621,6 +727,10 @@ async fn test_unique_constraint_prevents_duplicates() {
 
 #[tokio::test]
 async fn test_concurrent_insert_and_claim() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_concurrent";
     clean_queue(&pool, queue).await;
@@ -720,6 +830,10 @@ async fn test_concurrent_insert_and_claim() {
 
 #[tokio::test]
 async fn test_scheduled_jobs_become_available() {
+    let _permit = scale_test_gate()
+        .acquire_owned()
+        .await
+        .expect("scale test gate should be available");
     let pool = setup().await;
     let queue = "scale_scheduled";
     clean_queue(&pool, queue).await;

@@ -13,6 +13,8 @@ from awa._awa import (
     CallbackToken,
     WaitForCallback,
     ResolveResult,
+    # Dead Letter Queue
+    DlqEntry,
     # Transaction
     Transaction,
     SyncTransaction,
@@ -26,6 +28,8 @@ from awa._awa import (
     migrations,
     migrations_range,
     current_migration_version,
+    init_telemetry,
+    shutdown_telemetry,
     # Exceptions
     AwaError,
     UniqueConflict,
@@ -55,6 +59,8 @@ __all__ = [
     "CallbackToken",
     "WaitForCallback",
     "ResolveResult",
+    # Dead Letter Queue
+    "DlqEntry",
     # Transaction
     "Transaction",
     "SyncTransaction",
@@ -68,6 +74,8 @@ __all__ = [
     "migrations",
     "migrations_range",
     "current_migration_version",
+    "init_telemetry",
+    "shutdown_telemetry",
     # Exceptions
     "AwaError",
     "UniqueConflict",

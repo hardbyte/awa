@@ -3,8 +3,6 @@
 Tests run against real Postgres 15+ (not managed services). Dedicated test database.
 All tests are automated and run in CI.
 
-See [the full test plan](../prd.md) for detailed descriptions of each test case.
-
 ## Test Matrix
 
 **Rust** = Rust integration test, **Py** = Python test, **TLA+** = TLC model check, **Both** = cross-language.
@@ -238,6 +236,8 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA4 | AwaCron | No duplicate fire under leader failover |
 | TLA5 | AwaBatcher | At-most-once completion, DirectCompleteFail recovery |
 | TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
+| TLA7 | AwaSegmentedStorage | Segmented storage safety, waiting flow, optional attempt-state, prune safety |
+| TLA8 | AwaSegmentedStorageInterleavings | Two-worker segmented-storage interleavings |
 
 ## Running Tests
 
@@ -298,6 +298,8 @@ cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test 
 
 # TLA+ correctness models (requires Docker)
 ./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg

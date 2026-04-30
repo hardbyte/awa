@@ -9,7 +9,9 @@
 
 mod bench_output;
 
-use awa::model::{insert_many, insert_many_copy_from_pool, migrations};
+use awa::model::{
+    insert_many, insert_many_copy_from_pool, migrations, QueueStorage, QueueStorageConfig,
+};
 use awa::{
     Client, InsertOpts, InsertParams, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker,
 };
@@ -39,8 +41,183 @@ async fn setup(max_conns: u32) -> sqlx::PgPool {
     pool
 }
 
+async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
+    sqlx::query("CREATE EXTENSION IF NOT EXISTS pgstattuple")
+        .execute(pool)
+        .await
+        .expect("Failed to create pgstattuple extension for benchmark dead-tuple sampling");
+}
+
+async fn recreate_queue_storage_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
+    let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
+    sqlx::query(&drop_sql)
+        .execute(pool)
+        .await
+        .expect("Failed to drop queue storage benchmark schema");
+}
+
+async fn reset_storage_transition_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to reset storage transition state");
+
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to clear active queue storage backend");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(pool)
+        .await
+        .expect("Failed to clear runtime snapshots");
+}
+
+async fn insert_runtime_instance(pool: &sqlx::PgPool, capability: &str) -> uuid::Uuid {
+    let role = match capability {
+        "canonical" => "auto",
+        "canonical_drain_only" => "canonical_drain",
+        "queue_storage" => "queue_storage_target",
+        _ => "auto",
+    };
+    let instance_id = uuid::Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO awa.runtime_instances (
+            instance_id,
+            hostname,
+            pid,
+            version,
+            storage_capability,
+            transition_role,
+            started_at,
+            last_seen_at,
+            snapshot_interval_ms,
+            healthy,
+            postgres_connected,
+            poll_loop_alive,
+            heartbeat_alive,
+            maintenance_alive,
+            shutting_down,
+            leader,
+            global_max_workers,
+            queues,
+            queue_descriptor_hashes,
+            job_kind_descriptor_hashes
+        )
+        VALUES (
+            $1,
+            'benchmark-runtime',
+            1,
+            'test',
+            $2,
+            $3,
+            now(),
+            now(),
+            10000,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            TRUE,
+            FALSE,
+            TRUE,
+            NULL,
+            '[]'::jsonb,
+            '{}'::jsonb,
+            '{}'::jsonb
+        )
+        "#,
+    )
+    .bind(instance_id)
+    .bind(capability)
+    .bind(role)
+    .execute(pool)
+    .await
+    .expect("Failed to insert benchmark runtime instance");
+    instance_id
+}
+
+async fn activate_queue_storage_transition(pool: &sqlx::PgPool, schema: &str) {
+    reset_storage_transition_state(pool).await;
+    sqlx::query("SELECT * FROM awa.storage_prepare('queue_storage', $1)")
+        .bind(serde_json::json!({ "schema": schema }))
+        .execute(pool)
+        .await
+        .expect("Failed to prepare queue storage transition");
+    let gate_runtime = insert_runtime_instance(pool, "queue_storage").await;
+    sqlx::query("SELECT * FROM awa.storage_enter_mixed_transition()")
+        .execute(pool)
+        .await
+        .expect("Failed to enter mixed transition");
+    sqlx::query("SELECT * FROM awa.storage_finalize()")
+        .execute(pool)
+        .await
+        .expect("Failed to finalize queue storage transition");
+    sqlx::query("DELETE FROM awa.runtime_instances WHERE instance_id = $1")
+        .bind(gate_runtime)
+        .execute(pool)
+        .await
+        .expect("Failed to remove benchmark gate runtime");
+}
+
+async fn sample_pgstattuple_dead_tuples(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    relname_filter: &str,
+) -> Option<i64> {
+    let mut conn = pool
+        .acquire()
+        .await
+        .expect("Failed to acquire pgstattuple connection");
+
+    sqlx::query_scalar::<_, i64>(
+        r#"
+        SELECT COALESCE(sum((pgstattuple(c.oid::regclass)).dead_tuple_count), 0)::bigint
+        FROM pg_class AS c
+        INNER JOIN pg_namespace AS n
+            ON n.oid = c.relnamespace
+        WHERE n.nspname = $1
+          AND c.relkind = 'r'
+          AND c.relname LIKE $2
+        "#,
+    )
+    .bind(schema)
+    .bind(relname_filter)
+    .fetch_one(conn.as_mut())
+    .await
+    .ok()
+}
+
+async fn sample_canonical_exact_dead_tuples(pool: &sqlx::PgPool) -> HashMap<&'static str, i64> {
+    let mut out = HashMap::new();
+    for (label, relname) in [
+        ("jobs_hot", "jobs_hot"),
+        ("scheduled_jobs", "scheduled_jobs"),
+        ("queue_state_counts", "queue_state_counts"),
+    ] {
+        let count = sample_pgstattuple_dead_tuples(pool, "awa", relname)
+            .await
+            .unwrap_or(-1);
+        out.insert(label, count);
+    }
+    out
+}
+
 /// Clean only jobs and queue_meta for a specific queue.
 async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
+    reset_storage_transition_state(pool).await;
     sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
         .bind(queue)
         .execute(pool)
@@ -60,6 +237,7 @@ async fn reset_runtime_state(pool: &sqlx::PgPool) {
     .execute(pool)
     .await
     .expect("Failed to reset runtime benchmark state");
+    reset_storage_transition_state(pool).await;
 }
 
 #[derive(Debug, Clone)]
@@ -353,11 +531,18 @@ impl Worker for BenchWorker {
 #[ignore]
 async fn test_throughput_rust_workers() {
     let pool = setup(20).await;
+    ensure_pgstattuple(&pool).await;
     let queue = "bench_throughput";
     clean_queue(&pool, queue).await;
 
-    let total_jobs: i64 = 5_000;
-    let batch_size = 500;
+    let total_jobs: i64 = env_i64(
+        "AWA_RUNTIME_TOTAL_JOBS",
+        env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 5_000),
+    );
+    let batch_size = env_usize(
+        "AWA_RUNTIME_BATCH_SIZE",
+        env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500),
+    );
 
     // Build and start the Client with workers
     let client = Client::builder(pool.clone())
@@ -376,9 +561,10 @@ async fn test_throughput_rust_workers() {
     client.start().await.expect("Failed to start client");
 
     // Insert jobs in batches
+    let benchmark_start = Instant::now();
     let insert_start = Instant::now();
-    for batch_start in (0..total_jobs).step_by(batch_size as usize) {
-        let batch_end = (batch_start + batch_size).min(total_jobs);
+    for batch_start in (0..total_jobs).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size as i64).min(total_jobs);
         let params: Vec<_> = (batch_start..batch_end)
             .map(|i| {
                 awa::model::insert::params_with(
@@ -435,14 +621,34 @@ async fn test_throughput_rust_workers() {
         if completed == total_jobs {
             let processing_elapsed = processing_start.elapsed();
             let throughput = total_jobs as f64 / processing_elapsed.as_secs_f64();
+            let end_to_end_elapsed = benchmark_start.elapsed();
+            let end_to_end_throughput = total_jobs as f64 / end_to_end_elapsed.as_secs_f64();
             println!(
                 "[bench] All {} jobs completed in {:.2}s",
                 total_jobs,
                 processing_elapsed.as_secs_f64()
             );
-            println!("[bench] Throughput: {:.0} jobs/sec", throughput);
+            println!("[bench] Post-insert throughput: {:.0} jobs/sec", throughput);
+            println!(
+                "[bench] End-to-end throughput: {:.0} jobs/sec over {:.2}s",
+                end_to_end_throughput,
+                end_to_end_elapsed.as_secs_f64()
+            );
 
             client.shutdown(Duration::from_secs(5)).await;
+
+            let dead = sample_canonical_exact_dead_tuples(&pool).await;
+            let jobs_hot_dead = *dead.get("jobs_hot").unwrap_or(&-1);
+            let scheduled_dead = *dead.get("scheduled_jobs").unwrap_or(&-1);
+            let counts_dead = *dead.get("queue_state_counts").unwrap_or(&-1);
+            let total_dead = [jobs_hot_dead, scheduled_dead, counts_dead]
+                .into_iter()
+                .filter(|v| *v >= 0)
+                .sum::<i64>();
+            println!(
+                "[bench] exact_dead_tuples jobs_hot={} scheduled_jobs={} queue_state_counts={} total={}",
+                jobs_hot_dead, scheduled_dead, counts_dead, total_dead
+            );
 
             // Use a lower bound for CI variance (3000), but the PRD target is 5000
             assert!(
@@ -467,6 +673,190 @@ async fn test_throughput_rust_workers() {
         } else {
             stall_checks = 0;
             last_count = completed;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_throughput_rust_workers_queue_storage() {
+    let pool = setup(20).await;
+    ensure_pgstattuple(&pool).await;
+    reset_runtime_state(&pool).await;
+
+    let queue = "bench_throughput_queue_storage";
+    let total_jobs: i64 = env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 5_000);
+    let batch_size = env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500);
+    let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
+    let lease_slot_count = env_usize("AWA_VA_RUNTIME_LEASE_SLOTS", 4);
+    let queue_stripe_count = env_usize("AWA_VA_RUNTIME_QUEUE_STRIPES", 1);
+    let queue_rotate_ms = env_i64("AWA_VA_RUNTIME_QUEUE_ROTATE_MS", 1_000);
+    let lease_rotate_ms = env_i64("AWA_VA_RUNTIME_LEASE_ROTATE_MS", 50);
+
+    let store_config = QueueStorageConfig {
+        queue_slot_count,
+        lease_slot_count,
+        queue_stripe_count,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+        ..Default::default()
+    };
+    let store =
+        QueueStorage::new(store_config.clone()).expect("Failed to build queue storage store");
+    recreate_queue_storage_schema(&pool, &store).await;
+    store
+        .install(&pool)
+        .await
+        .expect("Failed to install queue storage store");
+    store
+        .reset(&pool)
+        .await
+        .expect("Failed to reset queue storage store");
+    activate_queue_storage_transition(&pool, store.schema()).await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 100,
+                poll_interval: Duration::from_millis(50),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(queue_rotate_ms as u64),
+            Duration::from_millis(lease_rotate_ms as u64),
+        )
+        .register_worker(BenchWorker)
+        .build()
+        .expect("Failed to build queue storage client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start queue storage client");
+
+    let benchmark_start = Instant::now();
+    let insert_start = Instant::now();
+    for batch_start in (0..total_jobs).step_by(batch_size) {
+        let batch_end = (batch_start + batch_size as i64).min(total_jobs);
+        let params: Vec<_> = (batch_start..batch_end)
+            .map(|i| {
+                awa::model::insert::params_with(
+                    &BenchJob { seq: i },
+                    InsertOpts {
+                        queue: queue.into(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("Failed to enqueue queue storage runtime batch");
+    }
+    let insert_elapsed = insert_start.elapsed();
+    println!(
+        "[bench-va] Inserted {} jobs in {:.2}s ({:.0} inserts/sec)",
+        total_jobs,
+        insert_elapsed.as_secs_f64(),
+        total_jobs as f64 / insert_elapsed.as_secs_f64()
+    );
+
+    let processing_start = Instant::now();
+    let timeout = Duration::from_secs(30);
+    let mut last_completed = 0i64;
+    let mut stall_checks = 0u32;
+
+    loop {
+        if processing_start.elapsed() > timeout {
+            let counts = store
+                .queue_counts(&pool, queue)
+                .await
+                .expect("Failed to sample queue storage queue counts");
+            panic!(
+                "Vacuum-aware timeout after 30s: completed={}/{} available={} running={}",
+                counts.completed, total_jobs, counts.available, counts.running
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let counts = store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("Failed to sample queue storage queue counts");
+
+        if counts.completed == total_jobs {
+            let processing_elapsed = processing_start.elapsed();
+            let throughput = total_jobs as f64 / processing_elapsed.as_secs_f64();
+            let end_to_end_elapsed = benchmark_start.elapsed();
+            let end_to_end_throughput = total_jobs as f64 / end_to_end_elapsed.as_secs_f64();
+            println!(
+                "[bench-va] All {} jobs completed in {:.2}s",
+                total_jobs,
+                processing_elapsed.as_secs_f64()
+            );
+            println!(
+                "[bench-va] Post-insert throughput: {:.0} jobs/sec",
+                throughput
+            );
+            println!(
+                "[bench-va] End-to-end throughput: {:.0} jobs/sec over {:.2}s",
+                end_to_end_throughput,
+                end_to_end_elapsed.as_secs_f64()
+            );
+
+            client.shutdown(Duration::from_secs(5)).await;
+
+            let queue_lanes_dead =
+                sample_pgstattuple_dead_tuples(&pool, store.schema(), "queue_lanes").await;
+            let ready_dead =
+                sample_pgstattuple_dead_tuples(&pool, store.schema(), "ready_entries_%").await;
+            let done_dead =
+                sample_pgstattuple_dead_tuples(&pool, store.schema(), "done_entries_%").await;
+            let leases_dead =
+                sample_pgstattuple_dead_tuples(&pool, store.schema(), "leases_%").await;
+            let attempt_state_dead =
+                sample_pgstattuple_dead_tuples(&pool, store.schema(), "attempt_state").await;
+
+            println!(
+                "[bench-va] exact_dead_tuples queue_lanes={} ready={} done={} leases={} attempt_state={} total={}",
+                queue_lanes_dead.unwrap_or(-1),
+                ready_dead.unwrap_or(-1),
+                done_dead.unwrap_or(-1),
+                leases_dead.unwrap_or(-1),
+                attempt_state_dead.unwrap_or(-1),
+                queue_lanes_dead.unwrap_or(0)
+                    + ready_dead.unwrap_or(0)
+                    + done_dead.unwrap_or(0)
+                    + leases_dead.unwrap_or(0)
+                    + attempt_state_dead.unwrap_or(0),
+            );
+
+            assert!(
+                throughput >= 3000.0,
+                "Vacuum-aware throughput {:.0} jobs/sec is below minimum threshold of 3000 jobs/sec",
+                throughput
+            );
+            return;
+        }
+
+        if counts.completed == last_completed {
+            stall_checks += 1;
+            if stall_checks > 50 {
+                panic!(
+                    "Vacuum-aware processing stalled at {}/{} completed jobs",
+                    counts.completed, total_jobs
+                );
+            }
+        } else {
+            stall_checks = 0;
+            last_completed = counts.completed;
         }
     }
 }
@@ -569,6 +959,128 @@ async fn test_pickup_latency_listen_notify() {
     assert!(
         p50 < Duration::from_millis(50),
         "Median pickup latency {:?} exceeds PRD target of 50ms",
+        p50
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn test_pickup_latency_listen_notify_queue_storage() {
+    let pool = setup(10).await;
+    let queue = "bench_latency_queue_storage";
+    let store_config = QueueStorageConfig {
+        queue_slot_count: env_usize("AWA_VA_LATENCY_QUEUE_SLOTS", 16),
+        lease_slot_count: env_usize("AWA_VA_LATENCY_LEASE_SLOTS", 4),
+        queue_stripe_count: env_usize("AWA_VA_LATENCY_QUEUE_STRIPES", 1),
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+        ..Default::default()
+    };
+    let queue_rotate_ms = env_i64("AWA_VA_LATENCY_QUEUE_ROTATE_MS", 1_000);
+    let lease_rotate_ms = env_i64("AWA_VA_LATENCY_LEASE_ROTATE_MS", 50);
+    let store =
+        QueueStorage::new(store_config.clone()).expect("Failed to build queue storage store");
+    recreate_queue_storage_schema(&pool, &store).await;
+    store
+        .install(&pool)
+        .await
+        .expect("Failed to install queue storage latency store");
+    store
+        .reset(&pool)
+        .await
+        .expect("Failed to reset queue storage latency store");
+    activate_queue_storage_transition(&pool, store.schema()).await;
+
+    let (pickup_tx, mut pickup_rx) = tokio::sync::mpsc::unbounded_channel::<std::time::Instant>();
+
+    struct LatencyWorker {
+        tx: tokio::sync::mpsc::UnboundedSender<std::time::Instant>,
+    }
+
+    #[async_trait::async_trait]
+    impl Worker for LatencyWorker {
+        fn kind(&self) -> &'static str {
+            "bench_job"
+        }
+
+        async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
+            let _ = self.tx.send(Instant::now());
+            Ok(JobResult::Completed)
+        }
+    }
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 10,
+                poll_interval: Duration::from_millis(200),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(queue_rotate_ms as u64),
+            Duration::from_millis(lease_rotate_ms as u64),
+        )
+        .register_worker(LatencyWorker { tx: pickup_tx })
+        .build()
+        .expect("Failed to build queue storage client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start queue storage client");
+
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let iterations = 50;
+    let mut latencies: Vec<Duration> = Vec::with_capacity(iterations);
+
+    for i in 0..iterations {
+        let insert_time = Instant::now();
+        let params = [awa::model::insert::params_with(
+            &BenchJob { seq: i as i64 },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .unwrap()];
+
+        store
+            .enqueue_params_batch(&pool, &params)
+            .await
+            .expect("Failed to enqueue queue storage latency job");
+
+        let pickup_time = tokio::time::timeout(Duration::from_secs(5), pickup_rx.recv())
+            .await
+            .expect("Timeout waiting for queue storage job pickup")
+            .expect("Vacuum-aware pickup channel closed unexpectedly");
+
+        latencies.push(pickup_time.duration_since(insert_time));
+    }
+
+    client.shutdown(Duration::from_secs(5)).await;
+
+    latencies.sort();
+    let p50 = latencies[latencies.len() / 2];
+    let p95 = latencies[(latencies.len() as f64 * 0.95) as usize];
+    let p99 = latencies[(latencies.len() as f64 * 0.99) as usize];
+    let min_latency = latencies[0];
+    let max_latency = latencies[latencies.len() - 1];
+
+    println!("[bench-va] Pickup latency over {} iterations:", iterations);
+    println!("[bench-va]   min:  {:?}", min_latency);
+    println!("[bench-va]   p50:  {:?}", p50);
+    println!("[bench-va]   p95:  {:?}", p95);
+    println!("[bench-va]   p99:  {:?}", p99);
+    println!("[bench-va]   max:  {:?}", max_latency);
+
+    assert!(
+        p50 < Duration::from_millis(50),
+        "Vacuum-aware median pickup latency {:?} exceeds PRD target of 50ms",
         p50
     );
 }

@@ -1,6 +1,6 @@
 use awa_model::admin::{
     self, QueueRuntimeConfigSnapshot, QueueRuntimeMode, QueueRuntimeSnapshot, RateLimitSnapshot,
-    RuntimeOverview, RuntimeSnapshotInput, StorageCapability,
+    RuntimeOverview, RuntimeSnapshotInput, StorageCapability, TransitionRole,
 };
 use awa_model::storage::StorageStatusReport;
 use axum::body::{to_bytes, Body};
@@ -34,6 +34,7 @@ async fn seed_runtime_snapshot(pool: &sqlx::PgPool, queue: &str, hostname: &str)
             pid: 1234,
             version: "0.4.0-test".to_string(),
             storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
             started_at: Utc::now(),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -145,6 +146,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
             pid: 4001,
             version: "0.4.0-test".to_string(),
             storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
             started_at: Utc::now() - Duration::minutes(30),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -174,6 +176,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
             pid: 4002,
             version: "0.4.0-test".to_string(),
             storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
             started_at: Utc::now() - Duration::minutes(5),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -315,6 +318,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             pid: 5001,
             version: "0.4.0-test".to_string(),
             storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
             started_at: Utc::now() - Duration::minutes(2),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -345,6 +349,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             pid: 5002,
             version: "0.4.0-test".to_string(),
             storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
             started_at: Utc::now() - Duration::minutes(1),
             snapshot_interval_ms: 10_000,
             healthy: false,
@@ -375,6 +380,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
             pid: 5003,
             version: "0.4.0-test".to_string(),
             storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
             started_at: Utc::now() - Duration::minutes(20),
             snapshot_interval_ms: 10_000,
             healthy: true,
@@ -468,10 +474,33 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
 #[tokio::test]
 async fn test_storage_endpoint_returns_canonical_baseline_report() {
     let pool = setup_pool().await;
-    sqlx::query("SELECT * FROM awa.storage_abort()")
+    // `storage_abort()` only returns to canonical from `prepared` or
+    // `mixed_transition`. With v013's auto-finalize-on-fresh-DB
+    // promoting straight to `active=queue_storage` whenever a runtime
+    // started against this DB earlier, abort is a silent no-op and
+    // the test sees `active_engine='queue_storage'`. Reset the
+    // singleton row directly so this test's "canonical baseline"
+    // precondition holds regardless of what previous tests in the
+    // job did to the transition state.
+    sqlx::query(
+        "UPDATE awa.storage_transition_state \
+         SET state = 'canonical', \
+             current_engine = 'canonical', \
+             prepared_engine = NULL, \
+             details = '{}'::jsonb, \
+             entered_at = now(), \
+             updated_at = now(), \
+             finalized_at = NULL, \
+             transition_epoch = transition_epoch + 1 \
+         WHERE singleton",
+    )
+    .execute(&pool)
+    .await
+    .expect("storage state reset should succeed");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends")
         .execute(&pool)
         .await
-        .expect("storage abort reset should succeed");
+        .expect("storage backend reset should succeed");
 
     let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
         .await

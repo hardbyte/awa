@@ -32,7 +32,12 @@ class DescriptorTestJob:
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    return c
+    await c.install_queue_storage(reset=True)
+    try:
+        yield c
+    finally:
+        await c.shutdown()
+        await c.close()
 
 
 def _sync_url() -> str:
@@ -189,6 +194,7 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
 
     # Second client, same fields → same hash (stable JSON canonicalization).
     client2 = awa.AsyncClient(DATABASE_URL)
+    await client2.install_queue_storage(reset=False)
     client2.queue_descriptor(
         queue,
         display_name="Version 1",
@@ -207,10 +213,14 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
             "same fields must produce same descriptor_hash across runs"
         )
     finally:
-        await client2.shutdown()
+        try:
+            await client2.shutdown()
+        finally:
+            await client2.close()
 
     # Third declaration, changed field → different hash.
     client3 = awa.AsyncClient(DATABASE_URL)
+    await client3.install_queue_storage(reset=False)
     client3.queue_descriptor(
         queue,
         display_name="Version 2",  # changed
@@ -227,8 +237,11 @@ async def test_python_descriptor_hash_matches_equivalent_rust_declaration(client
         third_hash = _fetch_queue_row(queue)["descriptor_hash"]
         assert third_hash != first_hash, "different fields must change the hash"
     finally:
-        await client3.shutdown()
-        _cleanup(queue, "descriptor_test_job")
+        try:
+            await client3.shutdown()
+        finally:
+            await client3.close()
+            _cleanup(queue, "descriptor_test_job")
 
 
 @pytest.mark.asyncio
@@ -300,6 +313,7 @@ async def test_last_seen_at_bumps_on_restart(client):
     await asyncio.sleep(1.2)
 
     client2 = awa.AsyncClient(DATABASE_URL)
+    await client2.install_queue_storage(reset=False)
     client2.queue_descriptor(queue, display_name="Liveness test")
 
     @client2.task(DescriptorTestJob, queue=queue)
@@ -313,5 +327,8 @@ async def test_last_seen_at_bumps_on_restart(client):
             "last_seen_at must advance on each client start"
         )
     finally:
-        await client2.shutdown()
-        _cleanup(queue, "descriptor_test_job")
+        try:
+            await client2.shutdown()
+        finally:
+            await client2.close()
+            _cleanup(queue, "descriptor_test_job")

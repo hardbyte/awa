@@ -344,7 +344,7 @@ where
               AND (last_enqueued_at IS NOT DISTINCT FROM $3)
             RETURNING name, kind, queue, args, priority, max_attempts, tags, metadata
         )
-        SELECT job.*
+        SELECT inserted.*
         FROM mark
         CROSS JOIN LATERAL awa.insert_job_compat(
             mark.kind,
@@ -358,7 +358,7 @@ where
             mark.tags,
             NULL,
             NULL
-        ) AS job
+        ) AS inserted
         "#,
     )
     .bind(cron_name)
@@ -386,7 +386,7 @@ where
             FROM awa.cron_jobs
             WHERE name = $1
         )
-        SELECT job.*
+        SELECT inserted.*
         FROM cron
         CROSS JOIN LATERAL awa.insert_job_compat(
             cron.kind,
@@ -400,7 +400,7 @@ where
             cron.tags,
             NULL,
             NULL
-        ) AS job
+        ) AS inserted
         "#,
     )
     .bind(name)

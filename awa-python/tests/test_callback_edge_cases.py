@@ -45,10 +45,15 @@ DATABASE_URL = os.environ.get(
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await c.install_queue_storage(reset=True)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'cbe_%'")
+    await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'cbe_%'")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        await c.shutdown()
+        await c.close()
 
 
 @dataclass
@@ -56,7 +61,22 @@ class ExternalTask:
     order_id: int
 
 
-async def _setup_waiting_job(client, queue: str, order_id: int, **insert_kwargs):
+async def _wait_for_job_state(
+    client, job_id: int, expected: tuple[awa.JobState, ...], timeout: float
+):
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        job = await client.get_job(job_id)
+        if any(job.state == state for state in expected):
+            return job
+        await asyncio.sleep(0.05)
+    job = await client.get_job(job_id)
+    raise AssertionError(f"Timed out waiting for job {job_id} to reach {expected}, last={job.state}")
+
+
+async def _setup_waiting_job(
+    client, queue: str, order_id: int, timeout_seconds: float = 3600, **insert_kwargs
+):
     """Insert a job, run it through a handler that parks in waiting_external.
 
     Returns (job, callback_id).
@@ -65,7 +85,7 @@ async def _setup_waiting_job(client, queue: str, order_id: int, **insert_kwargs)
 
     @client.task(ExternalTask, queue=queue)
     async def handle(job):
-        token = await job.register_callback(timeout_seconds=3600)
+        token = await job.register_callback(timeout_seconds=timeout_seconds)
         callback_ids.append(token.id)
         return awa.WaitForCallback(token)
 
@@ -83,10 +103,15 @@ async def _setup_waiting_job(client, queue: str, order_id: int, **insert_kwargs)
     deadline = asyncio.get_event_loop().time() + _scaled(5)
     while not callback_ids and asyncio.get_event_loop().time() < deadline:
         await asyncio.sleep(0.1)
-    await client.shutdown()
-
     assert len(callback_ids) == 1, f"handler should have registered a callback for {queue}"
-    return job, callback_ids[0]
+    waiting_job = await _wait_for_job_state(
+        client,
+        job.id,
+        (awa.JobState.WaitingExternal,),
+        _scaled(5),
+    )
+    await client.shutdown()
+    return waiting_job, callback_ids[0]
 
 
 # ── E5: Callback timeout rescue ──────────────────────────────────────
@@ -96,46 +121,21 @@ async def _setup_waiting_job(client, queue: str, order_id: int, **insert_kwargs)
 async def test_callback_timeout_rescue_retryable(client):
     """Callback timeout with remaining attempts transitions to retryable."""
     queue = "cbe_timeout_retry"
-    job, callback_id = await _setup_waiting_job(
-        client, queue, order_id=100, max_attempts=3
+    job, _callback_id = await _setup_waiting_job(
+        client, queue, order_id=100, max_attempts=3, timeout_seconds=0.1
     )
-
-    # Simulate timeout by backdating callback_timeout_at
-    tx = await client.transaction()
-    await tx.execute(
-        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' WHERE id = $1",
-        job.id,
+    await asyncio.sleep(_scaled(0.3))
+    await client.start(
+        [(queue, 1)],
+        poll_interval_ms=50,
+        heartbeat_interval_ms=50,
+        callback_rescue_interval_ms=25,
+        leader_election_interval_ms=100,
     )
-    await tx.commit()
-
-    # Run rescue via raw SQL (simulating what the maintenance leader does)
-    tx = await client.transaction()
-    await tx.execute(
-        """
-        UPDATE awa.jobs
-        SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state
-                         ELSE 'retryable'::awa.job_state END,
-            finalized_at = now(),
-            callback_id = NULL,
-            callback_timeout_at = NULL,
-            errors = errors || jsonb_build_object(
-                'error', 'callback timed out',
-                'attempt', attempt,
-                'at', now()
-            )::jsonb
-        WHERE id IN (
-            SELECT id FROM awa.jobs
-            WHERE state = 'waiting_external'
-              AND callback_timeout_at IS NOT NULL
-              AND callback_timeout_at < now()
-            LIMIT 500
-            FOR UPDATE SKIP LOCKED
-        )
-        """,
+    updated = await _wait_for_job_state(
+        client, job.id, (awa.JobState.Retryable,), _scaled(5)
     )
-    await tx.commit()
-
-    updated = await client.get_job(job.id)
+    await client.shutdown()
     assert updated.state == awa.JobState.Retryable
 
 
@@ -143,46 +143,19 @@ async def test_callback_timeout_rescue_retryable(client):
 async def test_callback_timeout_rescue_exhausted(client):
     """Callback timeout with max_attempts exhausted transitions to failed."""
     queue = "cbe_timeout_fail"
-    job, callback_id = await _setup_waiting_job(
-        client, queue, order_id=101, max_attempts=1
+    job, _callback_id = await _setup_waiting_job(
+        client, queue, order_id=101, max_attempts=1, timeout_seconds=0.1
     )
-
-    # Backdate timeout
-    tx = await client.transaction()
-    await tx.execute(
-        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' WHERE id = $1",
-        job.id,
+    await asyncio.sleep(_scaled(0.3))
+    await client.start(
+        [(queue, 1)],
+        poll_interval_ms=50,
+        heartbeat_interval_ms=50,
+        callback_rescue_interval_ms=25,
+        leader_election_interval_ms=100,
     )
-    await tx.commit()
-
-    # Run rescue
-    tx = await client.transaction()
-    await tx.execute(
-        """
-        UPDATE awa.jobs
-        SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state
-                         ELSE 'retryable'::awa.job_state END,
-            finalized_at = now(),
-            callback_id = NULL,
-            callback_timeout_at = NULL,
-            errors = errors || jsonb_build_object(
-                'error', 'callback timed out',
-                'attempt', attempt,
-                'at', now()
-            )::jsonb
-        WHERE id IN (
-            SELECT id FROM awa.jobs
-            WHERE state = 'waiting_external'
-              AND callback_timeout_at IS NOT NULL
-              AND callback_timeout_at < now()
-            LIMIT 500
-            FOR UPDATE SKIP LOCKED
-        )
-        """,
-    )
-    await tx.commit()
-
-    updated = await client.get_job(job.id)
+    updated = await _wait_for_job_state(client, job.id, (awa.JobState.Failed,), _scaled(5))
+    await client.shutdown()
     assert updated.state == awa.JobState.Failed
 
 
@@ -260,24 +233,26 @@ async def test_complete_external_during_running(client):
     clause accepts both 'running' and 'waiting_external'.
     """
     queue = "cbe_race_running"
+    callback_ids = []
+    registered = asyncio.Event()
+    release = asyncio.Event()
+
+    @client.task(ExternalTask, queue=queue)
+    async def handle(job):
+        token = await job.register_callback(timeout_seconds=3600)
+        callback_ids.append(token.id)
+        registered.set()
+        await release.wait()
+        return awa.WaitForCallback(token)
+
     job = await client.insert(ExternalTask(order_id=106), queue=queue)
+    await client.start([(queue, 1)], poll_interval_ms=50, leader_election_interval_ms=100)
+    await asyncio.wait_for(registered.wait(), timeout=_scaled(5))
+    callback_id = callback_ids[0]
 
-    # Manually transition to running and register a callback_id
-    callback_id = str(uuid_mod.uuid4())
-    tx = await client.transaction()
-    await tx.execute(
-        """UPDATE awa.jobs
-           SET state = 'running', attempt = 1, heartbeat_at = now(),
-               callback_id = $2::uuid,
-               callback_timeout_at = now() + interval '1 hour'
-           WHERE id = $1""",
-        job.id,
-        callback_id,
-    )
-    await tx.commit()
-
-    # External system completes while still in 'running' state
     completed = await client.complete_external(callback_id)
+    release.set()
+    await client.shutdown()
     assert completed.state == awa.JobState.Completed
 
 

@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 
 use awa_model::admin;
+use awa_model::dlq::DlqMetadata;
 use awa_model::job::{JobRow, JobState};
 
 use crate::error::ApiError;
@@ -21,6 +22,11 @@ pub struct JobResponse {
     pub original_priority: i16,
     pub queue_descriptor: Option<admin::QueueDescriptor>,
     pub kind_descriptor: Option<admin::JobKindDescriptor>,
+    /// Populated when the job has been moved to the Dead Letter Queue. The
+    /// frontend should send retry/cancel actions through `/api/dlq/*` rather
+    /// than `/api/jobs/*` when this is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq: Option<DlqMetadata>,
 }
 
 impl JobResponse {
@@ -28,6 +34,15 @@ impl JobResponse {
         row: JobRow,
         queue_descriptors: &HashMap<String, admin::QueueDescriptor>,
         kind_descriptors: &HashMap<String, admin::JobKindDescriptor>,
+    ) -> Self {
+        Self::from_row_with_dlq(row, queue_descriptors, kind_descriptors, None)
+    }
+
+    fn from_row_with_dlq(
+        row: JobRow,
+        queue_descriptors: &HashMap<String, admin::QueueDescriptor>,
+        kind_descriptors: &HashMap<String, admin::JobKindDescriptor>,
+        dlq: Option<DlqMetadata>,
     ) -> Self {
         let original_priority = row
             .metadata
@@ -40,6 +55,7 @@ impl JobResponse {
             kind_descriptor: kind_descriptors.get(&row.kind).cloned(),
             row,
             original_priority,
+            dlq,
         }
     }
 
@@ -100,9 +116,20 @@ pub async fn get_job(
     State(state): State<AppState>,
     Path(job_id): Path<i64>,
 ) -> Result<Json<JobResponse>, ApiError> {
-    let job = admin::get_job(&state.pool, job_id).await?;
-    let mut rows = JobResponse::from_rows(&state.pool, vec![job]).await?;
-    Ok(Json(rows.remove(0)))
+    // Queue storage keeps DLQ rows in `dlq_entries`, not the live job tables.
+    // `get_job_with_source` resolves that and surfaces `.dlq` metadata so the
+    // frontend can route retry/cancel through the `/api/dlq/*` endpoints.
+    let (job, dlq) = admin::get_job_with_source(&state.pool, job_id).await?;
+    let queue_descriptors =
+        admin::queue_descriptors_for_names(&state.pool, std::slice::from_ref(&job.queue)).await?;
+    let kind_descriptors =
+        admin::job_kind_descriptors_for_names(&state.pool, std::slice::from_ref(&job.kind)).await?;
+    Ok(Json(JobResponse::from_row_with_dlq(
+        job,
+        &queue_descriptors,
+        &kind_descriptors,
+        dlq,
+    )))
 }
 
 pub async fn retry_job(

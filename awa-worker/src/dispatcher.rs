@@ -1,17 +1,39 @@
-use crate::executor::JobExecutor;
+use crate::executor::{DispatchedJob, JobExecutor};
 use crate::runtime::InFlightMap;
+use crate::storage::RuntimeStorage;
 use awa_model::JobRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
+use uuid::Uuid;
 
 const CLAIM_BATCH_LIMIT: usize = 128;
+const MAX_CLAIMERS_PER_QUEUE: i16 = 4;
+const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
+const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);
+
+#[derive(Debug, Clone, Copy)]
+enum WakeReason {
+    Notify,
+    Capacity,
+    Poll,
+}
+
+impl WakeReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            WakeReason::Notify => "notify",
+            WakeReason::Capacity => "capacity",
+            WakeReason::Poll => "poll",
+        }
+    }
+}
 
 /// Rate limit configuration for a queue.
 #[derive(Debug, Clone)]
@@ -221,6 +243,7 @@ impl OverflowPool {
 /// Dispatcher polls a single queue for available jobs and dispatches them.
 pub struct Dispatcher {
     queue: String,
+    runtime_instance_id: Uuid,
     config: QueueConfig,
     pool: PgPool,
     executor: Arc<JobExecutor>,
@@ -231,12 +254,15 @@ pub struct Dispatcher {
     cancel: CancellationToken,
     job_set: Arc<Mutex<JoinSet<()>>>,
     rate_limiter: Option<TokenBucket>,
+    storage: RuntimeStorage,
+    capacity_wake: Arc<Notify>,
 }
 
 impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         queue: String,
+        runtime_instance_id: Uuid,
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
@@ -245,6 +271,7 @@ impl Dispatcher {
         alive: Arc<AtomicBool>,
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
+        storage: RuntimeStorage,
     ) -> Self {
         let concurrency = ConcurrencyMode::HardReserved {
             semaphore: Arc::new(Semaphore::new(config.max_workers as usize)),
@@ -252,6 +279,7 @@ impl Dispatcher {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
         Self {
             queue,
+            runtime_instance_id,
             config,
             pool,
             executor,
@@ -262,6 +290,8 @@ impl Dispatcher {
             cancel,
             job_set,
             rate_limiter,
+            storage,
+            capacity_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -269,6 +299,7 @@ impl Dispatcher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_concurrency(
         queue: String,
+        runtime_instance_id: Uuid,
         config: QueueConfig,
         pool: PgPool,
         executor: Arc<JobExecutor>,
@@ -278,10 +309,12 @@ impl Dispatcher {
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
         concurrency: ConcurrencyMode,
+        storage: RuntimeStorage,
     ) -> Self {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
         Self {
             queue,
+            runtime_instance_id,
             config,
             pool,
             executor,
@@ -292,6 +325,8 @@ impl Dispatcher {
             cancel,
             job_set,
             rate_limiter,
+            storage,
+            capacity_wake: Arc::new(Notify::new()),
         }
     }
 
@@ -338,7 +373,7 @@ impl Dispatcher {
                     match notification {
                         Ok(_) => {
                             debug!(queue = %self.queue, "Woken by NOTIFY");
-                            self.drain_ready().await;
+                            self.drain_ready(WakeReason::Notify, Instant::now()).await;
                         }
                         Err(err) => {
                             warn!(error = %err, "PG listener error, will retry");
@@ -346,8 +381,11 @@ impl Dispatcher {
                         }
                     }
                 }
+                _ = self.capacity_wake.notified() => {
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
+                }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.drain_ready().await;
+                    self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
         }
@@ -363,8 +401,11 @@ impl Dispatcher {
                     debug!(queue = %self.queue, "Dispatcher (poll-only) shutting down");
                     break;
                 }
+                _ = self.capacity_wake.notified() => {
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
+                }
                 _ = tokio::time::sleep(self.config.poll_interval) => {
-                    self.drain_ready().await;
+                    self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
         }
@@ -410,21 +451,38 @@ impl Dispatcher {
 
     /// Drain immediately available work after a wake-up until the queue is empty,
     /// capacity is exhausted, rate limiting stops us, or shutdown is requested.
-    async fn drain_ready(&mut self) {
+    async fn drain_ready(&mut self, wake_reason: WakeReason, woke_at: Instant) {
+        self.metrics
+            .record_dispatch_wake(&self.queue, wake_reason.as_str());
+        let mut first_iteration = true;
         while !self.cancel.is_cancelled() {
-            if !self.poll_once().await {
+            let wake_context = first_iteration.then_some((wake_reason, woke_at));
+            if !self.poll_once(wake_context).await {
                 break;
             }
+            first_iteration = false;
         }
     }
 
     /// Single poll iteration: pre-acquire permits, claim jobs, dispatch.
     #[tracing::instrument(skip(self), fields(queue = %self.queue))]
-    async fn poll_once(&mut self) -> bool {
+    async fn poll_once(&mut self, wake_context: Option<(WakeReason, Instant)>) -> bool {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
             return false;
+        }
+        if let Some((reason, woke_at)) = wake_context {
+            self.metrics.record_dispatch_wake_to_claim(
+                &self.queue,
+                reason.as_str(),
+                woke_at.elapsed(),
+            );
+            self.metrics.record_dispatch_capacity_available(
+                &self.queue,
+                reason.as_str(),
+                permits.len() as u64,
+            );
         }
 
         // Phase 2: Apply rate limit
@@ -436,6 +494,10 @@ impl Dispatcher {
         let batch_size = permits.len().min(rate_available).min(CLAIM_BATCH_LIMIT);
         if batch_size == 0 {
             // Drop all permits — rate limited
+            if let Some((reason, _)) = wake_context {
+                self.metrics
+                    .record_dispatch_rate_limited(&self.queue, reason.as_str());
+            }
             return false;
         }
         // Release excess permits beyond what rate limit allows
@@ -457,70 +519,131 @@ impl Dispatcher {
         let deadline_secs = self.config.deadline_duration.as_secs_f64();
         let claim_start = Instant::now();
 
-        let jobs: Vec<JobRow> = match sqlx::query_as::<_, JobRow>(
-            r#"
-            WITH claimed AS (
-                SELECT id
-                FROM awa.jobs_hot
-                WHERE state = 'available'
-                  AND queue = $1
-                  AND run_at <= now()
-                  AND NOT EXISTS (
-                      SELECT 1 FROM awa.queue_meta
-                      WHERE queue = $1 AND paused = TRUE
-                  )
-                ORDER BY priority ASC, run_at ASC, id ASC
-                LIMIT $2
-                FOR UPDATE SKIP LOCKED
+        let jobs: Vec<DispatchedJob> = match &self.storage {
+            RuntimeStorage::Canonical => match sqlx::query_as::<_, JobRow>(
+                r#"
+                WITH claimed AS (
+                    SELECT id
+                    FROM awa.jobs_hot
+                    WHERE state = 'available'
+                      AND queue = $1
+                      AND run_at <= now()
+                      AND NOT EXISTS (
+                          SELECT 1 FROM awa.queue_meta
+                          WHERE queue = $1 AND paused = TRUE
+                      )
+                    ORDER BY priority ASC, run_at ASC, id ASC
+                    LIMIT $2
+                    FOR UPDATE SKIP LOCKED
+                )
+                UPDATE awa.jobs_hot
+                SET state = 'running',
+                    attempt = attempt + 1,
+                    run_lease = run_lease + 1,
+                    attempted_at = now(),
+                    heartbeat_at = now(),
+                    deadline_at = now() + make_interval(secs => $3)
+                FROM claimed
+                WHERE awa.jobs_hot.id = claimed.id
+                  AND awa.jobs_hot.state = 'available'
+                RETURNING awa.jobs_hot.*
+                "#,
             )
-            UPDATE awa.jobs_hot
-            SET state = 'running',
-                attempt = attempt + 1,
-                run_lease = run_lease + 1,
-                attempted_at = now(),
-                heartbeat_at = now(),
-                deadline_at = now() + make_interval(secs => $3)
-            FROM claimed
-            WHERE awa.jobs_hot.id = claimed.id
-              AND awa.jobs_hot.state = 'available'
-            RETURNING awa.jobs_hot.*
-            "#,
-        )
-        .bind(&self.queue)
-        .bind(batch_size as i32)
-        .bind(deadline_secs)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(jobs) => jobs,
-            Err(err) => {
-                warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
-                return false;
-            }
+            .bind(&self.queue)
+            .bind(batch_size as i32)
+            .bind(deadline_secs)
+            .fetch_all(&self.pool)
+            .await
+            {
+                Ok(jobs) => jobs
+                    .into_iter()
+                    .map(|job| DispatchedJob {
+                        job,
+                        queue_storage_claim: None,
+                        queue_storage_unique_states: None,
+                    })
+                    .collect(),
+                Err(err) => {
+                    warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
+                    return false;
+                }
+            },
+            RuntimeStorage::QueueStorage(runtime) => match runtime
+                .store
+                .claim_runtime_batch_with_aging_for_instance(
+                    &self.pool,
+                    &self.queue,
+                    batch_size as i64,
+                    self.config.deadline_duration,
+                    self.config.priority_aging_interval,
+                    self.runtime_instance_id,
+                    MAX_CLAIMERS_PER_QUEUE,
+                    CLAIMER_LEASE_TTL,
+                    CLAIMER_IDLE_THRESHOLD,
+                )
+                .await
+            {
+                Ok(jobs) => jobs
+                    .into_iter()
+                    .map(|claimed| DispatchedJob {
+                        job: claimed.job,
+                        queue_storage_claim: Some(claimed.claim),
+                        queue_storage_unique_states: claimed.unique_states,
+                    })
+                    .collect(),
+                Err(err) => {
+                    warn!(
+                        queue = %self.queue,
+                        error = %err,
+                        "Failed to claim queue storage jobs"
+                    );
+                    return false;
+                }
+            },
         };
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
         if !jobs.is_empty() {
             self.metrics
                 .record_job_claimed(&self.queue, jobs.len() as u64);
+            // Wait duration = created_at → now() (claim moment).
+            //
+            // Earlier this used `attempted_at - created_at`, but the
+            // queue_storage claim path only populates `attempted_at`
+            // when deadline_duration > 0. Receipt-plane jobs (zero
+            // deadline, the 0.6 default) get NULL attempted_at on the
+            // ClaimedRuntimeJob, so the previous version silently
+            // skipped the metric — it never appeared on the
+            // dashboard. Falling back to `Utc::now()` measures the
+            // same operator-visible quantity ("time from enqueue to
+            // claim") regardless of whether the receipt-plane
+            // optimisation skipped the attempted_at write.
+            let now = chrono::Utc::now();
             for job in &jobs {
-                if let Some(attempted_at) = job.attempted_at {
-                    let wait_secs =
-                        (attempted_at - job.created_at).num_milliseconds() as f64 / 1000.0;
-                    if wait_secs >= 0.0 {
-                        self.metrics.record_wait_duration(&self.queue, wait_secs);
-                    }
+                let claim_at = job.job.attempted_at.unwrap_or(now);
+                let wait_secs = (claim_at - job.job.created_at).num_milliseconds() as f64 / 1000.0;
+                if wait_secs >= 0.0 {
+                    self.metrics.record_wait_duration(&self.queue, wait_secs);
                 }
             }
         }
 
         // Phase 4: Release excess permits if DB had fewer jobs
+        let unused_permits = permits.len().saturating_sub(jobs.len());
         while permits.len() > jobs.len() {
             permits.pop();
+        }
+        if unused_permits > 0 {
+            self.metrics
+                .record_dispatch_unused_permits(&self.queue, unused_permits as u64);
         }
 
         // Phase 5: Clear overflow demand if no jobs found
         if jobs.is_empty() {
+            if let Some((reason, _)) = wake_context {
+                self.metrics
+                    .record_dispatch_empty_claim(&self.queue, reason.as_str());
+            }
             if let ConcurrencyMode::Weighted {
                 overflow_pool,
                 queue_name,
@@ -541,12 +664,20 @@ impl Dispatcher {
 
         // Phase 7: Dispatch (each job takes one pre-acquired permit)
         let mut set = self.job_set.lock().await;
+        // Reap completed task handles. JoinSet retains JoinHandles (and the
+        // task Cell they keep alive) until join_next() consumes them; under
+        // steady-state load that pins the entire execute_task closure
+        // captures and leaks ~3 GB/h/replica. Drain here so the set only
+        // holds in-flight tasks.
+        while set.try_join_next().is_some() {}
         for (job, permit) in jobs.into_iter().zip(permits) {
             let cancel_flag = Arc::new(AtomicBool::new(false));
             let task = self.executor.execute_task(job, cancel_flag);
+            let capacity_wake = self.capacity_wake.clone();
             set.spawn(async move {
                 task.await;
                 drop(permit);
+                capacity_wake.notify_one();
             });
         }
 

@@ -19,6 +19,29 @@ DATABASE_URL = os.environ.get(
 )
 
 
+async def enable_queue_storage(client: awa.AsyncClient) -> None:
+    await client.install_queue_storage(reset=True)
+
+
+async def wait_for_job_state(
+    client: awa.AsyncClient,
+    job_id: int,
+    expected_state: awa.JobState,
+    timeout: float = 2.0,
+) -> awa.Job:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        try:
+            job = await client.get_job(job_id)
+        except awa.AwaError:
+            await asyncio.sleep(0.05)
+            continue
+        if job.state == expected_state:
+            return job
+        await asyncio.sleep(0.05)
+    return await client.get_job(job_id)
+
+
 @dataclass
 class AdvJob:
     value: str
@@ -76,6 +99,7 @@ async def test_task_decorator_registers_handler():
     """@client.task() registers a handler that processes jobs."""
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
+    await enable_queue_storage(client)
     results = []
 
     @client.task(AdvJob, queue="adv_task_reg")
@@ -205,6 +229,7 @@ async def test_handler_exception_preserves_type():
     """A Python exception in a handler surfaces with the correct type."""
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
+    await enable_queue_storage(client)
 
     @client.task(AdvJob, queue="adv_error_type")
     async def handle(job):
@@ -215,11 +240,13 @@ async def test_handler_exception_preserves_type():
         queue="adv_error_type",
         max_attempts=1,
     )
-    await client.start([("adv_error_type", 1)])
-    await asyncio.sleep(2)
+    await client.start(
+        [("adv_error_type", 1)],
+        queue_storage_queue_rotate_interval_ms=60_000,
+    )
+    stored = await wait_for_job_state(client, job.id, awa.JobState.Failed)
     await client.shutdown()
 
-    stored = await client.get_job(job.id)
     assert str(stored.state) == "failed"
 
     # Errors are exposed as a list of dicts
@@ -237,6 +264,7 @@ async def test_terminal_error_in_handler():
     """TerminalError immediately fails without retry."""
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
+    await enable_queue_storage(client)
     call_count = 0
 
     @client.task(AdvJob, queue="adv_terminal")
@@ -250,11 +278,13 @@ async def test_terminal_error_in_handler():
         queue="adv_terminal",
         max_attempts=5,
     )
-    await client.start([("adv_terminal", 1)])
-    await asyncio.sleep(2)
+    await client.start(
+        [("adv_terminal", 1)],
+        queue_storage_queue_rotate_interval_ms=60_000,
+    )
+    stored = await wait_for_job_state(client, job.id, awa.JobState.Failed)
     await client.shutdown()
 
-    stored = await client.get_job(job.id)
     assert str(stored.state) == "failed"
     assert call_count == 1, f"Terminal error should not retry, but ran {call_count} times"
 
@@ -287,8 +317,7 @@ async def test_no_duplicate_processing_with_task_decorator():
     """Jobs registered via @task are processed exactly once."""
     client = awa.AsyncClient(DATABASE_URL)
     await client.migrate()
-    # Clean stale jobs from previous runs
-    await client.drain_queue("adv_dedup")
+    await enable_queue_storage(client)
     results = []
 
     @client.task(AdvJob, queue="adv_dedup")

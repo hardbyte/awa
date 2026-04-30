@@ -9,8 +9,9 @@ reference results from local runs and dedicated-server enqueue comparisons.
 - Local runtime: PostgreSQL 17 in Docker (OrbStack)
 - Local database URL used for the example commands:
   `postgres://postgres:test@localhost:15432/awa_test`
-- The portable harness in `benchmarks/portable/` defaults to PostgreSQL 17 but
-  accepts `--pg-image postgres:18-alpine` for PG18 runs.
+- Cross-system long-horizon comparisons run from a separate repo:
+  [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
+  Default Postgres image is 17.2; `--pg-image postgres:18-alpine` selects PG18.
 - Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
   a separate Linux host. Those numbers are used only for shape comparison and
   should not be treated as published throughput claims.
@@ -27,6 +28,44 @@ reference results from local runs and dedicated-server enqueue comparisons.
 These are local engineering benchmarks, not published vendor-style numbers. The
 main goal is to compare shapes, validate architecture changes, and catch
 regressions.
+
+## Positioning Proof Checklist
+
+Queue storage changes Awa's comparison set.
+
+The interesting public question is no longer "can Postgres run jobs?" It is
+"can a Postgres job queue keep dispatch latency low while also keeping hot-path
+dead tuples bounded?"
+
+That means the benchmark burden for positioning is different from the benchmark
+burden for internal regressions. Before making the strongest public claim, the
+comparison needs to be rerun cleanly on the same hardware against the right
+reference points:
+
+- Awa queue storage
+- PgQue
+- River
+- optionally Oban Pro as a paid partitioned reference
+
+The benchmark set should include:
+
+- idle pickup latency
+- sustained runtime throughput
+- overlap readers / MVCC horizon pressure
+- mixed workload soak
+- terminal-failure burst
+
+Operational differences should be called out, not hidden:
+
+- Awa does not require `pg_cron`; the worker runtime owns dispatch, rescue,
+  rotation, and prune.
+- PgQue is designed around a periodic ticker and recommends `pg_cron`.
+- River and Oban are job frameworks rather than shared-log event queues, so
+  they remain the more comparable references for worker semantics.
+
+Commands and raw output for any public-facing table should live in-repo under
+`docs/adr/bench/` or another stable location so the resulting claim is
+auditable.
 
 ## Methodology Notes
 
@@ -117,37 +156,7 @@ mixed-workload setup:
 That soak benchmark is wired into CI as a weekly/manual run, while the shorter
 `test_mvcc_horizon_overlap_benchmark` remains the daily nightly smoke.
 
-## Cross-system visualisation: the long-horizon portable bench
-
-Awa's MVCC benches above are the **awa regression detection** track: fast,
-precise, Rust harness, hard thresholds on `overlap_handler_per_s` /
-`dead_tup_delta`. They run only against awa and exist to catch awa-specific
-regressions between commits.
-
-A separate **cross-system visualisation** track lives at
-`benchmarks/portable/long_horizon.py`. It drives multi-hour scenarios
-against awa plus peer systems (awa-python, river, procrastinate, oban, and
-future pgmq / pg-boss / PgQ adapters), collects Postgres-side and
-adapter-side telemetry on a shared timebase, and produces
-publication-quality cross-system plots (dead tuples, p99 latency,
-throughput, table size, queue depth, and a faceted per-event-table view).
-
-See `benchmarks/portable/README.md` for usage and
-`benchmarks/portable/CONTRIBUTING_ADAPTERS.md` for the adapter contract.
-
-The two tracks are deliberately separate:
-
-| Question | Authoritative benchmark |
-|---|---|
-| Did awa regress overnight? | `test_mvcc_horizon_overlap_benchmark` (nightly) / `test_mvcc_horizon_planetscale_soak` (weekly) |
-| How does awa compare to other systems under multi-hour pressure? | `long_horizon.py`, named scenarios (`idle_in_tx_saturation`, `long_horizon`) |
-
-If the two ever diverge on workload shape or thresholds, the awa-only
-benches are canonical for awa's own numbers and the long-horizon runner
-defers. The long-horizon runner does **not** carry awa-specific regression
-gates.
-
-Useful knobs:
+### MVCC bench knobs
 
 - `AWA_MVCC_JOB_RATE` — steady producer rate in jobs/sec
 - `AWA_MVCC_BASELINE_SECS` / `AWA_MVCC_OVERLAP_SECS` / `AWA_MVCC_COOLDOWN_SECS`
@@ -157,6 +166,30 @@ Useful knobs:
 - `AWA_MVCC_ANALYTICS_TICK_MS` — cadence for repeated analytics scans in
   `active_scan` mode
 - `AWA_MVCC_CLEANUP_INTERVAL_MS` / `AWA_MVCC_CLEANUP_BATCH_SIZE`
+
+## Cross-system comparison
+
+The awa benches in this file are the awa-only regression detection track —
+fast, precise, hard thresholds, awa code only. They are not designed for
+fair comparison with other systems.
+
+For cross-system comparison, the long-horizon harness lives in a separate
+repository so each system-under-test can be benchmarked through its public
+API on equal footing:
+
+[**hardbyte/postgresql-job-queue-benchmarking**](https://github.com/hardbyte/postgresql-job-queue-benchmarking)
+
+The companion repo currently benchmarks awa against pgque, procrastinate,
+pg-boss, river, oban, and pgmq using a shared subprocess contract: each
+adapter is a self-contained binary that emits one JSON sample per line.
+Headline numbers, per-system architectural notes, and reproducible run
+instructions are in that repo's
+[`SYSTEM_COMPARISONS.md`](https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md)
+and [`results/2026-04-28/SUMMARY.md`](https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/results/2026-04-28/SUMMARY.md).
+
+The two tracks are deliberately separate. If they ever diverge on
+workload shape or thresholds, the awa-only benches in this file are
+canonical for awa's own numbers and the cross-system runner defers.
 
 ## Python Runtime Benchmarks
 
@@ -189,7 +222,7 @@ properties:
 - homogeneous inserts now route directly to `awa.jobs_hot` or
   `awa.scheduled_jobs` instead of going through the compatibility view
 - admin metadata maintenance moved from row-level triggers to statement-level
-  trigger batches (`v005`)
+  trigger batches
 - COPY staging now reuses a session-local temp table and stages typed values
   instead of reparsing text on the final `INSERT ... SELECT`
 
@@ -560,115 +593,18 @@ PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_tes
 - The current focus is relative behavior and architectural validation, not
   cross-machine leaderboard comparisons.
 
-## Cross-System Comparison (Portable Benchmarks)
+## Cross-system numbers
 
-The `benchmarks/portable/` harness runs comparable scenarios against Awa
-(native Rust), `awa-docker`, `awa-python`, River (Go), and Oban (Elixir)
-sharing the same Postgres instance. See `benchmarks/portable/README.md` for
-setup and usage.
+Cross-system comparison (awa vs pgque / procrastinate / pg-boss / river /
+oban / pgmq) lives in
+[hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
+That repo is the source of truth for fair-comparison numbers, chaos
+results across systems, and the long-horizon harness itself.
 
-A recent fair comparison used:
-
-- 5 isolated repetitions per system
-- 10,000 benchmark jobs
-- 50 workers
-- 50 pickup-latency iterations
-- portable chaos suite with 10 long-running jobs
-- systems included: `awa`, `awa-docker`, `awa-python`, `river`, `oban`
-
-`procrastinate` was excluded from the fair 5x comparison because its portable
-chaos adapter/schema path was not yet trustworthy enough to compare fairly.
-
-### Benchmark Summary (5 isolated repetitions)
-
-#### Enqueue Throughput (jobs/sec)
-
-| System | Mean | Stdev | Min | Max |
-|--------|-----:|------:|----:|----:|
-| `awa` | 30,798 | 8,293 | 20,599 | 43,522 |
-| `awa-docker` | 28,777 | 2,676 | 24,328 | 30,822 |
-| `awa-python` | 24,357 | 2,276 | 21,012 | 26,823 |
-| `river` | 39,792 | 15,912 | 31,461 | 68,195 |
-| `oban` | 12,129 | 452 | 11,641 | 12,739 |
-
-#### Worker Throughput — no-op jobs (jobs/sec)
-
-| System | Mean | Stdev | Min | Max |
-|--------|-----:|------:|----:|----:|
-| `awa` | 851 | 15 | 843 | 879 |
-| `awa-docker` | 847 | 3 | 843 | 849 |
-| `awa-python` | 818 | 3 | 816 | 823 |
-| `river` | 968 | 1 | 967 | 969 |
-| `oban` | 2,243 | 1,211 | 1,641 | 4,407 |
-
-#### Pickup Latency — single job to idle queue (p50)
-
-| System | Mean p50 | Min p50 | Max p50 |
-|--------|---------:|--------:|--------:|
-| `awa` | 56,023 us | 55,738 us | 56,697 us |
-| `awa-docker` | 55,768 us | 55,511 us | 56,041 us |
-| `awa-python` | 56,933 us | 56,662 us | 57,193 us |
-| `river` | 263,434 us | 262,101 us | 264,067 us |
-| `oban` | 55,430 us | 53,145 us | 56,045 us |
-
-### Benchmark Takeaways
-
-- The three Awa variants were tightly clustered and stable. Native Awa had the
-  fastest mean enqueue throughput, while `awa-docker` and `awa-python` stayed
-  close on pickup latency and worker throughput.
-- River had strong worker throughput and the fastest mean enqueue throughput in
-  this run set, but its enqueue numbers were much more variable than the Awa
-  family.
-- River remained a clear outlier on pickup latency at roughly `263 ms` p50,
-  versus roughly `55-57 ms` for the other systems.
-- Oban had the lowest enqueue throughput in this suite, but the highest mean
-  worker throughput. That mean is noisy: the 5-run range was `1.6k/s` to
-  `4.4k/s`, so the mean should not be treated as a stable single-number result.
-
-### Comparability Notes
-
-- These are still local engineering numbers on one machine, not published
-  vendor-style claims.
-- No-op workload measures queue/runtime overhead. Real jobs with meaningful work
-  would narrow many of these gaps.
-- River uses `InsertManyFast` (COPY protocol) for enqueue. Awa uses
-  `insert_many_copy_from_pool`.
-- Oban uses the open-source Basic engine; Oban Pro's SmartEngine would likely
-  differ.
-- Single-node only; no multi-process cluster benchmark is implied by these
-  results.
-
-### Correctness Under Adverse Conditions
-
-The portable chaos runner (`benchmarks/portable/chaos.py`) exercises crash
-recovery, Postgres restart, repeated worker kills, backend termination, leader
-failover, and connection-pool exhaustion.
-
-An early River configuration used a stuck-job timeout shorter than the 30s
-chaos job duration, which could falsely rescue healthy work. After correcting
-River to use a rescue timeout above the job duration, a focused rerun completed
-the portable chaos scenarios with zero lost jobs.
-
-#### Chaos Summary
-
-| System | Crash Recovery | Repeated Kills | Leader Failover | Postgres Restart |
-|--------|----------------|----------------|-----------------|------------------|
-| `awa` | mean `41.7s`, lost `0` | mean `53.4s`, lost `0` | mean `47.5s`, lost `0`, dupes `0` | mean `28.3s`, lost `0` |
-| `awa-docker` | mean `41.8s`, lost `0` | mean `54.3s`, lost `0` | mean `47.7s`, lost `0`, dupes `0` | mean `28.5s`, lost `0` |
-| `awa-python` | mean `42.2s`, lost `0` | mean `54.4s`, lost `0` | mean `47.9s`, lost `0`, dupes `0` | mean `28.9s`, lost `0` |
-| `river` | corrected rerun `103.6s`, lost `0` | corrected rerun `114.6s`, lost `0` | corrected rerun `110.6s`, lost `0`, dupes `0` | corrected rerun `28.4s`, lost `0` |
-| `oban` | mean `93.1s`, lost `0` | mean `110.4s`, lost `0` | mean `89.0s`, lost `0`, dupes `0` | mean `29.8s`, lost `0` |
-
-#### Chaos Takeaways
-
-- The Awa family was the most consistent result in the suite: all five runs of
-  all portable chaos scenarios completed with zero loss and zero duplicates.
-- Oban was also correct in this run set, but materially slower to rescue and
-  fail over than the Awa variants.
-- River's first run highlighted an important fairness issue in the harness:
-  stuck-job detection has to be configured relative to each system's recovery
-  semantics and the test job duration, not just matched numerically.
-- With the corrected River rescue timeout, the focused rerun completed the
-  portable chaos scenarios without job loss or duplicate completions.
-- All systems handled Postgres restart and backend-kill scenarios without job
-  loss in this suite.
+The reasoning for the split: cross-system benches need to evolve at the
+pace of the systems being compared (each gets new releases, new public
+APIs, new adapter caveats), and the awa-only regression track in this
+file needs to evolve at awa's pace. Keeping them in one repo coupled
+their schedules and conflated "did awa regress?" with "is awa still
+faster than X?". They're separate questions; they're now in separate
+places.

@@ -1,16 +1,36 @@
 use crate::runtime::RunLease;
-use awa_model::AwaError;
+use crate::storage::RuntimeStorage;
+use awa_model::{AwaError, ClaimedEntry, ClaimedRuntimeJob};
 use sqlx::PgPool;
 use std::collections::HashSet;
+use std::env;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
 const COMPLETION_BATCH_SIZE: usize = 512;
-const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
-const COMPLETION_SHARDS: usize = 8;
+
+fn completion_flush_interval() -> Duration {
+    env::var("AWA_COMPLETION_FLUSH_MS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .map(Duration::from_millis)
+        .unwrap_or_else(|| Duration::from_millis(1))
+}
+
+fn completion_shards(storage: &RuntimeStorage) -> usize {
+    env::var("AWA_COMPLETION_SHARDS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(match storage {
+            RuntimeStorage::Canonical => 8,
+            RuntimeStorage::QueueStorage(_) => 4,
+        })
+}
 const COMPLETE_BATCH_SQL: &str = r#"
     WITH completed (id, run_lease) AS (
         SELECT * FROM unnest($1::bigint[], $2::bigint[])
@@ -37,6 +57,8 @@ const COMPLETE_BATCH_SQL: &str = r#"
 struct CompletionRequest {
     job_id: i64,
     run_lease: RunLease,
+    claim: Option<ClaimedEntry>,
+    runtime_job: Option<ClaimedRuntimeJob>,
     response: oneshot::Sender<Result<bool, AwaError>>,
 }
 
@@ -47,12 +69,37 @@ pub(crate) struct CompletionBatcherHandle {
 
 impl CompletionBatcherHandle {
     pub async fn complete(&self, job_id: i64, run_lease: RunLease) -> Result<bool, AwaError> {
+        self.complete_inner(job_id, run_lease, None, None).await
+    }
+
+    pub async fn complete_runtime_job(
+        &self,
+        runtime_job: ClaimedRuntimeJob,
+    ) -> Result<bool, AwaError> {
+        self.complete_inner(
+            runtime_job.job.id,
+            runtime_job.job.run_lease,
+            Some(runtime_job.claim.clone()),
+            Some(runtime_job),
+        )
+        .await
+    }
+
+    async fn complete_inner(
+        &self,
+        job_id: i64,
+        run_lease: RunLease,
+        claim: Option<ClaimedEntry>,
+        runtime_job: Option<ClaimedRuntimeJob>,
+    ) -> Result<bool, AwaError> {
         let shard = (job_id.rem_euclid(self.shards.len() as i64)) as usize;
         let (response_tx, response_rx) = oneshot::channel();
         self.shards[shard]
             .send(CompletionRequest {
                 job_id,
                 run_lease,
+                claim,
+                runtime_job,
                 response: response_tx,
             })
             .await
@@ -73,11 +120,14 @@ impl CompletionBatcher {
         pool: PgPool,
         cancel: CancellationToken,
         metrics: crate::metrics::AwaMetrics,
+        storage: RuntimeStorage,
     ) -> (Self, CompletionBatcherHandle) {
-        let mut shards = Vec::with_capacity(COMPLETION_SHARDS);
-        let mut workers = Vec::with_capacity(COMPLETION_SHARDS);
+        let shard_count = completion_shards(&storage);
+        let flush_interval = completion_flush_interval();
+        let mut shards = Vec::with_capacity(shard_count);
+        let mut workers = Vec::with_capacity(shard_count);
 
-        for shard_id in 0..COMPLETION_SHARDS {
+        for shard_id in 0..shard_count {
             let (tx, rx) = mpsc::channel(COMPLETION_CHANNEL_CAPACITY);
             shards.push(tx);
             workers.push(CompletionWorker {
@@ -86,6 +136,8 @@ impl CompletionBatcher {
                 rx,
                 cancel: cancel.clone(),
                 metrics: metrics.clone(),
+                storage: storage.clone(),
+                flush_interval,
             });
         }
 
@@ -106,6 +158,8 @@ struct CompletionWorker {
     rx: mpsc::Receiver<CompletionRequest>,
     cancel: CancellationToken,
     metrics: crate::metrics::AwaMetrics,
+    storage: RuntimeStorage,
+    flush_interval: Duration,
 }
 
 impl CompletionWorker {
@@ -124,7 +178,7 @@ impl CompletionWorker {
                     }
                 }
             } else {
-                let timer = tokio::time::sleep(COMPLETION_FLUSH_INTERVAL);
+                let timer = tokio::time::sleep(self.flush_interval);
                 tokio::pin!(timer);
 
                 tokio::select! {
@@ -159,6 +213,10 @@ impl CompletionWorker {
         debug!(shard = self.shard_id, "Completion batcher shard stopped");
     }
 
+    #[tracing::instrument(
+        skip(self, pending),
+        fields(shard = self.shard_id, batch_size = pending.len())
+    )]
     async fn flush(&self, pending: &mut Vec<CompletionRequest>) {
         if pending.is_empty() {
             return;
@@ -170,11 +228,47 @@ impl CompletionWorker {
         let run_leases: Vec<i64> = batch.iter().map(|request| request.run_lease).collect();
         let flush_start = std::time::Instant::now();
 
-        let updated = sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
-            .bind(&job_ids)
-            .bind(&run_leases)
-            .fetch_all(&self.pool)
-            .await;
+        let updated = match &self.storage {
+            RuntimeStorage::Canonical => sqlx::query_as::<_, (i64, i64)>(COMPLETE_BATCH_SQL)
+                .bind(&job_ids)
+                .bind(&run_leases)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(AwaError::Database),
+            RuntimeStorage::QueueStorage(runtime) => {
+                if let Some(runtime_jobs) = batch
+                    .iter()
+                    .map(|request| request.runtime_job.clone())
+                    .collect::<Option<Vec<ClaimedRuntimeJob>>>()
+                {
+                    runtime
+                        .store
+                        .complete_runtime_batch(&self.pool, &runtime_jobs)
+                        .await
+                } else if let Some(claimed) = batch
+                    .iter()
+                    .map(|request| request.claim.clone())
+                    .collect::<Option<Vec<ClaimedEntry>>>()
+                {
+                    runtime
+                        .store
+                        .complete_claimed_batch(&self.pool, &claimed)
+                        .await
+                } else {
+                    runtime
+                        .store
+                        .complete_job_batch_by_id(
+                            &self.pool,
+                            &job_ids
+                                .iter()
+                                .copied()
+                                .zip(run_leases.iter().copied())
+                                .collect::<Vec<_>>(),
+                        )
+                        .await
+                }
+            }
+        };
 
         match updated {
             Ok(updated_rows) => {
@@ -244,6 +338,11 @@ mod tests {
     }
 
     async fn clean_queue(pool: &PgPool, queue: &str) {
+        sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = $1")
+            .bind(queue)
+            .execute(pool)
+            .await
+            .expect("Failed to clean canonical queue jobs");
         sqlx::query("DELETE FROM awa.jobs WHERE queue = $1")
             .bind(queue)
             .execute(pool)
@@ -464,6 +563,7 @@ mod tests {
             pool.clone(),
             CancellationToken::new(),
             crate::metrics::AwaMetrics::from_global(),
+            crate::storage::RuntimeStorage::Canonical,
         );
         let workers = batcher.spawn();
 
@@ -625,6 +725,7 @@ mod tests {
             pool.clone(),
             CancellationToken::new(),
             crate::metrics::AwaMetrics::from_global(),
+            crate::storage::RuntimeStorage::Canonical,
         );
         let workers = batcher.spawn();
 

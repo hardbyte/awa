@@ -41,11 +41,83 @@ async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
+    await tx.execute(
+        """
+        CREATE TABLE IF NOT EXISTS awa_test_chaos_markers (
+            job_id BIGINT NOT NULL,
+            attempt INTEGER NOT NULL,
+            marker TEXT NOT NULL,
+            observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """
+    )
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'chaos_%'")
     await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'chaos_%'")
+    await tx.execute(
+        "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+    )
+    await tx.execute("DELETE FROM awa.runtime_instances")
+    await tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
+    await tx.execute("DELETE FROM awa_test_chaos_markers")
     await tx.commit()
     yield c
     await c.close()
+
+
+async def _active_queue_storage_schema(client: awa.AsyncClient) -> str | None:
+    tx = await client.transaction()
+    try:
+        row = await tx.fetch_one("SELECT awa.active_queue_storage_schema() AS schema_name")
+        return row["schema_name"]
+    finally:
+        await tx.rollback()
+
+
+async def _backdate_running_deadline(client: awa.AsyncClient, job_id: int) -> None:
+    schema = await _active_queue_storage_schema(client)
+    tx = await client.transaction()
+    try:
+        if schema:
+            # Receipts-mode short-job claims live in `lease_claims`
+            # until they materialise (heartbeat writes to
+            # `attempt_state` only, which doesn't trigger
+            # materialisation). Backdate the deadline on whichever
+            # table is hosting the active attempt — leases for
+            # materialised claims, lease_claims for receipt-only
+            # claims. Both rescue paths read their own column.
+            await tx.execute(
+                f"UPDATE {schema}.leases "
+                "SET deadline_at = now() - interval '1 second' "
+                "WHERE job_id = $1 AND state = 'running'",
+                job_id,
+            )
+            await tx.execute(
+                f"UPDATE {schema}.lease_claims "
+                "SET deadline_at = now() - interval '1 second' "
+                "WHERE job_id = $1",
+                job_id,
+            )
+        else:
+            await tx.execute(
+                "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
+                job_id,
+            )
+        await tx.commit()
+    except Exception:
+        await tx.rollback()
+        raise
 
 
 @pytest.mark.asyncio
@@ -59,37 +131,36 @@ async def test_worker_sigkill_job_is_rescued_and_completed(client):
         await _wait_for_line(worker_a, "READY role=hang", timeout=10)
 
         job = await client.insert(ChaosProbe(marker="ci"), queue=queue)
-        await _wait_for_line(
-            worker_a,
-            f"START role=hang pid={worker_a.pid} job_id={job.id} attempt=1",
+        await _wait_for_job(
+            client,
+            job.id,
+            lambda row: row is not None
+            and row["state"] == "running"
+            and row["attempt"] == 1
+            and row["heartbeat_at"] is not None,
             timeout=10,
+            worker=worker_a,
+            description="running attempt=1 with heartbeat",
         )
 
-        tx = await client.transaction()
-        await tx.execute(
-            "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
-            job.id,
-        )
-        await tx.commit()
+        await _backdate_running_deadline(client, job.id)
 
         worker_a.kill()
         await asyncio.wait_for(worker_a.wait(), timeout=5)
 
         worker_b = await _start_worker(queue, "complete")
         await _wait_for_line(worker_b, "READY role=complete", timeout=10)
-        await _wait_for_line(
-            worker_b,
-            f"START role=complete pid={worker_b.pid} job_id={job.id} attempt=2",
-            timeout=45,
-        )
-        await _wait_for_line(
-            worker_b,
-            f"COMPLETE role=complete pid={worker_b.pid} job_id={job.id} attempt=2",
-            timeout=5,
-        )
 
-        row = await _wait_for_job_state(
-            client, job.id, "completed", timeout=10, worker=worker_b
+        row = await _wait_for_job(
+            client,
+            job.id,
+            lambda current: current is not None
+            and current["state"] == "completed"
+            and current["attempt"] == 2
+            and current["finalized_at"] is not None,
+            timeout=45,
+            worker=worker_b,
+            description="completed attempt=2",
         )
         assert row["attempt"] == 2
         assert row["finalized_at"] is not None
@@ -108,37 +179,39 @@ async def test_worker_hang_is_cancelled_by_deadline_rescue_and_retried(client):
         await _wait_for_line(worker, "READY role=hang_until_cancel", timeout=10)
 
         job = await client.insert(ChaosProbe(marker="deadline"), queue=queue)
-        await _wait_for_line(
-            worker,
-            f"START role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=1",
-            timeout=10,
-        )
-
-        tx = await client.transaction()
-        await tx.execute(
-            "UPDATE awa.jobs SET deadline_at = now() - interval '1 second' WHERE id = $1",
+        await _wait_for_job(
+            client,
             job.id,
-        )
-        await tx.commit()
-
-        await _wait_for_line(
-            worker,
-            f"CANCELLED role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=1",
+            lambda row: row is not None
+            and row["state"] == "running"
+            and row["attempt"] == 1
+            and row["heartbeat_at"] is not None,
             timeout=10,
-        )
-        await _wait_for_line(
-            worker,
-            f"START role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=2",
-            timeout=10,
-        )
-        await _wait_for_line(
-            worker,
-            f"COMPLETE role=hang_until_cancel pid={worker.pid} job_id={job.id} attempt=2",
-            timeout=5,
+            worker=worker,
+            description="running attempt=1 with heartbeat",
         )
 
-        row = await _wait_for_job_state(
-            client, job.id, "completed", timeout=10, worker=worker
+        await _backdate_running_deadline(client, job.id)
+
+        cancelled = await _wait_for_cancel_marker(
+            client,
+            job.id,
+            attempt=1,
+            timeout=10,
+            worker=worker,
+        )
+        assert cancelled["marker"] == "cancel_observed"
+
+        row = await _wait_for_job(
+            client,
+            job.id,
+            lambda current: current is not None
+            and current["state"] == "completed"
+            and current["attempt"] == 2
+            and current["finalized_at"] is not None,
+            timeout=10,
+            worker=worker,
+            description="completed attempt=2",
         )
         assert row["attempt"] == 2
         assert row["finalized_at"] is not None
@@ -156,33 +229,28 @@ async def test_callback_timeout_is_rescued_and_retried(client):
         await _wait_for_line(worker, "READY role=callback_wait", timeout=10)
 
         job = await client.insert(ChaosProbe(marker="callback"), queue=queue)
-        await _wait_for_line(
-            worker,
-            f"START role=callback_wait pid={worker.pid} job_id={job.id} attempt=1",
+        row = await _wait_for_job(
+            client,
+            job.id,
+            lambda current: current is not None
+            and current["state"] == "waiting_external"
+            and current["attempt"] == 1,
             timeout=10,
+            worker=worker,
+            description="waiting_external attempt=1",
         )
-        await _wait_for_line(
-            worker,
-            f"WAITING role=callback_wait pid={worker.pid} job_id={job.id} attempt=1",
-            timeout=5,
-        )
-
-        row = await _wait_for_job_state(client, job.id, "waiting_external", timeout=5)
         assert row["attempt"] == 1
 
-        await _wait_for_line(
-            worker,
-            f"START role=callback_wait pid={worker.pid} job_id={job.id} attempt=2",
+        final_row = await _wait_for_job(
+            client,
+            job.id,
+            lambda current: current is not None
+            and current["state"] == "completed"
+            and current["attempt"] == 2
+            and current["finalized_at"] is not None,
             timeout=10,
-        )
-        await _wait_for_line(
-            worker,
-            f"COMPLETE role=callback_wait pid={worker.pid} job_id={job.id} attempt=2",
-            timeout=5,
-        )
-
-        final_row = await _wait_for_job_state(
-            client, job.id, "completed", timeout=10, worker=worker
+            worker=worker,
+            description="completed attempt=2 after callback timeout rescue",
         )
         assert final_row["attempt"] == 2
         assert final_row["finalized_at"] is not None
@@ -313,18 +381,125 @@ async def _wait_for_line(worker: ChaosWorker, expected: str, timeout: float) -> 
     return await worker.wait_for_line(expected, timeout)
 
 
-async def _wait_for_job_state(
-    client: awa.AsyncClient,
-    job_id: int,
-    expected_state: str,
-    timeout: float,
-    worker: "ChaosWorker | None" = None,
-):
-    deadline = asyncio.get_running_loop().time() + scaled_timeout(timeout)
+async def _fetch_job_row(client: awa.AsyncClient, job_id: int):
+    """Read a job's lifecycle row in a backend-aware way.
 
-    while True:
-        tx = await client.transaction()
-        row = await tx.fetch_optional(
+    The previous SQL queried `awa.jobs` directly, which is empty
+    under queue_storage (the 0.6 default). Probe the active backend
+    once and dispatch to the right shape:
+    - **queue_storage**: stitch `leases` (materialized claims) and
+      `lease_claims` + `attempt_state` (receipt-backed claims that
+      heartbeat into `attempt_state.heartbeat_at` until the lease
+      materialises).
+    - **canonical**: keep the original `awa.jobs` query.
+
+    The test predicates read `state`, `attempt`, `heartbeat_at`,
+    `deadline_at`, `finalized_at`, `progress`, `heartbeat_age_s`,
+    so the queue_storage projection mirrors those columns.
+    """
+    tx = await client.transaction()
+    try:
+        schema_row = await tx.fetch_one(
+            "SELECT awa.active_queue_storage_schema() AS schema_name"
+        )
+        schema = schema_row["schema_name"] if schema_row else None
+
+        if schema is not None:
+            # Materialised claim → leases. Receipts mode short-job
+            # claims live in lease_claims; their heartbeat
+            # (when the worker has heartbeated at least once) lives
+            # in attempt_state.heartbeat_at.
+            row = await tx.fetch_optional(
+                f"""
+                WITH job_lease AS (
+                    SELECT id::bigint,
+                           state::text AS state,
+                           attempt,
+                           run_lease,
+                           heartbeat_at::text AS heartbeat_at,
+                           deadline_at::text AS deadline_at,
+                           NULL::text AS finalized_at,
+                           NULL::jsonb AS progress,
+                           EXTRACT(EPOCH FROM (now() - heartbeat_at))::float AS heartbeat_age_s
+                    FROM (
+                        SELECT $1::bigint AS id,
+                               state,
+                               attempt,
+                               run_lease,
+                               heartbeat_at,
+                               deadline_at
+                        FROM {schema}.leases
+                        WHERE job_id = $1
+                    ) AS lease
+                ),
+                job_claim AS (
+                    SELECT $1::bigint AS id,
+                           'running'::text AS state,
+                           claims.attempt,
+                           claims.run_lease,
+                           ast.heartbeat_at::text AS heartbeat_at,
+                           claims.deadline_at::text AS deadline_at,
+                           NULL::text AS finalized_at,
+                           ast.progress,
+                           EXTRACT(EPOCH FROM (now() - ast.heartbeat_at))::float AS heartbeat_age_s
+                    FROM {schema}.lease_claims AS claims
+                    LEFT JOIN {schema}.attempt_state AS ast
+                      ON ast.job_id = claims.job_id
+                     AND ast.run_lease = claims.run_lease
+                    WHERE claims.job_id = $1
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.lease_claim_closures AS cx
+                          WHERE cx.claim_slot = claims.claim_slot
+                            AND cx.job_id = claims.job_id
+                            AND cx.run_lease = claims.run_lease
+                      )
+                      AND NOT EXISTS (
+                          SELECT 1 FROM {schema}.leases AS lease
+                          WHERE lease.job_id = claims.job_id
+                            AND lease.run_lease = claims.run_lease
+                      )
+                ),
+                job_done AS (
+                    SELECT $1::bigint AS id,
+                           state::text AS state,
+                           attempt,
+                           run_lease,
+                           NULL::text AS heartbeat_at,
+                           NULL::text AS deadline_at,
+                           finalized_at::text AS finalized_at,
+                           NULL::jsonb AS progress,
+                           NULL::float AS heartbeat_age_s
+                    FROM {schema}.done_entries
+                    WHERE job_id = $1
+                ),
+                job_deferred AS (
+                    SELECT $1::bigint AS id,
+                           state::text AS state,
+                           attempt,
+                           run_lease,
+                           NULL::text AS heartbeat_at,
+                           NULL::text AS deadline_at,
+                           finalized_at::text AS finalized_at,
+                           NULL::jsonb AS progress,
+                           NULL::float AS heartbeat_age_s
+                    FROM {schema}.deferred_jobs
+                    WHERE job_id = $1
+                ),
+                merged AS (
+                    SELECT * FROM job_lease
+                    UNION ALL SELECT * FROM job_claim
+                    UNION ALL SELECT * FROM job_done
+                    UNION ALL SELECT * FROM job_deferred
+                )
+                SELECT * FROM merged
+                ORDER BY run_lease DESC NULLS LAST
+                LIMIT 1
+                """,
+                job_id,
+            )
+            return row
+
+        return await tx.fetch_optional(
             """
             SELECT id,
                    state::text AS state,
@@ -333,19 +508,35 @@ async def _wait_for_job_state(
                    heartbeat_at::text AS heartbeat_at,
                    deadline_at::text AS deadline_at,
                    finalized_at::text AS finalized_at,
+                   progress,
                    EXTRACT(EPOCH FROM (now() - heartbeat_at))::float AS heartbeat_age_s
             FROM awa.jobs
             WHERE id = $1
             """,
             job_id,
         )
-        await tx.commit()
+    finally:
+        await tx.rollback()
 
-        if row is not None and row["state"] == expected_state:
+
+async def _wait_for_job(
+    client: awa.AsyncClient,
+    job_id: int,
+    predicate,
+    timeout: float,
+    *,
+    worker: "ChaosWorker | None" = None,
+    description: str = "predicate satisfied",
+):
+    deadline = asyncio.get_running_loop().time() + scaled_timeout(timeout)
+
+    while True:
+        row = await _fetch_job_row(client, job_id)
+        if predicate(row):
             return row
 
         if asyncio.get_running_loop().time() >= deadline:
-            diag = f"job {job_id} did not reach state {expected_state!r}: {row!r}"
+            diag = f"job {job_id} did not reach expected condition ({description}): {row!r}"
             if worker is not None:
                 tail = worker.lines[-40:]
                 diag += (
@@ -362,3 +553,46 @@ async def _stop_process(worker: ChaosWorker | None) -> None:
     if worker is None:
         return
     await worker.shutdown()
+
+
+async def _wait_for_cancel_marker(
+    client: awa.AsyncClient,
+    job_id: int,
+    *,
+    attempt: int,
+    timeout: float,
+    worker: "ChaosWorker | None" = None,
+):
+    deadline = asyncio.get_running_loop().time() + scaled_timeout(timeout)
+    while True:
+        tx = await client.transaction()
+        try:
+            row = await tx.fetch_optional(
+                """
+                SELECT job_id, attempt, marker, observed_at::text AS observed_at
+                FROM awa_test_chaos_markers
+                WHERE job_id = $1 AND attempt = $2
+                ORDER BY observed_at DESC
+                LIMIT 1
+                """,
+                job_id,
+                attempt,
+            )
+        finally:
+            await tx.rollback()
+
+        if row is not None:
+            return row
+
+        if asyncio.get_running_loop().time() >= deadline:
+            diag = f"job {job_id} did not persist cancel marker for attempt {attempt}"
+            if worker is not None:
+                tail = worker.lines[-40:]
+                diag += (
+                    f"\nworker pid={worker.pid} returncode={worker.returncode}"
+                    f" stdout_lines={len(worker.lines)}\n"
+                    "-- last 40 stdout lines --\n" + "\n".join(tail)
+                )
+            raise AssertionError(diag)
+
+        await asyncio.sleep(0.2)

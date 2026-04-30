@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
@@ -60,6 +61,11 @@ enum Commands {
     Storage {
         #[command(subcommand)]
         command: StorageCommands,
+    },
+    /// Dead Letter Queue management
+    Dlq {
+        #[command(subcommand)]
+        command: DlqCommands,
     },
     /// Start the web UI server
     Serve {
@@ -151,6 +157,72 @@ enum JobCommands {
 }
 
 #[derive(Subcommand)]
+enum DlqCommands {
+    /// List rows in the Dead Letter Queue
+    List {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        #[arg(long)]
+        before_id: Option<i64>,
+        #[arg(long)]
+        before_dlq_at: Option<DateTime<Utc>>,
+        #[arg(long, default_value = "20")]
+        limit: i64,
+    },
+    /// Show DLQ depth (total, optionally by queue)
+    Depth {
+        #[arg(long)]
+        queue: Option<String>,
+    },
+    /// Retry a single DLQ'd job by id
+    Retry { id: i64 },
+    /// Retry DLQ rows in bulk matching the filter
+    RetryBulk {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        /// Retry every row in the DLQ when no filter is provided.
+        /// Required without `--kind`, `--queue`, or `--tag` to guard against
+        /// accidentally reviving the entire DLQ.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Move existing failed terminal rows into the DLQ
+    Move {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long, default_value = "manual")]
+        reason: String,
+        /// Move every failed row when no filter is provided.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Purge (delete) DLQ rows matching the filter
+    Purge {
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long)]
+        queue: Option<String>,
+        #[arg(long)]
+        tag: Option<String>,
+        /// Purge every row in the DLQ when no filter is provided.
+        /// Required without `--kind`, `--queue`, or `--tag` to guard against
+        /// accidentally wiping the DLQ.
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
 enum CronCommands {
     /// List all registered cron job schedules
     List,
@@ -170,8 +242,24 @@ enum StorageCommands {
         #[arg(long)]
         details: Option<String>,
     },
+    /// Materialize the queue-storage schema without activating routing
+    PrepareQueueStorageSchema {
+        #[arg(long, default_value = "awa")]
+        schema: String,
+        #[arg(long, default_value_t = 16)]
+        queue_slot_count: u32,
+        #[arg(long, default_value_t = 8)]
+        lease_slot_count: u32,
+        /// Drop and recreate the target schema before preparing it
+        #[arg(long)]
+        reset: bool,
+    },
     /// Abort a prepared or mixed-transition storage rollout before final activation
     Abort,
+    /// Enter mixed transition and begin routing new writes to the prepared engine
+    EnterMixedTransition,
+    /// Finalize the storage transition once drain and capability gates pass
+    Finalize,
 }
 
 #[derive(Subcommand)]
@@ -323,12 +411,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
         }
 
-        // All remaining CLI commands are single-shot (one query, then exit)
-        // so a single connection is sufficient.
+        // Most remaining CLI commands are single-shot (one query, then exit)
+        // so a small pool is sufficient. `storage prepare-queue-storage-schema`
+        // is the exception: it acquires an advisory-lock connection and then
+        // runs DDL via the same pool, which deadlocks at max_connections=1.
+        // Allow up to 4 connections so the lock connection and the DDL
+        // executor coexist.
         command => {
             let db_url = require_pool(&cli.database_url)?;
             let pool = PgPoolOptions::new()
-                .max_connections(1)
+                .max_connections(4)
                 .connect(&db_url)
                 .await?;
 
@@ -421,6 +513,147 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
 
+                Commands::Dlq { command } => match command {
+                    DlqCommands::List {
+                        kind,
+                        queue,
+                        tag,
+                        before_id,
+                        before_dlq_at,
+                        limit,
+                    } => {
+                        let filter = awa_model::dlq::ListDlqFilter {
+                            kind,
+                            queue,
+                            tag,
+                            before_id,
+                            before_dlq_at,
+                            limit: Some(limit),
+                        };
+                        let rows = awa_model::dlq::list_dlq(&pool, &filter).await?;
+                        if rows.is_empty() {
+                            println!("DLQ is empty (no matching rows).");
+                        } else {
+                            println!(
+                                "{:<8} {:<25} {:<10} {:<30} {:<25}",
+                                "ID", "KIND", "QUEUE", "REASON", "DLQ_AT"
+                            );
+                            for row in &rows {
+                                // Truncate by characters, not bytes: byte
+                                // slicing mid-codepoint panics on Unicode
+                                // reasons (e.g. an operator typing a
+                                // non-ASCII note).
+                                let char_count = row.reason.chars().count();
+                                let reason = if char_count > 30 {
+                                    let prefix: String = row.reason.chars().take(27).collect();
+                                    format!("{prefix}...")
+                                } else {
+                                    row.reason.clone()
+                                };
+                                println!(
+                                    "{:<8} {:<25} {:<10} {:<30} {:<25}",
+                                    row.job.id, row.job.kind, row.job.queue, reason, row.dlq_at
+                                );
+                            }
+                            println!("\n{} rows.", rows.len());
+                            if let Some(last) = rows.last() {
+                                println!(
+                                    "Next page: --before-id {} --before-dlq-at {}",
+                                    last.job.id, last.dlq_at
+                                );
+                            }
+                        }
+                    }
+                    DlqCommands::Depth { queue } => {
+                        if let Some(queue_name) = queue {
+                            let depth = awa_model::dlq::dlq_depth(&pool, Some(&queue_name)).await?;
+                            println!("{queue_name}: {depth}");
+                        } else {
+                            let total = awa_model::dlq::dlq_depth(&pool, None).await?;
+                            let by_queue = awa_model::dlq::dlq_depth_by_queue(&pool).await?;
+                            println!("Total: {total}");
+                            for (q, count) in &by_queue {
+                                println!("  {q}: {count}");
+                            }
+                        }
+                    }
+                    DlqCommands::Retry { id } => {
+                        let opts = awa_model::dlq::RetryFromDlqOpts::default();
+                        match awa_model::dlq::retry_from_dlq(&pool, id, &opts).await? {
+                            Some(job) => {
+                                awa_worker::AwaMetrics::from_global()
+                                    .record_dlq_retried(Some(&job.queue), 1);
+                                println!("Retried DLQ job {id} → job state {}", job.state);
+                            }
+                            None => println!("No DLQ row with id {id}"),
+                        }
+                    }
+                    DlqCommands::RetryBulk {
+                        kind,
+                        queue,
+                        tag,
+                        all,
+                    } => {
+                        let filter = awa_model::dlq::ListDlqFilter {
+                            kind,
+                            queue: queue.clone(),
+                            tag,
+                            ..Default::default()
+                        };
+                        let count =
+                            awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
+                        if count > 0 {
+                            awa_worker::AwaMetrics::from_global()
+                                .record_dlq_retried(queue.as_deref(), count);
+                        }
+                        println!("Retried {count} DLQ rows.");
+                    }
+                    DlqCommands::Move {
+                        kind,
+                        queue,
+                        reason,
+                        all,
+                    } => {
+                        let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                            &pool,
+                            kind.as_deref(),
+                            queue.as_deref(),
+                            &reason,
+                            all,
+                        )
+                        .await?;
+                        // Emit the same `awa.job.dlq_moved` counter the
+                        // executor uses for automatic routing, so dashboards
+                        // and alerting see admin bulk moves too.
+                        awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                            kind.as_deref(),
+                            queue.as_deref(),
+                            &reason,
+                            count,
+                        );
+                        println!("Moved {count} failed jobs into the DLQ.");
+                    }
+                    DlqCommands::Purge {
+                        kind,
+                        queue,
+                        tag,
+                        all,
+                    } => {
+                        let filter = awa_model::dlq::ListDlqFilter {
+                            kind,
+                            queue: queue.clone(),
+                            tag,
+                            ..Default::default()
+                        };
+                        let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
+                        if count > 0 {
+                            awa_worker::AwaMetrics::from_global()
+                                .record_dlq_purged(queue.as_deref(), count);
+                        }
+                        println!("Purged {count} DLQ rows.");
+                    }
+                },
+
                 Commands::Cron { command } => match command {
                     CronCommands::List => {
                         let schedules = awa_model::cron::list_cron_jobs(&pool).await?;
@@ -456,16 +689,64 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }
                     StorageCommands::Prepare { engine, details } => {
+                        // Auto-fill `details.schema` for queue-storage when the
+                        // operator didn't pass --details. Without this, v011's
+                        // SQL fallback would resolve to the historical
+                        // `awa_exp` default, mismatching the runtime's
+                        // configured schema (`awa` in 0.6) and breaking
+                        // `enter-mixed-transition`. Operators who pass
+                        // --details with their own schema name override.
                         let details = match details {
                             Some(raw) => serde_json::from_str(&raw)?,
+                            None if engine == "queue_storage" => serde_json::json!({
+                                "schema": awa_model::QueueStorageConfig::default().schema,
+                            }),
                             None => serde_json::json!({}),
                         };
                         awa_model::storage::prepare(&pool, &engine, details).await?;
                         let report = awa_model::storage::status_report(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }
+                    StorageCommands::PrepareQueueStorageSchema {
+                        schema,
+                        queue_slot_count,
+                        lease_slot_count,
+                        reset,
+                    } => {
+                        let store = awa_model::QueueStorage::new(awa_model::QueueStorageConfig {
+                            schema: schema.clone(),
+                            queue_slot_count: queue_slot_count as usize,
+                            lease_slot_count: lease_slot_count as usize,
+                            ..Default::default()
+                        })?;
+                        if reset {
+                            sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+                                .execute(&pool)
+                                .await?;
+                        }
+                        store.prepare_schema(&pool).await?;
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "schema": schema,
+                                "queue_slot_count": queue_slot_count,
+                                "lease_slot_count": lease_slot_count,
+                                "routing_changed": false,
+                            }))?
+                        );
+                    }
                     StorageCommands::Abort => {
                         awa_model::storage::abort(&pool).await?;
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    }
+                    StorageCommands::EnterMixedTransition => {
+                        awa_model::storage::enter_mixed_transition(&pool).await?;
+                        let report = awa_model::storage::status_report(&pool).await?;
+                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    }
+                    StorageCommands::Finalize => {
+                        awa_model::storage::finalize(&pool).await?;
                         let report = awa_model::storage::status_report(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }

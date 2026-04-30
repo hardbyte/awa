@@ -389,13 +389,13 @@
       "collapsed": true,
       "id": 500,
       "type": "row",
-      "title": "Descriptor catalogs · full tables live in awa-ui",
+      "title": "Descriptor catalogs (summary; full tables in awa-ui)",
       "gridPos": { "h": 1, "w": 24, "x": 0, "y": 15 },
       "panels": [
         {
           "id": 501,
           "type": "table",
-          "title": "Queue Descriptor Catalog",
+          "title": "Declared queues · joins to runtime metrics via awa_queue_info",
           "description": "awa_queue_info is always 1; it's a label-join target. Full queue table (with pause/drain actions) lives at /queues in awa-ui.",
           "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
           "fieldConfig": {
@@ -421,7 +421,7 @@
         {
           "id": 502,
           "type": "table",
-          "title": "Job Kind Descriptor Catalog",
+          "title": "Declared job kinds · joins to runtime metrics via awa_job_kind_info",
           "description": "awa_job_kind_info is always 1; it's a label-join target for per-kind panels. Full kind table with per-kind metadata lives at /kinds in awa-ui.",
           "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
           "fieldConfig": {
@@ -445,6 +445,324 @@
           "datasource": { "uid": "${DS_PROMETHEUS}" }
         }
       ]
+    },
+    {
+      "collapsed": true,
+      "id": 600,
+      "type": "row",
+      "title": "Storage transition",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 24 },
+      "panels": [
+        {
+          "id": 601,
+          "type": "table",
+          "title": "Current storage transition state",
+          "description": "One-hot state/engine gauge exported by queue-storage-capable runtimes. Use this to distinguish steady-state canonical operation from prepared or mixed-transition rollout windows.",
+          "gridPos": { "h": 7, "w": 10, "x": 0, "y": 25 },
+          "fieldConfig": {
+            "defaults": { "custom": { "align": "left" } },
+            "overrides": [
+              { "matcher": { "id": "byName", "options": "awa_storage_state" }, "properties": [{ "id": "displayName", "value": "state" }] },
+              { "matcher": { "id": "byName", "options": "awa_storage_current_engine" }, "properties": [{ "id": "displayName", "value": "current engine" }] },
+              { "matcher": { "id": "byName", "options": "awa_storage_active_engine" }, "properties": [{ "id": "displayName", "value": "active engine" }] },
+              { "matcher": { "id": "byName", "options": "awa_storage_prepared_engine" }, "properties": [{ "id": "displayName", "value": "prepared engine" }] },
+              { "matcher": { "id": "byName", "options": "Value" }, "properties": [{ "id": "custom.hidden", "value": true }] }
+            ]
+          },
+          "transformations": [
+            { "id": "labelsToFields", "options": { "mode": "columns" } },
+            { "id": "organize", "options": { "excludeByName": { "Time": true, "__name__": true, "job": true, "instance": true, "service_name": true }, "indexByName": {} } }
+          ],
+          "targets": [
+            { "expr": "awa_storage_state", "instant": true, "format": "table", "legendFormat": "" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 602,
+          "type": "stat",
+          "title": "Canonical live backlog",
+          "description": "Jobs still live in canonical tables. Must reach zero before finalize is safe.",
+          "gridPos": { "h": 7, "w": 4, "x": 10, "y": 25 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "green", "value": null },
+                { "color": "orange", "value": 1 }
+              ]}
+            }
+          },
+          "targets": [
+            { "expr": "max(awa_storage_canonical_live_backlog)", "legendFormat": "backlog" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 603,
+          "type": "stat",
+          "title": "Enter mixed transition",
+          "description": "1 means the fleet is ready to flip routing into queue storage. 0 means a blocker remains.",
+          "gridPos": { "h": 7, "w": 5, "x": 14, "y": 25 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Blocked" }, "1": { "text": "Ready" } } }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null },
+                { "color": "green", "value": 1 }
+              ]}
+            }
+          },
+          "targets": [
+            { "expr": "max(awa_storage_transition_ready{awa_storage_action=\"enter_mixed_transition\"})", "legendFormat": "enter-mixed-transition" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 604,
+          "type": "stat",
+          "title": "Finalize",
+          "description": "1 means canonical backlog and runtime-capability gates are clear for finalization.",
+          "gridPos": { "h": 7, "w": 5, "x": 19, "y": 25 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "none",
+              "mappings": [
+                { "type": "value", "options": { "0": { "text": "Blocked" }, "1": { "text": "Ready" } } }
+              ],
+              "thresholds": { "mode": "absolute", "steps": [
+                { "color": "red", "value": null },
+                { "color": "green", "value": 1 }
+              ]}
+            }
+          },
+          "targets": [
+            { "expr": "max(awa_storage_transition_ready{awa_storage_action=\"finalize\"})", "legendFormat": "finalize" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        },
+        {
+          "id": 605,
+          "type": "timeseries",
+          "title": "Live runtime capability counts",
+          "description": "How many live runtimes currently report each storage capability. During mixed rollout you should see queue_storage targets before the routing flip, then canonical_drain_only fall to zero before finalize.",
+          "gridPos": { "h": 8, "w": 24, "x": 0, "y": 32 },
+          "fieldConfig": {
+            "defaults": {
+              "unit": "short",
+              "custom": { "drawStyle": "line", "lineWidth": 2, "fillOpacity": 15 }
+            }
+          },
+          "targets": [
+            { "expr": "awa_storage_live_runtime_capability", "legendFormat": "{{awa_storage_capability}}" }
+          ],
+          "datasource": { "uid": "${DS_PROMETHEUS}" }
+        }
+      ]
+    }
+  ,
+    {
+      "id": 700,
+      "type": "row",
+      "title": "Ring rotation & prune (queue-storage)",
+      "collapsed": false,
+      "gridPos": {
+        "x": 0,
+        "y": 41,
+        "w": 24,
+        "h": 1
+      },
+      "panels": [
+        {
+          "id": 701,
+          "type": "timeseries",
+          "title": "Rotation rate by ring + outcome",
+          "description": "Ring rotation attempts/sec, split by ring (queue/lease/claim) and outcome. Healthy rings show non-zero `rotated` on a regular cadence; pinned rings dominate `skipped_busy`.",
+          "gridPos": {
+            "x": 0,
+            "y": 42,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring, awa_ring_outcome) (rate(awa_maintenance_rotate_attempts_total[1m]))",
+              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_outcome}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 702,
+          "type": "timeseries",
+          "title": "Rotation skip blockers (queue ring)",
+          "description": "When queue rotation is SkippedBusy, which side held it: ready_entries rows or done_entries rows on the next slot? `queue.ready_rows` dominating = producer faster than consumer (real backlog). `queue.done_rows` dominating = completion truncate falling behind.",
+          "gridPos": {
+            "x": 12,
+            "y": 42,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring_blocker) (rate(awa_maintenance_rotate_attempts_total{awa_ring=\"queue\", awa_ring_outcome=\"skipped_busy\"}[1m]))",
+              "legendFormat": "{{awa_ring_blocker}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 703,
+          "type": "timeseries",
+          "title": "Rotation skip magnitudes p95",
+          "description": "p95 row count seen at the blocker side when rotation is SkippedBusy. Distinguishes 'pinned by handful of stragglers' (transient race) from 'pinned by backlog mountain' (real saturation).",
+          "gridPos": {
+            "x": 0,
+            "y": 50,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "short"
+            }
+          },
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by(le, awa_ring, awa_ring_blocker) (rate(awa_maintenance_rotate_skipped_rows_bucket[5m])))",
+              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_blocker}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 704,
+          "type": "timeseries",
+          "title": "Prune rate by ring + outcome",
+          "description": "Ring prune attempts/sec by outcome. `pruned` advancing = ring reclaiming partitions. `skipped_active` rising = target slot still has live state. `blocked` = lock contention (held-tx, autovacuum).",
+          "gridPos": {
+            "x": 12,
+            "y": 50,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring, awa_ring_outcome) (rate(awa_maintenance_prune_attempts_total[1m]))",
+              "legendFormat": "{{awa_ring}} \u00b7 {{awa_ring_outcome}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 705,
+          "type": "timeseries",
+          "title": "Prune skip reasons (all rings)",
+          "description": "When prune returns SkippedActive, which gate fired? `queue.active_leases` = leases on prior generation. `queue.pending_ready` = ready rows without matching done. `claim.open` = open receipt-plane claims. `lease.current`/`claim.current` = rotator race (benign if rare).",
+          "gridPos": {
+            "x": 0,
+            "y": 58,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "ops"
+            }
+          },
+          "targets": [
+            {
+              "expr": "sum by(awa_ring_reason) (rate(awa_maintenance_prune_attempts_total{awa_ring_outcome=\"skipped_active\"}[1m]))",
+              "legendFormat": "{{awa_ring_reason}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        },
+        {
+          "id": 706,
+          "type": "timeseries",
+          "title": "Rotations per minute (generation derivative)",
+          "description": "Rate of ring generation advance. Headline 'is rotation working' signal \u2014 flat at zero with non-zero `skipped_busy` traffic above means the ring is pinned.",
+          "gridPos": {
+            "x": 12,
+            "y": 58,
+            "w": 12,
+            "h": 8
+          },
+          "fieldConfig": {
+            "defaults": {
+              "custom": {
+                "drawStyle": "line",
+                "lineWidth": 2,
+                "fillOpacity": 10
+              },
+              "unit": "opm"
+            }
+          },
+          "targets": [
+            {
+              "expr": "60 * deriv(awa_ring_generation[1m])",
+              "legendFormat": "{{awa_ring}}"
+            }
+          ],
+          "datasource": {
+            "uid": "${DS_PROMETHEUS}"
+          }
+        }
+      ]
     }
   ],
   "schemaVersion": 39,
@@ -454,6 +772,6 @@
   "timezone": "",
   "title": "Awa Job Queue",
   "uid": "awa-job-queue",
-  "version": 3,
+  "version": 4,
   "refresh": "30s"
 }

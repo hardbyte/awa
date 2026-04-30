@@ -30,6 +30,10 @@ async fn setup() -> PgPool {
     migrations::run(&pool)
         .await
         .expect("Failed to run migrations");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .expect("Failed to reset active runtime backend");
     pool
 }
 
@@ -50,6 +54,20 @@ async fn clean_queue(pool: &PgPool, queue: &str) {
         .execute(pool)
         .await
         .expect("Failed to clean queue");
+}
+
+async fn wait_for_leader(client: &Client, timeout: std::time::Duration) {
+    let start = std::time::Instant::now();
+    loop {
+        if client.health_check().await.leader {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "Timed out waiting for periodic test client to become leader"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 // -- Job types for testing --
@@ -354,12 +372,14 @@ async fn test_end_to_end_periodic_job_enqueued() {
         .unwrap();
 
     client.start().await.unwrap();
+    wait_for_leader(&client, std::time::Duration::from_secs(15)).await;
 
     // Poll until the cron evaluator fires, or timeout.
-    // Timing budget: leader election (1s retries) + cron eval (1s tick) +
-    // wait for next minute boundary (up to ~60s) = ~62s worst case.
+    // Timing budget: leader acquisition can be delayed by a previous test
+    // binary briefly holding the advisory lock, then cron eval ticks at 1s and
+    // waits for the next minute boundary (up to ~60s).
     let start = std::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(90);
+    let timeout = std::time::Duration::from_secs(120);
     let jobs = loop {
         let found: Vec<awa::JobRow> =
             sqlx::query_as("SELECT * FROM awa.jobs WHERE queue = $1 AND kind = 'daily_report'")

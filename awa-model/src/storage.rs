@@ -68,6 +68,26 @@ where
         .map_err(AwaError::from)
 }
 
+pub async fn enter_mixed_transition<'e, E>(executor: E) -> Result<StorageStatus, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as::<_, StorageStatus>("SELECT * FROM awa.storage_enter_mixed_transition()")
+        .fetch_one(executor)
+        .await
+        .map_err(AwaError::from)
+}
+
+pub async fn finalize<'e, E>(executor: E) -> Result<StorageStatus, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    sqlx::query_as::<_, StorageStatus>("SELECT * FROM awa.storage_finalize()")
+        .fetch_one(executor)
+        .await
+        .map_err(AwaError::from)
+}
+
 fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
     let queue_storage_involved = status.prepared_engine.as_deref() == Some("queue_storage")
         || status.active_engine == "queue_storage";
@@ -79,15 +99,12 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
             .details
             .get("schema")
             .and_then(serde_json::Value::as_str)
-            .unwrap_or("awa_exp")
+            .unwrap_or("awa")
             .to_string(),
     )
 }
 
-async fn prepared_queue_storage_schema_ready(
-    pool: &PgPool,
-    schema: &str,
-) -> Result<bool, AwaError> {
+pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
     sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
@@ -128,23 +145,26 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
     let canonical_live_backlog = canonical_live_backlog(pool).await?;
     let prepared_queue_storage_schema = queue_storage_schema_from_status(&status);
     let prepared_schema_ready = match prepared_queue_storage_schema.as_deref() {
-        Some(schema) => prepared_queue_storage_schema_ready(pool, schema).await?,
+        Some(schema) => queue_storage_schema_ready(pool, schema).await?,
         None => false,
     };
 
     let instances = admin::list_runtime_instances(pool).await?;
     let mut live_runtime_capability_counts = BTreeMap::new();
+    let mut live_queue_storage_targets = 0usize;
     for instance in instances.into_iter().filter(|instance| !instance.stale) {
         *live_runtime_capability_counts
             .entry(instance.storage_capability.as_str().to_string())
             .or_insert(0) += 1;
+        if instance.transition_role == admin::TransitionRole::QueueStorageTarget
+            && instance.storage_capability == admin::StorageCapability::QueueStorage
+        {
+            live_queue_storage_targets += 1;
+        }
     }
 
     let live_canonical = *live_runtime_capability_counts
         .get("canonical")
-        .unwrap_or(&0);
-    let live_queue_storage = *live_runtime_capability_counts
-        .get("queue_storage")
         .unwrap_or(&0);
     let live_drain = *live_runtime_capability_counts
         .get("canonical_drain_only")
@@ -170,9 +190,12 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
             "{live_canonical} canonical-only runtime(s) are still live"
         ));
     }
-    if live_queue_storage == 0 {
-        enter_mixed_transition_blockers
-            .push("no live queue-storage-capable runtimes are reporting".to_string());
+    if live_queue_storage_targets == 0 {
+        enter_mixed_transition_blockers.push(
+            "no live runtimes with transition_role=queue_storage_target are reporting; \
+             auto-role runtimes downgrade to drain-only after the routing flip"
+                .to_string(),
+        );
     }
 
     let mut finalize_blockers = Vec::new();

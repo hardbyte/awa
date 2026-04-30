@@ -1,5 +1,7 @@
+use crate::dlq::DlqMetadata;
 use crate::error::AwaError;
 use crate::job::{JobRow, JobState};
+use crate::queue_storage::QueueStorage;
 use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
@@ -34,6 +36,8 @@ pub struct JobDump {
     pub job: JobRow,
     pub summary: JobDumpSummary,
     pub timeline: Vec<JobTimelineEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dlq: Option<DlqMetadata>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,7 +198,7 @@ fn build_job_timeline(job: &JobRow) -> Vec<JobTimelineEvent> {
     events
 }
 
-fn build_job_dump(job: JobRow) -> JobDump {
+fn build_job_dump(job: JobRow, dlq: Option<DlqMetadata>) -> JobDump {
     let latest_error = job
         .errors
         .as_ref()
@@ -202,11 +206,12 @@ fn build_job_dump(job: JobRow) -> JobDump {
         .cloned();
     let summary = JobDumpSummary {
         original_priority: original_priority(&job),
-        can_retry: matches!(
-            job.state,
-            JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
-        ),
-        can_cancel: !job.state.is_terminal(),
+        can_retry: dlq.is_none()
+            && matches!(
+                job.state,
+                JobState::Failed | JobState::Cancelled | JobState::WaitingExternal
+            ),
+        can_cancel: dlq.is_none() && !job.state.is_terminal(),
         error_count: job.errors.as_ref().map(|errors| errors.len()).unwrap_or(0),
         latest_error,
     };
@@ -215,6 +220,7 @@ fn build_job_dump(job: JobRow) -> JobDump {
         job,
         summary,
         timeline,
+        dlq,
     }
 }
 
@@ -240,11 +246,164 @@ fn callback_dump(job: &JobRow) -> Option<CallbackDump> {
     }
 }
 
+async fn active_queue_storage(pool: &PgPool) -> Result<Option<QueueStorage>, AwaError> {
+    QueueStorage::active_schema(pool)
+        .await?
+        .map(QueueStorage::from_existing_schema)
+        .transpose()
+}
+
+fn queue_storage_current_jobs_cte(schema: &str) -> String {
+    format!(
+        r#"
+        WITH current_available AS (
+            SELECT
+                ready.job_id,
+                ready.kind,
+                ready.queue,
+                'available'::awa.job_state AS state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.ready_entries AS ready
+            JOIN {schema}.queue_claim_heads AS claims
+              ON claims.queue = ready.queue
+             AND claims.priority = ready.priority
+            WHERE ready.lane_seq >= claims.claim_seq
+        ),
+        current_jobs AS (
+            SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
+            FROM current_available
+            UNION ALL
+            SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
+            FROM {schema}.deferred_jobs
+            UNION ALL
+            SELECT
+                leases.job_id,
+                ready.kind,
+                leases.queue,
+                leases.state,
+                ready.created_at,
+                ready.run_at,
+                NULL::timestamptz AS finalized_at
+            FROM {schema}.leases AS leases
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = leases.ready_slot
+             AND ready.ready_generation = leases.ready_generation
+             AND ready.queue = leases.queue
+             AND ready.priority = leases.priority
+             AND ready.lane_seq = leases.lane_seq
+            UNION ALL
+            SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
+            FROM {schema}.done_entries
+            UNION ALL
+            SELECT
+                job_id,
+                kind,
+                queue,
+                'failed'::awa.job_state AS state,
+                created_at,
+                run_at,
+                finalized_at
+            FROM {schema}.dlq_entries
+        )
+        "#
+    )
+}
+
+async fn list_queue_storage_jobs(
+    store: &QueueStorage,
+    pool: &PgPool,
+    filter: &ListJobsFilter,
+) -> Result<Vec<JobRow>, AwaError> {
+    let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
+    let candidate_limit = if filter.tag.is_some() {
+        limit.saturating_mul(10).min(5000)
+    } else {
+        limit.saturating_mul(3).min(2000)
+    };
+
+    let sql = format!(
+        "{} \
+         SELECT job_id \
+         FROM current_jobs \
+         WHERE ($1::awa.job_state IS NULL OR state = $1) \
+           AND ($2::text IS NULL OR kind = $2) \
+           AND ($3::text IS NULL OR queue = $3) \
+           AND ($4::bigint IS NULL OR job_id < $4) \
+         ORDER BY job_id DESC \
+         LIMIT $5",
+        queue_storage_current_jobs_cte(store.schema())
+    );
+
+    let mut jobs = Vec::new();
+    let mut cursor = filter.before_id;
+
+    loop {
+        let ids: Vec<i64> = sqlx::query_scalar(&sql)
+            .bind(filter.state)
+            .bind(&filter.kind)
+            .bind(&filter.queue)
+            .bind(cursor)
+            .bind(candidate_limit)
+            .fetch_all(pool)
+            .await?;
+        if ids.is_empty() {
+            break;
+        }
+
+        for job_id in &ids {
+            let Some(job) = store.load_job(pool, *job_id).await? else {
+                continue;
+            };
+
+            if let Some(state) = filter.state {
+                if job.state != state {
+                    continue;
+                }
+            }
+            if let Some(kind) = &filter.kind {
+                if &job.kind != kind {
+                    continue;
+                }
+            }
+            if let Some(queue) = &filter.queue {
+                if &job.queue != queue {
+                    continue;
+                }
+            }
+            if let Some(tag) = &filter.tag {
+                if !job.tags.iter().any(|job_tag| job_tag == tag) {
+                    continue;
+                }
+            }
+
+            jobs.push(job);
+            if jobs.len() as i64 >= limit {
+                break;
+            }
+        }
+
+        if jobs.len() as i64 >= limit || ids.len() < candidate_limit as usize {
+            break;
+        }
+        cursor = ids.last().copied();
+    }
+
+    jobs.sort_by_key(|job| std::cmp::Reverse(job.id));
+    Ok(jobs)
+}
+
 /// Retry a single failed, cancelled, or waiting_external job.
-pub async fn retry<'e, E>(executor: E, job_id: i64) -> Result<Option<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn retry(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .retry_job(pool, job_id)
+            .await?
+            .ok_or(AwaError::JobNotFound { id: job_id })
+            .map(Some);
+    }
+
     sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -258,18 +417,40 @@ where
         "#,
     )
     .bind(job_id)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?
     .ok_or(AwaError::JobNotFound { id: job_id })
     .map(Some)
 }
 
 /// Cancel a single non-terminal job.
-pub async fn cancel<'e, E>(executor: E, job_id: i64) -> Result<Option<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    sqlx::query_as::<_, JobRow>(
+pub async fn cancel(pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .cancel_job(pool, job_id)
+            .await?
+            .ok_or(AwaError::JobNotFound { id: job_id })
+            .map(Some);
+    }
+
+    // Cancel the row and capture its prior state. If we moved it out
+    // of `running` / `waiting_external`, NOTIFY listening workers so
+    // the handler currently executing it can learn about the
+    // cancellation and stop cleanly.
+    let mut tx = pool.begin().await?;
+
+    let prior_state: Option<JobState> =
+        sqlx::query_scalar::<_, JobState>("SELECT state FROM awa.jobs WHERE id = $1 FOR UPDATE")
+            .bind(job_id)
+            .fetch_optional(tx.as_mut())
+            .await?;
+
+    let Some(prior_state) = prior_state else {
+        tx.rollback().await.ok();
+        return Err(AwaError::JobNotFound { id: job_id });
+    };
+
+    let job: Option<JobRow> = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
         SET state = 'cancelled', finalized_at = now(),
@@ -281,10 +462,25 @@ where
         "#,
     )
     .bind(job_id)
-    .fetch_optional(executor)
-    .await?
-    .ok_or(AwaError::JobNotFound { id: job_id })
-    .map(Some)
+    .fetch_optional(tx.as_mut())
+    .await?;
+
+    let Some(job) = job else {
+        tx.rollback().await.ok();
+        return Err(AwaError::JobNotFound { id: job_id });
+    };
+
+    if matches!(prior_state, JobState::Running | JobState::WaitingExternal) {
+        let payload =
+            serde_json::json!({ "job_id": job.id, "run_lease": job.run_lease }).to_string();
+        sqlx::query("SELECT pg_notify('awa:cancel', $1)")
+            .bind(payload)
+            .execute(tx.as_mut())
+            .await?;
+    }
+
+    tx.commit().await?;
+    Ok(Some(job))
 }
 
 /// Cancel a job by its unique key components.
@@ -322,17 +518,57 @@ where
 /// index. This is acceptable for low-volume use cases. For high-volume tables,
 /// consider adding a partial index on `unique_key WHERE unique_key IS NOT NULL`
 /// or routing through `job_unique_claims` (which is already indexed).
-pub async fn cancel_by_unique_key<'e, E>(
-    executor: E,
+pub async fn cancel_by_unique_key(
+    pool: &PgPool,
     kind: &str,
     queue: Option<&str>,
     args: Option<&serde_json::Value>,
     period_bucket: Option<i64>,
-) -> Result<Option<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<Option<JobRow>, AwaError> {
     let unique_key = crate::unique::compute_unique_key(kind, queue, args, period_bucket);
+
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            r#"
+            WITH current_available AS (
+                SELECT ready.job_id, ready.unique_key
+                FROM {schema}.ready_entries AS ready
+                JOIN {schema}.queue_claim_heads AS claims
+                  ON claims.queue = ready.queue
+                 AND claims.priority = ready.priority
+                WHERE ready.lane_seq >= claims.claim_seq
+            ),
+            candidates AS (
+                SELECT job_id
+                FROM current_available
+                WHERE unique_key = $1
+                UNION ALL
+                SELECT job_id
+                FROM {schema}.deferred_jobs
+                WHERE unique_key = $1
+                UNION ALL
+                SELECT job_id
+                FROM {schema}.leases
+                WHERE unique_key = $1
+            )
+            SELECT job_id
+            FROM candidates
+            ORDER BY job_id ASC
+            LIMIT 1
+            "#,
+            schema = store.schema()
+        );
+
+        let candidate: Option<i64> = sqlx::query_scalar(&sql)
+            .bind(&unique_key)
+            .fetch_optional(pool)
+            .await?;
+
+        return match candidate {
+            Some(job_id) => cancel(pool, job_id).await,
+            None => Ok(None),
+        };
+    }
 
     // Find the oldest matching job across both physical tables. CTE selects
     // candidate IDs without row locks; blocking on concurrently-locked rows
@@ -359,17 +595,29 @@ where
         "#,
     )
     .bind(&unique_key)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     Ok(row)
 }
 
 /// Retry all failed jobs of a given kind.
-pub async fn retry_failed_by_kind<'e, E>(executor: E, kind: &str) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn retry_failed_by_kind(pool: &PgPool, kind: &str) -> Result<Vec<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            r#"
+            SELECT job_id
+            FROM {schema}.done_entries
+            WHERE kind = $1
+              AND state = 'failed'
+            ORDER BY job_id ASC
+            "#,
+            schema = store.schema()
+        );
+        let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(kind).fetch_all(pool).await?;
+        return store.retry_jobs_by_ids(pool, &ids).await;
+    }
+
     let rows = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -380,17 +628,29 @@ where
         "#,
     )
     .bind(kind)
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
 }
 
 /// Retry all failed jobs in a given queue.
-pub async fn retry_failed_by_queue<'e, E>(executor: E, queue: &str) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn retry_failed_by_queue(pool: &PgPool, queue: &str) -> Result<Vec<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            r#"
+            SELECT job_id
+            FROM {schema}.done_entries
+            WHERE queue = $1
+              AND state = 'failed'
+            ORDER BY job_id ASC
+            "#,
+            schema = store.schema()
+        );
+        let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(queue).fetch_all(pool).await?;
+        return store.retry_jobs_by_ids(pool, &ids).await;
+    }
+
     let rows = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -401,20 +661,21 @@ where
         "#,
     )
     .bind(queue)
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
 }
 
 /// Discard (delete) all failed jobs of a given kind.
-pub async fn discard_failed<'e, E>(executor: E, kind: &str) -> Result<u64, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn discard_failed(pool: &PgPool, kind: &str) -> Result<u64, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.discard_failed_by_kind(pool, kind).await;
+    }
+
     let result = sqlx::query("DELETE FROM awa.jobs WHERE kind = $1 AND state = 'failed'")
         .bind(kind)
-        .execute(executor)
+        .execute(pool)
         .await?;
 
     Ok(result.rows_affected())
@@ -458,10 +719,24 @@ where
 }
 
 /// Drain a queue: cancel all non-running, non-terminal jobs.
-pub async fn drain_queue<'e, E>(executor: E, queue: &str) -> Result<u64, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn drain_queue(pool: &PgPool, queue: &str) -> Result<u64, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            "{} \
+             SELECT job_id \
+             FROM current_jobs \
+             WHERE queue = $1 \
+               AND state IN ('available', 'scheduled', 'retryable', 'waiting_external') \
+             ORDER BY job_id ASC",
+            queue_storage_current_jobs_cte(store.schema())
+        );
+        let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(queue).fetch_all(pool).await?;
+        return store
+            .cancel_jobs_by_ids(pool, &ids)
+            .await
+            .map(|rows| rows.len() as u64);
+    }
+
     let result = sqlx::query(
         r#"
         UPDATE awa.jobs
@@ -473,7 +748,7 @@ where
         "#,
     )
     .bind(queue)
-    .execute(executor)
+    .execute(pool)
     .await?;
 
     Ok(result.rows_affected())
@@ -935,6 +1210,62 @@ impl FromStr for StorageCapability {
     }
 }
 
+/// Operator-selected execution role used during a `0.5.x → 0.6` storage
+/// transition. Persisted on `awa.runtime_instances` so the SQL gate for
+/// `enter_mixed_transition` can require a runtime that will actually
+/// execute queue-storage work after routing flips, rather than only
+/// inspecting the more permissive `storage_capability` snapshot
+/// (auto-role runtimes report `queue_storage` while in
+/// canonical/prepared but downgrade to `canonical_drain_only` post-flip).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum TransitionRole {
+    /// Default. Resolves storage at startup from `awa.storage_status()`
+    /// and follows whatever the cluster is doing. Auto runtimes started
+    /// before mixed_transition cannot satisfy the queue-storage executor
+    /// gate; they're meant to drain canonical first and then have new
+    /// auto runtimes spin up post-flip to take over queue_storage work.
+    #[default]
+    Auto,
+    /// Stay on canonical execution regardless of transition state. Used
+    /// for runtimes that should keep draining canonical even after
+    /// routing flips.
+    CanonicalDrain,
+    /// Always execute queue-storage work, including pre-flip when state
+    /// is `prepared`. At least one live runtime in this role is required
+    /// before `awa.storage_enter_mixed_transition()` will succeed.
+    QueueStorageTarget,
+}
+
+impl TransitionRole {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::CanonicalDrain => "canonical_drain",
+            Self::QueueStorageTarget => "queue_storage_target",
+        }
+    }
+}
+
+impl fmt::Display for TransitionRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for TransitionRole {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "auto" => Ok(Self::Auto),
+            "canonical_drain" => Ok(Self::CanonicalDrain),
+            "queue_storage_target" => Ok(Self::QueueStorageTarget),
+            _ => Err(value.to_string()),
+        }
+    }
+}
+
 /// Data written by a worker runtime into the observability snapshot table.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeSnapshotInput {
@@ -943,6 +1274,8 @@ pub struct RuntimeSnapshotInput {
     pub pid: i32,
     pub version: String,
     pub storage_capability: StorageCapability,
+    #[serde(default)]
+    pub transition_role: TransitionRole,
     pub started_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
     pub healthy: bool,
@@ -966,6 +1299,8 @@ pub struct RuntimeInstance {
     pub pid: i32,
     pub version: String,
     pub storage_capability: StorageCapability,
+    #[serde(default)]
+    pub transition_role: TransitionRole,
     pub started_at: DateTime<Utc>,
     pub last_seen_at: DateTime<Utc>,
     pub snapshot_interval_ms: i64,
@@ -995,12 +1330,18 @@ impl RuntimeInstance {
                     "invalid storage capability in runtime_instances: {value}"
                 ))
             })?;
+        let transition_role = TransitionRole::from_str(&row.transition_role).map_err(|value| {
+            AwaError::Validation(format!(
+                "invalid transition_role in runtime_instances: {value}"
+            ))
+        })?;
         Ok(Self {
             instance_id: row.instance_id,
             hostname: row.hostname,
             pid: row.pid,
             version: row.version,
             storage_capability,
+            transition_role,
             started_at: row.started_at,
             last_seen_at: row.last_seen_at,
             snapshot_interval_ms: row.snapshot_interval_ms,
@@ -1050,6 +1391,7 @@ struct RuntimeInstanceRow {
     pid: i32,
     version: String,
     storage_capability: String,
+    transition_role: String,
     started_at: DateTime<Utc>,
     last_seen_at: DateTime<Utc>,
     snapshot_interval_ms: i64,
@@ -1080,6 +1422,7 @@ where
             pid,
             version,
             storage_capability,
+            transition_role,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -1096,13 +1439,14 @@ where
             job_kind_descriptor_hashes
         )
         VALUES (
-            $1, $2, $3, $4, $5, $6, now(), $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18
+            $1, $2, $3, $4, $5, $6, $7, now(), $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19
         )
         ON CONFLICT (instance_id) DO UPDATE SET
             hostname = EXCLUDED.hostname,
             pid = EXCLUDED.pid,
             version = EXCLUDED.version,
             storage_capability = EXCLUDED.storage_capability,
+            transition_role = EXCLUDED.transition_role,
             started_at = EXCLUDED.started_at,
             last_seen_at = now(),
             snapshot_interval_ms = EXCLUDED.snapshot_interval_ms,
@@ -1124,6 +1468,7 @@ where
     .bind(snapshot.pid)
     .bind(&snapshot.version)
     .bind(snapshot.storage_capability.as_str())
+    .bind(snapshot.transition_role.as_str())
     .bind(snapshot.started_at)
     .bind(snapshot.snapshot_interval_ms)
     .bind(snapshot.healthy)
@@ -1207,6 +1552,7 @@ where
             pid,
             version,
             storage_capability,
+            transition_role,
             started_at,
             last_seen_at,
             snapshot_interval_ms,
@@ -1344,10 +1690,106 @@ where
 ///
 /// For exact cached counts in tests without a running maintenance
 /// leader, call `flush_dirty_admin_metadata()` first.
-pub async fn queue_overviews<'e, E>(executor: E) -> Result<Vec<QueueOverview>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn queue_overviews(pool: &PgPool) -> Result<Vec<QueueOverview>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            r#"
+            {current_jobs_cte},
+            all_queues AS (
+                SELECT queue FROM current_jobs
+                UNION
+                SELECT queue FROM awa.queue_descriptors
+                UNION
+                SELECT queue FROM awa.queue_meta
+                UNION
+                SELECT DISTINCT descriptor.key AS queue
+                FROM awa.runtime_instances runtime
+                CROSS JOIN LATERAL jsonb_each_text(runtime.queue_descriptor_hashes) AS descriptor(key, value)
+            ),
+            live_queue_descriptor_variants AS (
+                SELECT
+                    descriptor.key AS queue,
+                    count(DISTINCT descriptor.value)::bigint AS descriptor_variant_count
+                FROM awa.runtime_instances runtime
+                CROSS JOIN LATERAL jsonb_each_text(runtime.queue_descriptor_hashes) AS descriptor(key, value)
+                WHERE runtime.last_seen_at + make_interval(
+                    secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+                ) >= now()
+                GROUP BY descriptor.key
+            ),
+            queue_counts AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
+                    count(*) FILTER (WHERE state = 'available')::bigint AS available,
+                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable,
+                    count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                    count(*) FILTER (WHERE state = 'failed')::bigint AS failed,
+                    count(*) FILTER (WHERE state = 'waiting_external')::bigint AS waiting_external
+                FROM current_jobs
+                GROUP BY queue
+            ),
+            available_lag AS (
+                SELECT
+                    queue,
+                    EXTRACT(EPOCH FROM (clock_timestamp() - min(run_at)))::float8 AS lag_seconds
+                FROM current_jobs
+                WHERE state = 'available'
+                GROUP BY queue
+            ),
+            completed_recent AS (
+                SELECT
+                    queue,
+                    count(*)::bigint AS completed_last_hour
+                FROM current_jobs
+                WHERE state = 'completed'
+                  AND finalized_at > clock_timestamp() - interval '1 hour'
+                GROUP BY queue
+            )
+            SELECT
+                q.queue,
+                qd.display_name,
+                qd.description,
+                qd.owner,
+                qd.docs_url,
+                COALESCE(qd.tags, ARRAY[]::text[]) AS tags,
+                COALESCE(qd.extra, '{{}}'::jsonb) AS extra,
+                qd.last_seen_at AS descriptor_last_seen_at,
+                CASE
+                    WHEN qd.last_seen_at IS NULL THEN FALSE
+                    ELSE qd.last_seen_at + make_interval(
+                        secs => GREATEST(((COALESCE(qd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
+                    ) < now()
+                END AS descriptor_stale,
+                COALESCE(qdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
+                COALESCE(qc.scheduled + qc.available + qc.running + qc.retryable + qc.waiting_external, 0) AS total_queued,
+                COALESCE(qc.scheduled, 0) AS scheduled,
+                COALESCE(qc.available, 0) AS available,
+                COALESCE(qc.retryable, 0) AS retryable,
+                COALESCE(qc.running, 0) AS running,
+                COALESCE(qc.failed, 0) AS failed,
+                COALESCE(qc.waiting_external, 0) AS waiting_external,
+                COALESCE(cr.completed_last_hour, 0) AS completed_last_hour,
+                al.lag_seconds,
+                COALESCE(qm.paused, FALSE) AS paused
+            FROM all_queues q
+            LEFT JOIN queue_counts qc ON qc.queue = q.queue
+            LEFT JOIN awa.queue_descriptors qd ON qd.queue = q.queue
+            LEFT JOIN live_queue_descriptor_variants qdv ON qdv.queue = q.queue
+            LEFT JOIN available_lag al ON al.queue = q.queue
+            LEFT JOIN completed_recent cr ON cr.queue = q.queue
+            LEFT JOIN awa.queue_meta qm ON qm.queue = q.queue
+            ORDER BY q.queue
+            "#,
+            current_jobs_cte = queue_storage_current_jobs_cte(store.schema())
+        );
+
+        let rows = sqlx::query_as::<_, QueueOverview>(&sql)
+            .fetch_all(pool)
+            .await?;
+        return Ok(rows);
+    }
+
     let rows = sqlx::query_as::<_, QueueOverview>(
         r#"
         WITH all_queues AS (
@@ -1431,21 +1873,15 @@ where
         ORDER BY q.queue
         "#,
     )
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
 }
 
 /// Get one queue overview by name.
-pub async fn queue_overview<'e, E>(
-    executor: E,
-    queue: &str,
-) -> Result<Option<QueueOverview>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let rows = queue_overviews(executor).await?;
+pub async fn queue_overview(pool: &PgPool, queue: &str) -> Result<Option<QueueOverview>, AwaError> {
+    let rows = queue_overviews(pool).await?;
     Ok(rows.into_iter().find(|row| row.queue == queue))
 }
 
@@ -1581,10 +2017,11 @@ pub struct ListJobsFilter {
 }
 
 /// List jobs matching the given filter.
-pub async fn list_jobs<'e, E>(executor: E, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn list_jobs(pool: &PgPool, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return list_queue_storage_jobs(&store, pool, filter).await;
+    }
+
     let limit = filter.limit.unwrap_or(100);
 
     let rows = sqlx::query_as::<_, JobRow>(
@@ -1605,32 +2042,48 @@ where
     .bind(&filter.tag)
     .bind(filter.before_id)
     .bind(limit)
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
 }
 
 /// Get a single job by ID.
-pub async fn get_job<'e, E>(executor: E, job_id: i64) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn get_job(pool: &PgPool, job_id: i64) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let row = store.load_job(pool, job_id).await?;
+        return row.ok_or(AwaError::JobNotFound { id: job_id });
+    }
+
     let row = sqlx::query_as::<_, JobRow>("SELECT * FROM awa.jobs WHERE id = $1")
         .bind(job_id)
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?;
 
     row.ok_or(AwaError::JobNotFound { id: job_id })
 }
 
+/// Fetch a job plus optional DLQ metadata for admin surfaces that need to
+/// distinguish a DLQ row from a normal live or terminal row.
+pub async fn get_job_with_source(
+    pool: &PgPool,
+    job_id: i64,
+) -> Result<(JobRow, Option<DlqMetadata>), AwaError> {
+    let job = get_job(pool, job_id).await?;
+    let dlq = if active_queue_storage(pool).await?.is_some() {
+        crate::dlq::get_dlq_job(pool, job_id)
+            .await?
+            .map(|row| row.metadata())
+    } else {
+        None
+    };
+    Ok((job, dlq))
+}
+
 /// Build a read-only inspection snapshot for one job.
-pub async fn dump_job<'e, E>(executor: E, job_id: i64) -> Result<JobDump, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let job = get_job(executor, job_id).await?;
-    Ok(build_job_dump(job))
+pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
+    let (job, dlq) = get_job_with_source(pool, job_id).await?;
+    Ok(build_job_dump(job, dlq))
 }
 
 /// Build a read-only inspection snapshot for one attempt.
@@ -1638,15 +2091,12 @@ where
 /// Awa does not currently persist a standalone runs table. The current attempt
 /// is inspected from the live job row. Historical attempts are reconstructed
 /// from the structured `errors[]` history.
-pub async fn dump_run<'e, E>(
-    executor: E,
+pub async fn dump_run(
+    pool: &PgPool,
     job_id: i64,
     attempt: Option<i16>,
-) -> Result<RunDump, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let job = get_job(executor, job_id).await?;
+) -> Result<RunDump, AwaError> {
+    let job = get_job(pool, job_id).await?;
     let selected_attempt = attempt.unwrap_or(job.attempt);
 
     if selected_attempt < 0 {
@@ -1769,10 +2219,54 @@ where
 /// Count jobs grouped by state.
 ///
 /// Reads from the `queue_state_counts` cache table.
-pub async fn state_counts<'e, E>(executor: E) -> Result<HashMap<JobState, i64>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            r#"
+            SELECT
+                COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'scheduled'), 0) AS scheduled,
+                COALESCE((
+                    SELECT count(*)::bigint
+                    FROM {schema}.ready_entries AS ready
+                    JOIN {schema}.queue_claim_heads AS claims
+                      ON claims.queue = ready.queue
+                     AND claims.priority = ready.priority
+                    WHERE ready.lane_seq >= claims.claim_seq
+                ), 0) AS available,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'), 0) AS completed,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE state = 'retryable'), 0) AS retryable,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'failed'), 0)
+                  + COALESCE((SELECT count(*)::bigint FROM {schema}.dlq_entries), 0) AS failed,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'cancelled'), 0) AS cancelled,
+                COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'waiting_external'), 0) AS waiting_external
+            "#,
+            schema = store.schema()
+        );
+
+        let (
+            scheduled,
+            available,
+            running,
+            completed,
+            retryable,
+            failed,
+            cancelled,
+            waiting_external,
+        ): (i64, i64, i64, i64, i64, i64, i64, i64) = sqlx::query_as(&sql).fetch_one(pool).await?;
+
+        return Ok(HashMap::from([
+            (JobState::Scheduled, scheduled),
+            (JobState::Available, available),
+            (JobState::Running, running),
+            (JobState::Completed, completed),
+            (JobState::Retryable, retryable),
+            (JobState::Failed, failed),
+            (JobState::Cancelled, cancelled),
+            (JobState::WaitingExternal, waiting_external),
+        ]));
+    }
+
     // Single scan of queue_state_counts — sums all columns in one pass
     // then unpivots via VALUES join.
     let rows = sqlx::query_as::<_, (JobState, i64)>(
@@ -1801,17 +2295,90 @@ where
         ) AS v(state, total)
         "#,
     )
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows.into_iter().collect())
 }
 
 /// Get job-kind overviews for all known kinds.
-pub async fn job_kind_overviews<'e, E>(executor: E) -> Result<Vec<JobKindOverview>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn job_kind_overviews(pool: &PgPool) -> Result<Vec<JobKindOverview>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            r#"
+            {current_jobs_cte},
+            all_kinds AS (
+                SELECT kind FROM current_jobs
+                UNION
+                SELECT kind FROM awa.job_kind_descriptors
+                UNION
+                SELECT DISTINCT descriptor.key AS kind
+                FROM awa.runtime_instances runtime
+                CROSS JOIN LATERAL jsonb_each_text(runtime.job_kind_descriptor_hashes) AS descriptor(key, value)
+            ),
+            live_kind_descriptor_variants AS (
+                SELECT
+                    descriptor.key AS kind,
+                    count(DISTINCT descriptor.value)::bigint AS descriptor_variant_count
+                FROM awa.runtime_instances runtime
+                CROSS JOIN LATERAL jsonb_each_text(runtime.job_kind_descriptor_hashes) AS descriptor(key, value)
+                WHERE runtime.last_seen_at + make_interval(
+                    secs => GREATEST(((GREATEST(runtime.snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+                ) >= now()
+                GROUP BY descriptor.key
+            ),
+            kind_counts AS (
+                SELECT
+                    kind,
+                    count(*)::bigint AS job_count,
+                    count(DISTINCT queue)::bigint AS queue_count
+                FROM current_jobs
+                GROUP BY kind
+            ),
+            completed_recent AS (
+                SELECT
+                    kind,
+                    count(*)::bigint AS completed_last_hour
+                FROM current_jobs
+                WHERE state = 'completed'
+                  AND finalized_at > clock_timestamp() - interval '1 hour'
+                GROUP BY kind
+            )
+            SELECT
+                k.kind,
+                kd.display_name,
+                kd.description,
+                kd.owner,
+                kd.docs_url,
+                COALESCE(kd.tags, ARRAY[]::text[]) AS tags,
+                COALESCE(kd.extra, '{{}}'::jsonb) AS extra,
+                kd.last_seen_at AS descriptor_last_seen_at,
+                CASE
+                    WHEN kd.last_seen_at IS NULL THEN FALSE
+                    ELSE kd.last_seen_at + make_interval(
+                        secs => GREATEST(((COALESCE(kd.sync_interval_ms, 10000) / 1000) * 3)::int, 30)
+                    ) < now()
+                END AS descriptor_stale,
+                COALESCE(kdv.descriptor_variant_count, 0) > 1 AS descriptor_mismatch,
+                COALESCE(kc.job_count, 0) AS job_count,
+                COALESCE(kc.queue_count, 0) AS queue_count,
+                COALESCE(cr.completed_last_hour, 0) AS completed_last_hour
+            FROM all_kinds k
+            LEFT JOIN kind_counts kc ON kc.kind = k.kind
+            LEFT JOIN awa.job_kind_descriptors kd ON kd.kind = k.kind
+            LEFT JOIN live_kind_descriptor_variants kdv ON kdv.kind = k.kind
+            LEFT JOIN completed_recent cr ON cr.kind = k.kind
+            ORDER BY k.kind
+            "#,
+            current_jobs_cte = queue_storage_current_jobs_cte(store.schema())
+        );
+
+        let rows = sqlx::query_as::<_, JobKindOverview>(&sql)
+            .fetch_all(pool)
+            .await?;
+        return Ok(rows);
+    }
+
     let rows = sqlx::query_as::<_, JobKindOverview>(
         r#"
         WITH all_kinds AS (
@@ -1891,34 +2458,42 @@ where
         ORDER BY k.kind
         "#,
     )
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
 }
 
-pub async fn job_kind_overview<'e, E>(
-    executor: E,
+pub async fn job_kind_overview(
+    pool: &PgPool,
     kind: &str,
-) -> Result<Option<JobKindOverview>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    let rows = job_kind_overviews(executor).await?;
+) -> Result<Option<JobKindOverview>, AwaError> {
+    let rows = job_kind_overviews(pool).await?;
     Ok(rows.into_iter().find(|row| row.kind == kind))
 }
 
 /// Return all distinct job kinds.
 ///
 /// Reads from the `job_kind_catalog` cache table.
-pub async fn distinct_kinds<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn distinct_kinds(pool: &PgPool) -> Result<Vec<String>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            "{} \
+             SELECT DISTINCT kind \
+             FROM current_jobs \
+             ORDER BY kind",
+            queue_storage_current_jobs_cte(store.schema())
+        );
+        return sqlx::query_scalar(&sql)
+            .fetch_all(pool)
+            .await
+            .map_err(AwaError::from);
+    }
+
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT kind FROM awa.job_kind_catalog WHERE ref_count > 0 ORDER BY kind",
     )
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
@@ -1927,14 +2502,25 @@ where
 /// Return all distinct queue names.
 ///
 /// Reads from the `job_queue_catalog` cache table.
-pub async fn distinct_queues<'e, E>(executor: E) -> Result<Vec<String>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn distinct_queues(pool: &PgPool) -> Result<Vec<String>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            "{} \
+             SELECT DISTINCT queue \
+             FROM current_jobs \
+             ORDER BY queue",
+            queue_storage_current_jobs_cte(store.schema())
+        );
+        return sqlx::query_scalar(&sql)
+            .fetch_all(pool)
+            .await
+            .map_err(AwaError::from);
+    }
+
     let rows = sqlx::query_scalar::<_, String>(
         "SELECT queue FROM awa.job_queue_catalog WHERE ref_count > 0 ORDER BY queue",
     )
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
@@ -1946,6 +2532,9 @@ where
 /// Called frequently by the maintenance leader (~2s). Uses per-queue
 /// indexes for targeted recompute rather than full table scans.
 pub async fn recompute_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
+    if active_queue_storage(pool).await?.is_some() {
+        return Ok(0);
+    }
     let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
         .fetch_one(pool)
         .await?;
@@ -1959,6 +2548,9 @@ pub async fn recompute_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaErr
 /// acquires a blocking advisory lock, so concurrent callers serialize
 /// rather than skip.
 pub async fn flush_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> {
+    if active_queue_storage(pool).await?.is_some() {
+        return Ok(0);
+    }
     let mut total = 0i32;
     loop {
         let count: i32 = sqlx::query_scalar("SELECT awa.recompute_dirty_admin_metadata(100)")
@@ -1978,6 +2570,9 @@ pub async fn flush_dirty_admin_metadata(pool: &PgPool) -> Result<i32, AwaError> 
 /// to correct any drift from skipped dirty keys. Also called during
 /// migrate() to warm the cache.
 pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
+    if active_queue_storage(pool).await?.is_some() {
+        return Ok(());
+    }
     sqlx::query("SELECT awa.refresh_admin_metadata()")
         .execute(pool)
         .await?;
@@ -1985,10 +2580,11 @@ pub async fn refresh_admin_metadata(pool: &PgPool) -> Result<(), AwaError> {
 }
 
 /// Retry multiple jobs by ID. Only retries failed, cancelled, or waiting_external jobs.
-pub async fn bulk_retry<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn bulk_retry(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.retry_jobs_by_ids(pool, ids).await;
+    }
+
     let rows = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -2002,17 +2598,18 @@ where
         "#,
     )
     .bind(ids)
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
 }
 
 /// Cancel multiple jobs by ID. Only cancels non-terminal jobs.
-pub async fn bulk_cancel<'e, E>(executor: E, ids: &[i64]) -> Result<Vec<JobRow>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn bulk_cancel(pool: &PgPool, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.cancel_jobs_by_ids(pool, ids).await;
+    }
+
     let rows = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -2025,7 +2622,7 @@ where
         "#,
     )
     .bind(ids)
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows)
@@ -2040,13 +2637,38 @@ pub struct StateTimeseriesBucket {
 }
 
 /// Return time-bucketed state counts over the last N minutes.
-pub async fn state_timeseries<'e, E>(
-    executor: E,
+pub async fn state_timeseries(
+    pool: &PgPool,
     minutes: i32,
-) -> Result<Vec<StateTimeseriesBucket>, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<Vec<StateTimeseriesBucket>, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let sql = format!(
+            "{} \
+             SELECT \
+                 date_trunc('minute', created_at) AS bucket, \
+                 state, \
+                 count(*) AS count \
+             FROM current_jobs \
+             WHERE created_at >= clock_timestamp() - make_interval(mins => $1) \
+             GROUP BY bucket, state \
+             ORDER BY bucket",
+            queue_storage_current_jobs_cte(store.schema())
+        );
+        let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(&sql)
+            .bind(minutes)
+            .fetch_all(pool)
+            .await?;
+
+        return Ok(rows
+            .into_iter()
+            .map(|(bucket, state, count)| StateTimeseriesBucket {
+                bucket,
+                state,
+                count,
+            })
+            .collect());
+    }
+
     let rows = sqlx::query_as::<_, (chrono::DateTime<chrono::Utc>, JobState, i64)>(
         r#"
         SELECT
@@ -2060,7 +2682,7 @@ where
         "#,
     )
     .bind(minutes)
-    .fetch_all(executor)
+    .fetch_all(pool)
     .await?;
 
     Ok(rows
@@ -2081,15 +2703,18 @@ where
 /// about the callback.
 ///
 /// Returns the generated callback UUID on success.
-pub async fn register_callback<'e, E>(
-    executor: E,
+pub async fn register_callback(
+    pool: &PgPool,
     job_id: i64,
     run_lease: i64,
     timeout: std::time::Duration,
-) -> Result<Uuid, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<Uuid, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .register_callback(pool, job_id, run_lease, timeout)
+            .await;
+    }
+
     let callback_id = Uuid::new_v4();
     let timeout_secs = timeout.as_secs_f64();
     let result = sqlx::query(
@@ -2106,7 +2731,7 @@ where
     .bind(callback_id)
     .bind(timeout_secs)
     .bind(run_lease)
-    .execute(executor)
+    .execute(pool)
     .await?;
     if result.rows_affected() == 0 {
         return Err(AwaError::Validation("job is not in running state".into()));
@@ -2123,17 +2748,14 @@ where
 /// When `resume` is `true`, the job transitions back to `running` with the
 /// callback payload stored in metadata under `_awa_callback_result`. The
 /// handler can then read the result and continue processing (sequential
-/// callback pattern from ADR-016).
-pub async fn complete_external<'e, E>(
-    executor: E,
+/// callback pattern from ADR-021).
+pub async fn complete_external(
+    pool: &PgPool,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    complete_external_inner(executor, callback_id, payload, run_lease, false).await
+) -> Result<JobRow, AwaError> {
+    complete_external_inner(pool, callback_id, payload, run_lease, false).await
 }
 
 /// Complete a waiting job and resume the handler with the callback payload.
@@ -2141,28 +2763,28 @@ where
 /// Like `complete_external`, but the job transitions to `running` instead of
 /// `completed`, allowing the handler to continue with sequential callbacks.
 /// The payload is stored in `metadata._awa_callback_result`.
-pub async fn resume_external<'e, E>(
-    executor: E,
+pub async fn resume_external(
+    pool: &PgPool,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
-    complete_external_inner(executor, callback_id, payload, run_lease, true).await
+) -> Result<JobRow, AwaError> {
+    complete_external_inner(pool, callback_id, payload, run_lease, true).await
 }
 
-async fn complete_external_inner<'e, E>(
-    executor: E,
+async fn complete_external_inner(
+    pool: &PgPool,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
     resume: bool,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .complete_external(pool, callback_id, payload, run_lease, resume)
+            .await;
+    }
+
     let row = if resume {
         // Resume: transition to running, store payload, refresh heartbeat.
         // The handler is still alive and polling — it will detect the state change.
@@ -2187,7 +2809,7 @@ where
         .bind(callback_id)
         .bind(run_lease)
         .bind(&payload_json)
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?
     } else {
         // Complete: terminal state, clear everything.
@@ -2212,7 +2834,7 @@ where
         )
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(executor)
+        .fetch_optional(pool)
         .await?
     };
 
@@ -2224,15 +2846,18 @@ where
 /// Fail a waiting job via external callback.
 ///
 /// Records the error and transitions to `failed`.
-pub async fn fail_external<'e, E>(
-    executor: E,
+pub async fn fail_external(
+    pool: &PgPool,
     callback_id: Uuid,
     error: &str,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .fail_external(pool, callback_id, error, run_lease)
+            .await;
+    }
+
     let row = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -2259,7 +2884,7 @@ where
     .bind(callback_id)
     .bind(error)
     .bind(run_lease)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2276,14 +2901,15 @@ where
 /// terminal transitions, retry puts the job back to `available`. Allowing
 /// retry from `running` would risk concurrent dispatch if the original
 /// handler hasn't finished yet.
-pub async fn retry_external<'e, E>(
-    executor: E,
+pub async fn retry_external(
+    pool: &PgPool,
     callback_id: Uuid,
     run_lease: Option<i64>,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.retry_external(pool, callback_id, run_lease).await;
+    }
+
     let row = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE awa.jobs
@@ -2306,7 +2932,7 @@ where
     )
     .bind(callback_id)
     .bind(run_lease)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2322,14 +2948,15 @@ where
 ///
 /// Returns the updated job row, or `CallbackNotFound` if the callback ID
 /// doesn't match a waiting job.
-pub async fn heartbeat_callback<'e, E>(
-    executor: E,
+pub async fn heartbeat_callback(
+    pool: &PgPool,
     callback_id: Uuid,
     timeout: std::time::Duration,
-) -> Result<JobRow, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.heartbeat_callback(pool, callback_id, timeout).await;
+    }
+
     let timeout_secs = timeout.as_secs_f64();
     let row = sqlx::query_as::<_, JobRow>(
         r#"
@@ -2341,7 +2968,7 @@ where
     )
     .bind(callback_id)
     .bind(timeout_secs)
-    .fetch_optional(executor)
+    .fetch_optional(pool)
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2354,14 +2981,11 @@ where
 /// Best-effort cleanup: returns `Ok(true)` if a row was updated,
 /// `Ok(false)` if no match (already resolved, rescued, or wrong lease).
 /// Callers should not treat `false` as an error.
-pub async fn cancel_callback<'e, E>(
-    executor: E,
-    job_id: i64,
-    run_lease: i64,
-) -> Result<bool, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+pub async fn cancel_callback(pool: &PgPool, job_id: i64, run_lease: i64) -> Result<bool, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.cancel_callback(pool, job_id, run_lease).await;
+    }
+
     let result = sqlx::query(
         r#"
         UPDATE awa.jobs
@@ -2376,7 +3000,7 @@ where
     )
     .bind(job_id)
     .bind(run_lease)
-    .execute(executor)
+    .execute(pool)
     .await?;
 
     Ok(result.rows_affected() > 0)
@@ -2417,6 +3041,12 @@ pub async fn enter_callback_wait(
     run_lease: i64,
     callback_id: Uuid,
 ) -> Result<bool, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .enter_callback_wait(pool, job_id, run_lease, callback_id)
+            .await;
+    }
+
     let result = sqlx::query(
         r#"
         UPDATE awa.jobs
@@ -2445,6 +3075,10 @@ pub async fn check_callback_state(
     job_id: i64,
     callback_id: Uuid,
 ) -> Result<CallbackPollResult, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store.check_callback_state(pool, job_id, callback_id).await;
+    }
+
     let row: Option<(JobState, Option<Uuid>, serde_json::Value)> =
         sqlx::query_as("SELECT state, callback_id, metadata FROM awa.jobs WHERE id = $1")
             .bind(job_id)
@@ -2567,16 +3201,13 @@ impl ResolveOutcome {
 ///
 /// When the `cel` feature is disabled and any expression is non-None,
 /// returns `AwaError::Validation`.
-pub async fn register_callback_with_config<'e, E>(
-    executor: E,
+pub async fn register_callback_with_config(
+    pool: &PgPool,
     job_id: i64,
     run_lease: i64,
     timeout: std::time::Duration,
     config: &CallbackConfig,
-) -> Result<Uuid, AwaError>
-where
-    E: PgExecutor<'e>,
-{
+) -> Result<Uuid, AwaError> {
     // Validate CEL expressions at registration time: compile + check references
     #[cfg(feature = "cel")]
     {
@@ -2620,6 +3251,12 @@ where
         }
     }
 
+    if let Some(store) = active_queue_storage(pool).await? {
+        return store
+            .register_callback_with_config(pool, job_id, run_lease, timeout, config)
+            .await;
+    }
+
     let callback_id = Uuid::new_v4();
     let timeout_secs = timeout.as_secs_f64();
 
@@ -2641,7 +3278,7 @@ where
     .bind(&config.on_fail)
     .bind(&config.transform)
     .bind(run_lease)
-    .execute(executor)
+    .execute(pool)
     .await?;
 
     if result.rows_affected() == 0 {
@@ -2672,6 +3309,45 @@ pub async fn resolve_callback(
     default_action: DefaultAction,
     run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
+    if let Some(store) = active_queue_storage(pool).await? {
+        let job = store
+            .callback_job(pool, callback_id, run_lease)
+            .await?
+            .ok_or(AwaError::CallbackNotFound {
+                callback_id: callback_id.to_string(),
+            })?;
+
+        let action = evaluate_or_default(&job, &payload, default_action)?;
+
+        return match action {
+            ResolveAction::Complete(transformed_payload) => {
+                let completed_job = store
+                    .complete_external(pool, callback_id, None, run_lease, false)
+                    .await?;
+                Ok(ResolveOutcome::Completed {
+                    payload: transformed_payload,
+                    job: completed_job,
+                })
+            }
+            ResolveAction::Fail { error, expression } => {
+                let mut error_json = serde_json::json!({
+                    "error": error,
+                    "attempt": job.attempt,
+                    "at": chrono::Utc::now().to_rfc3339(),
+                });
+                if let Some(expr) = expression {
+                    error_json["expression"] = serde_json::Value::String(expr);
+                }
+
+                let failed_job = store
+                    .fail_external_with_error_entry(pool, callback_id, error_json, run_lease)
+                    .await?;
+                Ok(ResolveOutcome::Failed { job: failed_job })
+            }
+            ResolveAction::Ignore(reason) => Ok(ResolveOutcome::Ignored { reason }),
+        };
+    }
+
     let mut tx = pool.begin().await?;
 
     // Query jobs_hot directly (not the awa.jobs UNION ALL view) because

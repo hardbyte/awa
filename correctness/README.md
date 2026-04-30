@@ -53,6 +53,60 @@ What is intentionally not modeled:
 
 - `AwaCore.tla` / `AwaCore.cfg`: focused model for rescue, admin cancel, and
   stale completion protection
+- `storage/AwaSegmentedStorage.tla` / `storage/AwaSegmentedStorage.cfg`: focused
+  segmented-storage model covering `ready_entries`, `deferred_jobs`,
+  live `leases` including `waiting_external`, optional `attempt_state`,
+  `done_entries`, `dlq_entries`, queue-local append/claim cursors, and
+  segment rotation/prune safety for ready, lease, terminal, and claim
+  families. Heartbeat freshness lives on non-waiting leases, matching the
+  Rust implementation. DLQ modelling covers both executor-side `FailToDlq`
+  and admin-side `MoveFailedToDlq`, plus `RetryFromDlq` (with `run_lease`
+  reset) and `PurgeDlq`. See [`storage/MAPPING.md`](storage/MAPPING.md) for
+  the TLA+ ↔ Rust correspondence table.
+- `storage/AwaSegmentedStorageInterleavings.cfg`: alternate two-worker config
+  for the same segmented-storage spec, used to exercise stale completion and
+  waiting/resume interleavings without changing the base safety model
+- `storage/AwaSegmentedStorageRaces.tla` / `storage/AwaSegmentedStorageRaces.cfg`
+  / `storage/AwaSegmentedStorageRacesSafe.cfg`: focused race-exposure spec
+  that splits `Claim` into `BeginClaim` / `CommitClaim` to model the claim
+  path's cursor-read-without-lock behaviour. The race config produces a
+  counterexample trace (claim snapshots segment, rotate+prune fire, commit
+  lands lease in pruned segment — simultaneously the claim-vs-rotate race
+  and the prune check-then-act race). The safe config uses a checked
+  commit and passes. Production uses CAS on ring state plus child-partition
+  locks and busy checks, not `FOR SHARE` on `lease_ring_state` — see
+  `storage/MAPPING.md` for the full analysis.
+- `storage/AwaStorageLockOrder.tla` / `storage/AwaStorageLockOrder.cfg` /
+  `storage/AwaStorageLockOrderDeadlockDemo.cfg`: lock-ordering protocol
+  spec. Models each storage-engine transaction (claim, rotate-leases,
+  prune-leases, rotate-ready, prune-ready) as an ordered sequence of
+  Postgres lock acquisitions with a shared/exclusive compatibility matrix.
+  Checks `NoDeadlock` via a waits-for cycle detector. The main config
+  passes cleanly (39,040 distinct states), confirming the current
+  lock ordering is deadlock-free. The demo config uses a deliberately
+  cycle-creating plan pair to prove the detector itself works.
+- `storage/AwaStorageTransition.tla` /
+  `storage/AwaStorageTransition.cfg` /
+  `storage/AwaStorageTransitionCurrentGate.cfg`: focused model for the
+  0.5.x-to-0.6 storage transition control plane. It covers prepare,
+  schema readiness, mixed-transition entry, canonical backlog drain,
+  queue-storage routing, finalize, and abort interlocks. The desired
+  config requires a live queue-storage executor at the mixed-transition
+  gate and passes cleanly. The current-gate config intentionally models
+  the SQL capability-only gate and produces a witness where an auto
+  runtime started before mixed transition reports `queue_storage` while
+  prepared, then becomes drain-only after routing flips.
+- `storage/AwaSegmentedStorageTrace.tla` /
+  `storage/AwaSegmentedStorageTrace.cfg` /
+  `storage/AwaSegmentedStorageTraceReceiptRescue.cfg` /
+  `storage/AwaSegmentedStorageTraceRunningCancel.cfg` /
+  `storage/AwaSegmentedStorageTraceDlqRetry.cfg` /
+  `storage/AwaSegmentedStorageTraceBroken.cfg`: trace-validation
+  harness. Takes hand-transcribed sequences of queue-storage runtime
+  events and verifies each transition is accepted by the storage spec.
+  Current positive traces cover snooze, receipt rescue, running cancel,
+  and DLQ retry. A deliberately-broken variant trips deadlock at
+  traceIdx = 2 to confirm the checker rejects invalid sequences.
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -89,6 +143,19 @@ From the repository root:
 
 ```bash
 ./correctness/run-tlc.sh core/AwaCore.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+./correctness/run-tlc.sh storage/AwaStorageTransition.tla
+./correctness/run-tlc.sh storage/AwaStorageTransition.tla storage/AwaStorageTransitionCurrentGate.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptRescue.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceRunningCancel.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceDlqRetry.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
@@ -150,6 +217,18 @@ To keep the state graph finite, `AwaExtended` bounds retries with
 `MaxAttempts == 2`. Admin cancel remains covered in `AwaCore`; the extended
 model is deliberately focused on the shutdown / rescue / permit / fairness
 protocol rather than re-exploring the full cancel surface.
+
+`AwaSegmentedStorage` focuses on the storage split behind the vacuum-aware
+runtime direction rather than the full worker lifecycle protocol. It treats
+`ready_entries` as runnable queue records, `deferred_jobs` as the promoted
+backlog family, `leases` as the live claim surface including
+`waiting_external`, `attempt_state` as an optional per-attempt mutable row, and
+`done_entries` as reclaimable completion history. It also models `lane_state`
+with explicit append/claim cursors and a gap-skipping claim advance. The key
+invariants are that `attempt_state` can only exist for live leases, waiting is
+a lease state rather than a separate table, deferred jobs hold no live runtime
+state, and ready/lease/terminal/claim segments cannot be pruned while they
+still own live rows.
 
 `AwaBatcher` models the async completion path between handler return and DB
 update. In the real system (`awa-worker/src/completion.rs`), completed jobs

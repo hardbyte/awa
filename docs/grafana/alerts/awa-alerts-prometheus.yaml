@@ -239,6 +239,116 @@ groups:
                   reducer: { type: last, params: [] }
                   evaluator: { type: lt, params: [1] }
 
+      - uid: awa_storage_prepared_blocked
+        title: "awa storage transition prepared but blocked"
+        condition: "C"
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Storage transition is prepared but cannot enter mixed transition"
+          description: |
+            The fleet is in `prepared`, but `enter_mixed_transition` has been
+            blocked for 10 minutes. Common causes are live canonical-only
+            runtimes still reporting, no queue-storage target runtime, or the
+            prepared schema not being ready. Check /runtime in awa-ui or the
+            "Storage transition" section on the dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: |
+                max(awa_storage_state{awa_storage_state="prepared"})
+                  * (1 - max(awa_storage_transition_ready{awa_storage_action="enter_mixed_transition"}))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: replaceNN, replaceWithValue: 0 }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0.5] }
+
+      - uid: awa_storage_finalize_blocked
+        title: "awa storage mixed transition blocked from finalize"
+        condition: "C"
+        for: 10m
+        noDataState: OK
+        execErrState: Error
+        labels:
+          severity: warning
+          owner: awa
+        annotations:
+          summary: "Storage transition is in mixed_transition but cannot finalize"
+          description: |
+            The fleet is routing to queue storage, but finalization has been
+            blocked for 10 minutes. Canonical backlog may still be draining or
+            canonical/canonical_drain runtimes may still be live. Check
+            /runtime in awa-ui or the "Storage transition" section on the
+            dashboard.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 600, to: 0 }
+            datasourceUid: DS_PROMETHEUS
+            model:
+              refId: A
+              datasource: { type: prometheus, uid: DS_PROMETHEUS }
+              expr: |
+                max(awa_storage_state{awa_storage_state="mixed_transition"})
+                  * (1 - max(awa_storage_transition_ready{awa_storage_action="finalize"}))
+              instant: true
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+              settings: { mode: replaceNN, replaceWithValue: 0 }
+          - refId: C
+            relativeTimeRange: { from: 0, to: 0 }
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - type: query
+                  operator: { type: and }
+                  query: { params: [C] }
+                  reducer: { type: last, params: [] }
+                  evaluator: { type: gt, params: [0.5] }
+
       - uid: awa_throughput_collapsed
         title: "awa completion throughput dropped below 10% of baseline"
         condition: "D"

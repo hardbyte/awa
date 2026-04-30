@@ -23,10 +23,14 @@ async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
     await tx.execute("DELETE FROM awa.jobs")
     await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        await c.close()
 
 
 # ── Kind derivation golden tests (must match Rust exactly) ─────────────

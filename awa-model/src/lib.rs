@@ -1,11 +1,13 @@
 pub mod admin;
 pub mod bridge;
 pub mod cron;
+pub mod dlq;
 pub mod error;
 pub mod insert;
 pub mod job;
 pub mod kind;
 pub mod migrations;
+pub mod queue_storage;
 pub mod storage;
 pub mod unique;
 
@@ -24,9 +26,14 @@ pub use admin::{
 #[deprecated(since = "0.5.4", note = "use `QueueOverview` instead")]
 pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, PeriodicJob, PeriodicJobBuilder};
+pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 pub use error::AwaError;
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
+pub use queue_storage::{
+    ClaimedEntry, ClaimedRuntimeJob, PruneOutcome, QueueCounts, QueueStorage, QueueStorageConfig,
+    RotateOutcome,
+};
 pub use storage::StorageStatus;
 
 // Re-export the derive macro

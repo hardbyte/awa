@@ -45,7 +45,18 @@ pub async fn setup(max_connections: u32) -> PgPool {
     awa_model::migrations::run(&pool)
         .await
         .expect("Failed to run migrations");
+    reset_runtime_backend(&pool).await;
     pool
+}
+
+/// Clear any previously-activated runtime backend so legacy integration tests
+/// start from the canonical compatibility surface unless they opt into a
+/// queue-storage runtime explicitly.
+pub async fn reset_runtime_backend(pool: &PgPool) {
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to reset active runtime backend for test setup");
 }
 
 /// Delete all jobs, queue metadata, and admin caches for a specific queue.

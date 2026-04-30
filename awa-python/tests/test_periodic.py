@@ -11,17 +11,42 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+RUNTIME_START_KWARGS = {
+    "leader_election_interval_ms": 100,
+    "heartbeat_interval_ms": 100,
+    "queue_storage_queue_rotate_interval_ms": 60_000,
+}
 
 
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await c.install_queue_storage(reset=True)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'periodic_%'")
     await tx.execute("DELETE FROM awa.cron_jobs WHERE name LIKE 'test_%'")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        await c.shutdown()
+        await c.close()
+
+
+async def _wait_for_cron_job(client, name: str, timeout_seconds: float = 5.0):
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while asyncio.get_running_loop().time() < deadline:
+        tx = await client.transaction()
+        row = await tx.fetch_optional(
+            "SELECT name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata "
+            "FROM awa.cron_jobs WHERE name = $1",
+            name,
+        )
+        await tx.commit()
+        if row is not None:
+            return row
+        await asyncio.sleep(0.1)
+    raise AssertionError(f"Timed out waiting for cron job {name}")
 
 
 @dataclass
@@ -56,17 +81,9 @@ async def test_periodic_registration(client):
     )
 
     # Start briefly to trigger cron sync
-    await client.start([(queue, 1)])
-    await asyncio.sleep(2.0)
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
+    row = await _wait_for_cron_job(client, "test_daily_report")
     await client.shutdown()
-
-    # Verify cron_jobs table has the schedule
-    tx = await client.transaction()
-    row = await tx.fetch_optional(
-        "SELECT name, cron_expr, timezone, kind, queue, args FROM awa.cron_jobs WHERE name = $1",
-        "test_daily_report",
-    )
-    await tx.commit()
 
     assert row is not None, "cron job should be synced to database"
     assert row["cron_expr"] == "0 9 * * *"
@@ -96,16 +113,9 @@ async def test_periodic_with_metadata_and_tags(client):
         metadata={"team": "platform"},
     )
 
-    await client.start([(queue, 1)])
-    await asyncio.sleep(2.0)
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
+    row = await _wait_for_cron_job(client, "test_hourly_sync")
     await client.shutdown()
-
-    tx = await client.transaction()
-    row = await tx.fetch_optional(
-        "SELECT priority, max_attempts, tags, metadata FROM awa.cron_jobs WHERE name = $1",
-        "test_hourly_sync",
-    )
-    await tx.commit()
 
     assert row is not None
     assert row["priority"] == 1
@@ -183,7 +193,10 @@ async def test_periodic_fires_and_executes(client):
 
     # Use fast leader election so the cron job fires promptly.
     # Default 10s election interval makes this test timing-dependent.
-    await client.start([(queue, 1)], leader_election_interval_ms=100, heartbeat_interval_ms=100)
+    await client.start(
+        [(queue, 1)],
+        **RUNTIME_START_KWARGS,
+    )
 
     # Poll until the job fires or timeout.
     for _ in range(60):
@@ -193,7 +206,9 @@ async def test_periodic_fires_and_executes(client):
 
     await client.shutdown()
 
-    assert len(executed) >= 1, f"periodic job should have fired at least once, got {len(executed)}"
+    assert len(executed) >= 1, (
+        f"periodic job should have fired at least once, got {len(executed)}"
+    )
     # args comes through as the deserialized dataclass from the dispatch bridge
     args = executed[0]
     if isinstance(args, dict):

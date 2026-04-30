@@ -1,6 +1,6 @@
 # Troubleshooting
 
-This guide focuses on the operational issues called out in issue `#16`: stuck `running` jobs, leader-election delays, and heartbeat timeouts.
+This guide covers the operational issues that come up most often in practice: stuck `running` jobs, leader-election delays, and heartbeat timeouts.
 
 ## Quick Checks
 
@@ -27,16 +27,52 @@ A job staying in `running` is not automatically a bug. It usually means one of t
 
 ### Inspect Running Jobs
 
+In 0.6 with the default queue-storage backend, running attempts live
+in `{schema}.leases` (lease-materialized attempts) and unmaterialized
+short-job claims live in `{schema}.lease_claims`. The `{schema}` is
+`awa` unless the operator chose a different name; replace below as
+needed.
+
 ```sql
+-- Materialized leases. heartbeat_at and deadline_at both populated.
 SELECT
-    id,
-    kind,
+    job_id,
     queue,
     attempt,
     heartbeat_at,
     deadline_at,
     EXTRACT(EPOCH FROM (now() - heartbeat_at)) AS heartbeat_age_s,
     EXTRACT(EPOCH FROM (deadline_at - now())) AS deadline_remaining_s
+FROM awa.leases
+WHERE state = 'running'
+ORDER BY heartbeat_at ASC;
+
+-- Receipt-mode short-job claims that haven't materialized yet. No
+-- heartbeat row; deadline_at lives on the claim if deadline_duration > 0
+-- and the receipt-side deadline rescue (`rescue_expired_receipt_deadlines_tx`)
+-- is what kicks in here. Anti-join with closures to filter "still open".
+SELECT
+    c.job_id,
+    c.queue,
+    c.attempt,
+    c.claimed_at,
+    c.deadline_at,
+    EXTRACT(EPOCH FROM (now() - c.claimed_at)) AS claimed_age_s,
+    EXTRACT(EPOCH FROM (c.deadline_at - now())) AS deadline_remaining_s
+FROM awa.lease_claims c
+WHERE NOT EXISTS (
+    SELECT 1 FROM awa.lease_claim_closures cx
+    WHERE cx.claim_slot = c.claim_slot
+      AND cx.job_id = c.job_id
+      AND cx.run_lease = c.run_lease
+)
+ORDER BY c.claimed_at ASC;
+```
+
+Pre-0.6 / canonical-only deployments still query `awa.jobs` directly:
+
+```sql
+SELECT id, kind, queue, attempt, heartbeat_at, deadline_at
 FROM awa.jobs
 WHERE state = 'running'
 ORDER BY heartbeat_at ASC;
@@ -45,8 +81,8 @@ ORDER BY heartbeat_at ASC;
 Interpretation:
 
 - low `heartbeat_age_s`: the worker is still alive
-- `heartbeat_age_s` well above `90`: stale-heartbeat rescue should pick it up soon
-- very negative `deadline_remaining_s`: deadline rescue should pick it up soon
+- `heartbeat_age_s` well above `heartbeat_staleness` (default `90s`): stale-heartbeat rescue should pick it up on the next scan
+- very negative `deadline_remaining_s`: deadline rescue should pick it up soon (lease side or receipt side, depending on which table the row lives in)
 
 ### Inspect Runtime Health
 
@@ -80,6 +116,53 @@ awa --database-url "$DATABASE_URL" job cancel <job-id>
 ```
 
 Then investigate why the worker stopped.
+
+### Admin Cancel Doesn't Wake A Running Worker
+
+`awa job cancel <id>` writes the cancellation to the database and emits
+`pg_notify('awa:cancel', {job_id, run_lease})`. Each worker runtime
+runs a `CancelListener` (PgListener-based) that picks up the
+notification and fires the matching `Arc<AtomicBool>` cancel flag the
+handler's `JobContext` holds — so the handler sees
+`ctx.is_cancelled() == true` on its next check and can stop cleanly.
+
+If the listener fails to start or its connection drops, the listener
+logs a `warn!` and exits; admin cancels then silently fall back to
+heartbeat / deadline rescue for detection (i.e. the cancel does take
+effect on the next completion-time `run_lease` check, but the handler
+doesn't get the early wake-up). Symptoms: `awa job cancel` returns
+success and the database shows the job as `cancelled`, but a worker
+reports completing the cancelled `run_lease` long after the cancel
+was issued; the completion is rejected by `StaleCompleteRejected` so
+no harm done, just wasted work.
+
+To diagnose:
+
+- Search the worker logs for `Failed to create PG listener for admin
+  cancel` or `Failed to LISTEN on cancel channel`. Either message
+  means the listener started, hit the failure, and the runtime is
+  now in fallback mode.
+- Search for `PG cancel listener error; will retry` — the listener
+  saw a transient error and is sleeping 1s before reconnecting; not
+  a steady-state failure unless it spams the log.
+- Confirm `pg_listener` works from outside the runtime:
+  `psql -c "LISTEN \"awa:cancel\";"` and watch a separate session
+  fire `SELECT pg_notify('awa:cancel', '{}');`.
+
+To recover:
+
+- Restart the worker process — the listener spawns at runtime
+  startup, so restart re-creates the listener with a fresh
+  connection.
+- If the failure is steady (e.g. a Postgres pool sized so all
+  connections are saturated by claim/complete traffic and `LISTEN`
+  can't acquire one), increase the pool max or dedicate a
+  connection to listening.
+
+In all cases the cancel itself is durable — only the early wake-up
+is lost. Long-running handlers that don't poll `ctx.is_cancelled()`
+between heartbeats won't notice the cancel until they finish or
+heartbeat-rescue fires.
 
 ## Leader Election Delays
 
@@ -148,25 +231,37 @@ If long-running jobs are expected, remember:
 
 If a job really needs `20m`, set a longer deadline for that queue.
 
-## Dead Tuples Growing On `awa.jobs_hot`
+## Dead Tuples Growing In Queue Storage
 
 ### What It Usually Means
 
-If queue throughput starts to sag while `awa.jobs_hot` keeps accumulating dead
-tuples, the usual cause is not duplicate dispatch or a broken worker. The more
-common pattern is:
+If queue throughput starts to sag while lease tables keep accumulating dead
+tuples, the usual cause is not duplicate dispatch. The more common pattern is:
 
 - workers are still claiming and completing jobs
-- the maintenance leader is still running cleanup
+- the maintenance leader is still rotating and pruning
 - one or more long-lived transactions on the primary are holding an old
-  snapshot open
-- vacuum cannot reclaim dead rows aggressively enough because the MVCC horizon
-  is pinned
+  snapshot open or touching older segments
+- prune cannot truncate old lease or terminal segments aggressively enough
+  because the MVCC horizon is pinned or a reader still holds a lockable view of
+  the segment
 
 This is the same general failure mode described in PlanetScale's "Keeping a
 Postgres queue healthy" post.
 
+### Find The Active Queue-Storage Schema
+
+```sql
+SELECT
+    backend,
+    schema_name,
+    updated_at
+FROM awa.runtime_storage_backends;
+```
+
 ### Inspect Table Churn
+
+Replace `<schema>` with the active `schema_name` from the previous query.
 
 ```sql
 SELECT
@@ -178,16 +273,29 @@ SELECT
     last_vacuum,
     last_autovacuum
 FROM pg_stat_user_tables
-WHERE schemaname = 'awa'
-  AND relname IN ('jobs_hot', 'scheduled_jobs')
-ORDER BY relname;
+WHERE schemaname = '<schema>'
+  AND (
+      relname = 'attempt_state'
+      OR relname = 'deferred_jobs'
+      OR relname = 'dlq_entries'
+      OR relname LIKE 'ready_entries%'
+      OR relname LIKE 'done_entries%'
+      OR relname LIKE 'leases%'
+  )
+ORDER BY n_dead_tup DESC, relname;
 ```
 
 Interpretation:
 
-- rising `n_dead_tup` on `jobs_hot` with steady worker activity means churn is happening
-- `autovacuum_count` staying flat for a long time can indicate vacuum is not keeping up
-- `scheduled_jobs` is usually not the problem here; `jobs_hot` is the churn table
+- `ready_entries%` should usually stay at or near zero dead tuples
+- `leases%` can rise within the current rotation window, but should fall again
+  after prune
+- `attempt_state` should roughly match live long-running attempts, not total
+  queue depth, and should return close to zero after drain
+- `autovacuum_count` staying flat for a long time can indicate vacuum is not
+  keeping up on churn-heavy lease partitions
+- persistent dead tuples across many `leases%` tables usually means prune is
+  blocked or the maintenance leader is unhealthy
 
 ### Inspect Long Transactions
 
@@ -218,11 +326,50 @@ Pay particular attention to:
 - terminate or fix the long-lived transaction that is pinning the horizon
 - move analytical reads to a replica
 - shorten transaction scope in admin or reporting code
-- reduce terminal-row retention if the table is much larger than needed
-- review autovacuum settings if high churn is expected continuously
+- confirm one maintenance leader is healthy; rotation and prune are leader-owned
+- reduce terminal-row retention if the terminal history is much larger than needed
+- review autovacuum settings if lease churn is expected continuously
 
 If you want to reproduce the behavior locally before changing settings, run the
 MVCC benchmark documented in `docs/benchmarking.md`.
+
+## Something's In The DLQ
+
+The Dead Letter Queue is where terminal failures land when a queue has DLQ
+enabled. These rows are never claimed. Operators retry them, purge them, or let
+retention remove them.
+
+Quick checks:
+
+```bash
+awa --database-url "$DATABASE_URL" dlq depth
+awa --database-url "$DATABASE_URL" dlq list --limit 20
+awa --database-url "$DATABASE_URL" dlq list --queue email
+```
+
+`dlq_reason` tells you how the row got there:
+
+- `terminal_error`
+- `max_attempts_exhausted`
+- `callback_timeout`
+- an operator-supplied reason from `awa dlq move`
+
+Useful actions:
+
+```bash
+awa --database-url "$DATABASE_URL" dlq retry <job-id>
+awa --database-url "$DATABASE_URL" dlq retry-bulk --queue email
+awa --database-url "$DATABASE_URL" dlq purge --queue email
+awa --database-url "$DATABASE_URL" dlq move --queue email --reason backfill
+```
+
+If DLQ depth is growing quickly:
+
+- inspect a few rows and compare `dlq_reason`
+- sample `awa job dump <id>` for the full error/progress chain
+- pause the upstream queue or producer if one failure mode is dominating
+- tune `dlq_retention` or `RetentionPolicy.dlq` if forensic retention is too
+  long for the incident volume
 
 ## Common Error Cases
 

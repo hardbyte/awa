@@ -16,11 +16,36 @@ DATABASE_URL = os.environ.get(
 )
 
 
+async def wait_for_job_state(
+    client: awa.AsyncClient,
+    job_id: int,
+    expected_state: awa.JobState,
+    timeout: float = 2.0,
+) -> awa.Job:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        job = await client.get_job(job_id)
+        if job.state == expected_state:
+            return job
+        await asyncio.sleep(0.05)
+    return await client.get_job(job_id)
+
+
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
+    tx = await c.transaction()
+    await tx.execute("DROP SCHEMA IF EXISTS awa CASCADE")
+    await tx.commit()
     await c.migrate()
-    return c
+    tx = await c.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute("DELETE FROM awa.runtime_instances")
+    await tx.commit()
+    try:
+        yield c
+    finally:
+        await c.close()
 
 
 @dataclass
@@ -246,3 +271,349 @@ async def test_per_queue_retention_in_dict_config(client):
         ]
     )
     await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_per_queue_priority_aging_and_deadline_in_dict_config(client):
+    """Dict form accepts per-queue priority_aging_interval_ms and
+    deadline_duration_ms (parity with Rust QueueConfig).
+
+    Verifies the kwargs are recognised and the worker starts; the
+    actual claim-time aging arithmetic and deadline rescue are covered
+    by the Rust queue_storage_runtime_test suite, so here we only
+    assert the Python plumbing surface accepts the values and a job
+    flows through.
+    """
+    queue = "cfg_per_queue_aging_deadline"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    await client.start(
+        [
+            {
+                "name": queue,
+                "max_workers": 4,
+                "priority_aging_interval_ms": 30_000,
+                "deadline_duration_ms": 60_000,
+            }
+        ]
+    )
+    try:
+        await client.insert(ConfigTestJob(value="aged"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=5.0)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_per_queue_aging_zero_disables_escalation(client):
+    """`priority_aging_interval_ms=0` and `deadline_duration_ms=0`
+    are meaningful values (not "use default"). The worker should
+    accept them and execute jobs without applying claim-time
+    escalation or attempt-deadline rescue."""
+    queue = "cfg_per_queue_zero_aging_deadline"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    await client.start(
+        [
+            {
+                "name": queue,
+                "max_workers": 4,
+                "priority_aging_interval_ms": 0,
+                "deadline_duration_ms": 0,
+            }
+        ]
+    )
+    try:
+        await client.insert(ConfigTestJob(value="strict"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=5.0)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_default_start_on_fresh_install_auto_finalizes_to_queue_storage(client):
+    """Fresh-install fast path (v013): a default `client.start(...)` on
+    a database that has never seen canonical work auto-promotes the
+    storage transition to `active=queue_storage` so the operator
+    doesn't have to run `prepare → enter-mixed-transition → finalize`
+    by hand. See `awa.storage_auto_finalize_if_fresh()` and the
+    "Fresh install" section of `docs/migrations.md`.
+    """
+    queue = "cfg_fresh_install_auto_finalize"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    try:
+        await client.start([(queue, 1)], poll_interval_ms=25)
+        job = await client.insert(ConfigTestJob(value="fresh-install"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=2.0)
+        fetched = await wait_for_job_state(client, job.id, awa.JobState.Completed)
+        assert fetched.state == awa.JobState.Completed
+
+        tx = await client.transaction()
+        status = await tx.fetch_one(
+            """
+            SELECT
+                awa.active_queue_storage_schema() AS active_schema,
+                (SELECT state FROM awa.storage_status()) AS state,
+                (SELECT active_engine FROM awa.storage_status()) AS active_engine
+            """
+        )
+        await tx.commit()
+        # Fresh-install conditions held (no canonical jobs, no live
+        # canonical-only workers) so the auto-finalize gate fired and
+        # the transition advanced straight to active. The schema is
+        # the default "awa" name from QueueStorageConfig::default().
+        assert status["state"] == "active"
+        assert status["active_engine"] == "queue_storage"
+        assert status["active_schema"] == "awa"
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_default_start_with_canonical_backlog_stays_canonical(client):
+    """Counterpart to the auto-finalize test: a database with
+    in-flight canonical work fails the
+    `storage_auto_finalize_if_fresh()` precondition (canonical jobs
+    exist), so the auto runtime keeps draining canonical until an
+    operator explicitly runs the staged transition.
+    """
+    queue = "cfg_canonical_backlog_no_auto_finalize"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    # Park a canonical job *before* starting the worker so the
+    # auto-finalize gate sees a non-empty backlog at start time and
+    # bails out. The job's queue isn't registered yet, but
+    # `insert` only writes the canonical row — the registration
+    # check fires at start time.
+    await client.insert(ConfigTestJob(value="canonical-pre-start"), queue=queue)
+    try:
+        await client.start([(queue, 1)], poll_interval_ms=25)
+        await asyncio.wait_for(seen.wait(), timeout=2.0)
+
+        tx = await client.transaction()
+        status = await tx.fetch_one(
+            """
+            SELECT
+                awa.active_queue_storage_schema() AS active_schema,
+                (SELECT state FROM awa.storage_status()) AS state,
+                (SELECT active_engine FROM awa.storage_status()) AS active_engine
+            """
+        )
+        await tx.commit()
+        assert status["state"] == "canonical"
+        assert status["active_engine"] == "canonical"
+        assert status["active_schema"] is None
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_invalid_storage_transition_role_raises(client):
+    """Unknown storage_transition_role values should be rejected early."""
+    queue = "cfg_bad_transition_role"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    with pytest.raises(ValueError, match="storage_transition_role must be one of"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            storage_transition_role="queue-storage-now",
+        )
+
+
+@pytest.mark.asyncio
+async def test_queue_storage_target_role_executes_after_mixed_transition(client):
+    """A queue-storage target worker can start before the routing flip and pick up new work immediately."""
+    queue = "cfg_queue_storage_target"
+    schema = "awa_py_cfg_target"
+    auto_count = 0
+    target_count = 0
+    auto_seen = asyncio.Event()
+    target_seen = asyncio.Event()
+    target_client = awa.AsyncClient(DATABASE_URL)
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle_auto(job):
+        nonlocal auto_count
+        auto_count += 1
+        auto_seen.set()
+        return None
+
+    @target_client.task(ConfigTestJob, queue=queue)
+    async def handle_target(job):
+        nonlocal target_count
+        target_count += 1
+        target_seen.set()
+        return None
+
+    try:
+        await target_client.migrate()
+
+        # Staged 0.5 → 0.6 transition setup: drop any leftover schema,
+        # flip the transition singleton to `prepared` with this run's
+        # schema name, and materialize the schema's tables /
+        # functions. The `resolve_effective_storage` gate refuses to
+        # start a 0.6 runtime against a `prepared`-state schema whose
+        # tables don't physically exist, so the prep step is required
+        # before either client can start.
+        tx = await client.transaction()
+        await tx.execute("SELECT * FROM awa.storage_abort()")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await tx.execute(
+            "SELECT * FROM awa.storage_prepare('queue_storage', jsonb_build_object('schema', $1::text))",
+            schema,
+        )
+        await tx.commit()
+        await target_client.prepare_queue_storage_schema(schema=schema)
+
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_schema=schema,
+        )
+        await target_client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_schema=schema,
+            storage_transition_role="queue_storage_target",
+        )
+
+        preflip_job = await client.insert(ConfigTestJob(value="before-flip"), queue=queue)
+        await asyncio.wait_for(auto_seen.wait(), timeout=2.0)
+        fetched = await wait_for_job_state(client, preflip_job.id, awa.JobState.Completed)
+        assert fetched.state == awa.JobState.Completed
+        assert auto_count == 1
+        assert target_count == 0
+
+        tx = await client.transaction()
+        await tx.execute("SELECT * FROM awa.storage_enter_mixed_transition()")
+        status = await tx.fetch_one(
+            """
+            SELECT
+                (SELECT state FROM awa.storage_status()) AS state,
+                (SELECT active_engine FROM awa.storage_status()) AS active_engine,
+                awa.active_queue_storage_schema() AS active_schema
+            """
+        )
+        await tx.commit()
+        assert status["state"] == "mixed_transition"
+        assert status["active_engine"] == "queue_storage"
+        assert status["active_schema"] == schema
+
+        postflip_job = await client.insert(ConfigTestJob(value="after-flip"), queue=queue)
+        await asyncio.wait_for(target_seen.wait(), timeout=2.0)
+        fetched = await wait_for_job_state(client, postflip_job.id, awa.JobState.Completed)
+        assert fetched.state == awa.JobState.Completed
+        assert auto_count == 1
+        assert target_count == 1
+    finally:
+        await target_client.shutdown()
+        await target_client.close()
+        await client.shutdown()
+        await client.close()
+        reset = awa.AsyncClient(DATABASE_URL)
+        try:
+            tx = await reset.transaction()
+            await tx.execute("DELETE FROM awa.runtime_instances")
+            await tx.execute(
+                """
+                UPDATE awa.storage_transition_state
+                SET current_engine = 'canonical',
+                    prepared_engine = NULL,
+                    state = 'canonical',
+                    transition_epoch = transition_epoch + 1,
+                    details = '{}'::jsonb,
+                    updated_at = now(),
+                    finalized_at = NULL
+                WHERE singleton
+                """
+            )
+            await tx.execute(
+                "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+            )
+            await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+            await tx.commit()
+        finally:
+            await reset.close()
+
+
+@pytest.mark.asyncio
+async def test_install_queue_storage_rejected_while_runtime_is_running(client):
+    """install_queue_storage() is blocked once the worker runtime has started."""
+    queue = "cfg_install_queue_storage_guard"
+    schema = "awa_py_cfg_runtime_guard"
+
+    tx = await client.transaction()
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+    await tx.commit()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    try:
+        await client.start([(queue, 1)], poll_interval_ms=25, queue_storage_schema=schema)
+        with pytest.raises(awa.AwaError, match="cannot install queue storage while the worker runtime is running"):
+            await client.install_queue_storage(schema=f"{schema}_other")
+    finally:
+        await client.shutdown()
+        tx = await client.transaction()
+        await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        await tx.execute(f"DROP SCHEMA IF EXISTS {schema}_other CASCADE")
+        await tx.commit()
+
+
+@pytest.mark.asyncio
+async def test_queue_storage_claim_ring_knobs_validate(client):
+    """ADR-023 claim-ring sizing/cadence parameters reach the Rust binding.
+
+    Negative values for the new claim_slot_count / claim_rotate_interval_ms
+    knobs must be rejected before any partial worker setup runs. This is the
+    counterpart to the existing queue/lease validation; without this test, a
+    stub default could silently mask the parameter wiring breaking.
+    """
+    queue = "cfg_claim_ring_validation"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    with pytest.raises(ValueError, match="queue_storage_claim_slot_count must be > 0"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_claim_slot_count=0,
+        )
+
+    with pytest.raises(ValueError, match="queue_storage_claim_rotate_interval_ms must be > 0"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_claim_rotate_interval_ms=0,
+        )

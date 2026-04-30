@@ -1,6 +1,8 @@
+use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
+use crate::storage::RuntimeStorage;
 use awa_model::cron::{atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow};
-use awa_model::{JobRow, PeriodicJob};
+use awa_model::{JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome};
 use chrono::Utc;
 use croner::Cron;
 use sqlx::pool::PoolConnection;
@@ -19,6 +21,8 @@ pub struct RetentionPolicy {
     pub completed: Duration,
     /// How long to keep failed/cancelled jobs before cleanup.
     pub failed: Duration,
+    /// How long to keep DLQ rows before cleanup.
+    pub dlq: Option<Duration>,
 }
 
 impl Default for RetentionPolicy {
@@ -26,6 +30,7 @@ impl Default for RetentionPolicy {
         Self {
             completed: Duration::from_secs(86400), // 24h
             failed: Duration::from_secs(259200),   // 72h
+            dlq: None,
         }
     }
 }
@@ -44,6 +49,7 @@ pub struct MaintenanceService {
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
+    storage: RuntimeStorage,
     heartbeat_rescue_interval: Duration,
     deadline_rescue_interval: Duration,
     callback_rescue_interval: Duration,
@@ -59,6 +65,9 @@ pub struct MaintenanceService {
     cleanup_batch_size: i64,
     queue_retention_overrides: HashMap<String, RetentionPolicy>,
     queue_stats_interval: Duration,
+    dlq_retention: Duration,
+    dlq_cleanup_batch_size: i64,
+    dlq_policy: DlqPolicy,
     dirty_key_recompute_interval: Duration,
     metadata_reconciliation_interval: Duration,
     /// Interval for priority aging — jobs waiting longer than this have their
@@ -72,8 +81,10 @@ pub struct MaintenanceService {
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
+type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
 
 impl MaintenanceService {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         pool: PgPool,
         metrics: crate::metrics::AwaMetrics,
@@ -82,6 +93,7 @@ impl MaintenanceService {
         cancel: CancellationToken,
         periodic_jobs: Arc<Vec<PeriodicJob>>,
         in_flight: InFlightMap,
+        storage: RuntimeStorage,
     ) -> Self {
         Self {
             pool,
@@ -91,6 +103,7 @@ impl MaintenanceService {
             alive,
             periodic_jobs,
             in_flight,
+            storage,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             callback_rescue_interval: Duration::from_secs(30),
@@ -106,6 +119,9 @@ impl MaintenanceService {
             cleanup_batch_size: 1000,
             queue_retention_overrides: HashMap::new(),
             queue_stats_interval: Duration::from_secs(30),
+            dlq_retention: Duration::from_secs(60 * 60 * 24 * 30),
+            dlq_cleanup_batch_size: 1000,
+            dlq_policy: DlqPolicy::default(),
             dirty_key_recompute_interval: Duration::from_secs(2),
             metadata_reconciliation_interval: Duration::from_secs(60),
             priority_aging_interval: Duration::from_secs(60),
@@ -214,6 +230,24 @@ impl MaintenanceService {
         self
     }
 
+    /// Set retention for DLQ rows (default: 30 days).
+    pub fn dlq_retention(mut self, retention: Duration) -> Self {
+        self.dlq_retention = retention;
+        self
+    }
+
+    /// Set the maximum number of DLQ rows deleted per cleanup pass (default: 1000).
+    pub fn dlq_cleanup_batch_size(mut self, batch_size: i64) -> Self {
+        self.dlq_cleanup_batch_size = batch_size;
+        self
+    }
+
+    /// Set the per-queue DLQ policy.
+    pub(crate) fn dlq_policy(mut self, policy: DlqPolicy) -> Self {
+        self.dlq_policy = policy;
+        self
+    }
+
     /// Set per-queue retention overrides.
     pub fn queue_retention_overrides(
         mut self,
@@ -276,6 +310,18 @@ impl MaintenanceService {
             let mut metadata_reconciliation_timer =
                 tokio::time::interval(self.metadata_reconciliation_interval);
             let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
+            let mut vacuum_queue_timer = self
+                .storage
+                .queue_storage()
+                .map(|runtime| tokio::time::interval(runtime.queue_rotate_interval));
+            let mut vacuum_lease_timer = self
+                .storage
+                .queue_storage()
+                .map(|runtime| tokio::time::interval(runtime.lease_rotate_interval));
+            let mut vacuum_claim_timer = self
+                .storage
+                .queue_storage()
+                .map(|runtime| tokio::time::interval(runtime.claim_rotate_interval));
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -290,6 +336,15 @@ impl MaintenanceService {
             dirty_key_timer.tick().await;
             metadata_reconciliation_timer.tick().await;
             priority_aging_timer.tick().await;
+            if let Some(timer) = &mut vacuum_queue_timer {
+                timer.tick().await;
+            }
+            if let Some(timer) = &mut vacuum_lease_timer {
+                timer.tick().await;
+            }
+            if let Some(timer) = &mut vacuum_claim_timer {
+                timer.tick().await;
+            }
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
@@ -318,6 +373,7 @@ impl MaintenanceService {
                     }
                     _ = cleanup_timer.tick() => {
                         self.cleanup_completed().await;
+                        self.cleanup_dlq_rows().await;
                         self.cleanup_stale_runtime_snapshots().await;
                         self.cleanup_stale_descriptors().await;
                     }
@@ -338,6 +394,33 @@ impl MaintenanceService {
                     }
                     _ = priority_aging_timer.tick() => {
                         self.age_waiting_priorities().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut vacuum_queue_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if vacuum_queue_timer.is_some() => {
+                        self.rotate_queue_storage_queue().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut vacuum_lease_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if vacuum_lease_timer.is_some() => {
+                        self.rotate_queue_storage_leases().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut vacuum_claim_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if vacuum_claim_timer.is_some() => {
+                        self.rotate_queue_storage_claims().await;
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -462,39 +545,50 @@ impl MaintenanceService {
     /// Rescue jobs with stale heartbeats (crash detection).
     #[tracing::instrument(skip(self), name = "maintenance.rescue_stale")]
     async fn rescue_stale_heartbeats(&self) {
-        let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
-        match sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE awa.jobs
-            SET state = 'retryable',
-                finalized_at = now(),
-                heartbeat_at = NULL,
-                deadline_at = NULL,
-                callback_id = NULL,
-                callback_timeout_at = NULL,
-                callback_filter = NULL,
-                callback_on_complete = NULL,
-                callback_on_fail = NULL,
-                callback_transform = NULL,
-                errors = errors || jsonb_build_object(
-                    'error', 'heartbeat stale: worker presumed dead',
-                    'attempt', attempt,
-                    'at', now()
-                )::jsonb
-            WHERE id IN (
-                SELECT id FROM awa.jobs_hot
-                WHERE state = 'running'
-                  AND heartbeat_at < now() - ($1 * interval '1 millisecond')
-                LIMIT 500
-                FOR UPDATE SKIP LOCKED
-            )
-            RETURNING *
-            "#,
-        )
-        .bind(staleness_ms)
-        .fetch_all(&self.pool)
-        .await
-        {
+        let outcome = match &self.storage {
+            RuntimeStorage::Canonical => {
+                let staleness_ms = self.heartbeat_staleness.as_millis() as i64;
+                sqlx::query_as::<_, JobRow>(
+                    r#"
+                    UPDATE awa.jobs
+                    SET state = 'retryable',
+                        finalized_at = now(),
+                        heartbeat_at = NULL,
+                        deadline_at = NULL,
+                        callback_id = NULL,
+                        callback_timeout_at = NULL,
+                        callback_filter = NULL,
+                        callback_on_complete = NULL,
+                        callback_on_fail = NULL,
+                        callback_transform = NULL,
+                        errors = errors || jsonb_build_object(
+                            'error', 'heartbeat stale: worker presumed dead',
+                            'attempt', attempt,
+                            'at', now()
+                        )::jsonb
+                    WHERE id IN (
+                        SELECT id FROM awa.jobs_hot
+                        WHERE state = 'running'
+                          AND heartbeat_at < now() - ($1 * interval '1 millisecond')
+                        LIMIT 500
+                        FOR UPDATE SKIP LOCKED
+                    )
+                    RETURNING *
+                    "#,
+                )
+                .bind(staleness_ms)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(awa_model::AwaError::Database)
+            }
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime
+                    .store
+                    .rescue_stale_heartbeats(&self.pool, self.heartbeat_staleness)
+                    .await
+            }
+        };
+        match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 self.metrics.maintenance_rescues.add(
                     rescued.len() as u64,
@@ -514,38 +608,44 @@ impl MaintenanceService {
     /// Rescue jobs that exceeded their hard deadline.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_deadline")]
     async fn rescue_expired_deadlines(&self) {
-        match sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE awa.jobs
-            SET state = 'retryable',
-                finalized_at = now(),
-                heartbeat_at = NULL,
-                deadline_at = NULL,
-                callback_id = NULL,
-                callback_timeout_at = NULL,
-                callback_filter = NULL,
-                callback_on_complete = NULL,
-                callback_on_fail = NULL,
-                callback_transform = NULL,
-                errors = errors || jsonb_build_object(
-                    'error', 'hard deadline exceeded',
-                    'attempt', attempt,
-                    'at', now()
-                )::jsonb
-            WHERE id IN (
-                SELECT id FROM awa.jobs_hot
-                WHERE state = 'running'
-                  AND deadline_at IS NOT NULL
-                  AND deadline_at < now()
-                LIMIT 500
-                FOR UPDATE SKIP LOCKED
+        let outcome = match &self.storage {
+            RuntimeStorage::Canonical => sqlx::query_as::<_, JobRow>(
+                r#"
+                UPDATE awa.jobs
+                SET state = 'retryable',
+                    finalized_at = now(),
+                    heartbeat_at = NULL,
+                    deadline_at = NULL,
+                    callback_id = NULL,
+                    callback_timeout_at = NULL,
+                    callback_filter = NULL,
+                    callback_on_complete = NULL,
+                    callback_on_fail = NULL,
+                    callback_transform = NULL,
+                    errors = errors || jsonb_build_object(
+                        'error', 'hard deadline exceeded',
+                        'attempt', attempt,
+                        'at', now()
+                    )::jsonb
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_hot
+                    WHERE state = 'running'
+                      AND deadline_at IS NOT NULL
+                      AND deadline_at < now()
+                    LIMIT 500
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
+                "#,
             )
-            RETURNING *
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        {
+            .fetch_all(&self.pool)
+            .await
+            .map_err(awa_model::AwaError::Database),
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime.store.rescue_expired_deadlines(&self.pool).await
+            }
+        };
+        match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 self.metrics.maintenance_rescues.add(
                     rescued.len() as u64,
@@ -565,38 +665,44 @@ impl MaintenanceService {
     /// Rescue jobs whose callback timeout has expired.
     #[tracing::instrument(skip(self), name = "maintenance.rescue_callback_timeout")]
     async fn rescue_expired_callbacks(&self) {
-        match sqlx::query_as::<_, JobRow>(
-            r#"
-            UPDATE awa.jobs
-            SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
-                finalized_at = now(),
-                callback_id = NULL,
-                callback_timeout_at = NULL,
-                callback_filter = NULL,
-                callback_on_complete = NULL,
-                callback_on_fail = NULL,
-                callback_transform = NULL,
-                run_at = CASE WHEN attempt >= max_attempts THEN run_at
-                         ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
-                errors = errors || jsonb_build_object(
-                    'error', 'callback timed out',
-                    'attempt', attempt,
-                    'at', now()
-                )::jsonb
-            WHERE id IN (
-                SELECT id FROM awa.jobs_hot
-                WHERE state = 'waiting_external'
-                  AND callback_timeout_at IS NOT NULL
-                  AND callback_timeout_at < now()
-                LIMIT 500
-                FOR UPDATE SKIP LOCKED
+        let outcome = match &self.storage {
+            RuntimeStorage::Canonical => sqlx::query_as::<_, JobRow>(
+                r#"
+                UPDATE awa.jobs
+                SET state = CASE WHEN attempt >= max_attempts THEN 'failed'::awa.job_state ELSE 'retryable'::awa.job_state END,
+                    finalized_at = now(),
+                    callback_id = NULL,
+                    callback_timeout_at = NULL,
+                    callback_filter = NULL,
+                    callback_on_complete = NULL,
+                    callback_on_fail = NULL,
+                    callback_transform = NULL,
+                    run_at = CASE WHEN attempt >= max_attempts THEN run_at
+                             ELSE now() + awa.backoff_duration(attempt, max_attempts) END,
+                    errors = errors || jsonb_build_object(
+                        'error', 'callback timed out',
+                        'attempt', attempt,
+                        'at', now()
+                    )::jsonb
+                WHERE id IN (
+                    SELECT id FROM awa.jobs_hot
+                    WHERE state = 'waiting_external'
+                      AND callback_timeout_at IS NOT NULL
+                      AND callback_timeout_at < now()
+                    LIMIT 500
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
+                "#,
             )
-            RETURNING *
-            "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        {
+            .fetch_all(&self.pool)
+            .await
+            .map_err(awa_model::AwaError::Database),
+            RuntimeStorage::QueueStorage(runtime) => {
+                runtime.store.rescue_expired_callbacks(&self.pool).await
+            }
+        };
+        match outcome {
             Ok(rescued) if !rescued.is_empty() => {
                 self.metrics.maintenance_rescues.add(
                     rescued.len() as u64,
@@ -606,6 +712,35 @@ impl MaintenanceService {
                     )],
                 );
                 warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
+                if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
+                    for job in &rescued {
+                        if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue)
+                        {
+                            continue;
+                        }
+                        match runtime
+                            .store
+                            .move_failed_to_dlq(&self.pool, job.id, "callback_timeout")
+                            .await
+                        {
+                            Ok(Some(_)) => {
+                                self.metrics.record_dlq_moved(
+                                    &job.kind,
+                                    &job.queue,
+                                    "callback_timeout",
+                                );
+                            }
+                            Ok(None) => {}
+                            Err(err) => {
+                                error!(
+                                    job_id = job.id,
+                                    error = %err,
+                                    "Failed to move rescued callback timeout into DLQ"
+                                );
+                            }
+                        }
+                    }
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
@@ -622,10 +757,18 @@ impl MaintenanceService {
     /// report it accurately.
     #[tracing::instrument(skip(self), name = "maintenance.priority_aging")]
     async fn age_waiting_priorities(&self) {
-        let aging_secs = self.priority_aging_interval.as_secs() as f64;
+        let aging_secs = self.priority_aging_interval.as_secs_f64();
         if aging_secs <= 0.0 {
             return;
         }
+        if let Some(runtime) = self.storage.queue_storage() {
+            debug!(
+                schema = %runtime.store.schema(),
+                "Queue storage uses claim-time priority aging; skipping physical reprioritization pass"
+            );
+            return;
+        }
+
         match sqlx::query_scalar::<_, i64>(
             r#"
             WITH eligible AS (
@@ -690,7 +833,7 @@ impl MaintenanceService {
         &self,
         state: &'static str,
         label: &'static str,
-    ) -> Result<(), sqlx::Error> {
+    ) -> Result<(), awa_model::AwaError> {
         let mut promoted_total = 0usize;
         let mut notified_queues = HashSet::new();
 
@@ -699,16 +842,53 @@ impl MaintenanceService {
                 break;
             }
 
-            let (promoted, queues) = self.promote_due_batch(state).await?;
-            if promoted == 0 {
-                break;
-            }
+            match &self.storage {
+                RuntimeStorage::Canonical => {
+                    let (promoted, queues) = self
+                        .promote_due_batch(state)
+                        .await
+                        .map_err(awa_model::AwaError::Database)?;
+                    if promoted == 0 {
+                        break;
+                    }
 
-            promoted_total += promoted;
-            notified_queues.extend(queues);
+                    promoted_total += promoted;
+                    notified_queues.extend(queues);
 
-            if promoted < PROMOTE_BATCH_SIZE as usize {
-                break;
+                    if promoted < PROMOTE_BATCH_SIZE as usize {
+                        break;
+                    }
+                }
+                RuntimeStorage::QueueStorage(runtime) => {
+                    let job_state = match state {
+                        "scheduled" => awa_model::JobState::Scheduled,
+                        "retryable" => awa_model::JobState::Retryable,
+                        other => {
+                            return Err(awa_model::AwaError::Validation(format!(
+                                "unsupported queue storage promote state: {other}"
+                            )));
+                        }
+                    };
+                    let promote_start = std::time::Instant::now();
+                    let promoted = runtime
+                        .store
+                        .promote_due(&self.pool, job_state, PROMOTE_BATCH_SIZE)
+                        .await?;
+                    self.metrics.record_promotion_batch(
+                        state,
+                        promoted as u64,
+                        promote_start.elapsed(),
+                    );
+                    if promoted == 0 {
+                        break;
+                    }
+
+                    promoted_total += promoted;
+
+                    if promoted < PROMOTE_BATCH_SIZE as usize {
+                        break;
+                    }
+                }
             }
         }
 
@@ -815,6 +995,185 @@ impl MaintenanceService {
         Ok((promoted, queues))
     }
 
+    async fn rotate_queue_storage_queue(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+
+        match runtime.store.rotate(&self.pool).await {
+            Ok(outcome) => {
+                self.metrics.record_rotate_outcome("queue", &outcome);
+                match outcome {
+                    RotateOutcome::Rotated { slot, generation } => {
+                        debug!(slot, generation, "Rotated queue storage queue segment");
+                    }
+                    RotateOutcome::SkippedBusy { slot, busy } => {
+                        debug!(
+                            slot,
+                            ready_rows = busy.queue_ready,
+                            done_rows = busy.queue_done,
+                            "Skipped busy queue storage queue segment",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rotate queue storage queue segments");
+                return;
+            }
+        }
+
+        match runtime.store.prune_oldest(&self.pool).await {
+            Ok(outcome) => {
+                self.metrics.record_prune_outcome("queue", &outcome);
+                match outcome {
+                    PruneOutcome::Noop => {}
+                    PruneOutcome::Pruned { slot } => {
+                        debug!(slot, "Pruned queue storage queue segment");
+                    }
+                    PruneOutcome::Blocked { slot } => {
+                        debug!(slot, "Queue storage queue segment prune blocked");
+                    }
+                    PruneOutcome::SkippedActive {
+                        slot,
+                        reason,
+                        count,
+                    } => {
+                        debug!(
+                            slot,
+                            reason = reason.as_str(),
+                            count,
+                            "Queue storage queue segment still active",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to prune queue storage queue segments");
+            }
+        }
+    }
+
+    async fn rotate_queue_storage_leases(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+
+        match runtime.store.rotate_leases(&self.pool).await {
+            Ok(outcome) => {
+                self.metrics.record_rotate_outcome("lease", &outcome);
+                match outcome {
+                    RotateOutcome::Rotated { slot, generation } => {
+                        debug!(slot, generation, "Rotated queue storage lease segment");
+                    }
+                    RotateOutcome::SkippedBusy { slot, busy } => {
+                        debug!(
+                            slot,
+                            lease_rows = busy.leases,
+                            "Skipped busy queue storage lease segment",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rotate queue storage lease segments");
+                return;
+            }
+        }
+
+        match runtime.store.prune_oldest_leases(&self.pool).await {
+            Ok(outcome) => {
+                self.metrics.record_prune_outcome("lease", &outcome);
+                match outcome {
+                    PruneOutcome::Noop => {}
+                    PruneOutcome::Pruned { slot } => {
+                        debug!(slot, "Pruned queue storage lease segment");
+                    }
+                    PruneOutcome::Blocked { slot } => {
+                        debug!(slot, "Queue storage lease segment prune blocked");
+                    }
+                    PruneOutcome::SkippedActive {
+                        slot,
+                        reason,
+                        count,
+                    } => {
+                        debug!(
+                            slot,
+                            reason = reason.as_str(),
+                            count,
+                            "Queue storage lease segment still active",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to prune queue storage lease segments");
+            }
+        }
+    }
+
+    /// Claim-ring maintenance tick (see ADR-023). Rotates the claim-ring
+    /// cursor and prunes the oldest fully-closed partition, mirroring the
+    /// lease-ring rotate/prune pair above.
+    async fn rotate_queue_storage_claims(&self) {
+        let Some(runtime) = self.storage.queue_storage() else {
+            return;
+        };
+
+        match runtime.store.rotate_claims(&self.pool).await {
+            Ok(outcome) => {
+                self.metrics.record_rotate_outcome("claim", &outcome);
+                match outcome {
+                    RotateOutcome::Rotated { slot, generation } => {
+                        debug!(slot, generation, "Rotated queue storage claim segment");
+                    }
+                    RotateOutcome::SkippedBusy { slot, busy } => {
+                        debug!(
+                            slot,
+                            claim_rows = busy.claims,
+                            closure_rows = busy.closures,
+                            "Skipped busy queue storage claim segment",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to rotate queue storage claim segments");
+                return;
+            }
+        }
+
+        match runtime.store.prune_oldest_claims(&self.pool).await {
+            Ok(outcome) => {
+                self.metrics.record_prune_outcome("claim", &outcome);
+                match outcome {
+                    PruneOutcome::Noop => {}
+                    PruneOutcome::Pruned { slot } => {
+                        debug!(slot, "Pruned queue storage claim segment");
+                    }
+                    PruneOutcome::Blocked { slot } => {
+                        debug!(slot, "Queue storage claim segment prune blocked");
+                    }
+                    PruneOutcome::SkippedActive {
+                        slot,
+                        reason,
+                        count,
+                    } => {
+                        debug!(
+                            slot,
+                            reason = reason.as_str(),
+                            count,
+                            "Queue storage claim segment still active",
+                        );
+                    }
+                }
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to prune queue storage claim segments");
+            }
+        }
+    }
+
     /// Clean up completed/failed/cancelled jobs past retention.
     ///
     /// Targets `jobs_hot` directly (bypassing the `awa.jobs` INSTEAD OF trigger)
@@ -823,14 +1182,21 @@ impl MaintenanceService {
     /// for queues with custom retention.
     #[tracing::instrument(skip(self), name = "maintenance.cleanup")]
     async fn cleanup_completed(&self) {
+        if matches!(self.storage, RuntimeStorage::QueueStorage(_)) {
+            // Queue storage uses rotation/prune rather than row-by-row cleanup.
+            return;
+        }
+
         let mut total_deleted: u64 = 0;
 
         // Collect override queue names for the exclusion clause
         let override_queues: Vec<String> = self.queue_retention_overrides.keys().cloned().collect();
 
         // Global pass: delete jobs in queues that do NOT have overrides
-        let completed_retention = format!("{} seconds", self.completed_retention.as_secs());
-        let failed_retention = format!("{} seconds", self.failed_retention.as_secs());
+        let completed_retention_secs =
+            i64::try_from(self.completed_retention.as_secs()).unwrap_or(i64::MAX);
+        let failed_retention_secs =
+            i64::try_from(self.failed_retention.as_secs()).unwrap_or(i64::MAX);
 
         let global_result = if override_queues.is_empty() {
             sqlx::query(
@@ -838,14 +1204,14 @@ impl MaintenanceService {
                 DELETE FROM awa.jobs_hot
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
-                    WHERE (state = 'completed' AND finalized_at < now() - $1::interval)
-                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval)
+                    WHERE (state = 'completed' AND finalized_at < now() - make_interval(secs => $1::bigint))
+                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - make_interval(secs => $2::bigint))
                     LIMIT $3
                 )
                 "#,
             )
-            .bind(&completed_retention)
-            .bind(&failed_retention)
+            .bind(completed_retention_secs)
+            .bind(failed_retention_secs)
             .bind(self.cleanup_batch_size)
             .execute(&self.pool)
             .await
@@ -855,15 +1221,15 @@ impl MaintenanceService {
                 DELETE FROM awa.jobs_hot
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
-                    WHERE ((state = 'completed' AND finalized_at < now() - $1::interval)
-                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval))
+                    WHERE ((state = 'completed' AND finalized_at < now() - make_interval(secs => $1::bigint))
+                       OR (state IN ('failed', 'cancelled') AND finalized_at < now() - make_interval(secs => $2::bigint)))
                       AND queue != ALL($4::text[])
                     LIMIT $3
                 )
                 "#,
             )
-            .bind(&completed_retention)
-            .bind(&failed_retention)
+            .bind(completed_retention_secs)
+            .bind(failed_retention_secs)
             .bind(self.cleanup_batch_size)
             .bind(&override_queues)
             .execute(&self.pool)
@@ -882,8 +1248,9 @@ impl MaintenanceService {
 
         // Per-queue override passes
         for (queue_name, policy) in &self.queue_retention_overrides {
-            let queue_completed = format!("{} seconds", policy.completed.as_secs());
-            let queue_failed = format!("{} seconds", policy.failed.as_secs());
+            let queue_completed_secs =
+                i64::try_from(policy.completed.as_secs()).unwrap_or(i64::MAX);
+            let queue_failed_secs = i64::try_from(policy.failed.as_secs()).unwrap_or(i64::MAX);
 
             match sqlx::query(
                 r#"
@@ -891,14 +1258,14 @@ impl MaintenanceService {
                 WHERE id IN (
                     SELECT id FROM awa.jobs_hot
                     WHERE queue = $4
-                      AND ((state = 'completed' AND finalized_at < now() - $1::interval)
-                        OR (state IN ('failed', 'cancelled') AND finalized_at < now() - $2::interval))
+                      AND ((state = 'completed' AND finalized_at < now() - make_interval(secs => $1::bigint))
+                        OR (state IN ('failed', 'cancelled') AND finalized_at < now() - make_interval(secs => $2::bigint)))
                     LIMIT $3
                 )
                 "#,
             )
-            .bind(&queue_completed)
-            .bind(&queue_failed)
+            .bind(queue_completed_secs)
+            .bind(queue_failed_secs)
             .bind(self.cleanup_batch_size)
             .bind(queue_name)
             .execute(&self.pool)
@@ -925,6 +1292,99 @@ impl MaintenanceService {
 
         if total_deleted > 0 {
             info!(count = total_deleted, "Cleaned up old jobs");
+        }
+    }
+
+    #[tracing::instrument(skip(self), name = "maintenance.cleanup_dlq")]
+    async fn cleanup_dlq_rows(&self) {
+        let RuntimeStorage::QueueStorage(runtime) = &self.storage else {
+            return;
+        };
+
+        let schema = runtime.store.schema();
+        let override_queues: Vec<&str> = self
+            .queue_retention_overrides
+            .iter()
+            .filter(|(_, policy)| policy.dlq.is_some())
+            .map(|(queue, _)| queue.as_str())
+            .collect();
+        let retention_secs = i64::try_from(self.dlq_retention.as_secs()).unwrap_or(i64::MAX);
+
+        let global_result = if override_queues.is_empty() {
+            sqlx::query(&format!(
+                r#"
+                DELETE FROM {schema}.dlq_entries
+                WHERE job_id IN (
+                    SELECT job_id FROM {schema}.dlq_entries
+                    WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+                    LIMIT $2
+                )
+                "#
+            ))
+            .bind(retention_secs)
+            .bind(self.dlq_cleanup_batch_size)
+            .execute(&self.pool)
+            .await
+        } else {
+            sqlx::query(&format!(
+                r#"
+                DELETE FROM {schema}.dlq_entries
+                WHERE job_id IN (
+                    SELECT job_id FROM {schema}.dlq_entries
+                    WHERE dlq_at < now() - make_interval(secs => $1::bigint)
+                      AND queue != ALL($3::text[])
+                    LIMIT $2
+                )
+                "#
+            ))
+            .bind(retention_secs)
+            .bind(self.dlq_cleanup_batch_size)
+            .bind(&override_queues)
+            .execute(&self.pool)
+            .await
+        };
+
+        match global_result {
+            Ok(result) if result.rows_affected() > 0 => {
+                self.metrics.record_dlq_purged(None, result.rows_affected());
+            }
+            Err(err) => {
+                error!(error = %err, "Failed to clean up DLQ rows (global pass)");
+            }
+            _ => {}
+        }
+
+        for (queue, policy) in &self.queue_retention_overrides {
+            let Some(retention) = policy.dlq else {
+                continue;
+            };
+            let retention_secs = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
+            match sqlx::query(&format!(
+                r#"
+                DELETE FROM {schema}.dlq_entries
+                WHERE job_id IN (
+                    SELECT job_id FROM {schema}.dlq_entries
+                    WHERE queue = $3
+                      AND dlq_at < now() - make_interval(secs => $1::bigint)
+                    LIMIT $2
+                )
+                "#
+            ))
+            .bind(retention_secs)
+            .bind(self.dlq_cleanup_batch_size)
+            .bind(queue)
+            .execute(&self.pool)
+            .await
+            {
+                Ok(result) if result.rows_affected() > 0 => {
+                    self.metrics
+                        .record_dlq_purged(Some(queue), result.rows_affected());
+                }
+                Err(err) => {
+                    error!(queue, error = %err, "Failed to clean up DLQ rows");
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -1034,6 +1494,9 @@ impl MaintenanceService {
     /// every ~2s to keep dashboard counters fresh.
     #[tracing::instrument(skip(self), name = "maintenance.recompute_dirty_metadata")]
     async fn recompute_dirty_admin_metadata(&self) {
+        if self.storage.queue_storage().is_some() {
+            return;
+        }
         match awa_model::admin::recompute_dirty_admin_metadata(&self.pool).await {
             Ok(count) if count > 0 => {
                 tracing::debug!(count, "Recomputed dirty admin metadata keys");
@@ -1049,6 +1512,9 @@ impl MaintenanceService {
     /// Safety net for any drift — runs infrequently (~60s).
     #[tracing::instrument(skip(self), name = "maintenance.refresh_admin_metadata")]
     async fn refresh_admin_metadata(&self) {
+        if self.storage.queue_storage().is_some() {
+            return;
+        }
         if let Err(err) = awa_model::admin::refresh_admin_metadata(&self.pool).await {
             tracing::warn!(error = %err, "Failed to refresh admin metadata");
         }
@@ -1057,6 +1523,11 @@ impl MaintenanceService {
     /// Publish queue depth and lag as OTel gauge metrics.
     #[tracing::instrument(skip(self), name = "maintenance.queue_stats")]
     async fn publish_queue_health_metrics(&self) {
+        if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
+            self.publish_queue_storage_health_metrics(runtime).await;
+            return;
+        }
+
         let stats = match awa_model::admin::queue_overviews(&self.pool).await {
             Ok(stats) => stats,
             Err(err) => {
@@ -1085,6 +1556,134 @@ impl MaintenanceService {
             // Lag
             if let Some(lag_seconds) = queue_stat.lag_seconds {
                 self.metrics.record_queue_lag(queue, lag_seconds);
+            }
+        }
+    }
+
+    async fn publish_queue_storage_health_metrics(
+        &self,
+        runtime: &crate::storage::QueueStorageRuntime,
+    ) {
+        let schema = runtime.store.schema();
+        let rows: Vec<QueueStorageMetricRow> = match sqlx::query_as(&format!(
+            r#"
+            WITH queues AS (
+                SELECT DISTINCT queue
+                FROM (
+                    SELECT queue FROM awa.queue_meta
+                    UNION ALL
+                    SELECT queue FROM {schema}.ready_entries
+                    UNION ALL
+                    SELECT queue FROM {schema}.leases
+                    UNION ALL
+                    SELECT queue FROM {schema}.deferred_jobs
+                    UNION ALL
+                    SELECT queue FROM {schema}.done_entries
+                    UNION ALL
+                    SELECT queue FROM {schema}.dlq_entries
+                ) queues
+            ),
+            ready AS (
+                SELECT
+                    queue,
+                    count(*)::bigint AS available,
+                    EXTRACT(EPOCH FROM clock_timestamp() - min(run_at))::double precision
+                        AS lag_seconds
+                FROM {schema}.ready_entries
+                GROUP BY queue
+            ),
+            leases AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'running')::bigint AS running,
+                    count(*) FILTER (WHERE state = 'waiting_external')::bigint
+                        AS waiting_external
+                FROM {schema}.leases
+                GROUP BY queue
+            ),
+            deferred AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'scheduled')::bigint AS scheduled,
+                    count(*) FILTER (WHERE state = 'retryable')::bigint AS retryable
+                FROM {schema}.deferred_jobs
+                GROUP BY queue
+            ),
+            terminal AS (
+                SELECT
+                    queue,
+                    count(*) FILTER (WHERE state = 'failed')::bigint AS failed_done
+                FROM {schema}.done_entries
+                GROUP BY queue
+            ),
+            dlq AS (
+                SELECT
+                    queue,
+                    count(*)::bigint AS failed_dlq
+                FROM {schema}.dlq_entries
+                GROUP BY queue
+            )
+            SELECT
+                queues.queue,
+                COALESCE(ready.available, 0)::bigint AS available,
+                COALESCE(leases.running, 0)::bigint AS running,
+                COALESCE(leases.waiting_external, 0)::bigint AS waiting_external,
+                COALESCE(deferred.scheduled, 0)::bigint AS scheduled,
+                COALESCE(deferred.retryable, 0)::bigint AS retryable,
+                COALESCE(terminal.failed_done, 0)::bigint AS failed_done,
+                COALESCE(dlq.failed_dlq, 0)::bigint AS failed_dlq,
+                ready.lag_seconds
+            FROM queues
+            LEFT JOIN ready
+              ON ready.queue = queues.queue
+            LEFT JOIN leases
+              ON leases.queue = queues.queue
+            LEFT JOIN deferred
+              ON deferred.queue = queues.queue
+            LEFT JOIN terminal
+              ON terminal.queue = queues.queue
+            LEFT JOIN dlq
+              ON dlq.queue = queues.queue
+            ORDER BY queues.queue
+            "#
+        ))
+        .fetch_all(&self.pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(err) => {
+                tracing::warn!(error = %err, "Failed to query queue storage stats for metrics");
+                return;
+            }
+        };
+
+        for (
+            queue,
+            available,
+            running,
+            waiting_external,
+            scheduled,
+            retryable,
+            failed_done,
+            failed_dlq,
+            lag_seconds,
+        ) in rows
+        {
+            self.metrics
+                .record_queue_depth(&queue, "available", available);
+            self.metrics.record_queue_depth(&queue, "running", running);
+            self.metrics
+                .record_queue_depth(&queue, "failed", failed_done + failed_dlq);
+            self.metrics
+                .record_queue_depth(&queue, "scheduled", scheduled);
+            self.metrics
+                .record_queue_depth(&queue, "retryable", retryable);
+            self.metrics
+                .record_queue_depth(&queue, "waiting_external", waiting_external);
+            self.metrics.record_dlq_depth(&queue, failed_dlq);
+
+            if let Some(lag_seconds) = lag_seconds {
+                self.metrics.record_queue_lag(&queue, lag_seconds);
             }
         }
     }

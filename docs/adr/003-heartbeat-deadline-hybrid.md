@@ -94,3 +94,17 @@ For a worker crash, heartbeat recovery kicks in within ~90-120 seconds (stalenes
 - **Write amplification:** Heartbeat updates generate write I/O proportional to the number of in-flight jobs. At 30-second intervals with 500 in-flight jobs, this is ~17 rows/second of UPDATE traffic -- negligible for Postgres. At 50,000 in-flight jobs, it becomes 100 batch updates per tick (chunked at 500), still manageable but worth monitoring.
 - **Two scan queries per maintenance cycle:** The leader runs two separate rescue queries (heartbeat staleness and deadline expiry). Both are indexed (`idx_awa_jobs_heartbeat` and `idx_awa_jobs_deadline`) and limited to 500 rows per sweep, so the cost is minimal.
 - **Complexity:** Two recovery mechanisms to understand, configure, and test. The trade-off is justified by the elimination of blind spots.
+
+## Relationship to ADR-019
+
+ADR-019 moved the mutable runtime fields (`heartbeat_at`, `deadline_at`,
+`run_lease`, callback token/timeout) from `awa.jobs_hot` onto the
+`{schema}.active_leases` rows, keyed by `(job_id, run_lease)`. The recovery
+policy in this ADR is unchanged: heartbeat staleness and deadline expiry are
+both scanned on the maintenance leader, and rescued leases are re-enqueued
+into `ready_entries`. The `UPDATE awa.jobs_hot AS jobs SET heartbeat_at =
+now() ...` SQL example above reflects the pre-ADR-019 schema; the current
+batched heartbeat UPDATE targets `active_leases` with the same
+`(job_id, run_lease)` key. The spec-level guarantees are verified in
+`AwaSegmentedStorage.tla` (short-job rescue reachable via lease-level
+heartbeat freshness) — see [ADR-019](019-queue-storage-redesign.md).

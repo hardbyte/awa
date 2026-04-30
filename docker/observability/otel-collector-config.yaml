@@ -1,0 +1,55 @@
+# OTel collector config for the awa-bench observability side-stack.
+#
+# Receives OTLP from awa-bench replicas (gRPC :4317 by default), bridges
+# into a Prometheus scrape endpoint at :8889. No traces or logs pipeline —
+# the awa runtime currently only emits metrics through OTel.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  # Batch metrics before exporting to amortise scrape-side overhead.
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+  # Drop the `service_instance_id` resource attribute when present —
+  # without it the awa.* metrics' label set explodes per-replica-restart
+  # and the existing dashboard PromQL groups break (queries do
+  # `sum by(awa_ring, ...)` and don't carry instance dimensions).
+  # The awa.bench.replica_id label still gives per-replica detail.
+  resource:
+    attributes:
+      - action: delete
+        key: service.instance.id
+
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    # Without `enable_open_metrics` the histogram bucket boundaries from
+    # OTLP get rendered with a `_bucket` suffix that PromQL handles
+    # natively; with it on, the format is OpenMetrics-style with `+Inf`
+    # bucket explicit. Standard Prometheus query syntax works either way
+    # for histogram_quantile.
+    enable_open_metrics: true
+    # Resource attributes promoted to labels become things like
+    # `service_name="awa-portable-bench"` on every series. Useful for
+    # filtering when more than one OTLP source shares the collector;
+    # cheap when there's only one.
+    resource_to_telemetry_conversion:
+      enabled: true
+
+service:
+  pipelines:
+    metrics:
+      receivers: [otlp]
+      processors: [batch, resource]
+      exporters: [prometheus]
+  telemetry:
+    logs:
+      level: info

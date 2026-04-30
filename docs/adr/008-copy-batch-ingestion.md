@@ -1,7 +1,8 @@
-# ADR 008: Batch COPY Ingestion
+# ADR-008: Batch COPY Ingestion
 
-**Status:** Accepted
-**Date:** 2026-03-18
+## Status
+
+Accepted
 
 ## Context
 
@@ -95,3 +96,15 @@ and dispatchers handle duplicates gracefully.
 - **Staging overhead remains:** COPY still pays for staging and a final insert
   into the real Awa tables, so it is not automatically faster than chunked
   multi-row `INSERT` in every workload.
+
+## Relationship to ADR-019
+
+ADR-019 supersedes the hot/deferred physical layout as Awa's primary storage
+engine. The staging-table decision in this ADR still stands: COPY into a
+session-local temp table, then route staged rows into the active storage
+backend. Under queue storage, routing targets `awa.insert_job_compat(...)`
+which appends into `{schema}.ready_entries` or `{schema}.deferred_jobs`
+rather than `jobs_hot` / `scheduled_jobs`. References in this ADR to
+`awa.jobs_hot` / `awa.scheduled_jobs` describe the canonical compatibility
+path, not the universal hot path — see
+[ADR-019](019-queue-storage-redesign.md).

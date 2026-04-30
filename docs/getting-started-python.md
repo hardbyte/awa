@@ -118,6 +118,23 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `awa.Client` provides a synchronous API for Django or Flask — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`, `client.transaction()`).
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
 
+### Exporting OpenTelemetry metrics
+
+awa records 20+ metrics (throughput, pickup latency, in-flight jobs, rescues, …) on the Rust side. Python workers enable OTLP export by calling `awa.init_telemetry(...)` once before the worker starts:
+
+```python
+import os
+import awa
+
+awa.init_telemetry(
+    os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"],   # e.g. http://localhost:4317
+    os.environ.get("OTEL_SERVICE_NAME", "my-service"),
+)
+# ... then build the client and start workers as normal.
+```
+
+`init_telemetry` is idempotent; only the first call installs a provider. Call `awa.shutdown_telemetry()` at the end of short-lived scripts to flush pending metrics. See [`awa-python/examples/telemetry.py`](../awa-python/examples/telemetry.py) for a runnable example.
+
 ## More Examples
 
 - [Bundled quickstart example](../awa-python/examples/quickstart.py)

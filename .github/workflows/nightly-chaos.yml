@@ -12,6 +12,74 @@ env:
   DATABASE_URL: postgres://postgres:postgres@localhost:5432/awa_test
 
 jobs:
+  tla-storage:
+    name: TLA+ storage model checking
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Show Docker version
+        run: docker --version
+      - name: AwaSegmentedStorage (1 worker)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
+      - name: AwaSegmentedStorage (2-worker interleavings)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+      - name: AwaSegmentedStorageRaces (race-exposing — expected to fail)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg > /tmp/tlc-races.log 2>&1
+          rc=$?
+          if grep -q "PrunedLeaseSegmentsAreEmpty is violated\|PrunedClaimSegmentsAreEmpty is violated" /tmp/tlc-races.log; then
+            echo "race spec correctly exposes the claim/rotate/prune race"
+            exit 0
+          fi
+          cat /tmp/tlc-races.log
+          exit 1
+      - name: AwaSegmentedStorageRaces (safe commit)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
+      - name: AwaSegmentedStorageRaces (safe commit, 3 workers)
+        run: ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesMultiWorker.cfg
+      - name: AwaSegmentedStorageTrace (snooze trace accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTrace.cfg > /tmp/tlc-trace.log 2>&1
+          rc=$?
+          if grep -q "SnoozeTraceIncomplete is violated" /tmp/tlc-trace.log; then
+            echo "snooze trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (broken trace rejected)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg > /tmp/tlc-trace-broken.log 2>&1
+          rc=$?
+          if grep -q "Deadlock reached" /tmp/tlc-trace-broken.log; then
+            echo "broken trace rejected with expected deadlock"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-broken.log
+          exit 1
+      - name: AwaStorageLockOrder
+        run: ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrder.cfg
+      - name: AwaStorageLockOrder (deadlock-demo — expected to fail)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg > /tmp/tlc-deadlock.log 2>&1
+          rc=$?
+          if grep -q "NoDeadlock is violated" /tmp/tlc-deadlock.log; then
+            echo "deadlock detector is working"
+            exit 0
+          fi
+          cat /tmp/tlc-deadlock.log
+          exit 1
+      - name: AwaDeadTupleContract (architectural reclaim contract)
+        run: ./correctness/run-tlc.sh storage/AwaDeadTupleContract.tla storage/AwaDeadTupleContract.cfg
+
   postgres-failover-smoke:
     name: Postgres failover smoke
     runs-on: ubuntu-latest
@@ -88,10 +156,58 @@ jobs:
           cargo test --package awa --test chaos_suite_test \
             -- --ignored --test-threads=1 --nocapture \
             | tee artifacts/nightly/rust-chaos.txt
+      - name: Run receipt-plane chaos suite
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          cargo test --package awa --test receipt_plane_chaos_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-receipt-plane-chaos.txt
+      - name: Run receipt-plane regression gate
+        timeout-minutes: 6
+        run: |
+          set -o pipefail
+          # ADR-023 invariant gate: enforces closure-partition n_dead_tup=0,
+          # bounded claim-partition churn, and ring rotation actually
+          # advancing under sustained load. Distinct from the chaos
+          # suite (which tests adversarial scenarios) — this gate
+          # asserts steady-state architectural bounds.
+          cargo test --package awa --test receipt_plane_regression_gate \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-receipt-plane-regression-gate.txt
+      - name: Run real-PG-restart chaos
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          # Issue #197 release-readiness item: spins up a dedicated
+          # postgres container, drives a workload, runs `docker
+          # restart` mid-flight (real process death + restart, not
+          # `pg_terminate_backend` TCP drop), asserts every enqueued
+          # job survives the restart. Two scenarios cover queue_storage
+          # default and receipt_plane fast-path; canonical-engine
+          # connection-loss is already in chaos_suite_test.
+          cargo test --package awa --test pg_restart_chaos_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-pg-restart-chaos.txt
+      - name: Run rolling transition rehearsal
+        timeout-minutes: 5
+        run: |
+          set -o pipefail
+          # Issue #197 P0 release-readiness item: drives the full 0.6
+          # storage transition state machine (canonical → prepared →
+          # mixed_transition → active) end-to-end under a continuous
+          # producer with both Rust and Python workers in the fleet.
+          # Asserts no jobs are lost across the routing flip and that
+          # every engine — auto Rust canonical drain, auto Python
+          # canonical drain, queue_storage_target — actually does
+          # work. The Python helper reuses mixed_fleet_helper.py.
+          export AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python"
+          cargo test --package awa --test rolling_transition_rehearsal_test \
+            -- --ignored --test-threads=1 --nocapture \
+            | tee artifacts/nightly/rust-rolling-transition-rehearsal.txt
       - name: Run sustained deferred benchmark
         if: always()
         timeout-minutes: 15
-        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --package awa --test scheduling_benchmark_test \
@@ -100,7 +216,6 @@ jobs:
       - name: Run failure-mode benchmark matrix
         if: always()
         timeout-minutes: 10
-        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
@@ -109,7 +224,6 @@ jobs:
       - name: Run stale-heartbeat rescue benchmark
         if: always()
         timeout-minutes: 5
-        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --package awa --test failure_benchmark_test \
@@ -118,7 +232,6 @@ jobs:
       - name: Run concurrent multi-queue lifecycle benchmark
         if: always()
         timeout-minutes: 10
-        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --release --package awa --test concurrent_lifecycle_test \
@@ -127,7 +240,6 @@ jobs:
       - name: Run MVCC horizon overlap benchmark
         if: always()
         timeout-minutes: 10
-        continue-on-error: true
         env:
           AWA_MVCC_POOL_MAX: "24"
           AWA_MVCC_ANALYTICS_POOL_MAX: "4"
@@ -149,7 +261,6 @@ jobs:
       - name: Run MVCC horizon soak benchmark
         if: always() && (github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * 0')
         timeout-minutes: 30
-        continue-on-error: true
         run: |
           set -o pipefail
           cargo test --release --package awa --test scheduling_benchmark_test \
@@ -270,7 +381,7 @@ jobs:
   # ─── Notify on failure ───────────────────────────────────
   notify-failure:
     name: Create issue on failure
-    needs: [postgres-failover-smoke, rust-nightly, python-nightly]
+    needs: [tla-storage, postgres-failover-smoke, rust-nightly, python-nightly]
     if: failure()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -286,6 +397,7 @@ jobs:
           Nightly run failed on $(date -u +%Y-%m-%d).
 
           **Failed jobs:**
+          - tla-storage: ${{ needs.tla-storage.result }}
           - postgres-failover-smoke: ${{ needs.postgres-failover-smoke.result }}
           - rust-nightly: ${{ needs.rust-nightly.result }}
           - python-nightly: ${{ needs.python-nightly.result }}

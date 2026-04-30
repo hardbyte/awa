@@ -33,7 +33,9 @@ impl TestClient {
 
     /// Run migrations (call this in test setup).
     pub async fn migrate(&self) -> Result<(), AwaError> {
-        awa_model::migrations::run(&self.pool).await
+        awa_model::migrations::run(&self.pool).await?;
+        crate::setup::reset_runtime_backend(&self.pool).await;
+        Ok(())
     }
 
     /// Clean the awa schema (for test isolation).
@@ -42,6 +44,9 @@ impl TestClient {
             .execute(&self.pool)
             .await?;
         sqlx::query("DELETE FROM awa.queue_meta")
+            .execute(&self.pool)
+            .await?;
+        sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
             .execute(&self.pool)
             .await?;
         Ok(())
@@ -105,7 +110,7 @@ impl TestClient {
         let progress = Arc::new(std::sync::Mutex::new(ProgressState::new(
             job.progress.clone(),
         )));
-        let ctx = JobContext::new(
+        let ctx = JobContext::new_for_testing(
             job.clone(),
             cancel,
             state,

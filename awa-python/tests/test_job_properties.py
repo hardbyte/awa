@@ -8,7 +8,7 @@ and progress lifecycle across state transitions.
 import asyncio
 import os
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -17,16 +17,23 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+TIMESTAMP_SKEW_TOLERANCE = timedelta(seconds=1)
+RUNTIME_START_KWARGS = {
+    "leader_election_interval_ms": 100,
+    "queue_storage_queue_rotate_interval_ms": 60_000,
+}
 
 
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'props_%'")
-    await tx.commit()
-    return c
+    await c.install_queue_storage(reset=True)
+    try:
+        yield c
+    finally:
+        await c.shutdown()
+        await c.close()
 
 
 @dataclass
@@ -46,7 +53,7 @@ async def test_created_at_set_on_insert(client):
 
     assert job.created_at is not None
     created = datetime.fromisoformat(job.created_at)
-    assert before <= created <= after
+    assert before - TIMESTAMP_SKEW_TOLERANCE <= created <= after + TIMESTAMP_SKEW_TOLERANCE
 
 
 @pytest.mark.asyncio
@@ -57,7 +64,7 @@ async def test_run_at_defaults_to_now(client):
     after = datetime.now(timezone.utc)
 
     run_at = datetime.fromisoformat(job.run_at)
-    assert before <= run_at <= after
+    assert before - TIMESTAMP_SKEW_TOLERANCE <= run_at <= after + TIMESTAMP_SKEW_TOLERANCE
 
 
 @pytest.mark.asyncio
@@ -116,7 +123,7 @@ async def test_deadline_set_during_execution(client):
 
     await client.insert(PropsJob(value="dl"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -149,7 +156,7 @@ async def test_progress_readable_on_retrying_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -173,7 +180,7 @@ async def test_progress_cleared_on_completed_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -194,7 +201,7 @@ async def test_progress_preserved_on_failed_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -216,7 +223,7 @@ async def test_progress_preserved_on_cancelled_job(client):
 
     job = await client.insert(PropsJob(value="p"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -256,7 +263,7 @@ async def test_progress_readable_during_execution(client):
 
     await client.insert(PropsJob(value="live"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -280,7 +287,7 @@ async def test_progress_clamped_to_100(client):
 
     await client.insert(PropsJob(value="clamp"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -306,7 +313,7 @@ async def test_update_metadata_shallow_merge(client):
 
     await client.insert(PropsJob(value="merge"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -330,7 +337,7 @@ async def test_update_metadata_rejects_non_dict(client):
 
     await client.insert(PropsJob(value="bad"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 

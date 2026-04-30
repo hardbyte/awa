@@ -1,0 +1,81 @@
+# Observability side-stack for the long-horizon bench.
+#
+# Start independently of `benchmarks/portable/docker-compose.yml` —
+# this stack is opt-in for capturing OTel metrics from awa-bench
+# replicas and visualising them through the dashboard the awa repo
+# already ships at `docs/grafana/awa-dashboard.json`.
+#
+# Usage (from this directory):
+#
+#   docker compose up -d
+#
+# Then run the bench with the OTLP endpoint set:
+#
+#   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
+#   OTEL_SERVICE_NAME=awa-portable-bench \
+#   uv run python ../../benchmarks/portable/long_horizon.py run ...
+#
+# Grafana lands at http://localhost:13000 (admin/admin), with the
+# Awa dashboard pre-loaded under "Awa / Awa Job Queue".
+
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.115.1
+    container_name: awa-otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8889:8889"   # Prometheus scrape endpoint
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  prometheus:
+    image: prom/prometheus:v3.0.1
+    container_name: awa-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--storage.tsdb.retention.time=24h"
+      - "--web.enable-lifecycle"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    ports:
+      - "19090:9090"
+    depends_on:
+      - otel-collector
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    container_name: awa-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_DEFAULT_THEME: dark
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "13000:3000"
+    depends_on:
+      - prometheus
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+volumes:
+  prometheus-data:
+  grafana-data:

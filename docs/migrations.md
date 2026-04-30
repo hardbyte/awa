@@ -53,20 +53,25 @@ Because migrations are additive-only, old workers should continue to function du
 
 ## Storage Transition Preparation
 
-Awa ships a generic storage-transition framework that schema migrations,
-operator tooling, and future storage-engine upgrades share. The framework is
-intentionally storage-engine neutral: the first user is the planned
-`canonical -> queue_storage` migration, but the same tables and helpers can
-drive any later engine transition without a second ad-hoc path.
+This release introduces a generic storage-transition framework that future
+storage-engine upgrades can build on.
 
-In a canonical deployment the framework is dormant — the routing seam and
-capability metadata are present, but worker execution remains canonical.
+The 0.5.x prep-release migration does **not** change the current execution
+engine. The 0.6 compatibility migration builds on that foundation and also
+adds:
 
-New surfaces:
+- the queue-storage compatibility layer
+- the active-backend selector in `awa.runtime_storage_backends`
+- the segmented DLQ table in the active queue-storage schema (`{schema}.dlq_entries`)
+- `awa.jobs` / `awa.insert_job_compat()` routing that follows the active
+  backend when queue storage is activated
+
+New operator surfaces:
 
 ```bash
 awa --database-url "$DATABASE_URL" storage status
 awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa
 awa --database-url "$DATABASE_URL" storage abort
 ```
 
@@ -87,34 +92,37 @@ These functions are one-shot operational commands. They are not schema-migration
 DDL and should be run deliberately by an operator or rollout tool, not embedded
 into the extracted migration SQL itself.
 
-Reserved SQL identities for a later engine release that finalises the
-transition:
+`storage prepare-queue-storage-schema` is also an operational command, but it
+only materializes the queue-storage schema. It does **not** change
+`awa.storage_transition_state` and it does **not** activate routing.
+
+On the `0.5.x` prep release these SQL identities existed as stubs. On this
+`0.6` branch they are implemented:
 
 - `awa.storage_enter_mixed_transition()`
 - `awa.storage_finalize()`
 
-On a canonical-only deployment these raise `55000` with a clear
-"requires a later engine release" error, so operators cannot accidentally
-force the state machine forward on a build that cannot drive it.
-
-Canonical-only behaviour:
+Current behavior:
 
 - `storage status` reports the singleton row in `awa.storage_transition_state`
 - `storage status` also reports canonical live backlog, live runtime capability counts,
   and blocker lists for `enter-mixed-transition` / `finalize`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
-- `storage abort` clears a prepared engine selection; it is also the
-  forward-compatible primitive for aborting a `mixed_transition` rollout
-  before final activation on a release that supports it
+- `storage prepare-queue-storage-schema` creates the target queue-storage
+  schema ahead of time without changing routing
+- `storage abort` returns routing to canonical and clears a prepared or mixed-transition
+  rollout before final activation
+- `storage enter-mixed-transition` requires prepared queue-storage metadata,
+  a prepared queue-storage schema, and no live canonical-only runtimes
+- `storage finalize` requires zero canonical live backlog and no live
+  canonical / drain-only runtimes
 - workers continue to run the canonical engine before and after `prepare`
 
 ### `0.5.x` -> `0.6` Queue-Storage Rollout
 
-The first use of the transition framework is the `0.5.x` -> `0.6` move from
-canonical storage to queue storage. The sequence has two phases: first bring
-the whole fleet to a `0.5.x` release that has this framework (without
-activating anything), then roll out `0.6` which completes the transition.
+The 0.6 storage-engine upgrade uses the transition protocol introduced in the
+0.5.x prep release. The intended operator sequence has two phases.
 
 #### Phase 1: last `0.5.x` release everywhere
 
@@ -171,16 +179,37 @@ activating anything), then roll out `0.6` which completes the transition.
    routing flip. This is the gate that prevents canonical-only workers from
    surviving into `mixed_transition`.
 
-5. Planned `0.6` behavior is then:
+   In `0.6`, the intended worker roles are:
+
+   - the default `auto` role, which stays canonical before the routing flip
+     and becomes `canonical_drain_only` once mixed transition starts
+   - an explicit queue-storage target role, which prepares the queue-storage
+     executor before the routing flip so new work can start executing
+     immediately after `enter-mixed-transition`
+
+   The `enter_mixed_transition()` SQL gate requires at least
+   one live runtime running with `transition_role = 'queue_storage_target'`
+   reporting `storage_capability = 'queue_storage'`. Auto-role runtimes
+   that pre-date the flip will downgrade to `canonical_drain_only` after
+   routing flips, so they cannot satisfy the gate on their own — there
+   would be no queue-storage executor post-flip. Auto-role runtimes
+   started *after* `enter-mixed-transition` resolve to queue storage at
+   startup and behave normally.
+
+   Current APIs:
+
+   - Rust: `Client::builder(...).transition_role(TransitionWorkerRole::QueueStorageTarget)`
+   - Python: `AsyncClient.start(..., storage_transition_role="queue_storage_target")`
+
+5. From here, the `0.6` sequence is:
 
    - `awa storage enter-mixed-transition` flips new writes and cron enqueues to
      queue storage
-   - queue-storage-capable workers begin reporting capability for the new
-     engine, while canonical drain work is handled by `0.6` workers in
-     drain-only mode
+   - queue-storage-capable workers report capability for the new engine, while
+     canonical drain work is handled by `0.6` workers in drain-only mode
    - canonical backlog drains while new work lands in queue storage
-   - `awa storage finalize` (or an assisted automatic equivalent) advances the
-     state to `active` once live capability and backlog checks pass
+   - `awa storage finalize` advances the state to `active` once live capability
+     and backlog checks pass
 
 Expected status progression during that rollout:
 
@@ -207,10 +236,12 @@ must not enter `mixed_transition` until canonical-only workers have stopped
 heartbeating. Finalization must also wait until canonical backlog is empty.
 
 If you need to stop the rollout before final activation, `storage abort` is the
-intended primitive. It returns the singleton row to `canonical` and clears the
-prepared engine metadata. It does **not** make an already-created queue-storage
-backlog runnable by `0.5` workers. If `0.6` has already routed jobs into queue
-storage, keep `0.6` workers available until that backlog is drained.
+intended primitive. In `prepared`, it returns the singleton row to `canonical`
+and clears the prepared engine metadata. In `mixed_transition`, `0.6` now
+enforces a rollback interlock: abort is only allowed while there are **no**
+live queue-storage runtimes and **no** rows in queue-storage tables. Once
+queue-storage has started accepting work, abort is rejected instead of trying
+to paper over a partial rollback.
 
 Current `0.5.x` fail-safe behavior if someone forces the state forward without
 `0.6` support:
@@ -219,6 +250,53 @@ Current `0.5.x` fail-safe behavior if someone forces the state forward without
 - batch insert and COPY insert paths also fail closed
 - the reserved `awa.storage_enter_mixed_transition()` and
   `awa.storage_finalize()` functions raise “requires 0.6”
+
+#### `0.6` Receipt-plane partition migration (ADR-023)
+
+The `0.6` queue-storage engine partitions the receipt plane:
+`lease_claims` and `lease_claim_closures` are
+`PARTITIONED BY LIST (claim_slot)` parents with one child per
+claim-ring slot. Upgrading from a 0.5.x deploy where these were
+regular (non-partitioned) tables runs an in-place migration inside
+`prepare_schema()`:
+
+1. The legacy tables are renamed in place to
+   `lease_claims_legacy` / `lease_claim_closures_legacy`.
+2. The new partitioned parents are created alongside the legacy
+   tables.
+3. Rows are copied from the legacy tables into the partitioned
+   parents, all landing in the current `claim_ring_state.current_slot`
+   (so existing receipts close out on their normal lifecycle in
+   that partition; the ring's natural rotation re-balances over
+   subsequent claims).
+4. The legacy tables are dropped.
+
+Steps 3 and 4 run inside a single Postgres transaction so a crash
+mid-migration leaves the schema in exactly one of two states:
+pre-migration (legacy tables still present, partitioned parents
+empty) or post-migration (legacy tables gone, partitioned parents
+populated). On restart, `prepare_schema()` detects whichever state
+is current and either re-runs the migration or skips it. The
+`ON CONFLICT DO NOTHING` on the copy step is a defensive
+belt-and-braces; under the transactional shape it should never
+fire.
+
+If the migration is partially applied at the time of a `reset()`
+call, the legacy tables are dropped explicitly before the main
+`TRUNCATE`. Without that, `reset()` would TRUNCATE the partitioned
+parents but leave the legacy data intact, and the next
+`prepare_schema()` would re-run the migration on top and silently
+re-insert old rows. Operators should not normally call `reset()`
+during an upgrade — it's a test fixture rather than a recovery
+primitive — but the safety net is there.
+
+**Reverse migration** (only relevant if a production rollback fires
+between an ADR-023 deploy and the older runtime catching up): create
+unpartitioned `lease_claims` and `lease_claim_closures` tables,
+`INSERT ... SELECT * FROM` each partitioned parent, drop the
+partitioned parents. This is not committed to source — the forward
+path is the only supported one — but operators are expected to keep
+this recipe in their runbook for the rollout window.
 
 ### Why This Exists
 
@@ -291,9 +369,10 @@ constraint:
 - once the cluster has entered `mixed_transition` and `0.6` has routed jobs to
   queue storage, a pure fleet downgrade back to `0.5` is not supported
 - `0.5` workers do not know how to claim queue-storage work
-- use `storage abort` only as a way to stop advancing the rollout and to return
-  new writes to canonical while `0.6` workers remain available to drain any
-  queue-storage backlog that already exists
+- `storage abort` is only a rollback path from `mixed_transition` before any
+  queue-storage runtime is live and before any queue-storage rows exist
+- once queue-storage has accepted work, keep `0.6` workers available and treat
+  the transition as one-way until finalize or full database restore
 
 ### 2. Database Rollback
 
@@ -310,17 +389,50 @@ If Awa ever needs a non-additive schema change, the intended contract is a major
 
 ## Recommended Production Flow
 
+The shape depends on whether you're doing a **fresh install** or
+**upgrading from `0.5.x`**.
+
+### Fresh install (no prior canonical data)
+
 ```bash
 # 1. Apply schema
 awa --database-url "$DATABASE_URL" migrate
 
-# 2. Optional: record and verify future storage prep state
-awa --database-url "$DATABASE_URL" storage status
-
-# 3. Roll out workers
-# 4. Verify runtime health / queue stats
-awa --database-url "$DATABASE_URL" queue stats
+# 2. Start workers (Rust or Python). queue-storage runs by default.
 ```
+
+That's the whole flow. The first worker that comes up in `auto` mode
+detects the DB is fresh — `state=canonical`, `prepared_engine=NULL`,
+no canonical jobs ever, no other live workers — and atomically
+installs the queue-storage schema and advances state directly to
+`active` via `awa.storage_auto_finalize_if_fresh()`. Subsequent
+workers see `state=active` and run as queue-storage straight away.
+
+The auto-finalize fast-path **only** fires on a truly fresh DB. Any
+of these conditions disqualify it and force the operator down the
+staged `prepare → enter-mixed-transition → finalize` path:
+
+- canonical jobs exist in `awa.jobs` (even terminal-state)
+- `prepared_engine` is already set (operator started the staged path)
+- another runtime is heartbeating in `awa.runtime_instances`
+
+If you specifically want the staged path on a fresh cluster (e.g.,
+to rehearse the transition flow), insert one canonical job before
+starting any worker, then follow the upgrade-from-0.5.x path.
+
+### Upgrading from `0.5.x`
+
+**Do not use the fresh-install recipe.** Live canonical data and
+canonical-only `0.5.x` workers must drain through `mixed_transition`
+before queue storage can take over. Follow the staged transition flow
+documented above under
+[`0.5.x` -> `0.6` Queue-Storage Rollout](#05x---06-queue-storage-rollout):
+
+1. Phase 1 — last `0.5.x` release everywhere with `awa migrate` applied.
+2. Phase 2 — roll out `0.6` binaries, then `prepare → enter-mixed-transition → finalize`.
+
+Rollback boundaries and `storage abort` semantics are documented in
+[Rollback Strategy](#rollback-strategy) below.
 
 ## Next
 

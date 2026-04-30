@@ -253,7 +253,15 @@ async fn kind_exists(pool: &PgPool, kind: &str) -> bool {
 
 #[tokio::test]
 async fn cleanup_stale_descriptors_deletes_beyond_window() {
-    with_clean_catalog("retention_", |p| async move {
+    // Distinct prefix from `cleanup_stale_descriptors_preserves_fresh_rows`
+    // — `with_clean_catalog` issues `DELETE … WHERE queue LIKE
+    // 'retention_%'` at both ends of the closure, and `tokio::test`
+    // runs siblings in parallel, so a shared prefix made the two
+    // tests race: the second test's pre-clean wiped the first
+    // test's freshly-synced row before the first reached its
+    // `queue_exists` assertion. Locally tests are usually fast enough
+    // to dodge this; CI saw it.
+    with_clean_catalog("retention_old_", |p| async move {
         sync_queue_descriptors(
             &p,
             &[NamedQueueDescriptor {
@@ -303,7 +311,7 @@ async fn cleanup_stale_descriptors_deletes_beyond_window() {
 
 #[tokio::test]
 async fn cleanup_stale_descriptors_preserves_fresh_rows() {
-    with_clean_catalog("retention_", |p| async move {
+    with_clean_catalog("retention_fresh_", |p| async move {
         sync_queue_descriptors(
             &p,
             &[NamedQueueDescriptor {
@@ -332,7 +340,7 @@ async fn cleanup_stale_descriptors_preserves_fresh_rows() {
 
 #[tokio::test]
 async fn cleanup_stale_descriptors_rejects_unknown_table() {
-    with_clean_catalog("retention_", |p| async move {
+    with_clean_catalog("retention_unknown_", |p| async move {
         let result = cleanup_stale_descriptors(
             &p,
             "awa.jobs", // not a descriptor catalog

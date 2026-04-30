@@ -1,4 +1,4 @@
-use awa_model::{JobRow, JobState};
+use awa_model::{JobRow, JobState, QueueStorage};
 use awa_worker::context::ProgressState;
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
@@ -99,6 +99,8 @@ pub struct PyJob {
     cancelled: Option<Arc<AtomicBool>>,
     /// Database pool for callback registration (only set during dispatch).
     pool: Option<PgPool>,
+    /// Active queue-storage backend (only set during queue-storage dispatch).
+    queue_storage: Option<Arc<QueueStorage>>,
     /// Shared progress buffer for in-flight reporting (only set during dispatch).
     progress_buffer: Option<Arc<std::sync::Mutex<ProgressState>>>,
     /// Progress JSON from the job row (for queried jobs).
@@ -128,6 +130,7 @@ impl Clone for PyJob {
             args_override: self.args_override.as_ref().map(|value| value.clone_ref(py)),
             cancelled: self.cancelled.clone(),
             pool: self.pool.clone(),
+            queue_storage: self.queue_storage.clone(),
             progress_buffer: self.progress_buffer.clone(),
             progress_json: self.progress_json.clone(),
             errors_json: self.errors_json.clone(),
@@ -270,6 +273,7 @@ impl PyJob {
         })?;
         let job_id = self.id;
         let run_lease = self.run_lease;
+        let queue_storage = self.queue_storage.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let (snapshot, target_generation) = {
@@ -280,23 +284,39 @@ impl PyJob {
                 }
             };
 
-            let result = sqlx::query(
-                r#"
-                UPDATE awa.jobs_hot
-                SET progress = $2
-                WHERE id = $1 AND state = 'running' AND run_lease = $3
-                "#,
-            )
-            .bind(job_id)
-            .bind(&snapshot)
-            .bind(run_lease)
-            .execute(&pool)
-            .await
-            .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+            if let Some(store) = queue_storage {
+                store
+                    .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                    .await
+                    .map_err(map_awa_error)?;
+            } else if let Some(schema) = QueueStorage::active_schema(&pool)
+                .await
+                .map_err(map_awa_error)?
+            {
+                QueueStorage::from_existing_schema(schema)
+                    .map_err(map_awa_error)?
+                    .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                    .await
+                    .map_err(map_awa_error)?;
+            } else {
+                let result = sqlx::query(
+                    r#"
+                    UPDATE awa.jobs_hot
+                    SET progress = $2
+                    WHERE id = $1 AND state = 'running' AND run_lease = $3
+                    "#,
+                )
+                .bind(job_id)
+                .bind(&snapshot)
+                .bind(run_lease)
+                .execute(&pool)
+                .await
+                .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
 
-            if result.rows_affected() == 0 {
-                // Job was rescued/cancelled — not an error for the caller
-                return Ok(());
+                if result.rows_affected() == 0 {
+                    // Job was rescued/cancelled — not an error for the caller
+                    return Ok(());
+                }
             }
 
             let mut guard = buffer.lock().expect("progress lock poisoned");
@@ -321,6 +341,7 @@ impl PyJob {
         })?;
         let job_id = self.id;
         let run_lease = self.run_lease;
+        let queue_storage = self.queue_storage.clone();
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -332,22 +353,38 @@ impl PyJob {
                     }
                 };
 
-                let result = sqlx::query(
-                    r#"
-                    UPDATE awa.jobs_hot
-                    SET progress = $2
-                    WHERE id = $1 AND state = 'running' AND run_lease = $3
-                    "#,
-                )
-                .bind(job_id)
-                .bind(&snapshot)
-                .bind(run_lease)
-                .execute(&pool)
-                .await
-                .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
+                if let Some(store) = queue_storage {
+                    store
+                        .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                        .await
+                        .map_err(map_awa_error)?;
+                } else if let Some(schema) = QueueStorage::active_schema(&pool)
+                    .await
+                    .map_err(map_awa_error)?
+                {
+                    QueueStorage::from_existing_schema(schema)
+                        .map_err(map_awa_error)?
+                        .flush_progress(&pool, job_id, run_lease, snapshot.clone())
+                        .await
+                        .map_err(map_awa_error)?;
+                } else {
+                    let result = sqlx::query(
+                        r#"
+                        UPDATE awa.jobs_hot
+                        SET progress = $2
+                        WHERE id = $1 AND state = 'running' AND run_lease = $3
+                        "#,
+                    )
+                    .bind(job_id)
+                    .bind(&snapshot)
+                    .bind(run_lease)
+                    .execute(&pool)
+                    .await
+                    .map_err(|e| map_awa_error(awa_model::AwaError::Database(e)))?;
 
-                if result.rows_affected() == 0 {
-                    return Ok(());
+                    if result.rows_affected() == 0 {
+                        return Ok(());
+                    }
                 }
 
                 let mut guard = buffer.lock().expect("progress lock poisoned");
@@ -432,10 +469,8 @@ impl PyJob {
         py: Python<'py>,
         token: PyRef<'_, PyCallbackToken>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        use awa_model::admin::{
-            check_callback_state, enter_callback_wait, CallbackPollResult,
-        };
         use crate::errors::map_awa_error;
+        use awa_model::admin::{check_callback_state, enter_callback_wait, CallbackPollResult};
 
         let pool = self.pool.clone().ok_or_else(|| {
             pyo3::exceptions::PyRuntimeError::new_err(
@@ -464,7 +499,11 @@ impl PyJob {
                         return Python::attach(|py| json_to_py(py, &payload));
                     }
                     CallbackPollResult::Pending => { /* Already in waiting_external */ }
-                    CallbackPollResult::Stale { token, current, state } => {
+                    CallbackPollResult::Stale {
+                        token,
+                        current,
+                        state,
+                    } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
                             "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
                         ))));
@@ -502,7 +541,11 @@ impl PyJob {
                     CallbackPollResult::Pending => {
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
-                    CallbackPollResult::Stale { token, current, state } => {
+                    CallbackPollResult::Stale {
+                        token,
+                        current,
+                        state,
+                    } => {
                         return Err(map_awa_error(awa_model::AwaError::Validation(format!(
                             "wait_for_callback: token {token} is stale; current callback is {current} in state {state:?}"
                         ))));
@@ -549,6 +592,7 @@ impl From<JobRow> for PyJob {
             args_override: None,
             cancelled: None,
             pool: None,
+            queue_storage: None,
             progress_buffer: None,
             progress_json,
             errors_json,
@@ -566,12 +610,14 @@ impl PyJob {
         args_override: Py<PyAny>,
         cancelled: Arc<AtomicBool>,
         pool: PgPool,
+        queue_storage: Option<Arc<QueueStorage>>,
         progress_buffer: Arc<std::sync::Mutex<ProgressState>>,
     ) -> Self {
         let mut job = Self::from(row);
         job.args_override = Some(args_override);
         job.cancelled = Some(cancelled);
         job.pool = Some(pool);
+        job.queue_storage = queue_storage;
         job.progress_buffer = Some(progress_buffer);
         job
     }

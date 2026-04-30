@@ -11,16 +11,26 @@ import awa
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
 )
+RUNTIME_START_KWARGS = {
+    "leader_election_interval_ms": 100,
+    "promote_interval_ms": 100,
+    "queue_storage_queue_rotate_interval_ms": 60_000,
+}
 
 
 @pytest.fixture
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await c.install_queue_storage(reset=True)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'progress_%'")
+    await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'progress_%'")
     await tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        await c.shutdown()
+        await c.close()
 
 
 @dataclass
@@ -44,7 +54,7 @@ async def test_set_progress_from_handler(client):
 
     await client.insert(ProgressArgs(data="pp1"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -68,18 +78,16 @@ async def test_update_metadata_from_handler(client):
         job.update_metadata({"batch": 1, "cursor": "abc"})
         await job.flush_progress()
 
-        # Verify the progress was written
-        jobs = await client.list_jobs(queue=queue, state="running")
-        for j in jobs:
-            if j.id == job.id and j.progress is not None:
-                assert j.progress["metadata"]["batch"] == 1
-                assert j.progress["metadata"]["cursor"] == "abc"
-                verified.append(True)
+        fetched = await client.get_job(job.id)
+        assert fetched.progress is not None
+        assert fetched.progress["metadata"]["batch"] == 1
+        assert fetched.progress["metadata"]["cursor"] == "abc"
+        verified.append(True)
         return None
 
     await client.insert(ProgressArgs(data="pp2"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -97,18 +105,16 @@ async def test_flush_progress_immediate(client):
     async def handle(job):
         job.set_progress(42, "flushing now")
         await job.flush_progress()
-        # Read back from DB to verify
-        jobs = await client.list_jobs(queue=queue, state="running")
-        for j in jobs:
-            if j.id == job.id and j.progress is not None:
-                assert j.progress["percent"] == 42
-                assert j.progress["message"] == "flushing now"
-                flush_verified.append(True)
+        fetched = await client.get_job(job.id)
+        assert fetched.progress is not None
+        assert fetched.progress["percent"] == 42
+        assert fetched.progress["message"] == "flushing now"
+        flush_verified.append(True)
         return None
 
     await client.insert(ProgressArgs(data="pp3"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -138,7 +144,7 @@ async def test_progress_property_returns_dict(client):
 
     await client.insert(ProgressArgs(data="pp4"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -168,8 +174,11 @@ async def test_progress_persists_across_retry(client):
 
     await client.insert(ProgressArgs(data="pp5"), queue=queue)
 
-    await client.start([(queue, 1)])
-    await asyncio.sleep(2.0)  # Give time for retry
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
+    for _ in range(60):
+        await asyncio.sleep(0.1)
+        if attempt_data:
+            break
     await client.shutdown()
 
     assert len(attempt_data) == 1, f"second attempt should have read checkpoint, got {attempt_data}"
@@ -195,7 +204,7 @@ async def test_get_job_returns_progress(client):
 
     inserted = await client.insert(ProgressArgs(data="pp6"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -223,7 +232,7 @@ async def test_flush_progress_sync(client):
 
     await client.insert(ProgressArgs(data="pp7"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 
@@ -245,7 +254,7 @@ async def test_get_job_sync_returns_progress(client):
 
     inserted = await client.insert(ProgressArgs(data="pp8"), queue=queue)
 
-    await client.start([(queue, 1)])
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
     await asyncio.sleep(1.0)
     await client.shutdown()
 

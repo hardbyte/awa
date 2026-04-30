@@ -1,0 +1,3 @@
+# Rendered at compose-up via render-dashboard.sh from
+# ../../docs/grafana/awa-dashboard.json. Don't commit the rendered copy.
+grafana/dashboards/

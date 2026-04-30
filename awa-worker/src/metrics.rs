@@ -10,6 +10,7 @@
 //! - Units declared via `.with_unit()` using UCUM notation
 //! - No unit suffix in metric names (exporters append automatically)
 
+use awa_model::storage::StorageStatus;
 use opentelemetry::metrics::{Counter, Gauge, Histogram, Meter, UpDownCounter};
 use std::time::Duration;
 
@@ -30,6 +31,18 @@ pub struct AwaMetrics {
     pub jobs_claimed: Counter<u64>,
     /// Number of dispatcher claim queries executed.
     pub claim_batches: Counter<u64>,
+    /// Number of dispatcher wake-ups by reason.
+    pub dispatch_wakeups: Counter<u64>,
+    /// Time from wake-up to the first claim attempt.
+    pub dispatch_wake_to_claim_seconds: Histogram<f64>,
+    /// Number of permits available when a dispatcher wake is processed.
+    pub dispatch_capacity_available: Histogram<u64>,
+    /// Number of wakes that found no jobs despite available capacity.
+    pub dispatch_empty_claims: Counter<u64>,
+    /// Number of pre-acquired permits released unused after a claim round.
+    pub dispatch_unused_permits: Counter<u64>,
+    /// Number of wakes that were blocked by rate limiting.
+    pub dispatch_rate_limited: Counter<u64>,
     /// Claim batch size distribution.
     pub claim_batch_size: Histogram<u64>,
     /// Claim query duration.
@@ -62,6 +75,14 @@ pub struct AwaMetrics {
     pub queue_lag_seconds: Gauge<f64>,
     /// Time from job creation to claim — the user-visible queuing latency.
     pub wait_duration_seconds: Histogram<f64>,
+    /// Total jobs moved into the Dead Letter Queue.
+    pub dlq_moved: Counter<u64>,
+    /// Total jobs retried out of the Dead Letter Queue.
+    pub dlq_retried: Counter<u64>,
+    /// Total DLQ rows purged.
+    pub dlq_purged: Counter<u64>,
+    /// Current DLQ depth per queue.
+    pub dlq_depth: Gauge<i64>,
     /// Info gauge for declared queue descriptors — value is always 1, the
     /// useful payload is the attribute set (display_name, owner, tags).
     /// Dashboards join it into throughput / latency panels with a
@@ -72,6 +93,43 @@ pub struct AwaMetrics {
     /// Info gauge for declared job-kind descriptors. Same pattern as
     /// [`queue_info`][Self::queue_info].
     pub job_kind_info: Gauge<i64>,
+    /// Readiness gauge for storage transition actions such as
+    /// `enter_mixed_transition` and `finalize` (1 = ready, 0 = blocked).
+    pub storage_transition_ready: Gauge<i64>,
+    /// Current canonical live backlog observed by queue-storage-capable runtimes.
+    pub storage_canonical_live_backlog: Gauge<i64>,
+    /// Current live runtime count per reported storage capability.
+    pub storage_live_runtime_capability: Gauge<i64>,
+    /// One-hot info gauge for the current storage transition state and engines.
+    pub storage_state: Gauge<i64>,
+    /// Maintenance ring rotation attempts, attributed to (ring, outcome,
+    /// blocker). For Rotated outcomes the `awa.ring.blocker` attribute is
+    /// "none"; for SkippedBusy it carries the per-ring blocker label
+    /// ("queue.ready_rows", "queue.done_rows", "lease.rows", "claim.rows",
+    /// "claim.closure_rows"). One increment per non-zero blocker means a
+    /// single SkippedBusy with both queue_ready and queue_done populated
+    /// emits two events — that's intentional so dashboards can attribute
+    /// blame independently per side.
+    pub maintenance_rotate_attempts: Counter<u64>,
+    /// Magnitudes of the per-blocker row counts when a rotation is
+    /// SkippedBusy. Histogram so dashboards can show whether the ring is
+    /// pinned by handfuls of stragglers or by mountains of unfinished work.
+    pub maintenance_rotate_skipped_rows: Histogram<u64>,
+    /// Maintenance ring prune attempts, attributed to (ring, outcome, reason).
+    /// reason="none" for Pruned/Noop/Blocked; otherwise carries the
+    /// SkipReason discriminator (e.g. "queue.active_leases",
+    /// "queue.pending_ready", "claim.open").
+    pub maintenance_prune_attempts: Counter<u64>,
+    /// Magnitude of the reason count when prune returns SkippedActive.
+    pub maintenance_prune_skipped_rows: Histogram<u64>,
+    /// Current ring `current_slot` per ring, sampled from each rotate call.
+    /// The slot number itself isn't meaningful but the rate of advance is —
+    /// dashboards plot `rate(slot_changes)` to see whether rotation is
+    /// healthy or pinned.
+    pub ring_current_slot: Gauge<i64>,
+    /// Current ring `generation` per ring. Always-increasing; dashboards
+    /// show its derivative as "rotations per minute".
+    pub ring_generation: Gauge<i64>,
 }
 
 impl AwaMetrics {
@@ -112,6 +170,36 @@ impl AwaMetrics {
                 .u64_counter("awa.dispatch.claim_batches")
                 .with_description("Number of dispatcher claim queries executed")
                 .with_unit("{batch}")
+                .build(),
+            dispatch_wakeups: meter
+                .u64_counter("awa.dispatch.wakeups")
+                .with_description("Number of dispatcher wake-ups by reason")
+                .with_unit("{wake}")
+                .build(),
+            dispatch_wake_to_claim_seconds: meter
+                .f64_histogram("awa.dispatch.wake_to_claim_duration")
+                .with_description("Time from dispatcher wake-up to first claim attempt")
+                .with_unit("s")
+                .build(),
+            dispatch_capacity_available: meter
+                .u64_histogram("awa.dispatch.capacity_available")
+                .with_description("Number of permits available when a dispatcher wake is processed")
+                .with_unit("{permit}")
+                .build(),
+            dispatch_empty_claims: meter
+                .u64_counter("awa.dispatch.empty_claims")
+                .with_description("Number of dispatcher wakes that found no jobs despite available capacity")
+                .with_unit("{wake}")
+                .build(),
+            dispatch_unused_permits: meter
+                .u64_counter("awa.dispatch.unused_permits")
+                .with_description("Number of pre-acquired permits released unused after claiming fewer jobs than capacity")
+                .with_unit("{permit}")
+                .build(),
+            dispatch_rate_limited: meter
+                .u64_counter("awa.dispatch.rate_limited")
+                .with_description("Number of dispatcher wakes that could not claim because of rate limiting")
+                .with_unit("{wake}")
                 .build(),
             claim_batch_size: meter
                 .u64_histogram("awa.dispatch.claim_batch_size")
@@ -193,6 +281,26 @@ impl AwaMetrics {
                 .with_description("Time from job creation to claim")
                 .with_unit("s")
                 .build(),
+            dlq_moved: meter
+                .u64_counter("awa.job.dlq_moved")
+                .with_description("Number of jobs moved into the Dead Letter Queue")
+                .with_unit("{job}")
+                .build(),
+            dlq_retried: meter
+                .u64_counter("awa.job.dlq_retried")
+                .with_description("Number of jobs retried out of the Dead Letter Queue")
+                .with_unit("{job}")
+                .build(),
+            dlq_purged: meter
+                .u64_counter("awa.job.dlq_purged")
+                .with_description("Number of DLQ rows deleted")
+                .with_unit("{job}")
+                .build(),
+            dlq_depth: meter
+                .i64_gauge("awa.job.dlq_depth")
+                .with_description("Current Dead Letter Queue depth per queue")
+                .with_unit("{job}")
+                .build(),
             queue_info: meter
                 .i64_gauge("awa.queue.info")
                 .with_description(
@@ -206,6 +314,62 @@ impl AwaMetrics {
                     "Declared job-kind descriptors (always 1; use as a label-join target)",
                 )
                 .with_unit("{kind}")
+                .build(),
+            storage_transition_ready: meter
+                .i64_gauge("awa.storage.transition_ready")
+                .with_description("Storage transition readiness by action (1 = ready, 0 = blocked)")
+                .with_unit("{state}")
+                .build(),
+            storage_canonical_live_backlog: meter
+                .i64_gauge("awa.storage.canonical_live_backlog")
+                .with_description("Current canonical live backlog during a storage transition")
+                .with_unit("{job}")
+                .build(),
+            storage_live_runtime_capability: meter
+                .i64_gauge("awa.storage.live_runtime_capability")
+                .with_description("Current live runtime count by reported storage capability")
+                .with_unit("{runtime}")
+                .build(),
+            storage_state: meter
+                .i64_gauge("awa.storage.state")
+                .with_description(
+                    "Current storage transition state and engine combination (always 1)",
+                )
+                .with_unit("{state}")
+                .build(),
+            maintenance_rotate_attempts: meter
+                .u64_counter("awa.maintenance.rotate.attempts")
+                .with_description(
+                    "Ring rotation attempts by ring/outcome/blocker. Multiple increments per call when SkippedBusy has multiple non-zero blockers.",
+                )
+                .with_unit("{attempt}")
+                .build(),
+            maintenance_rotate_skipped_rows: meter
+                .u64_histogram("awa.maintenance.rotate.skipped_rows")
+                .with_description(
+                    "Row count for the blocker side of a SkippedBusy rotation",
+                )
+                .with_unit("{row}")
+                .build(),
+            maintenance_prune_attempts: meter
+                .u64_counter("awa.maintenance.prune.attempts")
+                .with_description("Ring prune attempts by ring/outcome/reason")
+                .with_unit("{attempt}")
+                .build(),
+            maintenance_prune_skipped_rows: meter
+                .u64_histogram("awa.maintenance.prune.skipped_rows")
+                .with_description("Magnitude of the reason count on a SkippedActive prune")
+                .with_unit("{row}")
+                .build(),
+            ring_current_slot: meter
+                .i64_gauge("awa.ring.current_slot")
+                .with_description("Current slot index per ring (queue/lease/claim)")
+                .with_unit("{slot}")
+                .build(),
+            ring_generation: meter
+                .i64_gauge("awa.ring.generation")
+                .with_description("Current ring generation per ring; derivative is rotations/sec")
+                .with_unit("{generation}")
                 .build(),
         }
     }
@@ -267,6 +431,61 @@ impl AwaMetrics {
             .record(duration.as_secs_f64(), &attrs);
     }
 
+    /// Record a dispatcher wake-up reason.
+    pub fn record_dispatch_wake(&self, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_wakeups.add(1, &attrs);
+    }
+
+    /// Record time from wake-up to the first claim attempt.
+    pub fn record_dispatch_wake_to_claim(&self, queue: &str, reason: &str, duration: Duration) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_wake_to_claim_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record how many permits were available on a dispatcher wake.
+    pub fn record_dispatch_capacity_available(&self, queue: &str, reason: &str, permits: u64) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_capacity_available.record(permits, &attrs);
+    }
+
+    /// Record a dispatcher wake that found no jobs.
+    pub fn record_dispatch_empty_claim(&self, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_empty_claims.add(1, &attrs);
+    }
+
+    /// Record permits released unused after a claim round.
+    pub fn record_dispatch_unused_permits(&self, queue: &str, count: u64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.dispatch_unused_permits.add(count, &attrs);
+    }
+
+    /// Record a wake that could not claim because of rate limiting.
+    pub fn record_dispatch_rate_limited(&self, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dispatch.reason", reason.to_string()),
+        ];
+        self.dispatch_rate_limited.add(1, &attrs);
+    }
+
     /// Record a completion batch flush.
     pub fn record_completion_flush(&self, shard: usize, batch_size: u64, duration: Duration) {
         let attrs = [opentelemetry::KeyValue::new(
@@ -325,6 +544,72 @@ impl AwaMetrics {
             queue.to_string(),
         )];
         self.wait_duration_seconds.record(seconds, &attrs);
+    }
+
+    /// Record a job moved into the DLQ.
+    pub fn record_dlq_moved(&self, kind: &str, queue: &str, reason: &str) {
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.kind", kind.to_string()),
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.dlq.reason", reason.to_string()),
+        ];
+        self.dlq_moved.add(1, &attrs);
+    }
+
+    /// Record a bulk admin move into the DLQ.
+    pub fn record_dlq_moved_bulk(
+        &self,
+        kind: Option<&str>,
+        queue: Option<&str>,
+        reason: &str,
+        count: u64,
+    ) {
+        if count == 0 {
+            return;
+        }
+
+        let mut attrs = vec![opentelemetry::KeyValue::new(
+            "awa.dlq.reason",
+            reason.to_string(),
+        )];
+        if let Some(kind) = kind {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.kind",
+                kind.to_string(),
+            ));
+        }
+        if let Some(queue) = queue {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.job.queue",
+                queue.to_string(),
+            ));
+        }
+        self.dlq_moved.add(count, &attrs);
+    }
+
+    /// Record jobs retried out of the DLQ.
+    pub fn record_dlq_retried(&self, queue: Option<&str>, count: u64) {
+        let attrs: Vec<opentelemetry::KeyValue> = queue
+            .map(|q| vec![opentelemetry::KeyValue::new("awa.job.queue", q.to_string())])
+            .unwrap_or_default();
+        self.dlq_retried.add(count, &attrs);
+    }
+
+    /// Record DLQ rows purged.
+    pub fn record_dlq_purged(&self, queue: Option<&str>, count: u64) {
+        let attrs: Vec<opentelemetry::KeyValue> = queue
+            .map(|q| vec![opentelemetry::KeyValue::new("awa.job.queue", q.to_string())])
+            .unwrap_or_default();
+        self.dlq_purged.add(count, &attrs);
+    }
+
+    /// Record current DLQ depth for a queue.
+    pub fn record_dlq_depth(&self, queue: &str, count: i64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.dlq_depth.record(count, &attrs);
     }
 
     /// Emit the info gauge for a declared queue descriptor. Called once per
@@ -423,6 +708,129 @@ impl AwaMetrics {
             ));
         }
         self.job_kind_info.record(1, &attrs);
+    }
+
+    /// Record whether a storage transition action is currently ready.
+    pub fn record_storage_transition_ready(&self, action: &str, ready: bool) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.storage.action",
+            action.to_string(),
+        )];
+        self.storage_transition_ready
+            .record(if ready { 1 } else { 0 }, &attrs);
+    }
+
+    /// Record canonical live backlog for the storage transition.
+    pub fn record_storage_canonical_live_backlog(&self, count: i64) {
+        self.storage_canonical_live_backlog.record(count, &[]);
+    }
+
+    /// Record the number of live runtimes reporting a given storage capability.
+    pub fn record_storage_live_runtime_capability(&self, capability: &str, count: i64) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.storage.capability",
+            capability.to_string(),
+        )];
+        self.storage_live_runtime_capability.record(count, &attrs);
+    }
+
+    /// Emit the current storage transition state as a one-hot info gauge.
+    pub fn record_storage_state(&self, status: &StorageStatus) {
+        let mut attrs = vec![
+            opentelemetry::KeyValue::new("awa.storage.state", status.state.clone()),
+            opentelemetry::KeyValue::new(
+                "awa.storage.current_engine",
+                status.current_engine.clone(),
+            ),
+            opentelemetry::KeyValue::new("awa.storage.active_engine", status.active_engine.clone()),
+        ];
+        if let Some(prepared_engine) = &status.prepared_engine {
+            attrs.push(opentelemetry::KeyValue::new(
+                "awa.storage.prepared_engine",
+                prepared_engine.clone(),
+            ));
+        }
+        self.storage_state.record(1, &attrs);
+    }
+
+    /// Record a ring rotation outcome.
+    ///
+    /// `ring` is one of "queue" / "lease" / "claim" — set by the caller based on
+    /// which rotate fn returned the outcome. For SkippedBusy, every non-zero
+    /// blocker count emits its own counter increment plus a histogram sample,
+    /// so a queue rotate skipped on (ready=42, done=17) produces two events
+    /// with different `awa.ring.blocker` labels. This makes
+    /// `sum by (awa.ring.blocker) (rate(...))` work cleanly in Grafana.
+    pub fn record_rotate_outcome(&self, ring: &'static str, outcome: &awa_model::RotateOutcome) {
+        match outcome {
+            awa_model::RotateOutcome::Rotated { slot, generation } => {
+                let attrs = [
+                    opentelemetry::KeyValue::new("awa.ring", ring),
+                    opentelemetry::KeyValue::new("awa.ring.outcome", "rotated"),
+                    opentelemetry::KeyValue::new("awa.ring.blocker", "none"),
+                ];
+                self.maintenance_rotate_attempts.add(1, &attrs);
+                let slot_attrs = [opentelemetry::KeyValue::new("awa.ring", ring)];
+                self.ring_current_slot.record(*slot as i64, &slot_attrs);
+                self.ring_generation.record(*generation, &slot_attrs);
+            }
+            awa_model::RotateOutcome::SkippedBusy { slot: _, busy } => {
+                let blockers: &[(&str, i64)] = &[
+                    ("queue.ready_rows", busy.queue_ready),
+                    ("queue.done_rows", busy.queue_done),
+                    ("lease.rows", busy.leases),
+                    ("claim.rows", busy.claims),
+                    ("claim.closure_rows", busy.closures),
+                ];
+                let mut emitted_any = false;
+                for (label, count) in blockers {
+                    if *count > 0 {
+                        emitted_any = true;
+                        let attrs = [
+                            opentelemetry::KeyValue::new("awa.ring", ring),
+                            opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_busy"),
+                            opentelemetry::KeyValue::new("awa.ring.blocker", *label),
+                        ];
+                        self.maintenance_rotate_attempts.add(1, &attrs);
+                        self.maintenance_rotate_skipped_rows
+                            .record(*count as u64, &attrs);
+                    }
+                }
+                // Lost-CAS path can return SkippedBusy with all-zero counts
+                // (the row counts we sampled before were stale by the time
+                // we lost the race). Emit a single attempt event so the
+                // counter still reflects the call.
+                if !emitted_any {
+                    let attrs = [
+                        opentelemetry::KeyValue::new("awa.ring", ring),
+                        opentelemetry::KeyValue::new("awa.ring.outcome", "skipped_busy"),
+                        opentelemetry::KeyValue::new("awa.ring.blocker", "lost_cas"),
+                    ];
+                    self.maintenance_rotate_attempts.add(1, &attrs);
+                }
+            }
+        }
+    }
+
+    /// Record a ring prune outcome.
+    pub fn record_prune_outcome(&self, ring: &'static str, outcome: &awa_model::PruneOutcome) {
+        let (label, reason, count) = match outcome {
+            awa_model::PruneOutcome::Noop => ("noop", "none", None),
+            awa_model::PruneOutcome::Pruned { .. } => ("pruned", "none", None),
+            awa_model::PruneOutcome::Blocked { .. } => ("blocked", "none", None),
+            awa_model::PruneOutcome::SkippedActive { reason, count, .. } => {
+                ("skipped_active", reason.as_str(), Some(*count))
+            }
+        };
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.ring", ring),
+            opentelemetry::KeyValue::new("awa.ring.outcome", label),
+            opentelemetry::KeyValue::new("awa.ring.reason", reason),
+        ];
+        self.maintenance_prune_attempts.add(1, &attrs);
+        if let Some(c) = count {
+            self.maintenance_prune_skipped_rows.record(c as u64, &attrs);
+        }
     }
 }
 

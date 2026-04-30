@@ -2,14 +2,16 @@
 //!
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
+use awa::model::queue_storage::{QueueStorage, QueueStorageConfig};
 use awa::model::{admin, migrations};
 use awa::{
     Client, JobArgs, JobError, JobEvent, JobResult, JobState, QueueConfig, UntypedJobEvent, Worker,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Semaphore};
 
 fn database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -23,9 +25,22 @@ async fn setup_pool() -> sqlx::PgPool {
         .connect(&database_url())
         .await
         .expect("Failed to connect to database — is Postgres running?");
+    // Wipe and re-migrate so tests start from a known state regardless
+    // of what previous tests left behind (queue-storage tables, an
+    // advanced storage_transition_state, etc.).
+    sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
+        .execute(&pool)
+        .await
+        .expect("Failed to drop awa schema");
     migrations::run(&pool)
         .await
         .expect("Failed to run migrations");
+
+    QueueStorage::new(QueueStorageConfig::default())
+        .expect("Failed to build queue storage")
+        .install(&pool)
+        .await
+        .expect("Failed to install queue storage");
     pool
 }
 
@@ -49,6 +64,57 @@ async fn recv_event<T>(rx: &mut mpsc::UnboundedReceiver<T>) -> T {
         .expect("Lifecycle event channel closed")
 }
 
+fn test_gate() -> Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(1))).clone()
+}
+
+async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+        .fetch_optional(pool)
+        .await
+        .expect("Failed to query active queue storage schema")
+        .flatten()
+}
+
+async fn backdate_running_heartbeat(pool: &sqlx::PgPool, job_id: i64) {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        sqlx::query(&format!(
+            "UPDATE {schema}.leases \
+             SET heartbeat_at = now() - interval '5 minutes' \
+             WHERE job_id = $1 AND state = 'running'"
+        ))
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate queue-storage heartbeat");
+        return;
+    }
+
+    sqlx::query("UPDATE awa.jobs SET heartbeat_at = now() - interval '5 minutes' WHERE id = $1")
+        .bind(job_id)
+        .execute(pool)
+        .await
+        .expect("Failed to backdate heartbeat");
+}
+
+async fn wait_for_job_state(pool: &sqlx::PgPool, job_id: i64, state: JobState) -> awa::JobRow {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if let Ok(job) = admin::get_job(pool, job_id).await {
+            if job.state == state {
+                return job;
+            }
+        }
+
+        if tokio::time::Instant::now() >= deadline {
+            panic!("Timed out waiting for job {job_id} to reach state {state:?}");
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
 struct HookJob {
     action: String,
@@ -62,6 +128,10 @@ struct RawHookJob {
 
 #[tokio::test]
 async fn test_typed_completed_event_handler_runs() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_completed";
     clean_queue(&pool, queue).await;
@@ -115,6 +185,10 @@ async fn test_typed_completed_event_handler_runs() {
 
 #[tokio::test]
 async fn test_typed_retried_event_handler_runs() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_retried";
     clean_queue(&pool, queue).await;
@@ -181,6 +255,10 @@ async fn test_typed_retried_event_handler_runs() {
 
 #[tokio::test]
 async fn test_typed_exhausted_event_handler_runs() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_exhausted";
     clean_queue(&pool, queue).await;
@@ -244,6 +322,10 @@ async fn test_typed_exhausted_event_handler_runs() {
 
 #[tokio::test]
 async fn test_typed_cancelled_event_handler_runs() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_cancelled";
     clean_queue(&pool, queue).await;
@@ -312,6 +394,10 @@ impl Worker for RawHookWorker {
 
 #[tokio::test]
 async fn test_untyped_event_handlers_stack_for_raw_workers() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_raw_stack";
     clean_queue(&pool, queue).await;
@@ -379,6 +465,10 @@ async fn test_untyped_event_handlers_stack_for_raw_workers() {
 
 #[tokio::test]
 async fn test_handler_panic_does_not_crash_executor() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_panic";
     clean_queue(&pool, queue).await;
@@ -435,6 +525,10 @@ async fn test_handler_panic_does_not_crash_executor() {
 
 #[tokio::test]
 async fn test_no_handlers_registered_still_completes() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_no_handlers";
     clean_queue(&pool, queue).await;
@@ -467,11 +561,9 @@ async fn test_no_handlers_registered_still_completes() {
     .unwrap();
 
     client.start().await.unwrap();
-    // Wait for job to be processed
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    let stored = wait_for_job_state(&pool, inserted.id, JobState::Completed).await;
     client.shutdown(Duration::from_secs(2)).await;
 
-    let stored = admin::get_job(&pool, inserted.id).await.unwrap();
     assert_eq!(stored.state, JobState::Completed);
 }
 
@@ -479,6 +571,10 @@ async fn test_no_handlers_registered_still_completes() {
 
 #[tokio::test]
 async fn test_stale_completion_does_not_fire_event() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_stale";
     clean_queue(&pool, queue).await;
@@ -542,11 +638,7 @@ async fn test_stale_completion_does_not_fire_event() {
     .unwrap();
 
     // Immediately mark heartbeat as stale so rescue fires quickly
-    sqlx::query("UPDATE awa.jobs SET heartbeat_at = now() - interval '5 minutes' WHERE id = $1")
-        .bind(inserted.id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    backdate_running_heartbeat(&pool, inserted.id).await;
 
     client.start().await.unwrap();
 
@@ -579,6 +671,10 @@ async fn test_stale_completion_does_not_fire_event() {
 
 #[tokio::test]
 async fn test_terminal_error_emits_exhausted() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_terminal";
     clean_queue(&pool, queue).await;
@@ -639,6 +735,10 @@ async fn test_terminal_error_emits_exhausted() {
 
 #[tokio::test]
 async fn test_snooze_does_not_emit_event() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
     let pool = setup_pool().await;
     let queue = "lifecycle_snooze";
     clean_queue(&pool, queue).await;

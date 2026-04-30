@@ -21,10 +21,12 @@ DATABASE_URL = os.environ.get(
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
-    tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'cb_%'")
-    await tx.commit()
-    return c
+    await c.install_queue_storage(reset=True)
+    try:
+        yield c
+    finally:
+        await c.shutdown()
+        await c.close()
 
 
 @dataclass

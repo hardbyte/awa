@@ -19,6 +19,10 @@ async fn setup() -> sqlx::PgPool {
         .await
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .expect("Failed to reset active runtime backend");
     pool
 }
 

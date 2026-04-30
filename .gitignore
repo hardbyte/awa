@@ -22,6 +22,7 @@ awa-python/python/awa/lib_awa.dylib.dSYM/
 /artifacts/
 /awa-cli/dist/
 /corectness/
+correctness/**/*_TTrace_*.tla
 
 # Local IDE / MCP cruft
 /.idea/
@@ -30,3 +31,4 @@ awa-python/python/awa/lib_awa.dylib.dSYM/
 
 # Benchmark run artifacts
 /benchmarks/portable/results/
+/benchmarks/portable/awa-bench/target/

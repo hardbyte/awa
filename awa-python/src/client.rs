@@ -6,7 +6,10 @@ use crate::transaction::{
 };
 use crate::worker::PythonWorker;
 use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
-use awa_model::{InsertOpts, InsertParams, JobState, PeriodicJob};
+use awa_model::{
+    InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage, QueueStorageConfig,
+};
+use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use sqlx::postgres::PgPoolOptions;
@@ -23,6 +26,17 @@ fn validate_timeout_seconds(timeout_seconds: f64) -> PyResult<Duration> {
     }
 
     Ok(Duration::from_secs_f64(timeout_seconds))
+}
+
+fn parse_transition_worker_role(value: Option<&str>) -> PyResult<awa_worker::TransitionWorkerRole> {
+    match value.unwrap_or("auto") {
+        "auto" => Ok(awa_worker::TransitionWorkerRole::Auto),
+        "canonical_drain" => Ok(awa_worker::TransitionWorkerRole::CanonicalDrain),
+        "queue_storage_target" => Ok(awa_worker::TransitionWorkerRole::QueueStorageTarget),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "storage_transition_role must be one of 'auto', 'canonical_drain', or 'queue_storage_target' (got '{other}')"
+        ))),
+    }
 }
 
 fn build_queue_descriptor(
@@ -312,6 +326,47 @@ impl Clone for WorkerEntry {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RuntimeLifecycle {
+    Idle,
+    InstallingQueueStorage,
+    Running,
+}
+
+fn set_runtime_lifecycle(lifecycle: &Mutex<RuntimeLifecycle>, state: RuntimeLifecycle) {
+    *lifecycle.lock().expect("runtime lifecycle mutex poisoned") = state;
+}
+
+fn begin_queue_storage_install(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
+    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    match *guard {
+        RuntimeLifecycle::Idle => {
+            *guard = RuntimeLifecycle::InstallingQueueStorage;
+            Ok(())
+        }
+        RuntimeLifecycle::InstallingQueueStorage => Err(state_error(
+            "queue storage installation is already in progress",
+        )),
+        RuntimeLifecycle::Running => Err(state_error(
+            "cannot install queue storage while the worker runtime is running",
+        )),
+    }
+}
+
+fn begin_runtime_start(lifecycle: &Mutex<RuntimeLifecycle>) -> PyResult<()> {
+    let mut guard = lifecycle.lock().expect("runtime lifecycle mutex poisoned");
+    match *guard {
+        RuntimeLifecycle::Idle => {
+            *guard = RuntimeLifecycle::Running;
+            Ok(())
+        }
+        RuntimeLifecycle::InstallingQueueStorage => Err(state_error(
+            "cannot start the worker runtime while queue storage installation is in progress",
+        )),
+        RuntimeLifecycle::Running => Err(state_error("worker runtime is already running")),
+    }
+}
+
 /// The main Python client.
 #[pyclass(name = "Client")]
 pub struct PyClient {
@@ -320,6 +375,7 @@ pub struct PyClient {
     periodic_jobs: Arc<Mutex<Vec<PeriodicJob>>>,
     queue_descriptors: Arc<Mutex<HashMap<String, QueueDescriptor>>>,
     job_kind_descriptors: Arc<Mutex<HashMap<String, JobKindDescriptor>>>,
+    lifecycle: Arc<Mutex<RuntimeLifecycle>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
 }
 
@@ -353,6 +409,7 @@ impl PyClient {
             periodic_jobs: Arc::new(Mutex::new(Vec::new())),
             queue_descriptors: Arc::new(Mutex::new(HashMap::new())),
             job_kind_descriptors: Arc::new(Mutex::new(HashMap::new())),
+            lifecycle: Arc::new(Mutex::new(RuntimeLifecycle::Idle)),
             runtime: Arc::new(Mutex::new(None)),
         })
     }
@@ -458,6 +515,107 @@ impl PyClient {
             .map_err(|e| state_error(format!("migration task failed: {e}")))?
             .map_err(map_awa_error)?;
             Ok(())
+        })
+    }
+
+    /// Materialize the queue-storage schema's tables / indexes /
+    /// functions without changing the storage transition state.
+    ///
+    /// Mirrors `awa storage prepare-queue-storage-schema` on the CLI:
+    /// the operator-facing prep step that pairs with
+    /// `storage_prepare(...)` for a staged 0.5 → 0.6 transition. Use
+    /// this when you want the queue-storage tables to exist before
+    /// any worker starts but do *not* want to activate the backend
+    /// yet (i.e. `state` should stay at `prepared` rather than jumping
+    /// to `active`). For the "all in one shot" path, see
+    /// [`Self::install_queue_storage`].
+    fn prepare_queue_storage_schema<'py>(
+        &self,
+        py: Python<'py>,
+        schema: String,
+        queue_slot_count: u32,
+        lease_slot_count: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let store = QueueStorage::new(QueueStorageConfig {
+                schema,
+                queue_slot_count: queue_slot_count as usize,
+                lease_slot_count: lease_slot_count as usize,
+                ..Default::default()
+            })
+            .map_err(map_awa_error)?;
+            store.prepare_schema(&pool).await.map_err(map_awa_error)?;
+            Ok(())
+        })
+    }
+
+    fn install_queue_storage<'py>(
+        &self,
+        py: Python<'py>,
+        schema: String,
+        queue_slot_count: u32,
+        lease_slot_count: u32,
+        reset: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        begin_queue_storage_install(&self.lifecycle)?;
+        let pool = self.pool.clone();
+        let lifecycle = self.lifecycle.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let result = async {
+                let store = QueueStorage::new(QueueStorageConfig {
+                    schema,
+                    queue_slot_count: queue_slot_count as usize,
+                    lease_slot_count: lease_slot_count as usize,
+                    ..Default::default()
+                })
+                .map_err(map_awa_error)?;
+                if reset {
+                    awa_model::storage::abort(&pool)
+                        .await
+                        .map_err(map_awa_error)?;
+                    let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
+                    sqlx::query(&drop_sql)
+                        .execute(&pool)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                    // The queue-storage schema is `awa` by default,
+                    // so the CASCADE above also dropped the
+                    // control-plane migrations the queue-storage tables
+                    // depend on (`awa.job_state` etc). Re-run them
+                    // before `prepare_schema` so `leases.state
+                    // awa.job_state` parses. When the queue-storage
+                    // schema is configured to a non-`awa` name this is
+                    // just a quick idempotent no-op.
+                    //
+                    // `migrations::run` is `!Send` (holds a
+                    // `PoolConnection` across awaits), and this async
+                    // block goes through `future_into_py` which
+                    // requires `Send`. Bridge via spawn_blocking +
+                    // current_thread runtime, the same pattern
+                    // `Self::migrate` uses.
+                    let pool_for_migrate = pool.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build current_thread runtime for migrate");
+                        rt.block_on(awa_model::migrations::run(&pool_for_migrate))
+                    })
+                    .await
+                    .map_err(|e| state_error(format!("migration task failed: {e}")))?
+                    .map_err(map_awa_error)?;
+                    store.prepare_schema(&pool).await.map_err(map_awa_error)?;
+                    store.reset(&pool).await.map_err(map_awa_error)?;
+                    store.activate_backend(&pool).await.map_err(map_awa_error)?;
+                } else {
+                    store.install(&pool).await.map_err(map_awa_error)?;
+                }
+                Ok(())
+            }
+            .await;
+            set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+            result
         })
     }
 
@@ -582,6 +740,7 @@ impl PyClient {
         tags=None,
         extra=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn queue_descriptor(
         &self,
         py: Python<'_>,
@@ -596,25 +755,19 @@ impl PyClient {
         // Mutation after start() is a footgun: the runtime only reads
         // queue_descriptors during startup, so the late call would
         // silently have no effect. Fail loudly instead.
-        if self
-            .runtime
-            .lock()
-            .expect("runtime mutex poisoned")
-            .is_some()
-        {
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .expect("runtime lifecycle mutex poisoned"),
+            RuntimeLifecycle::Idle
+        ) {
             return Err(state_error(
                 "queue_descriptor() must be called before start()",
             ));
         }
-        let descriptor = build_queue_descriptor(
-            py,
-            display_name,
-            description,
-            owner,
-            docs_url,
-            tags,
-            extra,
-        )?;
+        let descriptor =
+            build_queue_descriptor(py, display_name, description, owner, docs_url, tags, extra)?;
         self.queue_descriptors
             .lock()
             .expect("queue_descriptors mutex poisoned")
@@ -634,6 +787,7 @@ impl PyClient {
         tags=None,
         extra=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn job_kind_descriptor(
         &self,
         py: Python<'_>,
@@ -645,25 +799,19 @@ impl PyClient {
         tags: Option<Vec<String>>,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<()> {
-        if self
-            .runtime
-            .lock()
-            .expect("runtime mutex poisoned")
-            .is_some()
-        {
+        if !matches!(
+            *self
+                .lifecycle
+                .lock()
+                .expect("runtime lifecycle mutex poisoned"),
+            RuntimeLifecycle::Idle
+        ) {
             return Err(state_error(
                 "job_kind_descriptor() must be called before start()",
             ));
         }
-        let descriptor = build_job_kind_descriptor(
-            py,
-            display_name,
-            description,
-            owner,
-            docs_url,
-            tags,
-            extra,
-        )?;
+        let descriptor =
+            build_job_kind_descriptor(py, display_name, description, owner, docs_url, tags, extra)?;
         self.job_kind_descriptors
             .lock()
             .expect("job_kind_descriptors mutex poisoned")
@@ -831,6 +979,158 @@ impl PyClient {
         })
     }
 
+    // ── Admin introspection: dumps, cron catalog, storage status ────────
+    //
+    // These return JSON strings (matching the Rust CLI's admin commands) so
+    // the Python CLI can print them verbatim and callers that want structured
+    // data can json.loads them. Keeping the shape as JSON avoids a churn of
+    // PyO3 struct mappings whenever an admin field is added.
+
+    fn dump_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let dump = awa_model::admin::dump_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string_pretty(&dump).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!("dump serialization failed: {e}"))
+            })
+        })
+    }
+
+    fn dump_job_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let dump = awa_model::admin::dump_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string_pretty(&dump).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "dump serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    #[pyo3(signature = (job_id, attempt=None))]
+    fn dump_run<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: i64,
+        attempt: Option<i16>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let dump = awa_model::admin::dump_run(&pool, job_id, attempt)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string_pretty(&dump).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "run dump serialization failed: {e}"
+                ))
+            })
+        })
+    }
+
+    #[pyo3(signature = (job_id, attempt=None))]
+    fn dump_run_sync(&self, py: Python<'_>, job_id: i64, attempt: Option<i16>) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let dump = awa_model::admin::dump_run(&pool, job_id, attempt)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string_pretty(&dump).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "run dump serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    fn storage_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let report = awa_model::storage::status_report(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string_pretty(&report).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "storage status serialization failed: {e}"
+                ))
+            })
+        })
+    }
+
+    fn storage_status_sync(&self, py: Python<'_>) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let report = awa_model::storage::status_report(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string_pretty(&report).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "storage status serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    fn list_cron_jobs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = awa_model::cron::list_cron_jobs(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            serde_json::to_string(&rows).map_err(|e| {
+                pyo3::exceptions::PyRuntimeError::new_err(format!(
+                    "cron list serialization failed: {e}"
+                ))
+            })
+        })
+    }
+
+    fn list_cron_jobs_sync(&self, py: Python<'_>) -> PyResult<String> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let rows = awa_model::cron::list_cron_jobs(&pool)
+                    .await
+                    .map_err(map_awa_error)?;
+                serde_json::to_string(&rows).map_err(|e| {
+                    pyo3::exceptions::PyRuntimeError::new_err(format!(
+                        "cron list serialization failed: {e}"
+                    ))
+                })
+            })
+        })
+    }
+
+    fn delete_cron_job<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            awa_model::cron::delete_cron_job(&pool, &name)
+                .await
+                .map_err(map_awa_error)
+        })
+    }
+
+    fn delete_cron_job_sync(&self, py: Python<'_>, name: String) -> PyResult<bool> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::cron::delete_cron_job(&pool, &name)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
     fn queue_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -905,6 +1205,260 @@ impl PyClient {
         })
     }
 
+    /// List DLQ entries, optionally filtered by kind/queue/tag. `before_id`
+    /// enables cursor pagination (pass the smallest id from the previous
+    /// page). Rows are ordered by `dlq_at DESC, id DESC`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let filter =
+                crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
+            let rows = awa_model::dlq::list_dlq(&pool, &filter)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                let list = pyo3::types::PyList::empty(py);
+                for row in rows {
+                    let entry = crate::dlq::dlq_row_to_entry(py, row)?;
+                    list.append(Py::new(py, entry)?)?;
+                }
+                Ok(list.unbind())
+            })
+        })
+    }
+
+    /// Fetch a single DLQ entry by id. Returns `None` if the row isn't in the DLQ.
+    fn get_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let row = awa_model::dlq::get_dlq_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            Python::attach(|py| {
+                Ok(match row {
+                    Some(row) => crate::dlq::dlq_row_to_entry(py, row)?
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Count DLQ rows, optionally filtered by queue.
+    #[pyo3(signature = (*, queue=None))]
+    fn dlq_depth<'py>(
+        &self,
+        py: Python<'py>,
+        queue: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let count = awa_model::dlq::dlq_depth(&pool, queue.as_deref())
+                .await
+                .map_err(map_awa_error)?;
+            Ok(count)
+        })
+    }
+
+    /// DLQ row counts grouped by queue (descending).
+    fn dlq_depth_by_queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = awa_model::dlq::dlq_depth_by_queue(&pool)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(rows)
+        })
+    }
+
+    /// Retry a single DLQ'd job. Returns the revived PyJob or `None` if the
+    /// DLQ row no longer exists.
+    #[pyo3(signature = (job_id, *, run_at=None, priority=None, queue=None))]
+    fn retry_from_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: i64,
+        run_at: Option<DateTime<Utc>>,
+        priority: Option<i16>,
+        queue: Option<String>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let opts = crate::dlq::build_retry_opts(run_at, priority, queue);
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
+                .await
+                .map_err(map_awa_error)?;
+            if let Some(job) = job.as_ref() {
+                awa_worker::AwaMetrics::from_global().record_dlq_retried(Some(&job.queue), 1);
+            }
+            Python::attach(|py| {
+                Ok(match job {
+                    Some(job) => PyJob::from(job).into_pyobject(py)?.into_any().unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Bulk retry DLQ rows matching the filter. Returns the count of revived jobs.
+    ///
+    /// Requires at least one of `kind`, `queue`, or `tag` unless
+    /// `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    fn bulk_retry_from_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        allow_all: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let queue_attr = queue.clone();
+            let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
+            let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
+                .await
+                .map_err(map_awa_error)?;
+            if count > 0 {
+                awa_worker::AwaMetrics::from_global()
+                    .record_dlq_retried(queue_attr.as_deref(), count);
+            }
+            Ok(count)
+        })
+    }
+
+    /// Move an already-failed job (in `jobs_hot`) into the DLQ. Returns the
+    /// resulting DlqEntry, or `None` if the row wasn't in `failed` state.
+    fn move_failed_to_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        job_id: i64,
+        reason: String,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
+                .await
+                .map_err(map_awa_error)?;
+            if let Some(row) = row.as_ref() {
+                awa_worker::AwaMetrics::from_global().record_dlq_moved(
+                    &row.job.kind,
+                    &row.job.queue,
+                    &reason,
+                );
+            }
+            Python::attach(|py| {
+                Ok(match row {
+                    Some(row) => crate::dlq::dlq_row_to_entry(py, row)?
+                        .into_pyobject(py)?
+                        .into_any()
+                        .unbind(),
+                    None => py.None(),
+                })
+            })
+        })
+    }
+
+    /// Bulk-move failed jobs into the DLQ.
+    ///
+    /// Requires at least one of `kind` or `queue` unless `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false))]
+    fn bulk_move_failed_to_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        reason: String,
+        allow_all: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let kind_attr = kind.clone();
+            let queue_attr = queue.clone();
+            let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                &pool,
+                kind.as_deref(),
+                queue.as_deref(),
+                &reason,
+                allow_all,
+            )
+            .await
+            .map_err(map_awa_error)?;
+            if count > 0 {
+                awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                    kind_attr.as_deref(),
+                    queue_attr.as_deref(),
+                    &reason,
+                    count,
+                );
+            }
+            Ok(count)
+        })
+    }
+
+    /// Purge a single DLQ row. Returns `True` if the row was deleted.
+    fn purge_dlq_job<'py>(&self, py: Python<'py>, job_id: i64) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let queue = awa_model::dlq::get_dlq_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?
+                .map(|row| row.job.queue);
+            let deleted = awa_model::dlq::purge_dlq_job(&pool, job_id)
+                .await
+                .map_err(map_awa_error)?;
+            if deleted {
+                awa_worker::AwaMetrics::from_global().record_dlq_purged(queue.as_deref(), 1);
+            }
+            Ok(deleted)
+        })
+    }
+
+    /// Bulk-purge DLQ rows matching the filter.
+    ///
+    /// Requires at least one of `kind`, `queue`, or `tag` unless
+    /// `allow_all=True`.
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn purge_dlq<'py>(
+        &self,
+        py: Python<'py>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
+        allow_all: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let queue_attr = queue.clone();
+            let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
+            let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
+                .await
+                .map_err(map_awa_error)?;
+            if count > 0 {
+                awa_worker::AwaMetrics::from_global()
+                    .record_dlq_purged(queue_attr.as_deref(), count);
+            }
+            Ok(count)
+        })
+    }
+
     fn health_check<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
@@ -927,7 +1481,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None))]
+    #[pyo3(signature = (queues=None, *, poll_interval_ms=200, global_max_workers=None, completed_retention_hours=None, failed_retention_hours=None, descriptor_retention_days=None, cleanup_batch_size=None, leader_election_interval_ms=None, heartbeat_interval_ms=None, promote_interval_ms=None, heartbeat_rescue_interval_ms=None, heartbeat_staleness_ms=None, deadline_rescue_interval_ms=None, callback_rescue_interval_ms=None, queue_storage_schema=None, queue_storage_queue_slot_count=16, queue_storage_lease_slot_count=8, queue_storage_claim_slot_count=8, queue_storage_queue_rotate_interval_ms=1000, queue_storage_lease_rotate_interval_ms=50, queue_storage_claim_rotate_interval_ms=None, storage_transition_role=None))]
     #[allow(clippy::too_many_arguments)]
     fn start<'py>(
         &self,
@@ -946,14 +1500,15 @@ impl PyClient {
         heartbeat_staleness_ms: Option<u64>,
         deadline_rescue_interval_ms: Option<u64>,
         callback_rescue_interval_ms: Option<u64>,
+        queue_storage_schema: Option<String>,
+        queue_storage_queue_slot_count: u32,
+        queue_storage_lease_slot_count: u32,
+        queue_storage_claim_slot_count: u32,
+        queue_storage_queue_rotate_interval_ms: u64,
+        queue_storage_lease_rotate_interval_ms: u64,
+        queue_storage_claim_rotate_interval_ms: Option<u64>,
+        storage_transition_role: Option<String>,
     ) -> PyResult<Bound<'py, PyAny>> {
-        {
-            let guard = self.runtime.lock().expect("runtime mutex poisoned");
-            if guard.is_some() {
-                return Err(state_error("worker runtime is already running"));
-            }
-        }
-
         let entries: Vec<_> = self
             .workers
             .read()
@@ -972,17 +1527,25 @@ impl PyClient {
 
         let mut builder = awa_worker::Client::builder(self.pool.clone());
         for config in &queue_configs {
-            builder = builder.queue(
-                config.name.clone(),
-                awa_worker::QueueConfig {
-                    max_workers: config.max_workers,
-                    poll_interval: Duration::from_millis(poll_interval_ms),
-                    rate_limit: config.rate_limit.clone(),
-                    min_workers: config.min_workers,
-                    weight: config.weight,
-                    ..Default::default()
-                },
-            );
+            // The Rust QueueConfig defaults (5m deadline, 60s
+            // priority aging) carry through unless the dict form
+            // overrides them; `Some(0)` is a meaningful value
+            // (disables that knob for this queue).
+            let mut queue_config = awa_worker::QueueConfig {
+                max_workers: config.max_workers,
+                poll_interval: Duration::from_millis(poll_interval_ms),
+                rate_limit: config.rate_limit.clone(),
+                min_workers: config.min_workers,
+                weight: config.weight,
+                ..Default::default()
+            };
+            if let Some(ms) = config.priority_aging_interval_ms {
+                queue_config.priority_aging_interval = Duration::from_millis(ms);
+            }
+            if let Some(ms) = config.deadline_duration_ms {
+                queue_config.deadline_duration = Duration::from_millis(ms);
+            }
+            builder = builder.queue(config.name.clone(), queue_config);
         }
         if let Some(global_max) = global_max_workers {
             builder = builder.global_max_workers(global_max);
@@ -1047,6 +1610,62 @@ impl PyClient {
         if let Some(ms) = callback_rescue_interval_ms {
             builder = builder.callback_rescue_interval(Duration::from_millis(ms));
         }
+        if queue_storage_queue_slot_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_queue_slot_count must be > 0",
+            ));
+        }
+        if queue_storage_lease_slot_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_lease_slot_count must be > 0",
+            ));
+        }
+        if queue_storage_claim_slot_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_claim_slot_count must be > 0",
+            ));
+        }
+        if queue_storage_queue_rotate_interval_ms == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_queue_rotate_interval_ms must be > 0",
+            ));
+        }
+        if queue_storage_lease_rotate_interval_ms == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_lease_rotate_interval_ms must be > 0",
+            ));
+        }
+        if let Some(ms) = queue_storage_claim_rotate_interval_ms {
+            if ms == 0 {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "queue_storage_claim_rotate_interval_ms must be > 0",
+                ));
+            }
+        }
+
+        builder = builder.queue_storage(
+            QueueStorageConfig {
+                schema: queue_storage_schema
+                    .unwrap_or_else(|| QueueStorageConfig::default().schema),
+                queue_slot_count: queue_storage_queue_slot_count as usize,
+                lease_slot_count: queue_storage_lease_slot_count as usize,
+                claim_slot_count: queue_storage_claim_slot_count as usize,
+                ..Default::default()
+            },
+            Duration::from_millis(queue_storage_queue_rotate_interval_ms),
+            Duration::from_millis(queue_storage_lease_rotate_interval_ms),
+        );
+        // Claim ring rotation cadence defaults to queue_rotate_interval if
+        // unset (matches the Rust ClientBuilder default — see
+        // awa-worker/src/client.rs::claim_rotate_interval). Passing it
+        // explicitly only takes effect on queue storage; canonical mode
+        // ignores it.
+        if let Some(ms) = queue_storage_claim_rotate_interval_ms {
+            builder = builder.claim_rotate_interval(Duration::from_millis(ms));
+        }
+        builder = builder.transition_role(parse_transition_worker_role(
+            storage_transition_role.as_deref(),
+        )?);
 
         for entry in &entries {
             builder = builder.register_worker(PythonWorker::from_entry(entry));
@@ -1082,15 +1701,24 @@ impl PyClient {
             builder = builder.job_kind_descriptor_kind(kind, descriptor);
         }
 
-        let runtime = Arc::new(builder.build().map_err(|e| state_error(e.to_string()))?);
+        begin_runtime_start(&self.lifecycle)?;
+        let runtime = match builder.build() {
+            Ok(runtime) => Arc::new(runtime),
+            Err(err) => {
+                set_runtime_lifecycle(&self.lifecycle, RuntimeLifecycle::Idle);
+                return Err(state_error(err.to_string()));
+            }
+        };
         let runtime_clone = runtime.clone();
         let runtime_store = self.runtime.clone();
+        let lifecycle = self.lifecycle.clone();
         // Store the runtime BEFORE starting so shutdown() can find it
         // even if called concurrently. If start() fails, remove it.
         *runtime_store.lock().expect("runtime mutex poisoned") = Some(runtime);
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Err(e) = runtime_clone.start().await {
                 runtime_store.lock().expect("runtime mutex poisoned").take();
+                set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
                 return Err(map_awa_error(e));
             }
             Ok(())
@@ -1100,10 +1728,12 @@ impl PyClient {
     #[pyo3(signature = (timeout_ms=2000))]
     fn shutdown<'py>(&self, py: Python<'py>, timeout_ms: u64) -> PyResult<Bound<'py, PyAny>> {
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").take();
+        let lifecycle = self.lifecycle.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             if let Some(runtime) = runtime {
                 runtime.shutdown(Duration::from_millis(timeout_ms)).await;
             }
+            set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
             Ok(())
         })
     }
@@ -1533,6 +2163,59 @@ impl PyClient {
         })
     }
 
+    fn install_queue_storage_sync(
+        &self,
+        py: Python<'_>,
+        schema: String,
+        queue_slot_count: u32,
+        lease_slot_count: u32,
+        reset: bool,
+    ) -> PyResult<()> {
+        begin_queue_storage_install(&self.lifecycle)?;
+        let pool = self.pool.clone();
+        let lifecycle = self.lifecycle.clone();
+        py.detach(|| {
+            let result = pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let store = QueueStorage::new(QueueStorageConfig {
+                    schema,
+                    queue_slot_count: queue_slot_count as usize,
+                    lease_slot_count: lease_slot_count as usize,
+                    ..Default::default()
+                })
+                .map_err(map_awa_error)?;
+                if reset {
+                    awa_model::storage::abort(&pool)
+                        .await
+                        .map_err(map_awa_error)?;
+                    let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
+                    sqlx::query(&drop_sql)
+                        .execute(&pool)
+                        .await
+                        .map_err(map_sqlx_error)?;
+                    // The queue-storage schema is `awa` by default,
+                    // so the CASCADE above also dropped the
+                    // control-plane migrations the queue-storage tables
+                    // depend on (`awa.job_state` etc). Re-run them
+                    // before `prepare_schema` so `leases.state
+                    // awa.job_state` parses. When the queue-storage
+                    // schema is configured to a non-`awa` name this is
+                    // just a quick idempotent no-op.
+                    awa_model::migrations::run(&pool)
+                        .await
+                        .map_err(map_awa_error)?;
+                    store.prepare_schema(&pool).await.map_err(map_awa_error)?;
+                    store.reset(&pool).await.map_err(map_awa_error)?;
+                    store.activate_backend(&pool).await.map_err(map_awa_error)?;
+                } else {
+                    store.install(&pool).await.map_err(map_awa_error)?;
+                }
+                Ok(())
+            });
+            set_runtime_lifecycle(&lifecycle, RuntimeLifecycle::Idle);
+            result
+        })
+    }
+
     fn transaction_sync(&self, py: Python<'_>) -> PyResult<PySyncTransaction> {
         let pool = self.pool.clone();
         py.detach(|| {
@@ -1755,6 +2438,234 @@ impl PyClient {
         })
     }
 
+    // --- DLQ sync versions -------------------------------------------------
+
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, limit=100))]
+    #[allow(clippy::too_many_arguments)]
+    fn list_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> PyResult<Vec<crate::dlq::PyDlqEntry>> {
+        let pool = self.pool.clone();
+        let filter =
+            crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, Some(limit));
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let rows = awa_model::dlq::list_dlq(&pool, &filter)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| {
+                    rows.into_iter()
+                        .map(|row| crate::dlq::dlq_row_to_entry(py, row))
+                        .collect()
+                })
+            })
+        })
+    }
+
+    fn get_dlq_job_sync(
+        &self,
+        py: Python<'_>,
+        job_id: i64,
+    ) -> PyResult<Option<crate::dlq::PyDlqEntry>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::dlq::get_dlq_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                Python::attach(|py| row.map(|r| crate::dlq::dlq_row_to_entry(py, r)).transpose())
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, queue=None))]
+    fn dlq_depth_sync(&self, py: Python<'_>, queue: Option<String>) -> PyResult<i64> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::dlq_depth(&pool, queue.as_deref())
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
+    fn dlq_depth_by_queue_sync(&self, py: Python<'_>) -> PyResult<Vec<(String, i64)>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                awa_model::dlq::dlq_depth_by_queue(&pool)
+                    .await
+                    .map_err(map_awa_error)
+            })
+        })
+    }
+
+    #[pyo3(signature = (job_id, *, run_at=None, priority=None, queue=None))]
+    fn retry_from_dlq_sync(
+        &self,
+        py: Python<'_>,
+        job_id: i64,
+        run_at: Option<DateTime<Utc>>,
+        priority: Option<i16>,
+        queue: Option<String>,
+    ) -> PyResult<Option<PyJob>> {
+        let pool = self.pool.clone();
+        let opts = crate::dlq::build_retry_opts(run_at, priority, queue);
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let job = awa_model::dlq::retry_from_dlq(&pool, job_id, &opts)
+                    .await
+                    .map_err(map_awa_error)?;
+                if let Some(job) = job.as_ref() {
+                    awa_worker::AwaMetrics::from_global().record_dlq_retried(Some(&job.queue), 1);
+                }
+                Ok(job.map(PyJob::from))
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, allow_all=false))]
+    fn bulk_retry_from_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        allow_all: bool,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        let queue_attr = queue.clone();
+        let filter = crate::dlq::build_filter(kind, queue, tag, None, None, None);
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let count = awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, allow_all)
+                    .await
+                    .map_err(map_awa_error)?;
+                if count > 0 {
+                    awa_worker::AwaMetrics::from_global()
+                        .record_dlq_retried(queue_attr.as_deref(), count);
+                }
+                Ok(count)
+            })
+        })
+    }
+
+    fn move_failed_to_dlq_sync(
+        &self,
+        py: Python<'_>,
+        job_id: i64,
+        reason: String,
+    ) -> PyResult<Option<crate::dlq::PyDlqEntry>> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let row = awa_model::dlq::move_failed_to_dlq(&pool, job_id, &reason)
+                    .await
+                    .map_err(map_awa_error)?;
+                if let Some(row) = row.as_ref() {
+                    awa_worker::AwaMetrics::from_global().record_dlq_moved(
+                        &row.job.kind,
+                        &row.job.queue,
+                        &reason,
+                    );
+                }
+                Python::attach(|py| row.map(|r| crate::dlq::dlq_row_to_entry(py, r)).transpose())
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None, reason="manual".to_string(), allow_all=false))]
+    fn bulk_move_failed_to_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        reason: String,
+        allow_all: bool,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        let kind_attr = kind.clone();
+        let queue_attr = queue.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                    &pool,
+                    kind.as_deref(),
+                    queue.as_deref(),
+                    &reason,
+                    allow_all,
+                )
+                .await
+                .map_err(map_awa_error)?;
+                if count > 0 {
+                    awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
+                        kind_attr.as_deref(),
+                        queue_attr.as_deref(),
+                        &reason,
+                        count,
+                    );
+                }
+                Ok(count)
+            })
+        })
+    }
+
+    fn purge_dlq_job_sync(&self, py: Python<'_>, job_id: i64) -> PyResult<bool> {
+        let pool = self.pool.clone();
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let queue = awa_model::dlq::get_dlq_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?
+                    .map(|row| row.job.queue);
+                let deleted = awa_model::dlq::purge_dlq_job(&pool, job_id)
+                    .await
+                    .map_err(map_awa_error)?;
+                if deleted {
+                    awa_worker::AwaMetrics::from_global().record_dlq_purged(queue.as_deref(), 1);
+                }
+                Ok(deleted)
+            })
+        })
+    }
+
+    #[pyo3(signature = (*, kind=None, queue=None, tag=None, before_id=None, before_dlq_at=None, allow_all=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn purge_dlq_sync(
+        &self,
+        py: Python<'_>,
+        kind: Option<String>,
+        queue: Option<String>,
+        tag: Option<String>,
+        before_id: Option<i64>,
+        before_dlq_at: Option<DateTime<Utc>>,
+        allow_all: bool,
+    ) -> PyResult<u64> {
+        let pool = self.pool.clone();
+        let queue_attr = queue.clone();
+        let filter = crate::dlq::build_filter(kind, queue, tag, before_id, before_dlq_at, None);
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let count = awa_model::dlq::purge_dlq(&pool, &filter, allow_all)
+                    .await
+                    .map_err(map_awa_error)?;
+                if count > 0 {
+                    awa_worker::AwaMetrics::from_global()
+                        .record_dlq_purged(queue_attr.as_deref(), count);
+                }
+                Ok(count)
+            })
+        })
+    }
+
     fn health_check_sync(&self, py: Python<'_>) -> PyResult<PyHealthCheck> {
         let pool = self.pool.clone();
         let runtime = self.runtime.lock().expect("runtime mutex poisoned").clone();
@@ -1835,6 +2746,14 @@ struct ParsedQueueConfig {
     min_workers: u32,
     weight: u32,
     rate_limit: Option<awa_worker::RateLimit>,
+    /// Per-queue priority-aging cadence. `None` keeps the Rust
+    /// `QueueConfig` default (60s); `Some(0)` disables claim-time
+    /// priority escalation entirely.
+    priority_aging_interval_ms: Option<u64>,
+    /// Per-queue per-attempt deadline. `None` keeps the Rust
+    /// `QueueConfig` default (5m); `Some(0)` skips the deadline
+    /// rescue path for this queue.
+    deadline_duration_ms: Option<u64>,
 }
 
 /// Parse queue configs from Python input (list of tuples or dicts).
@@ -1873,6 +2792,8 @@ fn parse_queue_configs(
                 min_workers: 0,
                 weight: 1,
                 rate_limit: None,
+                priority_aging_interval_ms: None,
+                deadline_duration_ms: None,
             });
             continue;
         }
@@ -1943,12 +2864,23 @@ fn parse_queue_configs(
             None
         };
 
+        let priority_aging_interval_ms: Option<u64> = dict
+            .get_item("priority_aging_interval_ms")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let deadline_duration_ms: Option<u64> = dict
+            .get_item("deadline_duration_ms")?
+            .map(|v| v.extract())
+            .transpose()?;
+
         configs.push(ParsedQueueConfig {
             name,
             max_workers,
             min_workers,
             weight,
             rate_limit,
+            priority_aging_interval_ms,
+            deadline_duration_ms,
         });
     }
 
@@ -1975,6 +2907,8 @@ fn normalize_queue_configs(
                     min_workers: 0,
                     weight: 1,
                     rate_limit: None,
+                    priority_aging_interval_ms: None,
+                    deadline_duration_ms: None,
                 });
             }
         }
@@ -2160,6 +3094,7 @@ fn parse_queue_retention_overrides(
             awa_worker::RetentionPolicy {
                 completed: Duration::from_secs_f64(completed_hours * 3600.0),
                 failed: Duration::from_secs_f64(failed_hours * 3600.0),
+                dlq: None,
             },
         ));
     }
