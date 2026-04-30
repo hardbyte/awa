@@ -5,8 +5,8 @@ Provides ``Client`` (sync, for producers) and ``AsyncClient`` (async, for
 workers and async applications). Both delegate to the underlying PyO3
 ``_awa.Client`` but present a clean, un-suffixed API.
 
-The raw ``_awa.Client`` remains available as ``RawClient`` for advanced use
-or migration from the 0.4.x ``_sync`` pattern.
+The raw ``_awa.Client`` remains available as ``RawClient`` for advanced
+use or for legacy code that uses the ``_sync`` method suffixes directly.
 """
 
 from __future__ import annotations
@@ -139,8 +139,9 @@ class AsyncClient:
 
         This is a low-level helper for tests and explicit queue-storage-only
         setups. It prepares the schema and selects it as the active backend
-        immediately. For the staged `0.5 -> 0.6` storage transition, use the
-        dedicated storage-transition commands instead.
+        immediately. For the staged storage transition (existing canonical
+        clusters moving to queue storage), use the dedicated
+        storage-transition commands instead.
         """
         return await self._raw.install_queue_storage(
             schema=schema,
@@ -161,7 +162,7 @@ class AsyncClient:
 
         Mirrors ``awa storage prepare-queue-storage-schema`` on the CLI.
         Pairs with ``awa.storage_prepare(...)`` for a staged
-        ``0.5 → 0.6`` transition: call ``storage_prepare`` to flip the
+        storage transition: call ``storage_prepare`` to flip the
         transition state to ``prepared``, call this method to create
         the actual tables, then start workers. For the all-in-one
         "install and activate" path, see :meth:`install_queue_storage`.
@@ -775,8 +776,9 @@ class Client:
 
         This is a low-level helper for tests and explicit queue-storage-only
         setups. It prepares the schema and selects it as the active backend
-        immediately. For the staged `0.5 -> 0.6` storage transition, use the
-        dedicated storage-transition commands instead.
+        immediately. For the staged storage transition (existing canonical
+        clusters moving to queue storage), use the dedicated
+        storage-transition commands instead.
         """
         return self._raw.install_queue_storage_sync(
             schema=schema,

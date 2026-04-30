@@ -65,10 +65,9 @@ receipt plane (`lease_claims` / `lease_claim_closures` partitioning):
 - [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
 - [ADR-023: Receipt Plane Ring Partitioning](adr/023-receipt-plane-ring-partitioning.md)
 
-This overview focuses on the current runtime boundaries and subsystems. The
-migration and compatibility surfaces for older SQL entry points are documented
-in [migrations.md](migrations.md). ADR-019 is the storage-design source of
-truth when this overview needs more detail.
+This overview focuses on the current runtime boundaries and subsystems.
+Migration and compatibility surfaces for older SQL entry points are
+documented in [migrations.md](migrations.md).
 
 ### Queue storage at a glance
 
@@ -82,13 +81,10 @@ truth when this overview needs more detail.
 - `lane_state` stays off the terminal-completion hot path: live completion
   totals come from `terminal_entries`, and the cached cold rollup used to keep
   counts stable across prune lives outside `lane_state`
-- live availability reads `sum(queue_lanes.available_count)` — a denormalized
-  counter the queue-storage SQL functions keep in sync with `ready_entries`
-  inserts and claim head advances. The previous design derived availability
-  from a `ready_entries` row scan; long-horizon profiling showed that scan
-  collapsed under multi-million-row backlog, so the counter was reintroduced
-  as the authoritative dispatch read with a drift-detection test pinning it
-  to the live-row count
+- live availability reads `sum(queue_lanes.available_count)` — a
+  denormalized counter the queue-storage SQL functions keep in sync with
+  `ready_entries` inserts and claim head advances. A drift-detection test
+  pins the counter to the live-row count.
 - maintenance leader: promotion, rescue, rotation, prune, DLQ retention, and
   queue-health publication
 
@@ -133,7 +129,7 @@ The source-of-truth split matters because the three concerns have different life
 - **descriptor liveness and drift** — derived at read time from per-runtime hash snapshots in `awa.runtime_instances`, so they don't need their own writer path
 - **mutable queue control state** (pause/resume, paused_by, …) — owned by operators; stays in `awa.queue_meta`, which is also on the dispatcher hot path and therefore kept narrow
 
-Declared-but-empty queues and kinds still appear in the admin surfaces because the catalog is authoritative; before descriptors existed, listings were driven by `queue_state_counts`, so an idle-but-declared queue would disappear from the UI.
+Declared-but-empty queues and kinds still appear in the admin surfaces because the descriptor catalog is authoritative.
 
 ### Catalog retention
 

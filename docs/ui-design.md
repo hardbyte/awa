@@ -86,7 +86,7 @@ Full inspection of a single job: state badge, queue (linked), priority, attempt 
 
 ### Queues (`/queues`)
 
-Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative — before descriptors shipped, listings were driven by `queue_state_counts` so idle declared queues would silently disappear.
+Per-queue stats table showing depth by state, completion rate, lag, concurrency mode, capacity, rate limits, runtime health, and status. Each queue has Pause and Drain action buttons. Declared-but-empty queues appear alongside active ones because the descriptor catalog is authoritative.
 
 Descriptor display name, owner, tags, and docs URL (when declared) appear inline; a stale or drifted descriptor shows a subdued status badge so operators can tell when the catalog diverged from any live runtime.
 

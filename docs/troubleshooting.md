@@ -1,6 +1,6 @@
 # Troubleshooting
 
-This guide focuses on the operational issues called out in issue `#16`: stuck `running` jobs, leader-election delays, and heartbeat timeouts.
+This guide covers the operational issues that come up most often in practice: stuck `running` jobs, leader-election delays, and heartbeat timeouts.
 
 ## Quick Checks
 
