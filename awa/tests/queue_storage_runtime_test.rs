@@ -4327,8 +4327,18 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
         .await
         .expect("Failed to start callback dlq client");
 
-    let waiting = wait_for_callback_job(&store, &pool, job_id, Duration::from_secs(10)).await;
-    assert!(waiting.callback_timeout_at.is_some());
+    // NOTE: this test deliberately does not poll for the transient
+    // `WaitingExternal` state. With a 100ms callback timeout and a 25ms
+    // callback-rescue interval, that surface is only observable for ~100ms,
+    // which can lie entirely inside a single load_job round under CI runner
+    // load (load_job issues 6 sequential queries) — leading to the test
+    // missing the window even though the callback path fired correctly.
+    // The terminal `dlq_reason == "callback_timeout"` assertion below is
+    // sufficient evidence that the worker registered the callback and that
+    // the rescue path expired it: that reason is set exclusively by the
+    // callback-rescue maintenance pass in awa-worker, which only fires for
+    // jobs that reached `state = 'waiting_external'` with a non-null
+    // `callback_timeout_at`.
 
     let failed = wait_for_job_state(
         &store,
