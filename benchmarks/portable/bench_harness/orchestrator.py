@@ -488,6 +488,15 @@ def run_one_system(
     manifest = AdapterManifest.load(entry.bench_dir)
     print(f"\n=== [{system}] === ({manifest.db_name})", file=sys.stderr)
 
+    # Re-run the builder right before launching. The pre-loop pre-build
+    # in `drive` is the bulk of the work; this second call is
+    # idempotent (cargo / docker build cache hit, <1s) and protects
+    # against an adapter image being pruned during a multi-hour run
+    # ahead of it (`pgboss-bench` was missing at hour 2 of a 4-system
+    # consolidated run despite being built at startup, because docker
+    # GC reclaimed it during the long pgque phase).
+    entry.builder(False)
+
     # Sequential per-system fresh-PG isolation is the default.
     if not fast:
         stop_postgres(pg_image)
