@@ -7095,7 +7095,7 @@ impl QueueStorage {
                 claims.lane_seq,
                 ready.run_at,
                 attempt.heartbeat_at,
-                NULL::timestamptz AS deadline_at,
+                claims.deadline_at,
                 claims.claimed_at AS attempted_at,
                 NULL::timestamptz AS finalized_at,
                 ready.created_at,
