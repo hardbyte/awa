@@ -579,6 +579,32 @@ impl PyClient {
                         .execute(&pool)
                         .await
                         .map_err(map_sqlx_error)?;
+                    // The queue-storage schema is `awa` by default,
+                    // so the CASCADE above also dropped the
+                    // control-plane migrations the queue-storage tables
+                    // depend on (`awa.job_state` etc). Re-run them
+                    // before `prepare_schema` so `leases.state
+                    // awa.job_state` parses. When the queue-storage
+                    // schema is configured to a non-`awa` name this is
+                    // just a quick idempotent no-op.
+                    //
+                    // `migrations::run` is `!Send` (holds a
+                    // `PoolConnection` across awaits), and this async
+                    // block goes through `future_into_py` which
+                    // requires `Send`. Bridge via spawn_blocking +
+                    // current_thread runtime, the same pattern
+                    // `Self::migrate` uses.
+                    let pool_for_migrate = pool.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .expect("failed to build current_thread runtime for migrate");
+                        rt.block_on(awa_model::migrations::run(&pool_for_migrate))
+                    })
+                    .await
+                    .map_err(|e| state_error(format!("migration task failed: {e}")))?
+                    .map_err(map_awa_error)?;
                     store.prepare_schema(&pool).await.map_err(map_awa_error)?;
                     store.reset(&pool).await.map_err(map_awa_error)?;
                     store.activate_backend(&pool).await.map_err(map_awa_error)?;
@@ -2166,6 +2192,17 @@ impl PyClient {
                         .execute(&pool)
                         .await
                         .map_err(map_sqlx_error)?;
+                    // The queue-storage schema is `awa` by default,
+                    // so the CASCADE above also dropped the
+                    // control-plane migrations the queue-storage tables
+                    // depend on (`awa.job_state` etc). Re-run them
+                    // before `prepare_schema` so `leases.state
+                    // awa.job_state` parses. When the queue-storage
+                    // schema is configured to a non-`awa` name this is
+                    // just a quick idempotent no-op.
+                    awa_model::migrations::run(&pool)
+                        .await
+                        .map_err(map_awa_error)?;
                     store.prepare_schema(&pool).await.map_err(map_awa_error)?;
                     store.reset(&pool).await.map_err(map_awa_error)?;
                     store.activate_backend(&pool).await.map_err(map_awa_error)?;
