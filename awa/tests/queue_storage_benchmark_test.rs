@@ -598,8 +598,24 @@ fn average_completed_rate(samples: &[QueueStorageSample]) -> f64 {
 #[tokio::test]
 async fn test_queue_storage_round_trip_smoke() {
     let pool = pool_with(12).await;
-    let store = QueueStorage::new(QueueStorageConfig::default())
-        .expect("Failed to construct queue storage store");
+    // Use a dedicated schema, separate from the awa control plane.
+    // The default queue-storage schema is now `awa`, so
+    // `recreate_store_schema`'s `DROP SCHEMA … CASCADE` would also
+    // drop `awa.job_state` and the rest of the migrations the
+    // queue-storage tables themselves depend on.
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: "awa_qs_smoke".to_string(),
+        // This test exercises the lease-row complete path
+        // (`complete_batch` deletes from `{schema}.leases`). With
+        // receipts mode on — the 0.6 default — short-job claims land
+        // in `lease_claims` instead, so `complete_batch` would have
+        // nothing to delete. Receipt-aware completion has its own
+        // coverage; keep this fixture on the legacy path so we don't
+        // lose coverage for it.
+        lease_claim_receipts: false,
+        ..Default::default()
+    })
+    .expect("Failed to construct queue storage store");
     recreate_store_schema(&pool, &store).await;
     store.install(&pool).await.expect("Failed to install store");
     store.reset(&pool).await.expect("Failed to reset store");
@@ -684,6 +700,16 @@ async fn test_queue_storage_storage_benchmark() {
     let lease_slot_count = env_u32("AWA_VA_LEASE_SLOT_COUNT", 8);
     let store = Arc::new(
         QueueStorage::new(QueueStorageConfig {
+            // Same isolation reasoning as the smoke test above: avoid
+            // dropping the awa control-plane schema as a side-effect.
+            schema: "awa_qs_bench".to_string(),
+            // The benchmark drives `claim_batch` → `complete_batch`
+            // directly. Receipts-mode short-job claims write to
+            // `lease_claims` instead of `leases`, so the legacy
+            // `complete_batch` path here has nothing to delete.
+            // Force the lease-row path so the benchmark exercises
+            // what its harness measures.
+            lease_claim_receipts: false,
             queue_slot_count: queue_slot_count as usize,
             lease_slot_count: lease_slot_count as usize,
             ..Default::default()
