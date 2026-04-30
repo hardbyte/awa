@@ -123,12 +123,12 @@ export default async function globalSetup() {
       ('legacy_queue', 2, 2, 1, 1),
       ('e2e_dlq', 2, 1, 1, 0);
 
-    -- After 4e02d6f the per-lane next_seq/claim_seq cursors live in
-    -- their own tables, not in queue_lanes. The runtime's enqueue and
-    -- claim paths read these heads, so seeding queue_lanes alone
-    -- leaves the next-INSERT cursor at next_seq=1 — colliding with
-    -- the seeded ready_entries rows that already occupy lane_seq=1
-    -- the first time a UI test triggers a retry/enqueue. Mirror the
+    -- The per-lane next_seq/claim_seq cursors live in their own
+    -- tables, not in queue_lanes. The runtime's enqueue and claim
+    -- paths read these heads, so seeding queue_lanes alone leaves
+    -- the next-INSERT cursor at next_seq=1 — colliding with the
+    -- seeded ready_entries rows that already occupy lane_seq=1 the
+    -- first time a UI test triggers a retry/enqueue. Mirror the
     -- queue_lanes values into queue_enqueue_heads / queue_claim_heads.
     INSERT INTO ${queueStorageSchema}.queue_enqueue_heads (queue, priority, next_seq)
     VALUES
