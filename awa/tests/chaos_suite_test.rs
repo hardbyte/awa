@@ -70,6 +70,51 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
 }
 
 async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
+    // The 0.6 default is queue_storage; jobs flow through the
+    // segmented schema (`ready_entries`, `leases`, `lease_claims`,
+    // `done_entries`, `dlq_entries`) rather than `awa.jobs`. Mirror
+    // the union the telemetry test uses so this helper sees the
+    // same set the dispatcher does — including open `lease_claims`
+    // (anti-joined with closures) projected as `running`.
+    if let Some(schema) = queue_storage_schema_for_counts(pool).await {
+        let sql = format!(
+            "SELECT state::text, count(*)::bigint FROM ( \
+                 SELECT 'available'::awa.job_state AS state \
+                 FROM {schema}.ready_entries AS ready \
+                 JOIN {schema}.queue_claim_heads AS claims \
+                   ON claims.queue = ready.queue \
+                  AND claims.priority = ready.priority \
+                 WHERE ready.queue = $1 \
+                   AND ready.lane_seq >= claims.claim_seq \
+                 UNION ALL \
+                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.leases WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT 'running'::awa.job_state AS state \
+                 FROM {schema}.lease_claims AS lc \
+                 WHERE lc.queue = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                     WHERE cx.claim_slot = lc.claim_slot \
+                       AND cx.job_id = lc.job_id \
+                       AND cx.run_lease = lc.run_lease \
+                   ) \
+                 UNION ALL \
+                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
+             ) AS jobs \
+             GROUP BY state"
+        );
+        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+            .bind(queue)
+            .fetch_all(pool)
+            .await
+            .expect("Failed to query queue-storage state counts");
+        return rows.into_iter().collect();
+    }
+
     let rows: Vec<(String, i64)> = sqlx::query_as(
         r#"
         SELECT state::text, count(*)::bigint
@@ -84,6 +129,29 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
     .expect("Failed to query state counts");
 
     rows.into_iter().collect()
+}
+
+async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+        .fetch_one(pool)
+        .await
+        .expect("Failed to resolve active queue storage schema")
+}
+
+async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        return Some(schema);
+    }
+    let default_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa.ready_entries') IS NOT NULL \
+         AND to_regclass('awa.deferred_jobs') IS NOT NULL \
+         AND to_regclass('awa.leases') IS NOT NULL \
+         AND to_regclass('awa.done_entries') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("Failed to probe default queue storage schema");
+    default_exists.then_some("awa".to_string())
 }
 
 fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
