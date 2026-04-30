@@ -160,6 +160,11 @@ async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> 
 
 async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
+        // Open `lease_claims` (receipt-mode short-job claims that
+        // haven't materialised into a `leases` row yet) count as
+        // `running`. With receipts mode on by default, omitting them
+        // makes the test see 0 running jobs while several are
+        // actually in flight.
         let sql = format!(
             "SELECT COUNT(*)::bigint FROM (\
                  SELECT 'available'::awa.job_state AS state \
@@ -173,6 +178,16 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                  SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
                  UNION ALL \
                  SELECT state FROM {schema}.leases WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT 'running'::awa.job_state AS state \
+                 FROM {schema}.lease_claims AS lc \
+                 WHERE lc.queue = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                     WHERE cx.claim_slot = lc.claim_slot \
+                       AND cx.job_id = lc.job_id \
+                       AND cx.run_lease = lc.run_lease \
+                   ) \
                  UNION ALL \
                  SELECT state FROM {schema}.done_entries WHERE queue = $1 \
                  UNION ALL \
@@ -200,6 +215,9 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
 
 async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String, i64)> {
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
+        // Same receipts-mode fix as `queue_job_count` above: open
+        // `lease_claims` count as `running` so the breakdown matches
+        // the dispatcher's view of what's in flight.
         let sql = format!(
             "SELECT state::text, COUNT(*)::bigint FROM (\
                  SELECT 'available'::awa.job_state AS state \
@@ -213,6 +231,16 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                  SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
                  UNION ALL \
                  SELECT state FROM {schema}.leases WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT 'running'::awa.job_state AS state \
+                 FROM {schema}.lease_claims AS lc \
+                 WHERE lc.queue = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                     WHERE cx.claim_slot = lc.claim_slot \
+                       AND cx.job_id = lc.job_id \
+                       AND cx.run_lease = lc.run_lease \
+                   ) \
                  UNION ALL \
                  SELECT state FROM {schema}.done_entries WHERE queue = $1 \
                  UNION ALL \
