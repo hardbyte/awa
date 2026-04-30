@@ -1224,10 +1224,19 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
             observed_cancel: observed_cancel.clone(),
         },
     );
+    // Construct the `Notified` future BEFORE starting the client, so
+    // a `notify_waiters()` call from the worker can't fire-and-forget
+    // before we register interest. `Notify::notified()` only catches
+    // notifications received after the future is constructed; if the
+    // dispatcher is fast enough to claim and start the handler before
+    // we await below, the notification is otherwise lost and the
+    // timeout fires.
+    let running_notified = running.notified();
+    tokio::pin!(running_notified);
     client.start().await.expect("client start");
 
     // Wait for the handler to actually start executing.
-    tokio::time::timeout(Duration::from_secs(5), running.notified())
+    tokio::time::timeout(Duration::from_secs(5), running_notified)
         .await
         .expect("handler should start running");
 
