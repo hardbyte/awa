@@ -30,9 +30,11 @@ they are insert-only. `open_receipt_claims` does not. Its design is one
 `INSERT` per claim and one `DELETE` per completion, so every completion
 produces a dead tuple on that table.
 
-Measurements on the current branch confirm this is the remaining MVCC
-source. In `benchmarks/portable/results/custom-20260424T065828Z-227187`
-(28-minute clean phase at ~800/s per replica, receipts on), the
+Measurements at the time the receipt ring landed confirmed this is the
+remaining MVCC source. In an internal long-horizon run from
+`custom-20260424T065828Z-227187` (since-extracted to
+[postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking),
+28-minute clean phase at ~800/s per replica, receipts on), the
 `open_receipt_claims` heap held a median of 28,390 dead tuples and a peak
 of 93,789 while every other hot table stayed under 100 dead tuples. The
 autovacuum floor is `autovacuum_naptime=60s`, which is global, so per-table

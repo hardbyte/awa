@@ -9,7 +9,7 @@ members = [
     "awa-cli",
     "awa-ui",
 ]
-exclude = ["awa-python", "spike", "benchmarks/portable/awa-bench"]
+exclude = ["awa-python", "spike"]
 
 [workspace.package]
 version = "0.5.6"

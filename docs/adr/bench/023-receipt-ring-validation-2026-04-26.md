@@ -7,6 +7,15 @@ post-Phase-6 system: `lease_claim_receipts` defaulted on, the legacy
 `lease_claim_closures` partitioned by `claim_slot` with the claim ring
 rotating in lockstep with the lease ring.
 
+> **Note on paths.** This validation artefact pre-dates the extraction
+> of the long-horizon harness into its own repository. References to
+> `benchmarks/portable/...` below describe the in-tree layout at the
+> time of the run; the harness now lives at
+> [hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
+> The data files referenced by run-id (`custom-20260426...`) are
+> retained on the host that produced the run; they are not in the new
+> public repo.
+
 ## Run identity
 
 - Run id: `custom-20260426T032000Z-839ddc`

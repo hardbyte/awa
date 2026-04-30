@@ -1,3 +1,0 @@
-[submodule "benchmarks/portable/pgque-bench/vendor/pgque"]
-	path = benchmarks/portable/pgque-bench/vendor/pgque
-	url = https://github.com/NikolayS/pgque.git

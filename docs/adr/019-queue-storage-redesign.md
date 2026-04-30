@@ -311,14 +311,18 @@ sampled). The full command log, raw output, and per-table dead-tuple
 breakdown are in
 [`bench/019-queue-storage-validation-2026-04-19.md`](bench/019-queue-storage-validation-2026-04-19.md).
 
-The repo also maintains a phase-driven portable comparison harness under
-`benchmarks/portable/`. That harness records producer, subscriber, and
-end-to-end latency on a shared timebase while also sampling throughput, queue
-depth, and dead tuples over time. Current engineering runs consistently place
-Awa ahead of PgQue on subscriber and end-to-end latency and ahead on sustained
-throughput in the event-delivery scenarios, while PgQue keeps a lower
-dead-tuple profile. See [docs/benchmarking.md](../benchmarking.md) for the
-current comparison methodology and caveats.
+The phase-driven portable comparison harness lives in a separate repo:
+[postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
+That harness records producer, subscriber, and end-to-end latency on a
+shared timebase while also sampling throughput, queue depth, and dead
+tuples over time. Recent runs place Awa ahead of pgque on end-to-end
+latency and on sustained throughput in clean-phase scenarios, while
+pgque holds a comparable dead-tuple profile (both are append-only /
+partition-rotated). See
+[`SYSTEM_COMPARISONS.md`](https://github.com/hardbyte/postgresql-job-queue-benchmarking/blob/main/SYSTEM_COMPARISONS.md)
+for the per-system architectural notes and
+[docs/benchmarking.md](../benchmarking.md) for awa's own regression
+methodology.
 
 The current pressure frontier after the split-head change is the lease plane:
 `queue_lanes` is no longer the dominant MVCC hotspot, but the mutable
