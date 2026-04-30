@@ -100,6 +100,26 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
                        AND cx.job_id = lc.job_id \
                        AND cx.run_lease = lc.run_lease \
                    ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.leases AS lease \
+                     WHERE lease.job_id = lc.job_id \
+                       AND lease.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.deferred_jobs AS deferred \
+                     WHERE deferred.job_id = lc.job_id \
+                       AND deferred.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.done_entries AS done \
+                     WHERE done.job_id = lc.job_id \
+                       AND done.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.dlq_entries AS dlq \
+                     WHERE dlq.job_id = lc.job_id \
+                       AND dlq.run_lease = lc.run_lease \
+                   ) \
                  UNION ALL \
                  SELECT state FROM {schema}.done_entries WHERE queue = $1 \
                  UNION ALL \

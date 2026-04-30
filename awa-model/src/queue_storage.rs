@@ -7135,6 +7135,31 @@ impl QueueStorage {
                   WHERE lease.job_id = claims.job_id
                     AND lease.run_lease = claims.run_lease
               )
+              -- Exclude claims whose attempt has already been moved to
+              -- a non-running disposition. Rescue paths (callback
+              -- timeout, deadline, heartbeat) DELETE the materialised
+              -- lease and INSERT into `deferred_jobs` / `done_entries`
+              -- / `dlq_entries`, but they don't always write a
+              -- closure to `lease_claim_closures` — so the original
+              -- `lease_claims` row sits "open" until partition prune.
+              -- Without this guard, `load_job` returns the stale
+              -- 'running' projection and masks the actual retryable /
+              -- failed / completed state of the same attempt.
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.deferred_jobs AS deferred
+                  WHERE deferred.job_id = claims.job_id
+                    AND deferred.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.done_entries AS done
+                  WHERE done.job_id = claims.job_id
+                    AND done.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.dlq_entries AS dlq
+                  WHERE dlq.job_id = claims.job_id
+                    AND dlq.run_lease = claims.run_lease
+              )
             ORDER BY claims.run_lease DESC
             "#,
         ))
