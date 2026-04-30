@@ -445,9 +445,14 @@ async def scenario_long_horizon() -> None:
     async def handle(job: awa.Job[BenchJob]) -> None:
         nonlocal completed
         now = time.monotonic()
-        # `job.created_at` is a UTC datetime in the awa-python bridge.
+        # `job.created_at` is an RFC3339 string from the Rust binding
+        # (`PyJob::created_at` calls `to_rfc3339()`), not a datetime —
+        # parse it. Previously the handler assumed it was already a
+        # datetime, the subtract raised TypeError, the fallback set
+        # `latency_ms = 0`, and every claim/end-to-end percentile in
+        # raw.csv was reported as 0.0.
         try:
-            created = job.created_at
+            created = datetime.datetime.fromisoformat(job.created_at)
             now_wall = datetime.datetime.now(datetime.timezone.utc)
             latency_ms = max(0.0, (now_wall - created).total_seconds() * 1000.0)
         except Exception:
