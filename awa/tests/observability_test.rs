@@ -168,11 +168,23 @@ async fn wait_for_job_state(
 ) -> JobState {
     let start = std::time::Instant::now();
     loop {
-        let state: String = sqlx::query_scalar("SELECT state::text FROM awa.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(pool)
-            .await
-            .expect("Failed to query job state");
+        // Route through `awa::model::admin::get_job` so the lookup
+        // follows whichever backend is active (queue_storage vs
+        // canonical). The previous direct `SELECT FROM awa.jobs`
+        // returned `RowNotFound` under queue_storage because jobs
+        // flow through `ready_entries` / `lease_claims` / `leases`
+        // / `done_entries`, not the canonical `awa.jobs` view.
+        let state: String = match awa::model::admin::get_job(pool, job_id).await {
+            Ok(job) => job.state.to_string(),
+            Err(awa::model::AwaError::JobNotFound { .. }) => {
+                if start.elapsed() >= timeout {
+                    panic!("Job {job_id} not found after {timeout:?}");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                continue;
+            }
+            Err(err) => panic!("Failed to query job state: {err}"),
+        };
 
         let job_state = match state.as_str() {
             "available" => JobState::Available,
