@@ -68,13 +68,12 @@ Local queue-storage soak, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95
 pickup**, **417 exact final dead tuples**. Enqueue: ~30k/s single-producer,
 ~100k/s multi-producer.
 
-The repo also carries a phase-driven portable benchmark harness that compares
-Awa against PgQue, PGMQ, and pg-boss on a shared Postgres instance and records
-producer, subscriber, and end-to-end delivery latency alongside throughput,
-queue depth, and dead tuples over time. Current engineering runs show Awa
-ahead of PgQue on sustained throughput and subscriber/end-to-end latency in
-the event-delivery scenarios, while PgQue still keeps a lower dead-tuple
-profile.
+A phase-driven portable benchmark harness comparing Awa against pgque,
+procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres
+instance lives in its own repository:
+[hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
+It records producer, subscriber, and end-to-end delivery latency
+alongside throughput, queue depth, and dead tuples over time.
 
 Methodology and caveats live in
 [benchmarking notes](docs/benchmarking.md). Validation artifacts:
@@ -299,7 +298,7 @@ pip install awa-cli      # CLI: migrations, queue admin, web UI
 
 ```toml
 [dependencies]
-awa = "0.5"
+awa = "0.6"
 ```
 
 ### CLI

@@ -8,7 +8,7 @@ boundary, and the health checks to run at each step.
 
 > **Fresh installs do not need this file.** A new cluster runs
 > `awa migrate` and starts workers; the first worker auto-finalizes
-> via `awa.storage_auto_finalize_if_fresh()` (migration v012). See
+> via `awa.storage_auto_finalize_if_fresh()`. See
 > migrations.md ["Fresh install"](migrations.md#fresh-install-no-prior-canonical-data).
 > This checklist is for **upgrading existing 0.5.x clusters**, where
 > canonical drain is unavoidable and auto-finalize correctly defers to
@@ -24,7 +24,7 @@ boundary, and the health checks to run at each step.
   - Run `awa storage` commands against the production DSN
   - Inspect `awa.runtime_instances` for live capability reporting
   - Watch worker logs / Grafana dashboards during the cutover
-- [ ] Confirmed every queue-storage-capable Python worker is on a binding that includes the ADR-023 claim-ring knobs (commit `3940ba1` or later); skip if running Rust-only
+- [ ] Confirmed every queue-storage-capable Python worker is on an `awa-pg` wheel that exposes the ADR-023 claim-ring knobs (the `queue_storage_claim_*` kwargs on `client.start()`); skip if running Rust-only
 
 ## Phase 1 — last 0.5.x everywhere (safe stop)
 
@@ -87,7 +87,7 @@ psql "$DATABASE_URL" -c "
 #    → canonical_only must be 0
 
 # 6. Start at least one runtime with `transition_role=queue_storage_target`.
-#    This is what the SQL gate (v014+) actually requires. An auto-role
+#    This is what the mixed-transition SQL gate actually requires. An auto-role
 #    runtime started before mixed_transition resolves its effective
 #    storage to canonical at startup and will downgrade to
 #    `canonical_drain_only` immediately after routing flips, leaving
@@ -171,7 +171,7 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 
 ## Known issues
 
-- **Python workers without claim-ring knobs.** Pre-`3940ba1` Python bindings don't accept `queue_storage_claim_slot_count` / `queue_storage_claim_rotate_interval_ms`. They'll still run with default values and the rollout will work, but operators wanting non-default ring sizing must rebuild the Python wheel against a newer `awa-python` first.
+- **Python workers without claim-ring knobs.** Older Python wheels don't accept `queue_storage_claim_slot_count` / `queue_storage_claim_rotate_interval_ms` on `client.start()`. They'll still run with default values and the rollout will work, but operators wanting non-default ring sizing need a wheel that exposes those kwargs.
 - **Held-tx during finalize.** A long-running canonical transaction (e.g., reporting query) blocks vacuum, which can stall partition prune in the queue-storage tables. `awa.maintenance.prune.attempts{awa_ring_outcome="blocked"}` will rise. Identify and terminate the held-tx; prune resumes on the next maintenance tick.
 - **0.6 rollback after queue-storage work.** Not supported via `awa storage abort` once any rows exist in queue-storage tables. Plan accordingly: keep `0.6` workers available throughout the transition window. Only emergency rollback path is database restore.
 
@@ -181,4 +181,3 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 - [configuration.md](configuration.md) — claim-ring / lease-ring sizing knobs
 - [`docs/adr/023-receipt-plane-ring-partitioning.md`](adr/023-receipt-plane-ring-partitioning.md) — receipt-plane partition design and reverse-migration recipe
 - [`docs/grafana/awa-dashboard.json`](grafana/awa-dashboard.json) — Prometheus dashboard with the rotation/prune panels
-- Issue [#197](https://github.com/hardbyte/awa/issues/197) — 0.6 release-readiness tracker

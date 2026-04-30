@@ -187,7 +187,7 @@ The 0.6 storage-engine upgrade uses the transition protocol introduced in the
      executor before the routing flip so new work can start executing
      immediately after `enter-mixed-transition`
 
-   The `enter_mixed_transition()` SQL gate (since v014) requires at least
+   The `enter_mixed_transition()` SQL gate requires at least
    one live runtime running with `transition_role = 'queue_storage_target'`
    reporting `storage_capability = 'queue_storage'`. Auto-role runtimes
    that pre-date the flip will downgrade to `canonical_drain_only` after
@@ -405,9 +405,8 @@ That's the whole flow. The first worker that comes up in `auto` mode
 detects the DB is fresh — `state=canonical`, `prepared_engine=NULL`,
 no canonical jobs ever, no other live workers — and atomically
 installs the queue-storage schema and advances state directly to
-`active` via `awa.storage_auto_finalize_if_fresh()` (added in
-migration v012). Subsequent workers see `state=active` and run as
-queue-storage straight away.
+`active` via `awa.storage_auto_finalize_if_fresh()`. Subsequent
+workers see `state=active` and run as queue-storage straight away.
 
 The auto-finalize fast-path **only** fires on a truly fresh DB. Any
 of these conditions disqualify it and force the operator down the

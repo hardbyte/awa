@@ -14,7 +14,7 @@ path = "src/main.rs"
 [dependencies]
 awa-model.workspace = true
 awa-worker.workspace = true
-awa-ui = { path = "../awa-ui", version = "0.5.6" }
+awa-ui = { path = "../awa-ui", version = "0.6.0" }
 axum.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
@@ -26,7 +26,7 @@ chrono.workspace = true
 hex.workspace = true
 
 [dev-dependencies]
-awa-testing = { path = "../awa-testing", version = "0.5.6" }
+awa-testing = { path = "../awa-testing", version = "0.6.0" }
 assert_cmd = "2"
 serde.workspace = true
 uuid.workspace = true

@@ -222,7 +222,7 @@ properties:
 - homogeneous inserts now route directly to `awa.jobs_hot` or
   `awa.scheduled_jobs` instead of going through the compatibility view
 - admin metadata maintenance moved from row-level triggers to statement-level
-  trigger batches (`v005`)
+  trigger batches
 - COPY staging now reuses a session-local temp table and stages typed values
   instead of reparsing text on the final `INSERT ... SELECT`
 

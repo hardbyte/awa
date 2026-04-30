@@ -429,15 +429,17 @@ await client.start(
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
 | `queue_stripe_count` | `1` | Rust `QueueStorageConfig` only in the current API. Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current release-shape candidate; higher values should be benchmarked before use. |
-| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Receipts mode now supports per-claim deadlines too: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. The default flipped from `false` to `true` in 0.6 — see ADR-023. |
+| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Tests that pin claim-ring layout for a deterministic count assertion can push this past their wall-clock window (see `queue_storage_runtime_test.rs::queue_storage_client` helper). |
 
-The portable benchmark adapters also read `QUEUE_SLOT_COUNT`,
-`LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`, `QUEUE_STRIPE_COUNT`, and
-`LEASE_CLAIM_RECEIPTS` from the environment. Those env vars are benchmark
-configuration, not general worker-runtime configuration.
+The benchmark harness in
+[postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking)
+reads `QUEUE_SLOT_COUNT`, `LEASE_SLOT_COUNT`, `CLAIM_SLOT_COUNT`,
+`QUEUE_STRIPE_COUNT`, and `LEASE_CLAIM_RECEIPTS` from the environment.
+Those env vars are benchmark configuration, not general worker-runtime
+configuration.
 
 Use the defaults unless you have a reason not to:
 
