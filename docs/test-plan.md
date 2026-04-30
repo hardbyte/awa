@@ -3,8 +3,6 @@
 Tests run against real Postgres 15+ (not managed services). Dedicated test database.
 All tests are automated and run in CI.
 
-See [the full test plan](../prd.md) for detailed descriptions of each test case.
-
 ## Test Matrix
 
 **Rust** = Rust integration test, **Py** = Python test, **TLA+** = TLC model check, **Both** = cross-language.
