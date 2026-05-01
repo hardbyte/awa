@@ -18,6 +18,26 @@ DATABASE_URL = os.environ.get(
 )
 
 
+def reset_storage_transition_state(client: awa.Client) -> None:
+    tx = client.transaction()
+    tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
+    tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    tx.execute("DELETE FROM awa.runtime_instances")
+    tx.commit()
+
+
 @dataclass
 class SyncEmail:
     to: str
@@ -35,12 +55,17 @@ def client():
     """Create a client and run migrations synchronously."""
     c = awa.Client(DATABASE_URL)
     c.migrate()
+    reset_storage_transition_state(c)
     # Clean up jobs from previous tests
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs")
     tx.execute("DELETE FROM awa.queue_meta")
     tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        reset_storage_transition_state(c)
+        c.close()
 
 
 # -- Test 12: insert_sync returns Job directly --

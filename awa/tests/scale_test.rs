@@ -90,19 +90,46 @@ async fn pool() -> sqlx::PgPool {
         .expect("Failed to connect")
 }
 
+async fn reset_storage_transition_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to reset storage transition state");
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(pool)
+        .await
+        .expect("Failed to clear queue storage activation for scale tests");
+}
+
 async fn setup() -> sqlx::PgPool {
     let url = database_url();
     SCALE_TEST_DB_INIT
         .get_or_init(|| async {
             ensure_database_exists(&url).await;
+            let pool = pool().await;
+            sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
+                .execute(&pool)
+                .await
+                .expect("Failed to reset awa schema for scale tests");
+            migrations::run(&pool).await.expect("Failed to migrate");
+            reset_storage_transition_state(&pool).await;
+            pool.close().await;
         })
         .await;
     let pool = pool().await;
-    migrations::run(&pool).await.expect("Failed to migrate");
-    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        .execute(&pool)
-        .await
-        .expect("Failed to clear queue storage activation for scale tests");
+    reset_storage_transition_state(&pool).await;
     pool
 }
 

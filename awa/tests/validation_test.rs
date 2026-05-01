@@ -81,6 +81,20 @@ async fn pool_with(max_conns: u32) -> sqlx::PgPool {
     VALIDATION_TEST_DB_INIT
         .get_or_init(|| async {
             ensure_database_exists(&url).await;
+            let setup_pool = PgPoolOptions::new()
+                .max_connections(1)
+                .connect(&url)
+                .await
+                .expect("Failed to connect to validation test database for migration");
+            sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
+                .execute(&setup_pool)
+                .await
+                .expect("Failed to reset awa schema for validation tests");
+            migrations::run(&setup_pool)
+                .await
+                .expect("Failed to migrate validation test database");
+            reset_storage_transition_state(&setup_pool).await;
+            setup_pool.close().await;
         })
         .await;
     PgPoolOptions::new()
@@ -96,12 +110,27 @@ async fn pool() -> sqlx::PgPool {
 
 async fn setup() -> sqlx::PgPool {
     let p = pool().await;
-    prepare_pool(&p).await;
+    reset_storage_transition_state(&p).await;
     p
 }
 
-async fn prepare_pool(pool: &sqlx::PgPool) {
-    migrations::run(pool).await.expect("Failed to migrate");
+async fn reset_storage_transition_state(pool: &sqlx::PgPool) {
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(pool)
+    .await
+    .expect("Failed to reset storage transition state");
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
         .execute(pool)
         .await
@@ -1006,7 +1035,7 @@ async fn t21_deserialization_failure() {
 async fn t22_pool_exhaustion_resilience() {
     // Create a pool with very few connections
     let pool = pool_with(5).await;
-    prepare_pool(&pool).await;
+    reset_storage_transition_state(&pool).await;
     let queue = "t22_pool";
     clean_queue(&pool, queue).await;
 
@@ -1096,8 +1125,8 @@ async fn t26_migration_idempotency() {
     let pool = pool().await;
 
     // Run migrations twice — second should be no-op
-    prepare_pool(&pool).await;
-    prepare_pool(&pool).await;
+    migrations::run(&pool).await.expect("first migration run");
+    migrations::run(&pool).await.expect("second migration run");
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);

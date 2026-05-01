@@ -16,19 +16,40 @@ DATABASE_URL = os.environ.get(
 )
 
 
+async def reset_storage_transition_state(client: awa.AsyncClient) -> None:
+    tx = await client.transaction()
+    await tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute("DELETE FROM awa.runtime_instances")
+    await tx.commit()
+
+
 @pytest.fixture
 async def client():
     """Create a client and run migrations."""
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await reset_storage_transition_state(c)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
     await tx.execute("DELETE FROM awa.jobs")
     await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
     try:
         yield c
     finally:
+        await reset_storage_transition_state(c)
         await c.close()
 
 
