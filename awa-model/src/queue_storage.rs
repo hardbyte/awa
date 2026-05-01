@@ -20,6 +20,7 @@ const DEFAULT_CLAIM_SLOT_COUNT: usize = 8;
 const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
+const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct QueueStorageConfig {
@@ -3748,11 +3749,6 @@ impl QueueStorage {
 
         let schema = self.schema();
         let ring = self.current_queue_ring(tx).await?;
-        let mut csv_buf = Vec::with_capacity(rows.len() * 320);
-        for row in rows {
-            write_ready_copy_row(&mut csv_buf, ring.0, ring.1, row);
-        }
-
         let copy_sql = format!(
             "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
@@ -3761,7 +3757,20 @@ impl QueueStorage {
             .copy_in_raw(&copy_sql)
             .await
             .map_err(map_sqlx_error)?;
-        copy_in.send(csv_buf).await.map_err(map_sqlx_error)?;
+        // 320 bytes/row is only a rough starting point; large JSON payloads
+        // are bounded by chunked COPY sends below rather than by this reserve.
+        let mut csv_buf = Vec::with_capacity(rows.len().min(1024) * 320);
+        for row in rows {
+            write_ready_copy_row(&mut csv_buf, ring.0, ring.1, row);
+            if csv_buf.len() >= COPY_CHUNK_TARGET_BYTES {
+                let chunk =
+                    std::mem::replace(&mut csv_buf, Vec::with_capacity(COPY_CHUNK_TARGET_BYTES));
+                copy_in.send(chunk).await.map_err(map_sqlx_error)?;
+            }
+        }
+        if !csv_buf.is_empty() {
+            copy_in.send(csv_buf).await.map_err(map_sqlx_error)?;
+        }
         copy_in.finish().await.map_err(map_sqlx_error)?;
 
         Ok(rows.len())
@@ -3864,6 +3873,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<RuntimeReadyRow>,
+        job_ids: Vec<i64>,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
@@ -3879,7 +3889,11 @@ impl QueueStorage {
         }
 
         let total_rows: usize = grouped.values().map(Vec::len).sum();
-        let job_ids = self.next_job_ids(tx, total_rows).await?;
+        if job_ids.len() != total_rows {
+            return Err(AwaError::Validation(
+                "queue storage job id allocation count mismatch".to_string(),
+            ));
+        }
         let mut job_id_iter = job_ids.into_iter();
 
         let mut ready_rows = Vec::with_capacity(total_rows);
@@ -4098,7 +4112,6 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<DeferredJobRow>,
-        old_state: Option<JobState>,
     ) -> Result<usize, AwaError> {
         if rows.is_empty() {
             return Ok(0);
@@ -4110,18 +4123,13 @@ impl QueueStorage {
                 row.job_id,
                 &row.unique_key,
                 row.unique_states.as_deref(),
-                old_state,
+                None,
                 Some(row.state),
             )
             .await?;
         }
 
         let schema = self.schema();
-        let mut csv_buf = Vec::with_capacity(rows.len() * 320);
-        for row in &rows {
-            write_deferred_copy_row(&mut csv_buf, row);
-        }
-
         let copy_sql = format!(
             "COPY {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
@@ -4130,7 +4138,20 @@ impl QueueStorage {
             .copy_in_raw(&copy_sql)
             .await
             .map_err(map_sqlx_error)?;
-        copy_in.send(csv_buf).await.map_err(map_sqlx_error)?;
+        // 320 bytes/row is only a rough starting point; large JSON payloads
+        // are bounded by chunked COPY sends below rather than by this reserve.
+        let mut csv_buf = Vec::with_capacity(rows.len().min(1024) * 320);
+        for row in &rows {
+            write_deferred_copy_row(&mut csv_buf, row);
+            if csv_buf.len() >= COPY_CHUNK_TARGET_BYTES {
+                let chunk =
+                    std::mem::replace(&mut csv_buf, Vec::with_capacity(COPY_CHUNK_TARGET_BYTES));
+                copy_in.send(chunk).await.map_err(map_sqlx_error)?;
+            }
+        }
+        if !csv_buf.is_empty() {
+            copy_in.send(csv_buf).await.map_err(map_sqlx_error)?;
+        }
         copy_in.finish().await.map_err(map_sqlx_error)?;
 
         Ok(rows.len())
@@ -4536,6 +4557,11 @@ impl QueueStorage {
             }
         }
 
+        let queues_to_notify: BTreeSet<String> = ready_rows
+            .iter()
+            .map(|row| self.logical_queue_name(&row.queue).to_string())
+            .collect();
+
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
         if !ready_rows.is_empty() {
@@ -4555,10 +4581,6 @@ impl QueueStorage {
                 .await?;
         }
 
-        let queues_to_notify: BTreeSet<String> = ready_rows
-            .into_iter()
-            .map(|row| self.logical_queue_name(&row.queue).to_string())
-            .collect();
         for queue in queues_to_notify {
             sqlx::query("SELECT pg_notify($1, '')")
                 .bind(format!("awa:{queue}"))
@@ -4641,29 +4663,33 @@ impl QueueStorage {
             }
         }
 
+        let queues_to_notify: BTreeSet<String> = ready_rows
+            .iter()
+            .map(|row| self.logical_queue_name(&row.queue).to_string())
+            .collect();
+
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
+        let job_ids = self
+            .next_job_ids(&mut tx, ready_rows.len() + deferred_rows.len())
+            .await?;
+        let (ready_job_ids, deferred_job_ids) = job_ids.split_at(ready_rows.len());
         if !ready_rows.is_empty() {
             total += self
-                .insert_ready_rows_copy_tx(&mut tx, ready_rows.clone())
+                .insert_ready_rows_copy_tx(&mut tx, ready_rows, ready_job_ids.to_vec())
                 .await?;
         }
         if !deferred_rows.is_empty() {
-            let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
             let deferred_rows: Vec<_> = deferred_rows
                 .into_iter()
-                .zip(ids)
+                .zip(deferred_job_ids.iter().copied())
                 .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
                 .collect();
             total += self
-                .insert_deferred_rows_copy_tx(&mut tx, deferred_rows, None)
+                .insert_deferred_rows_copy_tx(&mut tx, deferred_rows)
                 .await?;
         }
 
-        let queues_to_notify: BTreeSet<String> = ready_rows
-            .into_iter()
-            .map(|row| self.logical_queue_name(&row.queue).to_string())
-            .collect();
         for queue in queues_to_notify {
             sqlx::query("SELECT pg_notify($1, '')")
                 .bind(format!("awa:{queue}"))

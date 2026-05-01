@@ -270,6 +270,9 @@ cargo test --package awa --test postgres_failover_smoke_test -- --ignored --noca
 # COPY integration tests
 DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa --test copy_test -- --nocapture
 
+# Queue-storage COPY producer tests
+DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test cargo test --package awa-model --test queue_storage_copy_test -- --nocapture
+
 # Python sync tests
 cd awa-python && DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test .venv/bin/pytest tests/test_sync.py -v
 
