@@ -150,8 +150,8 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
         .expect("copy enqueue");
     assert_eq!(inserted, 3);
 
-    let ready: Vec<(i64, serde_json::Value)> = sqlx::query_as(&format!(
-        "SELECT lane_seq, payload FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq",
+    let ready: Vec<(i64, i64, Option<serde_json::Value>)> = sqlx::query_as(&format!(
+        "SELECT lane_seq, (args->>'seq')::bigint, payload FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq",
         store.schema()
     ))
     .bind(queue)
@@ -159,9 +159,42 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
     .await
     .expect("read ready rows");
     assert_eq!(ready.len(), 2);
-    assert_eq!(ready[1].0, ready[0].0 + 1);
-    assert_eq!(ready[0].1["metadata"]["source"], "copy");
-    assert_eq!(ready[0].1["tags"], serde_json::json!(["bulk"]));
+    let tagged = ready
+        .iter()
+        .find(|(_, seq, _)| *seq == 0)
+        .expect("tagged ready row");
+    let default = ready
+        .iter()
+        .find(|(_, seq, _)| *seq == 1)
+        .expect("default ready row");
+    let tagged_payload = tagged.2.as_ref().expect("tagged payload should persist");
+    assert_eq!(tagged_payload["metadata"]["source"], "copy");
+    assert_eq!(tagged_payload["tags"], serde_json::json!(["bulk"]));
+    assert_eq!(
+        default.2, None,
+        "default payloads should persist as SQL NULL in COPY rows"
+    );
+
+    let (compact_payload_bytes, expanded_payload_bytes): (i32, i32) = sqlx::query_as(&format!(
+        "SELECT COALESCE(pg_column_size(payload), 0)::int, \
+                pg_column_size('{{\"metadata\":{{}},\"tags\":[],\"errors\":[],\"progress\":null}}'::jsonb)::int \
+           FROM {}.ready_entries \
+          WHERE queue = $1 AND lane_seq = $2",
+        store.schema()
+    ))
+    .bind(queue)
+    .bind(default.0)
+    .fetch_one(&pool)
+    .await
+    .expect("measure compact payload size");
+    println!(
+        "[queue-storage-copy] default payload jsonb bytes compact={} expanded={}",
+        compact_payload_bytes, expanded_payload_bytes
+    );
+    assert!(
+        compact_payload_bytes < expanded_payload_bytes,
+        "compact payload should use fewer JSONB bytes ({compact_payload_bytes} >= {expanded_payload_bytes})"
+    );
 
     let deferred_count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*)::bigint FROM {}.deferred_jobs WHERE queue = $1 AND state = 'scheduled'",

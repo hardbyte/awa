@@ -7,7 +7,7 @@ use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -338,15 +338,22 @@ fn default_payload_metadata() -> serde_json::Value {
     serde_json::json!({})
 }
 
+fn is_empty_json_object(value: &serde_json::Value) -> bool {
+    value.as_object().is_some_and(serde_json::Map::is_empty)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct RuntimePayload {
-    #[serde(default = "default_payload_metadata")]
+    #[serde(
+        default = "default_payload_metadata",
+        skip_serializing_if = "is_empty_json_object"
+    )]
     metadata: serde_json::Value,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     errors: Vec<serde_json::Value>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     progress: Option<serde_json::Value>,
 }
 
@@ -363,6 +370,9 @@ impl Default for RuntimePayload {
 
 impl RuntimePayload {
     fn from_json(value: serde_json::Value) -> Result<Self, AwaError> {
+        if value.is_null() {
+            return Ok(Self::default());
+        }
         let payload: Self = serde_json::from_value(value)?;
         if !payload.metadata.is_object() {
             return Err(AwaError::Validation(
@@ -400,6 +410,104 @@ impl RuntimePayload {
     }
 }
 
+#[cfg(test)]
+mod runtime_payload_tests {
+    use super::{storage_payload, terminal_storage_payload, RuntimePayload};
+
+    #[test]
+    fn default_runtime_payload_serializes_compactly() {
+        assert_eq!(
+            RuntimePayload::default().into_json(),
+            serde_json::json!({}),
+            "default payloads should not write empty metadata/tags/errors/progress"
+        );
+        assert_eq!(
+            storage_payload(&RuntimePayload::default().into_json()),
+            None
+        );
+    }
+
+    #[test]
+    fn missing_runtime_payload_fields_round_trip_with_defaults() {
+        let payload = RuntimePayload::from_json(serde_json::json!({})).unwrap();
+
+        assert_eq!(payload.metadata, serde_json::json!({}));
+        assert!(payload.tags.is_empty());
+        assert!(payload.errors.is_empty());
+        assert_eq!(payload.progress, None);
+        assert_eq!(payload.into_json(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn null_runtime_payload_round_trips_with_defaults() {
+        let payload = RuntimePayload::from_json(serde_json::Value::Null).unwrap();
+
+        assert_eq!(payload.metadata, serde_json::json!({}));
+        assert!(payload.tags.is_empty());
+        assert!(payload.errors.is_empty());
+        assert_eq!(payload.progress, None);
+        assert_eq!(storage_payload(&payload.into_json()), None);
+    }
+
+    #[test]
+    fn legacy_expanded_runtime_payload_round_trips_to_compact_form() {
+        let payload = RuntimePayload::from_json(serde_json::json!({
+            "metadata": {},
+            "tags": [],
+            "errors": [],
+            "progress": null
+        }))
+        .unwrap();
+
+        assert_eq!(payload.metadata, serde_json::json!({}));
+        assert!(payload.tags.is_empty());
+        assert!(payload.errors.is_empty());
+        assert_eq!(payload.progress, None);
+        assert_eq!(payload.into_json(), serde_json::json!({}));
+    }
+
+    #[test]
+    fn non_default_runtime_payload_fields_are_preserved() {
+        let payload = RuntimePayload::from_json(serde_json::json!({
+            "metadata": { "source": "test" },
+            "tags": ["fast"],
+            "errors": [{ "message": "boom" }],
+            "progress": { "step": 1 }
+        }))
+        .unwrap();
+
+        assert_eq!(
+            payload.into_json(),
+            serde_json::json!({
+                "metadata": { "source": "test" },
+                "tags": ["fast"],
+                "errors": [{ "message": "boom" }],
+                "progress": { "step": 1 }
+            })
+        );
+    }
+
+    #[test]
+    fn unchanged_terminal_payload_elides_storage_copy() {
+        let payload = serde_json::json!({
+            "metadata": { "source": "test" },
+            "tags": ["fast"]
+        });
+
+        assert_eq!(terminal_storage_payload(&payload, Some(&payload)), None);
+
+        let changed = serde_json::json!({
+            "metadata": { "source": "test" },
+            "tags": ["fast"],
+            "errors": [{ "message": "boom" }]
+        });
+        assert_eq!(
+            terminal_storage_payload(&changed, Some(&payload)),
+            Some(&changed)
+        );
+    }
+}
+
 fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     let Some(bitmask) = unique_states else {
         return false;
@@ -432,6 +540,32 @@ fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
 fn write_copy_json(buf: &mut Vec<u8>, value: &serde_json::Value) {
     let json = serde_json::to_string(value).expect("JSON serialization should not fail");
     write_copy_field(buf, &json);
+}
+
+fn storage_payload(value: &serde_json::Value) -> Option<&serde_json::Value> {
+    (!is_storage_payload_empty(value)).then_some(value)
+}
+
+fn terminal_storage_payload<'a>(
+    value: &'a serde_json::Value,
+    ready_payload: Option<&serde_json::Value>,
+) -> Option<&'a serde_json::Value> {
+    if is_storage_payload_empty(value) || ready_payload.is_some_and(|ready| ready == value) {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn is_storage_payload_empty(value: &serde_json::Value) -> bool {
+    value.is_null() || is_empty_json_object(value)
+}
+
+fn write_copy_storage_payload(buf: &mut Vec<u8>, value: &serde_json::Value) {
+    match storage_payload(value) {
+        Some(value) => write_copy_json(buf, value),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+    }
 }
 
 fn write_copy_datetime(buf: &mut Vec<u8>, value: DateTime<Utc>) {
@@ -500,7 +634,7 @@ fn write_ready_copy_row(
     buf.push(b',');
     write_copy_optional_string(buf, row.unique_states.as_deref());
     buf.push(b',');
-    write_copy_json(buf, &row.payload);
+    write_copy_storage_payload(buf, &row.payload);
     buf.push(b'\n');
 }
 
@@ -535,7 +669,7 @@ fn write_deferred_copy_row(buf: &mut Vec<u8>, row: &DeferredJobRow) {
     buf.push(b',');
     write_copy_optional_string(buf, row.unique_states.as_deref());
     buf.push(b',');
-    write_copy_json(buf, &row.payload);
+    write_copy_storage_payload(buf, &row.payload);
     buf.push(b'\n');
 }
 
@@ -2817,7 +2951,7 @@ impl QueueStorage {
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 unique_key        BYTEA,
                 unique_states     TEXT,
-                payload           JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                payload           JSONB,
                 PRIMARY KEY (ready_slot, queue, priority, lane_seq)
             ) PARTITION BY LIST (ready_slot)
             "#
@@ -2847,7 +2981,7 @@ impl QueueStorage {
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 unique_key        BYTEA,
                 unique_states     TEXT,
-                payload           JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                payload           JSONB,
                 PRIMARY KEY (ready_slot, queue, priority, lane_seq)
             ) PARTITION BY LIST (ready_slot)
             "#
@@ -2874,7 +3008,7 @@ impl QueueStorage {
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 unique_key        BYTEA,
                 unique_states     TEXT,
-                payload           JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                payload           JSONB,
                 CONSTRAINT deferred_jobs_state_check
                     CHECK (state IN ('scheduled', 'retryable'))
             )
@@ -2922,7 +3056,7 @@ impl QueueStorage {
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 unique_key        BYTEA,
                 unique_states     TEXT,
-                payload           JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                payload           JSONB,
                 dlq_reason        TEXT NOT NULL,
                 dlq_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 original_run_lease BIGINT NOT NULL
@@ -3246,7 +3380,7 @@ impl QueueStorage {
                         ready.created_at,
                         ready.unique_key,
                         ready.unique_states,
-                        ready.payload
+                        COALESCE(ready.payload, '{{}}'::jsonb) AS payload
                     FROM {schema}.ready_entries AS ready
                     WHERE ready.queue = p_queue
                       AND ready.priority = v_lane_priority
@@ -3764,7 +3898,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             FROM {schema}.claim_ready_runtime($1, $2, $3, $4)
             "#
         ))
@@ -3808,7 +3942,7 @@ impl QueueStorage {
                 .push_bind(row.created_at)
                 .push_bind(&row.unique_key)
                 .push_bind(&row.unique_states)
-                .push_bind(&row.payload);
+                .push_bind(storage_payload(&row.payload));
         });
         builder
             .build()
@@ -4168,7 +4302,7 @@ impl QueueStorage {
                 .push_bind(row.created_at)
                 .push_bind(&row.unique_key)
                 .push_bind(&row.unique_states)
-                .push_bind(&row.payload);
+                .push_bind(storage_payload(&row.payload));
         });
         builder
             .build()
@@ -4241,10 +4375,19 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
+        let ready_payloads = self.ready_payloads_for_done_rows_tx(tx, rows).await?;
         let mut builder = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) "
         ));
         builder.push_values(rows.iter(), |mut b, row| {
+            let ready_key = (
+                row.ready_slot,
+                row.ready_generation,
+                row.queue.as_str(),
+                row.priority,
+                row.lane_seq,
+            );
+            let ready_payload = ready_payloads.get(&ready_key);
             b.push_bind(row.ready_slot)
                 .push_bind(row.ready_generation)
                 .push_bind(row.job_id)
@@ -4263,7 +4406,7 @@ impl QueueStorage {
                 .push_bind(row.created_at)
                 .push_bind(&row.unique_key)
                 .push_bind(&row.unique_states)
-                .push_bind(&row.payload);
+                .push_bind(terminal_storage_payload(&row.payload, ready_payload));
         });
         builder
             .build()
@@ -4272,6 +4415,85 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         Ok(rows.len())
+    }
+
+    async fn ready_payloads_for_done_rows_tx<'a, 'r>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &'r [DoneJobRow],
+    ) -> Result<HashMap<(i32, i64, &'r str, i16, i64), serde_json::Value>, AwaError> {
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let schema = self.schema();
+        let ready_slots: Vec<i32> = rows.iter().map(|row| row.ready_slot).collect();
+        let ready_generations: Vec<i64> = rows.iter().map(|row| row.ready_generation).collect();
+        let queues: Vec<&str> = rows.iter().map(|row| row.queue.as_str()).collect();
+        let priorities: Vec<i16> = rows.iter().map(|row| row.priority).collect();
+        let lane_seqs: Vec<i64> = rows.iter().map(|row| row.lane_seq).collect();
+
+        let payload_rows: Vec<(i32, i64, String, i16, i64, serde_json::Value)> =
+            sqlx::query_as(&format!(
+                r#"
+                WITH refs(ready_slot, ready_generation, queue, priority, lane_seq) AS (
+                    SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::bigint[])
+                )
+                SELECT
+                    ready.ready_slot,
+                    ready.ready_generation,
+                    ready.queue,
+                    ready.priority,
+                    ready.lane_seq,
+                    COALESCE(ready.payload, '{{}}'::jsonb) AS payload
+                FROM refs
+                JOIN {schema}.ready_entries AS ready
+                  ON ready.ready_slot = refs.ready_slot
+                 AND ready.ready_generation = refs.ready_generation
+                 AND ready.queue = refs.queue
+                 AND ready.priority = refs.priority
+                 AND ready.lane_seq = refs.lane_seq
+                "#
+            ))
+            .bind(&ready_slots)
+            .bind(&ready_generations)
+            .bind(&queues)
+            .bind(&priorities)
+            .bind(&lane_seqs)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        let mut payload_by_owned_key = HashMap::with_capacity(payload_rows.len());
+        for (ready_slot, ready_generation, queue, priority, lane_seq, payload) in payload_rows {
+            payload_by_owned_key.insert(
+                (ready_slot, ready_generation, queue, priority, lane_seq),
+                payload,
+            );
+        }
+
+        let mut payloads = HashMap::with_capacity(payload_by_owned_key.len());
+        for row in rows {
+            if let Some(payload) = payload_by_owned_key.remove(&(
+                row.ready_slot,
+                row.ready_generation,
+                row.queue.clone(),
+                row.priority,
+                row.lane_seq,
+            )) {
+                payloads.insert(
+                    (
+                        row.ready_slot,
+                        row.ready_generation,
+                        row.queue.as_str(),
+                        row.priority,
+                        row.lane_seq,
+                    ),
+                    payload,
+                );
+            }
+        }
+        Ok(payloads)
     }
 
     async fn insert_dlq_rows_tx<'a>(
@@ -4316,7 +4538,7 @@ impl QueueStorage {
                 .push_bind(row.created_at)
                 .push_bind(&row.unique_key)
                 .push_bind(&row.unique_states)
-                .push_bind(&row.payload)
+                .push_bind(storage_payload(&row.payload))
                 .push_bind(&row.dlq_reason)
                 .push_bind(row.dlq_at)
                 .push_bind(row.original_run_lease);
@@ -5944,7 +6166,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(job_id)
@@ -6133,7 +6355,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(job_id)
@@ -6291,7 +6513,7 @@ impl QueueStorage {
                         created_at,
                         unique_key,
                         unique_states,
-                        payload
+                        COALESCE(payload, '{{}}'::jsonb) AS payload
                     FROM {schema}.ready_entries
                     WHERE job_id = $1
                       AND ready_slot = $2
@@ -6400,7 +6622,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(job_id)
@@ -6523,7 +6745,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(cutoff)
@@ -7028,7 +7250,7 @@ impl QueueStorage {
                 ready.created_at,
                 ready.unique_key,
                 ready.unique_states,
-                ready.payload
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
             FROM refs
             JOIN {schema}.ready_entries AS ready
               ON ready.ready_slot = refs.ready_slot
@@ -7502,7 +7724,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             FROM {schema}.ready_entries
             WHERE job_id = $1
             ORDER BY run_lease DESC, attempted_at DESC NULLS LAST, run_at DESC
@@ -7534,7 +7756,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             FROM {schema}.deferred_jobs
             WHERE job_id = $1
             "#,
@@ -7576,7 +7798,7 @@ impl QueueStorage {
                 attempt.callback_on_complete,
                 attempt.callback_on_fail,
                 attempt.callback_transform,
-                ready.payload,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
                 attempt.progress,
                 attempt.callback_result
             FROM {schema}.leases AS lease
@@ -7632,7 +7854,7 @@ impl QueueStorage {
                 attempt.callback_on_complete,
                 attempt.callback_on_fail,
                 attempt.callback_transform,
-                ready.payload,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
                 attempt.progress,
                 attempt.callback_result
             FROM {schema}.lease_claims AS claims
@@ -7699,28 +7921,34 @@ impl QueueStorage {
         let done_rows: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                run_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                payload
-            FROM {schema}.done_entries
-            WHERE job_id = $1
-            ORDER BY run_lease DESC, finalized_at DESC
+                done.ready_slot,
+                done.ready_generation,
+                done.job_id,
+                done.kind,
+                done.queue,
+                done.args,
+                done.state,
+                done.priority,
+                done.attempt,
+                done.run_lease,
+                done.max_attempts,
+                done.lane_seq,
+                done.run_at,
+                done.attempted_at,
+                done.finalized_at,
+                done.created_at,
+                done.unique_key,
+                done.unique_states,
+                COALESCE(done.payload, ready.payload, '{{}}'::jsonb) AS payload
+            FROM {schema}.done_entries AS done
+            LEFT JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = done.ready_slot
+             AND ready.ready_generation = done.ready_generation
+             AND ready.queue = done.queue
+             AND ready.priority = done.priority
+             AND ready.lane_seq = done.lane_seq
+            WHERE done.job_id = $1
+            ORDER BY done.run_lease DESC, done.finalized_at DESC
             "#,
         ))
         .bind(job_id)
@@ -7749,7 +7977,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload,
+                COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
                 original_run_lease
@@ -8169,7 +8397,7 @@ impl QueueStorage {
                 attempt.callback_on_complete,
                 attempt.callback_on_fail,
                 attempt.callback_transform,
-                ready.payload,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
                 attempt.progress,
                 attempt.callback_result
             FROM {} AS lease
@@ -8916,7 +9144,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(job_id)
@@ -8979,7 +9207,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(kind)
@@ -9032,7 +9260,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload,
+                COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
                 original_run_lease
@@ -9132,7 +9360,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload,
+                COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
                 original_run_lease
@@ -9205,7 +9433,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(kind)
@@ -9233,7 +9461,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload,
+                COALESCE(payload, '{{}}'::jsonb) AS payload,
                 dlq_reason,
                 dlq_at,
                 original_run_lease
@@ -9656,7 +9884,7 @@ impl QueueStorage {
                 created_at,
                 unique_key,
                 unique_states,
-                payload
+                COALESCE(payload, '{{}}'::jsonb) AS payload
             "#
         ))
         .bind(state)
