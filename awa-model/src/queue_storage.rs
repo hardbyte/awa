@@ -19,6 +19,7 @@ const DEFAULT_LEASE_SLOT_COUNT: usize = 8;
 const DEFAULT_CLAIM_SLOT_COUNT: usize = 8;
 const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
+const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 
 #[derive(Debug, Clone)]
 pub struct QueueStorageConfig {
@@ -404,6 +405,137 @@ fn unique_state_claims(unique_states: Option<&str>, state: JobState) -> bool {
     };
     let idx = state.bit_position() as usize;
     bitmask.as_bytes().get(idx).is_some_and(|bit| *bit == b'1')
+}
+
+fn write_copy_field(buf: &mut Vec<u8>, value: &str) {
+    if value.contains(',')
+        || value.contains('"')
+        || value.contains('\n')
+        || value.contains('\r')
+        || value.contains('\\')
+        || value == COPY_NULL_SENTINEL
+    {
+        buf.push(b'"');
+        for byte in value.bytes() {
+            if byte == b'"' {
+                buf.push(b'"');
+            }
+            buf.push(byte);
+        }
+        buf.push(b'"');
+    } else {
+        buf.extend_from_slice(value.as_bytes());
+    }
+}
+
+fn write_copy_json(buf: &mut Vec<u8>, value: &serde_json::Value) {
+    let json = serde_json::to_string(value).expect("JSON serialization should not fail");
+    write_copy_field(buf, &json);
+}
+
+fn write_copy_datetime(buf: &mut Vec<u8>, value: DateTime<Utc>) {
+    write_copy_field(buf, &value.to_rfc3339());
+}
+
+fn write_copy_optional_datetime(buf: &mut Vec<u8>, value: Option<DateTime<Utc>>) {
+    match value {
+        Some(value) => write_copy_datetime(buf, value),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+    }
+}
+
+fn write_copy_optional_bytes(buf: &mut Vec<u8>, value: &Option<Vec<u8>>) {
+    match value {
+        Some(bytes) => {
+            let bytea_hex = format!("\\x{}", hex::encode(bytes));
+            write_copy_field(buf, &bytea_hex);
+        }
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+    }
+}
+
+fn write_copy_optional_string(buf: &mut Vec<u8>, value: Option<&str>) {
+    match value {
+        Some(value) => write_copy_field(buf, value),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+    }
+}
+
+fn write_ready_copy_row(
+    buf: &mut Vec<u8>,
+    ready_slot: i32,
+    ready_generation: i64,
+    row: &RuntimeReadyInsert,
+) {
+    buf.extend_from_slice(ready_slot.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(ready_generation.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.job_id.to_string().as_bytes());
+    buf.push(b',');
+    write_copy_field(buf, &row.kind);
+    buf.push(b',');
+    write_copy_field(buf, &row.queue);
+    buf.push(b',');
+    write_copy_json(buf, &row.args);
+    buf.push(b',');
+    buf.extend_from_slice(row.priority.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.attempt.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.run_lease.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.max_attempts.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.lane_seq.to_string().as_bytes());
+    buf.push(b',');
+    write_copy_datetime(buf, row.run_at);
+    buf.push(b',');
+    write_copy_optional_datetime(buf, row.attempted_at);
+    buf.push(b',');
+    write_copy_datetime(buf, row.created_at);
+    buf.push(b',');
+    write_copy_optional_bytes(buf, &row.unique_key);
+    buf.push(b',');
+    write_copy_optional_string(buf, row.unique_states.as_deref());
+    buf.push(b',');
+    write_copy_json(buf, &row.payload);
+    buf.push(b'\n');
+}
+
+fn write_deferred_copy_row(buf: &mut Vec<u8>, row: &DeferredJobRow) {
+    buf.extend_from_slice(row.job_id.to_string().as_bytes());
+    buf.push(b',');
+    write_copy_field(buf, &row.kind);
+    buf.push(b',');
+    write_copy_field(buf, &row.queue);
+    buf.push(b',');
+    write_copy_json(buf, &row.args);
+    buf.push(b',');
+    write_copy_field(buf, &row.state.to_string());
+    buf.push(b',');
+    buf.extend_from_slice(row.priority.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.attempt.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.run_lease.to_string().as_bytes());
+    buf.push(b',');
+    buf.extend_from_slice(row.max_attempts.to_string().as_bytes());
+    buf.push(b',');
+    write_copy_datetime(buf, row.run_at);
+    buf.push(b',');
+    write_copy_optional_datetime(buf, row.attempted_at);
+    buf.push(b',');
+    write_copy_optional_datetime(buf, row.finalized_at);
+    buf.push(b',');
+    write_copy_datetime(buf, row.created_at);
+    buf.push(b',');
+    write_copy_optional_bytes(buf, &row.unique_key);
+    buf.push(b',');
+    write_copy_optional_string(buf, row.unique_states.as_deref());
+    buf.push(b',');
+    write_copy_json(buf, &row.payload);
+    buf.push(b'\n');
 }
 
 fn lifecycle_error(error: impl Into<String>, attempt: i16, terminal: bool) -> serde_json::Value {
@@ -3605,6 +3737,36 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
+    async fn execute_ready_copy_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[RuntimeReadyInsert],
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let ring = self.current_queue_ring(tx).await?;
+        let mut csv_buf = Vec::with_capacity(rows.len() * 320);
+        for row in rows {
+            write_ready_copy_row(&mut csv_buf, ring.0, ring.1, row);
+        }
+
+        let copy_sql = format!(
+            "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
+        );
+        let mut copy_in = tx
+            .as_mut()
+            .copy_in_raw(&copy_sql)
+            .await
+            .map_err(map_sqlx_error)?;
+        copy_in.send(csv_buf).await.map_err(map_sqlx_error)?;
+        copy_in.finish().await.map_err(map_sqlx_error)?;
+
+        Ok(rows.len())
+    }
+
     async fn insert_ready_rows_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -3682,6 +3844,99 @@ impl QueueStorage {
         }
 
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
+        let mut count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
+        for row in &ready_rows {
+            *count_deltas
+                .entry((row.queue.clone(), row.priority))
+                .or_insert(0) += 1;
+        }
+        self.adjust_lane_counts_batch(
+            tx,
+            count_deltas
+                .into_iter()
+                .map(|((queue, priority), count)| (queue, priority, count, 0)),
+        )
+        .await?;
+        Ok(total_rows)
+    }
+
+    async fn insert_ready_rows_copy_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<RuntimeReadyRow>,
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let mut grouped: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
+        for row in rows {
+            grouped
+                .entry((row.queue.clone(), row.priority))
+                .or_default()
+                .push(row);
+        }
+
+        let total_rows: usize = grouped.values().map(Vec::len).sum();
+        let job_ids = self.next_job_ids(tx, total_rows).await?;
+        let mut job_id_iter = job_ids.into_iter();
+
+        let mut ready_rows = Vec::with_capacity(total_rows);
+
+        for ((queue, priority), lane_rows) in grouped {
+            self.ensure_lane(tx, &queue, priority).await?;
+
+            let count = lane_rows.len() as i64;
+            let start_seq: i64 = sqlx::query_scalar(&format!(
+                r#"
+                UPDATE {schema}.queue_enqueue_heads
+                SET next_seq = next_seq + $3
+                WHERE queue = $1 AND priority = $2
+                RETURNING next_seq - $3
+                "#
+            ))
+            .bind(&queue)
+            .bind(priority)
+            .bind(count)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            for (offset, row) in lane_rows.into_iter().enumerate() {
+                let job_id = job_id_iter.next().ok_or_else(|| {
+                    AwaError::Validation("queue storage job id allocation underflow".to_string())
+                })?;
+                self.sync_unique_claim(
+                    tx,
+                    job_id,
+                    &row.unique_key,
+                    row.unique_states.as_deref(),
+                    None,
+                    Some(JobState::Available),
+                )
+                .await?;
+                ready_rows.push(RuntimeReadyInsert {
+                    job_id,
+                    kind: row.kind,
+                    queue: row.queue,
+                    args: row.args,
+                    priority: row.priority,
+                    attempt: row.attempt,
+                    run_lease: row.run_lease,
+                    max_attempts: row.max_attempts,
+                    run_at: row.run_at,
+                    attempted_at: row.attempted_at,
+                    lane_seq: start_seq + offset as i64,
+                    created_at: row.created_at,
+                    unique_key: row.unique_key,
+                    unique_states: row.unique_states,
+                    payload: row.payload,
+                });
+            }
+        }
+
+        self.execute_ready_copy_tx(tx, &ready_rows).await?;
         let mut count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
         for row in &ready_rows {
             *count_deltas
@@ -3835,6 +4090,48 @@ impl QueueStorage {
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
+
+        Ok(rows.len())
+    }
+
+    async fn insert_deferred_rows_copy_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<DeferredJobRow>,
+        old_state: Option<JobState>,
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        for row in &rows {
+            self.sync_unique_claim(
+                tx,
+                row.job_id,
+                &row.unique_key,
+                row.unique_states.as_deref(),
+                old_state,
+                Some(row.state),
+            )
+            .await?;
+        }
+
+        let schema = self.schema();
+        let mut csv_buf = Vec::with_capacity(rows.len() * 320);
+        for row in &rows {
+            write_deferred_copy_row(&mut csv_buf, row);
+        }
+
+        let copy_sql = format!(
+            "COPY {schema}.deferred_jobs (job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
+        );
+        let mut copy_in = tx
+            .as_mut()
+            .copy_in_raw(&copy_sql)
+            .await
+            .map_err(map_sqlx_error)?;
+        copy_in.send(csv_buf).await.map_err(map_sqlx_error)?;
+        copy_in.finish().await.map_err(map_sqlx_error)?;
 
         Ok(rows.len())
     }
@@ -4255,6 +4552,111 @@ impl QueueStorage {
                 .collect();
             total += self
                 .insert_deferred_rows_tx(&mut tx, deferred_rows, None)
+                .await?;
+        }
+
+        let queues_to_notify: BTreeSet<String> = ready_rows
+            .into_iter()
+            .map(|row| self.logical_queue_name(&row.queue).to_string())
+            .collect();
+        for queue in queues_to_notify {
+            sqlx::query("SELECT pg_notify($1, '')")
+                .bind(format!("awa:{queue}"))
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(total)
+    }
+
+    /// Enqueue prepared jobs into queue storage using PostgreSQL COPY.
+    ///
+    /// This follows the same preparation, queue striping, lane sequencing,
+    /// uniqueness, and notification semantics as [`Self::enqueue_params_batch`],
+    /// but streams materialized rows directly into `ready_entries` and
+    /// `deferred_jobs` instead of building multi-row `INSERT` statements.
+    #[tracing::instrument(skip(self, pool, jobs), fields(job.count = jobs.len()), name = "queue_storage.enqueue_params_copy")]
+    pub async fn enqueue_params_copy(
+        &self,
+        pool: &PgPool,
+        jobs: &[InsertParams],
+    ) -> Result<usize, AwaError> {
+        if jobs.is_empty() {
+            return Ok(0);
+        }
+
+        let now = Utc::now();
+        let mut ready_rows = Vec::new();
+        let mut deferred_rows = Vec::new();
+
+        for (idx, job) in jobs.iter().enumerate() {
+            let prepared = prepare_row_raw(job.kind.clone(), job.args.clone(), job.opts.clone())?;
+            let payload = Self::payload_from_parts(prepared.metadata, prepared.tags, None, None)?;
+            let queue =
+                self.queue_stripe_for_enqueue(&prepared.queue, &prepared.unique_key, idx as i64);
+
+            let ready_row = RuntimeReadyRow {
+                kind: prepared.kind,
+                queue: queue.clone(),
+                args: prepared.args,
+                priority: prepared.priority,
+                attempt: 0,
+                run_lease: 0,
+                max_attempts: prepared.max_attempts,
+                run_at: prepared.run_at.unwrap_or(now),
+                attempted_at: None,
+                created_at: now,
+                unique_key: prepared.unique_key,
+                unique_states: prepared.unique_states,
+                payload: payload.clone(),
+            };
+
+            match prepared.state {
+                JobState::Available => ready_rows.push(ready_row),
+                JobState::Scheduled => deferred_rows.push(DeferredJobRow {
+                    job_id: 0,
+                    kind: ready_row.kind,
+                    queue,
+                    args: ready_row.args,
+                    state: JobState::Scheduled,
+                    priority: ready_row.priority,
+                    attempt: ready_row.attempt,
+                    run_lease: ready_row.run_lease,
+                    max_attempts: ready_row.max_attempts,
+                    run_at: ready_row.run_at,
+                    attempted_at: ready_row.attempted_at,
+                    finalized_at: None,
+                    created_at: ready_row.created_at,
+                    unique_key: ready_row.unique_key,
+                    unique_states: ready_row.unique_states,
+                    payload: payload.clone(),
+                }),
+                other => {
+                    return Err(AwaError::Validation(format!(
+                        "queue storage does not support initial state {other}"
+                    )));
+                }
+            }
+        }
+
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let mut total = 0usize;
+        if !ready_rows.is_empty() {
+            total += self
+                .insert_ready_rows_copy_tx(&mut tx, ready_rows.clone())
+                .await?;
+        }
+        if !deferred_rows.is_empty() {
+            let ids = self.next_job_ids(&mut tx, deferred_rows.len()).await?;
+            let deferred_rows: Vec<_> = deferred_rows
+                .into_iter()
+                .zip(ids)
+                .map(|(row, id)| DeferredJobRow { job_id: id, ..row })
+                .collect();
+            total += self
+                .insert_deferred_rows_copy_tx(&mut tx, deferred_rows, None)
                 .await?;
         }
 

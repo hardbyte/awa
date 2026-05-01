@@ -254,6 +254,7 @@ Application code
     │
     ▼
 awa_model::insert() / insert_with() / insert_many()
+QueueStorage::enqueue_params_batch() / enqueue_params_copy()
     │
     ▼
 enqueue into queue storage
@@ -275,8 +276,8 @@ transactional enqueue pattern.
 
 ### Batch Insert via COPY
 
-For high-throughput ingestion (10K+ jobs), `insert_many_copy` uses PostgreSQL's
-COPY protocol via a staging table approach (see ADR-008):
+For high-throughput compatibility-surface ingestion, `insert_many_copy` uses
+PostgreSQL's COPY protocol via a staging table approach (see ADR-008):
 
 ```text
 insert_many_copy(conn, jobs)
@@ -294,6 +295,24 @@ The staging table is session-local and reused across transactions so repeated
 COPY calls avoid temp-table catalog churn. Accepts `&mut PgConnection`, so it
 works within caller-managed transactions. `insert_many_copy_from_pool` is a
 convenience wrapper that manages its own transaction.
+
+Queue-storage producers can bypass the compatibility view/function with
+`QueueStorage::enqueue_params_copy`:
+
+```text
+enqueue_params_copy(pool, jobs)
+    │
+    ├── prepare InsertParams and queue stripes
+    ├── allocate job ids and reserve per-lane seq ranges
+    ├── sync uniqueness claims and lane counters in the same transaction
+    ├── COPY ready rows into `{schema}.ready_entries`
+    ├── COPY scheduled rows into `{schema}.deferred_jobs`
+    └── notify logical queues with newly-ready work
+```
+
+The COPY producer refines the same storage actions as the normal queue-storage
+batch producer: append ready/deferred rows atomically with the corresponding
+sequence, uniqueness, counter, and notification side effects.
 
 ### Poll and Claim (Dispatcher)
 

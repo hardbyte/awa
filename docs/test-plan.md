@@ -168,6 +168,7 @@ Rust worker.
 | # | Test | Rust | Py |
 |---|------|------|----|
 | T47-T57a | COPY: empty, single, 1000, special chars, tags, unique, atomic | ✓ | ✓ |
+| QSC1-QSC2 | Queue storage COPY producer: ready/deferred direct COPY, unique-conflict rollback | ✓ | |
 
 ### Rate Limiting & Weighted Concurrency
 
