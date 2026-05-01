@@ -97,6 +97,14 @@ fn copy_job_with_opts(
     }
 }
 
+fn bench_env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
 #[tokio::test]
 async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
     let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
@@ -228,6 +236,114 @@ async fn queue_storage_copy_rolls_back_on_unique_conflict() {
     .await
     .expect("count lane availability");
     assert_eq!(lane_available, 0);
+}
+
+#[tokio::test]
+async fn queue_storage_batch_rolls_back_on_batched_unique_conflict() {
+    let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
+    let (pool, store) = setup_store("awa_qs_batch_unique_conflict").await;
+    let queue = "qs_batch_unique_conflict";
+
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    };
+    let jobs = vec![
+        InsertParams {
+            kind: "batch_unique".to_string(),
+            args: serde_json::json!({"same": true}),
+            opts: opts.clone(),
+        },
+        InsertParams {
+            kind: "batch_unique".to_string(),
+            args: serde_json::json!({"same": true}),
+            opts,
+        },
+    ];
+
+    let err = store
+        .enqueue_params_batch(&pool, &jobs)
+        .await
+        .expect_err("duplicate unique batch should fail");
+    assert!(
+        matches!(err, AwaError::UniqueConflict { .. }),
+        "unexpected error: {err:?}"
+    );
+
+    let ready_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count ready rows");
+    assert_eq!(ready_count, 0);
+
+    let lane_available: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(available_count), 0)::bigint FROM {}.queue_lanes WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count lane availability");
+    assert_eq!(lane_available, 0);
+}
+
+#[tokio::test]
+async fn queue_storage_copy_rolls_back_on_existing_unique_conflict() {
+    let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
+    let (pool, store) = setup_store("awa_qs_copy_existing_unique_conflict").await;
+    let queue = "qs_copy_existing_unique_conflict";
+
+    let opts = InsertOpts {
+        queue: queue.to_string(),
+        unique: Some(UniqueOpts::default()),
+        ..Default::default()
+    };
+    let job = InsertParams {
+        kind: "copy_existing_unique".to_string(),
+        args: serde_json::json!({"same": true}),
+        opts,
+    };
+
+    assert_eq!(
+        store
+            .enqueue_params_batch(&pool, std::slice::from_ref(&job))
+            .await
+            .expect("seed unique job"),
+        1
+    );
+    let err = store
+        .enqueue_params_copy(&pool, std::slice::from_ref(&job))
+        .await
+        .expect_err("existing unique claim should fail");
+    assert!(
+        matches!(err, AwaError::UniqueConflict { .. }),
+        "unexpected error: {err:?}"
+    );
+
+    let ready_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {}.ready_entries WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count ready rows");
+    assert_eq!(ready_count, 1);
+
+    let lane_available: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(sum(available_count), 0)::bigint FROM {}.queue_lanes WHERE queue = $1",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count lane availability");
+    assert_eq!(lane_available, 1);
 }
 
 #[tokio::test]
@@ -425,14 +541,8 @@ async fn queue_storage_copy_escapes_csv_special_values() {
 #[ignore = "benchmark; requires local Postgres and is not part of the default suite"]
 async fn queue_storage_copy_benchmark_batch_vs_copy() {
     let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
-    let total_jobs: usize = std::env::var("AWA_QS_COPY_BENCH_JOBS")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(8192);
-    let batch_size: usize = std::env::var("AWA_QS_COPY_BENCH_BATCH")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(128);
+    let total_jobs = bench_env_usize("AWA_QS_COPY_BENCH_JOBS", 8192);
+    let batch_size = bench_env_usize("AWA_QS_COPY_BENCH_BATCH", 128);
 
     let (batch_pool, batch_store) = setup_store_with_config(
         QueueStorageConfig {
@@ -504,6 +614,88 @@ async fn queue_storage_copy_benchmark_batch_vs_copy() {
     );
     println!(
         "[bench] queue_storage COPY speedup: {:.2}x",
+        copy_rate / batch_rate
+    );
+}
+
+#[tokio::test]
+#[ignore = "benchmark; set DATABASE_URL and AWA_QS_COPY_BENCH_* to tune"]
+async fn queue_storage_copy_benchmark_unique_batch_vs_copy() {
+    let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
+    let total_jobs = bench_env_usize("AWA_QS_COPY_BENCH_JOBS", 4096);
+    let batch_size = bench_env_usize("AWA_QS_COPY_BENCH_BATCH", 128);
+
+    let (batch_pool, batch_store) = setup_store_with_config(
+        QueueStorageConfig {
+            schema: "awa_qs_copy_unique_bench_batch".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+        8,
+    )
+    .await;
+    let (copy_pool, copy_store) = setup_store_with_config(
+        QueueStorageConfig {
+            schema: "awa_qs_copy_unique_bench_copy".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            ..Default::default()
+        },
+        8,
+    )
+    .await;
+
+    let jobs: Vec<_> = (0..total_jobs)
+        .map(|seq| {
+            copy_job_with_opts(
+                "copy_unique_bench",
+                "qs_copy_unique_bench",
+                seq as i64,
+                InsertOpts {
+                    metadata: serde_json::json!({"bench": true, "seq": seq}),
+                    tags: vec!["bench".to_string(), "unique".to_string()],
+                    unique: Some(UniqueOpts::default()),
+                    ..Default::default()
+                },
+            )
+        })
+        .collect();
+
+    let batch_start = Instant::now();
+    for chunk in jobs.chunks(batch_size) {
+        batch_store
+            .enqueue_params_batch(&batch_pool, chunk)
+            .await
+            .expect("batch enqueue");
+    }
+    let batch_elapsed = batch_start.elapsed();
+
+    let copy_start = Instant::now();
+    for chunk in jobs.chunks(batch_size) {
+        copy_store
+            .enqueue_params_copy(&copy_pool, chunk)
+            .await
+            .expect("copy enqueue");
+    }
+    let copy_elapsed = copy_start.elapsed();
+
+    let batch_rate = total_jobs as f64 / batch_elapsed.as_secs_f64();
+    let copy_rate = total_jobs as f64 / copy_elapsed.as_secs_f64();
+    println!(
+        "[bench] queue_storage unique batch: {total_jobs} jobs in {:.3}s ({:.0} jobs/sec), batch_size={batch_size}",
+        batch_elapsed.as_secs_f64(),
+        batch_rate
+    );
+    println!(
+        "[bench] queue_storage unique COPY:  {total_jobs} jobs in {:.3}s ({:.0} jobs/sec), batch_size={batch_size}",
+        copy_elapsed.as_secs_f64(),
+        copy_rate
+    );
+    println!(
+        "[bench] queue_storage unique COPY speedup: {:.2}x",
         copy_rate / batch_rate
     );
 }

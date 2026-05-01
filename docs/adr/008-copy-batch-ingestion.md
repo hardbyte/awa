@@ -41,7 +41,8 @@ For queue storage producers, add a direct COPY path:
 
 1. Prepare `InsertParams` with the same code as `enqueue_params_batch`
 2. Apply queue striping, allocate job ids, reserve per-lane sequence ranges,
-   sync uniqueness claims, and update lane counters inside one transaction
+   sync uniqueness claims in one statement for new enqueues, and update lane
+   counters inside one transaction
 3. Stream available jobs into
    `{schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue,
    args, priority, attempt, run_lease, max_attempts, lane_seq, run_at,
@@ -113,6 +114,11 @@ and dispatchers handle duplicates gracefully.
   compatibility view/function and COPY directly into `ready_entries` and
   `deferred_jobs` while preserving job id, lane, counter, uniqueness, and
   notification invariants.
+- **Batched queue-storage uniqueness:** direct queue-storage producers batch
+  enqueue-time uniqueness claims with one `unnest(bytea[], bigint[])` driven
+  `INSERT ... ON CONFLICT` statement. Duplicate keys inside the request are
+  rejected before COPY; conflicts against existing claims abort the transaction
+  before any ready/deferred rows are copied.
 - **Python support:** Python bindings expose `insert_many_copy` /
   `insert_many_copy_sync` for compatibility COPY and `enqueue_many_copy` /
   `enqueue_many_copy_sync` for direct queue-storage COPY.
@@ -127,6 +133,11 @@ and dispatchers handle duplicates gracefully.
 - **Staging overhead remains:** COPY still pays for staging and a final insert
   into the real Awa tables, so it is not automatically faster than chunked
   multi-row `INSERT` in every workload.
+- **Lane counters remain online:** queue-storage enqueue still updates
+  `queue_lanes.available_count` once per touched lane and transaction. Deferring
+  those writes would reduce hot-lane churn further, but the dispatcher scaling
+  path reads the counters as online state, so lazy reconciliation needs a
+  separate design.
 
 ## Relationship to ADR-019
 

@@ -305,7 +305,7 @@ enqueue_params_copy(pool, jobs)
     │
     ├── prepare InsertParams and queue stripes
     ├── allocate job ids and reserve per-lane seq ranges
-    ├── sync uniqueness claims and lane counters in the same transaction
+    ├── sync enqueue-time uniqueness claims and lane counters in the same transaction
     ├── COPY ready rows into `{schema}.ready_entries`
     ├── COPY scheduled rows into `{schema}.deferred_jobs`
     └── notify logical queues with newly-ready work
@@ -313,7 +313,9 @@ enqueue_params_copy(pool, jobs)
 
 The COPY producer refines the same storage actions as the normal queue-storage
 batch producer: append ready/deferred rows atomically with the corresponding
-sequence, uniqueness, counter, and notification side effects.
+sequence, uniqueness, counter, and notification side effects. The
+enqueue-time uniqueness claim sync may be batched internally; state transitions
+that move existing jobs still use the transition-aware claim sync.
 
 ### Poll and Claim (Dispatcher)
 

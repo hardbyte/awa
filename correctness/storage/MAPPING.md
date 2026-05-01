@@ -42,8 +42,8 @@ for backfill / fallback reads during upgrades.
 
 | TLA+ action | Rust function | SQL / DDL |
 |---|---|---|
-| `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` and `QueueStorage::insert_ready_rows_copy_tx`; producer entry points include `enqueue_batch`, `enqueue_runtime_rows`, `enqueue_params_batch`, and `enqueue_params_copy` | reserve `{schema}.queue_enqueue_heads.next_seq`, sync uniqueness, append to `{schema}.ready_entries` via INSERT or COPY, update lane counters, and notify logical queues in one tx |
-| `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` and `QueueStorage::insert_deferred_rows_copy_tx`; producer entry points include `enqueue_params_batch` and `enqueue_params_copy` | allocate job ids, sync uniqueness, append to `{schema}.deferred_jobs` via INSERT or COPY in one tx |
+| `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` and `QueueStorage::insert_ready_rows_copy_tx`; producer entry points include `enqueue_batch`, `enqueue_runtime_rows`, `enqueue_params_batch`, and `enqueue_params_copy` | reserve `{schema}.queue_enqueue_heads.next_seq`, sync enqueue-time uniqueness claims, append to `{schema}.ready_entries` via INSERT or COPY, update lane counters, and notify logical queues in one tx |
+| `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` and `QueueStorage::insert_deferred_rows_copy_tx`; producer entry points include `enqueue_params_batch` and `enqueue_params_copy` | allocate job ids, sync enqueue-time uniqueness claims, append to `{schema}.deferred_jobs` via INSERT or COPY in one tx |
 | `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_state` | `DELETE FROM deferred_jobs ... INSERT INTO ready_entries ...` in one tx |
 | `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside the inline claim CTE; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
 | `Claim(w, j)` | `QueueStorage::claim_runtime_batch` (`queue_storage.rs:4145`) → `claim_runtime_batch_with_aging_for_instance` (`:4504`) → dispatcher (`awa-worker/src/dispatcher.rs`) | inline claim CTE: lane selection via `FOR UPDATE OF queue_claim_heads SKIP LOCKED`; bare reads of `lease_ring_state` and `claim_ring_state` (no FOR SHARE/UPDATE — rotate's CAS UPDATE on `(current_slot, generation)` plus the partition busy-check provides the conflict detection); INSERT into `lease_claims_<claim_slot>` (receipts mode) or `leases_<lease_slot>` (legacy mode); UPDATE `queue_claim_heads` |
@@ -144,6 +144,23 @@ progress snapshotting, while durable completion continues asynchronously
 through the completion batcher. That changes throughput and scheduling
 behavior, but it does not change the modeled storage safety boundary because
 the `run_lease`-guarded finalization and rescue semantics are unchanged.
+
+## Producer batching note
+
+The TLA+ storage model treats `EnqueueReady` and `EnqueueDeferred` as
+logical per-job state transitions. Rust may batch the SQL implementation
+of producer side effects: allocating a contiguous lane sequence range,
+syncing enqueue-time `job_unique_claims` with one array-backed statement,
+and inserting rows with multi-row `INSERT` or COPY. Those batching choices
+refine the same logical actions as long as they commit in the same
+transaction as the ready/deferred append.
+
+Uniqueness itself is intentionally outside this storage model: duplicate
+rejection is covered by Rust integration tests around `job_unique_claims`.
+The model's enqueue preconditions start after a job has been admitted to
+the storage state, so batching uniqueness claims changes implementation
+granularity rather than the modeled lifecycle, lane, lease, or prune
+invariants.
 
 ## Known modelling gaps with implementation implications
 

@@ -7,7 +7,7 @@ use chrono::TimeDelta;
 use chrono::{DateTime, Utc};
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -1594,6 +1594,87 @@ impl QueueStorage {
         }
 
         Ok(())
+    }
+
+    async fn sync_enqueue_unique_claims<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        claims: Vec<(Vec<u8>, i64)>,
+    ) -> Result<(), AwaError> {
+        if claims.is_empty() {
+            return Ok(());
+        }
+
+        let mut seen: HashSet<&[u8]> = HashSet::with_capacity(claims.len());
+        for (key, _) in &claims {
+            if !seen.insert(key.as_slice()) {
+                return Err(AwaError::UniqueConflict {
+                    constraint: Some("idx_awa_jobs_unique".to_string()),
+                });
+            }
+        }
+
+        let (keys, job_ids): (Vec<Vec<u8>>, Vec<i64>) = claims.into_iter().unzip();
+        let (requested, applied): (i64, i64) = sqlx::query_as(
+            r#"
+            WITH input(unique_key, job_id) AS (
+                SELECT * FROM unnest($1::bytea[], $2::bigint[])
+            ),
+            inserted AS (
+                INSERT INTO awa.job_unique_claims (unique_key, job_id)
+                SELECT unique_key, job_id FROM input
+                ON CONFLICT (unique_key)
+                DO UPDATE SET job_id = EXCLUDED.job_id
+                WHERE awa.job_unique_claims.job_id = EXCLUDED.job_id
+                RETURNING unique_key
+            )
+            SELECT
+                (SELECT count(*)::bigint FROM input) AS requested,
+                (SELECT count(*)::bigint FROM inserted) AS applied
+            "#,
+        )
+        .bind(keys)
+        .bind(job_ids)
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        if applied != requested {
+            return Err(AwaError::UniqueConflict {
+                constraint: Some("idx_awa_jobs_unique".to_string()),
+            });
+        }
+
+        Ok(())
+    }
+
+    // Enqueue inserts have no prior storage state, so uniqueness only needs to
+    // add claims for states included in the row's unique-state bitmask. State
+    // transitions still use `sync_unique_claim`, which can release old claims.
+    async fn sync_ready_enqueue_unique_claims<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[RuntimeReadyInsert],
+    ) -> Result<(), AwaError> {
+        let claims = rows
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), JobState::Available))
+            .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)))
+            .collect();
+        self.sync_enqueue_unique_claims(tx, claims).await
+    }
+
+    async fn sync_deferred_enqueue_unique_claims<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DeferredJobRow],
+    ) -> Result<(), AwaError> {
+        let claims = rows
+            .iter()
+            .filter(|row| unique_state_claims(row.unique_states.as_deref(), row.state))
+            .filter_map(|row| row.unique_key.as_ref().map(|key| (key.clone(), row.job_id)))
+            .collect();
+        self.sync_enqueue_unique_claims(tx, claims).await
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prepare_schema")]
@@ -3823,15 +3904,6 @@ impl QueueStorage {
                 let job_id = job_id_iter.next().ok_or_else(|| {
                     AwaError::Validation("queue storage job id allocation underflow".to_string())
                 })?;
-                self.sync_unique_claim(
-                    tx,
-                    job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    None,
-                    Some(JobState::Available),
-                )
-                .await?;
                 ready_rows.push(RuntimeReadyInsert {
                     job_id,
                     kind: row.kind,
@@ -3852,6 +3924,8 @@ impl QueueStorage {
             }
         }
 
+        self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
+            .await?;
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
         let mut count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
         for row in &ready_rows {
@@ -3921,15 +3995,6 @@ impl QueueStorage {
                 let job_id = job_id_iter.next().ok_or_else(|| {
                     AwaError::Validation("queue storage job id allocation underflow".to_string())
                 })?;
-                self.sync_unique_claim(
-                    tx,
-                    job_id,
-                    &row.unique_key,
-                    row.unique_states.as_deref(),
-                    None,
-                    Some(JobState::Available),
-                )
-                .await?;
                 ready_rows.push(RuntimeReadyInsert {
                     job_id,
                     kind: row.kind,
@@ -3950,6 +4015,8 @@ impl QueueStorage {
             }
         }
 
+        self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
+            .await?;
         self.execute_ready_copy_tx(tx, &ready_rows).await?;
         let mut count_deltas: BTreeMap<(String, i16), i64> = BTreeMap::new();
         for row in &ready_rows {
@@ -4065,16 +4132,20 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        for row in &rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                old_state,
-                Some(row.state),
-            )
-            .await?;
+        if old_state.is_none() {
+            self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
+        } else {
+            for row in &rows {
+                self.sync_unique_claim(
+                    tx,
+                    row.job_id,
+                    &row.unique_key,
+                    row.unique_states.as_deref(),
+                    old_state,
+                    Some(row.state),
+                )
+                .await?;
+            }
         }
 
         let schema = self.schema();
@@ -4117,17 +4188,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        for row in &rows {
-            self.sync_unique_claim(
-                tx,
-                row.job_id,
-                &row.unique_key,
-                row.unique_states.as_deref(),
-                None,
-                Some(row.state),
-            )
-            .await?;
-        }
+        self.sync_deferred_enqueue_unique_claims(tx, &rows).await?;
 
         let schema = self.schema();
         let copy_sql = format!(
