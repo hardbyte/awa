@@ -85,9 +85,34 @@ async fn ensure_database_exists(url: &str) {
     }
 }
 
+async fn terminate_database_connections(url: &str) {
+    let database_name = database_name(url);
+    validate_database_name(&database_name);
+    let admin_url = replace_database_name(url, "postgres");
+    let admin_pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await
+        .expect("Failed to connect to admin database for queue_storage connection reset");
+    sqlx::query(
+        r#"
+        SELECT pg_terminate_backend(pid)
+        FROM pg_stat_activity
+        WHERE datname = $1
+          AND pid <> pg_backend_pid()
+        "#,
+    )
+    .bind(database_name)
+    .execute(&admin_pool)
+    .await
+    .expect("Failed to terminate stale queue_storage test connections");
+    admin_pool.close().await;
+}
+
 async fn setup_pool(max_connections: u32) -> sqlx::PgPool {
     let url = database_url();
     ensure_database_exists(&url).await;
+    terminate_database_connections(&url).await;
     let reset_pool = PgPoolOptions::new()
         .max_connections(1)
         .connect(&url)
@@ -1524,43 +1549,31 @@ async fn test_lease_claim_rotation_isolation() {
     )
     .await;
 
-    let client = queue_storage_client(
-        &pool,
-        queue,
-        QueueStorageConfig {
-            schema: schema.to_string(),
-            queue_slot_count: 4,
-            lease_slot_count: 2,
-            claim_slot_count: 4,
-            queue_stripe_count: 1,
-            lease_claim_receipts: true,
-        },
-        RetryOnceWorker,
-    );
-    client.start().await.expect("client start");
-
-    let _ = wait_for_job_state(
-        &store,
-        &pool,
-        job_a,
-        &[JobState::Completed],
-        Duration::from_secs(10),
-    )
-    .await;
-
-    let slot_a: i32 = sqlx::query_scalar(&format!(
-        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 LIMIT 1"
-    ))
-    .bind(job_a)
-    .fetch_one(&pool)
-    .await
-    .expect("read slot_a");
+    let claimed_a = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim job A");
+    assert_eq!(claimed_a.len(), 1, "job A should be claimed");
+    assert_eq!(claimed_a[0].job.id, job_a, "claimed job A id");
+    let slot_a = claimed_a[0].claim.claim_slot;
+    store
+        .complete_runtime_batch(&pool, &claimed_a)
+        .await
+        .expect("complete job A claim");
 
     // Rotate the ring so subsequent claims land in a different partition.
-    store
+    let rotated_slot = match store
         .rotate_claims(&pool)
         .await
-        .expect("rotate_claims between jobs");
+        .expect("rotate_claims between jobs")
+    {
+        RotateOutcome::Rotated { slot, .. } => slot,
+        other => panic!("rotate_claims between jobs unexpected outcome: {other:?}"),
+    };
+    assert_ne!(
+        slot_a, rotated_slot,
+        "rotation should advance to a different claim slot"
+    );
 
     let job_b = enqueue_job(
         &pool,
@@ -1572,22 +1585,21 @@ async fn test_lease_claim_rotation_isolation() {
         },
     )
     .await;
-    let _ = wait_for_job_state(
-        &store,
-        &pool,
-        job_b,
-        &[JobState::Completed],
-        Duration::from_secs(10),
-    )
-    .await;
-
-    let slot_b: i32 = sqlx::query_scalar(&format!(
-        "SELECT claim_slot FROM {schema}.lease_claims WHERE job_id = $1 LIMIT 1"
-    ))
-    .bind(job_b)
-    .fetch_one(&pool)
-    .await
-    .expect("read slot_b");
+    let claimed_b = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim job B");
+    assert_eq!(claimed_b.len(), 1, "job B should be claimed");
+    assert_eq!(claimed_b[0].job.id, job_b, "claimed job B id");
+    let slot_b = claimed_b[0].claim.claim_slot;
+    store
+        .complete_runtime_batch(&pool, &claimed_b)
+        .await
+        .expect("complete job B claim");
+    assert_eq!(
+        rotated_slot, slot_b,
+        "job B (post-rotation) must land in the newly-opened claim_slot"
+    );
     assert_ne!(
         slot_a, slot_b,
         "job B (post-rotation) must land in a different claim_slot than job A"
@@ -1606,8 +1618,6 @@ async fn test_lease_claim_rotation_isolation() {
         slot_a, job_a_slot_still,
         "rotation must not move existing claim rows across partitions"
     );
-
-    client.shutdown(Duration::from_secs(5)).await;
 }
 
 /// Receipt-plane partition-migration test (see ADR-023). Start from

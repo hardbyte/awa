@@ -1996,9 +1996,9 @@ impl PyClient {
         })
     }
 
-    // ── COPY batch insert (async + sync) ────────────────────────────
+    // ── COPY batch insert/enqueue (async + sync) ────────────────────
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many_copy<'py>(
         &self,
@@ -2011,6 +2011,7 @@ impl PyClient {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2023,6 +2024,7 @@ impl PyClient {
             &tags,
             metadata.as_ref(),
             run_at.as_ref(),
+            unique_opts.as_ref(),
         )?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2039,7 +2041,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many_copy_sync(
         &self,
@@ -2052,6 +2054,7 @@ impl PyClient {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
     ) -> PyResult<Vec<PyJob>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2064,6 +2067,7 @@ impl PyClient {
             &tags,
             metadata.as_ref(),
             run_at.as_ref(),
+            unique_opts.as_ref(),
         )?;
 
         py.detach(|| {
@@ -2072,6 +2076,101 @@ impl PyClient {
                     .await
                     .map_err(map_awa_error)?;
                 Ok(results.into_iter().map(PyJob::from).collect())
+            })
+        })
+    }
+
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_many_copy<'py>(
+        &self,
+        py: Python<'py>,
+        jobs: Vec<Py<PyAny>>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let pool = self.pool.clone();
+        let insert_params = prepare_insert_many_params(
+            py,
+            &jobs,
+            kind,
+            &queue,
+            priority,
+            max_attempts,
+            &tags,
+            metadata.as_ref(),
+            run_at.as_ref(),
+            unique_opts.as_ref(),
+        )?;
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let schema = QueueStorage::active_schema(&pool)
+                .await
+                .map_err(map_awa_error)?
+                .ok_or_else(|| {
+                    map_awa_error(awa_model::AwaError::Validation(
+                        "enqueue_many_copy requires an active queue_storage backend".into(),
+                    ))
+                })?;
+            let store = QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
+            let count = store
+                .enqueue_params_copy(&pool, &insert_params)
+                .await
+                .map_err(map_awa_error)?;
+            Ok(count)
+        })
+    }
+
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_many_copy_sync(
+        &self,
+        py: Python<'_>,
+        jobs: Vec<Py<PyAny>>,
+        kind: Option<String>,
+        queue: String,
+        priority: i16,
+        max_attempts: i16,
+        tags: Vec<String>,
+        metadata: Option<Py<PyAny>>,
+        run_at: Option<Py<PyAny>>,
+        unique_opts: Option<Py<PyAny>>,
+    ) -> PyResult<usize> {
+        let pool = self.pool.clone();
+        let insert_params = prepare_insert_many_params(
+            py,
+            &jobs,
+            kind,
+            &queue,
+            priority,
+            max_attempts,
+            &tags,
+            metadata.as_ref(),
+            run_at.as_ref(),
+            unique_opts.as_ref(),
+        )?;
+
+        py.detach(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(async {
+                let schema = QueueStorage::active_schema(&pool)
+                    .await
+                    .map_err(map_awa_error)?
+                    .ok_or_else(|| {
+                        map_awa_error(awa_model::AwaError::Validation(
+                            "enqueue_many_copy requires an active queue_storage backend".into(),
+                        ))
+                    })?;
+                let store = QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
+                store
+                    .enqueue_params_copy(&pool, &insert_params)
+                    .await
+                    .map_err(map_awa_error)
             })
         })
     }
@@ -2702,6 +2801,7 @@ fn prepare_insert_many_params(
     tags: &[String],
     metadata: Option<&Py<PyAny>>,
     run_at: Option<&Py<PyAny>>,
+    unique_opts: Option<&Py<PyAny>>,
 ) -> PyResult<Vec<InsertParams>> {
     let metadata_json = metadata
         .map(|value| py_to_json(py, value.bind(py)))
@@ -2709,6 +2809,9 @@ fn prepare_insert_many_params(
         .unwrap_or(serde_json::json!({}));
     let run_at_dt = run_at
         .map(|value| parse_run_at(py, value.bind(py)))
+        .transpose()?;
+    let unique = unique_opts
+        .map(|value| parse_unique_opts(py, value.bind(py)))
         .transpose()?;
 
     jobs.iter()
@@ -2732,6 +2835,7 @@ fn prepare_insert_many_params(
                     run_at: run_at_dt,
                     metadata: metadata_json.clone(),
                     tags: tags.to_vec(),
+                    unique: unique.clone(),
                     ..Default::default()
                 },
             })

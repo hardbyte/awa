@@ -31,7 +31,9 @@ against the admin API.
 - **Cron** (`cron`) — `PeriodicJob`, `PeriodicJobBuilder`, `CronJobRow`.
 - **Queue storage** (`queue_storage`) — `QueueStorage`,
   `QueueStorageConfig`, `ClaimedRuntimeJob`, `RotateOutcome`,
-  `PruneOutcome`. The vacuum-aware engine introduced in 0.6.
+  `PruneOutcome`. The vacuum-aware engine introduced in 0.6, including
+  `QueueStorage::enqueue_params_copy` for direct COPY ingestion into
+  `ready_entries` / `deferred_jobs`.
 - **Storage status** (`storage`) — `StorageStatus` and the
   transition-state primitives the `awa storage` CLI surfaces.
 - **Bridge adapters** (`bridge`) — `PreparedRow` and friends used by

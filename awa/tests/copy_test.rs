@@ -19,6 +19,22 @@ async fn setup() -> sqlx::PgPool {
         .await
         .expect("Failed to connect to database");
     migrations::run(&pool).await.expect("Failed to migrate");
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .expect("Failed to reset storage transition state");
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
         .execute(&pool)
         .await

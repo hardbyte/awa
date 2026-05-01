@@ -16,19 +16,40 @@ DATABASE_URL = os.environ.get(
 )
 
 
+async def reset_storage_transition_state(client: awa.AsyncClient) -> None:
+    tx = await client.transaction()
+    await tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute("DELETE FROM awa.runtime_instances")
+    await tx.commit()
+
+
 @pytest.fixture
 async def client():
     """Create a client and run migrations."""
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await reset_storage_transition_state(c)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
     await tx.execute("DELETE FROM awa.jobs")
     await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()
     try:
         yield c
     finally:
+        await reset_storage_transition_state(c)
         await c.close()
 
 
@@ -273,6 +294,64 @@ async def test_transaction_insert_many(client):
     )
     await tx2.commit()
     assert row["cnt"] == 2
+
+
+@pytest.mark.asyncio
+async def test_enqueue_many_copy_queue_storage(client):
+    """enqueue_many_copy streams Python jobs directly into queue_storage."""
+    schema = "awa_py_enqueue_many_copy"
+    queue = "py_enqueue_many_copy"
+    await client.install_queue_storage(schema=schema, reset=True)
+
+    count = await client.enqueue_many_copy(
+        [
+            SendEmail(to="copy1@example.com", subject="One"),
+            SendEmail(to="copy2@example.com", subject="Two"),
+        ],
+        queue=queue,
+        priority=1,
+        tags=["bulk"],
+        metadata={"source": "python"},
+    )
+    assert count == 2
+
+    tx = await client.transaction()
+    row = await tx.fetch_one(
+        f"""
+        SELECT
+            count(*)::bigint AS ready_count,
+            min(payload->'metadata'->>'source') AS source,
+            min(payload->'tags'->>0) AS tag
+        FROM {schema}.ready_entries
+        WHERE queue = $1
+        """,
+        queue,
+    )
+    counts = await tx.fetch_one(
+        f"""
+        SELECT available_count
+        FROM {schema}.queue_lanes
+        WHERE queue = $1 AND priority = 1
+        """,
+        queue,
+    )
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.commit()
+
+    assert row["ready_count"] == 2
+    assert row["source"] == "python"
+    assert row["tag"] == "bulk"
+    assert counts["available_count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_enqueue_many_copy_requires_queue_storage(client):
+    """Direct COPY enqueue fails clearly unless queue_storage is active."""
+    with pytest.raises(awa.ValidationError, match="active queue_storage backend"):
+        await client.enqueue_many_copy(
+            [SendEmail(to="copy-missing@example.com", subject="Missing")],
+            queue="py_enqueue_many_copy_missing",
+        )
 
 
 # -- Admin tests --

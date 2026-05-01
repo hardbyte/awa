@@ -18,6 +18,26 @@ DATABASE_URL = os.environ.get(
 )
 
 
+def reset_storage_transition_state(client: awa.Client) -> None:
+    tx = client.transaction()
+    tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
+    tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    tx.execute("DELETE FROM awa.runtime_instances")
+    tx.commit()
+
+
 @dataclass
 class SyncEmail:
     to: str
@@ -35,12 +55,17 @@ def client():
     """Create a client and run migrations synchronously."""
     c = awa.Client(DATABASE_URL)
     c.migrate()
+    reset_storage_transition_state(c)
     # Clean up jobs from previous tests
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs")
     tx.execute("DELETE FROM awa.queue_meta")
     tx.commit()
-    return c
+    try:
+        yield c
+    finally:
+        reset_storage_transition_state(c)
+        c.close()
 
 
 # -- Test 12: insert_sync returns Job directly --
@@ -239,6 +264,49 @@ def test_insert_many_copy_sync(client):
         assert job.kind == "sync_email"
         assert job.queue == "sync_copy"
         assert job.args["to"] == f"copy{i}@example.com"
+
+
+def test_enqueue_many_copy_sync_queue_storage(client):
+    schema = "awa_py_sync_enqueue_many_copy"
+    queue = "sync_enqueue_many_copy"
+    client.install_queue_storage(schema=schema, reset=True)
+
+    count = client.enqueue_many_copy(
+        [SyncEmail(to=f"qs-copy{i}@example.com", subject=f"Copy {i}") for i in range(3)],
+        queue=queue,
+        priority=1,
+        metadata={"source": "python-sync"},
+        tags=["bulk"],
+    )
+    assert count == 3
+
+    tx = client.transaction()
+    row = tx.fetch_one(
+        f"""
+        SELECT
+            count(*)::bigint AS ready_count,
+            min(payload->'metadata'->>'source') AS source,
+            min(payload->'tags'->>0) AS tag
+        FROM {schema}.ready_entries
+        WHERE queue = $1
+        """,
+        queue,
+    )
+    counts = tx.fetch_one(
+        f"""
+        SELECT available_count
+        FROM {schema}.queue_lanes
+        WHERE queue = $1 AND priority = 1
+        """,
+        queue,
+    )
+    tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    tx.commit()
+
+    assert row["ready_count"] == 3
+    assert row["source"] == "python-sync"
+    assert row["tag"] == "bulk"
+    assert counts["available_count"] == 3
 
 
 # -- Test 25: JobState.__str__ returns lowercase --

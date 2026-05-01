@@ -437,7 +437,21 @@ class Client:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
+    async def enqueue_many_copy(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: datetime.datetime | None = None,
+        unique_opts: dict[str, Any] | None = None,
+    ) -> int: ...
     def periodic(
         self,
         name: str,
@@ -580,7 +594,21 @@ class Client:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
+    def enqueue_many_copy_sync(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] = [],
+        metadata: dict[str, Any] | None = None,
+        run_at: datetime.datetime | None = None,
+        unique_opts: dict[str, Any] | None = None,
+    ) -> int: ...
     # External callback completion (sync)
     def complete_external_sync(
         self,

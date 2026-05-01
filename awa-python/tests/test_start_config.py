@@ -16,6 +16,26 @@ DATABASE_URL = os.environ.get(
 )
 
 
+async def reset_storage_transition_state(client: awa.AsyncClient) -> None:
+    tx = await client.transaction()
+    await tx.execute(
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """
+    )
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.execute("DELETE FROM awa.runtime_instances")
+    await tx.commit()
+
+
 async def wait_for_job_state(
     client: awa.AsyncClient,
     job_id: int,
@@ -38,14 +58,17 @@ async def client():
     await tx.execute("DROP SCHEMA IF EXISTS awa CASCADE")
     await tx.commit()
     await c.migrate()
-    tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-    await tx.execute("DELETE FROM awa.runtime_instances")
-    await tx.commit()
+    await reset_storage_transition_state(c)
     try:
         yield c
     finally:
-        await c.close()
+        reset = awa.AsyncClient(DATABASE_URL)
+        try:
+            await reset.migrate()
+            await reset_storage_transition_state(reset)
+        finally:
+            await reset.close()
+            await c.close()
 
 
 @dataclass

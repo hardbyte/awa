@@ -110,6 +110,7 @@ class AsyncClient:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> list[Job]:
         """Bulk insert jobs using COPY for high throughput."""
         return await self._raw.insert_many_copy(
@@ -121,6 +122,33 @@ class AsyncClient:
             tags=tags if tags is not None else [],
             metadata=metadata,
             run_at=run_at,
+            unique_opts=unique_opts,
+        )
+
+    async def enqueue_many_copy(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
+    ) -> int:
+        """Enqueue jobs into active queue storage using direct COPY."""
+        return await self._raw.enqueue_many_copy(
+            jobs,
+            kind=kind,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+            run_at=run_at,
+            unique_opts=unique_opts,
         )
 
     async def migrate(self) -> None:
@@ -746,6 +774,7 @@ class Client:
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
     ) -> list[Job]:
         """Bulk insert jobs using COPY for high throughput."""
         return self._raw.insert_many_copy_sync(
@@ -757,6 +786,33 @@ class Client:
             tags=tags if tags is not None else [],
             metadata=metadata,
             run_at=run_at,
+            unique_opts=unique_opts,
+        )
+
+    def enqueue_many_copy(
+        self,
+        jobs: list[Any],
+        *,
+        kind: str | None = None,
+        queue: str = "default",
+        priority: int = 2,
+        max_attempts: int = 25,
+        tags: list[str] | None = None,
+        metadata: dict[str, Any] | None = None,
+        run_at: Any | None = None,
+        unique_opts: dict[str, Any] | None = None,
+    ) -> int:
+        """Enqueue jobs into active queue storage using direct COPY."""
+        return self._raw.enqueue_many_copy_sync(
+            jobs,
+            kind=kind,
+            queue=queue,
+            priority=priority,
+            max_attempts=max_attempts,
+            tags=tags if tags is not None else [],
+            metadata=metadata,
+            run_at=run_at,
+            unique_opts=unique_opts,
         )
 
     def migrate(self) -> None:
