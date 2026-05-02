@@ -11,7 +11,7 @@ use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
     UniqueOpts, Worker,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
@@ -4079,6 +4079,109 @@ async fn test_queue_storage_bounded_claimers_can_steal_idle_slot() {
     assert!(
         lease_b.lease_epoch > lease_a.lease_epoch,
         "stealing should bump the lease epoch"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let schema = "awa_qs_bounded_claimers_heartbeat";
+    let store = create_store(&pool, schema).await;
+    let queue = "qs_bounded_claimers_heartbeat";
+    let instance = Uuid::new_v4();
+    let ttl = Duration::from_secs(3);
+    let idle_threshold = Duration::from_millis(500);
+
+    let lease = store
+        .acquire_queue_claimer(&pool, queue, instance, 1, ttl, idle_threshold)
+        .await
+        .expect("instance should acquire claimer")
+        .expect("instance should get a claimer slot");
+
+    let before: DateTime<Utc> = sqlx::query_scalar(&format!(
+        "SELECT last_claimed_at FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = $2"
+    ))
+    .bind(queue)
+    .bind(lease.claimer_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to read initial heartbeat");
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("failed to enqueue fresh-lease claim job");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            instance,
+            1,
+            ttl,
+            idle_threshold,
+        )
+        .await
+        .expect("fresh lease claim should succeed");
+    assert_eq!(claimed.len(), 1);
+
+    let after_fresh: DateTime<Utc> = sqlx::query_scalar(&format!(
+        "SELECT last_claimed_at FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = $2"
+    ))
+    .bind(queue)
+    .bind(lease.claimer_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to read skipped heartbeat");
+    assert_eq!(
+        after_fresh, before,
+        "fresh heartbeat should not rewrite queue_claimer_leases"
+    );
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
+    ))
+    .bind(Utc::now() - chrono::Duration::milliseconds(600))
+    .bind(queue)
+    .bind(lease.claimer_slot)
+    .execute(&pool)
+    .await
+    .expect("failed to age claimer lease heartbeat");
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("failed to enqueue stale-lease claim job");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::from_secs(300),
+            Duration::from_secs(60),
+            instance,
+            1,
+            ttl,
+            idle_threshold,
+        )
+        .await
+        .expect("stale lease claim should succeed");
+    assert_eq!(claimed.len(), 1);
+
+    let after_stale: DateTime<Utc> = sqlx::query_scalar(&format!(
+        "SELECT last_claimed_at FROM {schema}.queue_claimer_leases WHERE queue = $1 AND claimer_slot = $2"
+    ))
+    .bind(queue)
+    .bind(lease.claimer_slot)
+    .fetch_one(&pool)
+    .await
+    .expect("failed to read refreshed heartbeat");
+    assert!(
+        after_stale > after_fresh,
+        "stale heartbeat should refresh queue_claimer_leases"
     );
 }
 

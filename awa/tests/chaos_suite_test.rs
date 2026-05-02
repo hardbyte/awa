@@ -70,15 +70,15 @@ async fn clean_queue(pool: &sqlx::PgPool, queue: &str) {
 }
 
 async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
-    // The 0.6 default is queue_storage; jobs flow through the
-    // segmented schema (`ready_entries`, `leases`, `lease_claims`,
-    // `done_entries`, `dlq_entries`) rather than `awa.jobs`. Mirror
-    // the union the telemetry test uses so this helper sees the
-    // same set the dispatcher does — including open `lease_claims`
-    // (anti-joined with closures) projected as `running`.
+    // Transition-era chaos tests may run against either canonical storage or
+    // queue_storage depending on the runtime capabilities each process reports.
+    // When queue_storage exists, include both planes so a mixed-language smoke
+    // test does not accidentally wait on the wrong one.
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
         let sql = format!(
             "SELECT state::text, count(*)::bigint FROM ( \
+                 SELECT state FROM awa.jobs WHERE queue = $1 \
+                 UNION ALL \
                  SELECT 'available'::awa.job_state AS state \
                  FROM {schema}.ready_entries AS ready \
                  JOIN {schema}.queue_claim_heads AS claims \
@@ -1225,38 +1225,56 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             .expect("Failed to insert Rust-enqueued ChaosProbe");
         }
 
-        let rust_processed_marker =
-            tokio::time::timeout(scaled_timeout(Duration::from_secs(10)), rx.recv())
-                .await
-                .expect("Timed out waiting for Rust worker to process a shared-kind job")
-                .expect("Rust mixed-fleet receiver closed unexpectedly");
-        assert!(
-            rust_processed_marker.starts_with("python-")
-                || rust_processed_marker.starts_with("rust-"),
-            "Unexpected marker processed by Rust worker: {rust_processed_marker}"
-        );
+        let expected_completed = batch_size * 2;
+        let deadline = tokio::time::sleep(scaled_timeout(Duration::from_secs(20)));
+        tokio::pin!(deadline);
+        let mut rust_completed = 0_i64;
+        let mut python_completed = 0_i64;
+        let mut first_rust_marker: Option<String> = None;
+        let mut first_python_line: Option<String> = None;
 
-        let python_line = python_worker
-            .wait_for_line("COMPLETE mode=worker_chaos_probe", Duration::from_secs(10))
-            .await;
-        assert!(
-            python_line.contains("marker=python-") || python_line.contains("marker=rust-"),
-            "Unexpected python worker completion line: {python_line}"
-        );
+        loop {
+            if rust_completed + python_completed == expected_completed {
+                break;
+            }
 
-        let counts = wait_for_counts(
-            &pool,
-            &queue,
-            |counts| {
-                state_count(counts, "completed") == batch_size * 2
-                    && state_count(counts, "failed") == 0
-                    && state_count(counts, "running") == 0
-                    && state_count(counts, "available") == 0
-            },
-            Duration::from_secs(20),
-        )
-        .await;
-        assert_eq!(state_count(&counts, "completed"), batch_size * 2);
+            tokio::select! {
+                marker = rx.recv() => {
+                    let marker = marker.expect("Rust mixed-fleet receiver closed unexpectedly");
+                    assert!(
+                        marker.starts_with("python-") || marker.starts_with("rust-"),
+                        "Unexpected marker processed by Rust worker: {marker}"
+                    );
+                    first_rust_marker.get_or_insert(marker);
+                    rust_completed += 1;
+                }
+                line = python_worker.stdout_lines.recv() => {
+                    let line = line.expect("Python mixed-fleet worker stdout closed unexpectedly");
+                    if line.contains("COMPLETE mode=worker_chaos_probe") {
+                        assert!(
+                            line.contains("marker=python-") || line.contains("marker=rust-"),
+                            "Unexpected python worker completion line: {line}"
+                        );
+                        first_python_line.get_or_insert(line);
+                        python_completed += 1;
+                    }
+                }
+                () = &mut deadline => {
+                    panic!(
+                        "Timed out waiting for mixed-fleet completions; rust_completed={rust_completed}, python_completed={python_completed}, expected={expected_completed}"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            first_rust_marker.is_some(),
+            "Rust worker did not process any mixed-fleet jobs"
+        );
+        assert!(
+            first_python_line.is_some(),
+            "Python worker did not process any mixed-fleet jobs"
+        );
 
         python_worker.stop().await;
     }
