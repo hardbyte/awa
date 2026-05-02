@@ -24,7 +24,7 @@ jobs:
     name: Verify version consistency
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Tag matches Cargo.toml versions
         shell: bash
         # Real TOML parse via stdlib `tomllib` (Python 3.11+). Ubuntu runners
@@ -100,7 +100,7 @@ jobs:
             release_asset: true
             docker_asset: false
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -123,7 +123,7 @@ jobs:
 
       # Frontend must be built before cargo so rust-embed in awa-ui picks it up.
       # Without this the binary ships the "Frontend not built" placeholder (#162).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
@@ -242,7 +242,7 @@ jobs:
 
       - name: Upload release artifact
         if: matrix.release_asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: binary-${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -258,7 +258,7 @@ jobs:
 
       - name: Upload Docker binary
         if: matrix.docker_asset
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: docker-binary-${{ matrix.target }}
           path: docker-dist/
@@ -273,11 +273,11 @@ jobs:
       IMAGE_REGISTRY: ghcr.io
       IMAGE_REPOSITORY: hardbyte
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Docker meta
         id: meta
-        uses: docker/metadata-action@v5
+        uses: docker/metadata-action@v6
         with:
           images: ${{ env.IMAGE_REGISTRY }}/${{ env.IMAGE_REPOSITORY }}/${{ env.IMAGE_NAME }}
           tags: |
@@ -295,7 +295,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Download Linux binaries
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: docker-binary-*
           path: dist
@@ -310,7 +310,7 @@ jobs:
       # not the "Frontend not built" placeholder (#162). We also check
       # `awa --version` matches the git tag.
       - name: Build local image for smoke test
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.runtime
@@ -378,7 +378,7 @@ jobs:
 
       - name: Build and push (multi-arch)
         id: build-and-push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/Dockerfile.runtime
@@ -414,10 +414,10 @@ jobs:
     needs: [build-binaries, python-wheels, cli-wheels]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: "{binary-*,wheels-*,cli-wheels-*}"
           merge-multiple: true
@@ -471,9 +471,9 @@ jobs:
           - os: macos-latest
             target: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
@@ -488,7 +488,7 @@ jobs:
             apt-get update && apt-get install -y libpq-dev || true
 
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -513,16 +513,16 @@ jobs:
           - os: macos-latest
             target: aarch64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
 
       # Frontend must be built before maturin invokes cargo so rust-embed in
       # awa-ui picks it up — the CLI wheel otherwise ships the "Frontend not
       # built" placeholder (#162).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm
@@ -562,7 +562,7 @@ jobs:
             apt-get update && apt-get install -y libpq-dev || true
 
       - name: Upload CLI wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cli-wheels-${{ matrix.os }}-${{ matrix.target }}
           path: dist/*.whl
@@ -577,7 +577,7 @@ jobs:
       id-token: write
     steps:
       - name: Download SDK wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: wheels-*
           merge-multiple: true
@@ -596,7 +596,7 @@ jobs:
       id-token: write
     steps:
       - name: Download CLI wheels
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           pattern: cli-wheels-*
           merge-multiple: true
@@ -611,14 +611,14 @@ jobs:
     needs: [version-check]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
 
       # awa-ui embeds `awa-ui/static/` via rust-embed; without building the
       # frontend first, the crate published to crates.io carries no assets and
       # every downstream `cargo install awa-cli` bakes in the placeholder HTML
       # (#162).
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: "22"
           cache: npm

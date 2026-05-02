@@ -4376,10 +4376,21 @@ impl QueueStorage {
 
         let schema = self.schema();
         let ready_payloads = self.ready_payloads_for_done_rows_tx(tx, rows).await?;
+        let mut ordered_rows: Vec<&DoneJobRow> = rows.iter().collect();
+        ordered_rows.sort_unstable_by_key(|row| {
+            (
+                row.ready_slot,
+                row.ready_generation,
+                row.queue.as_str(),
+                row.priority,
+                row.lane_seq,
+                row.job_id,
+            )
+        });
         let mut builder = QueryBuilder::<Postgres>::new(format!(
             "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) "
         ));
-        builder.push_values(rows.iter(), |mut b, row| {
+        builder.push_values(ordered_rows, |mut b, row| {
             let ready_key = (
                 row.ready_slot,
                 row.ready_generation,

@@ -20,7 +20,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Show Docker version
         run: docker --version
       - name: AwaSegmentedStorage (1 worker)
@@ -88,7 +88,7 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -121,12 +121,12 @@ jobs:
           --health-timeout 5s
           --health-retries 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: ". -> target"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Create Python venv for Rust chaos suite
@@ -150,6 +150,8 @@ jobs:
             | tee artifacts/nightly/rust-hot.txt
       - name: Run Rust chaos suite
         timeout-minutes: 5
+        env:
+          PYTHONFAULTHANDLER: "1"
         run: |
           set -o pipefail
           export AWA_PYTHON_BIN="$PWD/awa-python/.venv/bin/python"
@@ -271,7 +273,7 @@ jobs:
         run: python .github/scripts/check-bench-regression.py artifacts/nightly benchmarks/baseline.json
       - name: Upload Rust nightly artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-rust
           path: artifacts/nightly/
@@ -299,12 +301,12 @@ jobs:
         shell: bash
         working-directory: awa-python
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: "awa-python -> awa-python/target"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - name: Install uv
@@ -373,7 +375,7 @@ jobs:
         run: python .github/scripts/check-bench-regression.py awa-python/artifacts/nightly benchmarks/baseline.json
       - name: Upload Python nightly artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: nightly-python
           path: awa-python/artifacts/nightly/
@@ -388,7 +390,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
       - name: Build issue body
         id: body
         run: |

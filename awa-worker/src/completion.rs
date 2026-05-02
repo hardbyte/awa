@@ -12,6 +12,14 @@ use tracing::{debug, warn};
 const COMPLETION_BATCH_SIZE: usize = 512;
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
 
+fn completion_batch_size() -> usize {
+    env::var("AWA_COMPLETION_BATCH_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(COMPLETION_BATCH_SIZE)
+}
+
 fn completion_flush_interval() -> Duration {
     env::var("AWA_COMPLETION_FLUSH_MS")
         .ok()
@@ -123,6 +131,7 @@ impl CompletionBatcher {
         storage: RuntimeStorage,
     ) -> (Self, CompletionBatcherHandle) {
         let shard_count = completion_shards(&storage);
+        let batch_size = completion_batch_size();
         let flush_interval = completion_flush_interval();
         let mut shards = Vec::with_capacity(shard_count);
         let mut workers = Vec::with_capacity(shard_count);
@@ -137,6 +146,7 @@ impl CompletionBatcher {
                 cancel: cancel.clone(),
                 metrics: metrics.clone(),
                 storage: storage.clone(),
+                batch_size,
                 flush_interval,
             });
         }
@@ -159,12 +169,13 @@ struct CompletionWorker {
     cancel: CancellationToken,
     metrics: crate::metrics::AwaMetrics,
     storage: RuntimeStorage,
+    batch_size: usize,
     flush_interval: Duration,
 }
 
 impl CompletionWorker {
     async fn run(mut self) {
-        let mut pending = Vec::with_capacity(COMPLETION_BATCH_SIZE);
+        let mut pending = Vec::with_capacity(self.batch_size);
 
         loop {
             if pending.is_empty() {
@@ -190,7 +201,7 @@ impl CompletionWorker {
                         match request {
                             Some(request) => {
                                 pending.push(request);
-                                if pending.len() >= COMPLETION_BATCH_SIZE {
+                                if pending.len() >= self.batch_size {
                                     self.flush(&mut pending).await;
                                 }
                             }
@@ -203,7 +214,7 @@ impl CompletionWorker {
 
         while let Ok(request) = self.rx.try_recv() {
             pending.push(request);
-            if pending.len() >= COMPLETION_BATCH_SIZE {
+            if pending.len() >= self.batch_size {
                 self.flush(&mut pending).await;
             }
         }
