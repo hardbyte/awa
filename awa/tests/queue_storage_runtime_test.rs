@@ -4144,7 +4144,7 @@ async fn test_queue_storage_claimer_heartbeat_skips_fresh_lease() {
     sqlx::query(&format!(
         "UPDATE {schema}.queue_claimer_leases SET last_claimed_at = $1 WHERE queue = $2 AND claimer_slot = $3"
     ))
-    .bind(Utc::now() - chrono::Duration::milliseconds(300))
+    .bind(Utc::now() - chrono::Duration::milliseconds(600))
     .bind(queue)
     .bind(lease.claimer_slot)
     .execute(&pool)
