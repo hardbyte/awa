@@ -345,6 +345,14 @@ fix (v0.5.0) eliminated the bottleneck entirely.
 - `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
+- `AWA_COMPLETION_BATCH_SIZE` (default `128`): max rows per completion-batcher
+  flush. Lowered from `512` after multi-replica matrix runs showed `128`
+  delivered the lowest p99 across the 1–4 worker-process band; `512` did
+  not buy throughput and worsened tail latency.
+- `AWA_COMPLETION_SHARDS` (default `4`): number of parallel completion
+  flushers. Note that the effective fleet-wide flusher count is
+  `processes × AWA_COMPLETION_SHARDS`; tune accordingly for multi-process
+  deployments.
 
 ### Concurrent Multi-Queue Lifecycle
 

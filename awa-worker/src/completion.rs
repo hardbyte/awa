@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-const COMPLETION_BATCH_SIZE: usize = 512;
+const COMPLETION_BATCH_SIZE: usize = 128;
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
 
 fn completion_batch_size() -> usize {

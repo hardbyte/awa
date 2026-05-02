@@ -3,6 +3,16 @@
 Notable changes between releases. Detailed migration notes for storage
 transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
+## Unreleased
+
+### Changed
+
+- **Completion-batcher default size lowered from `512` to `128`.** Cross-system
+  matrix runs (1–4 worker processes × 16–128 workers per process) showed `128`
+  delivered the lowest p99 in every cell and `512` bought no throughput while
+  hurting tail latency under multi-process deployments. Override via
+  `AWA_COMPLETION_BATCH_SIZE`. See `docs/benchmarking.md` for tuning notes.
+
 ## [0.6.0-alpha.2] — 2026-05-02
 
 ### Added
