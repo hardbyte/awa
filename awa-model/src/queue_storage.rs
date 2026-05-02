@@ -5688,10 +5688,19 @@ impl QueueStorage {
                     WITH completed(claim_slot, job_id, run_lease) AS (
                         SELECT * FROM unnest($1::int[], $2::bigint[], $3::bigint[])
                     ),
+                    locked_claims AS (
+                        SELECT claims.claim_slot, claims.job_id, claims.run_lease
+                        FROM {schema}.lease_claims AS claims
+                        JOIN completed
+                          ON completed.claim_slot = claims.claim_slot
+                         AND completed.job_id = claims.job_id
+                         AND completed.run_lease = claims.run_lease
+                        FOR UPDATE OF claims
+                    ),
                     inserted AS (
                         INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
-                        SELECT completed.claim_slot, completed.job_id, completed.run_lease, 'completed', clock_timestamp()
-                        FROM completed
+                        SELECT locked_claims.claim_slot, locked_claims.job_id, locked_claims.run_lease, 'completed', clock_timestamp()
+                        FROM locked_claims
                         ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                         RETURNING job_id, run_lease
                     ),
