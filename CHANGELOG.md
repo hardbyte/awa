@@ -5,6 +5,8 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+## [0.6.0-alpha.3] — 2026-05-02
+
 ### Changed
 
 - **Completion-batcher default size lowered from `512` to `128`.** Cross-system
@@ -12,6 +14,22 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   delivered the lowest p99 in every cell and `512` bought no throughput while
   hurting tail latency under multi-process deployments. Override via
   `AWA_COMPLETION_BATCH_SIZE`. See `docs/benchmarking.md` for tuning notes.
+- **Reduced queue-storage claimer heartbeat churn.** Claimer leases now skip
+  refresh writes while still fresh, cutting coordination writes in the dispatch
+  path without changing claim ownership semantics.
+- **Updated architecture documentation.** The architecture guide now reflects
+  the queue-storage receipt path, lazy lease materialization, crash recovery,
+  maintenance leadership, and callback orchestration.
+
+### Fixed
+
+- **Receipt completion now serializes with heartbeat materialization.** The
+  queue-storage completion path locks the matching receipt claim before writing
+  its closure, preventing a concurrent heartbeat from recreating
+  `attempt_state` after completion.
+- **Hardened mixed Rust/Python chaos smoke coverage.** The mixed-fleet smoke
+  test now waits for worker-observed completions from both runtimes instead of
+  relying on transient terminal-row presence.
 
 ## [0.6.0-alpha.2] — 2026-05-02
 
