@@ -87,6 +87,40 @@ pub struct QueueClaimerLease {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
+struct QueueClaimerLeaseRow {
+    claimer_slot: i16,
+    lease_epoch: i64,
+    last_claimed_at: DateTime<Utc>,
+    expires_at: DateTime<Utc>,
+}
+
+impl QueueClaimerLeaseRow {
+    fn lease(self) -> QueueClaimerLease {
+        QueueClaimerLease {
+            claimer_slot: self.claimer_slot,
+            lease_epoch: self.lease_epoch,
+        }
+    }
+
+    fn needs_refresh(
+        self,
+        now: DateTime<Utc>,
+        lease_ttl: Duration,
+        idle_threshold: Duration,
+    ) -> bool {
+        let Ok(idle_refresh_delta) = TimeDelta::from_std(idle_threshold / 2) else {
+            return true;
+        };
+        let Ok(expiry_refresh_delta) = TimeDelta::from_std(lease_ttl / 2) else {
+            return true;
+        };
+
+        self.last_claimed_at <= now - idle_refresh_delta
+            || self.expires_at <= now + expiry_refresh_delta
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 pub struct QueueClaimerState {
     pub target_claimers: i16,
 }
@@ -2352,13 +2386,13 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            // mark_queue_claimer_active updates last_claimed_at + expires_at
-            // every heartbeat (~30/sec/row at 4-replica scale). HOT updates
-            // require free space on the same page as the old tuple, which
-            // default fillfactor=100% denies. Without explicit fillfactor the
-            // 30-min repro saw n_tup_hot_upd=2 / n_tup_upd=266116 — every
-            // heartbeat spilled to a fresh page. Match the pattern of the
-            // other 1-row-per-(queue, slot) hot Warm tables.
+            // mark_queue_claimer_active refreshes last_claimed_at + expires_at
+            // when a claimer lease is nearing the idle-steal threshold. HOT
+            // updates require free space on the same page as the old tuple,
+            // which default fillfactor=100% denies. Without explicit
+            // fillfactor, high-replica repros spilled frequent lease refreshes
+            // to fresh pages. Match the pattern of the other
+            // 1-row-per-(queue, slot) hot Warm tables.
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.queue_claimer_leases SET (
@@ -2387,13 +2421,13 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            // expires_at is updated on every heartbeat (mark_queue_claimer_active
-            // → SET expires_at = $now + ttl). Any column referenced by an
-            // index — INCLUDE columns count for HOT-blocking purposes on
-            // PG 17 — disqualifies the update from HOT. Empirically observed
-            // 0% HOT ratio at 4×8 with both `(queue, owner_instance_id,
-            // expires_at)` and `(queue, owner_instance_id) INCLUDE
-            // (expires_at)` index shapes.
+            // expires_at is updated by mark_queue_claimer_active when a
+            // claimer lease needs refresh. Any column referenced by an index —
+            // INCLUDE columns count for HOT-blocking purposes on PG 17 —
+            // disqualifies the update from HOT. Empirically observed 0% HOT
+            // ratio at 4×8 with both `(queue, owner_instance_id, expires_at)`
+            // and `(queue, owner_instance_id) INCLUDE (expires_at)` index
+            // shapes.
             //
             // Drop expires_at from the index entirely. The SELECT at
             // acquire_queue_claimer that filters `expires_at > $now` falls
@@ -5128,6 +5162,28 @@ impl QueueStorage {
         lease_ttl: Duration,
         idle_threshold: Duration,
     ) -> Result<Option<QueueClaimerLease>, AwaError> {
+        Ok(self
+            .acquire_queue_claimer_row(
+                pool,
+                queue,
+                instance_id,
+                max_claimers,
+                lease_ttl,
+                idle_threshold,
+            )
+            .await?
+            .map(QueueClaimerLeaseRow::lease))
+    }
+
+    async fn acquire_queue_claimer_row(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        instance_id: Uuid,
+        max_claimers: i16,
+        lease_ttl: Duration,
+        idle_threshold: Duration,
+    ) -> Result<Option<QueueClaimerLeaseRow>, AwaError> {
         if max_claimers <= 0 {
             return Ok(None);
         }
@@ -5148,9 +5204,9 @@ impl QueueStorage {
             0
         };
 
-        if let Some(owned) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
+        if let Some(owned) = sqlx::query_as::<_, QueueClaimerLeaseRow>(&format!(
             r#"
-            SELECT claimer_slot, lease_epoch
+            SELECT claimer_slot, lease_epoch, last_claimed_at, expires_at
             FROM {schema}.queue_claimer_leases
             WHERE queue = $1
               AND owner_instance_id = $2
@@ -5171,7 +5227,7 @@ impl QueueStorage {
 
         for offset in 0..max_claimers {
             let slot = (probe_start + offset) % max_claimers;
-            if let Some(updated) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
+            if let Some(updated) = sqlx::query_as::<_, QueueClaimerLeaseRow>(&format!(
                 r#"
                 UPDATE {schema}.queue_claimer_leases
                 SET owner_instance_id = $3,
@@ -5189,7 +5245,7 @@ impl QueueStorage {
                      OR expires_at <= $4
                      OR last_claimed_at <= $6
                   )
-                RETURNING claimer_slot, lease_epoch
+                RETURNING claimer_slot, lease_epoch, last_claimed_at, expires_at
                 "#
             ))
             .bind(queue)
@@ -5205,7 +5261,7 @@ impl QueueStorage {
                 return Ok(Some(updated));
             }
 
-            if let Some(inserted) = sqlx::query_as::<_, QueueClaimerLease>(&format!(
+            if let Some(inserted) = sqlx::query_as::<_, QueueClaimerLeaseRow>(&format!(
                 r#"
                 INSERT INTO {schema}.queue_claimer_leases (
                     queue,
@@ -5218,7 +5274,7 @@ impl QueueStorage {
                 )
                 VALUES ($1, $2, $3, 0, $4, $4, $5)
                 ON CONFLICT (queue, claimer_slot) DO NOTHING
-                RETURNING claimer_slot, lease_epoch
+                RETURNING claimer_slot, lease_epoch, last_claimed_at, expires_at
                 "#
             ))
             .bind(queue)
@@ -5438,7 +5494,7 @@ impl QueueStorage {
             .await?;
 
         let Some(lease) = self
-            .acquire_queue_claimer(
+            .acquire_queue_claimer_row(
                 pool,
                 queue,
                 instance_id,
@@ -5461,9 +5517,9 @@ impl QueueStorage {
             )
             .await?;
 
-        if !claimed.is_empty() {
+        if !claimed.is_empty() && lease.needs_refresh(Utc::now(), lease_ttl, idle_threshold) {
             let _ = self
-                .mark_queue_claimer_active(pool, queue, instance_id, lease, lease_ttl)
+                .mark_queue_claimer_active(pool, queue, instance_id, lease.lease(), lease_ttl)
                 .await?;
         }
 
