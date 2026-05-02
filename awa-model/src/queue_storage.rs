@@ -274,6 +274,10 @@ fn done_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.done_entries_{slot}")
 }
 
+fn completed_receipt_child_name(schema: &str, slot: usize) -> String {
+    format!("{schema}.completed_receipts_{slot}")
+}
+
 fn lease_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.leases_{slot}")
 }
@@ -559,6 +563,12 @@ fn terminal_storage_payload<'a>(
 
 fn is_storage_payload_empty(value: &serde_json::Value) -> bool {
     value.is_null() || is_empty_json_object(value)
+}
+
+fn compact_success_receipts_enabled() -> bool {
+    std::env::var("AWA_QS_COMPACT_SUCCESS_RECEIPTS")
+        .ok()
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "on"))
 }
 
 fn write_copy_storage_payload(buf: &mut Vec<u8>, value: &serde_json::Value) {
@@ -964,6 +974,21 @@ struct DoneJobRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct CompletedReceiptRow {
+    ready_slot: i32,
+    ready_generation: i64,
+    job_id: i64,
+    queue: String,
+    priority: i16,
+    attempt: i16,
+    run_lease: i64,
+    lane_seq: i64,
+    finalized_at: DateTime<Utc>,
+    unique_key: Option<Vec<u8>>,
+    unique_states: Option<String>,
 }
 
 impl DoneJobRow {
@@ -2992,6 +3017,26 @@ impl QueueStorage {
 
             sqlx::query(&format!(
                 r#"
+            CREATE TABLE IF NOT EXISTS {schema}.completed_receipts (
+                ready_slot        INT NOT NULL,
+                ready_generation  BIGINT NOT NULL,
+                job_id            BIGINT NOT NULL,
+                queue             TEXT NOT NULL,
+                priority          SMALLINT NOT NULL,
+                attempt           SMALLINT NOT NULL DEFAULT 1,
+                run_lease         BIGINT NOT NULL DEFAULT 1,
+                lane_seq          BIGINT NOT NULL,
+                finalized_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                PRIMARY KEY (ready_slot, queue, priority, lane_seq)
+            ) PARTITION BY LIST (ready_slot)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
             CREATE TABLE IF NOT EXISTS {schema}.deferred_jobs (
                 job_id            BIGINT PRIMARY KEY,
                 kind              TEXT NOT NULL,
@@ -3117,6 +3162,28 @@ impl QueueStorage {
                 FOR VALUES IN ({slot})
                 "#,
                     done_child_name(schema, slot)
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    r#"
+                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.completed_receipts
+                FOR VALUES IN ({slot})
+                "#,
+                    completed_receipt_child_name(schema, slot)
+                ))
+                .execute(pool)
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    r#"
+                CREATE INDEX IF NOT EXISTS idx_{schema}_completed_receipts_{slot}_job
+                    ON {} (job_id, run_lease)
+                "#,
+                    completed_receipt_child_name(schema, slot)
                 ))
                 .execute(pool)
                 .await
@@ -3655,6 +3722,7 @@ impl QueueStorage {
             TRUNCATE
                 {schema}.ready_entries,
                 {schema}.done_entries,
+                {schema}.completed_receipts,
                 {schema}.dlq_entries,
                 {schema}.leases,
                 {schema}.lease_claims,
@@ -4425,6 +4493,63 @@ impl QueueStorage {
                 .push_bind(&row.unique_key)
                 .push_bind(&row.unique_states)
                 .push_bind(terminal_storage_payload(&row.payload, ready_payload));
+        });
+        builder
+            .build()
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        Ok(rows.len())
+    }
+
+    async fn insert_completed_receipts_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[CompletedReceiptRow],
+        old_state: Option<JobState>,
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        for row in rows {
+            self.sync_unique_claim(
+                tx,
+                row.job_id,
+                &row.unique_key,
+                row.unique_states.as_deref(),
+                old_state,
+                Some(JobState::Completed),
+            )
+            .await?;
+        }
+
+        let schema = self.schema();
+        let mut ordered_rows: Vec<&CompletedReceiptRow> = rows.iter().collect();
+        ordered_rows.sort_unstable_by_key(|row| {
+            (
+                row.ready_slot,
+                row.ready_generation,
+                row.queue.as_str(),
+                row.priority,
+                row.lane_seq,
+                row.job_id,
+            )
+        });
+        let mut builder = QueryBuilder::<Postgres>::new(format!(
+            "INSERT INTO {schema}.completed_receipts (ready_slot, ready_generation, job_id, queue, priority, attempt, run_lease, lane_seq, finalized_at) "
+        ));
+        builder.push_values(ordered_rows, |mut b, row| {
+            b.push_bind(row.ready_slot)
+                .push_bind(row.ready_generation)
+                .push_bind(row.job_id)
+                .push_bind(&row.queue)
+                .push_bind(row.priority)
+                .push_bind(row.attempt)
+                .push_bind(row.run_lease)
+                .push_bind(row.lane_seq)
+                .push_bind(row.finalized_at);
         });
         builder
             .build()
@@ -5660,15 +5785,43 @@ impl QueueStorage {
                 if !updated.is_empty() {
                     let finalized_at = Utc::now();
                     let mut done_rows = Vec::with_capacity(updated.len());
+                    let mut completed_receipts = Vec::with_capacity(updated.len());
+                    let compact_success_receipts = compact_success_receipts_enabled();
                     for (job_id, run_lease) in &updated {
                         if let Some(runtime_job) = claimed_map.get(&(*job_id, *run_lease)).cloned()
                         {
-                            done_rows.push(runtime_job.into_done_row(finalized_at)?);
+                            let done_row = runtime_job.into_done_row(finalized_at)?;
+                            if compact_success_receipts
+                                && done_row.state == JobState::Completed
+                                && is_storage_payload_empty(&done_row.payload)
+                            {
+                                completed_receipts.push(CompletedReceiptRow {
+                                    ready_slot: done_row.ready_slot,
+                                    ready_generation: done_row.ready_generation,
+                                    job_id: done_row.job_id,
+                                    queue: done_row.queue,
+                                    priority: done_row.priority,
+                                    attempt: done_row.attempt,
+                                    run_lease: done_row.run_lease,
+                                    lane_seq: done_row.lane_seq,
+                                    finalized_at: done_row.finalized_at,
+                                    unique_key: done_row.unique_key,
+                                    unique_states: done_row.unique_states,
+                                });
+                            } else {
+                                done_rows.push(done_row);
+                            }
                         }
                     }
 
                     self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
                         .await?;
+                    self.insert_completed_receipts_tx(
+                        &mut tx,
+                        &completed_receipts,
+                        Some(JobState::Running),
+                    )
+                    .await?;
                     updated_all.extend(updated);
                 }
 
@@ -6028,9 +6181,19 @@ impl QueueStorage {
                 )::bigint AS running
             ),
             live_terminal AS (
-                SELECT count(*)::bigint AS completed
-                FROM {schema}.done_entries
-                WHERE queue = ANY($1)
+                SELECT (
+                    COALESCE((
+                        SELECT count(*)::bigint
+                        FROM {schema}.done_entries
+                        WHERE queue = ANY($1)
+                    ), 0)
+                    +
+                    COALESCE((
+                        SELECT count(*)::bigint
+                        FROM {schema}.completed_receipts
+                        WHERE queue = ANY($1)
+                    ), 0)
+                )::bigint AS completed
             )
             SELECT
                 lane_counts.available,
@@ -7906,6 +8069,11 @@ impl QueueStorage {
                     AND done.run_lease = claims.run_lease
               )
               AND NOT EXISTS (
+                  SELECT 1 FROM {schema}.completed_receipts AS completed
+                  WHERE completed.job_id = claims.job_id
+                    AND completed.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
                   SELECT 1 FROM {schema}.dlq_entries AS dlq
                   WHERE dlq.job_id = claims.job_id
                     AND dlq.run_lease = claims.run_lease
@@ -7959,6 +8127,47 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
         for row in done_rows {
+            candidates.push(row.into_job_row()?);
+        }
+
+        let completed_receipt_rows: Vec<DoneJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                completed.ready_slot,
+                completed.ready_generation,
+                completed.job_id,
+                ready.kind,
+                completed.queue,
+                ready.args,
+                'completed'::awa.job_state AS state,
+                completed.priority,
+                completed.attempt,
+                completed.run_lease,
+                ready.max_attempts,
+                completed.lane_seq,
+                ready.run_at,
+                ready.attempted_at,
+                completed.finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload
+            FROM {schema}.completed_receipts AS completed
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = completed.ready_slot
+             AND ready.ready_generation = completed.ready_generation
+             AND ready.queue = completed.queue
+             AND ready.priority = completed.priority
+             AND ready.lane_seq = completed.lane_seq
+            WHERE completed.job_id = $1
+            ORDER BY completed.run_lease DESC, completed.finalized_at DESC
+            "#,
+        ))
+        .bind(job_id)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        for row in completed_receipt_rows {
             candidates.push(row.into_job_row()?);
         }
 
@@ -9964,14 +10173,22 @@ impl QueueStorage {
         .fetch_one(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+        let completed_receipt_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint FROM {}",
+            completed_receipt_child_name(schema, next_slot as usize)
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        let terminal_count = done_count + completed_receipt_count;
 
-        if ready_count > 0 || done_count > 0 {
+        if ready_count > 0 || terminal_count > 0 {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(RotateOutcome::SkippedBusy {
                 slot: next_slot,
                 busy: BusyCounts {
                     queue_ready: ready_count,
-                    queue_done: done_count,
+                    queue_done: terminal_count,
                     ..Default::default()
                 },
             });
@@ -10137,6 +10354,7 @@ impl QueueStorage {
 
         let ready_child = ready_child_name(schema, slot as usize);
         let done_child = done_child_name(schema, slot as usize);
+        let completed_receipt_child = completed_receipt_child_name(schema, slot as usize);
 
         sqlx::query("SET LOCAL lock_timeout = '50ms'")
             .execute(tx.as_mut())
@@ -10144,7 +10362,7 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         let lock_tables = sqlx::query(&format!(
-            "LOCK TABLE {ready_child}, {done_child} IN ACCESS EXCLUSIVE MODE"
+            "LOCK TABLE {ready_child}, {done_child}, {completed_receipt_child} IN ACCESS EXCLUSIVE MODE"
         ))
         .execute(tx.as_mut())
         .await;
@@ -10186,7 +10404,13 @@ impl QueueStorage {
              AND done.queue = ready.queue
              AND done.priority = ready.priority
              AND done.lane_seq = ready.lane_seq
+            LEFT JOIN {completed_receipt_child} AS completed
+              ON completed.ready_generation = ready.ready_generation
+             AND completed.queue = ready.queue
+             AND completed.priority = ready.priority
+             AND completed.lane_seq = ready.lane_seq
             WHERE done.lane_seq IS NULL
+              AND completed.lane_seq IS NULL
             "#
         ))
         .fetch_one(tx.as_mut())
@@ -10207,15 +10431,21 @@ impl QueueStorage {
             SELECT queue, priority, count(*)::bigint AS pruned_count
             FROM {done_child}
             GROUP BY queue, priority
+            UNION ALL
+            SELECT queue, priority, count(*)::bigint AS pruned_count
+            FROM {completed_receipt_child}
+            GROUP BY queue, priority
             "#
         ))
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        let truncate = sqlx::query(&format!("TRUNCATE TABLE {ready_child}, {done_child}",))
-            .execute(tx.as_mut())
-            .await;
+        let truncate = sqlx::query(&format!(
+            "TRUNCATE TABLE {ready_child}, {done_child}, {completed_receipt_child}",
+        ))
+        .execute(tx.as_mut())
+        .await;
 
         match truncate {
             Ok(_) => {
