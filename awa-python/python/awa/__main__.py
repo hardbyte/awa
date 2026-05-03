@@ -243,7 +243,7 @@ def _find_awa_binary() -> Path | None:
     found = shutil.which("awa")
     if found:
         resolved = Path(found).resolve()
-        if resolved.suffix not in {".py"}:
+        if resolved.suffix not in {".py", ".pyw"}:
             return resolved
     return None
 
