@@ -21,7 +21,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 use uuid::Uuid;
 
 static QUEUE_STORAGE_RUNTIME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
@@ -708,8 +708,50 @@ struct CompleteJob {
     id: i64,
 }
 
+#[derive(Clone)]
+struct BlockingCompleteWorkerGate {
+    release: Arc<Notify>,
+    entered: Arc<AtomicBool>,
+    entered_wake: Arc<Notify>,
+}
+
+impl BlockingCompleteWorkerGate {
+    fn new() -> Self {
+        Self {
+            release: Arc::new(Notify::new()),
+            entered: Arc::new(AtomicBool::new(false)),
+            entered_wake: Arc::new(Notify::new()),
+        }
+    }
+
+    fn worker(&self) -> BlockingCompleteWorker {
+        BlockingCompleteWorker { gate: self.clone() }
+    }
+
+    async fn wait_until_entered(&self, timeout: Duration) {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.entered.load(Ordering::SeqCst) {
+                return;
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                panic!("timed out waiting for blocking worker to await release");
+            }
+
+            let remaining = deadline.saturating_duration_since(now);
+            let _ = tokio::time::timeout(remaining, self.entered_wake.notified()).await;
+        }
+    }
+
+    fn release(&self) {
+        self.release.notify_waiters();
+    }
+}
+
 struct BlockingCompleteWorker {
-    release: Arc<tokio::sync::Notify>,
+    gate: BlockingCompleteWorkerGate,
 }
 
 #[async_trait::async_trait]
@@ -719,7 +761,9 @@ impl Worker for BlockingCompleteWorker {
     }
 
     async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
-        self.release.notified().await;
+        self.gate.entered.store(true, Ordering::SeqCst);
+        self.gate.entered_wake.notify_waiters();
+        self.gate.release.notified().await;
         Ok(JobResult::Completed)
     }
 }
@@ -2353,7 +2397,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
     let queue = "qs_attempt_state_short_job";
     let schema = "awa_qs_runtime_attempt_state_short";
     let store = create_store(&pool, schema).await;
-    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = BlockingCompleteWorkerGate::new();
     let client = queue_storage_client(
         &pool,
         queue,
@@ -2364,9 +2408,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
             lease_claim_receipts: false,
             ..Default::default()
         },
-        BlockingCompleteWorker {
-            release: release.clone(),
-        },
+        gate.worker(),
     );
 
     let job_id = enqueue_job(
@@ -2396,7 +2438,8 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
     assert_eq!(running.state, JobState::Running);
     assert_eq!(attempt_state_count(&pool, &store).await, 0);
 
-    release.notify_waiters();
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+    gate.release();
 
     let completed = wait_for_job_state(
         &store,
@@ -2430,7 +2473,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
         },
     )
     .await;
-    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = BlockingCompleteWorkerGate::new();
     let client = queue_storage_client(
         &pool,
         queue,
@@ -2442,9 +2485,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             lease_claim_receipts: true,
             claim_slot_count: 2,
         },
-        BlockingCompleteWorker {
-            release: release.clone(),
-        },
+        gate.worker(),
     );
 
     let job_id = enqueue_job(
@@ -2483,7 +2524,8 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
         .expect("Failed to load queue counts while receipt-backed job is running");
     assert_eq!(running_counts.running, 1);
 
-    release.notify_waiters();
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+    gate.release();
 
     let completed = wait_for_job_state(
         &store,
@@ -2571,7 +2613,12 @@ async fn test_queue_storage_capacity_wake_skips_empty_claim_after_partial_drain(
         &pool,
         job_id,
         &[JobState::Completed],
-        Duration::from_secs(5),
+        // Keep the dispatcher fallback poll interval long so any post-completion
+        // empty claim within the 250ms observation window must come from the
+        // capacity wake path. The first enqueue can still race dispatcher
+        // LISTEN setup in CI, so allow one missed-NOTIFY fallback poll before
+        // declaring the job stuck.
+        Duration::from_secs(15),
     )
     .await;
     assert_eq!(completed.state, JobState::Completed);
@@ -2615,7 +2662,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
         },
     )
     .await;
-    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = BlockingCompleteWorkerGate::new();
     let client = queue_storage_client(
         &pool,
         queue,
@@ -2627,9 +2674,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             lease_claim_receipts: true,
             claim_slot_count: 2,
         },
-        BlockingCompleteWorker {
-            release: release.clone(),
-        },
+        gate.worker(),
     );
 
     let job_id = enqueue_job(
@@ -2658,7 +2703,8 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
     .await;
     assert_eq!(running.state, JobState::Running);
 
-    release.notify_waiters();
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+    gate.release();
 
     let completed = wait_for_job_state(
         &store,
@@ -2777,7 +2823,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
         },
     )
     .await;
-    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = BlockingCompleteWorkerGate::new();
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -2800,9 +2846,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
-        .register_worker(BlockingCompleteWorker {
-            release: release.clone(),
-        })
+        .register_worker(gate.worker())
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(50))
@@ -2865,7 +2909,8 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 0);
     assert_eq!(lease_count(&pool, &store).await, 0);
 
-    release.notify_waiters();
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+    gate.release();
 
     let completed = wait_for_job_state(
         &store,
@@ -3145,7 +3190,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         },
     )
     .await;
-    let release = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(Notify::new());
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -3371,7 +3416,7 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     let queue = "qs_admin_runtime";
     let schema = "awa_qs_admin_runtime";
     let store = create_store(&pool, schema).await;
-    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = BlockingCompleteWorkerGate::new();
 
     let running_job_id = enqueue_job(
         &pool,
@@ -3414,9 +3459,7 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
             Duration::from_millis(1_000),
             Duration::from_millis(50),
         )
-        .register_worker(BlockingCompleteWorker {
-            release: release.clone(),
-        })
+        .register_worker(gate.worker())
         .register_worker(TerminalFailureWorker)
         .dlq_enabled_by_default(true)
         .promote_interval(Duration::from_millis(25))
@@ -3505,7 +3548,8 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
     assert_eq!(failed_jobs.len(), 1);
     assert_eq!(failed_jobs[0].id, failed_job_id);
 
-    release.notify_waiters();
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+    gate.release();
     client.shutdown(Duration::from_secs(5)).await;
 }
 
@@ -3517,7 +3561,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     let schema = "awa_qs_runtime_prune_live_slot";
     let store = create_store(&pool, schema).await;
 
-    let release = Arc::new(tokio::sync::Notify::new());
+    let gate = BlockingCompleteWorkerGate::new();
     let client = queue_storage_client(
         &pool,
         queue,
@@ -3528,9 +3572,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
             lease_claim_receipts: false,
             ..Default::default()
         },
-        BlockingCompleteWorker {
-            release: release.clone(),
-        },
+        gate.worker(),
     );
 
     let job_id = enqueue_job(
@@ -3580,7 +3622,8 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
         "unexpected prune outcome while lease is live: {prune_while_running:?}"
     );
 
-    release.notify_waiters();
+    gate.wait_until_entered(Duration::from_secs(5)).await;
+    gate.release();
 
     let completed = wait_for_job_state(
         &store,
