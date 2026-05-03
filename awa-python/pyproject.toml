@@ -6,7 +6,7 @@ build-backend = "maturin"
 name = "awa-pg"
 requires-python = ">=3.10"
 version = "0.6.0-alpha.4"
-description = "Postgres-native background job queue — Python SDK with async/sync workers, transactional enqueue, progress tracking, and web UI"
+description = "Postgres-native background job queue — Python SDK with async/sync workers, transactional enqueue, and progress tracking. Install awa-pg[ui] to add the bundled web dashboard."
 readme = {file = "../README.md", content-type = "text/markdown"}
 license = {text = "MIT OR Apache-2.0"}
 authors = [{name = "Brian Thorne"}]

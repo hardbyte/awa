@@ -5,6 +5,19 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+### Added
+
+- **`awa-pg[ui]` optional extra** ([#186](https://github.com/hardbyte/awa/issues/186)).
+  `pip install 'awa-pg[ui]'` pulls in the [`awa-cli`](https://pypi.org/project/awa-cli/)
+  wheel so `python -m awa serve` (and `awa serve` directly) launches the
+  embedded React dashboard. The default `awa-pg` install stays small —
+  workers and producers don't pay for the ~10 MB axum + UI bundle they
+  don't need.
+- `python -m awa serve` is now a subcommand. It detects the `awa` binary
+  in `sys.prefix/{bin,Scripts}` (where `awa-cli`'s wheel installs it) and
+  forwards the full argument tail verbatim. If the extra isn't installed,
+  it exits with a `pip install 'awa-pg[ui]'` hint.
+
 ## [0.6.0-alpha.3] — 2026-05-02
 
 ### Changed

@@ -98,8 +98,9 @@ See [docs/positioning.md](docs/positioning.md) for the category map and messagin
 
 ```bash
 # 1. Install
-pip install awa-pg awa-cli     # Python
-# or: cargo add awa             # Rust
+pip install 'awa-pg[ui]'       # Python SDK + dashboard binary
+# pip install awa-pg           # SDK only (no dashboard, smaller wheel)
+# or: cargo add awa            # Rust
 
 # 2. Start Postgres and run migrations
 awa --database-url $DATABASE_URL migrate
@@ -292,9 +293,16 @@ Cancellation is cooperative for running handlers:
 ### Python
 
 ```bash
-pip install awa-pg       # SDK: insert, worker, admin, progress
-pip install awa-cli      # CLI: migrations, queue admin, web UI
+pip install awa-pg          # SDK: insert, worker, admin, progress
+pip install 'awa-pg[ui]'    # SDK + bundled `awa` binary for the dashboard
+# or, just the CLI:
+pip install awa-cli         # CLI on its own: migrations, queue admin, web UI
 ```
+
+`pip install awa-pg` stays small for workers and producers. The `[ui]` extra
+pulls in [`awa-cli`](https://pypi.org/project/awa-cli/), which ships the
+`awa` binary plus the embedded React dashboard; afterwards `python -m awa
+serve` (or `awa serve` directly) launches it.
 
 ### Rust
 
