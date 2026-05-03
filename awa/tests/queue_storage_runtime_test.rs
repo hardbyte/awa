@@ -12,6 +12,8 @@ use awa::{
     UniqueOpts, Worker,
 };
 use chrono::{DateTime, Utc};
+use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
+use opentelemetry_sdk::metrics::{InMemoryMetricExporter, SdkMeterProvider};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashSet;
@@ -23,6 +25,45 @@ use tokio::sync::Mutex;
 use uuid::Uuid;
 
 static QUEUE_STORAGE_RUNTIME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn install_in_memory_metrics() -> (InMemoryMetricExporter, SdkMeterProvider) {
+    let exporter = InMemoryMetricExporter::default();
+    let meter_provider = SdkMeterProvider::builder()
+        .with_periodic_exporter(exporter.clone())
+        .build();
+    opentelemetry::global::set_meter_provider(meter_provider.clone());
+    (exporter, meter_provider)
+}
+
+fn sum_counter_metric_with_attribute(
+    resource_metrics: &[opentelemetry_sdk::metrics::data::ResourceMetrics],
+    name: &str,
+    attr_name: &str,
+    attr_value: &str,
+) -> u64 {
+    let mut total = 0;
+    for rm in resource_metrics {
+        for scope_metrics in rm.scope_metrics() {
+            for metric in scope_metrics.metrics() {
+                if metric.name() != name {
+                    continue;
+                }
+                if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+                    total += sum
+                        .data_points()
+                        .filter(|dp| {
+                            dp.attributes().any(|kv| {
+                                kv.key.as_str() == attr_name && kv.value.as_str() == attr_value
+                            })
+                        })
+                        .map(|dp| dp.value())
+                        .sum::<u64>();
+                }
+            }
+        }
+    }
+    total
+}
 
 fn base_database_url() -> String {
     std::env::var("DATABASE_URL")
@@ -2465,6 +2506,95 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
     assert_eq!(completed_counts.running, 0);
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_capacity_wake_skips_empty_claim_after_partial_drain() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let (exporter, meter_provider) = install_in_memory_metrics();
+    let pool = setup_pool(10).await;
+    let queue = "qs_capacity_wake_partial_drain";
+    let schema = "awa_qs_capacity_wake_partial_drain";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+        ..Default::default()
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: 8,
+                poll_interval: Duration::from_secs(5),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .claim_rotate_interval(Duration::from_secs(60))
+        .register_worker(CompleteWorker)
+        .promote_interval(Duration::from_millis(25))
+        .leader_election_interval(Duration::from_millis(100))
+        .leader_check_interval(Duration::from_millis(50))
+        .heartbeat_rescue_interval(Duration::from_millis(100))
+        .deadline_rescue_interval(Duration::from_millis(100))
+        .callback_rescue_interval(Duration::from_millis(25))
+        .build()
+        .expect("Failed to build capacity wake client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start capacity wake client");
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2003 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let completed = wait_for_job_state(
+        &store,
+        &pool,
+        job_id,
+        &[JobState::Completed],
+        Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(completed.state, JobState::Completed);
+
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    client.shutdown(Duration::from_secs(5)).await;
+    meter_provider
+        .force_flush()
+        .expect("Failed to flush metrics");
+    let resource_metrics = exporter
+        .get_finished_metrics()
+        .expect("Failed to get metrics");
+
+    let capacity_empty_claims = sum_counter_metric_with_attribute(
+        &resource_metrics,
+        "awa.dispatch.empty_claims",
+        "awa.dispatch.reason",
+        "capacity",
+    );
+    assert_eq!(
+        capacity_empty_claims, 0,
+        "partial-drain completion wake should not immediately issue an empty capacity claim"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
