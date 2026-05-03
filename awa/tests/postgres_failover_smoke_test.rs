@@ -178,13 +178,17 @@ impl Drop for ComposeStack {
     }
 }
 
-async fn connect_pool(database_url: &str) -> sqlx::PgPool {
+async fn connect_pool_with(database_url: &str, max_connections: u32) -> sqlx::PgPool {
     PgPoolOptions::new()
-        .max_connections(20)
+        .max_connections(max_connections)
         .acquire_timeout(Duration::from_secs(5))
         .connect(database_url)
         .await
         .expect("failed to connect to failover test database")
+}
+
+async fn connect_pool(database_url: &str) -> sqlx::PgPool {
+    connect_pool_with(database_url, 20).await
 }
 
 async fn wait_for_pool(database_url: &str, timeout: Duration) -> sqlx::PgPool {
@@ -252,6 +256,81 @@ async fn wait_for_writable(database_url: &str, timeout: Duration) {
 }
 
 async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
+    if let Some(schema) = queue_storage_schema_for_counts(pool).await {
+        let sql = format!(
+            "SELECT state::text, count(*)::bigint FROM ( \
+                 SELECT state FROM awa.jobs WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT 'available'::awa.job_state AS state \
+                 FROM {schema}.ready_entries AS ready \
+                 JOIN {schema}.queue_claim_heads AS claims \
+                   ON claims.queue = ready.queue \
+                  AND claims.priority = ready.priority \
+                 WHERE ready.queue = $1 \
+                   AND ready.lane_seq >= claims.claim_seq \
+                 UNION ALL \
+                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.leases WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT 'running'::awa.job_state AS state \
+                 FROM {schema}.lease_claims AS lc \
+                 WHERE lc.queue = $1 \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                     WHERE cx.claim_slot = lc.claim_slot \
+                       AND cx.job_id = lc.job_id \
+                       AND cx.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.leases AS lease \
+                     WHERE lease.job_id = lc.job_id \
+                       AND lease.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.deferred_jobs AS deferred \
+                     WHERE deferred.job_id = lc.job_id \
+                       AND deferred.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.done_entries AS done \
+                     WHERE done.job_id = lc.job_id \
+                       AND done.run_lease = lc.run_lease \
+                   ) \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.dlq_entries AS dlq \
+                     WHERE dlq.job_id = lc.job_id \
+                       AND dlq.run_lease = lc.run_lease \
+                   ) \
+                 UNION ALL \
+                 SELECT 'completed'::awa.job_state AS state \
+                 FROM {schema}.lease_claims AS lc \
+                 JOIN {schema}.lease_claim_closures AS cx \
+                   ON cx.claim_slot = lc.claim_slot \
+                  AND cx.job_id = lc.job_id \
+                  AND cx.run_lease = lc.run_lease \
+                 WHERE lc.queue = $1 \
+                   AND cx.outcome = 'completed' \
+                   AND NOT EXISTS ( \
+                     SELECT 1 FROM {schema}.done_entries AS done \
+                     WHERE done.job_id = lc.job_id \
+                       AND done.run_lease = lc.run_lease \
+                   ) \
+                 UNION ALL \
+                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                 UNION ALL \
+                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
+             ) AS jobs \
+             GROUP BY state"
+        );
+        let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
+            .bind(queue)
+            .fetch_all(pool)
+            .await
+            .expect("failed to query queue-storage state counts");
+        return rows.into_iter().collect();
+    }
+
     let rows: Vec<(String, i64)> = sqlx::query_as(
         r#"
         SELECT state::text, count(*)::bigint
@@ -266,6 +345,30 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
     .expect("failed to query queue state counts");
 
     rows.into_iter().collect()
+}
+
+async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
+    sqlx::query_scalar("SELECT awa.active_queue_storage_schema()")
+        .fetch_one(pool)
+        .await
+        .expect("failed to resolve active queue storage schema")
+}
+
+async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        return Some(schema);
+    }
+
+    let default_exists: bool = sqlx::query_scalar(
+        "SELECT to_regclass('awa.ready_entries') IS NOT NULL \
+         AND to_regclass('awa.deferred_jobs') IS NOT NULL \
+         AND to_regclass('awa.leases') IS NOT NULL \
+         AND to_regclass('awa.done_entries') IS NOT NULL",
+    )
+    .fetch_one(pool)
+    .await
+    .expect("failed to probe default queue storage schema");
+    default_exists.then_some("awa".to_string())
 }
 
 fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
@@ -287,10 +390,57 @@ async fn wait_for_counts(
 
         assert!(
             start.elapsed() < timeout,
-            "timed out waiting for queue {queue}; last counts: {counts:?}"
+            "timed out waiting for queue {queue}; last counts: {counts:?}; storage: {}",
+            storage_debug(pool, queue).await
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+}
+
+async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
+    let storage: Option<(String, String, Option<String>)> = sqlx::query_as(
+        "SELECT current_engine, state, awa.active_queue_storage_schema() \
+         FROM awa.storage_transition_state WHERE singleton",
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    let canonical_count: i64 =
+        sqlx::query_scalar("SELECT count(*)::bigint FROM awa.jobs WHERE queue = $1")
+            .bind(queue)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(-1);
+
+    let queue_storage_count = if let Some((_, _, Some(schema))) = &storage {
+        let sql = format!(
+            "SELECT \
+                 (SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.deferred_jobs WHERE queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.leases WHERE queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.lease_claims WHERE queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.lease_claim_closures AS cx \
+                   JOIN {schema}.lease_claims AS lc \
+                     ON lc.claim_slot = cx.claim_slot \
+                    AND lc.job_id = cx.job_id \
+                    AND lc.run_lease = cx.run_lease \
+                  WHERE lc.queue = $1) + \
+                 (SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1)"
+        );
+        sqlx::query_scalar::<_, i64>(&sql)
+            .bind(queue)
+            .fetch_one(pool)
+            .await
+            .unwrap_or(-1)
+    } else {
+        -1
+    };
+
+    format!(
+        "transition={storage:?}, canonical_rows={canonical_count}, queue_storage_rows={queue_storage_count}"
+    )
 }
 
 async fn wait_for_client_postgres_recovery(client: &Client, timeout: Duration) {
@@ -359,7 +509,7 @@ async fn test_postgres_hot_standby_promotion_keeps_awa_working() {
     let proxy_port = stack.proxy_port();
     let url = database_url(proxy_port);
 
-    let app_pool = wait_for_pool(&url, Duration::from_secs(30)).await;
+    let mut app_pool = wait_for_pool(&url, Duration::from_secs(30)).await;
     migrations::run(&app_pool)
         .await
         .expect("migrations should succeed through proxy");
@@ -368,6 +518,9 @@ async fn test_postgres_hot_standby_promotion_keeps_awa_working() {
     let client_pool = connect_pool(&url).await;
     let client = failover_client(client_pool, &queue);
     client.start().await.expect("client should start");
+
+    app_pool.close().await;
+    app_pool = connect_pool_with(&url, 1).await;
 
     for seq in 0..8_i64 {
         insert_with(
@@ -397,6 +550,9 @@ async fn test_postgres_hot_standby_promotion_keeps_awa_working() {
     stack.promote_replica();
     wait_for_writable(&url, Duration::from_secs(30)).await;
     wait_for_client_postgres_recovery(&client, Duration::from_secs(30)).await;
+
+    app_pool.close().await;
+    app_pool = connect_pool_with(&url, 1).await;
 
     for seq in 8..16_i64 {
         insert_with(

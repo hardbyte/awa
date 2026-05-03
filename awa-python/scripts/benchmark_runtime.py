@@ -74,7 +74,34 @@ async def state_counts(client: awa.AsyncClient, queue: str) -> dict[str, int]:
     return counts
 
 
-async def reset_runtime_state(client: awa.AsyncClient) -> None:
+async def reset_storage_transition_state(client: awa.AsyncClient) -> None:
+    await execute(
+        client,
+        """
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        """,
+    )
+    await execute(
+        client,
+        "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
+    )
+    await execute(client, "DELETE FROM awa.runtime_instances")
+
+
+async def reset_runtime_state(client: awa.AsyncClient, *, queue_storage: bool = False) -> None:
+    if queue_storage:
+        await client.install_queue_storage(reset=True)
+        return
+
+    await reset_storage_transition_state(client)
     await execute(
         client,
         """
@@ -114,7 +141,7 @@ async def run_copy_benchmark(
     chunk_size: int,
 ) -> None:
     queue = "py_bench_copy"
-    await reset_runtime_state(client)
+    await reset_runtime_state(client, queue_storage=True)
 
     started = asyncio.get_running_loop().time()
     inserted = 0
