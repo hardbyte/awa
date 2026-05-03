@@ -222,6 +222,31 @@ Follow-up tuning should focus on the multi-process completion path: either
 attenuating default completion shards by fleet topology, coordinating flushers
 more explicitly, or reducing the per-flush contention footprint further.
 
+### Queue-storage striping reference
+
+Queue striping is a contention-control knob for workloads dominated by one hot
+logical queue. The companion benchmark repo includes an awa-only sweep of
+`queue_storage_queue_stripe_count` over `1`, `2`, and `4` at `64`, `128`,
+`256`, and `512` workers. The source artifact lives in companion benchmark PR
+[#21](https://github.com/hardbyte/postgresql-job-queue-benchmarking/pull/21).
+
+Reference result:
+
+| Stripes | 64 workers | 128 workers | 256 workers | 512 workers |
+|---:|---:|---:|---:|---:|
+| 1 | `3,408/s` | `4,741/s` | `9,530/s` | `11,188/s` |
+| 2 | `4,654/s` | `7,667/s` | `11,975/s` | `11,173/s` |
+| 4 | `4,378/s` | `7,596/s` | `11,418/s` | `11,443/s` |
+
+The clearest gain was the `1 -> 2` stripe step: at `128` workers throughput
+rose by `62%`, and at `256` workers throughput rose by `26%` while end-to-end
+p99 fell from `1,802 ms` to `1,027 ms`. `4` stripes mostly matched `2` stripes
+in this shape, with the only clear advantage at the `512` worker tail.
+
+Treat this as tuning guidance, not an out-of-the-box setting. The default stays
+`queue_storage_queue_stripe_count=1`; hot single-queue deployments should
+consider `2` after measuring their own worker/replica shape.
+
 ## Python Runtime Benchmarks
 
 The Python benchmark script exercises the real `awa-python` worker path while
