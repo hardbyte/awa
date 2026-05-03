@@ -66,28 +66,6 @@ impl WakeReason {
     }
 }
 
-#[derive(Debug, Default)]
-struct CapacityWakeState {
-    recheck_on_capacity: bool,
-}
-
-impl CapacityWakeState {
-    fn should_drain_on_capacity(&self) -> bool {
-        self.recheck_on_capacity
-    }
-
-    fn mark_wake_deferred_for_capacity(&mut self) {
-        self.recheck_on_capacity = true;
-    }
-
-    fn record_claim_result(&mut self, claimed: usize) {
-        // A non-empty claim is enough evidence that capacity release may
-        // expose more ready work. Empty claims proved the opposite and should
-        // suppress completion-driven rechecks until another signal arrives.
-        self.recheck_on_capacity = claimed > 0;
-    }
-}
-
 #[derive(Debug, Clone)]
 struct PollBackoff {
     base: Duration,
@@ -342,7 +320,6 @@ pub struct Dispatcher {
     rate_limiter: Option<TokenBucket>,
     storage: RuntimeStorage,
     capacity_wake: Arc<Notify>,
-    capacity_wake_state: CapacityWakeState,
     poll_backoff: PollBackoff,
 }
 
@@ -381,7 +358,6 @@ impl Dispatcher {
             rate_limiter,
             storage,
             capacity_wake: Arc::new(Notify::new()),
-            capacity_wake_state: CapacityWakeState::default(),
             poll_backoff,
         }
     }
@@ -419,7 +395,6 @@ impl Dispatcher {
             rate_limiter,
             storage,
             capacity_wake: Arc::new(Notify::new()),
-            capacity_wake_state: CapacityWakeState::default(),
             poll_backoff,
         }
     }
@@ -477,9 +452,7 @@ impl Dispatcher {
                     }
                 }
                 _ = self.capacity_wake.notified() => {
-                    if self.capacity_wake_state.should_drain_on_capacity() {
-                        self.drain_ready(WakeReason::Capacity, Instant::now()).await;
-                    }
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
                 _ = tokio::time::sleep(self.poll_backoff.current_interval()) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
@@ -499,9 +472,7 @@ impl Dispatcher {
                     break;
                 }
                 _ = self.capacity_wake.notified() => {
-                    if self.capacity_wake_state.should_drain_on_capacity() {
-                        self.drain_ready(WakeReason::Capacity, Instant::now()).await;
-                    }
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
                 _ = tokio::time::sleep(self.poll_backoff.current_interval()) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
@@ -569,11 +540,8 @@ impl Dispatcher {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
-            if let Some((reason @ (WakeReason::Notify | WakeReason::Poll), _)) = wake_context {
-                if matches!(reason, WakeReason::Poll) {
-                    self.poll_backoff.record_empty_poll();
-                }
-                self.capacity_wake_state.mark_wake_deferred_for_capacity();
+            if let Some((WakeReason::Poll, _)) = wake_context {
+                self.poll_backoff.record_empty_poll();
             }
             return false;
         }
@@ -743,7 +711,6 @@ impl Dispatcher {
             self.metrics
                 .record_dispatch_unused_permits(&self.queue, unused_permits as u64);
         }
-        self.capacity_wake_state.record_claim_result(jobs.len());
 
         // Phase 5: Clear overflow demand if no jobs found
         if jobs.is_empty() {
@@ -797,44 +764,8 @@ impl Dispatcher {
 
 #[cfg(test)]
 mod tests {
-    use super::{CapacityWakeState, PollBackoff};
+    use super::PollBackoff;
     use std::time::Duration;
-
-    #[test]
-    fn capacity_wake_state_rechecks_after_full_capacity_claim() {
-        let mut state = CapacityWakeState::default();
-
-        state.record_claim_result(4);
-
-        assert!(state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn capacity_wake_state_skips_after_empty_claim() {
-        let mut state = CapacityWakeState::default();
-
-        state.mark_wake_deferred_for_capacity();
-        state.record_claim_result(0);
-        assert!(!state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn capacity_wake_state_rechecks_after_partial_non_empty_claim() {
-        let mut state = CapacityWakeState::default();
-
-        state.mark_wake_deferred_for_capacity();
-        state.record_claim_result(2);
-        assert!(state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn capacity_wake_state_rechecks_when_wake_arrived_without_capacity() {
-        let mut state = CapacityWakeState::default();
-
-        state.mark_wake_deferred_for_capacity();
-
-        assert!(state.should_drain_on_capacity());
-    }
 
     #[test]
     fn poll_backoff_doubles_after_empty_poll_until_cap() {
