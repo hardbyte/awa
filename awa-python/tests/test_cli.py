@@ -62,6 +62,77 @@ def test_serve_without_db_url_errors_cleanly():
     assert "--database-url is required" in result.stderr
 
 
+def test_awa_import_survives_without_native_serve():
+    """Builds compiled with `--no-default-features --features cel` (which
+    awa-python's Cargo.toml documents as supported) omit `_awa.serve`. The
+    `awa` package's `__init__.py` must keep working in that case — Codex
+    P1 on PR #221: an unconditional `from awa._awa import serve` would
+    raise ImportError and make non-UI commands unusable.
+
+    We simulate it in a subprocess so the running test process keeps its
+    real `awa.serve` available."""
+    code = (
+        "import sys, types\n"
+        # Strip any pre-cached awa imports so __init__.py runs again.
+        "for k in list(sys.modules):\n"
+        "    if k == 'awa' or k.startswith('awa.'):\n"
+        "        del sys.modules[k]\n"
+        # Import the native module first, drop `serve`, then import `awa`.
+        "import awa._awa as native\n"
+        "native.serve = None  # easiest cross-pyo3-version 'remove' that the\n"
+        "                     # try/except in awa/__init__.py treats as missing\n"
+        "if hasattr(native, 'serve') and native.serve is not None:\n"
+        "    del native.serve\n"
+        "for k in list(sys.modules):\n"
+        "    if k == 'awa' or (k.startswith('awa.') and k != 'awa._awa'):\n"
+        "        del sys.modules[k]\n"
+        "import awa\n"
+        "assert awa.serve is None, f'expected None, got {awa.serve!r}'\n"
+        "assert awa.AsyncClient is not None\n"
+        "print('OK')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert result.returncode == 0, f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
+    assert "OK" in result.stdout
+
+
+def test_serve_command_errors_cleanly_when_native_serve_missing():
+    """Companion to the import test: even if the native `serve` is absent,
+    `python -m awa serve` must surface a deliberate explanation rather than
+    AttributeError or ImportError."""
+    code = (
+        "import sys\n"
+        "for k in list(sys.modules):\n"
+        "    if k == 'awa' or k.startswith('awa.'):\n"
+        "        del sys.modules[k]\n"
+        "import awa._awa as native\n"
+        "if hasattr(native, 'serve'):\n"
+        "    del native.serve\n"
+        "for k in list(sys.modules):\n"
+        "    if k == 'awa' or (k.startswith('awa.') and k != 'awa._awa'):\n"
+        "        del sys.modules[k]\n"
+        "sys.argv = ['awa', '--database-url', 'postgres://x/y', 'serve']\n"
+        "import awa.__main__\n"
+        "try:\n"
+        "    awa.__main__.main()\n"
+        "except SystemExit as e:\n"
+        "    print(f'EXIT={e.code}')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    assert "EXIT=1" in result.stdout, f"stdout={result.stdout!r} stderr={result.stderr!r}"
+    assert "ui" in result.stderr.lower()
+
+
 @pytest.mark.parametrize(
     "group,expected_subs",
     [

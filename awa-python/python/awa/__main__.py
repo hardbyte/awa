@@ -187,6 +187,13 @@ def main() -> None:
 
 
 def _run_serve(args: argparse.Namespace) -> None:
+    if awa.serve is None:
+        print(
+            "serve is not available: this awa-pg wheel was built without the 'ui' feature. "
+            "Install a release wheel from PyPI, or rebuild with `--features cel,ui`.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
     db = _require_db(args)
     secret = args.callback_hmac_secret or os.environ.get("AWA_CALLBACK_HMAC_SECRET")
     awa.serve(
