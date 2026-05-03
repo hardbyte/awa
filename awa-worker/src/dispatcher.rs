@@ -5,7 +5,7 @@ use awa_model::JobRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
@@ -17,6 +17,36 @@ const CLAIM_BATCH_LIMIT: usize = 128;
 const MAX_CLAIMERS_PER_QUEUE: i16 = 4;
 const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
 const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);
+
+fn max_claimers_per_queue() -> i16 {
+    static MAX_CLAIMERS: OnceLock<i16> = OnceLock::new();
+    *MAX_CLAIMERS.get_or_init(|| {
+        let Ok(raw) = std::env::var("AWA_MAX_CLAIMERS_PER_QUEUE") else {
+            return MAX_CLAIMERS_PER_QUEUE;
+        };
+
+        match raw.parse::<i16>() {
+            Ok(value) if value > 0 => value,
+            Ok(value) => {
+                warn!(
+                    value,
+                    default = MAX_CLAIMERS_PER_QUEUE,
+                    "AWA_MAX_CLAIMERS_PER_QUEUE must be positive; using default"
+                );
+                MAX_CLAIMERS_PER_QUEUE
+            }
+            Err(error) => {
+                warn!(
+                    raw = %raw,
+                    %error,
+                    default = MAX_CLAIMERS_PER_QUEUE,
+                    "Failed to parse AWA_MAX_CLAIMERS_PER_QUEUE; using default"
+                );
+                MAX_CLAIMERS_PER_QUEUE
+            }
+        }
+    })
+}
 
 #[derive(Debug, Clone, Copy)]
 enum WakeReason {
@@ -577,7 +607,7 @@ impl Dispatcher {
                     self.config.deadline_duration,
                     self.config.priority_aging_interval,
                     self.runtime_instance_id,
-                    MAX_CLAIMERS_PER_QUEUE,
+                    max_claimers_per_queue(),
                     CLAIMER_LEASE_TTL,
                     CLAIMER_IDLE_THRESHOLD,
                 )
