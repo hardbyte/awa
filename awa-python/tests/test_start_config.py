@@ -634,6 +634,13 @@ async def test_queue_storage_claim_ring_knobs_validate(client):
             queue_storage_claim_slot_count=0,
         )
 
+    with pytest.raises(ValueError, match="queue_storage_queue_stripe_count must be > 0"):
+        await client.start(
+            [(queue, 1)],
+            poll_interval_ms=25,
+            queue_storage_queue_stripe_count=0,
+        )
+
     with pytest.raises(ValueError, match="queue_storage_claim_rotate_interval_ms must be > 0"):
         await client.start(
             [(queue, 1)],

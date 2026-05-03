@@ -232,10 +232,13 @@ directly and checks that no interleaving of claim / complete /
 close-receipt / rescue-receipts / ensure-running / cancel /
 rotate-leases / prune-leases / rotate-ready / prune-ready /
 rotate-claims / prune-claims transactions produces a waits-for cycle.
-Current result: 39,040 distinct states, no deadlock. A
-deliberately-broken demo config
-(`AwaStorageLockOrderDeadlockDemo.cfg`) confirms the deadlock
-detector fires when a cycle exists.
+It also models the striped producer path that updates multiple physical
+queue lanes in a stable order, while the current runtime claim path claims
+only one physical stripe per transaction. A deliberately-broken demo config
+(`AwaStorageLockOrderDeadlockDemo.cfg`) confirms the deadlock detector fires
+when a cycle exists, and `AwaStorageLockOrderOldStripedClaimDeadlock.cfg`
+captures the historical unsafe shape where one logical claim transaction
+walked multiple physical stripes in the opposite order from enqueue.
 
 Together the two specs cover complementary risks:
 - `AwaSegmentedStorageRaces` catches data-level races that would

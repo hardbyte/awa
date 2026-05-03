@@ -487,6 +487,7 @@ class Client:
         queue_storage_queue_slot_count: int = 16,
         queue_storage_lease_slot_count: int = 8,
         queue_storage_claim_slot_count: int = 8,
+        queue_storage_queue_stripe_count: int = 1,
         queue_storage_queue_rotate_interval_ms: int = 1000,
         queue_storage_lease_rotate_interval_ms: int = 50,
         queue_storage_claim_rotate_interval_ms: int | None = None,

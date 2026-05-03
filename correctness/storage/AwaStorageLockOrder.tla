@@ -58,6 +58,8 @@ EXTENDS TLC, Naturals, FiniteSets, Sequences
 
 CONSTANTS TxIds,
           Queues,
+          StripeA,
+          StripeB,
           Priorities,
           LeaseSlots,
           ReadySlots,
@@ -134,8 +136,33 @@ Resources ==
 \* A plan step is [res, mode].
 Step(res, mode) == [res |-> res, mode |-> mode]
 
+\* A small, explicit two-stripe shape for the hot logical queue case.
+\* `StripeA` / `StripeB` are physical queue names such as `queue#0`
+\* and `queue#1`. The enqueue path processes grouped physical queues
+\* in a stable order inside one transaction. Runtime claim used to
+\* visit multiple physical stripes inside one claim transaction; the
+\* Rust implementation now claims each physical stripe in its own
+\* transaction, so the main spec only starts single-stripe claim plans.
+TwoStripeQueuesOK ==
+    /\ StripeA \in Queues
+    /\ StripeB \in Queues
+    /\ StripeA # StripeB
+
 \* Transaction kind plans. Each mirrors the actual SQL in
 \* awa-model/src/queue_storage.rs as noted inline.
+
+\* insert_ready_rows_tx / insert_ready_rows_copy_tx
+\*   UPDATE queue_enqueue_heads for each grouped physical queue
+\*   INSERT / COPY ready rows
+\*   UPDATE queue_lanes for each grouped physical queue
+\*
+\* The model collapses the queue_enqueue_heads and queue_lanes rows
+\* into LaneResource, because the deadlock class we care about is
+\* multi-stripe transactions taking lane-family locks in different
+\* physical-queue orders. Enqueue keeps a stable physical-stripe order.
+EnqueueTwoStripePlan(p) ==
+    << Step(LaneResource(StripeA, p), ModeExclusive),
+       Step(LaneResource(StripeB, p), ModeExclusive) >>
 
 \* The claim CTE
 \* (`claim_runtime_batch_with_aging_for_instance` in queue_storage.rs)
@@ -165,6 +192,20 @@ ClaimLegacyPlan(q, p, readySlot, leaseSlot) ==
     << Step(LaneResource(q, p), ModeExclusive),
        Step(ReadyChildResource(readySlot), ModeShared),
        Step(LeaseChildResource(leaseSlot), ModeShared) >>
+
+\* Historical unsafe logical-queue claim shape: one transaction walked
+\* multiple physical stripes starting at a rotating probe point. This
+\* can invert the stable enqueue order and form a waits-for cycle:
+\* enqueue holds StripeA then wants StripeB while claim holds StripeB
+\* then wants StripeA. The production path no longer uses this shape;
+\* it remains in the spec only as a negative regression harness.
+OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot) ==
+    << Step(LaneResource(StripeB, p), ModeExclusive),
+       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ClaimChildResource(claimSlot), ModeShared),
+       Step(LaneResource(StripeA, p), ModeExclusive),
+       Step(ReadyChildResource(readySlot), ModeShared),
+       Step(ClaimChildResource(claimSlot), ModeShared) >>
 
 \* complete_runtime_batch receipt branch (ADR-023)
 \*   No queue_lanes lock (completion does not gate on a lane row)
@@ -299,6 +340,9 @@ Init ==
     /\ txPlan = [t \in TxIds |-> EmptyPlan]
     /\ txNextStep = [t \in TxIds |-> 0]
 
+ConfigOK ==
+    TwoStripeQueuesOK
+
 \* Does any other tx hold an incompatible lock on r wrt mode?
 Blocked(t, r, mode) ==
     \E u \in TxIds \ {t} :
@@ -339,6 +383,15 @@ StartClaimLegacy(t, q, p, readySlot, leaseSlot) ==
     /\ leaseSlot \in LeaseSlots
     /\ txState' = [txState EXCEPT ![t] = "running"]
     /\ txPlan' = [txPlan EXCEPT ![t] = ClaimLegacyPlan(q, p, readySlot, leaseSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+StartEnqueueTwoStripe(t, p) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] = EnqueueTwoStripePlan(p)]
     /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
     /\ UNCHANGED heldLocks
 
@@ -495,6 +548,7 @@ Recycle(t) ==
 Stutter == /\ UNCHANGED vars
 
 Next ==
+    \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
     \/ \E t \in TxIds, q \in Queues, p \in Priorities,
          rs \in ReadySlots, cs \in ClaimSlots :
           StartClaimReceipts(t, q, p, rs, cs)
@@ -524,7 +578,7 @@ Next ==
     \/ \E t \in TxIds : Recycle(t)
     \/ Stutter
 
-Spec == Init /\ [][Next]_vars
+Spec == ConfigOK /\ Init /\ [][Next]_vars
 
 \* ---- Sanity check for the deadlock detector ----
 \*
@@ -566,11 +620,47 @@ NextDeadlockDemo ==
 
 SpecDeadlockDemo == Init /\ [][NextDeadlockDemo]_vars
 
+\* ---- Historical striped-claim deadlock harness ----
+\*
+\* This models the pre-fix shape where a single logical queue claim
+\* transaction could walk multiple physical stripes in an order opposite
+\* to the producer's stable grouped enqueue order. TLC is expected to
+\* flag NoDeadlock on this spec. If it passes, this harness no longer
+\* describes the bug class we fixed.
+
+StartOldClaimTwoStripeReceipts(t, p, readySlot, claimSlot) ==
+    /\ t \in TxIds
+    /\ txState[t] = "idle"
+    /\ p \in Priorities
+    /\ readySlot \in ReadySlots
+    /\ claimSlot \in ClaimSlots
+    /\ txState' = [txState EXCEPT ![t] = "running"]
+    /\ txPlan' = [txPlan EXCEPT ![t] =
+        OldClaimTwoStripeReceiptsPlan(p, readySlot, claimSlot)]
+    /\ txNextStep' = [txNextStep EXCEPT ![t] = 1]
+    /\ UNCHANGED heldLocks
+
+NextOldStripedClaimDeadlockDemo ==
+    \/ \E t \in TxIds, p \in Priorities : StartEnqueueTwoStripe(t, p)
+    \/ \E t \in TxIds, p \in Priorities, rs \in ReadySlots,
+         cs \in ClaimSlots :
+          StartOldClaimTwoStripeReceipts(t, p, rs, cs)
+    \/ \E t \in TxIds : AcquireNext(t)
+    \/ \E t \in TxIds : Commit(t)
+    \/ \E t \in TxIds : Recycle(t)
+    \/ Stutter
+
+SpecOldStripedClaimDeadlockDemo ==
+    ConfigOK /\ Init /\ [][NextOldStripedClaimDeadlockDemo]_vars
+
 \* ---- Invariants ----
 
 TypeOK ==
     /\ TxIds # {}
     /\ Queues # {}
+    /\ StripeA \in Queues
+    /\ StripeB \in Queues
+    /\ StripeA # StripeB
     /\ Priorities # {}
     /\ LeaseSlots # {}
     /\ ReadySlots # {}

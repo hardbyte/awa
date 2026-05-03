@@ -77,14 +77,17 @@ What is intentionally not modeled:
   locks and busy checks, not `FOR SHARE` on `lease_ring_state` — see
   `storage/MAPPING.md` for the full analysis.
 - `storage/AwaStorageLockOrder.tla` / `storage/AwaStorageLockOrder.cfg` /
-  `storage/AwaStorageLockOrderDeadlockDemo.cfg`: lock-ordering protocol
-  spec. Models each storage-engine transaction (claim, rotate-leases,
-  prune-leases, rotate-ready, prune-ready) as an ordered sequence of
-  Postgres lock acquisitions with a shared/exclusive compatibility matrix.
-  Checks `NoDeadlock` via a waits-for cycle detector. The main config
-  passes cleanly (39,040 distinct states), confirming the current
-  lock ordering is deadlock-free. The demo config uses a deliberately
-  cycle-creating plan pair to prove the detector itself works.
+  `storage/AwaStorageLockOrderDeadlockDemo.cfg` /
+  `storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg`: lock-ordering protocol
+  spec. Models each storage-engine transaction (enqueue, claim,
+  complete, close-receipt, rescue-receipts, ensure-running, cancel,
+  rotate, and prune) as an ordered sequence of Postgres lock acquisitions
+  with a shared/exclusive compatibility matrix. The striped enqueue path
+  takes multiple physical queue lanes in stable order; the current striped
+  claim path takes at most one physical stripe per transaction. Checks
+  `NoDeadlock` via a waits-for cycle detector. The demo configs use a
+  deliberately cycle-creating plan pair and the historical old striped
+  logical-claim plan to prove the detector catches real cycles.
 - `storage/AwaStorageTransition.tla` /
   `storage/AwaStorageTransition.cfg` /
   `storage/AwaStorageTransitionCurrentGate.cfg`: focused model for the
@@ -149,6 +152,7 @@ From the repository root:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
 ./correctness/run-tlc.sh storage/AwaStorageTransition.tla
 ./correctness/run-tlc.sh storage/AwaStorageTransition.tla storage/AwaStorageTransitionCurrentGate.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla

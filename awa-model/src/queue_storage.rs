@@ -5109,27 +5109,71 @@ impl QueueStorage {
             return Ok(Vec::new());
         }
 
+        let stripe_queues = self.physical_queues_for_logical(queue);
+        if stripe_queues.len() > 1 {
+            let mut claimed = Vec::new();
+            let start = self.stripe_probe_start(stripe_queues.len());
+            for offset in 0..stripe_queues.len() {
+                if claimed.len() >= max_batch as usize {
+                    break;
+                }
+                let stripe_queue = &stripe_queues[(start + offset) % stripe_queues.len()];
+                let remaining = max_batch - claimed.len() as i64;
+                match self
+                    .claim_runtime_batch_with_aging_physical(
+                        pool,
+                        stripe_queue,
+                        remaining,
+                        deadline_duration,
+                        aging_interval,
+                    )
+                    .await
+                {
+                    Ok(stripe_claims) => claimed.extend(stripe_claims),
+                    Err(err) if claimed.is_empty() => return Err(err),
+                    Err(err) => {
+                        tracing::warn!(
+                            queue = %queue,
+                            stripe_queue = %stripe_queue,
+                            claimed = claimed.len(),
+                            error = ?err,
+                            "returning already-claimed runtime jobs after striped claim error"
+                        );
+                        break;
+                    }
+                }
+            }
+            return Ok(claimed);
+        }
+
+        self.claim_runtime_batch_with_aging_physical(
+            pool,
+            &stripe_queues[0],
+            max_batch,
+            deadline_duration,
+            aging_interval,
+        )
+        .await
+    }
+
+    async fn claim_runtime_batch_with_aging_physical(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+        max_batch: i64,
+        deadline_duration: Duration,
+        aging_interval: Duration,
+    ) -> Result<Vec<ClaimedRuntimeJob>, AwaError> {
+        if max_batch <= 0 {
+            return Ok(Vec::new());
+        }
+
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut claimed = Vec::new();
-        let stripe_queues = self.physical_queues_for_logical(queue);
-        let start = self.stripe_probe_start(stripe_queues.len());
-        for offset in 0..stripe_queues.len() {
-            if claimed.len() >= max_batch as usize {
-                break;
-            }
-            let stripe_queue = &stripe_queues[(start + offset) % stripe_queues.len()];
-            let remaining = max_batch - claimed.len() as i64;
-            claimed.extend(
-                self.claim_ready_rows_tx(
-                    &mut tx,
-                    stripe_queue,
-                    remaining,
-                    deadline_duration,
-                    aging_interval,
-                )
+        claimed.extend(
+            self.claim_ready_rows_tx(&mut tx, queue, max_batch, deadline_duration, aging_interval)
                 .await?,
-            );
-        }
+        );
 
         for row in &claimed {
             self.sync_unique_claim(
@@ -5143,13 +5187,14 @@ impl QueueStorage {
             .await?;
         }
 
-        tx.commit().await.map_err(map_sqlx_error)?;
-
         let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
-        claimed
+        let claimed = claimed
             .into_iter()
             .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(claimed)
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.acquire_queue_claimer")]

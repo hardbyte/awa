@@ -415,6 +415,7 @@ await client.start(
     queue_storage_queue_slot_count=16,
     queue_storage_lease_slot_count=8,
     queue_storage_claim_slot_count=8,
+    queue_storage_queue_stripe_count=1,
     queue_storage_queue_rotate_interval_ms=1000,
     queue_storage_lease_rotate_interval_ms=50,
     queue_storage_claim_rotate_interval_ms=1000,
@@ -428,7 +429,7 @@ await client.start(
 | `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
-| `queue_stripe_count` | `1` | Rust `QueueStorageConfig` only in the current API. Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current release-shape candidate; higher values should be benchmarked before use. |
+| `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current release-shape candidate; higher values should be benchmarked before use. |
 | `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |

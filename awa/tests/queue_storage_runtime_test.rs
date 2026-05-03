@@ -3898,6 +3898,61 @@ async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_striped_runtime_claims_do_not_deadlock_with_enqueues() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(20).await;
+    let queue = "qs_striped_claim_enqueue";
+    let schema = "awa_qs_striped_claim_enqueue";
+    let config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 2,
+        ..Default::default()
+    };
+    let store = Arc::new(create_store_with_config(&pool, config).await);
+
+    let producer_pool = pool.clone();
+    let producer_store = Arc::clone(&store);
+    let producer = tokio::spawn(async move {
+        for _ in 0..64 {
+            producer_store
+                .enqueue_batch(&producer_pool, queue, 1, 16)
+                .await
+                .expect("striped enqueue should not deadlock");
+            tokio::task::yield_now().await;
+        }
+    });
+
+    let claimer_pool = pool.clone();
+    let claimer_store = Arc::clone(&store);
+    let claimer = tokio::spawn(async move {
+        let mut claimed_total = 0usize;
+        for _ in 0..128 {
+            let claimed = claimer_store
+                .claim_runtime_batch(&claimer_pool, queue, 8, Duration::ZERO)
+                .await
+                .expect("striped runtime claim should not deadlock");
+            claimed_total += claimed.len();
+            tokio::task::yield_now().await;
+        }
+        claimed_total
+    });
+
+    let (_producer_done, claimed_total) = tokio::time::timeout(Duration::from_secs(20), async {
+        tokio::try_join!(producer, claimer)
+    })
+    .await
+    .expect("striped enqueue/claim workload timed out")
+    .expect("striped enqueue/claim task panicked");
+
+    assert!(
+        claimed_total > 0,
+        "expected concurrent striped runtime claims to claim at least one job"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_claim_runtime_does_not_wait_for_lease_rotation_lock() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
