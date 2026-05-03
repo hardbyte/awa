@@ -5163,13 +5163,27 @@ impl QueueStorage {
         }
 
         let use_lease_claim_receipts = self.use_lease_claim_receipts_for_runtime(deadline_duration);
-        let claimed = claimed
+        if !use_lease_claim_receipts && deadline_duration.is_zero() {
+            // Legacy zero-deadline claims have no heartbeat/deadline rescue
+            // timestamp, so a post-commit conversion error would strand the
+            // materialized lease indefinitely. Keep the old rollback semantics
+            // for that path.
+            let claimed = claimed
+                .into_iter()
+                .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
+                .collect::<Result<Vec<_>, _>>()?;
+            tx.commit().await.map_err(map_sqlx_error)?;
+            return Ok(claimed);
+        }
+
+        // Release claim locks before doing Rust-side payload conversion; this
+        // keeps the hot claim transaction focused on database state changes.
+        tx.commit().await.map_err(map_sqlx_error)?;
+
+        claimed
             .into_iter()
             .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(claimed)
+            .collect()
     }
 
     #[tracing::instrument(skip(self, pool), fields(queue = %queue, instance_id = %instance_id), name = "queue_storage.acquire_queue_claimer")]

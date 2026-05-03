@@ -1705,6 +1705,59 @@ async fn test_lease_claim_rotation_isolation() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_legacy_zero_deadline_claim_rollback";
+    let queue = "qs_legacy_zero_deadline_claim_rollback";
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.ready_entries SET payload = '{{\"metadata\":\"bad\"}}'::jsonb WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .expect("corrupt ready payload");
+
+    store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect_err("corrupt payload should fail runtime conversion");
+    assert_eq!(
+        lease_count(&pool, &store).await,
+        0,
+        "failed conversion must not leave an unrescueable legacy zero-deadline lease"
+    );
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.ready_entries SET payload = '{{}}'::jsonb WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .expect("repair ready payload");
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim should remain available after conversion rollback");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+}
+
 /// Receipt-plane partition-migration test (see ADR-023). Start from
 /// a schema that still has the legacy regular (non-partitioned)
 /// `lease_claims` + `lease_claim_closures`, seed some rows in them,
