@@ -80,7 +80,7 @@ impl CapacityWakeState {
         self.recheck_on_capacity = true;
     }
 
-    fn record_claim_result(&mut self, claimed: usize, _batch_size: usize, _unused_permits: usize) {
+    fn record_claim_result(&mut self, claimed: usize) {
         // A non-empty claim is enough evidence that capacity release may
         // expose more ready work. Empty claims proved the opposite and should
         // suppress completion-driven rechecks until another signal arrives.
@@ -743,8 +743,7 @@ impl Dispatcher {
             self.metrics
                 .record_dispatch_unused_permits(&self.queue, unused_permits as u64);
         }
-        self.capacity_wake_state
-            .record_claim_result(jobs.len(), batch_size, unused_permits);
+        self.capacity_wake_state.record_claim_result(jobs.len());
 
         // Phase 5: Clear overflow demand if no jobs found
         if jobs.is_empty() {
@@ -805,17 +804,17 @@ mod tests {
     fn capacity_wake_state_rechecks_after_full_capacity_claim() {
         let mut state = CapacityWakeState::default();
 
-        state.record_claim_result(4, 4, 0);
+        state.record_claim_result(4);
 
         assert!(state.should_drain_on_capacity());
     }
 
     #[test]
-    fn capacity_wake_state_skips_after_empty_or_partial_claim() {
+    fn capacity_wake_state_skips_after_empty_claim() {
         let mut state = CapacityWakeState::default();
 
         state.mark_wake_deferred_for_capacity();
-        state.record_claim_result(0, 4, 4);
+        state.record_claim_result(0);
         assert!(!state.should_drain_on_capacity());
     }
 
@@ -824,7 +823,7 @@ mod tests {
         let mut state = CapacityWakeState::default();
 
         state.mark_wake_deferred_for_capacity();
-        state.record_claim_result(2, 4, 2);
+        state.record_claim_result(2);
         assert!(state.should_drain_on_capacity());
     }
 
