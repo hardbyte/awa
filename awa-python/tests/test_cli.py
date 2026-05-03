@@ -72,16 +72,12 @@ def test_awa_import_survives_without_native_serve():
     We simulate it in a subprocess so the running test process keeps its
     real `awa.serve` available."""
     code = (
-        "import sys, types\n"
-        # Strip any pre-cached awa imports so __init__.py runs again.
-        "for k in list(sys.modules):\n"
-        "    if k == 'awa' or k.startswith('awa.'):\n"
-        "        del sys.modules[k]\n"
-        # Import the native module first, drop `serve`, then import `awa`.
+        "import sys\n"
+        # Import the native module first so we can strip `serve` from it,
+        # then drop the parent `awa` package so its __init__ re-runs and
+        # observes the missing symbol.
         "import awa._awa as native\n"
-        "native.serve = None  # easiest cross-pyo3-version 'remove' that the\n"
-        "                     # try/except in awa/__init__.py treats as missing\n"
-        "if hasattr(native, 'serve') and native.serve is not None:\n"
+        "if hasattr(native, 'serve'):\n"
         "    del native.serve\n"
         "for k in list(sys.modules):\n"
         "    if k == 'awa' or (k.startswith('awa.') and k != 'awa._awa'):\n"
