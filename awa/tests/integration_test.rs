@@ -9,7 +9,7 @@ use awa::{
 };
 use awa_testing::{TestClient, WorkResult};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::PgPoolOptions;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use std::sync::OnceLock;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -528,6 +528,68 @@ async fn test_admin_cancel() {
 
     let cancelled = client.get_job(job.id).await.unwrap();
     assert_eq!(cancelled.state, JobState::Cancelled);
+}
+
+#[tokio::test]
+async fn test_admin_cancel_by_unique_key_emits_canonical_running_cancel_notification() {
+    let _guard = test_lock().lock().await;
+    let client = setup_with_connections(4).await;
+    let queue = "integ_cancel_by_unique_key_notify";
+    awa_testing::setup::reset_runtime_backend(client.pool()).await;
+    clean_queue(client.pool(), queue).await;
+
+    let mut listener = PgListener::connect_with(client.pool()).await.unwrap();
+    listener.listen("awa:cancel").await.unwrap();
+
+    let args = SendEmail {
+        to: "cancel-by-key-running@example.com".into(),
+        subject: "Cancel running by key".into(),
+    };
+    let job = insert_with(
+        client.pool(),
+        &args,
+        InsertOpts {
+            queue: queue.into(),
+            unique: Some(UniqueOpts {
+                by_queue: true,
+                by_args: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(
+        "UPDATE awa.jobs \
+         SET state = 'running', attempt = 1, run_lease = 42, attempted_at = now(), heartbeat_at = now() \
+         WHERE id = $1",
+    )
+    .bind(job.id)
+    .execute(client.pool())
+    .await
+    .unwrap();
+
+    let cancelled = admin::cancel_by_unique_key(
+        client.pool(),
+        SendEmail::kind(),
+        Some(queue),
+        Some(&serde_json::to_value(&args).unwrap()),
+        None,
+    )
+    .await
+    .unwrap()
+    .expect("running job should be cancelled by unique key");
+    assert_eq!(cancelled.id, job.id);
+
+    let notification = tokio::time::timeout(Duration::from_secs(3), listener.recv())
+        .await
+        .expect("cancel notification should be emitted")
+        .expect("cancel listener should receive notification");
+    let payload: serde_json::Value = serde_json::from_str(notification.payload()).unwrap();
+    assert_eq!(payload["job_id"].as_i64(), Some(job.id));
+    assert_eq!(payload["run_lease"].as_i64(), Some(42));
 }
 
 #[tokio::test]

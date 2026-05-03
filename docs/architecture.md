@@ -193,8 +193,9 @@ stateDiagram-v2
 - DLQ is opt-in per queue. It is stored in `dlq_entries`; it is not a
   dispatchable `job_state`.
 - Cancellation is cooperative for live handlers. Runtime-driven shutdown,
-  stale-heartbeat rescue, and deadline rescue signal the local in-memory
-  cancellation flag when the rescuing process still has that handler registered.
+  admin cancel, stale-heartbeat rescue, and deadline rescue signal the local
+  in-memory cancellation flag when the process still has that handler
+  registered.
   A process that has panicked has no live handler left to signal; storage rescue
   and the `run_lease` guard are what let another worker recover the attempt.
 
@@ -858,17 +859,18 @@ Cancellation is cooperative:
 
 - Rust handlers observe `ctx.is_cancelled()`.
 - Python handlers observe `job.is_cancelled()`.
-- Shutdown and runtime rescue paths set that in-memory flag so long-running
-  handlers can notice cancellation and exit gracefully.
+- Shutdown, admin cancel, and runtime rescue paths set that in-memory flag so
+  long-running handlers can notice cancellation and exit gracefully.
 
-That is distinct from **admin cancellation**:
+Admin cancellation has both a storage effect and, for live local attempts, a
+handler-visible cooperative signal:
 
 - `admin::cancel(...)` / `client.cancel(...)` transitions the job row to
   `cancelled` in storage.
 - Pending and `waiting_external` jobs cancel immediately.
-- Running jobs are also cancelled in storage, but that storage transition does
-  not currently imply that the in-memory handler cancellation flag has been
-  signalled.
+- Running jobs are also cancelled in storage, and the worker runtime listens
+  for that cancellation so the matching `(job_id, run_lease)` handler sees
+  `ctx.is_cancelled()` / `job.is_cancelled()`.
 - If a running handler continues after an admin cancel, its later
   completion/retry/cancel result is treated as stale and ignored.
 

@@ -30,6 +30,7 @@ All tests are automated and run in CI.
 | B4 | Heartbeat alive during shutdown drain | ✓ | |
 | B5 | Deadline rescue signals ctx.is_cancelled() | ✓ | |
 | B6 | UniqueConflict.constraint field | ✓ | |
+| B7 | Admin cancel signals in-flight handler cancellation | ✓ | ✓ |
 | T75 | Priority aging maintenance task promotes long-waiting low-priority jobs | ✓ | |
 
 ### Uniqueness (Python)

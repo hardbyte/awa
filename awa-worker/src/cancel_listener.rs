@@ -23,6 +23,7 @@ use serde::Deserialize;
 use sqlx::postgres::PgListener;
 use sqlx::PgPool;
 use std::sync::atomic::Ordering;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
@@ -49,7 +50,7 @@ impl CancelListener {
         }
     }
 
-    pub async fn run(self) {
+    pub async fn spawn(self) -> Option<JoinHandle<()>> {
         let mut listener = match PgListener::connect_with(&self.pool).await {
             Ok(listener) => listener,
             Err(err) => {
@@ -58,7 +59,7 @@ impl CancelListener {
                     "Failed to create PG listener for admin cancel; admin cancels will \
                      only take effect via heartbeat/deadline rescue"
                 );
-                return;
+                return None;
             }
         };
 
@@ -69,11 +70,16 @@ impl CancelListener {
                 "Failed to LISTEN on cancel channel; admin cancels will only take \
                  effect via heartbeat/deadline rescue"
             );
-            return;
+            return None;
         }
 
         debug!(channel = CANCEL_CHANNEL, "Cancel listener started");
+        Some(tokio::spawn(async move {
+            self.run(listener).await;
+        }))
+    }
 
+    async fn run(self, mut listener: PgListener) {
         loop {
             tokio::select! {
                 _ = self.cancel.cancelled() => {

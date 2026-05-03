@@ -218,9 +218,9 @@ class AsyncClient:
         """Cancel a job.
 
         Pending/waiting jobs transition to ``cancelled`` immediately.
-        Running jobs are also cancelled in storage, but handler-visible
-        ``job.is_cancelled()`` is primarily driven by shutdown/rescue signals,
-        not by admin cancel alone.
+        Running jobs are cancelled in storage and, if the exact attempt is
+        still in-flight on a worker process, the handler can observe
+        ``job.is_cancelled()`` and exit cooperatively.
         """
         return await self._raw.cancel(job_id)
 
@@ -861,9 +861,9 @@ class Client:
         """Cancel a job.
 
         Pending/waiting jobs transition to ``cancelled`` immediately.
-        Running jobs are also cancelled in storage, but handler-visible
-        ``job.is_cancelled()`` is primarily driven by shutdown/rescue signals,
-        not by admin cancel alone.
+        Running jobs are cancelled in storage and, if the exact attempt is
+        still in-flight on a worker process, the handler can observe
+        ``job.is_cancelled()`` and exit cooperatively.
         """
         return self._raw.cancel_sync(job_id)
 

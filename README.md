@@ -281,9 +281,11 @@ Cancellation is cooperative for running handlers:
 - Rust handlers can poll `ctx.is_cancelled()`.
 - Python handlers can poll `job.is_cancelled()`.
 - Shutdown and runtime rescue paths flip that flag.
-- Admin cancel (`awa::admin::cancel`, `client.cancel`) always updates job state
-  in storage, but a running handler is not currently guaranteed to observe an
-  in-memory cancellation signal from admin cancel alone.
+- Admin cancel (`awa::admin::cancel`, `client.cancel`) updates job state in
+  storage and signals the matching in-flight handler, when that exact running
+  attempt is still alive on a worker process.
+- If a handler ignores the signal or returns too late, stale completion/retry
+  results remain no-ops because the job is already cancelled in storage.
 
 ## Installation
 

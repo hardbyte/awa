@@ -183,6 +183,36 @@ async def test_worker_dispatch_shutdown_signals_cancellation(client):
 
 
 @pytest.mark.asyncio
+async def test_worker_dispatch_admin_cancel_signals_cancellation(client):
+    """Admin cancel flips job.is_cancelled() for an in-flight Python handler."""
+    queue = "dispatch_admin_cancel_signal"
+    started = asyncio.Event()
+    observed = asyncio.Event()
+
+    @client.task(DispatchEmail, queue=queue)
+    async def handle(job):
+        started.set()
+        while not job.is_cancelled():
+            await asyncio.sleep(0.02)
+        observed.set()
+        return awa.Cancel(reason="admin cancel")
+
+    await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
+    job = await client.insert(
+        DispatchEmail(to="admin-cancel@test.com", subject="Signal"),
+        queue=queue,
+    )
+
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    cancelled = await client.cancel(job.id)
+    assert cancelled.state == awa.JobState.Cancelled
+    await asyncio.wait_for(observed.wait(), timeout=1.0)
+
+    stored = await client.get_job(job.id)
+    assert stored.state == awa.JobState.Cancelled
+
+
+@pytest.mark.asyncio
 async def test_worker_dispatch_health_check(client):
     """Health check reflects the Rust runtime state while workers are running."""
     queue = "dispatch_health"

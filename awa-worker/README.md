@@ -78,14 +78,14 @@ result like `JobResult::Cancel(...)`, `JobResult::RetryAfter(...)`, or
 
 There is an important distinction between:
 
-- **handler/runtime cancellation signals**
+- **handler cancellation signals**
   - the in-memory cancellation flag becomes `true`
   - the handler can observe cancellation while it is still running
 - **admin/job-state cancellation**
   - `admin::cancel(...)` / `client.cancel(...)` marks the job `cancelled` in storage
   - pending or waiting jobs transition immediately
-  - a running handler is not currently guaranteed to see its in-memory
-    cancellation flag flipped by admin cancel alone
+  - if the exact running attempt is still alive on a worker process, the
+    matching handler also sees its in-memory cancellation flag flip
 
 If a running job is cancelled in storage and the handler keeps running, its
 later completion/retry/cancel attempt is treated as stale and ignored.
