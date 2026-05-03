@@ -39,80 +39,20 @@ def test_help_lists_all_subcommands():
         assert cmd in result.stdout, f"top-level {cmd} missing from --help"
 
 
-def test_serve_help_lists_pool_and_security_flags():
-    """`serve --help` must surface the same knobs the Rust CLI does so
-    operators can swap between them without relearning."""
-    result = _cli("serve", "--help")
-    assert result.returncode == 0, result.stderr
-    for flag in (
-        "--host",
-        "--port",
-        "--pool-max",
-        "--pool-min",
-        "--cache-ttl",
-        "--callback-hmac-secret",
-        "--read-only",
-    ):
-        assert flag in result.stdout, f"serve --help missing {flag}"
+def test_serve_without_awa_binary_directs_to_extra(tmp_path, monkeypatch):
+    """Without `awa-pg[ui]` installed there's no `awa` binary on PATH and
+    no script in sys.prefix/bin; `python -m awa serve` must surface an
+    explicit "install awa-pg[ui]" message instead of a confusing
+    FileNotFoundError or "command not found"."""
+    # Force the lookup to miss every possible location.
+    fake_prefix = tmp_path / "fake-prefix"
+    (fake_prefix / "bin").mkdir(parents=True)
+    monkeypatch.setenv("PATH", str(fake_prefix / "bin"))
 
-
-def test_serve_without_db_url_errors_cleanly():
-    result = _cli("serve")
-    assert result.returncode == 1
-    assert "--database-url is required" in result.stderr
-
-
-def test_awa_import_survives_without_native_serve():
-    """Builds compiled with `--no-default-features --features cel` (which
-    awa-python's Cargo.toml documents as supported) omit `_awa.serve`. The
-    `awa` package's `__init__.py` must keep working in that case — Codex
-    P1 on PR #221: an unconditional `from awa._awa import serve` would
-    raise ImportError and make non-UI commands unusable.
-
-    We simulate it in a subprocess so the running test process keeps its
-    real `awa.serve` available."""
     code = (
         "import sys\n"
-        # Import the native module first so we can strip `serve` from it,
-        # then drop the parent `awa` package so its __init__ re-runs and
-        # observes the missing symbol.
-        "import awa._awa as native\n"
-        "if hasattr(native, 'serve'):\n"
-        "    del native.serve\n"
-        "for k in list(sys.modules):\n"
-        "    if k == 'awa' or (k.startswith('awa.') and k != 'awa._awa'):\n"
-        "        del sys.modules[k]\n"
-        "import awa\n"
-        "assert awa.serve is None, f'expected None, got {awa.serve!r}'\n"
-        "assert awa.AsyncClient is not None\n"
-        "print('OK')\n"
-    )
-    result = subprocess.run(
-        [sys.executable, "-c", code],
-        capture_output=True,
-        text=True,
-        timeout=15,
-    )
-    assert result.returncode == 0, f"stderr:\n{result.stderr}\nstdout:\n{result.stdout}"
-    assert "OK" in result.stdout
-
-
-def test_serve_command_errors_cleanly_when_native_serve_missing():
-    """Companion to the import test: even if the native `serve` is absent,
-    `python -m awa serve` must surface a deliberate explanation rather than
-    AttributeError or ImportError."""
-    code = (
-        "import sys\n"
-        "for k in list(sys.modules):\n"
-        "    if k == 'awa' or k.startswith('awa.'):\n"
-        "        del sys.modules[k]\n"
-        "import awa._awa as native\n"
-        "if hasattr(native, 'serve'):\n"
-        "    del native.serve\n"
-        "for k in list(sys.modules):\n"
-        "    if k == 'awa' or (k.startswith('awa.') and k != 'awa._awa'):\n"
-        "        del sys.modules[k]\n"
-        "sys.argv = ['awa', '--database-url', 'postgres://x/y', 'serve']\n"
+        f"sys.prefix = {str(fake_prefix)!r}\n"
+        "sys.argv = ['awa', 'serve']\n"
         "import awa.__main__\n"
         "try:\n"
         "    awa.__main__.main()\n"
@@ -124,9 +64,67 @@ def test_serve_command_errors_cleanly_when_native_serve_missing():
         capture_output=True,
         text=True,
         timeout=15,
+        env={**os.environ, "PATH": str(fake_prefix / "bin")},
     )
     assert "EXIT=1" in result.stdout, f"stdout={result.stdout!r} stderr={result.stderr!r}"
-    assert "ui" in result.stderr.lower()
+    assert "awa-pg[ui]" in result.stderr or "awa-cli" in result.stderr
+
+
+def test_serve_forwards_database_url_and_args_to_binary(tmp_path):
+    """`python -m awa --database-url X serve --port 80 --read-only` must
+    execute the bundled binary with the same flags verbatim. We stand up
+    a fake `awa` binary that records its argv, then assert the forwarded
+    command line."""
+    fake_bin_dir = tmp_path / "bin"
+    fake_bin_dir.mkdir()
+    fake_awa = fake_bin_dir / "awa"
+    log_path = tmp_path / "argv.log"
+    fake_awa.write_text(
+        f"#!{sys.executable}\n"
+        f"import sys\n"
+        f"open({str(log_path)!r}, 'w').write('\\n'.join(sys.argv[1:]))\n"
+    )
+    fake_awa.chmod(0o755)
+
+    code = (
+        "import sys\n"
+        f"sys.prefix = {str(tmp_path)!r}\n"
+        "sys.argv = ['awa', '--database-url', 'postgres://x/y',\n"
+        "            'serve', '--port', '80', '--read-only']\n"
+        "import awa.__main__\n"
+        "try:\n"
+        "    awa.__main__.main()\n"
+        "except SystemExit:\n"
+        "    pass\n"
+    )
+    subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True,
+        text=True,
+        timeout=15,
+        env={**os.environ, "PATH": str(fake_bin_dir)},
+    )
+
+    forwarded = log_path.read_text().splitlines()
+    # We forward the full original tail (incl. the leading --database-url)
+    # so clap sees it exactly as if the user had run `awa` directly.
+    assert forwarded == [
+        "--database-url",
+        "postgres://x/y",
+        "serve",
+        "--port",
+        "80",
+        "--read-only",
+    ], forwarded
+
+
+def test_serve_top_level_help_does_not_delegate():
+    """`python -m awa --help` should print our own help, not exec the
+    binary. Regression for the early-detection branch's edge cases."""
+    result = _cli("--help")
+    assert result.returncode == 0
+    assert "Awa job queue CLI" in result.stdout
+    assert "serve" in result.stdout
 
 
 @pytest.mark.parametrize(

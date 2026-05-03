@@ -25,15 +25,13 @@ classifiers = [
     "Framework :: AsyncIO",
 ]
 [project.optional-dependencies]
-# Pulls in the standalone `awa` Rust binary as a transitive wheel.
+# Adds the `awa-cli` wheel which ships the Rust `awa` binary plus the
+# embedded React dashboard. With this extra, `python -m awa serve`
+# delegates to the `awa serve` binary (and `awa serve` is also available
+# directly on PATH).
 #
-# `awa-pg` already serves the dashboard in-process via `python -m awa serve`
-# (the `_awa` extension embeds the same axum server), so this extra is only
-# needed for users who want the canonical `awa` binary on PATH — for example
-# scripts that call `awa serve` directly without going through Python, or
-# parity with the Rust crate release. NOTE: installing this extra registers
-# a second `awa` console script that may shadow the awa-pg one depending on
-# install order; prefer `python -m awa` to avoid ambiguity.
+# Kept opt-in so the default `awa-pg` install stays small — workers and
+# producers don't need the ~10 MB UI bundle.
 ui = ["awa-cli==0.6.0-alpha.4"]
 
 [project.urls]

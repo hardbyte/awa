@@ -12,7 +12,10 @@ import argparse
 import asyncio
 import datetime as dt
 import os
+import shutil
+import subprocess
 import sys
+from pathlib import Path
 
 import awa
 
@@ -48,6 +51,15 @@ def _iso_datetime(raw: str) -> dt.datetime:
 
 
 def main() -> None:
+    # `serve` delegates to the awa-cli binary verbatim. We detect it before
+    # argparse so its --flags don't get rejected as unknown arguments
+    # (argparse's REMAINDER has long-standing bugs around ---prefixed
+    # tokens after a subparser).
+    serve_argv = _split_serve_argv(sys.argv[1:])
+    if serve_argv is not None:
+        _run_serve(serve_argv)
+        return
+
     parser = argparse.ArgumentParser(prog="awa", description="Awa job queue CLI")
     _add_database_url(parser)
     sub = parser.add_subparsers(dest="command")
@@ -138,24 +150,12 @@ def main() -> None:
     # guardrails. Use the Rust CLI until dedicated Python subcommands land.
 
     # serve ---------------------------------------------------------------
-    p_serve = sub.add_parser("serve", help="Run the awa-ui dashboard (in-process)")
-    p_serve.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
-    p_serve.add_argument("--port", type=int, default=3000, help="Port to listen on (default: 3000)")
-    p_serve.add_argument("--pool-max", type=int, default=10, help="Max DB connections")
-    p_serve.add_argument("--pool-min", type=int, default=2, help="Min idle DB connections")
-    p_serve.add_argument("--pool-idle-timeout", type=int, default=300, help="Seconds before an idle connection is closed")
-    p_serve.add_argument("--pool-max-lifetime", type=int, default=1800, help="Max lifetime of a connection (seconds)")
-    p_serve.add_argument("--pool-acquire-timeout", type=int, default=10, help="Seconds to wait when acquiring a connection")
-    p_serve.add_argument("--cache-ttl", type=int, default=5, help="Cache TTL for dashboard queries (seconds)")
-    p_serve.add_argument(
-        "--callback-hmac-secret",
-        default=None,
-        help="Hex-encoded 32-byte key for verifying callback signatures (also AWA_CALLBACK_HMAC_SECRET)",
-    )
-    p_serve.add_argument(
-        "--read-only",
-        action="store_true",
-        help="Force read-only mode regardless of DB privilege",
+    # `serve` is intercepted before argparse runs (see above). Register a
+    # placeholder so it shows up in `python -m awa --help`.
+    sub.add_parser(
+        "serve",
+        help="Run the awa-ui dashboard (requires `pip install awa-pg[ui]`)",
+        add_help=False,
     )
 
     args = parser.parse_args()
@@ -179,36 +179,73 @@ def main() -> None:
             )
             sys.exit(1)
 
-    if args.command == "serve":
-        _run_serve(args)
-        return
-
     asyncio.run(_dispatch(args))
 
 
-def _run_serve(args: argparse.Namespace) -> None:
-    if awa.serve is None:
+def _split_serve_argv(argv: list[str]) -> list[str] | None:
+    """Walk `argv` past the top-level `--database-url ...` (if present) and
+    return the verbatim tail to forward to `awa serve` when the next
+    positional is `serve`. Returns None if `serve` is not the chosen
+    subcommand."""
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            return None
+        if token in {"-h", "--help"}:
+            return None
+        if token == "--database-url" and i + 1 < len(argv):
+            i += 2
+            continue
+        if token.startswith("--database-url="):
+            i += 1
+            continue
+        if token == "serve":
+            return argv  # forward the entire tail, including any pre-serve --database-url
+        return None
+    return None
+
+
+def _run_serve(forwarded_argv: list[str]) -> None:
+    binary = _find_awa_binary()
+    if binary is None:
         print(
-            "serve is not available: this awa-pg wheel was built without the 'ui' feature. "
-            "Install a release wheel from PyPI, or rebuild with `--features cel,ui`.",
+            "`awa serve` requires the awa-cli binary, which ships the dashboard\n"
+            "and React bundle. Install it with:\n"
+            "\n"
+            "    pip install 'awa-pg[ui]'\n"
+            "\n"
+            "Or, if you only need the CLI without the SDK, `pip install awa-cli`.",
             file=sys.stderr,
         )
         sys.exit(1)
-    db = _require_db(args)
-    secret = args.callback_hmac_secret or os.environ.get("AWA_CALLBACK_HMAC_SECRET")
-    awa.serve(
-        db,
-        host=args.host,
-        port=args.port,
-        pool_max=args.pool_max,
-        pool_min=args.pool_min,
-        pool_idle_timeout=args.pool_idle_timeout,
-        pool_max_lifetime=args.pool_max_lifetime,
-        pool_acquire_timeout=args.pool_acquire_timeout,
-        cache_ttl=args.cache_ttl,
-        callback_hmac_secret=secret,
-        read_only=args.read_only,
-    )
+
+    # Forward stdio + signals; Ctrl+C reaches the child's tokio runtime
+    # cleanly without us needing explicit handlers.
+    result = subprocess.run([str(binary), *forwarded_argv])
+    sys.exit(result.returncode)
+
+
+def _find_awa_binary() -> Path | None:
+    """Locate the awa-cli wheel's `awa` executable.
+
+    Prefers the current interpreter's script directory (where the [ui]
+    extra install lands) so we don't accidentally exec a stale binary
+    from PATH that targets a different awa version.
+    """
+    script_dirs = [Path(sys.prefix) / "bin", Path(sys.prefix) / "Scripts"]
+    for d in script_dirs:
+        for candidate in (d / "awa", d / "awa.exe"):
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate
+    # Last-resort PATH lookup. Skip if it resolves back to this Python entry
+    # point (would be a recursion if awa-pg ever registers an `awa` script).
+    found = shutil.which("awa")
+    if found:
+        resolved = Path(found).resolve()
+        if resolved.suffix not in {".py"}:
+            return resolved
+    return None
 
 
 async def _dispatch(args: argparse.Namespace) -> None:

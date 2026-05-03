@@ -8,7 +8,8 @@ schedules, and serve the web admin UI.
 ## Install
 
 The CLI is shipped as both a Rust binary and a Python wheel. Either
-distribution gives you the same `awa` executable.
+distribution gives you the same `awa` executable, including the
+embedded React admin dashboard for `awa serve`.
 
 ```bash
 # Python (no Rust toolchain needed)
@@ -17,6 +18,16 @@ pip install awa-cli
 # Rust
 cargo install awa-cli
 ```
+
+If you're already using the [`awa-pg`](https://pypi.org/project/awa-pg/)
+Python SDK, install both with one command:
+
+```bash
+pip install 'awa-pg[ui]'
+```
+
+That pulls in `awa-cli` as a dependency so `python -m awa serve` works
+end-to-end alongside the worker SDK.
 
 ## Quick start
 

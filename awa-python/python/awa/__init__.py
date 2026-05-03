@@ -44,14 +44,6 @@ from awa._awa import (
 
 from awa.client import AsyncClient, Client
 
-# `serve` is gated by the Rust `ui` feature. Source builds compiled with
-# `--no-default-features --features cel` omit it, so the import has to be
-# optional or `import awa` blows up before the worker SDK is reachable.
-try:
-    from awa._awa import serve  # noqa: F401
-except ImportError:
-    serve = None  # type: ignore[assignment]
-
 __all__ = [
     # Clients
     "Client",
@@ -84,8 +76,6 @@ __all__ = [
     "current_migration_version",
     "init_telemetry",
     "shutdown_telemetry",
-    # Web UI server
-    "serve",
     # Exceptions
     "AwaError",
     "UniqueConflict",

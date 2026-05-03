@@ -651,20 +651,6 @@ def init_telemetry(
     export_interval_ms: int = 5000,
 ) -> bool: ...
 def shutdown_telemetry() -> None: ...
-def serve(
-    database_url: str,
-    *,
-    host: str = "127.0.0.1",
-    port: int = 3000,
-    pool_max: int = 10,
-    pool_min: int = 2,
-    pool_idle_timeout: int = 300,
-    pool_max_lifetime: int = 1800,
-    pool_acquire_timeout: int = 10,
-    cache_ttl: int = 5,
-    callback_hmac_secret: str | None = None,
-    read_only: bool = False,
-) -> None: ...
 
 # Exceptions
 class AwaError(Exception): ...
