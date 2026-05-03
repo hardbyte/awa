@@ -30,6 +30,8 @@ from awa._awa import (
     current_migration_version,
     init_telemetry,
     shutdown_telemetry,
+    # Web UI server
+    serve,
     # Exceptions
     AwaError,
     UniqueConflict,
@@ -76,6 +78,8 @@ __all__ = [
     "current_migration_version",
     "init_telemetry",
     "shutdown_telemetry",
+    # Web UI server
+    "serve",
     # Exceptions
     "AwaError",
     "UniqueConflict",

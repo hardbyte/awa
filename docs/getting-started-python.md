@@ -31,13 +31,13 @@ export DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 python -m venv .venv
 source .venv/bin/activate
 
-pip install awa-pg awa-cli
+pip install awa-pg
 ```
 
 ## 2. Run Migrations
 
 ```bash
-awa --database-url "$DATABASE_URL" migrate
+python -m awa --database-url "$DATABASE_URL" migrate
 ```
 
 ## 3. Create a Worker
@@ -101,16 +101,16 @@ job 1 state = JobState.Completed
 ## 5. Inspect the Queue
 
 ```bash
-awa --database-url "$DATABASE_URL" job list --queue email
-awa --database-url "$DATABASE_URL" job dump 1
-awa --database-url "$DATABASE_URL" job dump-run 1
-awa --database-url "$DATABASE_URL" queue stats
-awa --database-url "$DATABASE_URL" serve
+python -m awa --database-url "$DATABASE_URL" job list --queue email
+python -m awa --database-url "$DATABASE_URL" job dump 1
+python -m awa --database-url "$DATABASE_URL" job dump-run 1
+python -m awa --database-url "$DATABASE_URL" queue stats
+python -m awa --database-url "$DATABASE_URL" serve
 ```
 
 `job dump` gives you the whole job snapshot as JSON. `job dump-run` focuses on one attempt: the current attempt uses live row data, while historical attempts are reconstructed from the stored `errors[]` history.
 
-The UI starts on `http://127.0.0.1:3000` by default.
+The UI starts on `http://127.0.0.1:3000` by default. The dashboard is bundled into the `awa-pg` wheel — no separate install or Rust toolchain is needed. (If you prefer the standalone Rust binary on PATH, install the optional extra: `pip install awa-pg[ui]`, which pulls in the `awa-cli` wheel.)
 
 ## Useful Variants
 

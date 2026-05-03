@@ -54,8 +54,9 @@ codebases that aren't async-first.
   rate limits, deadlines, retry/backoff, cron, dead-letter queue.
 - **Progress tracking** — handlers can write structured progress that
   survives across retries.
-- **Web UI** — `awa serve` (or `awa-cli`) gives you a live dashboard for
-  the running queue, including DLQ inspection and retry controls.
+- **Web UI** — `python -m awa serve` runs the bundled dashboard in-process
+  (no Rust toolchain needed) for live queue inspection, DLQ triage, and
+  retry controls.
 
 ## Migrations
 

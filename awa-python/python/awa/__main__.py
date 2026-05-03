@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import datetime as dt
+import os
 import sys
 
 import awa
@@ -136,6 +137,27 @@ def main() -> None:
     # deferred — they mutate production routing and deserve explicit safety
     # guardrails. Use the Rust CLI until dedicated Python subcommands land.
 
+    # serve ---------------------------------------------------------------
+    p_serve = sub.add_parser("serve", help="Run the awa-ui dashboard (in-process)")
+    p_serve.add_argument("--host", default="127.0.0.1", help="Host to bind to (default: 127.0.0.1)")
+    p_serve.add_argument("--port", type=int, default=3000, help="Port to listen on (default: 3000)")
+    p_serve.add_argument("--pool-max", type=int, default=10, help="Max DB connections")
+    p_serve.add_argument("--pool-min", type=int, default=2, help="Min idle DB connections")
+    p_serve.add_argument("--pool-idle-timeout", type=int, default=300, help="Seconds before an idle connection is closed")
+    p_serve.add_argument("--pool-max-lifetime", type=int, default=1800, help="Max lifetime of a connection (seconds)")
+    p_serve.add_argument("--pool-acquire-timeout", type=int, default=10, help="Seconds to wait when acquiring a connection")
+    p_serve.add_argument("--cache-ttl", type=int, default=5, help="Cache TTL for dashboard queries (seconds)")
+    p_serve.add_argument(
+        "--callback-hmac-secret",
+        default=None,
+        help="Hex-encoded 32-byte key for verifying callback signatures (also AWA_CALLBACK_HMAC_SECRET)",
+    )
+    p_serve.add_argument(
+        "--read-only",
+        action="store_true",
+        help="Force read-only mode regardless of DB privilege",
+    )
+
     args = parser.parse_args()
     if not args.command:
         parser.print_help()
@@ -157,7 +179,29 @@ def main() -> None:
             )
             sys.exit(1)
 
+    if args.command == "serve":
+        _run_serve(args)
+        return
+
     asyncio.run(_dispatch(args))
+
+
+def _run_serve(args: argparse.Namespace) -> None:
+    db = _require_db(args)
+    secret = args.callback_hmac_secret or os.environ.get("AWA_CALLBACK_HMAC_SECRET")
+    awa.serve(
+        db,
+        host=args.host,
+        port=args.port,
+        pool_max=args.pool_max,
+        pool_min=args.pool_min,
+        pool_idle_timeout=args.pool_idle_timeout,
+        pool_max_lifetime=args.pool_max_lifetime,
+        pool_acquire_timeout=args.pool_acquire_timeout,
+        cache_ttl=args.cache_ttl,
+        callback_hmac_secret=secret,
+        read_only=args.read_only,
+    )
 
 
 async def _dispatch(args: argparse.Namespace) -> None:

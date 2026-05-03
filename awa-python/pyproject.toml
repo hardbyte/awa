@@ -24,6 +24,18 @@ classifiers = [
     "Topic :: System :: Distributed Computing",
     "Framework :: AsyncIO",
 ]
+[project.optional-dependencies]
+# Pulls in the standalone `awa` Rust binary as a transitive wheel.
+#
+# `awa-pg` already serves the dashboard in-process via `python -m awa serve`
+# (the `_awa` extension embeds the same axum server), so this extra is only
+# needed for users who want the canonical `awa` binary on PATH — for example
+# scripts that call `awa serve` directly without going through Python, or
+# parity with the Rust crate release. NOTE: installing this extra registers
+# a second `awa` console script that may shadow the awa-pg one depending on
+# install order; prefer `python -m awa` to avoid ambiguity.
+ui = ["awa-cli==0.6.0-alpha.4"]
+
 [project.urls]
 Homepage = "https://github.com/hardbyte/awa"
 Repository = "https://github.com/hardbyte/awa"

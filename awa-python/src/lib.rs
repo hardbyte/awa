@@ -3,6 +3,8 @@ mod client;
 mod dlq;
 mod errors;
 mod job;
+#[cfg(feature = "ui")]
+mod serve;
 mod telemetry;
 mod transaction;
 mod worker;
@@ -103,6 +105,8 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(current_migration_version, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::init_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::shutdown_telemetry, m)?)?;
+    #[cfg(feature = "ui")]
+    m.add_function(wrap_pyfunction!(serve::serve, m)?)?;
 
     // Exceptions
     m.add("AwaError", m.py().get_type::<AwaError>())?;

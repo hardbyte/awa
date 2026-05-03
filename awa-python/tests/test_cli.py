@@ -35,8 +35,31 @@ def test_help_lists_all_subcommands():
     """Regression: argparse wiring for every subcommand stays intact."""
     result = _cli("--help")
     assert result.returncode == 0, result.stderr
-    for cmd in ("migrate", "job", "queue", "dlq", "cron", "storage"):
+    for cmd in ("migrate", "job", "queue", "dlq", "cron", "storage", "serve"):
         assert cmd in result.stdout, f"top-level {cmd} missing from --help"
+
+
+def test_serve_help_lists_pool_and_security_flags():
+    """`serve --help` must surface the same knobs the Rust CLI does so
+    operators can swap between them without relearning."""
+    result = _cli("serve", "--help")
+    assert result.returncode == 0, result.stderr
+    for flag in (
+        "--host",
+        "--port",
+        "--pool-max",
+        "--pool-min",
+        "--cache-ttl",
+        "--callback-hmac-secret",
+        "--read-only",
+    ):
+        assert flag in result.stdout, f"serve --help missing {flag}"
+
+
+def test_serve_without_db_url_errors_cleanly():
+    result = _cli("serve")
+    assert result.returncode == 1
+    assert "--database-url is required" in result.stderr
 
 
 @pytest.mark.parametrize(

@@ -54,10 +54,23 @@ jobs:
                   data = tomllib.load(f)
               return data.get("project", {}).get("version")
 
+          def ui_extra_pin(path: str) -> str | None:
+              # The `awa-pg[ui]` extra pins awa-cli to an exact version so the
+              # standalone-binary route stays in lockstep with the SDK wheel.
+              # Drift here ships a wheel that pip can't resolve.
+              with open(path, "rb") as f:
+                  data = tomllib.load(f)
+              extras = data.get("project", {}).get("optional-dependencies", {})
+              for spec in extras.get("ui", []):
+                  if spec.startswith("awa-cli=="):
+                      return spec.split("==", 1)[1]
+              return None
+
           checks = [
               ("Cargo.toml", cargo_version("Cargo.toml")),
               ("awa-python/Cargo.toml", cargo_version("awa-python/Cargo.toml")),
               ("awa-python/pyproject.toml", pyproject_version("awa-python/pyproject.toml")),
+              ("awa-python/pyproject.toml [ui] extra", ui_extra_pin("awa-python/pyproject.toml")),
           ]
 
           fail = 0
