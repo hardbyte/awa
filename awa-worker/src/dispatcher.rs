@@ -80,11 +80,11 @@ impl CapacityWakeState {
         self.recheck_on_capacity = true;
     }
 
-    fn record_claim_result(&mut self, claimed: usize, batch_size: usize, unused_permits: usize) {
-        // A capacity wake is only a useful claim signal if the previous
-        // claim filled the whole available batch. Empty or partial claims
-        // already proved that freed permits alone do not imply DB work.
-        self.recheck_on_capacity = claimed > 0 && claimed == batch_size && unused_permits == 0;
+    fn record_claim_result(&mut self, claimed: usize, _batch_size: usize, _unused_permits: usize) {
+        // A non-empty claim is enough evidence that capacity release may
+        // expose more ready work. Empty claims proved the opposite and should
+        // suppress completion-driven rechecks until another signal arrives.
+        self.recheck_on_capacity = claimed > 0;
     }
 }
 
@@ -817,10 +817,15 @@ mod tests {
         state.mark_wake_deferred_for_capacity();
         state.record_claim_result(0, 4, 4);
         assert!(!state.should_drain_on_capacity());
+    }
+
+    #[test]
+    fn capacity_wake_state_rechecks_after_partial_non_empty_claim() {
+        let mut state = CapacityWakeState::default();
 
         state.mark_wake_deferred_for_capacity();
         state.record_claim_result(2, 4, 2);
-        assert!(!state.should_drain_on_capacity());
+        assert!(state.should_drain_on_capacity());
     }
 
     #[test]
