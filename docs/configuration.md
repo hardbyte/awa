@@ -135,10 +135,16 @@ Tuple form for simple cases, dict form for full control:
 # Hard-reserved — just (name, max_workers)
 await client.start([("email", 10), ("reports", 5)])
 
-# Dict form — rate limiting, weighted mode, retention
+# Dict form — rate limiting, deadlines, priority aging, retention
 await client.start([
     {"name": "email", "max_workers": 10, "rate_limit": (50.0, 50)},
-    {"name": "reports", "max_workers": 5},
+    {
+        "name": "reports",
+        "max_workers": 5,
+        "deadline_duration_ms": 600_000,
+        "priority_aging_interval_ms": 30_000,
+        "retention": {"completed_hours": 12, "failed_hours": 168},
+    },
 ])
 ```
 
@@ -155,6 +161,26 @@ await client.start(
 ### Weighted mode
 
 Enabled by `global_max_workers(N)` (Rust) or `global_max_workers=N` (Python). Each queue's `min_workers` is guaranteed; remaining capacity is distributed by `weight`. This is useful when queue load is unpredictable and you want elastic sharing rather than static partitioning.
+
+### What can be tuned per queue vs per job
+
+Queue configuration is the normal way to express operational policy. Job
+kinds are primarily handler registrations and descriptor/catalog entries; if
+two kinds need different runtime policy, put them on different queues.
+
+| Scope | Knobs | Notes |
+|---|---|---|
+| Per queue | `max_workers`, `rate_limit`, `deadline_duration`, `priority_aging_interval`, `poll_interval`, `min_workers`, `weight` | Runtime dispatch policy. `deadline_duration` is the hard per-attempt wall-clock timeout for every job claimed from that queue. |
+| Per job enqueue | `queue`, `priority`, `max_attempts`, `run_at`, `tags`, `metadata`, `unique` | Stored with the job. Use this for routing, priority, retry budget, scheduling, identity, and operator context. |
+| Per job kind | handler registration plus `JobKindDescriptor` | Descriptors cover display name, owner, docs link, tags, and extra metadata. They do not set dispatch limits or timeouts. |
+| Per callback wait | callback `timeout` | Applies only to jobs that enter `wait_for_callback`; see [Callback timeout](#callback-timeout--bounding-wait_for_callback). |
+| Per queue / global retention and DLQ policy | `completed_retention`, `failed_retention`, `queue_retention(...)`, `dlq_enabled_by_default`, `queue_dlq_enabled`, `dlq_retention` | Retention has global defaults with per-queue overrides. DLQ enablement is queue-scoped. Split job kinds across queues if only some kinds should DLQ. |
+| Per runtime / fleet | heartbeat timings, rescue scan intervals, cleanup batch size, descriptor retention, queue-storage slots/stripes/rotation | Process or storage-engine policy, not job-kind policy. `queue_storage_queue_stripe_count` currently applies to the queue-storage engine rather than to one named queue. |
+
+There is no active per-job-kind hard timeout today. The hard timeout is the
+queue's `deadline_duration`; moving long-running kinds onto their own queue is
+the intended way to give them a different timeout without making every job on a
+busy queue slower to rescue.
 
 ## Job priority and aging
 
@@ -429,7 +455,7 @@ await client.start(
 | `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
-| `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current release-shape candidate; higher values should be benchmarked before use. |
+| `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. |
 | `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |
@@ -447,7 +473,7 @@ Use the defaults unless you have a reason not to:
 - Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers or retention keep old segments live.
 - Increase `lease_slot_count` if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.
 - Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
-- Increase `queue_stripe_count` only for measured hot logical queues where many small replicas contend on the same queue. Striping spreads that one logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused.
+- Increase `queue_stripe_count` only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue `QueueConfig` field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. The post-#215 benchmark matrix found the load-bearing step was `1 -> 2` stripes for a single very hot queue at `128-256` workers; `4` stripes mostly matched `2` except at the highest worker count.
 - Increase rotation intervals to reduce partition churn and metadata activity.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 
