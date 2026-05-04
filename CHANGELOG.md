@@ -5,6 +5,8 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+## [0.6.0-alpha.5] — 2026-05-04
+
 ### Added
 
 - **`awa-pg[ui]` optional extra** ([#186](https://github.com/hardbyte/awa/issues/186)).
@@ -17,6 +19,31 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   in `sys.prefix/{bin,Scripts}` (where `awa-cli`'s wheel installs it) and
   forwards the full argument tail verbatim. If the extra isn't installed,
   it exits with a `pip install 'awa-pg[ui]'` hint.
+
+### Fixed
+
+- **Restored queue-storage dispatcher throughput under high concurrency**
+  ([#223](https://github.com/hardbyte/awa/issues/223)). Capacity-release wakes
+  still drain ready work immediately, but the dispatcher now uses the configured
+  fixed fallback poll interval instead of geometrically backing off after empty
+  or permit-saturated polls.
+
+### Changed
+
+- Queue-storage throughput benchmarks can run against a non-canonical storage
+  schema and configurable worker count, making local A/B checks safer and
+  easier to reproduce.
+- Added TLA+ trace witnesses for receipt-only cancel, callback wait, and DLQ
+  purge paths, plus documentation alignment for the queue-storage design.
+
+## [0.6.0-alpha.4] — 2026-05-03
+
+### Changed
+
+- Added capacity-wake suppression to reduce empty claim churn in quiet queues.
+  This improved some operational churn metrics but regressed high-concurrency
+  queue-storage throughput; alpha.5 keeps the useful wake-drain repair while
+  restoring fixed fallback polling.
 
 ## [0.6.0-alpha.3] — 2026-05-02
 
