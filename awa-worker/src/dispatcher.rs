@@ -17,7 +17,6 @@ const CLAIM_BATCH_LIMIT: usize = 128;
 const MAX_CLAIMERS_PER_QUEUE: i16 = 4;
 const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
 const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);
-const MAX_FALLBACK_POLL_BACKOFF: Duration = Duration::from_secs(300);
 
 fn max_claimers_per_queue() -> i16 {
     static MAX_CLAIMERS: OnceLock<i16> = OnceLock::new();
@@ -63,61 +62,6 @@ impl WakeReason {
             WakeReason::Capacity => "capacity",
             WakeReason::Poll => "poll",
         }
-    }
-}
-
-#[derive(Debug, Default)]
-struct CapacityWakeState {
-    recheck_on_capacity: bool,
-}
-
-impl CapacityWakeState {
-    fn should_drain_on_capacity(&self) -> bool {
-        self.recheck_on_capacity
-    }
-
-    fn mark_wake_deferred_for_capacity(&mut self) {
-        self.recheck_on_capacity = true;
-    }
-
-    fn record_claim_result(&mut self, claimed: usize) {
-        // A non-empty claim is enough evidence that capacity release may
-        // expose more ready work. Empty claims proved the opposite and should
-        // suppress completion-driven rechecks until another signal arrives.
-        self.recheck_on_capacity = claimed > 0;
-    }
-}
-
-#[derive(Debug, Clone)]
-struct PollBackoff {
-    base: Duration,
-    current: Duration,
-    max: Duration,
-}
-
-impl PollBackoff {
-    fn new(base: Duration) -> Self {
-        Self {
-            base,
-            current: base,
-            max: MAX_FALLBACK_POLL_BACKOFF.max(base),
-        }
-    }
-
-    fn current_interval(&self) -> Duration {
-        self.current
-    }
-
-    fn reset(&mut self) {
-        self.current = self.base;
-    }
-
-    fn record_empty_poll(&mut self) {
-        self.current = self
-            .current
-            .checked_mul(2)
-            .unwrap_or(self.max)
-            .min(self.max);
     }
 }
 
@@ -342,8 +286,6 @@ pub struct Dispatcher {
     rate_limiter: Option<TokenBucket>,
     storage: RuntimeStorage,
     capacity_wake: Arc<Notify>,
-    capacity_wake_state: CapacityWakeState,
-    poll_backoff: PollBackoff,
 }
 
 impl Dispatcher {
@@ -365,7 +307,6 @@ impl Dispatcher {
             semaphore: Arc::new(Semaphore::new(config.max_workers as usize)),
         };
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
-        let poll_backoff = PollBackoff::new(config.poll_interval);
         Self {
             queue,
             runtime_instance_id,
@@ -381,8 +322,6 @@ impl Dispatcher {
             rate_limiter,
             storage,
             capacity_wake: Arc::new(Notify::new()),
-            capacity_wake_state: CapacityWakeState::default(),
-            poll_backoff,
         }
     }
 
@@ -403,7 +342,6 @@ impl Dispatcher {
         storage: RuntimeStorage,
     ) -> Self {
         let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
-        let poll_backoff = PollBackoff::new(config.poll_interval);
         Self {
             queue,
             runtime_instance_id,
@@ -419,8 +357,6 @@ impl Dispatcher {
             rate_limiter,
             storage,
             capacity_wake: Arc::new(Notify::new()),
-            capacity_wake_state: CapacityWakeState::default(),
-            poll_backoff,
         }
     }
 
@@ -467,7 +403,6 @@ impl Dispatcher {
                     match notification {
                         Ok(_) => {
                             debug!(queue = %self.queue, "Woken by NOTIFY");
-                            self.poll_backoff.reset();
                             self.drain_ready(WakeReason::Notify, Instant::now()).await;
                         }
                         Err(err) => {
@@ -477,11 +412,9 @@ impl Dispatcher {
                     }
                 }
                 _ = self.capacity_wake.notified() => {
-                    if self.capacity_wake_state.should_drain_on_capacity() {
-                        self.drain_ready(WakeReason::Capacity, Instant::now()).await;
-                    }
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
-                _ = tokio::time::sleep(self.poll_backoff.current_interval()) => {
+                _ = tokio::time::sleep(self.config.poll_interval) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
@@ -499,11 +432,9 @@ impl Dispatcher {
                     break;
                 }
                 _ = self.capacity_wake.notified() => {
-                    if self.capacity_wake_state.should_drain_on_capacity() {
-                        self.drain_ready(WakeReason::Capacity, Instant::now()).await;
-                    }
+                    self.drain_ready(WakeReason::Capacity, Instant::now()).await;
                 }
-                _ = tokio::time::sleep(self.poll_backoff.current_interval()) => {
+                _ = tokio::time::sleep(self.config.poll_interval) => {
                     self.drain_ready(WakeReason::Poll, Instant::now()).await;
                 }
             }
@@ -569,12 +500,6 @@ impl Dispatcher {
         // Phase 1: Pre-acquire permits (non-blocking)
         let mut permits = self.acquire_permits();
         if permits.is_empty() {
-            if let Some((reason @ (WakeReason::Notify | WakeReason::Poll), _)) = wake_context {
-                if matches!(reason, WakeReason::Poll) {
-                    self.poll_backoff.record_empty_poll();
-                }
-                self.capacity_wake_state.mark_wake_deferred_for_capacity();
-            }
             return false;
         }
         if let Some((reason, woke_at)) = wake_context {
@@ -709,7 +634,6 @@ impl Dispatcher {
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
         if !jobs.is_empty() {
-            self.poll_backoff.reset();
             self.metrics
                 .record_job_claimed(&self.queue, jobs.len() as u64);
             // Wait duration = created_at → now() (claim moment).
@@ -743,14 +667,10 @@ impl Dispatcher {
             self.metrics
                 .record_dispatch_unused_permits(&self.queue, unused_permits as u64);
         }
-        self.capacity_wake_state.record_claim_result(jobs.len());
 
         // Phase 5: Clear overflow demand if no jobs found
         if jobs.is_empty() {
             if let Some((reason, _)) = wake_context {
-                if matches!(reason, WakeReason::Poll) {
-                    self.poll_backoff.record_empty_poll();
-                }
                 self.metrics
                     .record_dispatch_empty_claim(&self.queue, reason.as_str());
             }
@@ -792,71 +712,5 @@ impl Dispatcher {
         }
 
         true
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{CapacityWakeState, PollBackoff};
-    use std::time::Duration;
-
-    #[test]
-    fn capacity_wake_state_rechecks_after_full_capacity_claim() {
-        let mut state = CapacityWakeState::default();
-
-        state.record_claim_result(4);
-
-        assert!(state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn capacity_wake_state_skips_after_empty_claim() {
-        let mut state = CapacityWakeState::default();
-
-        state.mark_wake_deferred_for_capacity();
-        state.record_claim_result(0);
-        assert!(!state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn capacity_wake_state_rechecks_after_partial_non_empty_claim() {
-        let mut state = CapacityWakeState::default();
-
-        state.mark_wake_deferred_for_capacity();
-        state.record_claim_result(2);
-        assert!(state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn capacity_wake_state_rechecks_when_wake_arrived_without_capacity() {
-        let mut state = CapacityWakeState::default();
-
-        state.mark_wake_deferred_for_capacity();
-
-        assert!(state.should_drain_on_capacity());
-    }
-
-    #[test]
-    fn poll_backoff_doubles_after_empty_poll_until_cap() {
-        let mut backoff = PollBackoff::new(Duration::from_millis(200));
-
-        backoff.record_empty_poll();
-        assert_eq!(backoff.current_interval(), Duration::from_millis(400));
-
-        for _ in 0..20 {
-            backoff.record_empty_poll();
-        }
-        assert_eq!(backoff.current_interval(), Duration::from_secs(300));
-    }
-
-    #[test]
-    fn poll_backoff_resets_after_work_signal() {
-        let mut backoff = PollBackoff::new(Duration::from_millis(200));
-
-        backoff.record_empty_poll();
-        backoff.record_empty_poll();
-        backoff.reset();
-
-        assert_eq!(backoff.current_interval(), Duration::from_millis(200));
     }
 }

@@ -2551,7 +2551,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn test_queue_storage_capacity_wake_skips_empty_claim_after_partial_drain() {
+async fn test_queue_storage_capacity_wake_drains_after_partial_drain() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let (exporter, meter_provider) = install_in_memory_metrics();
     let pool = setup_pool(10).await;
@@ -2638,9 +2638,9 @@ async fn test_queue_storage_capacity_wake_skips_empty_claim_after_partial_drain(
         "awa.dispatch.reason",
         "capacity",
     );
-    assert_eq!(
-        capacity_empty_claims, 0,
-        "partial-drain completion wake should not immediately issue an empty capacity claim"
+    assert!(
+        capacity_empty_claims > 0,
+        "partial-drain completion wake should immediately drain capacity again"
     );
 }
 
