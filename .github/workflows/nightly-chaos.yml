@@ -53,6 +53,66 @@ jobs:
           fi
           cat /tmp/tlc-trace.log
           exit 1
+      - name: AwaSegmentedStorageTrace (receipt rescue accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptRescue.cfg > /tmp/tlc-trace-rescue.log 2>&1
+          if grep -q "ReceiptRescueTraceIncomplete is violated" /tmp/tlc-trace-rescue.log; then
+            echo "receipt-rescue trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-rescue.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (running cancel accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceRunningCancel.cfg > /tmp/tlc-trace-running-cancel.log 2>&1
+          if grep -q "RunningCancelTraceIncomplete is violated" /tmp/tlc-trace-running-cancel.log; then
+            echo "running-cancel trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-running-cancel.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (receipt-only cancel accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptOnlyCancel.cfg > /tmp/tlc-trace-receipt-cancel.log 2>&1
+          if grep -q "ReceiptOnlyCancelTraceIncomplete is violated" /tmp/tlc-trace-receipt-cancel.log; then
+            echo "receipt-only-cancel trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-receipt-cancel.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (callback wait/resume accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceCallbackWait.cfg > /tmp/tlc-trace-callback-wait.log 2>&1
+          if grep -q "CallbackWaitTraceIncomplete is violated" /tmp/tlc-trace-callback-wait.log; then
+            echo "callback-wait trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-callback-wait.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (DLQ retry accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceDlqRetry.cfg > /tmp/tlc-trace-dlq-retry.log 2>&1
+          if grep -q "DlqRetryTraceIncomplete is violated" /tmp/tlc-trace-dlq-retry.log; then
+            echo "dlq-retry trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-dlq-retry.log
+          exit 1
+      - name: AwaSegmentedStorageTrace (DLQ purge accepted)
+        run: |
+          set +e
+          ./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceDlqPurge.cfg > /tmp/tlc-trace-dlq-purge.log 2>&1
+          if grep -q "DlqPurgeTraceIncomplete is violated" /tmp/tlc-trace-dlq-purge.log; then
+            echo "dlq-purge trace fully consumed (positive witness)"
+            exit 0
+          fi
+          cat /tmp/tlc-trace-dlq-purge.log
+          exit 1
       - name: AwaSegmentedStorageTrace (broken trace rejected)
         run: |
           set +e

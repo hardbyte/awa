@@ -74,6 +74,46 @@ DlqRetryTrace == <<
     [action |-> "FastComplete", worker |-> "w1", job |-> "j1"]
 >>
 
+\* Receipt-only cancel trace. Models `awa::admin::cancel` racing with a
+\* freshly-opened receipt: the claim cursor has advanced and an open
+\* receipt exists, but the lease row hasn't materialized yet. Admin
+\* cancel closes the receipt and writes a terminal_entries row so the
+\* job's lifecycle is well-defined even if the worker never finishes
+\* materializing the lease. Distinct from RunningCancel (which targets
+\* an active lease) and from receipt rescue (which targets a stale
+\* receipt left behind by a vanished worker).
+ReceiptOnlyCancelTrace == <<
+    [action |-> "EnqueueReady",                job |-> "j1"],
+    [action |-> "SeedOpenReceiptOnlyClaim",    worker |-> "w1", job |-> "j1"],
+    [action |-> "CancelReceiptOnlyToTerminal", job |-> "j1"]
+>>
+
+\* Callback wait/resume trace: claim a job, materialize attempt_state,
+\* park into waiting_external (the `WaitForCallback` return path in the
+\* Rust executor), resume the same lease via the external callback, and
+\* finish via the stateful completion path. Covers the lifecycle the
+\* SnoozeTrace doesn't reach — snooze never enters waiting_external.
+CallbackWaitTrace == <<
+    [action |-> "EnqueueReady",            job |-> "j1"],
+    [action |-> "Claim",                   worker |-> "w1", job |-> "j1"],
+    [action |-> "MaterializeAttemptState", job |-> "j1"],
+    [action |-> "ParkToWaiting",           worker |-> "w1", job |-> "j1"],
+    [action |-> "ResumeWaitingToRunning",  job |-> "j1"],
+    [action |-> "StatefulComplete",        worker |-> "w1", job |-> "j1"]
+>>
+
+\* DLQ purge trace: an executor terminal failure moves the row into
+\* dlq_entries, then an operator-initiated purge removes it. Validates
+\* that PurgeDlq fires from a real DLQ-entry state and leaves the rest
+\* of the model invariants intact. Distinct from DlqRetry which revives
+\* the row back to ready_entries.
+DlqPurgeTrace == <<
+    [action |-> "EnqueueReady", job |-> "j1"],
+    [action |-> "Claim",        worker |-> "w1", job |-> "j1"],
+    [action |-> "FailToDlq",    worker |-> "w1", job |-> "j1"],
+    [action |-> "PurgeDlq",     job |-> "j1"]
+>>
+
 \* Deliberately-broken trace: steps 3 and 4 are swapped so PromoteDeferred
 \* fires before RetryToDeferred has moved the job into the deferred
 \* family. TLC is expected to report deadlock at traceIdx = 2 when
@@ -173,6 +213,9 @@ SpecSnooze == TraceInit /\ [][TraceNextFor(SnoozeTrace)]_<<vars, traceIdx>>
 SpecReceiptRescue == TraceInit /\ [][TraceNextFor(ReceiptRescueTrace)]_<<vars, traceIdx>>
 SpecRunningCancel == TraceInit /\ [][TraceNextFor(RunningCancelTrace)]_<<vars, traceIdx>>
 SpecDlqRetry == TraceInit /\ [][TraceNextFor(DlqRetryTrace)]_<<vars, traceIdx>>
+SpecReceiptOnlyCancel == TraceInit /\ [][TraceNextFor(ReceiptOnlyCancelTrace)]_<<vars, traceIdx>>
+SpecCallbackWait == TraceInit /\ [][TraceNextFor(CallbackWaitTrace)]_<<vars, traceIdx>>
+SpecDlqPurge == TraceInit /\ [][TraceNextFor(DlqPurgeTrace)]_<<vars, traceIdx>>
 SpecBroken == TraceInit /\ [][TraceNextFor(BrokenTrace)]_<<vars, traceIdx>>
 
 \* Positive witness invariants: negated so "violation" means acceptance.
@@ -185,6 +228,9 @@ SnoozeTraceIncomplete == traceIdx < Len(SnoozeTrace)
 ReceiptRescueTraceIncomplete == traceIdx < Len(ReceiptRescueTrace)
 RunningCancelTraceIncomplete == traceIdx < Len(RunningCancelTrace)
 DlqRetryTraceIncomplete == traceIdx < Len(DlqRetryTrace)
+ReceiptOnlyCancelTraceIncomplete == traceIdx < Len(ReceiptOnlyCancelTrace)
+CallbackWaitTraceIncomplete == traceIdx < Len(CallbackWaitTrace)
+DlqPurgeTraceIncomplete == traceIdx < Len(DlqPurgeTrace)
 BrokenTraceIncomplete == traceIdx < Len(BrokenTrace)
 
 \* All other safety invariants (TypeOK, DlqHasNoLiveRuntime, etc.) are
