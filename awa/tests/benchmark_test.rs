@@ -363,6 +363,10 @@ fn env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+fn env_string(name: &str, default: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| default.to_string())
+}
+
 #[derive(Debug, Clone, Copy)]
 enum EnqueueMode {
     Insert,
@@ -690,10 +694,13 @@ async fn test_throughput_rust_workers_queue_storage() {
     let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
     let lease_slot_count = env_usize("AWA_VA_RUNTIME_LEASE_SLOTS", 4);
     let queue_stripe_count = env_usize("AWA_VA_RUNTIME_QUEUE_STRIPES", 1);
+    let storage_schema = env_string("AWA_VA_RUNTIME_STORAGE_SCHEMA", "awa_queue_storage");
+    let max_workers = env_usize("AWA_VA_RUNTIME_MAX_WORKERS", 100);
     let queue_rotate_ms = env_i64("AWA_VA_RUNTIME_QUEUE_ROTATE_MS", 1_000);
     let lease_rotate_ms = env_i64("AWA_VA_RUNTIME_LEASE_ROTATE_MS", 50);
 
     let store_config = QueueStorageConfig {
+        schema: storage_schema,
         queue_slot_count,
         lease_slot_count,
         queue_stripe_count,
@@ -718,7 +725,7 @@ async fn test_throughput_rust_workers_queue_storage() {
         .queue(
             queue,
             QueueConfig {
-                max_workers: 100,
+                max_workers: max_workers.try_into().expect("max workers must fit in u32"),
                 poll_interval: Duration::from_millis(50),
                 deadline_duration: Duration::ZERO,
                 ..QueueConfig::default()
