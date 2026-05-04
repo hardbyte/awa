@@ -95,9 +95,12 @@ The implementation and migrations use these physical names:
 
 - The common path still records every claim, but the implementation can now do
   that in two stages:
-  - append-only `lease_claims` receipts for zero-deadline short jobs
-  - a bounded `open_receipt_claims` frontier for currently-live receipt-backed
-    attempts
+  - append-only `lease_claims` receipts for every claim (the receipt path is
+    now the default, not a zero-deadline-only short cut)
+  - **historical:** a bounded `open_receipt_claims` frontier for currently-live
+    receipt-backed attempts. ADR-023 replaces this with partitioned
+    `lease_claims` / `lease_claim_closures`; "currently open" is derived as an
+    anti-join over the active claim partitions.
   - lazy materialization into `active_leases` when the attempt needs the
     mutable execution path
 - Leases keep only dispatch and rescue-critical fields: ready reference,
@@ -144,8 +147,13 @@ The implementation and migrations use these physical names:
 - `lane_state` itself is reduced to stable per-lane identity and legacy
   fallback fields. The mutable enqueue cursor lives in `queue_enqueue_heads`
   and the mutable claim cursor lives in `queue_claim_heads`.
-- Availability is derived from `ready_entries` plus the claim head, not from a
-  hot cached `available_count` field on `lane_state`.
+- **historical:** the original ADR-019 design derived availability from
+  `ready_entries` plus the claim head, deliberately avoiding a hot cached
+  counter on `lane_state`. Long-horizon validation showed that scan was the
+  dispatcher hot-path bottleneck under multi-million-row backlogs; the
+  current implementation reads `sum(queue_lanes.available_count)`, which the
+  queue-storage SQL functions keep in lockstep with `ready_entries` inserts
+  and claim-head advances. `lane_state` itself remains cold.
 - Completed-history rollups live in a separate cold cache table so prune can
   preserve queue counts without serializing on the hot `lane_state` rows.
 - Completion must not update `lane_state` on every terminal transition; the
@@ -184,8 +192,11 @@ The implementation and migrations use these physical names:
   append-only and requeue it without first materializing a mutable
   `active_leases` row.
 - Runtime reads that need the current live receipt-backed set (`queue_counts`,
-  receipt rescue, and receipt-backed `load_job`) read
-  `open_receipt_claims`, not the full append-only claim history.
+  receipt rescue, and receipt-backed `load_job`) consult only the active
+  claim-ring partitions, not the full append-only claim history. **historical:**
+  ADR-019 used a bounded `open_receipt_claims` table for this; ADR-023 derives
+  the same set as an anti-join over partitioned `lease_claims` /
+  `lease_claim_closures`.
 - First heartbeat or progress flush for a receipt-backed attempt: lazily
   materialize the claim into `attempt_state` while keeping the claim on the
   append-only receipt path.
@@ -238,6 +249,8 @@ The leader-elected maintenance service owns:
 - rescuing stale heartbeats, deadlines, and callback timeouts
 - rotating and pruning queue partitions
 - rotating and pruning lease partitions
+- rotating and pruning claim-ring partitions (added by ADR-023; replaces the
+  ADR-019 `open_receipt_claims` cleanup path)
 - queue depth publication
 - DLQ retention cleanup
 
@@ -254,6 +267,11 @@ lock contract is:
 - prune-leases derives the oldest initialized slot from `lease_ring_state`,
   locks the child partition `ACCESS EXCLUSIVE`, rechecks that the slot is not
   current, then truncates if it is empty
+- prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state`,
+  `FOR UPDATE` on the target `claim_ring_slots` row, and `ACCESS EXCLUSIVE` on
+  both the matching `lease_claims_*` and `lease_claim_closures_*` partitions,
+  rescues any still-open claims in the slot, then `TRUNCATE`s both partitions
+  in lockstep
 
 That order is deliberate. The TLA+ storage race / lock-order models exist to
 prove that claim, rotate, and prune cannot interleave into “claim lands in a
@@ -261,8 +279,8 @@ pruned segment” behavior.
 
 Rotation and prune policy is also part of this decision:
 
-- lease segments rotate quickly because lease churn is the remaining hot-path
-  source
+- lease and claim-ring segments rotate quickly because their churn is the
+  remaining hot-path source
 - ready / deferred / waiting / terminal / dlq segments rotate more slowly and
   are primarily retention-driven
 - prune walks sealed segments oldest-first

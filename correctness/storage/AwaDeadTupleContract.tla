@@ -158,7 +158,6 @@ TableSpec == [
     \* schema changes), not job throughput. RowVacuum is fine.
     queue_lanes            |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_terminal_rollups |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
-    queue_count_snapshots  |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
     queue_claimer_state    |-> [kind |-> "RowVacuum", hot |-> "cold", bounded_by |-> ""],
 
     \* ---- Ring-state singletons ----
