@@ -706,7 +706,6 @@ async fn test_throughput_rust_workers_queue_storage() {
         queue_stripe_count,
         lease_claim_receipts: true,
         claim_slot_count: 2,
-        ..Default::default()
     };
     let store =
         QueueStorage::new(store_config.clone()).expect("Failed to build queue storage store");
