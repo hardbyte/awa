@@ -323,6 +323,21 @@ optionally a retry-from-deferred or retry-from-dlq round trip.
   CancelRunningToTerminal. Accepts cleanly with 4 states.
 - `DlqRetryTrace`: 6 events — EnqueueReady → Claim → FailToDlq →
   RetryFromDlq → Claim → FastComplete. Accepts cleanly with 7 states.
+- `ReceiptOnlyCancelTrace`: 3 events — EnqueueReady →
+  SeedOpenReceiptOnlyClaim → CancelReceiptOnlyToTerminal. Accepts
+  cleanly with 4 states. Models `awa::admin::cancel` racing with a
+  freshly-opened receipt before the lease row materialises;
+  complements `RunningCancelTrace` (active lease) and
+  `ReceiptRescueTrace` (stale receipt left by a vanished worker).
+- `CallbackWaitTrace`: 6 events — EnqueueReady → Claim →
+  MaterializeAttemptState → ParkToWaiting → ResumeWaitingToRunning →
+  StatefulComplete. Accepts cleanly with 7 states. Covers the
+  external-callback `WaitForCallback` round-trip; distinct from
+  `SnoozeTrace`, which never enters `waiting_external`.
+- `DlqPurgeTrace`: 4 events — EnqueueReady → Claim → FailToDlq →
+  PurgeDlq. Accepts cleanly with 5 states. Validates the operator
+  `awa dlq purge` path; complements `DlqRetryTrace` which revives the
+  row instead of removing it.
 - `BrokenTrace`: same 6 events but with steps 3 and 4 swapped so
   PromoteDeferred fires before RetryToDeferred. TLC reports deadlock
   at traceIdx = 2 (after EnqueueReady + Claim, before the
