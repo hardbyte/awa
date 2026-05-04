@@ -109,3 +109,9 @@ async def main() -> None:
 
 if __name__ == "__main__":
     asyncio.run(main())
+    # Skip Python finalizer to avoid SIGSEGV in PyO3 during interpreter
+    # teardown. The subprocess has completed its work; os._exit bypasses
+    # the module-unload phase where outstanding tokio tasks (held by
+    # pyo3-async-runtimes) can reference partially-destroyed Python objects.
+    # See https://github.com/hardbyte/awa/issues/228
+    os._exit(0)
