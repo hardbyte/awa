@@ -317,6 +317,78 @@ def test_bulk_retry_and_purge_require_scope_unless_allow_all(sync_client):
     assert sync_client.dlq_depth(queue="pydlq_purge_all") == 0
 
 
+def test_list_dlq_composite_cursor_walks_non_monotonic_dlq_at(sync_client):
+    """Regression for #160. The pre-fix code paginated with `id < before_id`
+    while sorting by `(dlq_at DESC, id DESC)`, so a row with a larger id and
+    smaller dlq_at than the page boundary was silently skipped. With the
+    composite cursor `(dlq_at, id) < ($before_dlq_at, $before_id)`, walking
+    one row at a time must surface every DLQ entry exactly once in
+    `(dlq_at DESC, id DESC)` order regardless of how `dlq_at` lines up with
+    `id`."""
+    queue = "pydlq_composite_cursor"
+
+    # Insert four jobs in id order (so id_a < id_b < id_c < id_d), then
+    # backdate dlq_at on three of them to a permutation that is NOT
+    # monotonic with id. The pre-fix `id < before_id` cursor would skip
+    # rows in this layout; the composite cursor walks all four.
+    j_a = sync_client.insert(DlqPyJob(value="a"), queue=queue)
+    j_b = sync_client.insert(DlqPyJob(value="b"), queue=queue)
+    j_c = sync_client.insert(DlqPyJob(value="c"), queue=queue)
+    j_d = sync_client.insert(DlqPyJob(value="d"), queue=queue)
+    for j in (j_a, j_b, j_c, j_d):
+        _move_ready_to_failed_done(sync_client, j.id)
+        sync_client.move_failed_to_dlq(j.id, "composite")
+
+    # Resulting (dlq_at DESC, id DESC) order: [j_b, j_d, j_a, j_c].
+    # Notice that j_d's id > j_b's id but j_d's dlq_at < j_b's, and j_c's id
+    # > j_a's but j_c's dlq_at < j_a's — the failure mode #160 describes.
+    for offset_days, jid in [(0, j_b.id), (1, j_d.id), (3, j_a.id), (4, j_c.id)]:
+        tx = sync_client.transaction()
+        tx.execute(
+            f"UPDATE {SCHEMA}.dlq_entries "
+            f"SET dlq_at = now() - ($1::int * interval '1 day') "
+            f"WHERE job_id = $2",
+            offset_days,
+            jid,
+        )
+        tx.commit()
+
+    expected_order = [j_b.id, j_d.id, j_a.id, j_c.id]
+
+    # Sanity: a single full-page list returns the whole permutation.
+    full = sync_client.list_dlq(queue=queue)
+    assert [entry.job.id for entry in full] == expected_order
+
+    # Walk pagination one row at a time using BOTH cursor fields. Every row
+    # must surface exactly once and in `(dlq_at DESC, id DESC)` order — the
+    # exact property #160 says was broken under the id-only cursor.
+    walked: list[int] = []
+    cursor_id: int | None = None
+    cursor_dlq_at = None
+    while True:
+        kwargs = {"queue": queue, "limit": 1}
+        if cursor_id is not None and cursor_dlq_at is not None:
+            kwargs["before_id"] = cursor_id
+            kwargs["before_dlq_at"] = cursor_dlq_at
+        page = sync_client.list_dlq(**kwargs)
+        if not page:
+            break
+        assert len(page) == 1
+        walked.append(page[0].job.id)
+        cursor_id = page[0].job.id
+        cursor_dlq_at = page[0].dlq_at
+        # Defensive cap — the loop must terminate within len(rows) iterations.
+        assert len(walked) <= len(expected_order)
+
+    assert walked == expected_order, (
+        f"composite-cursor walk skipped or duplicated rows: "
+        f"got {walked}, expected {expected_order}"
+    )
+
+    # Cleanup so the queue's depth is back to zero for any later test.
+    sync_client.purge_dlq(queue=queue, allow_all=True)
+
+
 def test_list_and_purge_with_before_dlq_at_only(sync_client):
     queue = "pydlq_before_cursor"
     older = sync_client.insert(DlqPyJob(value="older"), queue=queue)
