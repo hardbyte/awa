@@ -5814,34 +5814,63 @@ impl QueueStorage {
                     .map(|entry| entry.job.run_lease)
                     .collect();
 
+                // CTE-as-DML: delete the leases and the matching attempt_state
+                // rows in one round-trip. See the receipt-disabled branch
+                // below for the same pattern.
                 let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
                     r#"
                     WITH completed(lease_slot, queue, priority, lane_seq, run_lease) AS (
                         SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
+                    ),
+                    deleted AS (
+                        DELETE FROM {schema}.leases AS leases
+                        USING completed
+                        WHERE leases.lease_slot = completed.lease_slot
+                          AND leases.queue = completed.queue
+                          AND leases.priority = completed.priority
+                          AND leases.lane_seq = completed.lane_seq
+                          AND leases.run_lease = completed.run_lease
+                        RETURNING
+                            leases.ready_slot,
+                            leases.ready_generation,
+                            leases.job_id,
+                            leases.queue,
+                            leases.state,
+                            leases.priority,
+                            leases.attempt,
+                            leases.run_lease,
+                            leases.max_attempts,
+                            leases.lane_seq,
+                            leases.heartbeat_at,
+                            leases.deadline_at,
+                            leases.attempted_at,
+                            leases.callback_id,
+                            leases.callback_timeout_at
+                    ),
+                    del_attempts AS (
+                        DELETE FROM {schema}.attempt_state AS attempt
+                        USING deleted
+                        WHERE attempt.job_id = deleted.job_id
+                          AND attempt.run_lease = deleted.run_lease
+                        RETURNING attempt.job_id
                     )
-                    DELETE FROM {schema}.leases AS leases
-                    USING completed
-                    WHERE leases.lease_slot = completed.lease_slot
-                      AND leases.queue = completed.queue
-                      AND leases.priority = completed.priority
-                      AND leases.lane_seq = completed.lane_seq
-                      AND leases.run_lease = completed.run_lease
-                    RETURNING
-                        leases.ready_slot,
-                        leases.ready_generation,
-                        leases.job_id,
-                        leases.queue,
-                        leases.state,
-                        leases.priority,
-                        leases.attempt,
-                        leases.run_lease,
-                        leases.max_attempts,
-                        leases.lane_seq,
-                        leases.heartbeat_at,
-                        leases.deadline_at,
-                        leases.attempted_at,
-                        leases.callback_id,
-                        leases.callback_timeout_at
+                    SELECT
+                        ready_slot,
+                        ready_generation,
+                        job_id,
+                        queue,
+                        state,
+                        priority,
+                        attempt,
+                        run_lease,
+                        max_attempts,
+                        lane_seq,
+                        heartbeat_at,
+                        deadline_at,
+                        attempted_at,
+                        callback_id,
+                        callback_timeout_at
+                    FROM deleted
                     "#
                 ))
                 .bind(&lease_slots)
@@ -5854,27 +5883,6 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
 
                 if !deleted.is_empty() {
-                    let deleted_job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
-                    let deleted_run_leases: Vec<i64> =
-                        deleted.iter().map(|row| row.run_lease).collect();
-
-                    sqlx::query(&format!(
-                        r#"
-                        WITH completed(job_id, run_lease) AS (
-                            SELECT * FROM unnest($1::bigint[], $2::bigint[])
-                        )
-                        DELETE FROM {schema}.attempt_state AS attempt
-                        USING completed
-                        WHERE attempt.job_id = completed.job_id
-                          AND attempt.run_lease = completed.run_lease
-                        "#
-                    ))
-                    .bind(&deleted_job_ids)
-                    .bind(&deleted_run_leases)
-                    .execute(tx.as_mut())
-                    .await
-                    .map_err(map_sqlx_error)?;
-
                     let finalized_at = Utc::now();
                     let mut done_rows = Vec::with_capacity(deleted.len());
                     for deleted_row in deleted {
@@ -5905,34 +5913,66 @@ impl QueueStorage {
         let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
         let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
 
+        // Single CTE-as-DML statement: delete the leases and the matching
+        // attempt_state rows in one round-trip. The `deleted` CTE materialises
+        // the lease deletion (so its RETURNING is observable to the
+        // attempt-state delete and to the final SELECT), and `del_attempts`
+        // hangs off it. Saves one round-trip per completion batch versus
+        // issuing the attempt-state delete as a separate statement.
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             WITH completed(lease_slot, queue, priority, lane_seq, run_lease) AS (
                 SELECT * FROM unnest($1::int[], $2::text[], $3::smallint[], $4::bigint[], $5::bigint[])
+            ),
+            deleted AS (
+                DELETE FROM {schema}.leases AS leases
+                USING completed
+                WHERE leases.lease_slot = completed.lease_slot
+                  AND leases.queue = completed.queue
+                  AND leases.priority = completed.priority
+                  AND leases.lane_seq = completed.lane_seq
+                  AND leases.run_lease = completed.run_lease
+                RETURNING
+                    leases.ready_slot,
+                    leases.ready_generation,
+                    leases.job_id,
+                    leases.queue,
+                    leases.state,
+                    leases.priority,
+                    leases.attempt,
+                    leases.run_lease,
+                    leases.max_attempts,
+                    leases.lane_seq,
+                    leases.heartbeat_at,
+                    leases.deadline_at,
+                    leases.attempted_at,
+                    leases.callback_id,
+                    leases.callback_timeout_at
+            ),
+            del_attempts AS (
+                DELETE FROM {schema}.attempt_state AS attempt
+                USING deleted
+                WHERE attempt.job_id = deleted.job_id
+                  AND attempt.run_lease = deleted.run_lease
+                RETURNING attempt.job_id
             )
-            DELETE FROM {schema}.leases AS leases
-            USING completed
-            WHERE leases.lease_slot = completed.lease_slot
-              AND leases.queue = completed.queue
-              AND leases.priority = completed.priority
-              AND leases.lane_seq = completed.lane_seq
-              AND leases.run_lease = completed.run_lease
-            RETURNING
-                leases.ready_slot,
-                leases.ready_generation,
-                leases.job_id,
-                leases.queue,
-                leases.state,
-                leases.priority,
-                leases.attempt,
-                leases.run_lease,
-                leases.max_attempts,
-                leases.lane_seq,
-                leases.heartbeat_at,
-                leases.deadline_at,
-                leases.attempted_at,
-                leases.callback_id,
-                leases.callback_timeout_at
+            SELECT
+                ready_slot,
+                ready_generation,
+                job_id,
+                queue,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                heartbeat_at,
+                deadline_at,
+                attempted_at,
+                callback_id,
+                callback_timeout_at
+            FROM deleted
             "#
         ))
         .bind(&lease_slots)
@@ -5948,26 +5988,6 @@ impl QueueStorage {
             tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
-
-        let deleted_job_ids: Vec<i64> = deleted.iter().map(|row| row.job_id).collect();
-        let deleted_run_leases: Vec<i64> = deleted.iter().map(|row| row.run_lease).collect();
-
-        sqlx::query(&format!(
-            r#"
-            WITH completed(job_id, run_lease) AS (
-                SELECT * FROM unnest($1::bigint[], $2::bigint[])
-            )
-            DELETE FROM {schema}.attempt_state AS attempt
-            USING completed
-            WHERE attempt.job_id = completed.job_id
-              AND attempt.run_lease = completed.run_lease
-            "#
-        ))
-        .bind(&deleted_job_ids)
-        .bind(&deleted_run_leases)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
 
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(deleted.len());
