@@ -91,9 +91,17 @@ pub async fn retry_dlq_job(
         },
         None => RetryFromDlqOpts::default(),
     };
+    // Capture the source queue before retry runs — `opts.queue` may
+    // re-route the job to a different destination, in which case the
+    // returned JobRow's `queue` is the destination, not the queue the
+    // DLQ row came from. The metric tracks DLQ outflow per source
+    // queue, matching `record_dlq_purged`'s pattern below.
+    let source_queue = dlq::get_dlq_job(&state.pool, job_id)
+        .await?
+        .map(|row| row.job.queue);
     let job = dlq::retry_from_dlq(&state.pool, job_id, &opts).await?;
-    if let Some(job) = job.as_ref() {
-        AwaMetrics::from_global().record_dlq_retried(Some(&job.queue), 1);
+    if job.is_some() {
+        AwaMetrics::from_global().record_dlq_retried(source_queue.as_deref(), 1);
     }
     Ok(Json(job))
 }

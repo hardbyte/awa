@@ -192,240 +192,244 @@ pub struct AwaMetrics {
 
 impl AwaMetrics {
     /// Create metrics from an OpenTelemetry meter.
+    ///
+    /// Instrument names come from [`names`] so the public constants and the
+    /// registered instruments can't drift — a rename in `names::*` updates
+    /// the registration too.
     pub fn new(meter: &Meter) -> Self {
         Self {
             jobs_inserted: meter
-                .u64_counter("awa.job.inserted")
+                .u64_counter(names::JOB_INSERTED)
                 .with_description("Number of jobs inserted")
                 .with_unit("{job}")
                 .build(),
             jobs_completed: meter
-                .u64_counter("awa.job.completed")
+                .u64_counter(names::JOB_COMPLETED)
                 .with_description("Number of jobs completed successfully")
                 .with_unit("{job}")
                 .build(),
             jobs_failed: meter
-                .u64_counter("awa.job.failed")
+                .u64_counter(names::JOB_FAILED)
                 .with_description("Number of jobs that failed terminally")
                 .with_unit("{job}")
                 .build(),
             jobs_retried: meter
-                .u64_counter("awa.job.retried")
+                .u64_counter(names::JOB_RETRIED)
                 .with_description("Number of jobs marked retryable")
                 .with_unit("{job}")
                 .build(),
             jobs_cancelled: meter
-                .u64_counter("awa.job.cancelled")
+                .u64_counter(names::JOB_CANCELLED)
                 .with_description("Number of jobs cancelled")
                 .with_unit("{job}")
                 .build(),
             jobs_claimed: meter
-                .u64_counter("awa.job.claimed")
+                .u64_counter(names::JOB_CLAIMED)
                 .with_description("Number of jobs claimed for execution")
                 .with_unit("{job}")
                 .build(),
             claim_batches: meter
-                .u64_counter("awa.dispatch.claim_batches")
+                .u64_counter(names::DISPATCH_CLAIM_BATCHES)
                 .with_description("Number of dispatcher claim queries executed")
                 .with_unit("{batch}")
                 .build(),
             dispatch_wakeups: meter
-                .u64_counter("awa.dispatch.wakeups")
+                .u64_counter(names::DISPATCH_WAKEUPS)
                 .with_description("Number of dispatcher wake-ups by reason")
                 .with_unit("{wake}")
                 .build(),
             dispatch_wake_to_claim_seconds: meter
-                .f64_histogram("awa.dispatch.wake_to_claim_duration")
+                .f64_histogram(names::DISPATCH_WAKE_TO_CLAIM_DURATION)
                 .with_description("Time from dispatcher wake-up to first claim attempt")
                 .with_unit("s")
                 .build(),
             dispatch_capacity_available: meter
-                .u64_histogram("awa.dispatch.capacity_available")
+                .u64_histogram(names::DISPATCH_CAPACITY_AVAILABLE)
                 .with_description("Number of permits available when a dispatcher wake is processed")
                 .with_unit("{permit}")
                 .build(),
             dispatch_empty_claims: meter
-                .u64_counter("awa.dispatch.empty_claims")
+                .u64_counter(names::DISPATCH_EMPTY_CLAIMS)
                 .with_description("Number of dispatcher wakes that found no jobs despite available capacity")
                 .with_unit("{wake}")
                 .build(),
             dispatch_unused_permits: meter
-                .u64_counter("awa.dispatch.unused_permits")
+                .u64_counter(names::DISPATCH_UNUSED_PERMITS)
                 .with_description("Number of pre-acquired permits released unused after claiming fewer jobs than capacity")
                 .with_unit("{permit}")
                 .build(),
             dispatch_rate_limited: meter
-                .u64_counter("awa.dispatch.rate_limited")
+                .u64_counter(names::DISPATCH_RATE_LIMITED)
                 .with_description("Number of dispatcher wakes that could not claim because of rate limiting")
                 .with_unit("{wake}")
                 .build(),
             claim_batch_size: meter
-                .u64_histogram("awa.dispatch.claim_batch_size")
+                .u64_histogram(names::DISPATCH_CLAIM_BATCH_SIZE)
                 .with_description("Dispatcher claim batch size")
                 .with_unit("{job}")
                 .build(),
             claim_duration_seconds: meter
-                .f64_histogram("awa.dispatch.claim_duration")
+                .f64_histogram(names::DISPATCH_CLAIM_DURATION)
                 .with_description("Dispatcher claim query duration")
                 .with_unit("s")
                 .build(),
             job_duration_seconds: meter
-                .f64_histogram("awa.job.duration")
+                .f64_histogram(names::JOB_DURATION)
                 .with_description("Job execution duration")
                 .with_unit("s")
                 .build(),
             completion_flushes: meter
-                .u64_counter("awa.completion.flushes")
+                .u64_counter(names::COMPLETION_FLUSHES)
                 .with_description("Number of completion batch flushes")
                 .with_unit("{batch}")
                 .build(),
             completion_flush_batch_size: meter
-                .u64_histogram("awa.completion.flush_batch_size")
+                .u64_histogram(names::COMPLETION_FLUSH_BATCH_SIZE)
                 .with_description("Completion batch flush size")
                 .with_unit("{job}")
                 .build(),
             completion_flush_duration_seconds: meter
-                .f64_histogram("awa.completion.flush_duration")
+                .f64_histogram(names::COMPLETION_FLUSH_DURATION)
                 .with_description("Completion batch flush duration")
                 .with_unit("s")
                 .build(),
             promotion_batches: meter
-                .u64_counter("awa.maintenance.promote_batches")
+                .u64_counter(names::MAINTENANCE_PROMOTE_BATCHES)
                 .with_description("Number of scheduled/retryable promotion batches")
                 .with_unit("{batch}")
                 .build(),
             promotion_batch_size: meter
-                .u64_histogram("awa.maintenance.promote_batch_size")
+                .u64_histogram(names::MAINTENANCE_PROMOTE_BATCH_SIZE)
                 .with_description("Promotion batch size")
                 .with_unit("{job}")
                 .build(),
             promotion_duration_seconds: meter
-                .f64_histogram("awa.maintenance.promote_duration")
+                .f64_histogram(names::MAINTENANCE_PROMOTE_DURATION)
                 .with_description("Promotion batch duration")
                 .with_unit("s")
                 .build(),
             jobs_in_flight: meter
-                .i64_up_down_counter("awa.job.in_flight")
+                .i64_up_down_counter(names::JOB_IN_FLIGHT)
                 .with_description("Current number of in-flight jobs")
                 .with_unit("{job}")
                 .build(),
             heartbeat_batches: meter
-                .u64_counter("awa.heartbeat.batches")
+                .u64_counter(names::HEARTBEAT_BATCHES)
                 .with_description("Number of heartbeat batch updates sent")
                 .with_unit("{batch}")
                 .build(),
             maintenance_rescues: meter
-                .u64_counter("awa.maintenance.rescues")
+                .u64_counter(names::MAINTENANCE_RESCUES)
                 .with_description("Number of jobs rescued by maintenance")
                 .with_unit("{job}")
                 .build(),
             jobs_waiting_external: meter
-                .u64_counter("awa.job.waiting_external")
+                .u64_counter(names::JOB_WAITING_EXTERNAL)
                 .with_description("Number of jobs parked for external callback")
                 .with_unit("{job}")
                 .build(),
             queue_depth: meter
-                .i64_gauge("awa.queue.depth")
+                .i64_gauge(names::QUEUE_DEPTH)
                 .with_description("Current number of jobs per queue and state")
                 .with_unit("{job}")
                 .build(),
             queue_lag_seconds: meter
-                .f64_gauge("awa.queue.lag")
+                .f64_gauge(names::QUEUE_LAG)
                 .with_description("Age of the oldest available job per queue")
                 .with_unit("s")
                 .build(),
             wait_duration_seconds: meter
-                .f64_histogram("awa.job.wait_duration")
+                .f64_histogram(names::JOB_WAIT_DURATION)
                 .with_description("Time from job creation to claim")
                 .with_unit("s")
                 .build(),
             dlq_moved: meter
-                .u64_counter("awa.job.dlq_moved")
+                .u64_counter(names::JOB_DLQ_MOVED)
                 .with_description("Number of jobs moved into the Dead Letter Queue")
                 .with_unit("{job}")
                 .build(),
             dlq_retried: meter
-                .u64_counter("awa.job.dlq_retried")
+                .u64_counter(names::JOB_DLQ_RETRIED)
                 .with_description("Number of jobs retried out of the Dead Letter Queue")
                 .with_unit("{job}")
                 .build(),
             dlq_purged: meter
-                .u64_counter("awa.job.dlq_purged")
+                .u64_counter(names::JOB_DLQ_PURGED)
                 .with_description("Number of DLQ rows deleted")
                 .with_unit("{job}")
                 .build(),
             dlq_depth: meter
-                .i64_gauge("awa.job.dlq_depth")
+                .i64_gauge(names::JOB_DLQ_DEPTH)
                 .with_description("Current Dead Letter Queue depth per queue")
                 .with_unit("{job}")
                 .build(),
             queue_info: meter
-                .i64_gauge("awa.queue.info")
+                .i64_gauge(names::QUEUE_INFO)
                 .with_description(
                     "Declared queue descriptors (always 1; use as a label-join target)",
                 )
                 .with_unit("{queue}")
                 .build(),
             job_kind_info: meter
-                .i64_gauge("awa.job_kind.info")
+                .i64_gauge(names::JOB_KIND_INFO)
                 .with_description(
                     "Declared job-kind descriptors (always 1; use as a label-join target)",
                 )
                 .with_unit("{kind}")
                 .build(),
             storage_transition_ready: meter
-                .i64_gauge("awa.storage.transition_ready")
+                .i64_gauge(names::STORAGE_TRANSITION_READY)
                 .with_description("Storage transition readiness by action (1 = ready, 0 = blocked)")
                 .with_unit("{state}")
                 .build(),
             storage_canonical_live_backlog: meter
-                .i64_gauge("awa.storage.canonical_live_backlog")
+                .i64_gauge(names::STORAGE_CANONICAL_LIVE_BACKLOG)
                 .with_description("Current canonical live backlog during a storage transition")
                 .with_unit("{job}")
                 .build(),
             storage_live_runtime_capability: meter
-                .i64_gauge("awa.storage.live_runtime_capability")
+                .i64_gauge(names::STORAGE_LIVE_RUNTIME_CAPABILITY)
                 .with_description("Current live runtime count by reported storage capability")
                 .with_unit("{runtime}")
                 .build(),
             storage_state: meter
-                .i64_gauge("awa.storage.state")
+                .i64_gauge(names::STORAGE_STATE)
                 .with_description(
                     "Current storage transition state and engine combination (always 1)",
                 )
                 .with_unit("{state}")
                 .build(),
             maintenance_rotate_attempts: meter
-                .u64_counter("awa.maintenance.rotate.attempts")
+                .u64_counter(names::MAINTENANCE_ROTATE_ATTEMPTS)
                 .with_description(
                     "Ring rotation attempts by ring/outcome/blocker. Multiple increments per call when SkippedBusy has multiple non-zero blockers.",
                 )
                 .with_unit("{attempt}")
                 .build(),
             maintenance_rotate_skipped_rows: meter
-                .u64_histogram("awa.maintenance.rotate.skipped_rows")
+                .u64_histogram(names::MAINTENANCE_ROTATE_SKIPPED_ROWS)
                 .with_description(
                     "Row count for the blocker side of a SkippedBusy rotation",
                 )
                 .with_unit("{row}")
                 .build(),
             maintenance_prune_attempts: meter
-                .u64_counter("awa.maintenance.prune.attempts")
+                .u64_counter(names::MAINTENANCE_PRUNE_ATTEMPTS)
                 .with_description("Ring prune attempts by ring/outcome/reason")
                 .with_unit("{attempt}")
                 .build(),
             maintenance_prune_skipped_rows: meter
-                .u64_histogram("awa.maintenance.prune.skipped_rows")
+                .u64_histogram(names::MAINTENANCE_PRUNE_SKIPPED_ROWS)
                 .with_description("Magnitude of the reason count on a SkippedActive prune")
                 .with_unit("{row}")
                 .build(),
             ring_current_slot: meter
-                .i64_gauge("awa.ring.current_slot")
+                .i64_gauge(names::RING_CURRENT_SLOT)
                 .with_description("Current slot index per ring (queue/lease/claim)")
                 .with_unit("{slot}")
                 .build(),
             ring_generation: meter
-                .i64_gauge("awa.ring.generation")
+                .i64_gauge(names::RING_GENERATION)
                 .with_description("Current ring generation per ring; derivative is rotations/sec")
                 .with_unit("{generation}")
                 .build(),
