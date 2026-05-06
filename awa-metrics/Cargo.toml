@@ -1,0 +1,12 @@
+[package]
+name = "awa-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Internal OpenTelemetry metric definitions shared across Awa crates"
+repository.workspace = true
+publish = false
+
+[dependencies]
+awa-model.workspace = true
+opentelemetry.workspace = true
