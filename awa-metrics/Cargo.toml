@@ -1,0 +1,20 @@
+[package]
+name = "awa-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "OpenTelemetry metric definitions shared across the Awa job queue crates"
+repository.workspace = true
+readme = "README.md"
+keywords = ["awa", "opentelemetry", "metrics"]
+categories = ["asynchronous"]
+# Published to crates.io because `awa-worker` (published) depends on the
+# `AwaMetrics` type directly. Cargo strips path dependencies during
+# publish but keeps the version constraint, so awa-metrics must resolve
+# from the registry for downstream consumers of awa-worker. The crate is
+# intentionally minimal — just the OTel metric handles and `record_*`
+# methods — but it is part of the public dep tree.
+
+[dependencies]
+awa-model.workspace = true
+opentelemetry.workspace = true

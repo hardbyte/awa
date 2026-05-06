@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "awa-model",
     "awa-macros",
+    "awa-metrics",
     "awa-worker",
     "awa",
     "awa-testing",
@@ -25,6 +26,7 @@ categories = ["database", "asynchronous", "web-programming"]
 # Internal crates
 awa-model = { path = "awa-model", version = "0.6.0-alpha.5" }
 awa-macros = { path = "awa-macros", version = "0.6.0-alpha.5" }
+awa-metrics = { path = "awa-metrics", version = "0.6.0-alpha.5" }
 awa-worker = { path = "awa-worker", version = "0.6.0-alpha.5" }
 
 # Database

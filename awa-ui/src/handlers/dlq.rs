@@ -2,33 +2,11 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
+use awa_metrics::AwaMetrics;
 use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 
 use crate::error::ApiError;
 use crate::state::AppState;
-
-/// Emit an OTel counter against the global meter.
-///
-/// The UI crate intentionally avoids depending on `awa-worker` (which would
-/// pull in the dispatcher/runtime crate graph) for the sake of a few counter
-/// increments. The OTel SDK caches instruments by name so repeated builds are
-/// a hashmap lookup; attribute sets here match `AwaMetrics` so dashboards
-/// don't drift between UI and worker sources.
-fn emit_counter(name: &'static str, description: &'static str, count: u64, queue: Option<&str>) {
-    if count == 0 {
-        return;
-    }
-    let meter = opentelemetry::global::meter("awa");
-    let counter = meter
-        .u64_counter(name)
-        .with_description(description)
-        .with_unit("{job}")
-        .build();
-    let attrs: Vec<opentelemetry::KeyValue> = queue
-        .map(|q| vec![opentelemetry::KeyValue::new("awa.job.queue", q.to_string())])
-        .unwrap_or_default();
-    counter.add(count, &attrs);
-}
 
 #[derive(Debug, Deserialize)]
 pub struct ListDlqParams {
@@ -113,14 +91,17 @@ pub async fn retry_dlq_job(
         },
         None => RetryFromDlqOpts::default(),
     };
+    // Capture the source queue before retry runs — `opts.queue` may
+    // re-route the job to a different destination, in which case the
+    // returned JobRow's `queue` is the destination, not the queue the
+    // DLQ row came from. The metric tracks DLQ outflow per source
+    // queue, matching `record_dlq_purged`'s pattern below.
+    let source_queue = dlq::get_dlq_job(&state.pool, job_id)
+        .await?
+        .map(|row| row.job.queue);
     let job = dlq::retry_from_dlq(&state.pool, job_id, &opts).await?;
-    if let Some(job) = job.as_ref() {
-        emit_counter(
-            "awa.job.dlq_retried",
-            "Number of jobs retried out of the Dead Letter Queue",
-            1,
-            Some(&job.queue),
-        );
+    if job.is_some() {
+        AwaMetrics::from_global().record_dlq_retried(source_queue.as_deref(), 1);
     }
     Ok(Json(job))
 }
@@ -157,12 +138,9 @@ pub async fn bulk_retry_dlq(
         ..Default::default()
     };
     let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
-    emit_counter(
-        "awa.job.dlq_retried",
-        "Number of jobs retried out of the Dead Letter Queue",
-        count,
-        queue_attr.as_deref(),
-    );
+    if count > 0 {
+        AwaMetrics::from_global().record_dlq_retried(queue_attr.as_deref(), count);
+    }
     Ok(Json(CountResponse { count }))
 }
 
@@ -178,12 +156,9 @@ pub async fn purge_dlq_job(
         .map(|row| row.job.queue);
     let deleted = dlq::purge_dlq_job(&state.pool, job_id).await?;
     let count = if deleted { 1 } else { 0 };
-    emit_counter(
-        "awa.job.dlq_purged",
-        "Number of DLQ rows purged",
-        count,
-        queue.as_deref(),
-    );
+    if count > 0 {
+        AwaMetrics::from_global().record_dlq_purged(queue.as_deref(), count);
+    }
     Ok(Json(CountResponse { count }))
 }
 
@@ -200,12 +175,9 @@ pub async fn bulk_purge_dlq(
         ..Default::default()
     };
     let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
-    emit_counter(
-        "awa.job.dlq_purged",
-        "Number of DLQ rows purged",
-        count,
-        queue_attr.as_deref(),
-    );
+    if count > 0 {
+        AwaMetrics::from_global().record_dlq_purged(queue_attr.as_deref(), count);
+    }
     Ok(Json(CountResponse { count }))
 }
 
@@ -242,36 +214,13 @@ pub async fn bulk_move_failed(
         payload.all,
     )
     .await?;
-    // Mirror the worker: emit the `awa.job.dlq_moved` counter so operator
-    // dashboards reflect admin bulk moves alongside automatic routing.
-    // Done inline against the global OTel meter rather than through an
-    // awa-worker dependency, which would pull in the dispatcher/runtime
-    // crate graph for a single counter increment. Attribute set matches
-    // `AwaMetrics::record_dlq_moved_bulk` so dashboards don't drift.
     if count > 0 {
-        let meter = opentelemetry::global::meter("awa");
-        let counter = meter
-            .u64_counter("awa.job.dlq_moved")
-            .with_description("Number of jobs moved into the Dead Letter Queue")
-            .with_unit("{job}")
-            .build();
-        let mut attrs = vec![opentelemetry::KeyValue::new(
-            "awa.dlq.reason",
-            payload.reason.clone(),
-        )];
-        if let Some(kind) = payload.kind.as_deref() {
-            attrs.push(opentelemetry::KeyValue::new(
-                "awa.job.kind",
-                kind.to_string(),
-            ));
-        }
-        if let Some(queue) = payload.queue.as_deref() {
-            attrs.push(opentelemetry::KeyValue::new(
-                "awa.job.queue",
-                queue.to_string(),
-            ));
-        }
-        counter.add(count, &attrs);
+        AwaMetrics::from_global().record_dlq_moved_bulk(
+            payload.kind.as_deref(),
+            payload.queue.as_deref(),
+            &payload.reason,
+            count,
+        );
     }
     Ok(Json(CountResponse { count }))
 }

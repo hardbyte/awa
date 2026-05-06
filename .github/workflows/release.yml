@@ -677,6 +677,17 @@ jobs:
       - name: Wait for index
         run: sleep 30
 
+      # awa-metrics depends on awa-model and is depended on by awa-worker,
+      # so it must publish in this slot. First publish auto-creates the
+      # crate on crates.io under the token owner's namespace.
+      - name: Publish awa-metrics
+        run: cargo publish --package awa-metrics --no-verify
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
+      - name: Wait for index
+        run: sleep 30
+
       - name: Publish awa-worker
         run: cargo publish --package awa-worker --no-verify
         env:

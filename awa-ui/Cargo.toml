@@ -21,6 +21,7 @@ include = [
 
 [dependencies]
 awa-model.workspace = true
+awa-metrics.workspace = true
 axum.workspace = true
 blake3.workspace = true
 tower-http.workspace = true
@@ -30,7 +31,6 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-opentelemetry.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 mime_guess = "2"
