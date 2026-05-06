@@ -5,6 +5,48 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+## [0.6.0-alpha.6] — 2026-05-07
+
+### Added
+
+- **`awa-metrics` crate** ([#176](https://github.com/hardbyte/awa/issues/176),
+  [#232](https://github.com/hardbyte/awa/pull/232)). The `AwaMetrics` type
+  and its `record_*` methods move from `awa-worker` into a dedicated
+  `awa-metrics` crate so non-runtime callers (`awa-ui`, `awa-cli`) can emit
+  the same OTel counters as the worker without depending on the
+  dispatcher/runtime crate graph. `awa-worker::AwaMetrics` re-exports for
+  source compatibility — no semver break for `awa-cli` or `awa-python`.
+  `awa-metrics::names` exposes public string constants for every metric, and
+  `AwaMetrics::new()` is built from those constants so registered
+  instruments and the public names can't drift.
+
+### Changed
+
+- **Multi-queue NOTIFY collapses to one round-trip per enqueue tx**
+  ([#235](https://github.com/hardbyte/awa/pull/235)). The three queue-storage
+  enqueue paths (`enqueue_runtime_rows`, `enqueue_params_batch`,
+  `enqueue_params_copy`) used to issue one `pg_notify($1, '')` per distinct
+  destination queue inside the enqueue transaction. Now routed through
+  `notify_queues_tx`, which uses
+  `SELECT pg_notify(channel, '') FROM unnest($1::text[])` so any number of
+  queues becomes one round-trip. Single-queue enqueue (the common case) is
+  unchanged.
+- **Completion path: lease delete and `attempt_state` cleanup merge into a
+  single CTE-as-DML statement** ([#235](https://github.com/hardbyte/awa/pull/235)).
+  `complete_runtime_batch` previously issued two consecutive DELETEs (leases,
+  then `attempt_state`) on the receipt-disabled path and on the materialized
+  fallback inside the receipt-enabled path. They now share one statement —
+  one fewer round-trip per completion batch, identical atomicity and
+  return shape.
+
+### Fixed
+
+- **`awa.job.dlq_retried` tagged with the source queue** ([#232](https://github.com/hardbyte/awa/pull/232)).
+  Single-job retry from `awa-ui` previously read `job.queue` from the
+  returned `JobRow`, which carries the *destination* queue if the request
+  body supplied a `queue` override. The metric now looks the source queue
+  up before retry runs (matching `record_dlq_purged`'s pattern).
+
 ## [0.6.0-alpha.5] — 2026-05-04
 
 ### Added
