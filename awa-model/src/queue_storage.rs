@@ -4773,17 +4773,8 @@ impl QueueStorage {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let total_rows = self.insert_ready_rows_tx(&mut tx, rows.clone()).await?;
 
-        let queues_to_notify: BTreeSet<String> = rows
-            .iter()
-            .map(|row| self.logical_queue_name(&row.queue).to_string())
-            .collect();
-        for queue in queues_to_notify {
-            sqlx::query("SELECT pg_notify($1, '')")
-                .bind(format!("awa:{queue}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-        }
+        let queues_to_notify: Vec<String> = rows.iter().map(|row| row.queue.clone()).collect();
+        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(total_rows)
@@ -4892,10 +4883,8 @@ impl QueueStorage {
             }
         }
 
-        let queues_to_notify: BTreeSet<String> = ready_rows
-            .iter()
-            .map(|row| self.logical_queue_name(&row.queue).to_string())
-            .collect();
+        let queues_to_notify: Vec<String> =
+            ready_rows.iter().map(|row| row.queue.clone()).collect();
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
@@ -4916,13 +4905,7 @@ impl QueueStorage {
                 .await?;
         }
 
-        for queue in queues_to_notify {
-            sqlx::query("SELECT pg_notify($1, '')")
-                .bind(format!("awa:{queue}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-        }
+        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(total)
@@ -4998,10 +4981,8 @@ impl QueueStorage {
             }
         }
 
-        let queues_to_notify: BTreeSet<String> = ready_rows
-            .iter()
-            .map(|row| self.logical_queue_name(&row.queue).to_string())
-            .collect();
+        let queues_to_notify: Vec<String> =
+            ready_rows.iter().map(|row| row.queue.clone()).collect();
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut total = 0usize;
@@ -5025,13 +5006,7 @@ impl QueueStorage {
                 .await?;
         }
 
-        for queue in queues_to_notify {
-            sqlx::query("SELECT pg_notify($1, '')")
-                .bind(format!("awa:{queue}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-        }
+        self.notify_queues_tx(&mut tx, queues_to_notify).await?;
 
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(total)
@@ -7026,17 +7001,23 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queues: impl IntoIterator<Item = String>,
     ) -> Result<(), AwaError> {
-        let queues: BTreeSet<String> = queues
+        // BTreeSet dedups so we never emit the same NOTIFY twice per
+        // transaction. Multi-queue enqueues fold into a single round-trip via
+        // `unnest($1::text[])` rather than one round-trip per channel.
+        let channels: Vec<String> = queues
             .into_iter()
-            .map(|queue| self.logical_queue_name(&queue).to_string())
+            .map(|queue| format!("awa:{}", self.logical_queue_name(&queue)))
+            .collect::<BTreeSet<String>>()
+            .into_iter()
             .collect();
-        for queue in queues {
-            sqlx::query("SELECT pg_notify($1, '')")
-                .bind(format!("awa:{queue}"))
-                .execute(tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
+        if channels.is_empty() {
+            return Ok(());
         }
+        sqlx::query("SELECT pg_notify(channel, '') FROM unnest($1::text[]) AS channel")
+            .bind(&channels)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
         Ok(())
     }
 
