@@ -619,6 +619,15 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
 
   # ─── Publish Rust crates ─────────────────────────────────────────────
+  #
+  # Authentication: crates.io Trusted Publishing via GitHub OIDC.
+  # `rust-lang/crates-io-auth-action` exchanges the workflow's OIDC token
+  # for a short-lived crates.io token (~30 minutes). No long-lived
+  # CARGO_REGISTRY_TOKEN secret needed. Each crate must have a Trusted
+  # Publisher entry configured on crates.io (Settings → Trusted
+  # Publishing) matching this repo + workflow filename. New crates use
+  # the "Pending Publisher" flow on crates.io to bootstrap before the
+  # first publish.
   publish-crates:
     name: Publish to crates.io
     needs: [version-check]
@@ -626,6 +635,10 @@ jobs:
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+
+      - name: Authenticate to crates.io (OIDC)
+        id: crates-io-auth
+        uses: rust-lang/crates-io-auth-action@v1
 
       # awa-ui embeds `awa-ui/static/` via rust-embed; without building the
       # frontend first, the crate published to crates.io carries no assets and
@@ -664,7 +677,7 @@ jobs:
       - name: Publish awa-macros
         run: cargo publish --package awa-macros --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for index
         run: sleep 30
@@ -672,7 +685,7 @@ jobs:
       - name: Publish awa-model
         run: cargo publish --package awa-model --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for index
         run: sleep 30
@@ -680,7 +693,7 @@ jobs:
       - name: Publish awa-worker
         run: cargo publish --package awa-worker --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for index
         run: sleep 30
@@ -688,7 +701,7 @@ jobs:
       - name: Publish awa-testing
         run: cargo publish --package awa-testing --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for index
         run: sleep 30
@@ -704,7 +717,7 @@ jobs:
       - name: Publish awa-ui
         run: cargo publish --package awa-ui --no-verify --allow-dirty
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for index
         run: sleep 30
@@ -712,7 +725,7 @@ jobs:
       - name: Publish awa-cli
         run: cargo publish --package awa-cli --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
 
       - name: Wait for index
         run: sleep 30
@@ -720,4 +733,4 @@ jobs:
       - name: Publish awa (facade)
         run: cargo publish --package awa --no-verify
         env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-io-auth.outputs.token }}
