@@ -3,6 +3,7 @@ import os
 from dataclasses import dataclass
 
 import awa
+from _subprocess_exit import run_async_main_without_finalizers
 
 
 @dataclass
@@ -108,4 +109,7 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # PyO3/tokio teardown can segfault while Python unloads modules. These
+    # helpers run in single-purpose subprocesses, so skip finalizers after a
+    # clean run or an external stop signal.
+    run_async_main_without_finalizers(main)
