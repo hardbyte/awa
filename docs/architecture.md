@@ -945,10 +945,11 @@ MaintenanceService (leader)
     ├── Every 60s: sync_periodic_jobs_to_db()
     │   └── UPSERT all registered schedules (additive, no deletes)
     │
-    ├── Every 1s: evaluate_cron_schedules()
+    ├── Cron evaluator task (own leader-scoped lane, every 1s)
     │   ├── SELECT * FROM awa.cron_jobs
-    │   ├── For each: compute latest fire time ≤ now, after last_enqueued_at
-    │   └── If due: atomic CTE (mark last_enqueued_at + INSERT INTO awa.jobs)
+    │   ├── coalesce: compute one latest due fire after last_enqueued_at
+    │   ├── catch_up: compute bounded due fires in timestamp order
+    │   └── For each fire: atomic CTE (mark last_enqueued_at + INSERT INTO awa.jobs)
     │
     └── Every 30s: leader liveness check
         └── SELECT 1 on leader connection (break to re-election if dead)
@@ -984,18 +985,19 @@ Awa uses a hybrid approach with two independent crash recovery mechanisms, each 
 ### Leader Election
 
 Maintenance tasks (heartbeat rescue, deadline rescue, scheduled promotion,
-cleanup, cron evaluation, and canonical-table priority aging) run on a single
-leader instance elected via Postgres advisory lock
+cleanup, cron sync, cron evaluation, and canonical-table priority aging) run on
+a single leader instance elected via Postgres advisory lock
 (`pg_try_advisory_lock(0x4157415f4d41494e)`). The lock is session-scoped -- it
 auto-releases if the leader's connection drops. Non-leaders retry every 10
 seconds. The leader verifies its connection is still alive every 30 seconds; if
-the ping fails, it re-enters the election loop. Queue storage does not
-physically reprioritize ready rows; it applies effective priority aging at
-claim time.
+the ping fails, it re-enters the election loop and stops the leader-scoped cron
+evaluator task. Queue storage does not physically reprioritize ready rows; it
+applies effective priority aging at claim time.
 
 Scheduled and retryable promotion runs every 250ms by default, in bounded
 batches, and emits queue notifications after promotion. Cron evaluation remains
-on a 1-second tick.
+on a 1-second tick but runs in its own leader-scoped task so slower background
+hygiene cannot starve schedule evaluation.
 
 ## Python Integration
 

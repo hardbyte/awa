@@ -1482,9 +1482,13 @@ fn compute_fire_times(
     let should_catch_up =
         row.last_enqueued_at.is_some() && missed_fire_policy == CronMissedFirePolicy::CatchUp;
 
-    let mut fire_times = Vec::new();
-    let mut latest_fire: Option<chrono::DateTime<Utc>> = None;
+    if !should_catch_up {
+        return latest_due_fire(&cron, tz, search_start, row.last_enqueued_at, now)
+            .into_iter()
+            .collect();
+    }
 
+    let mut fire_times = Vec::new();
     for fire_time in cron.iter_from(search_start) {
         let fire_utc = fire_time.with_timezone(&Utc);
 
@@ -1498,22 +1502,90 @@ fn compute_fire_times(
             }
         }
 
-        if !should_catch_up {
-            latest_fire = Some(fire_utc);
-            continue;
-        }
-
         fire_times.push(fire_utc);
         if fire_times.len() >= limit {
             break;
         }
     }
 
-    if should_catch_up {
-        fire_times
-    } else {
-        latest_fire.into_iter().collect()
+    fire_times
+}
+
+fn latest_due_fire(
+    cron: &Cron,
+    tz: chrono_tz::Tz,
+    search_start: chrono::DateTime<chrono_tz::Tz>,
+    last_enqueued_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    let first_due = first_due_fire(cron, search_start, last_enqueued_at, now)?;
+    let total_span_seconds = now.signed_duration_since(first_due).num_seconds().max(1);
+    let mut lookback_seconds = 1_i64;
+
+    loop {
+        // Croner has no previous-occurrence iterator. Search backward from
+        // `now` with an exponentially growing window, then scan only that
+        // small window to preserve coalesced/latest-only semantics.
+        let window_start_utc = (now - chrono::Duration::seconds(lookback_seconds)).max(first_due);
+        let window_start = window_start_utc.with_timezone(&tz);
+        let next_in_window = cron
+            .iter_from(window_start)
+            .next()
+            .map(|fire_time| fire_time.with_timezone(&Utc));
+
+        if next_in_window.is_some_and(|fire_utc| {
+            fire_utc <= now && last_enqueued_at.is_none_or(|last| fire_utc > last)
+        }) {
+            return latest_due_fire_in_window(cron, window_start, last_enqueued_at, now)
+                .or(Some(first_due));
+        }
+
+        if lookback_seconds >= total_span_seconds {
+            return Some(first_due);
+        }
+
+        lookback_seconds = lookback_seconds.saturating_mul(2).min(total_span_seconds);
     }
+}
+
+fn first_due_fire(
+    cron: &Cron,
+    search_start: chrono::DateTime<chrono_tz::Tz>,
+    last_enqueued_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    for fire_time in cron.iter_from(search_start) {
+        let fire_utc = fire_time.with_timezone(&Utc);
+        if fire_utc > now {
+            return None;
+        }
+        if last_enqueued_at.is_none_or(|last| fire_utc > last) {
+            return Some(fire_utc);
+        }
+    }
+
+    None
+}
+
+fn latest_due_fire_in_window(
+    cron: &Cron,
+    window_start: chrono::DateTime<chrono_tz::Tz>,
+    last_enqueued_at: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> Option<chrono::DateTime<Utc>> {
+    let mut latest_fire = None;
+
+    for fire_time in cron.iter_from(window_start) {
+        let fire_utc = fire_time.with_timezone(&Utc);
+        if fire_utc > now {
+            break;
+        }
+        if last_enqueued_at.is_none_or(|last| fire_utc > last) {
+            latest_fire = Some(fire_utc);
+        }
+    }
+
+    latest_fire
 }
 
 impl MaintenanceService {
@@ -1796,6 +1868,25 @@ mod tests {
         );
 
         let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap()]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_coalesces_to_latest_fire_after_long_outage() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 6, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row(
+            "*/1 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::Coalesce,
+        );
+
+        let fires = compute_fire_times(&row, now, 2);
 
         assert_eq!(
             fires,
