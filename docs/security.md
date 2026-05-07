@@ -123,17 +123,17 @@ the grant block against that schema:
 
 ```sql
 GRANT USAGE ON SCHEMA my_qs_schema TO awa_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA my_qs_schema TO awa_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA my_qs_schema TO awa_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA my_qs_schema TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO awa_runtime;
+  GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role only needs read/write/execute, never DDL.
+The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
 
 ### 5. Configure your processes
 

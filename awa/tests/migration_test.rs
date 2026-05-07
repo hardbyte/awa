@@ -9,8 +9,9 @@
 use awa::model::{insert_many, insert_many_copy_from_pool, migrations, storage, QueueStorage};
 use awa::{InsertOpts, InsertParams, JobArgs, UniqueOpts};
 use serde::{Deserialize, Serialize};
-use sqlx::postgres::{PgConnection, PgPoolOptions};
+use sqlx::postgres::{PgConnectOptions, PgConnection, PgPoolOptions};
 use sqlx::{Connection, PgPool};
+use std::str::FromStr;
 use std::sync::OnceLock;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -218,6 +219,70 @@ async fn active_queue_storage_schema(pool: &PgPool) -> Option<String> {
         .expect("active queue storage schema query should succeed")
 }
 
+fn assert_safe_generated_role_name(role: &str) {
+    assert!(
+        role.chars()
+            .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_'),
+        "generated test role contains unsafe characters: {role}"
+    );
+}
+
+async fn create_login_role(pool: &PgPool, role: &str) {
+    assert_safe_generated_role_name(role);
+    sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(pool)
+        .await
+        .expect("test role should be dropped before create");
+    sqlx::query(&format!(
+        "CREATE ROLE {role} LOGIN PASSWORD 'awa_test_password'"
+    ))
+    .execute(pool)
+    .await
+    .expect("test role should be created");
+}
+
+async fn drop_login_role(pool: &PgPool, role: &str) {
+    assert_safe_generated_role_name(role);
+    let _ = sqlx::query(&format!("DROP ROLE IF EXISTS {role}"))
+        .execute(pool)
+        .await;
+}
+
+async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: bool) {
+    assert_safe_generated_role_name(role);
+    let table_privileges = if include_truncate {
+        "SELECT, INSERT, UPDATE, DELETE, TRUNCATE"
+    } else {
+        "SELECT, INSERT, UPDATE, DELETE"
+    };
+    sqlx::raw_sql(&format!(
+        r#"
+        GRANT CONNECT ON DATABASE awa_migration_test TO {role};
+        GRANT USAGE ON SCHEMA awa TO {role};
+        GRANT USAGE, SELECT ON SEQUENCE awa.jobs_id_seq TO {role};
+        GRANT {table_privileges} ON ALL TABLES IN SCHEMA awa TO {role};
+        GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {role};
+        "#
+    ))
+    .execute(pool)
+    .await
+    .expect("runtime grants should apply");
+}
+
+async fn runtime_pool_for_role(role: &str) -> PgPool {
+    assert_safe_generated_role_name(role);
+    let options = PgConnectOptions::from_str(&migration_database_url())
+        .expect("migration database URL should parse")
+        .username(role)
+        .password("awa_test_password");
+    PgPoolOptions::new()
+        .max_connections(1)
+        .acquire_timeout(std::time::Duration::from_secs(5))
+        .connect_with(options)
+        .await
+        .expect("runtime role should connect")
+}
+
 async fn relation_exists(pool: &PgPool, qualified_relname: &str) -> bool {
     sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
         .bind(qualified_relname)
@@ -322,6 +387,44 @@ async fn test_migrations_are_idempotent() {
 
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+}
+
+#[tokio::test]
+async fn test_documented_runtime_grants_cover_admin_refresh_truncate() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.unwrap();
+
+    let suffix = Uuid::new_v4().simple().to_string();
+    let runtime_without_truncate = format!("awa_runtime_no_truncate_{suffix}");
+    let runtime_with_truncate = format!("awa_runtime_with_truncate_{suffix}");
+
+    create_login_role(&pool, &runtime_without_truncate).await;
+    create_login_role(&pool, &runtime_with_truncate).await;
+
+    grant_runtime_privileges(&pool, &runtime_without_truncate, false).await;
+    grant_runtime_privileges(&pool, &runtime_with_truncate, true).await;
+
+    let old_doc_pool = runtime_pool_for_role(&runtime_without_truncate).await;
+    let err = awa::model::admin::refresh_admin_metadata(&old_doc_pool)
+        .await
+        .expect_err("runtime grants without TRUNCATE should fail during metadata refresh");
+    assert_eq!(
+        sqlstate_from_awa_error(&err).as_deref(),
+        Some("42501"),
+        "missing TRUNCATE should surface as insufficient_privilege"
+    );
+    old_doc_pool.close().await;
+
+    let documented_pool = runtime_pool_for_role(&runtime_with_truncate).await;
+    awa::model::admin::refresh_admin_metadata(&documented_pool)
+        .await
+        .expect("documented runtime grants should allow metadata refresh");
+    documented_pool.close().await;
+
+    drop_login_role(&pool, &runtime_without_truncate).await;
+    drop_login_role(&pool, &runtime_with_truncate).await;
 }
 
 // ── Step-through upgrade with data survival ──────────────────────
