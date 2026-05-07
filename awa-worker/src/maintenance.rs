@@ -1013,73 +1013,6 @@ fn compute_fire_time(
     latest_fire
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn cron_row(
-        cron_expr: &str,
-        created_at: chrono::DateTime<Utc>,
-        last_enqueued_at: Option<chrono::DateTime<Utc>>,
-    ) -> CronJobRow {
-        CronJobRow {
-            name: "test_cron".to_string(),
-            cron_expr: cron_expr.to_string(),
-            timezone: "UTC".to_string(),
-            kind: "test_job".to_string(),
-            queue: "default".to_string(),
-            args: serde_json::json!({}),
-            priority: 2,
-            max_attempts: 25,
-            tags: Vec::new(),
-            metadata: serde_json::json!({}),
-            last_enqueued_at,
-            created_at,
-            updated_at: created_at,
-        }
-    }
-
-    #[test]
-    fn compute_fire_time_coalesces_missed_existing_fires() {
-        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
-        let row = cron_row("*/5 * * * * *", last, Some(last));
-
-        let fire = compute_fire_time(&row, now);
-
-        assert_eq!(
-            fire,
-            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap())
-        );
-    }
-
-    #[test]
-    fn compute_fire_time_returns_none_when_no_fire_is_due() {
-        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 2).unwrap();
-        let row = cron_row("*/5 * * * * *", last, Some(last));
-
-        let fire = compute_fire_time(&row, now);
-
-        assert_eq!(fire, None);
-    }
-
-    #[test]
-    fn compute_fire_time_keeps_first_registration_latest_only() {
-        let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
-        let row = cron_row("*/5 * * * * *", created_at, None);
-
-        let fire = compute_fire_time(&row, now);
-
-        assert_eq!(
-            fire,
-            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap())
-        );
-    }
-}
-
 impl MaintenanceService {
     /// Clean up runtime snapshots older than 24 hours.
     /// Runs as part of the leader's cleanup cycle (not on every snapshot publish).
@@ -1177,5 +1110,72 @@ impl MaintenanceService {
                 self.metrics.record_queue_lag(queue, lag_seconds);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn cron_row(
+        cron_expr: &str,
+        created_at: chrono::DateTime<Utc>,
+        last_enqueued_at: Option<chrono::DateTime<Utc>>,
+    ) -> CronJobRow {
+        CronJobRow {
+            name: "test_cron".to_string(),
+            cron_expr: cron_expr.to_string(),
+            timezone: "UTC".to_string(),
+            kind: "test_job".to_string(),
+            queue: "default".to_string(),
+            args: serde_json::json!({}),
+            priority: 2,
+            max_attempts: 25,
+            tags: Vec::new(),
+            metadata: serde_json::json!({}),
+            last_enqueued_at,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn compute_fire_time_coalesces_missed_existing_fires() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row("*/5 * * * * *", last, Some(last));
+
+        let fire = compute_fire_time(&row, now);
+
+        assert_eq!(
+            fire,
+            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap())
+        );
+    }
+
+    #[test]
+    fn compute_fire_time_returns_none_when_no_fire_is_due() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 2).unwrap();
+        let row = cron_row("*/5 * * * * *", last, Some(last));
+
+        let fire = compute_fire_time(&row, now);
+
+        assert_eq!(fire, None);
+    }
+
+    #[test]
+    fn compute_fire_time_keeps_first_registration_latest_only() {
+        let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
+        let row = cron_row("*/5 * * * * *", created_at, None);
+
+        let fire = compute_fire_time(&row, now);
+
+        assert_eq!(
+            fire,
+            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap())
+        );
     }
 }
