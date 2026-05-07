@@ -11,6 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -81,6 +82,7 @@ pub struct MaintenanceService {
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
+const CRON_CATCH_UP_LIMIT: usize = 1_000;
 type QueueStorageMetricRow = (String, i64, i64, i64, i64, i64, i64, i64, Option<f64>);
 
 impl MaintenanceService {
@@ -303,7 +305,6 @@ impl MaintenanceService {
             let mut promote_timer = tokio::time::interval(self.promote_interval);
             let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
             let mut cron_sync_timer = tokio::time::interval(self.cron_sync_interval);
-            let mut cron_eval_timer = tokio::time::interval(self.cron_eval_interval);
             let mut leader_check_timer = tokio::time::interval(self.leader_check_interval);
             let mut queue_stats_timer = tokio::time::interval(self.queue_stats_interval);
             let mut dirty_key_timer = tokio::time::interval(self.dirty_key_recompute_interval);
@@ -330,7 +331,6 @@ impl MaintenanceService {
             promote_timer.tick().await;
             cleanup_timer.tick().await;
             cron_sync_timer.tick().await;
-            cron_eval_timer.tick().await;
             leader_check_timer.tick().await;
             queue_stats_timer.tick().await;
             dirty_key_timer.tick().await;
@@ -348,12 +348,19 @@ impl MaintenanceService {
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
+            let cron_eval_cancel = self.cancel.child_token();
+            let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
+                self.pool.clone(),
+                cron_eval_cancel.clone(),
+                self.cron_eval_interval,
+            ));
 
             loop {
                 tokio::select! {
                     _ = self.cancel.cancelled() => {
                         debug!("Maintenance service shutting down");
                         self.leader.store(false, Ordering::SeqCst);
+                        Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
                         // Release leader lock on the same connection that acquired it.
                         // If this fails, dropping the connection will release the lock anyway.
                         let _ = Self::release_leader(&mut leader_conn).await;
@@ -379,9 +386,6 @@ impl MaintenanceService {
                     }
                     _ = cron_sync_timer.tick() => {
                         self.sync_periodic_jobs_to_db().await;
-                    }
-                    _ = cron_eval_timer.tick() => {
-                        self.evaluate_cron_schedules().await;
                     }
                     _ = queue_stats_timer.tick() => {
                         self.publish_queue_health_metrics().await;
@@ -429,6 +433,7 @@ impl MaintenanceService {
                         if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
                             warn!("Leader connection lost, re-entering election loop");
                             self.leader.store(false, Ordering::SeqCst);
+                            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
                             break;
                         }
                     }
@@ -470,6 +475,25 @@ impl MaintenanceService {
         Ok(())
     }
 
+    async fn run_cron_evaluator(pool: PgPool, cancel: CancellationToken, interval: Duration) {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = timer.tick() => {
+                    Self::evaluate_cron_schedules(&pool).await;
+                }
+            }
+        }
+    }
+
+    fn stop_cron_evaluator(cancel: &CancellationToken, task: &JoinHandle<()>) {
+        cancel.cancel();
+        task.abort();
+    }
+
     /// Sync all registered periodic job schedules to `awa.cron_jobs` via UPSERT.
     ///
     /// Additive only — does NOT delete schedules not in the local set (multi-deployment safe).
@@ -493,12 +517,13 @@ impl MaintenanceService {
 
     /// Evaluate all cron schedules and enqueue any that are due.
     ///
-    /// For each schedule, computes the latest fire time ≤ now that is after
-    /// `last_enqueued_at`. If a fire is due, executes the atomic CTE to
-    /// mark + insert in one statement.
-    #[tracing::instrument(skip(self), name = "maintenance.cron_eval")]
-    async fn evaluate_cron_schedules(&self) {
-        let cron_rows = match list_cron_jobs(&self.pool).await {
+    /// For each schedule, computes due fire times ≤ now that are after
+    /// `last_enqueued_at`. If fires are due, executes the atomic CTE for each
+    /// fire in order so delayed evaluation catches up instead of collapsing
+    /// intermediate fires.
+    #[tracing::instrument(skip(pool), name = "maintenance.cron_eval")]
+    async fn evaluate_cron_schedules(pool: &PgPool) {
+        let cron_rows = match list_cron_jobs(pool).await {
             Ok(rows) => rows,
             Err(err) => {
                 error!(error = %err, "Failed to load cron jobs for evaluation");
@@ -513,30 +538,43 @@ impl MaintenanceService {
         let now = Utc::now();
 
         for row in &cron_rows {
-            let fire_time = match compute_fire_time(row, now) {
-                Some(time) => time,
-                None => continue,
-            };
+            let fire_times = compute_fire_times(row, now, CRON_CATCH_UP_LIMIT);
+            if fire_times.is_empty() {
+                continue;
+            }
+            if fire_times.len() == CRON_CATCH_UP_LIMIT {
+                warn!(
+                    cron_name = %row.name,
+                    catch_up_limit = CRON_CATCH_UP_LIMIT,
+                    "Cron catch-up limit reached; remaining due fires will be retried on the next evaluation"
+                );
+            }
 
-            match atomic_enqueue(&self.pool, &row.name, fire_time, row.last_enqueued_at).await {
-                Ok(Some(job)) => {
-                    info!(
-                        cron_name = %row.name,
-                        job_id = job.id,
-                        fire_time = %fire_time,
-                        "Enqueued periodic job"
-                    );
-                }
-                Ok(None) => {
-                    // Another leader already claimed this fire — not an error
-                    debug!(cron_name = %row.name, "Cron fire already claimed");
-                }
-                Err(err) => {
-                    error!(
-                        cron_name = %row.name,
-                        error = %err,
-                        "Failed to enqueue periodic job"
-                    );
+            let mut previous_enqueued_at = row.last_enqueued_at;
+            for fire_time in fire_times {
+                match atomic_enqueue(pool, &row.name, fire_time, previous_enqueued_at).await {
+                    Ok(Some(job)) => {
+                        previous_enqueued_at = Some(fire_time);
+                        info!(
+                            cron_name = %row.name,
+                            job_id = job.id,
+                            fire_time = %fire_time,
+                            "Enqueued periodic job"
+                        );
+                    }
+                    Ok(None) => {
+                        // Another leader already claimed this fire — not an error
+                        debug!(cron_name = %row.name, "Cron fire already claimed");
+                        break;
+                    }
+                    Err(err) => {
+                        error!(
+                            cron_name = %row.name,
+                            error = %err,
+                            "Failed to enqueue periodic job"
+                        );
+                        break;
+                    }
                 }
             }
         }
@@ -1397,18 +1435,21 @@ impl Drop for MaintenanceAliveGuard {
     }
 }
 
-/// Compute the latest fire time for a cron job row, using its expression and timezone.
+/// Compute due fire times for a cron job row, using its expression and timezone.
 ///
-/// Returns `None` if no fire is due (next occurrence is in the future).
-fn compute_fire_time(
+/// Existing schedules catch up missed fires up to `limit`. First registration
+/// still enqueues only the latest due fire to avoid backfilling before the
+/// schedule was known to AWA.
+fn compute_fire_times(
     row: &CronJobRow,
     now: chrono::DateTime<Utc>,
-) -> Option<chrono::DateTime<Utc>> {
+    limit: usize,
+) -> Vec<chrono::DateTime<Utc>> {
     let cron = match Cron::new(&row.cron_expr).with_seconds_optional().parse() {
         Ok(c) => c,
         Err(err) => {
             error!(cron_name = %row.name, error = %err, "Invalid cron expression in database");
-            return None;
+            return Vec::new();
         }
     };
 
@@ -1416,7 +1457,7 @@ fn compute_fire_time(
         Ok(tz) => tz,
         Err(err) => {
             error!(cron_name = %row.name, error = %err, "Invalid timezone in database");
-            return None;
+            return Vec::new();
         }
     };
 
@@ -1429,6 +1470,7 @@ fn compute_fire_time(
         None => (row.created_at - chrono::Duration::minutes(1)).with_timezone(&tz),
     };
 
+    let mut fire_times = Vec::new();
     let mut latest_fire: Option<chrono::DateTime<Utc>> = None;
 
     for fire_time in cron.iter_from(search_start) {
@@ -1444,10 +1486,100 @@ fn compute_fire_time(
             }
         }
 
-        latest_fire = Some(fire_utc);
+        if row.last_enqueued_at.is_none() {
+            latest_fire = Some(fire_utc);
+            continue;
+        }
+
+        fire_times.push(fire_utc);
+        if fire_times.len() >= limit {
+            break;
+        }
     }
 
-    latest_fire
+    if row.last_enqueued_at.is_none() {
+        latest_fire.into_iter().collect()
+    } else {
+        fire_times
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn cron_row(
+        cron_expr: &str,
+        created_at: chrono::DateTime<Utc>,
+        last_enqueued_at: Option<chrono::DateTime<Utc>>,
+    ) -> CronJobRow {
+        CronJobRow {
+            name: "test_cron".to_string(),
+            cron_expr: cron_expr.to_string(),
+            timezone: "UTC".to_string(),
+            kind: "test_job".to_string(),
+            queue: "default".to_string(),
+            args: serde_json::json!({}),
+            priority: 2,
+            max_attempts: 25,
+            tags: Vec::new(),
+            metadata: serde_json::json!({}),
+            last_enqueued_at,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn compute_fire_times_catches_up_missed_existing_fires() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row("*/5 * * * * *", last, Some(last));
+
+        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 15).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_limits_catch_up_work() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let row = cron_row("*/5 * * * * *", last, Some(last));
+
+        let fires = compute_fire_times(&row, now, 2);
+
+        assert_eq!(
+            fires,
+            vec![
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_keeps_first_registration_latest_only() {
+        let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
+        let row = cron_row("*/5 * * * * *", created_at, None);
+
+        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap()]
+        );
+    }
 }
 
 impl MaintenanceService {
