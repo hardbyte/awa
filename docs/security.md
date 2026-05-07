@@ -133,7 +133,7 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
+The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute privileges plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
 
 ### 5. Configure your processes
 
