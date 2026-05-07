@@ -1516,120 +1516,6 @@ fn compute_fire_times(
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::TimeZone;
-
-    fn cron_row(
-        cron_expr: &str,
-        created_at: chrono::DateTime<Utc>,
-        last_enqueued_at: Option<chrono::DateTime<Utc>>,
-        missed_fire_policy: CronMissedFirePolicy,
-    ) -> CronJobRow {
-        CronJobRow {
-            name: "test_cron".to_string(),
-            cron_expr: cron_expr.to_string(),
-            timezone: "UTC".to_string(),
-            kind: "test_job".to_string(),
-            queue: "default".to_string(),
-            args: serde_json::json!({}),
-            priority: 2,
-            max_attempts: 25,
-            tags: Vec::new(),
-            metadata: serde_json::json!({}),
-            missed_fire_policy: missed_fire_policy.as_str().to_string(),
-            last_enqueued_at,
-            created_at,
-            updated_at: created_at,
-        }
-    }
-
-    #[test]
-    fn compute_fire_times_coalesces_missed_existing_fires_by_default() {
-        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
-        let row = cron_row(
-            "*/5 * * * * *",
-            last,
-            Some(last),
-            CronMissedFirePolicy::Coalesce,
-        );
-
-        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
-
-        assert_eq!(
-            fires,
-            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap()]
-        );
-    }
-
-    #[test]
-    fn compute_fire_times_catches_up_when_policy_requests_it() {
-        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
-        let row = cron_row(
-            "*/5 * * * * *",
-            last,
-            Some(last),
-            CronMissedFirePolicy::CatchUp,
-        );
-
-        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
-
-        assert_eq!(
-            fires,
-            vec![
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 15).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn compute_fire_times_limits_catch_up_work() {
-        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
-        let row = cron_row(
-            "*/5 * * * * *",
-            last,
-            Some(last),
-            CronMissedFirePolicy::CatchUp,
-        );
-
-        let fires = compute_fire_times(&row, now, 2);
-
-        assert_eq!(
-            fires,
-            vec![
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
-            ]
-        );
-    }
-
-    #[test]
-    fn compute_fire_times_keeps_first_registration_latest_only() {
-        let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
-        let row = cron_row(
-            "*/5 * * * * *",
-            created_at,
-            None,
-            CronMissedFirePolicy::CatchUp,
-        );
-
-        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
-
-        assert_eq!(
-            fires,
-            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap()]
-        );
-    }
-}
-
 impl MaintenanceService {
     /// Clean up runtime snapshots older than 24 hours.
     /// Runs as part of the leader's cleanup cycle (not on every snapshot publish).
@@ -1866,5 +1752,119 @@ impl MaintenanceService {
                 self.metrics.record_queue_lag(&queue, lag_seconds);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn cron_row(
+        cron_expr: &str,
+        created_at: chrono::DateTime<Utc>,
+        last_enqueued_at: Option<chrono::DateTime<Utc>>,
+        missed_fire_policy: CronMissedFirePolicy,
+    ) -> CronJobRow {
+        CronJobRow {
+            name: "test_cron".to_string(),
+            cron_expr: cron_expr.to_string(),
+            timezone: "UTC".to_string(),
+            kind: "test_job".to_string(),
+            queue: "default".to_string(),
+            args: serde_json::json!({}),
+            priority: 2,
+            max_attempts: 25,
+            tags: Vec::new(),
+            metadata: serde_json::json!({}),
+            missed_fire_policy: missed_fire_policy.as_str().to_string(),
+            last_enqueued_at,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn compute_fire_times_coalesces_missed_existing_fires_by_default() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row(
+            "*/5 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::Coalesce,
+        );
+
+        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap()]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_catches_up_when_policy_requests_it() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row(
+            "*/5 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::CatchUp,
+        );
+
+        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 15).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_limits_catch_up_work() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let row = cron_row(
+            "*/5 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::CatchUp,
+        );
+
+        let fires = compute_fire_times(&row, now, 2);
+
+        assert_eq!(
+            fires,
+            vec![
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
+                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
+            ]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_keeps_first_registration_latest_only() {
+        let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
+        let row = cron_row(
+            "*/5 * * * * *",
+            created_at,
+            None,
+            CronMissedFirePolicy::CatchUp,
+        );
+
+        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap()]
+        );
     }
 }
