@@ -68,6 +68,7 @@ jobs:
 
           checks = [
               ("Cargo.toml", cargo_version("Cargo.toml")),
+              ("awa-cli/pyproject.toml", pyproject_version("awa-cli/pyproject.toml")),
               ("awa-python/Cargo.toml", cargo_version("awa-python/Cargo.toml")),
               ("awa-python/pyproject.toml", pyproject_version("awa-python/pyproject.toml")),
               ("awa-python/pyproject.toml [ui] extra", ui_extra_pin("awa-python/pyproject.toml")),
