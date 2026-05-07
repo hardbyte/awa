@@ -915,8 +915,8 @@ Python.
 
 ### Lifecycle Hooks
 
-Builder-side lifecycle hooks let applications react to committed job outcomes
-without growing the `Worker` trait surface. See
+Builder-side lifecycle hooks let applications react when a job starts and when
+committed job outcomes are applied, without growing the `Worker` trait surface. See
 [ADR-015](adr/015-post-commit-lifecycle-hooks.md) for the design rationale:
 
 ```rust
@@ -931,11 +931,14 @@ let client = Client::builder(pool)
     .build()?;
 ```
 
-Hooks are best-effort, post-commit notifications. They run in detached tasks
-after the job's in-flight permit has been released — a slow or panicking hook
-cannot block queue capacity or delay other jobs. `shutdown()` does not wait
-for hook tasks to complete; in-flight hooks may be dropped during shutdown.
-If the side effect must be durable or retried, enqueue another job instead.
+Hooks are best-effort notifications. `Started` dispatch is scheduled after the
+claim commits and before the worker handler is invoked; outcome events fire
+only after their guarded state transition commits. Hooks run in detached tasks
+— a slow or panicking hook cannot block queue capacity or delay other jobs, and
+very short jobs may complete before a started hook finishes. `shutdown()` does
+not wait for hook tasks to complete; in-flight hooks may be dropped during
+shutdown. If the side effect must be durable or retried, enqueue another job
+instead.
 
 ### Scheduler Flow (Leader-Only)
 

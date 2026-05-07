@@ -1168,6 +1168,8 @@ pub struct QueueRuntimeConfigSnapshot {
     pub poll_interval_ms: u64,
     pub deadline_duration_secs: u64,
     pub priority_aging_interval_secs: u64,
+    #[serde(default)]
+    pub dlq_enabled: Option<bool>,
     pub rate_limit: Option<RateLimitSnapshot>,
 }
 
@@ -1389,6 +1391,41 @@ pub struct QueueRuntimeSummary {
     pub overflow_held_total: Option<u64>,
     pub config_mismatch: bool,
     pub config: Option<QueueRuntimeConfigSnapshot>,
+}
+
+fn queue_runtime_configs_match(
+    left: &QueueRuntimeConfigSnapshot,
+    right: &QueueRuntimeConfigSnapshot,
+) -> bool {
+    left.mode == right.mode
+        && left.max_workers == right.max_workers
+        && left.min_workers == right.min_workers
+        && left.weight == right.weight
+        && left.global_max_workers == right.global_max_workers
+        && left.poll_interval_ms == right.poll_interval_ms
+        && left.deadline_duration_secs == right.deadline_duration_secs
+        && left.priority_aging_interval_secs == right.priority_aging_interval_secs
+        && left.rate_limit == right.rate_limit
+        && (left.dlq_enabled.is_none()
+            || right.dlq_enabled.is_none()
+            || left.dlq_enabled == right.dlq_enabled)
+}
+
+fn representative_queue_runtime_config(
+    configs: &[QueueRuntimeConfigSnapshot],
+) -> Option<QueueRuntimeConfigSnapshot> {
+    let first = configs.first()?;
+    if first.dlq_enabled.is_some() {
+        return Some(first.clone());
+    }
+
+    configs
+        .iter()
+        .find(|candidate| {
+            candidate.dlq_enabled.is_some() && queue_runtime_configs_match(first, candidate)
+        })
+        .cloned()
+        .or_else(|| Some(first.clone()))
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1658,11 +1695,12 @@ where
             } else {
                 live_configs
             };
-            let config = config_candidates.first().cloned();
-            let config_mismatch = config_candidates
-                .iter()
-                .skip(1)
-                .any(|candidate| Some(candidate) != config.as_ref());
+            let config = representative_queue_runtime_config(&config_candidates);
+            let config_mismatch = config_candidates.iter().skip(1).any(|candidate| {
+                config
+                    .as_ref()
+                    .is_some_and(|cfg| !queue_runtime_configs_match(cfg, candidate))
+            });
 
             QueueRuntimeSummary {
                 queue,

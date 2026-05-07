@@ -33,7 +33,7 @@ test.describe("Queues page", () => {
       "Running",
       "Retry",
       "Failed",
-      "Rate/hr",
+      "Completed/hr",
       "Capacity",
       "Status",
       "Actions",
@@ -74,6 +74,73 @@ test.describe("Queues page", () => {
     }
   });
 
+  test("queue table surfaces DLQ policy from runtime config", async ({ page }) => {
+    await page.route("**/api/queues", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            queue: "dlq_off_queue",
+            display_name: "DLQ Off Queue",
+            description: null,
+            owner: null,
+            docs_url: null,
+            tags: [],
+            extra: {},
+            descriptor_last_seen_at: "2026-03-01T00:00:00Z",
+            descriptor_stale: false,
+            descriptor_mismatch: false,
+            total_queued: 1,
+            scheduled: 0,
+            available: 1,
+            retryable: 0,
+            running: 0,
+            failed: 1,
+            waiting_external: 0,
+            completed_last_hour: 0,
+            lag_seconds: 1,
+            paused: false,
+          },
+        ]),
+      });
+    });
+    await page.route("**/api/queues/runtime", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            queue: "dlq_off_queue",
+            instance_count: 1,
+            live_instances: 1,
+            stale_instances: 0,
+            healthy_instances: 1,
+            total_in_flight: 0,
+            overflow_held_total: 0,
+            config_mismatch: false,
+            config: {
+              mode: "weighted",
+              max_workers: null,
+              min_workers: 1,
+              weight: 1,
+              global_max_workers: 16,
+              poll_interval_ms: 200,
+              deadline_duration_secs: 300,
+              priority_aging_interval_secs: 60,
+              dlq_enabled: false,
+              rate_limit: null,
+            },
+          },
+        ]),
+      });
+    });
+
+    await page.goto("/queues");
+
+    const queueTable = page.getByRole("grid", { name: "Queues" });
+    await expect(queueTable.getByRole("rowheader", { name: /DLQ Off Queue/ })).toBeVisible();
+    await expect(queueTable.getByText("DLQ off", { exact: true })).toBeVisible();
+  });
+
   test("click queue navigates to queue detail", async ({ page }) => {
     await loadQueuesPage(page);
 
@@ -98,6 +165,81 @@ test.describe("Queues page", () => {
     await expect(page.getByText("End-to-end queue used for UI coverage")).toBeVisible();
     await expect(page.getByText("qa-platform")).toBeVisible();
     await expect(page.getByText("critical")).toBeVisible();
+  });
+
+  test("queue detail links to filtered DLQ rows when DLQ is enabled", async ({ page }) => {
+    await page.route("**/api/queues/payments", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({
+          queue: "payments",
+          display_name: "Payments",
+          description: "Customer payment processing",
+          owner: "platform",
+          docs_url: null,
+          tags: ["critical"],
+          extra: {},
+          descriptor_last_seen_at: "2026-03-01T00:00:00Z",
+          descriptor_stale: false,
+          descriptor_mismatch: false,
+          total_queued: 1,
+          scheduled: 0,
+          available: 1,
+          retryable: 0,
+          running: 0,
+          failed: 1,
+          waiting_external: 0,
+          completed_last_hour: 0,
+          lag_seconds: 1,
+          paused: false,
+        }),
+      });
+    });
+    await page.route("**/api/queues/runtime", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify([
+          {
+            queue: "payments",
+            instance_count: 1,
+            live_instances: 1,
+            stale_instances: 0,
+            healthy_instances: 1,
+            total_in_flight: 0,
+            overflow_held_total: 0,
+            config_mismatch: false,
+            config: {
+              mode: "weighted",
+              max_workers: null,
+              min_workers: 1,
+              weight: 1,
+              global_max_workers: 16,
+              poll_interval_ms: 200,
+              deadline_duration_secs: 300,
+              priority_aging_interval_secs: 60,
+              dlq_enabled: true,
+              rate_limit: null,
+            },
+          },
+        ]),
+      });
+    });
+    await page.route("**/api/dlq/depth", async (route) => {
+      await route.fulfill({
+        contentType: "application/json",
+        body: JSON.stringify({ total: 0, by_queue: [] }),
+      });
+    });
+    await page.route("**/api/dlq**", async (route) => {
+      await route.fulfill({ contentType: "application/json", body: JSON.stringify([]) });
+    });
+
+    await page.goto("/queues/payments");
+
+    const dlqLink = page.getByRole("link", { name: "View DLQ rows" });
+    await expect(dlqLink).toBeVisible();
+    await dlqLink.click();
+    await expect(page).toHaveURL(/\/dlq\?q=queue%3Apayments$/);
   });
 
   test("legacy queue still renders without descriptors", async ({ page }) => {

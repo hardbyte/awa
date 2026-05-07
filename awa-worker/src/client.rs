@@ -263,9 +263,13 @@ impl ClientBuilder {
 
     /// Register a typed lifecycle event handler for a job kind.
     ///
-    /// Handlers run only after the corresponding DB state transition commits.
-    /// They are best-effort in-process hooks, not a durable workflow mechanism.
-    /// Capture any shared dependencies you need in the closure environment.
+    /// `Started` dispatch is scheduled after the claim commits and before the
+    /// worker handler is invoked. Outcome handlers run only after the
+    /// corresponding DB state transition commits. Hooks are best-effort
+    /// in-process notifications, not a durable workflow mechanism; because
+    /// they run in detached tasks, a very short job can complete before a
+    /// `Started` handler finishes. Capture any shared dependencies you need in
+    /// the closure environment.
     pub fn on_event<T, F, Fut>(mut self, handler: F) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -303,7 +307,7 @@ impl ClientBuilder {
     /// Register an untyped lifecycle event handler for a specific job kind.
     ///
     /// Use this with `register_worker(...)` or for cross-cutting logic that
-    /// doesn't need typed args.
+    /// doesn't need typed args. Timing matches `on_event(...)`.
     pub fn on_event_kind<F, Fut>(mut self, kind: impl Into<String>, handler: F) -> Self
     where
         F: Fn(UntypedJobEvent) -> Fut + Send + Sync + 'static,
@@ -818,6 +822,7 @@ struct RuntimeReporterState {
     dispatch_cancel: CancellationToken,
     overflow_pool: Option<Arc<OverflowPool>>,
     global_max_workers: Option<u32>,
+    dlq_policy: DlqPolicy,
     instance_id: Uuid,
     started_at: DateTime<Utc>,
     hostname: Option<String>,
@@ -1010,6 +1015,7 @@ impl Client {
             dispatch_cancel: self.dispatch_cancel.clone(),
             overflow_pool: self.overflow_pool.clone(),
             global_max_workers: self.global_max_workers,
+            dlq_policy: self.dlq_policy.clone(),
             instance_id: self.runtime_instance_id,
             started_at: self.runtime_started_at,
             hostname: self.runtime_hostname.clone(),
@@ -1556,6 +1562,7 @@ impl RuntimeReporterState {
                 poll_interval_ms: config.poll_interval.as_millis() as u64,
                 deadline_duration_secs: config.deadline_duration.as_secs(),
                 priority_aging_interval_secs: config.priority_aging_interval.as_secs(),
+                dlq_enabled: Some(self.dlq_policy.enabled_for(queue)),
                 rate_limit: config.rate_limit.as_ref().map(|rl| RateLimitSnapshot {
                     max_rate: rl.max_rate,
                     burst: rl.burst,

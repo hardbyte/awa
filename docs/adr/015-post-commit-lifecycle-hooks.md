@@ -1,4 +1,4 @@
-# ADR-015: Builder-Side Post-Commit Lifecycle Hooks
+# ADR-015: Builder-Side Lifecycle Hooks
 
 ## Status
 
@@ -13,12 +13,14 @@ backed it out after review because it was the wrong abstraction:
 - It coupled job execution with follow-up side effects
 - It encouraged growing the `Worker` trait for every new lifecycle need
 
-Awa still needed a way for applications to react to committed job outcomes:
+Awa still needed a way for applications to react to job execution starts and
+committed job outcomes:
 
 - Job-type-specific cleanup on permanent failure
 - Cross-cutting metrics or alerting for a specific kind
 - A hook model that works for both typed and raw worker registration
-- Semantics that do not fire for stale completions or uncommitted outcomes
+- Outcome semantics that do not fire for stale completions or uncommitted
+  outcomes
 
 The solution also had to fit Awa's existing execution model. Finalization is
 guarded by `run_lease` (ADR-013), and queue capacity must not be held open by
@@ -34,12 +36,13 @@ Add builder-side lifecycle hooks keyed by job kind:
 
 Supported events are:
 
+- `Started`
 - `Completed`
 - `Retried`
 - `Exhausted`
 - `Cancelled`
 
-No lifecycle event is emitted for:
+No lifecycle outcome event is emitted for:
 
 - `Snooze`, because it is an internal reschedule rather than a meaningful
   outcome for observers
@@ -48,22 +51,32 @@ No lifecycle event is emitted for:
 
 ### Emission Semantics
 
-Hooks run only after the corresponding database state transition commits
-successfully. The event carries the updated `JobRow`, so `job.state` reflects
-the post-transition state.
+`Started` dispatch is scheduled after the claim transaction commits and before
+the worker handler is invoked. The event carries the claimed `JobRow`, so
+`job.state` reflects `running`.
 
-If guarded finalization rejects the outcome as stale, no lifecycle event is
-emitted.
+Outcome hooks run only after the corresponding database state transition
+commits successfully. The event carries the updated `JobRow`, so `job.state`
+reflects the post-transition state.
+
+If guarded finalization rejects the outcome as stale, no lifecycle outcome
+event is emitted. A `Started` event may already have been emitted for the
+claimed attempt.
 
 ### Execution Semantics
 
 Hooks are best-effort, in-process notifications:
 
-- They run in detached tasks after the in-flight permit is released
-- They do not block executor progress or queue capacity
+- `Started` hooks run in detached tasks while the attempt is in flight; outcome
+  hooks run in detached tasks after the in-flight permit is released
+- Hooks do not block executor progress or queue capacity
 - `shutdown()` does not wait for them
 - Handlers for a kind run sequentially; panics are logged and later handlers
   still run
+- `Started` dispatch is detached so a slow hook does not delay handler
+  execution; very fast jobs may therefore complete before a started hook
+  finishes, and observers should not rely on strict started-before-outcome
+  delivery ordering for short jobs
 - If a hook side effect must be durable or retried, that logic should enqueue
   another job instead
 

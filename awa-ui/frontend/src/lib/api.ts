@@ -100,6 +100,7 @@ export interface QueueRuntimeConfigSnapshot {
   poll_interval_ms: number;
   deadline_duration_secs: number;
   priority_aging_interval_secs: number;
+  dlq_enabled?: boolean | null;
   rate_limit: RateLimitSnapshot | null;
 }
 

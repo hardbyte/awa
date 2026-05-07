@@ -16,7 +16,7 @@ import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
+import { Button, buttonStyles } from "@/components/ui/button";
 import { Card, CardContent, CardHeader } from "@/components/ui/card";
 import {
   DescriptionDetails,
@@ -27,6 +27,12 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
 import type { QueueRuntimeSummary } from "@/lib/api";
 import { timeAgo } from "@/lib/time";
+import {
+  dlqPolicyIntent,
+  dlqPolicyLabel,
+  queueCapacityLabel,
+  rateLimitLabel,
+} from "@/components/RuntimeDisplay";
 
 export function QueueDetailPage() {
   const { name } = useParams({ strict: false });
@@ -125,6 +131,11 @@ export function QueueDetailPage() {
         ) : (
           <Badge intent="success">Active</Badge>
         )}
+        {runtime?.config && (
+          <Badge intent={dlqPolicyIntent(runtime.config)}>
+            {dlqPolicyLabel(runtime.config)}
+          </Badge>
+        )}
         {queue.descriptor_stale && <Badge intent="warning">Descriptor stale</Badge>}
         {queue.descriptor_mismatch && <Badge intent="danger">Descriptor drift</Badge>}
       </div>
@@ -141,6 +152,15 @@ export function QueueDetailPage() {
         >
           View jobs
         </Button>
+        {runtime?.config?.dlq_enabled === true && (
+          <Link
+            to="/dlq"
+            search={{ q: `queue:${queue.queue}` }}
+            className={buttonStyles({ intent: "outline", size: "sm" })}
+          >
+            View DLQ rows
+          </Link>
+        )}
         {queue.paused ? (
           <Button
             intent="outline"
@@ -266,7 +286,7 @@ export function QueueDetailPage() {
 
             <DescriptionTerm>Lag</DescriptionTerm>
             <DescriptionDetails>
-              <LagValue seconds={queue.lag_seconds} />
+              <LagValue seconds={queue.lag_seconds} /> s
             </DescriptionDetails>
           </DescriptionList>
         </CardContent>
@@ -291,10 +311,33 @@ export function QueueDetailPage() {
               {runtime.config && (
                 <>
                   <DescriptionTerm>Mode</DescriptionTerm>
-                  <DescriptionDetails>{runtime.config.mode}</DescriptionDetails>
+                  <DescriptionDetails>
+                    {runtime.config.mode === "weighted" ? "Weighted" : "Reserved"}
+                  </DescriptionDetails>
+
+                  <DescriptionTerm>Capacity</DescriptionTerm>
+                  <DescriptionDetails>{queueCapacityLabel(runtime.config)}</DescriptionDetails>
+
+                  <DescriptionTerm>Rate limit</DescriptionTerm>
+                  <DescriptionDetails>{rateLimitLabel(runtime.config)}</DescriptionDetails>
 
                   <DescriptionTerm>Poll interval</DescriptionTerm>
                   <DescriptionDetails>{runtime.config.poll_interval_ms} ms</DescriptionDetails>
+
+                  <DescriptionTerm>Deadline duration</DescriptionTerm>
+                  <DescriptionDetails>{runtime.config.deadline_duration_secs} s</DescriptionDetails>
+
+                  <DescriptionTerm>Priority aging</DescriptionTerm>
+                  <DescriptionDetails>
+                    {runtime.config.priority_aging_interval_secs} s
+                  </DescriptionDetails>
+
+                  <DescriptionTerm>DLQ policy</DescriptionTerm>
+                  <DescriptionDetails>
+                    <Badge intent={dlqPolicyIntent(runtime.config)}>
+                      {dlqPolicyLabel(runtime.config)}
+                    </Badge>
+                  </DescriptionDetails>
                 </>
               )}
 

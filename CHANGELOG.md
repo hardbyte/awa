@@ -5,6 +5,20 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+### Added
+
+- **Lifecycle hooks now include `Started` events**. `JobEvent<T>` and
+  `UntypedJobEvent` fire `Started` after a claim commits and just before the
+  worker handler is invoked, so applications can observe job execution
+  beginning as well as final outcomes.
+
+### Changed
+
+- **Breaking alpha API change:** exhaustive matches on `JobEvent<T>` or
+  `UntypedJobEvent` must handle the new `Started` variant. No stable Awa
+  release has been published yet, so this is documented as an alpha-series
+  source break.
+
 ## [0.6.0-alpha.7] — 2026-05-07
 
 ### Added

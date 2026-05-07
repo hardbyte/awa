@@ -33,6 +33,8 @@ import {
   instanceLabel,
   LoopStatus,
   PostgresBadge,
+  dlqPolicyIntent,
+  dlqPolicyLabel,
   queueCapacityLabel,
   queueConfigDetails,
   queueListLabel,
@@ -543,6 +545,16 @@ export function RuntimePage() {
                     <span>{queue.config?.global_max_workers ?? "—"}</span>
                     <span className="text-muted-fg">Rate limit</span>
                     <span>{rateLimitLabel(queue.config)}</span>
+                    <span className="text-muted-fg">DLQ</span>
+                    <span>
+                      {queue.config ? (
+                        <Badge intent={dlqPolicyIntent(queue.config)}>
+                          {dlqPolicyLabel(queue.config)}
+                        </Badge>
+                      ) : (
+                        "—"
+                      )}
+                    </span>
                     <span className="text-muted-fg">In flight</span>
                     <span>{queue.total_in_flight}</span>
                     <span className="text-muted-fg">Nodes</span>
@@ -576,6 +588,7 @@ export function RuntimePage() {
               <TableColumn>Mode</TableColumn>
               <TableColumn>Capacity</TableColumn>
               <TableColumn>Rate limit</TableColumn>
+              <TableColumn>DLQ</TableColumn>
               <TableColumn className="text-right">In flight</TableColumn>
               <TableColumn>Nodes</TableColumn>
               <TableColumn>Notes</TableColumn>
@@ -620,6 +633,15 @@ export function RuntimePage() {
                     <TableCell>
                       <div>{rateLimitLabel(queue.config)}</div>
                       <div className="text-xs text-muted-fg">{queueConfigDetails(queue.config)}</div>
+                    </TableCell>
+                    <TableCell>
+                      {queue.config ? (
+                        <Badge intent={dlqPolicyIntent(queue.config)}>
+                          {dlqPolicyLabel(queue.config)}
+                        </Badge>
+                      ) : (
+                        "—"
+                      )}
                     </TableCell>
                     <TableCell className="text-right tabular-nums">
                       {queue.total_in_flight}

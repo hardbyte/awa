@@ -90,6 +90,7 @@ test.describe("Runtime page", () => {
                     poll_interval_ms: 200,
                     deadline_duration_secs: 300,
                     priority_aging_interval_secs: 60,
+                    dlq_enabled: true,
                     rate_limit: { max_rate: 5.5, burst: 10 },
                   },
                 },
@@ -126,6 +127,7 @@ test.describe("Runtime page", () => {
                     poll_interval_ms: 200,
                     deadline_duration_secs: 300,
                     priority_aging_interval_secs: 60,
+                    dlq_enabled: true,
                     rate_limit: { max_rate: 5.5, burst: 10 },
                   },
                 },
@@ -158,6 +160,7 @@ test.describe("Runtime page", () => {
               poll_interval_ms: 200,
               deadline_duration_secs: 300,
               priority_aging_interval_secs: 60,
+              dlq_enabled: true,
               rate_limit: { max_rate: 5.5, burst: 10 },
             },
           },
@@ -178,10 +181,11 @@ test.describe("Runtime page", () => {
     const queueGrid = page.getByRole("grid", { name: "Queue runtime summary" });
     await expect(queueGrid).toBeVisible();
     await expect(queueGrid.getByRole("rowheader", { name: "email" })).toBeVisible();
-    await expect(queueGrid.getByRole("gridcell", { name: "min 2 / w 3" })).toBeVisible();
-    await expect(queueGrid.getByRole("gridcell", { name: "5.5/s (10)" })).toBeVisible();
+    await expect(queueGrid.getByRole("gridcell", { name: "min 2 / weight 3" })).toBeVisible();
+    await expect(queueGrid.getByRole("gridcell", { name: /5\.5\/s · burst 10/ })).toBeVisible();
     await expect(queueGrid.getByText("global 16")).toBeVisible();
-    await expect(queueGrid.getByText("poll 200ms · deadline 300s · aging 60s")).toBeVisible();
+    await expect(queueGrid.getByText("DLQ on", { exact: true })).toBeVisible();
+    await expect(queueGrid.getByText("poll 200ms · deadline 300s · aging 60s · DLQ on")).toBeVisible();
     await expect(queueGrid.getByRole("gridcell", { name: "overflow held 1" })).toBeVisible();
   });
 
@@ -227,6 +231,7 @@ test.describe("Runtime page", () => {
                     poll_interval_ms: 200,
                     deadline_duration_secs: 300,
                     priority_aging_interval_secs: 60,
+                    dlq_enabled: true,
                     rate_limit: { max_rate: 5.5, burst: 10 },
                   },
                 },
@@ -259,6 +264,7 @@ test.describe("Runtime page", () => {
               poll_interval_ms: 200,
               deadline_duration_secs: 300,
               priority_aging_interval_secs: 60,
+              dlq_enabled: true,
               rate_limit: { max_rate: 5.5, burst: 10 },
             },
           },
@@ -282,7 +288,7 @@ test.describe("Runtime page", () => {
     });
     await expect(assignmentsGrid).toBeVisible();
     await expect(
-      assignmentsGrid.getByText("poll 200ms · deadline 300s · aging 60s")
+      assignmentsGrid.getByText("poll 200ms · deadline 300s · aging 60s · DLQ on")
     ).toBeVisible();
   });
 });

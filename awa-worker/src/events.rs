@@ -8,6 +8,8 @@ use std::time::Duration;
 /// Typed lifecycle event for a specific job argument type.
 #[derive(Debug, Clone)]
 pub enum JobEvent<T> {
+    /// Job execution started after the claim committed.
+    Started { args: T, job: JobRow },
     /// Job completed successfully.
     Completed {
         args: T,
@@ -41,7 +43,8 @@ impl<T> JobEvent<T> {
     /// The job snapshot associated with this event.
     pub fn job(&self) -> &JobRow {
         match self {
-            JobEvent::Completed { job, .. }
+            JobEvent::Started { job, .. }
+            | JobEvent::Completed { job, .. }
             | JobEvent::Retried { job, .. }
             | JobEvent::Exhausted { job, .. }
             | JobEvent::Cancelled { job, .. } => job,
@@ -52,6 +55,8 @@ impl<T> JobEvent<T> {
 /// Untyped lifecycle event keyed only by job kind.
 #[derive(Debug, Clone)]
 pub enum UntypedJobEvent {
+    /// Job execution started after the claim committed.
+    Started { job: JobRow },
     /// Job completed successfully.
     Completed { job: JobRow, duration: Duration },
     /// Job failed but will be retried later.
@@ -75,7 +80,8 @@ impl UntypedJobEvent {
     /// The job snapshot associated with this event.
     pub fn job(&self) -> &JobRow {
         match self {
-            UntypedJobEvent::Completed { job, .. }
+            UntypedJobEvent::Started { job, .. }
+            | UntypedJobEvent::Completed { job, .. }
             | UntypedJobEvent::Retried { job, .. }
             | UntypedJobEvent::Exhausted { job, .. }
             | UntypedJobEvent::Cancelled { job, .. } => job,
@@ -84,6 +90,7 @@ impl UntypedJobEvent {
 
     pub(crate) fn into_typed<T>(self, args: T) -> JobEvent<T> {
         match self {
+            UntypedJobEvent::Started { job } => JobEvent::Started { args, job },
             UntypedJobEvent::Completed { job, duration } => JobEvent::Completed {
                 args,
                 job,
