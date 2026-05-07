@@ -106,6 +106,8 @@ CREATE TABLE awa.cron_jobs (
     max_attempts     SMALLINT    NOT NULL DEFAULT 25,
     tags             TEXT[]      NOT NULL DEFAULT '{}',
     metadata         JSONB       NOT NULL DEFAULT '{}',
+    missed_fire_policy TEXT      NOT NULL DEFAULT 'coalesce'
+        CHECK (missed_fire_policy IN ('coalesce', 'catch_up')),
     last_enqueued_at TIMESTAMPTZ,
     created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     updated_at       TIMESTAMPTZ NOT NULL DEFAULT now()

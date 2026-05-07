@@ -38,7 +38,7 @@ async def _wait_for_cron_job(client, name: str, timeout_seconds: float = 5.0):
     while asyncio.get_running_loop().time() < deadline:
         tx = await client.transaction()
         row = await tx.fetch_optional(
-            "SELECT name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata "
+            "SELECT name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata, missed_fire_policy "
             "FROM awa.cron_jobs WHERE name = $1",
             name,
         )
@@ -88,6 +88,7 @@ async def test_periodic_registration(client):
     assert row is not None, "cron job should be synced to database"
     assert row["cron_expr"] == "0 9 * * *"
     assert row["timezone"] == "Pacific/Auckland"
+    assert row["missed_fire_policy"] == "coalesce"
     assert row["kind"] == "daily_report"
     assert row["queue"] == queue
 
@@ -111,6 +112,7 @@ async def test_periodic_with_metadata_and_tags(client):
         max_attempts=3,
         tags=["sync", "hourly"],
         metadata={"team": "platform"},
+        missed_fire_policy="catch_up",
     )
 
     await client.start([(queue, 1)], **RUNTIME_START_KWARGS)
@@ -122,6 +124,7 @@ async def test_periodic_with_metadata_and_tags(client):
     assert row["max_attempts"] == 3
     assert row["tags"] == ["sync", "hourly"]
     assert row["metadata"]["team"] == "platform"
+    assert row["missed_fire_policy"] == "catch_up"
 
 
 @pytest.mark.asyncio

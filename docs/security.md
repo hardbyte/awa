@@ -87,15 +87,17 @@ GRANT USAGE, SELECT ON SEQUENCE awa.jobs_id_seq TO awa_runtime;
 
 -- All tables: the runtime needs full DML because triggers run as the
 -- invoking role (SECURITY INVOKER), so inserting a job also writes to
--- the admin metadata cache tables via triggers.
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA awa TO awa_runtime;
+-- the admin metadata cache tables via triggers. The maintenance leader
+-- also calls refresh_admin_metadata(), which truncates dirty-key tables
+-- after taking the metadata advisory lock.
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO awa_runtime;
 
 -- Functions (trigger functions execute with invoker privileges)
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
 
 -- Default privileges for future migrations
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO awa_runtime;
+  GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
@@ -121,17 +123,17 @@ the grant block against that schema:
 
 ```sql
 GRANT USAGE ON SCHEMA my_qs_schema TO awa_runtime;
-GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA my_qs_schema TO awa_runtime;
+GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA my_qs_schema TO awa_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA my_qs_schema TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
-  GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO awa_runtime;
+  GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role only needs read/write/execute, never DDL.
+The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute privileges plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
 
 ### 5. Configure your processes
 
@@ -144,7 +146,7 @@ The queue-storage schema is migrated by `awa storage prepare-queue-storage-schem
 
 ## What the runtime role needs and why
 
-The runtime grants look broad (`SELECT, INSERT, UPDATE, DELETE ON ALL TABLES`) because AWA's internal tables are maintained by `SECURITY INVOKER` trigger functions. When a worker inserts a job, triggers automatically update:
+The runtime grants look broad (`SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES`) because AWA's internal tables are maintained by `SECURITY INVOKER` trigger functions. When a worker inserts a job, triggers automatically update:
 
 - `awa.queue_state_counts` — per-queue job state tallies
 - `awa.job_kind_catalog` — distinct job kinds
@@ -152,6 +154,8 @@ The runtime grants look broad (`SELECT, INSERT, UPDATE, DELETE ON ALL TABLES`) b
 - `awa.job_unique_claims` — unique key deduplication
 
 Since these triggers run with the caller's privileges, the runtime role needs write access to these internal tables even though application code never touches them directly.
+
+The maintenance leader also calls `awa.refresh_admin_metadata()` as a full reconciliation safety net. That function runs with invoker privileges and uses `TRUNCATE` on `awa.admin_dirty_queues` and `awa.admin_dirty_kinds` after taking the metadata advisory lock, so `awa_runtime` needs the `TRUNCATE` table privilege too.
 
 The runtime also directly upserts into the descriptor catalogs on startup and on each runtime snapshot tick:
 
@@ -181,14 +185,14 @@ profiles:
       - on: { type: schema }
         privileges: [USAGE]
       - on: { type: table, name: "*" }
-        privileges: [SELECT, INSERT, UPDATE, DELETE]
+        privileges: [SELECT, INSERT, UPDATE, DELETE, TRUNCATE]
       - on: { type: sequence, name: "*" }
         privileges: [USAGE, SELECT]
       - on: { type: function, name: "*" }
         privileges: [EXECUTE]
     default_privileges:
       - on_type: table
-        privileges: [SELECT, INSERT, UPDATE, DELETE]
+        privileges: [SELECT, INSERT, UPDATE, DELETE, TRUNCATE]
       - on_type: sequence
         privileges: [USAGE, SELECT]
       - on_type: function

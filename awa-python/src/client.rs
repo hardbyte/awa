@@ -7,7 +7,8 @@ use crate::transaction::{
 use crate::worker::PythonWorker;
 use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
 use awa_model::{
-    InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage, QueueStorageConfig,
+    CronMissedFirePolicy, InsertOpts, InsertParams, JobState, PeriodicJob, QueueStorage,
+    QueueStorageConfig,
 };
 use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
@@ -681,7 +682,7 @@ impl PyClient {
     ///
     /// The schedule is synced to the database by the leader and evaluated
     /// every second to enqueue jobs when they're due.
-    #[pyo3(signature = (name, cron_expr, args_type, args, *, timezone="UTC".to_string(), queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None))]
+    #[pyo3(signature = (name, cron_expr, args_type, args, *, timezone="UTC".to_string(), queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, missed_fire_policy="coalesce".to_string()))]
     #[allow(clippy::too_many_arguments)]
     fn periodic(
         &self,
@@ -696,6 +697,7 @@ impl PyClient {
         max_attempts: i16,
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
+        missed_fire_policy: String,
     ) -> PyResult<()> {
         let args_bound = args.bind(py);
         let kind = {
@@ -708,6 +710,8 @@ impl PyClient {
             .map(|value| py_to_json(py, value.bind(py)))
             .transpose()?
             .unwrap_or(serde_json::json!({}));
+        let missed_fire_policy =
+            CronMissedFirePolicy::parse(&missed_fire_policy).map_err(map_awa_error)?;
 
         let periodic_job = PeriodicJob::builder(&name, &cron_expr)
             .timezone(&timezone)
@@ -716,6 +720,7 @@ impl PyClient {
             .max_attempts(max_attempts)
             .tags(tags)
             .metadata(metadata_json)
+            .missed_fire_policy(missed_fire_policy)
             .build_raw(kind, args_json)
             .map_err(map_awa_error)?;
 

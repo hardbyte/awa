@@ -10,6 +10,35 @@ use croner::Cron;
 use serde::Serialize;
 use sqlx::PgExecutor;
 
+/// How AWA handles cron fires missed because evaluation was delayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CronMissedFirePolicy {
+    /// Enqueue only the latest due fire. This preserves pre-existing behavior.
+    Coalesce,
+    /// Enqueue each missed fire in timestamp order, subject to worker catch-up limits.
+    CatchUp,
+}
+
+impl CronMissedFirePolicy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Coalesce => "coalesce",
+            Self::CatchUp => "catch_up",
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, AwaError> {
+        match value {
+            "coalesce" => Ok(Self::Coalesce),
+            "catch_up" => Ok(Self::CatchUp),
+            other => Err(AwaError::Validation(format!(
+                "invalid cron missed fire policy '{other}'"
+            ))),
+        }
+    }
+}
+
 /// A periodic job schedule definition.
 ///
 /// Created via `PeriodicJob::builder(name, cron_expr).build(args)`.
@@ -35,6 +64,8 @@ pub struct PeriodicJob {
     pub tags: Vec<String>,
     /// Extra metadata merged into created jobs.
     pub metadata: serde_json::Value,
+    /// How delayed cron evaluation handles missed scheduled fire times.
+    pub missed_fire_policy: CronMissedFirePolicy,
 }
 
 impl PeriodicJob {
@@ -52,6 +83,7 @@ impl PeriodicJob {
             max_attempts: 25,
             tags: Vec::new(),
             metadata: serde_json::json!({}),
+            missed_fire_policy: CronMissedFirePolicy::Coalesce,
         }
     }
 
@@ -122,6 +154,7 @@ pub struct PeriodicJobBuilder {
     max_attempts: i16,
     tags: Vec<String>,
     metadata: serde_json::Value,
+    missed_fire_policy: CronMissedFirePolicy,
 }
 
 impl PeriodicJobBuilder {
@@ -158,6 +191,12 @@ impl PeriodicJobBuilder {
     /// Set extra metadata for created jobs.
     pub fn metadata(mut self, metadata: serde_json::Value) -> Self {
         self.metadata = metadata;
+        self
+    }
+
+    /// Set how delayed cron evaluation handles missed scheduled fire times.
+    pub fn missed_fire_policy(mut self, policy: CronMissedFirePolicy) -> Self {
+        self.missed_fire_policy = policy;
         self
     }
 
@@ -209,6 +248,7 @@ impl PeriodicJobBuilder {
             max_attempts: self.max_attempts,
             tags: self.tags,
             metadata: self.metadata,
+            missed_fire_policy: self.missed_fire_policy,
         })
     }
 }
@@ -226,6 +266,7 @@ pub struct CronJobRow {
     pub max_attempts: i16,
     pub tags: Vec<String>,
     pub metadata: serde_json::Value,
+    pub missed_fire_policy: String,
     pub last_enqueued_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -240,8 +281,8 @@ where
 {
     sqlx::query(
         r#"
-        INSERT INTO awa.cron_jobs (name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        INSERT INTO awa.cron_jobs (name, cron_expr, timezone, kind, queue, args, priority, max_attempts, tags, metadata, missed_fire_policy)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
         ON CONFLICT (name) DO UPDATE SET
             cron_expr = EXCLUDED.cron_expr,
             timezone = EXCLUDED.timezone,
@@ -252,6 +293,7 @@ where
             max_attempts = EXCLUDED.max_attempts,
             tags = EXCLUDED.tags,
             metadata = EXCLUDED.metadata,
+            missed_fire_policy = EXCLUDED.missed_fire_policy,
             updated_at = now()
         "#,
     )
@@ -265,6 +307,7 @@ where
     .bind(job.max_attempts)
     .bind(&job.tags)
     .bind(&job.metadata)
+    .bind(job.missed_fire_policy.as_str())
     .execute(executor)
     .await?;
 
@@ -427,6 +470,7 @@ mod tests {
             max_attempts: 25,
             tags: vec![],
             metadata: serde_json::json!({}),
+            missed_fire_policy: CronMissedFirePolicy::Coalesce,
         }
     }
 

@@ -469,10 +469,14 @@ async def _dispatch_cron(client: "awa.AsyncClient", args: argparse.Namespace) ->
         if not rows:
             print("No cron job schedules found.")
             return
-        print(f"{'NAME':<25} {'CRON':<20} {'TIMEZONE':<12} {'KIND':<25} {'QUEUE':<10}")
+        print(
+            f"{'NAME':<25} {'CRON':<20} {'TIMEZONE':<12} "
+            f"{'MISSED':<12} {'KIND':<25} {'QUEUE':<10}"
+        )
         for s in rows:
             print(
                 f"{s['name']:<25} {s['cron_expr']:<20} {s['timezone']:<12} "
+                f"{s.get('missed_fire_policy', 'coalesce'):<12} "
                 f"{s['kind']:<25} {s['queue']:<10}"
             )
         print(f"\n{len(rows)} schedules listed.")

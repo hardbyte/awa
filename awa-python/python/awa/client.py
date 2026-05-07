@@ -535,8 +535,14 @@ class AsyncClient:
         max_attempts: int = 25,
         tags: list[str] | None = None,
         metadata: dict[str, Any] | None = None,
+        missed_fire_policy: str = "coalesce",
     ) -> None:
-        """Register a periodic (cron) job schedule."""
+        """Register a periodic (cron) job schedule.
+
+        ``missed_fire_policy`` controls delayed evaluation: ``"coalesce"``
+        enqueues only the latest due fire, while ``"catch_up"`` enqueues each
+        missed fire in order.
+        """
         return self._raw.periodic(
             name,
             cron_expr,
@@ -548,6 +554,7 @@ class AsyncClient:
             max_attempts=max_attempts,
             tags=tags if tags is not None else [],
             metadata=metadata,
+            missed_fire_policy=missed_fire_policy,
         )
 
     def queue_descriptor(
