@@ -661,13 +661,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("No cron job schedules found.");
                         } else {
                             println!(
-                                "{:<25} {:<20} {:<12} {:<25} {:<10}",
-                                "NAME", "CRON", "TIMEZONE", "KIND", "QUEUE"
+                                "{:<25} {:<20} {:<12} {:<12} {:<25} {:<10}",
+                                "NAME", "CRON", "TIMEZONE", "MISSED", "KIND", "QUEUE"
                             );
                             for s in &schedules {
                                 println!(
-                                    "{:<25} {:<20} {:<12} {:<25} {:<10}",
-                                    s.name, s.cron_expr, s.timezone, s.kind, s.queue,
+                                    "{:<25} {:<20} {:<12} {:<12} {:<25} {:<10}",
+                                    s.name,
+                                    s.cron_expr,
+                                    s.timezone,
+                                    s.missed_fire_policy,
+                                    s.kind,
+                                    s.queue,
                                 );
                             }
                             println!("\n{} schedules listed.", schedules.len());

@@ -222,6 +222,8 @@ client.periodic(
     "daily_report", "0 9 * * *",
     GenerateReport, GenerateReport(format="pdf"),
     timezone="Pacific/Auckland",
+    # missed_fire_policy="coalesce" by default; use "catch_up" for
+    # idempotent reconciliation jobs that need every missed fire.
 )
 ```
 

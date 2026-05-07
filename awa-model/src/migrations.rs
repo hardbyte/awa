@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 14;
+pub const CURRENT_VERSION: i32 = 15;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -62,6 +62,7 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Storage transition role tracking and tightened mixed-transition gate",
         &[V14_UP],
     ),
+    (15, "Cron missed-fire policy", &[V15_UP]),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -77,6 +78,7 @@ const V11_UP: &str = include_str!("../migrations/v011_storage_transition_self_he
 const V12_UP: &str = include_str!("../migrations/v012_queue_storage_compat.sql");
 const V13_UP: &str = include_str!("../migrations/v013_storage_auto_finalize.sql");
 const V14_UP: &str = include_str!("../migrations/v014_storage_transition_role.sql");
+const V15_UP: &str = include_str!("../migrations/v015_cron_missed_fire_policy.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

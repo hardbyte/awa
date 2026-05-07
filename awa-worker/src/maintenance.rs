@@ -1,7 +1,9 @@
 use crate::executor::DlqPolicy;
 use crate::runtime::InFlightMap;
 use crate::storage::RuntimeStorage;
-use awa_model::cron::{atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow};
+use awa_model::cron::{
+    atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
+};
 use awa_model::{JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome};
 use chrono::Utc;
 use croner::Cron;
@@ -1437,9 +1439,9 @@ impl Drop for MaintenanceAliveGuard {
 
 /// Compute due fire times for a cron job row, using its expression and timezone.
 ///
-/// Existing schedules catch up missed fires up to `limit`. First registration
-/// still enqueues only the latest due fire to avoid backfilling before the
-/// schedule was known to AWA.
+/// Existing schedules can catch up missed fires up to `limit` when configured.
+/// First registration always enqueues only the latest due fire to avoid
+/// backfilling before the schedule was known to AWA.
 fn compute_fire_times(
     row: &CronJobRow,
     now: chrono::DateTime<Utc>,
@@ -1470,6 +1472,16 @@ fn compute_fire_times(
         None => (row.created_at - chrono::Duration::minutes(1)).with_timezone(&tz),
     };
 
+    let missed_fire_policy = match CronMissedFirePolicy::parse(&row.missed_fire_policy) {
+        Ok(policy) => policy,
+        Err(err) => {
+            error!(cron_name = %row.name, error = %err, "Invalid cron missed-fire policy in database");
+            return Vec::new();
+        }
+    };
+    let should_catch_up =
+        row.last_enqueued_at.is_some() && missed_fire_policy == CronMissedFirePolicy::CatchUp;
+
     let mut fire_times = Vec::new();
     let mut latest_fire: Option<chrono::DateTime<Utc>> = None;
 
@@ -1486,7 +1498,7 @@ fn compute_fire_times(
             }
         }
 
-        if row.last_enqueued_at.is_none() {
+        if !should_catch_up {
             latest_fire = Some(fire_utc);
             continue;
         }
@@ -1497,10 +1509,10 @@ fn compute_fire_times(
         }
     }
 
-    if row.last_enqueued_at.is_none() {
-        latest_fire.into_iter().collect()
-    } else {
+    if should_catch_up {
         fire_times
+    } else {
+        latest_fire.into_iter().collect()
     }
 }
 
@@ -1513,6 +1525,7 @@ mod tests {
         cron_expr: &str,
         created_at: chrono::DateTime<Utc>,
         last_enqueued_at: Option<chrono::DateTime<Utc>>,
+        missed_fire_policy: CronMissedFirePolicy,
     ) -> CronJobRow {
         CronJobRow {
             name: "test_cron".to_string(),
@@ -1525,6 +1538,7 @@ mod tests {
             max_attempts: 25,
             tags: Vec::new(),
             metadata: serde_json::json!({}),
+            missed_fire_policy: missed_fire_policy.as_str().to_string(),
             last_enqueued_at,
             created_at,
             updated_at: created_at,
@@ -1532,10 +1546,34 @@ mod tests {
     }
 
     #[test]
-    fn compute_fire_times_catches_up_missed_existing_fires() {
+    fn compute_fire_times_coalesces_missed_existing_fires_by_default() {
         let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
-        let row = cron_row("*/5 * * * * *", last, Some(last));
+        let row = cron_row(
+            "*/5 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::Coalesce,
+        );
+
+        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+
+        assert_eq!(
+            fires,
+            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap()]
+        );
+    }
+
+    #[test]
+    fn compute_fire_times_catches_up_when_policy_requests_it() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row(
+            "*/5 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::CatchUp,
+        );
 
         let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
 
@@ -1554,7 +1592,12 @@ mod tests {
     fn compute_fire_times_limits_catch_up_work() {
         let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
-        let row = cron_row("*/5 * * * * *", last, Some(last));
+        let row = cron_row(
+            "*/5 * * * * *",
+            last,
+            Some(last),
+            CronMissedFirePolicy::CatchUp,
+        );
 
         let fires = compute_fire_times(&row, now, 2);
 
@@ -1571,7 +1614,12 @@ mod tests {
     fn compute_fire_times_keeps_first_registration_latest_only() {
         let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
-        let row = cron_row("*/5 * * * * *", created_at, None);
+        let row = cron_row(
+            "*/5 * * * * *",
+            created_at,
+            None,
+            CronMissedFirePolicy::CatchUp,
+        );
 
         let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
 

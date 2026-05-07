@@ -887,6 +887,9 @@ let client = Client::builder(pool)
     .periodic(
         PeriodicJob::builder("daily_report", "0 9 * * *")
             .timezone("Pacific/Auckland")
+            // Default: coalesce delayed evaluation to the latest due fire.
+            // Use CronMissedFirePolicy::CatchUp for reconciliation jobs that
+            // should enqueue every missed fire in order.
             .build(&DailyReport { format: "pdf".into() })?
     )
     .build()?;
@@ -899,10 +902,16 @@ client.periodic(
     args_type=DailyReport,
     args=DailyReport(format="pdf"),
     timezone="Pacific/Auckland",
+    # Default missed_fire_policy="coalesce"; use "catch_up" when each
+    # missed scheduled fire must be enqueued.
 )
 ```
 
 Cron expressions and timezones are validated eagerly at registration time via the `croner` crate and `chrono-tz`.
+By default, delayed evaluation is coalesced to the latest due fire. Jobs that
+need every missed fire can opt into catch-up behavior with
+`CronMissedFirePolicy::CatchUp` in Rust or `missed_fire_policy="catch_up"` in
+Python.
 
 ### Lifecycle Hooks
 

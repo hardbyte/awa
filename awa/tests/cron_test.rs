@@ -6,7 +6,10 @@ use awa::model::{
     cron::{atomic_enqueue, delete_cron_job, list_cron_jobs, upsert_cron_job},
     migrations,
 };
-use awa::{Client, JobArgs, JobContext, JobResult, JobState, PeriodicJob, QueueConfig};
+use awa::{
+    Client, CronMissedFirePolicy, JobArgs, JobContext, JobResult, JobState, PeriodicJob,
+    QueueConfig,
+};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
@@ -147,6 +150,7 @@ async fn test_upsert_inserts_new_schedule() {
     assert_eq!(found.timezone, "UTC");
     assert_eq!(found.queue, "default");
     assert_eq!(found.priority, 2);
+    assert_eq!(found.missed_fire_policy, "coalesce");
     assert!(found.last_enqueued_at.is_none());
 }
 
@@ -167,6 +171,7 @@ async fn test_upsert_updates_existing_schedule() {
     let job_v2 = PeriodicJob::builder("test_upsert_update", "30 8 * * *")
         .timezone("Pacific/Auckland")
         .queue("reports")
+        .missed_fire_policy(CronMissedFirePolicy::CatchUp)
         .build_raw(
             "daily_report".to_string(),
             serde_json::json!({"format": "csv"}),
@@ -183,6 +188,7 @@ async fn test_upsert_updates_existing_schedule() {
     assert_eq!(found.timezone, "Pacific/Auckland");
     assert_eq!(found.queue, "reports");
     assert_eq!(found.args, serde_json::json!({"format": "csv"}));
+    assert_eq!(found.missed_fire_policy, "catch_up");
 }
 
 #[tokio::test]

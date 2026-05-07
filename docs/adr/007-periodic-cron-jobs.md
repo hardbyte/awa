@@ -50,9 +50,11 @@ A naive sync would `DELETE FROM awa.cron_jobs WHERE name NOT IN (...)` to remove
 
 Awa's sync is additive: UPSERT only, never DELETE. Stale schedules from decommissioned deployments can be cleaned up manually via `awa cron remove <name>` or direct SQL.
 
-### No backfill
+### Missed-fire policy
 
-When a worker starts after being down, the scheduler enqueues only the most recent missed fire time per schedule, not every missed occurrence. This avoids a thundering herd of jobs when a worker recovers from a long outage. This matches River's approach.
+By default, when evaluation is delayed or a worker starts after being down, the scheduler enqueues only the most recent missed fire time per schedule, not every missed occurrence. This `coalesce` policy avoids a thundering herd of jobs when a worker recovers from a long outage.
+
+Schedules that represent reconciliation or polling work can opt into `catch_up`, which enqueues each missed fire in timestamp order subject to the worker's bounded per-pass catch-up limit. Catch-up schedules should use idempotent handlers and expect several jobs to appear in quick succession after downtime.
 
 ### Leader liveness verification
 
@@ -73,4 +75,4 @@ The advisory lock is session-scoped: as long as the connection is alive, the loc
 - **1-second evaluation granularity.** Sub-second schedules are not supported. This is acceptable for cron-style workloads (hourly, daily, etc.).
 - **Leader bottleneck.** All cron evaluation happens on the leader. For thousands of schedules this could become a bottleneck, though in practice most deployments have dozens, not thousands.
 - **No automatic orphan cleanup.** Decommissioned schedules must be removed manually. This is an intentional trade-off for multi-deployment safety.
-- **No backfill.** If a schedule was down for 24 hours, only the most recent fire is recovered. Users who need guaranteed delivery of every missed fire must implement their own catch-up logic.
+- **Coalesced by default.** If a schedule was down for 24 hours, only the most recent fire is recovered unless the schedule explicitly opts into `catch_up`.
