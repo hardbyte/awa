@@ -5,6 +5,39 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+## [0.6.0-alpha.7] — 2026-05-07
+
+### Added
+
+- **Cron missed-fire policy** ([#239](https://github.com/hardbyte/awa/issues/239),
+  [#240](https://github.com/hardbyte/awa/pull/240)). Periodic schedules now
+  persist an explicit `missed_fire_policy`: `coalesce` remains the default and
+  enqueues only the latest due fire after delayed evaluation, while `catch_up`
+  enqueues missed fires in timestamp order for idempotent reconciliation jobs.
+  The policy is exposed through the Rust and Python APIs, CLI schedule output,
+  docs, and migration v015.
+
+### Changed
+
+- **Cron evaluation runs in its own leader-scoped maintenance lane**
+  ([#240](https://github.com/hardbyte/awa/pull/240)). Slow cleanup, rotation,
+  or reconciliation work no longer starves the scheduler branch. Coalesced
+  schedules also use a bounded latest-fire lookup so a stale high-frequency
+  schedule does not scan every missed tick.
+- **Runtime grants now document required `TRUNCATE` privileges**
+  ([#239](https://github.com/hardbyte/awa/issues/239),
+  [#240](https://github.com/hardbyte/awa/pull/240)). The security guide now
+  includes `TRUNCATE` in runtime table grants and default privileges, with a
+  DB-backed regression covering the previously documented grants.
+
+### Fixed
+
+- **Queue-storage claim transactions commit before rescueable runtime payload
+  conversion** ([#222](https://github.com/hardbyte/awa/pull/222)). Runtime
+  claims now keep hot claim transactions shorter while preserving rollback
+  behavior for legacy zero-deadline claims that cannot be rescued after a
+  conversion error.
+
 ## [0.6.0-alpha.6] — 2026-05-07
 
 ### Added
