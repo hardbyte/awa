@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
@@ -269,7 +270,6 @@ impl MaintenanceService {
             let mut promote_timer = tokio::time::interval(self.promote_interval);
             let mut cleanup_timer = tokio::time::interval(self.cleanup_interval);
             let mut cron_sync_timer = tokio::time::interval(self.cron_sync_interval);
-            let mut cron_eval_timer = tokio::time::interval(self.cron_eval_interval);
             let mut leader_check_timer = tokio::time::interval(self.leader_check_interval);
             let mut queue_stats_timer = tokio::time::interval(self.queue_stats_interval);
             let mut dirty_key_timer = tokio::time::interval(self.dirty_key_recompute_interval);
@@ -284,7 +284,6 @@ impl MaintenanceService {
             promote_timer.tick().await;
             cleanup_timer.tick().await;
             cron_sync_timer.tick().await;
-            cron_eval_timer.tick().await;
             leader_check_timer.tick().await;
             queue_stats_timer.tick().await;
             dirty_key_timer.tick().await;
@@ -293,12 +292,19 @@ impl MaintenanceService {
 
             // Do an initial sync immediately on becoming leader
             self.sync_periodic_jobs_to_db().await;
+            let cron_eval_cancel = self.cancel.child_token();
+            let cron_eval_task = tokio::spawn(Self::run_cron_evaluator(
+                self.pool.clone(),
+                cron_eval_cancel.clone(),
+                self.cron_eval_interval,
+            ));
 
             loop {
                 tokio::select! {
                     _ = self.cancel.cancelled() => {
                         debug!("Maintenance service shutting down");
                         self.leader.store(false, Ordering::SeqCst);
+                        Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
                         // Release leader lock on the same connection that acquired it.
                         // If this fails, dropping the connection will release the lock anyway.
                         let _ = Self::release_leader(&mut leader_conn).await;
@@ -324,9 +330,6 @@ impl MaintenanceService {
                     _ = cron_sync_timer.tick() => {
                         self.sync_periodic_jobs_to_db().await;
                     }
-                    _ = cron_eval_timer.tick() => {
-                        self.evaluate_cron_schedules().await;
-                    }
                     _ = queue_stats_timer.tick() => {
                         self.publish_queue_health_metrics().await;
                     }
@@ -346,6 +349,7 @@ impl MaintenanceService {
                         if sqlx::query("SELECT 1").execute(&mut *leader_conn).await.is_err() {
                             warn!("Leader connection lost, re-entering election loop");
                             self.leader.store(false, Ordering::SeqCst);
+                            Self::stop_cron_evaluator(&cron_eval_cancel, &cron_eval_task);
                             break;
                         }
                     }
@@ -387,6 +391,25 @@ impl MaintenanceService {
         Ok(())
     }
 
+    async fn run_cron_evaluator(pool: PgPool, cancel: CancellationToken, interval: Duration) {
+        let mut timer = tokio::time::interval(interval);
+        timer.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = timer.tick() => {
+                    Self::evaluate_cron_schedules(&pool).await;
+                }
+            }
+        }
+    }
+
+    fn stop_cron_evaluator(cancel: &CancellationToken, task: &JoinHandle<()>) {
+        cancel.cancel();
+        task.abort();
+    }
+
     /// Sync all registered periodic job schedules to `awa.cron_jobs` via UPSERT.
     ///
     /// Additive only — does NOT delete schedules not in the local set (multi-deployment safe).
@@ -413,9 +436,9 @@ impl MaintenanceService {
     /// For each schedule, computes the latest fire time ≤ now that is after
     /// `last_enqueued_at`. If a fire is due, executes the atomic CTE to
     /// mark + insert in one statement.
-    #[tracing::instrument(skip(self), name = "maintenance.cron_eval")]
-    async fn evaluate_cron_schedules(&self) {
-        let cron_rows = match list_cron_jobs(&self.pool).await {
+    #[tracing::instrument(skip(pool), name = "maintenance.cron_eval")]
+    async fn evaluate_cron_schedules(pool: &PgPool) {
+        let cron_rows = match list_cron_jobs(pool).await {
             Ok(rows) => rows,
             Err(err) => {
                 error!(error = %err, "Failed to load cron jobs for evaluation");
@@ -435,7 +458,7 @@ impl MaintenanceService {
                 None => continue,
             };
 
-            match atomic_enqueue(&self.pool, &row.name, fire_time, row.last_enqueued_at).await {
+            match atomic_enqueue(pool, &row.name, fire_time, row.last_enqueued_at).await {
                 Ok(Some(job)) => {
                     info!(
                         cron_name = %row.name,
@@ -1087,5 +1110,72 @@ impl MaintenanceService {
                 self.metrics.record_queue_lag(queue, lag_seconds);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn cron_row(
+        cron_expr: &str,
+        created_at: chrono::DateTime<Utc>,
+        last_enqueued_at: Option<chrono::DateTime<Utc>>,
+    ) -> CronJobRow {
+        CronJobRow {
+            name: "test_cron".to_string(),
+            cron_expr: cron_expr.to_string(),
+            timezone: "UTC".to_string(),
+            kind: "test_job".to_string(),
+            queue: "default".to_string(),
+            args: serde_json::json!({}),
+            priority: 2,
+            max_attempts: 25,
+            tags: Vec::new(),
+            metadata: serde_json::json!({}),
+            last_enqueued_at,
+            created_at,
+            updated_at: created_at,
+        }
+    }
+
+    #[test]
+    fn compute_fire_time_coalesces_missed_existing_fires() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
+        let row = cron_row("*/5 * * * * *", last, Some(last));
+
+        let fire = compute_fire_time(&row, now);
+
+        assert_eq!(
+            fire,
+            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap())
+        );
+    }
+
+    #[test]
+    fn compute_fire_time_returns_none_when_no_fire_is_due() {
+        let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 2).unwrap();
+        let row = cron_row("*/5 * * * * *", last, Some(last));
+
+        let fire = compute_fire_time(&row, now);
+
+        assert_eq!(fire, None);
+    }
+
+    #[test]
+    fn compute_fire_time_keeps_first_registration_latest_only() {
+        let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
+        let row = cron_row("*/5 * * * * *", created_at, None);
+
+        let fire = compute_fire_time(&row, now);
+
+        assert_eq!(
+            fire,
+            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap())
+        );
     }
 }
