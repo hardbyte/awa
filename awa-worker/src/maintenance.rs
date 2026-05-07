@@ -73,7 +73,6 @@ pub struct MaintenanceService {
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
 const PROMOTE_MAX_BATCHES_PER_TICK: usize = 32;
-const CRON_CATCH_UP_LIMIT: usize = 1_000;
 
 impl MaintenanceService {
     pub(crate) fn new(
@@ -434,10 +433,9 @@ impl MaintenanceService {
 
     /// Evaluate all cron schedules and enqueue any that are due.
     ///
-    /// For each schedule, computes due fire times ≤ now that are after
-    /// `last_enqueued_at`. If fires are due, executes the atomic CTE for each
-    /// fire in order so delayed evaluation catches up instead of collapsing
-    /// intermediate fires.
+    /// For each schedule, computes the latest fire time ≤ now that is after
+    /// `last_enqueued_at`. If a fire is due, executes the atomic CTE to
+    /// mark + insert in one statement.
     #[tracing::instrument(skip(pool), name = "maintenance.cron_eval")]
     async fn evaluate_cron_schedules(pool: &PgPool) {
         let cron_rows = match list_cron_jobs(pool).await {
@@ -455,43 +453,30 @@ impl MaintenanceService {
         let now = Utc::now();
 
         for row in &cron_rows {
-            let fire_times = compute_fire_times(row, now, CRON_CATCH_UP_LIMIT);
-            if fire_times.is_empty() {
-                continue;
-            }
-            if fire_times.len() == CRON_CATCH_UP_LIMIT {
-                warn!(
-                    cron_name = %row.name,
-                    catch_up_limit = CRON_CATCH_UP_LIMIT,
-                    "Cron catch-up limit reached; remaining due fires will be retried on the next evaluation"
-                );
-            }
+            let fire_time = match compute_fire_time(row, now) {
+                Some(time) => time,
+                None => continue,
+            };
 
-            let mut previous_enqueued_at = row.last_enqueued_at;
-            for fire_time in fire_times {
-                match atomic_enqueue(pool, &row.name, fire_time, previous_enqueued_at).await {
-                    Ok(Some(job)) => {
-                        previous_enqueued_at = Some(fire_time);
-                        info!(
-                            cron_name = %row.name,
-                            job_id = job.id,
-                            fire_time = %fire_time,
-                            "Enqueued periodic job"
-                        );
-                    }
-                    Ok(None) => {
-                        // Another leader already claimed this fire — not an error
-                        debug!(cron_name = %row.name, "Cron fire already claimed");
-                        break;
-                    }
-                    Err(err) => {
-                        error!(
-                            cron_name = %row.name,
-                            error = %err,
-                            "Failed to enqueue periodic job"
-                        );
-                        break;
-                    }
+            match atomic_enqueue(pool, &row.name, fire_time, row.last_enqueued_at).await {
+                Ok(Some(job)) => {
+                    info!(
+                        cron_name = %row.name,
+                        job_id = job.id,
+                        fire_time = %fire_time,
+                        "Enqueued periodic job"
+                    );
+                }
+                Ok(None) => {
+                    // Another leader already claimed this fire — not an error
+                    debug!(cron_name = %row.name, "Cron fire already claimed");
+                }
+                Err(err) => {
+                    error!(
+                        cron_name = %row.name,
+                        error = %err,
+                        "Failed to enqueue periodic job"
+                    );
                 }
             }
         }
@@ -975,21 +960,18 @@ impl Drop for MaintenanceAliveGuard {
     }
 }
 
-/// Compute due fire times for a cron job row, using its expression and timezone.
+/// Compute the latest fire time for a cron job row, using its expression and timezone.
 ///
-/// Existing schedules catch up missed fires up to `limit`. First registration
-/// still enqueues only the latest due fire to avoid backfilling before the
-/// schedule was known to AWA.
-fn compute_fire_times(
+/// Returns `None` if no fire is due (next occurrence is in the future).
+fn compute_fire_time(
     row: &CronJobRow,
     now: chrono::DateTime<Utc>,
-    limit: usize,
-) -> Vec<chrono::DateTime<Utc>> {
+) -> Option<chrono::DateTime<Utc>> {
     let cron = match Cron::new(&row.cron_expr).with_seconds_optional().parse() {
         Ok(c) => c,
         Err(err) => {
             error!(cron_name = %row.name, error = %err, "Invalid cron expression in database");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -997,7 +979,7 @@ fn compute_fire_times(
         Ok(tz) => tz,
         Err(err) => {
             error!(cron_name = %row.name, error = %err, "Invalid timezone in database");
-            return Vec::new();
+            return None;
         }
     };
 
@@ -1010,7 +992,6 @@ fn compute_fire_times(
         None => (row.created_at - chrono::Duration::minutes(1)).with_timezone(&tz),
     };
 
-    let mut fire_times = Vec::new();
     let mut latest_fire: Option<chrono::DateTime<Utc>> = None;
 
     for fire_time in cron.iter_from(search_start) {
@@ -1026,22 +1007,10 @@ fn compute_fire_times(
             }
         }
 
-        if row.last_enqueued_at.is_none() {
-            latest_fire = Some(fire_utc);
-            continue;
-        }
-
-        fire_times.push(fire_utc);
-        if fire_times.len() >= limit {
-            break;
-        }
+        latest_fire = Some(fire_utc);
     }
 
-    if row.last_enqueued_at.is_none() {
-        latest_fire.into_iter().collect()
-    } else {
-        fire_times
-    }
+    latest_fire
 }
 
 #[cfg(test)]
@@ -1072,52 +1041,41 @@ mod tests {
     }
 
     #[test]
-    fn compute_fire_times_catches_up_missed_existing_fires() {
+    fn compute_fire_time_coalesces_missed_existing_fires() {
         let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap();
         let row = cron_row("*/5 * * * * *", last, Some(last));
 
-        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+        let fire = compute_fire_time(&row, now);
 
         assert_eq!(
-            fires,
-            vec![
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 15).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap(),
-            ]
+            fire,
+            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 20).unwrap())
         );
     }
 
     #[test]
-    fn compute_fire_times_limits_catch_up_work() {
+    fn compute_fire_time_returns_none_when_no_fire_is_due() {
         let last = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 0).unwrap();
-        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 2).unwrap();
         let row = cron_row("*/5 * * * * *", last, Some(last));
 
-        let fires = compute_fire_times(&row, now, 2);
+        let fire = compute_fire_time(&row, now);
 
-        assert_eq!(
-            fires,
-            vec![
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 5).unwrap(),
-                Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
-            ]
-        );
+        assert_eq!(fire, None);
     }
 
     #[test]
-    fn compute_fire_times_keeps_first_registration_latest_only() {
+    fn compute_fire_time_keeps_first_registration_latest_only() {
         let created_at = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 30).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap();
         let row = cron_row("*/5 * * * * *", created_at, None);
 
-        let fires = compute_fire_times(&row, now, CRON_CATCH_UP_LIMIT);
+        let fire = compute_fire_time(&row, now);
 
         assert_eq!(
-            fires,
-            vec![Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap()]
+            fire,
+            Some(Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 55).unwrap())
         );
     }
 }
