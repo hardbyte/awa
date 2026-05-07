@@ -279,6 +279,11 @@ let client = Client::builder(pool)
 client.start().await?;
 ```
 
+Lifecycle hooks receive `Started` after a claim commits as the worker handler
+is about to run, plus outcome events (`Completed`, `Retried`, `Exhausted`,
+`Cancelled`) after the corresponding state transition commits. Hooks run in
+detached tasks, so they do not block job execution.
+
 Cancellation is cooperative for running handlers:
 
 - Rust handlers can poll `ctx.is_cancelled()`.
@@ -406,7 +411,7 @@ Rust and Python workers coexist on the same queues. See
 - [012: Split hot and deferred job storage](docs/adr/012-hot-deferred-job-storage.md)
 - [013: Durable run leases and guarded finalization](docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](docs/adr/014-structured-progress.md)
-- [015: Builder-side post-commit lifecycle hooks](docs/adr/015-post-commit-lifecycle-hooks.md)
+- [015: Builder-side lifecycle hooks](docs/adr/015-post-commit-lifecycle-hooks.md)
 - [016: Shared insert preparation and tokio-postgres adapter](docs/adr/016-bridge-adapters.md)
 - [017: Python insert-only transaction bridging](docs/adr/017-python-transaction-bridging.md)
 - [018: HTTP Worker for serverless job dispatch](docs/adr/018-http-worker.md)

@@ -184,6 +184,60 @@ async fn test_typed_completed_event_handler_runs() {
 }
 
 #[tokio::test]
+async fn test_typed_started_event_handler_runs() {
+    let _permit = test_gate()
+        .acquire_owned()
+        .await
+        .expect("test gate should be available");
+    let pool = setup_pool().await;
+    let queue = "lifecycle_started";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<HookJob, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                if let JobEvent::Started { args, job } = event {
+                    tx.send((args.value, job.id, job.state)).unwrap();
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let inserted = awa::insert_with(
+        &pool,
+        &HookJob {
+            action: "start".into(),
+            value: "just_started".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let (value, event_job_id, event_state) = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(value, "just_started");
+    assert_eq!(event_job_id, inserted.id);
+    assert_eq!(event_state, JobState::Running);
+}
+
+#[tokio::test]
 async fn test_typed_retried_event_handler_runs() {
     let _permit = test_gate()
         .acquire_owned()
@@ -484,8 +538,10 @@ async fn test_handler_panic_does_not_crash_executor() {
         )
         .register::<HookJob, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
         // First handler panics
-        .on_event::<HookJob, _, _>(|_event| async move {
-            panic!("handler exploded!");
+        .on_event::<HookJob, _, _>(|event| async move {
+            if matches!(event, JobEvent::Completed { .. }) {
+                panic!("handler exploded!");
+            }
         })
         // Second handler should still run despite the first panicking
         .on_event::<HookJob, _, _>(move |event| {
@@ -602,6 +658,9 @@ async fn test_stale_completion_does_not_fire_event() {
             async move {
                 // Send any event we receive
                 match event {
+                    JobEvent::Started { args, .. } => {
+                        tx.send(format!("started:{}", args.value)).unwrap()
+                    }
                     JobEvent::Completed { args, .. } => {
                         tx.send(format!("completed:{}", args.value)).unwrap()
                     }
@@ -646,24 +705,13 @@ async fn test_stale_completion_does_not_fire_event() {
     tokio::time::sleep(Duration::from_secs(3)).await;
     client.shutdown(Duration::from_secs(2)).await;
 
-    // The channel should be empty — no lifecycle event for stale completions
-    let received = rx.try_recv();
-    // It's acceptable for a Retried event to fire if the job was re-claimed
-    // and retried successfully. But "completed:should_not_fire" should NOT
-    // appear because the original handler's completion was stale.
-    match received {
-        Err(mpsc::error::TryRecvError::Empty) => {
-            // Good — no event fired for the stale completion
-        }
-        Ok(msg) => {
-            assert!(
-                !msg.starts_with("completed:"),
-                "Stale completion should not fire a Completed event, got: {msg}"
-            );
-        }
-        Err(mpsc::error::TryRecvError::Disconnected) => {
-            // Channel closed — also fine
-        }
+    // Started may fire for claimed attempts, but the stale completion must not
+    // produce a Completed event.
+    while let Ok(msg) = rx.try_recv() {
+        assert!(
+            !msg.starts_with("completed:"),
+            "Stale completion should not fire a Completed event, got: {msg}"
+        );
     }
 }
 
@@ -695,6 +743,7 @@ async fn test_terminal_error_emits_exhausted() {
             let tx = tx.clone();
             async move {
                 match event {
+                    JobEvent::Started { .. } => {}
                     JobEvent::Exhausted { error, attempt, .. } => {
                         tx.send(("exhausted".to_string(), error, attempt)).unwrap();
                     }
@@ -731,10 +780,10 @@ async fn test_terminal_error_emits_exhausted() {
     assert_eq!(attempt, 1); // Only ran once — terminal, not retried
 }
 
-// ── Edge case: snooze does NOT emit event ────────────────────────
+// ── Edge case: snooze emits Started but no outcome event ─────────
 
 #[tokio::test]
-async fn test_snooze_does_not_emit_event() {
+async fn test_snooze_only_emits_started_event() {
     let _permit = test_gate()
         .acquire_owned()
         .await
@@ -759,6 +808,7 @@ async fn test_snooze_does_not_emit_event() {
             let tx = tx.clone();
             async move {
                 let label = match &event {
+                    JobEvent::Started { .. } => "started",
                     JobEvent::Completed { .. } => "completed",
                     JobEvent::Retried { .. } => "retried",
                     JobEvent::Exhausted { .. } => "exhausted",
@@ -785,13 +835,16 @@ async fn test_snooze_does_not_emit_event() {
     .unwrap();
 
     client.start().await.unwrap();
+    let label = recv_event(&mut rx).await;
+    assert_eq!(label, "started");
+
     // Give enough time for the job to be claimed and snoozed
     tokio::time::sleep(Duration::from_millis(500)).await;
     client.shutdown(Duration::from_secs(2)).await;
 
-    // No event should have fired
+    // No outcome event should have fired.
     assert!(
         rx.try_recv().is_err(),
-        "Snooze should not produce a lifecycle event"
+        "Snooze should not produce a lifecycle outcome event"
     );
 }

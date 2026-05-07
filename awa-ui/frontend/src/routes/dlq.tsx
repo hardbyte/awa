@@ -202,7 +202,7 @@ export function DlqPage() {
             <TableRow>
               <TableCell colSpan={6}>
                 <div className="text-muted-fg py-6">
-                  DLQ is empty{hasActiveFilter ? " (matching this filter)" : ""}.
+                  DLQ is empty{hasActiveFilter ? " (matching this filter)" : ""}. Terminal failures appear here only for queues with DLQ on.
                 </div>
               </TableCell>
             </TableRow>

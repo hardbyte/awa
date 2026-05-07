@@ -269,6 +269,7 @@ impl JobExecutor {
                 counter.fetch_add(1, Ordering::SeqCst);
             }
             metrics.record_in_flight_change(&job_queue, 1);
+            let has_lifecycle_handlers = lifecycle_handlers.contains_key(&job_kind);
 
             let start = std::time::Instant::now();
             let ctx = JobContext::new(
@@ -281,7 +282,22 @@ impl JobExecutor {
             );
 
             let result = match workers.get(&job.kind) {
-                Some(worker) => worker.perform(&ctx).await,
+                Some(worker) => {
+                    if has_lifecycle_handlers {
+                        let started_handlers = lifecycle_handlers.clone();
+                        let started_kind = job_kind.clone();
+                        let started_job = job.clone();
+                        tokio::spawn(async move {
+                            dispatch_lifecycle_event(
+                                &started_handlers,
+                                &started_kind,
+                                UntypedJobEvent::Started { job: started_job },
+                            )
+                            .await;
+                        });
+                    }
+                    worker.perform(&ctx).await
+                }
                 None => {
                     error!(kind = %job.kind, job_id, "No worker registered for job kind");
                     Err(JobError::Terminal(format!(
@@ -309,7 +325,6 @@ impl JobExecutor {
             }
             metrics.record_in_flight_change(&job_queue, -1);
 
-            let has_lifecycle_handlers = lifecycle_handlers.contains_key(&job_kind);
             let dlq_enabled = dlq_policy.enabled_for(&job_queue);
             tokio::spawn(async move {
                 let outcome = complete_job(

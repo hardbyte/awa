@@ -31,6 +31,10 @@ import { ConfirmDialog } from "@/components/ConfirmDialog";
 import { LagValue } from "@/components/LagValue";
 import { usePollInterval } from "@/hooks/use-poll-interval";
 import { timeAgo } from "@/lib/time";
+import {
+  dlqPolicyIntent,
+  dlqPolicyLabel,
+} from "@/components/RuntimeDisplay";
 
 export function QueuesPage() {
   const queryClient = useQueryClient();
@@ -94,14 +98,14 @@ export function QueuesPage() {
   function capacityLabel(runtime: QueueRuntimeSummary | undefined): string {
     if (!runtime?.config) return "—";
     if (runtime.config.mode === "weighted") {
-      return `min ${runtime.config.min_workers ?? 0} / w ${runtime.config.weight ?? 1}`;
+      return `min ${runtime.config.min_workers ?? 0} / weight ${runtime.config.weight ?? 1}`;
     }
     return `max ${runtime.config.max_workers ?? 0}`;
   }
 
   function rateLimitLabel(runtime: QueueRuntimeSummary | undefined): string {
     if (!runtime?.config?.rate_limit) return "—";
-    return `${runtime.config.rate_limit.max_rate}/s (${runtime.config.rate_limit.burst})`;
+    return `${runtime.config.rate_limit.max_rate}/s · burst ${runtime.config.rate_limit.burst}`;
   }
 
   function runtimeHealthLabel(runtime: QueueRuntimeSummary | undefined): string {
@@ -202,11 +206,13 @@ export function QueuesPage() {
                   </>
                 )}
                 <span className="text-muted-fg">Lag</span>
-                <span><LagValue seconds={q.lag_seconds} /></span>
+                <span><LagValue seconds={q.lag_seconds} /> s</span>
                 <span className="text-muted-fg">Capacity</span>
                 <span>{capacityLabel(runtime)}</span>
                 <span className="text-muted-fg">Rate limit</span>
                 <span>{rateLimitLabel(runtime)}</span>
+                <span className="text-muted-fg">DLQ</span>
+                <span>{dlqPolicyLabel(runtime?.config)}</span>
                 <span className="text-muted-fg">Healthy nodes</span>
                 <span>{runtimeHealthLabel(runtime)}</span>
                 {runtime?.config_mismatch && (
@@ -260,7 +266,7 @@ export function QueuesPage() {
           <TableColumn className="text-right">Running</TableColumn>
           <TableColumn className="text-right">Retry</TableColumn>
           <TableColumn className="text-right">Failed</TableColumn>
-          <TableColumn className="text-right">Rate/hr</TableColumn>
+          <TableColumn className="text-right">Completed/hr</TableColumn>
           <TableColumn>Capacity</TableColumn>
           <TableColumn>Status</TableColumn>
           <TableColumn>Actions</TableColumn>
@@ -307,7 +313,7 @@ export function QueuesPage() {
                       {q.waiting_external > 0 && (
                         <div className="mt-0.5 text-xs text-muted-fg">
                           {q.waiting_external.toLocaleString()} waiting · lag{" "}
-                          <LagValue seconds={q.lag_seconds} />
+                          <LagValue seconds={q.lag_seconds} /> s
                         </div>
                       )}
                       {descriptorSyncLabel(q) && (
@@ -388,6 +394,11 @@ export function QueuesPage() {
                       )}
                       {q.descriptor_mismatch && (
                         <Badge intent="danger">Descriptor drift</Badge>
+                      )}
+                      {runtime?.config && (
+                        <Badge intent={dlqPolicyIntent(runtime.config)}>
+                          {dlqPolicyLabel(runtime.config)}
+                        </Badge>
                       )}
                     </div>
                   </TableCell>

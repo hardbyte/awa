@@ -85,6 +85,7 @@ fn weighted_config(weight: u32) -> QueueRuntimeConfigSnapshot {
         poll_interval_ms: 200,
         deadline_duration_secs: 300,
         priority_aging_interval_secs: 60,
+        dlq_enabled: Some(true),
         rate_limit: Some(RateLimitSnapshot {
             max_rate: 5.5,
             burst: 10,
@@ -297,10 +298,127 @@ async fn test_get_queue_runtime_endpoint_returns_queue_summary() {
     assert_eq!(
         queue_summary
             .get("config")
+            .and_then(|cfg| cfg.get("dlq_enabled"))
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        queue_summary
+            .get("config")
             .and_then(|cfg| cfg.get("rate_limit"))
             .and_then(|cfg| cfg.get("burst"))
             .and_then(Value::as_u64),
         Some(10)
+    );
+}
+
+#[tokio::test]
+async fn test_queue_runtime_endpoint_treats_unknown_dlq_policy_as_rollout_compatible() {
+    let pool = setup_pool().await;
+    let queue = "ui_runtime_api_queue_dlq_rollout";
+    clean_runtime_snapshots_for_queue(&pool, queue).await;
+
+    let mut legacy_config = weighted_config(3);
+    legacy_config.dlq_enabled = None;
+
+    seed_runtime_snapshot_with(
+        &pool,
+        RuntimeSnapshotInput {
+            instance_id: Uuid::new_v4(),
+            hostname: Some("worker-legacy".to_string()),
+            pid: 5101,
+            version: "0.5.x-test".to_string(),
+            storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
+            started_at: Utc::now() - Duration::minutes(2),
+            snapshot_interval_ms: 10_000,
+            healthy: true,
+            postgres_connected: true,
+            poll_loop_alive: true,
+            heartbeat_alive: true,
+            maintenance_alive: true,
+            shutting_down: false,
+            leader: true,
+            global_max_workers: Some(16),
+            queues: vec![QueueRuntimeSnapshot {
+                queue: queue.to_string(),
+                in_flight: 1,
+                overflow_held: Some(0),
+                config: legacy_config,
+            }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
+        },
+    )
+    .await;
+
+    seed_runtime_snapshot_with(
+        &pool,
+        RuntimeSnapshotInput {
+            instance_id: Uuid::new_v4(),
+            hostname: Some("worker-upgraded".to_string()),
+            pid: 5102,
+            version: "0.6.0-test".to_string(),
+            storage_capability: StorageCapability::Canonical,
+            transition_role: TransitionRole::Auto,
+            started_at: Utc::now() - Duration::minutes(1),
+            snapshot_interval_ms: 10_000,
+            healthy: true,
+            postgres_connected: true,
+            poll_loop_alive: true,
+            heartbeat_alive: true,
+            maintenance_alive: true,
+            shutting_down: false,
+            leader: false,
+            global_max_workers: Some(16),
+            queues: vec![QueueRuntimeSnapshot {
+                queue: queue.to_string(),
+                in_flight: 2,
+                overflow_held: Some(0),
+                config: weighted_config(3),
+            }],
+            queue_descriptor_hashes: HashMap::new(),
+            job_kind_descriptor_hashes: HashMap::new(),
+        },
+    )
+    .await;
+
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/queues/runtime")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("queue runtime request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+    let summaries: Vec<Value> =
+        serde_json::from_slice(&body).expect("queue summaries should deserialize");
+    let queue_summary = summaries
+        .iter()
+        .find(|entry| entry.get("queue").and_then(Value::as_str) == Some(queue))
+        .expect("seeded queue should be present");
+
+    assert_eq!(
+        queue_summary
+            .get("config_mismatch")
+            .and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        queue_summary
+            .get("config")
+            .and_then(|cfg| cfg.get("dlq_enabled"))
+            .and_then(Value::as_bool),
+        Some(true)
     );
 }
 

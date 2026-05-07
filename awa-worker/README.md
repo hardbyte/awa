@@ -25,9 +25,9 @@ top of Awa.
   `register_handler`.
 - **Queue configuration** — `QueueConfig` (concurrency, weighted mode,
   rate limiting, per-claim deadlines), `RateLimit`.
-- **Lifecycle hooks** — `JobEvent<T>` and `UntypedJobEvent` fire after
-  guarded finalization commits, useful for cache invalidation,
-  notifications, and metrics emission.
+- **Lifecycle hooks** — `JobEvent<T>` and `UntypedJobEvent` fire when
+  handler execution starts and after guarded finalization commits, useful
+  for cache invalidation, notifications, and metrics emission.
 - **HTTP worker** — `HttpWorker`, `HttpWorkerConfig`, `HttpWorkerMode`
   dispatch jobs to serverless endpoints over HTTP with HMAC-BLAKE3
   signing. See [ADR-018](../docs/adr/018-http-worker.md).

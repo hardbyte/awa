@@ -17,14 +17,28 @@ export function formatSnapshotInterval(ms: number): string {
 export function queueCapacityLabel(config?: QueueRuntimeConfigSnapshot | null): string {
   if (!config) return "—";
   if (config.mode === "weighted") {
-    return `min ${config.min_workers ?? 0} / w ${config.weight ?? 1}`;
+    return `min ${config.min_workers ?? 0} / weight ${config.weight ?? 1}`;
   }
   return `max ${config.max_workers ?? 0}`;
 }
 
 export function rateLimitLabel(config?: QueueRuntimeConfigSnapshot | null): string {
   if (!config?.rate_limit) return "—";
-  return `${config.rate_limit.max_rate}/s (${config.rate_limit.burst})`;
+  return `${config.rate_limit.max_rate}/s · burst ${config.rate_limit.burst}`;
+}
+
+export function dlqPolicyLabel(config?: QueueRuntimeConfigSnapshot | null): string {
+  if (config?.dlq_enabled === true) return "DLQ on";
+  if (config?.dlq_enabled === false) return "DLQ off";
+  return "DLQ unknown";
+}
+
+export function dlqPolicyIntent(
+  config?: QueueRuntimeConfigSnapshot | null,
+): "success" | "outline" | "secondary" {
+  if (config?.dlq_enabled === true) return "success";
+  if (config?.dlq_enabled === false) return "outline";
+  return "secondary";
 }
 
 export function instanceLabel(instance: RuntimeInstance): string {
@@ -48,7 +62,7 @@ export function queueListLabel(instance: RuntimeInstance): string {
 
 export function queueConfigDetails(config?: QueueRuntimeConfigSnapshot | null): string {
   if (!config) return "No runtime config snapshot";
-  return `poll ${formatSnapshotInterval(config.poll_interval_ms)} · deadline ${config.deadline_duration_secs}s · aging ${config.priority_aging_interval_secs}s`;
+  return `poll ${formatSnapshotInterval(config.poll_interval_ms)} · deadline ${config.deadline_duration_secs}s · aging ${config.priority_aging_interval_secs}s · ${dlqPolicyLabel(config)}`;
 }
 
 export function RuntimeHealthBadge({ instance }: { instance: RuntimeInstance }) {
