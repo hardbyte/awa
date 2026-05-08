@@ -5,6 +5,16 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+## [0.6.0-alpha.9] — 2026-05-08
+
+### Fixed
+
+- **Queue-storage priority-aging completions now preserve the lane priority in
+  terminal storage.** Workers still receive the aged effective priority, with
+  `_awa_original_priority` in metadata, but `done_entries` now uses the original
+  queue lane priority for its storage key. This prevents aged low-priority jobs
+  from colliding with high-priority jobs that share the same per-lane sequence.
+
 ## [0.6.0-alpha.8] — 2026-05-08
 
 ### Added

@@ -142,7 +142,7 @@ impl ClaimedRuntimeJob {
             queue: self.job.queue,
             args: self.job.args,
             state: JobState::Completed,
-            priority: self.job.priority,
+            priority: self.claim.priority,
             attempt: self.job.attempt,
             run_lease: self.job.run_lease,
             max_attempts: self.job.max_attempts,

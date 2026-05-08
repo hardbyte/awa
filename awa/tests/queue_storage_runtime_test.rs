@@ -4294,6 +4294,92 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_aged_completion_keeps_lane_priority_for_done_key() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_aged_completion_lane_priority";
+    let schema = "awa_qs_aged_completion_lane_priority";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let low_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 1 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 4,
+            ..Default::default()
+        },
+    )
+    .await;
+    let high_id = enqueue_job(
+        &pool,
+        &store,
+        &RetryJob { id: 2 },
+        InsertOpts {
+            queue: queue.into(),
+            priority: 1,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let aging_interval = Duration::from_secs(60);
+    let high_claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, aging_interval)
+        .await
+        .expect("Failed to claim high-priority job");
+    assert_eq!(high_claimed.len(), 1);
+    assert_eq!(high_claimed[0].job.id, high_id);
+    store
+        .complete_runtime_batch(&pool, &high_claimed)
+        .await
+        .expect("Failed to complete high-priority job");
+
+    sqlx::query(&format!(
+        "UPDATE {schema}.ready_entries SET run_at = $1 WHERE job_id = $2"
+    ))
+    .bind(Utc::now() - chrono::Duration::seconds(aging_interval.as_secs() as i64 * 4))
+    .bind(low_id)
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate low-priority queue storage job");
+
+    let aged_claimed = store
+        .claim_runtime_batch_with_aging(&pool, queue, 1, Duration::ZERO, aging_interval)
+        .await
+        .expect("Failed to claim aged low-priority job");
+    assert_eq!(aged_claimed.len(), 1);
+    assert_eq!(aged_claimed[0].job.id, low_id);
+    assert_eq!(aged_claimed[0].claim.priority, 4);
+    assert_eq!(aged_claimed[0].job.priority, 1);
+    store
+        .complete_runtime_batch(&pool, &aged_claimed)
+        .await
+        .expect("Failed to complete aged low-priority job");
+
+    let stored_priority: i16 = sqlx::query_scalar(&format!(
+        "SELECT priority FROM {schema}.done_entries WHERE job_id = $1"
+    ))
+    .bind(low_id)
+    .fetch_one(&pool)
+    .await
+    .expect("Failed to read aged done entry");
+    assert_eq!(stored_priority, 4);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_bounded_claimers_limit_active_claimers_per_queue() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
