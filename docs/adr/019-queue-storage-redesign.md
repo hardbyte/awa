@@ -129,8 +129,9 @@ The implementation and migrations use these physical names:
 5. `terminal_entries`
 
 - Completion appends a terminal history row.
-- Done partitions are append-only and can be pruned by retention policy rather
-  than row-by-row cleanup.
+- Done partitions are append-only and are pruned with their ready segment once
+  the segment is sealed and no active lease or pending ready row still
+  references it.
 
 6. `dlq_entries`
 
@@ -270,8 +271,9 @@ lock contract is:
 - prune-claim-ring (added by ADR-023) takes `FOR UPDATE` on `claim_ring_state`,
   `FOR UPDATE` on the target `claim_ring_slots` row, and `ACCESS EXCLUSIVE` on
   both the matching `lease_claims_*` and `lease_claim_closures_*` partitions,
-  rescues any still-open claims in the slot, then `TRUNCATE`s both partitions
-  in lockstep
+  verifies every claim in the slot has a matching closure, then `TRUNCATE`s
+  both partitions in lockstep. Open claims make prune skip the slot until
+  normal completion or the separate receipt-rescue scans close them.
 
 That order is deliberate. The TLA+ storage race / lock-order models exist to
 prove that claim, rotate, and prune cannot interleave into “claim lands in a
@@ -281,8 +283,9 @@ Rotation and prune policy is also part of this decision:
 
 - lease and claim-ring segments rotate quickly because their churn is the
   remaining hot-path source
-- ready / deferred / waiting / terminal / dlq segments rotate more slowly and
-  are primarily retention-driven
+- ready / terminal segments rotate more slowly than the lease and claim rings;
+  deferred and DLQ rows are plain backlog/hold tables with their own promotion,
+  retry, purge, and retention cleanup paths
 - prune walks sealed segments oldest-first
 - prune uses `SET LOCAL lock_timeout = '50ms'` and returns gracefully when a
   reader or writer still holds the segment
@@ -290,9 +293,10 @@ Rotation and prune policy is also part of this decision:
   expected to run analytical reads on replicas and keep primary-side
   `statement_timeout` discipline
 
-Retention is therefore a rotation-and-prune story, not a row-by-row delete
-story. Queue retention knobs, DLQ retention, and segment counts all compose
-within that operational policy.
+Ordinary queue-storage terminal history is therefore a rotation-and-prune
+story, not a row-by-row delete story. DLQ retention remains a bounded cleanup
+pass against the separate `dlq_entries` hold table, and the canonical
+compatibility path still has row-retention cleanup.
 
 ### Hot-path requirements
 

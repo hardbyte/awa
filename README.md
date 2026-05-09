@@ -24,8 +24,8 @@ without Redis or RabbitMQ, Awa is built for you.
 ### Runtime
 - **Rust and Python workers** — same queues, same storage engine, mixed deployments.
 - **Crash recovery** — heartbeat + hard deadline rescue. Stale jobs recovered automatically.
-- **Runtime-owned maintenance** — dispatch, rescue, segment rotation, and pruning run in the worker fleet; no `pg_cron` ticker required.
-- **Segmented queue storage** — append-only ready and terminal entries with rotating lease segments; queue history and execution churn stay off the dispatch path.
+- **Runtime-owned maintenance** — dispatch, rescue, queue/lease/claim ring rotation, pruning, and cleanup run in the worker fleet; no `pg_cron` ticker required.
+- **Segmented queue storage** — append-only ready/terminal partitions, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
 - **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
 - **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-BLAKE3 callback auth.
 - **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.

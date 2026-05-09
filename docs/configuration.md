@@ -392,14 +392,26 @@ ready (or DLQ if attempts are exhausted).
 
 ### Retention and cleanup
 
-Terminal jobs and DLQ rows aren't purged synchronously; the
-maintenance leader sweeps them in batches.
+Retention depends on the storage path.
+
+Queue storage is the worker engine in `0.6`: ordinary terminal snapshots
+(`completed`, non-DLQ `failed`, and `cancelled`) live in the rotating
+`done_entries_*` partitions and are reclaimed by queue-ring prune after the
+matching ready segment is no longer live. The `completed_retention` and
+`failed_retention` knobs apply to the canonical compatibility path, not to
+queue-storage terminal history. In queue storage, use the queue-ring sizing and
+rotation knobs below to control how much ordinary terminal history remains
+queryable.
+
+DLQ rows are different: `dlq_entries` is a separate hold table and the
+maintenance leader deletes rows older than `dlq_retention` in bounded cleanup
+passes.
 
 | Knob | Default | What it does |
 |---|---|---|
-| `completed_retention` | `24h` | How long completed jobs stay queryable before the cleanup pass deletes them. |
-| `failed_retention` | `72h` | Same for failed/cancelled jobs (excluding DLQ). |
-| `dlq_retention` | none | If unset, DLQ rows live forever. Set a duration to age them out. |
+| `completed_retention` | `24h` | Canonical compatibility path only: how long completed jobs stay queryable before row cleanup deletes them. Queue storage uses queue-ring prune instead. |
+| `failed_retention` | `72h` | Canonical compatibility path only: same for failed/cancelled jobs excluding DLQ. Queue storage uses queue-ring prune instead. |
+| `dlq_retention` | `30d` | How long DLQ rows stay in `dlq_entries` before bounded cleanup deletes them. |
 | `descriptor_retention` | `30d` | How long stale queue/kind descriptor catalog rows survive. |
 | `cleanup_interval` | `60s` | How often the cleanup pass runs. |
 | `cleanup_batch_size` | `1000` | Max rows deleted per pass. Raise for very high throughput; lower if you want gentler IO. |
@@ -410,7 +422,7 @@ maintenance leader sweeps them in batches.
 Queue storage is the runtime engine in `0.6`, and most deployments can keep
 the defaults. Queue-storage tables live in the canonical `awa` schema; the
 main knobs are there for large fleets, very bursty queues, or operators who
-want to trade off retention-window size against rotation churn.
+want to trade off the partition-reclaim window against rotation churn.
 
 ### Rust
 
@@ -452,11 +464,11 @@ await client.start(
 
 | Knob | Default | What it controls |
 |---|---|---|
-| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions |
+| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
 | `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. |
-| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring rotation). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
+| `lease_claim_receipts` | `true` | Use the receipt-plane short path (claim writes a row into `lease_claims`; completion writes a closure tombstone into `lease_claim_closures`; both reclaimed by claim-ring prune). Receipts mode supports per-claim deadlines: when `QueueConfig.deadline_duration > 0`, the claim writes `clock_timestamp() + interval` onto `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims with a `'deadline_expired'` closure. Set to `false` to force every claim through the legacy `leases` materialization path. See ADR-023. |
 | `queue_rotate_interval` | `1000ms` | How often ready/terminal segments rotate |
 | `lease_rotate_interval` | `50ms` | How often lease segments rotate |
 | `claim_rotate_interval` | matches `queue_rotate_interval` | How often the ADR-023 claim-ring rotates. Set with `ClientBuilder::claim_rotate_interval` (Rust) or `queue_storage_claim_rotate_interval_ms` (Python). Test harnesses sometimes set this to a long interval to pin claim-ring layout for deterministic count assertions. |
@@ -470,7 +482,7 @@ configuration.
 
 Use the defaults unless you have a reason not to:
 
-- Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers or retention keep old segments live.
+- Increase `queue_slot_count` if queue partitions stay unprunable for too long because readers, active leases, or pending ready rows keep old segments live.
 - Increase `lease_slot_count` if lease churn is high enough that dead tuples in the lease ring stop collapsing promptly.
 - Increase `claim_slot_count` if the rotation cadence (`claim_rotate_interval`) plus the slot count combine to a partition retention window shorter than your longest in-flight zero-deadline short job; running out of empty slots forces `rotate_claims` to return `SkippedBusy` and the receipt-plane churn falls back onto a smaller working set of partitions.
 - Increase `queue_stripe_count` only for measured workloads where many small replicas contend on the same logical queue. This is queue-storage configuration, not a per-queue `QueueConfig` field: it gives each logical queue the same number of physical stripes. Striping spreads a hot logical queue over `queue#N` physical coordination paths, but it weakens perfect global ordering and can regress calmer shapes if overused. For single hot-queue workloads, benchmark `2` stripes first; higher values should be treated as workload-specific tuning rather than a general default.
@@ -489,9 +501,9 @@ single-queue workloads, `queue_stripe_count`.
 
 The DLQ is the **separate, durable hold-table for jobs that exhausted
 retries or hit a non-retryable terminal failure**. Without it,
-terminal failures live in ordinary `terminal_entries` rotation and
-age out under the `failed_retention` window — they're observable
-briefly, then gone. With DLQ enabled, those rows land in
+terminal failures live in ordinary queue-storage `done_entries_*` partitions
+and are reclaimed when queue-ring prune can safely truncate their segment.
+With DLQ enabled, those rows land in
 `dlq_entries`, are visible to the admin UI / API as a discrete
 backlog, and can be retried or purged by an operator.
 

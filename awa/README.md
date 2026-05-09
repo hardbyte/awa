@@ -54,9 +54,9 @@ async fn main() -> anyhow::Result<()> {
 
 - **Transactional enqueue** — enqueueing a job is a normal `INSERT` you can
   commit alongside your application's writes.
-- **Vacuum-aware storage** — append-only ready entries plus a partitioned
-  receipt ring keep the queue tables' dead-tuple footprint bounded under
-  sustained load. See [ADR-019](../docs/adr/019-queue-storage-redesign.md)
+- **Vacuum-aware storage** — append-only ready/terminal partitions plus
+  rotating lease and receipt rings keep the hot queue tables' dead-tuple
+  footprint bounded under sustained load. See [ADR-019](../docs/adr/019-queue-storage-redesign.md)
   and [ADR-023](../docs/adr/023-receipt-plane-ring-partitioning.md).
 - **Crash-safe execution** — heartbeat-based lease tracking; jobs whose
   workers vanish are rescued automatically.

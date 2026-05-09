@@ -31,16 +31,17 @@ top of Awa.
 - **HTTP worker** — `HttpWorker`, `HttpWorkerConfig`, `HttpWorkerMode`
   dispatch jobs to serverless endpoints over HTTP with HMAC-BLAKE3
   signing. See [ADR-018](../docs/adr/018-http-worker.md).
-- **Maintenance** — `RetentionPolicy` controls retention sweeps; the
-  maintenance leader also rotates the receipt-ring partitions
-  introduced in 0.6.
+- **Maintenance** — the elected maintenance leader runs rescue, promotion,
+  queue/lease/claim ring rotation and prune, DLQ cleanup, descriptor cleanup,
+  cron evaluation, and queue-health publication.
 - **Metrics** — `AwaMetrics` exposes the runtime metric surface for
   Prometheus / OTel scrapers.
 
 ## Capabilities
 
 - **Vacuum-aware queue storage** — workers default to the queue-storage
-  engine and rotating receipt ring described in
+  engine: append-only ready/terminal partitions, rotating lease and receipt
+  rings, and separate deferred/DLQ tables described in
   [ADR-019](../docs/adr/019-queue-storage-redesign.md) and
   [ADR-023](../docs/adr/023-receipt-plane-ring-partitioning.md).
 - **Dead Letter Queue** — terminal failures land in `dlq_entries` for

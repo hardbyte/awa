@@ -146,17 +146,16 @@ smaller than what `open_receipt_claims` used to hold dynamically.
   at the same cadence as the queue ring so claim partitions age out
   roughly in step with the ready / done partitions they reference.
 - A claim-slot partition may be truncated only when every claim in it is
-  either:
-  - represented by a closure row in the corresponding
-    `lease_claim_closures` partition, or
-  - rescued through the existing receipt-rescue path immediately before
-    prune takes `ACCESS EXCLUSIVE` on the partition.
+  represented by a closure row in the corresponding
+  `lease_claim_closures` partition. If open claims remain, prune skips the
+  partition until normal completion or the separate receipt-rescue scans close
+  those claims.
 - Prune order mirrors `prune_oldest` and `prune_oldest_leases`:
   1. `FOR UPDATE` on `claim_ring_state`.
   2. `FOR UPDATE` on the target `claim_ring_slots` row.
   3. `SET LOCAL lock_timeout = '50ms'`.
   4. `ACCESS EXCLUSIVE` on both partitions (claims and closures).
-  5. Liveness recheck: rescue any still-open claims, then `TRUNCATE`.
+  5. Liveness recheck: every claim must have a closure, then `TRUNCATE`.
 - Partition truncation never races with claim because claim always writes
   to the ring's current slot and rotation advances the current slot
   atomically under the same lock order.
