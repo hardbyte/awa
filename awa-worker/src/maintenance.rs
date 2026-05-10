@@ -80,6 +80,17 @@ pub struct MaintenanceService {
     /// before the maintenance leader deletes it. Zero disables cleanup.
     /// Default: 30 days.
     descriptor_retention: Duration,
+    /// ADR-024: cadence for the deferred-done_entries materialiser.
+    /// Only fires when QueueStorageConfig.deferred_done_entries is on.
+    /// Default 100 ms — small enough that backlog stays bounded under
+    /// any realistic completion rate, large enough that it's not on
+    /// the latency hot path.
+    materialise_done_interval: Duration,
+    /// ADR-024: max rows the materialiser drains per pass. Default
+    /// 4096 — bounds the SQL statement's per-call cost while keeping
+    /// throughput well above 14k jobs/s headline at the default
+    /// cadence.
+    materialise_done_batch: i64,
 }
 
 const PROMOTE_BATCH_SIZE: i64 = 4_096;
@@ -130,7 +141,21 @@ impl MaintenanceService {
             metadata_reconciliation_interval: Duration::from_secs(60),
             priority_aging_interval: Duration::from_secs(60),
             descriptor_retention: Duration::from_secs(30 * 86400), // 30d
+            materialise_done_interval: Duration::from_millis(100),
+            materialise_done_batch: 4_096,
         }
+    }
+
+    /// ADR-024: deferred done_entries materialiser cadence.
+    pub fn materialise_done_interval(mut self, interval: Duration) -> Self {
+        self.materialise_done_interval = interval;
+        self
+    }
+
+    /// ADR-024: deferred done_entries materialiser per-pass batch size.
+    pub fn materialise_done_batch(mut self, batch: i64) -> Self {
+        self.materialise_done_batch = batch.max(0);
+        self
     }
 
     /// Set the priority aging interval (default: 60s).
@@ -313,6 +338,14 @@ impl MaintenanceService {
             let mut metadata_reconciliation_timer =
                 tokio::time::interval(self.metadata_reconciliation_interval);
             let mut priority_aging_timer = tokio::time::interval(self.priority_aging_interval);
+            // ADR-024: deferred-done_entries materialiser. Only ticks
+            // when the storage backend is queue_storage AND the
+            // backend has the deferred_done_entries flag enabled.
+            let mut materialise_done_timer = self
+                .storage
+                .queue_storage()
+                .filter(|qs| qs.store.deferred_done_entries())
+                .map(|_| tokio::time::interval(self.materialise_done_interval));
             let mut vacuum_queue_timer = self
                 .storage
                 .queue_storage()
@@ -338,6 +371,9 @@ impl MaintenanceService {
             dirty_key_timer.tick().await;
             metadata_reconciliation_timer.tick().await;
             priority_aging_timer.tick().await;
+            if let Some(timer) = &mut materialise_done_timer {
+                timer.tick().await;
+            }
             if let Some(timer) = &mut vacuum_queue_timer {
                 timer.tick().await;
             }
@@ -400,6 +436,15 @@ impl MaintenanceService {
                     }
                     _ = priority_aging_timer.tick() => {
                         self.age_waiting_priorities().await;
+                    }
+                    _ = async {
+                        if let Some(timer) = &mut materialise_done_timer {
+                            timer.tick().await;
+                        } else {
+                            std::future::pending::<()>().await;
+                        }
+                    }, if materialise_done_timer.is_some() => {
+                        self.materialise_done_entries().await;
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_queue_timer {
@@ -786,6 +831,38 @@ impl MaintenanceService {
                 error!(error = %err, "Failed to rescue callback-timed-out jobs");
             }
             _ => {}
+        }
+    }
+
+    /// ADR-024: backfill `done_entries` from closures that the
+    /// completion hot path skipped. Only fires when the storage
+    /// backend is queue_storage AND its `deferred_done_entries` flag
+    /// is enabled (the timer in `run` already gates that). Single
+    /// SQL round-trip per pass; bounded by `materialise_done_batch`.
+    #[tracing::instrument(skip(self), name = "maintenance.materialise_done")]
+    async fn materialise_done_entries(&self) {
+        let runtime = match self.storage.queue_storage() {
+            Some(runtime) => runtime,
+            None => return,
+        };
+        if !runtime.store.deferred_done_entries() {
+            return;
+        }
+        match runtime
+            .store
+            .materialise_done_entries(&self.pool, self.materialise_done_batch)
+            .await
+        {
+            Ok(count) if count > 0 => {
+                debug!(
+                    count,
+                    "Materialised deferred done_entries rows from closures"
+                );
+            }
+            Ok(_) => {}
+            Err(err) => {
+                warn!(error = %err, "Failed to materialise deferred done_entries");
+            }
         }
     }
 

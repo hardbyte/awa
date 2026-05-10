@@ -329,6 +329,7 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
     )
@@ -1036,6 +1037,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             ..Default::default()
         },
     )
@@ -1064,6 +1066,7 @@ async fn test_claim_ring_rotate_and_prune_under_load() {
             claim_slot_count: 4,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
         },
         CompleteWorker,
     );
@@ -1203,6 +1206,7 @@ async fn test_prune_oldest_claims_refuses_to_truncate_open_claim() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             ..Default::default()
         },
     )
@@ -1328,6 +1332,7 @@ async fn test_admin_cancel_wakes_in_flight_handler() {
             claim_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
         },
         CancelObservingWorker {
             running: running.clone(),
@@ -1393,6 +1398,7 @@ async fn test_open_receipt_claims_is_absent_after_install() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             ..Default::default()
         },
     )
@@ -1440,6 +1446,7 @@ async fn test_open_receipt_claims_is_absent_after_install() {
             claim_slot_count: 4,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
         },
         CompleteWorker,
     );
@@ -1492,6 +1499,7 @@ async fn test_lease_claim_partition_routing() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             ..Default::default()
         },
     )
@@ -1538,6 +1546,7 @@ async fn test_lease_claim_partition_routing() {
             claim_slot_count: 4,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
         },
         RetryOnceWorker,
     );
@@ -1618,6 +1627,7 @@ async fn test_lease_claim_rotation_isolation() {
             lease_slot_count: 2,
             claim_slot_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             ..Default::default()
         },
     )
@@ -1980,6 +1990,7 @@ async fn test_queue_storage_runtime_retry_after() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         RetryOnceWorker,
@@ -2012,6 +2023,7 @@ async fn test_queue_storage_two_clients_drain_without_duplicate_execution() {
         queue_slot_count: 4,
         lease_slot_count: 2,
         lease_claim_receipts: false,
+        deferred_done_entries: false,
         ..Default::default()
     };
 
@@ -2459,6 +2471,7 @@ async fn test_queue_storage_short_jobs_do_not_create_attempt_state() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         gate.worker(),
@@ -2522,6 +2535,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -2536,6 +2550,7 @@ async fn test_queue_storage_short_jobs_complete_via_lease_claim_receipts() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
         gate.worker(),
@@ -2615,6 +2630,7 @@ async fn test_queue_storage_capacity_wake_drains_after_partial_drain() {
         queue_slot_count: 4,
         lease_slot_count: 2,
         lease_claim_receipts: true,
+        deferred_done_entries: false,
         claim_slot_count: 2,
         ..Default::default()
     };
@@ -2711,6 +2727,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             lease_slot_count: 2,
             queue_stripe_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -2725,6 +2742,7 @@ async fn test_queue_storage_striped_short_jobs_complete_via_lease_claim_receipts
             lease_slot_count: 2,
             queue_stripe_count: 4,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
         gate.worker(),
@@ -2792,6 +2810,7 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -2872,6 +2891,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -2894,6 +2914,7 @@ async fn test_queue_storage_receipt_claims_materialize_on_heartbeat() {
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
                 lease_claim_receipts: true,
+                deferred_done_entries: false,
                 claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
@@ -2997,6 +3018,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -3010,6 +3032,7 @@ async fn test_queue_storage_receipt_claims_retry_successfully() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
         RetryOnceWorker,
@@ -3064,6 +3087,7 @@ async fn test_queue_storage_receipt_claims_fail_retryable_without_materializing_
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -3119,6 +3143,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -3152,6 +3177,7 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
                 lease_claim_receipts: true,
+                deferred_done_entries: false,
                 claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
@@ -3239,6 +3265,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -3261,6 +3288,7 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
                 lease_slot_count: 2,
                 queue_stripe_count: 1,
                 lease_claim_receipts: true,
+                deferred_done_entries: false,
                 claim_slot_count: 2,
             },
             Duration::from_millis(1_000),
@@ -3370,6 +3398,7 @@ async fn test_queue_storage_runtime_snooze() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         SnoozeOnceWorker {
@@ -3426,6 +3455,7 @@ async fn test_queue_storage_runtime_stale_heartbeat_rescue() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -3507,6 +3537,7 @@ async fn test_queue_storage_admin_queries_cover_running_and_failed_rows() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -3623,6 +3654,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         gate.worker(),
@@ -4234,6 +4266,7 @@ async fn test_queue_storage_claim_runtime_applies_priority_aging_dynamically() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -4307,6 +4340,7 @@ async fn test_queue_storage_aged_completion_keeps_lane_priority_for_done_key() {
             lease_slot_count: 2,
             queue_stripe_count: 1,
             lease_claim_receipts: true,
+            deferred_done_entries: false,
             claim_slot_count: 2,
         },
     )
@@ -4642,6 +4676,7 @@ async fn test_queue_storage_runtime_complete_external() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         CallbackWorker {
@@ -4715,6 +4750,7 @@ async fn test_queue_storage_runtime_terminal_failure_moves_to_dlq() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4785,6 +4821,7 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4880,6 +4917,7 @@ async fn test_queue_storage_dlq_api_round_trip() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -4986,6 +5024,7 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -5073,6 +5112,7 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -5145,6 +5185,7 @@ async fn test_queue_storage_retry_from_dlq_surfaces_unique_conflict() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -5208,6 +5249,7 @@ async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -5285,6 +5327,7 @@ async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conf
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -5355,6 +5398,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
             queue_slot_count: 4,
             lease_slot_count: 2,
             lease_claim_receipts: false,
+            deferred_done_entries: false,
             ..Default::default()
         },
         TerminalFailureWorker,
@@ -5430,6 +5474,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
                 queue_slot_count: 4,
                 lease_slot_count: 2,
                 lease_claim_receipts: false,
+                deferred_done_entries: false,
                 ..Default::default()
             },
             Duration::from_millis(1_000),
@@ -5706,4 +5751,270 @@ async fn test_priority_aging_off_does_not_stamp_original() {
         "_awa_original_priority must not be stamped when no aging fired; got metadata={}",
         job.metadata
     );
+}
+
+// ── ADR-024: deferred done_entries materialisation ─────────────────
+
+/// With `deferred_done_entries=true`, completing a runtime job writes
+/// only the `lease_claim_closures` row — `done_entries` stays empty
+/// until the materialiser runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_deferred_done_entries_skips_synchronous_done_insert() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_defer_skips_sync";
+    let schema = "awa_qs_defer_skips_sync";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            deferred_done_entries: true,
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 2, 1)
+        .await
+        .expect("Failed to enqueue");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("claim failed");
+    assert_eq!(claimed.len(), 1);
+
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete failed");
+
+    // closure must exist; done_entries must be empty.
+    let closures: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.lease_claim_closures WHERE outcome = 'completed'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count closures");
+    assert_eq!(closures, 1, "expected one completion closure");
+
+    let done_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count done_entries");
+    assert_eq!(
+        done_rows, 0,
+        "deferred mode must skip the synchronous done_entries write"
+    );
+}
+
+/// The materialiser reconstructs `done_entries` from
+/// `lease_claim_closures` ⨝ `lease_claims` ⨝ `ready_entries`.
+/// Outcome must equal the synchronous path's row.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_materialiser_backfills_done_entries_from_closures() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_defer_backfill";
+    let schema = "awa_qs_defer_backfill";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            deferred_done_entries: true,
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 3, 5)
+        .await
+        .expect("Failed to enqueue");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            10,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("claim failed");
+    assert_eq!(claimed.len(), 5);
+    store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete failed");
+
+    let materialised = store
+        .materialise_done_entries(&pool, 100)
+        .await
+        .expect("materialise failed");
+    assert_eq!(materialised, 5);
+
+    // After materialisation, done_entries holds the same five jobs.
+    let done_state_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count done");
+    assert_eq!(done_state_count, 5);
+
+    // Each materialised row must carry the args that came from
+    // ready_entries — proving the JOIN reconstruction is real.
+    let args_match: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries done
+         JOIN {schema}.ready_entries ready
+           ON done.ready_slot = ready.ready_slot
+          AND done.queue = ready.queue
+          AND done.priority = ready.priority
+          AND done.lane_seq = ready.lane_seq
+         WHERE done.args = ready.args"
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("args compare");
+    assert_eq!(
+        args_match, 5,
+        "every materialised row must carry the original args"
+    );
+}
+
+/// The materialiser is idempotent under repeated invocations.
+/// Running it twice on the same closure backlog yields the same
+/// done_entries set, no duplicates, no errors.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_materialiser_is_idempotent() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_defer_idempotent";
+    let schema = "awa_qs_defer_idempotent";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            deferred_done_entries: true,
+        },
+    )
+    .await;
+
+    store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            10,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+
+    let first = store.materialise_done_entries(&pool, 100).await.unwrap();
+    let second = store.materialise_done_entries(&pool, 100).await.unwrap();
+    assert_eq!(first, 3);
+    assert_eq!(second, 0, "second pass must drain to zero");
+
+    let total: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        total, 3,
+        "no duplicate rows after idempotent re-materialise"
+    );
+}
+
+/// `unmaterialised_closures_for_ready_partition` is the rotation
+/// guard precondition. Returns the count of completed closures
+/// pointing into the partition that still need materialising.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_unmaterialised_for_partition_drains_after_materialise() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_defer_partition_guard";
+    let schema = "awa_qs_defer_partition_guard";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            deferred_done_entries: true,
+        },
+    )
+    .await;
+
+    store.enqueue_batch(&pool, queue, 1, 2).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            10,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+    let claimed_partition = claimed[0].claim.ready_slot;
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+
+    let pending = store
+        .unmaterialised_closures_for_ready_partition(&pool, claimed_partition)
+        .await
+        .unwrap();
+    assert_eq!(pending, 2, "two completed closures should be pending");
+
+    store.materialise_done_entries(&pool, 100).await.unwrap();
+
+    let pending_after = store
+        .unmaterialised_closures_for_ready_partition(&pool, claimed_partition)
+        .await
+        .unwrap();
+    assert_eq!(pending_after, 0, "guard must clear after materialise");
 }
