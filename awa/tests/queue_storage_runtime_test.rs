@@ -5583,3 +5583,127 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
         "INSTEAD OF DELETE trigger should report both deleted rows (one ready + one deferred) once delete_job_compat correctly returns TRUE"
     );
 }
+
+/// Priority-aging end-to-end check: a low-priority job that has been
+/// waiting longer than the configured aging interval is claimed at a
+/// raised effective priority, and its `_awa_original_priority` metadata
+/// records the lane it came from.
+///
+/// Motivated by the 2026-05-09 sweep's `starvation_awa_60min` cell
+/// reporting `aged_completion_rate=0` across a 60-minute soak. This test
+/// confirms the *mechanism* works at a known interval; if it ever stops,
+/// the bench will surface the regression as a zero counter again — but
+/// without this test, a future change to the SQL aging clause could
+/// silently break aging without breaking any other test.
+///
+/// We use a 100 ms aging interval and sleep 250 ms before claiming so
+/// that a priority-4 job's effective priority drops by at least one
+/// step (`floor(elapsed / interval) = 2`, capped at min priority 1).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_priority_aging_lifts_effective_priority_and_records_original() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_priority_aging_lift";
+    let schema = "awa_qs_priority_aging_lift";
+    let store = create_store(&pool, schema).await;
+
+    // Enqueue a single priority-4 job. Single row keeps the test
+    // deterministic — the claim path either ages it or it doesn't.
+    store
+        .enqueue_batch(&pool, queue, 4, 1)
+        .await
+        .expect("Failed to enqueue priority-4 job");
+
+    // Sleep past two aging windows so floor(elapsed / interval) = 2,
+    // i.e. a priority-4 row's effective priority becomes 2.
+    let aging_interval = Duration::from_millis(100);
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            aging_interval,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("Failed to claim with aging on");
+
+    assert_eq!(
+        claimed.len(),
+        1,
+        "expected the priority-4 job to be claimed"
+    );
+    let job = &claimed[0].job;
+
+    assert!(
+        job.priority < 4,
+        "expected effective priority < 4 after aging; got {}",
+        job.priority
+    );
+
+    let original = job
+        .metadata
+        .get("_awa_original_priority")
+        .and_then(|v| v.as_i64())
+        .unwrap_or_else(|| {
+            panic!(
+                "claimed aged job missing _awa_original_priority metadata; got metadata={}",
+                job.metadata
+            )
+        });
+    assert_eq!(
+        original, 4,
+        "_awa_original_priority should record the lane priority"
+    );
+}
+
+/// Counterpart to the aging test: when the aging interval is so large
+/// that no aging fires within the test's wall-clock window, the claimed
+/// job's priority equals the lane priority and `_awa_original_priority`
+/// is *absent* from metadata. Pins the no-aging-on-no-elapsed-time
+/// branch of `into_job_row`'s `priority < lane_priority` guard so a
+/// future refactor can't accidentally always-stamp the metadata.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_priority_aging_off_does_not_stamp_original() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_priority_aging_off";
+    let schema = "awa_qs_priority_aging_off";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 4, 1)
+        .await
+        .expect("Failed to enqueue priority-4 job");
+
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            // Aging interval much larger than the test's wall clock.
+            Duration::from_secs(3_600),
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("Failed to claim with aging off (effectively)");
+
+    assert_eq!(claimed.len(), 1);
+    let job = &claimed[0].job;
+    assert_eq!(job.priority, 4, "no aging should leave priority unchanged");
+    assert!(
+        job.metadata.get("_awa_original_priority").is_none(),
+        "_awa_original_priority must not be stamped when no aging fired; got metadata={}",
+        job.metadata
+    );
+}
