@@ -36,6 +36,7 @@ in-place as historical context.
 | 021 | [Sequential callbacks and callback heartbeats](021-enhanced-external-wait.md) | Accepted | `wait_for_callback()` + `resume_external()` for multi-step orchestration; `heartbeat_callback` for long-running externals | Callback state moved to `active_leases` per ADR-019 |
 | 022 | [Descriptor catalog](022-descriptor-catalog.md) | Accepted | `queue_descriptors` / `job_kind_descriptors` tables, BLAKE3-hashed, code-declared, off the hot path | Off the queue-storage hot path |
 | 023 | [Receipt plane ring partitioning](023-receipt-plane-ring-partitioning.md) | Accepted | Partitioned `lease_claims` / `lease_claim_closures` ring replaces `open_receipt_claims`; receipts default on in 0.6 | Refines ADR-019 receipt plane |
+| 024 | [Deferred done_entries materialisation](024-deferred-done-entries.md) | **Rejected** | Move `done_entries` write off the completion hot path to a maintenance materialiser pass | Investigated 2026-05-10/11; benchmarked 34 % slower than synchronous receipt-ring complete. Kept as design-space record alongside `correctness/storage/AwaDeferredMaterialize.tla` |
 
 ## Validation artifacts
 
