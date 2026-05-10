@@ -6019,6 +6019,66 @@ async fn test_unmaterialised_for_partition_drains_after_materialise() {
     assert_eq!(pending_after, 0, "guard must clear after materialise");
 }
 
+/// Regression guard: with `deferred_done_entries=false` (the
+/// default), the synchronous path writes `done_entries` exactly as
+/// before the refactor. Catches the case where extracting
+/// `release_unique_claims_for_done_rows_tx` accidentally drops the
+/// wide INSERT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_synchronous_path_still_writes_done_entries() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_sync_writes_done";
+    let schema = "awa_qs_sync_writes_done";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            deferred_done_entries: false,
+        },
+    )
+    .await;
+
+    store.enqueue_batch(&pool, queue, 2, 3).await.unwrap();
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            10,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap();
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+
+    // Synchronous path: done_entries lands in the same tx as the
+    // closure. No materialiser pass needed.
+    let done_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE state = 'completed'"
+    ))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(done_count, 3);
+
+    // Materialiser fires on the same backlog: zero new rows, idempotent.
+    let materialised = store.materialise_done_entries(&pool, 100).await.unwrap();
+    assert_eq!(
+        materialised, 0,
+        "synchronous path leaves no backlog for the materialiser"
+    );
+}
+
 /// End-to-end rotation guard: under deferred mode, the existing
 /// `prune_oldest` JOIN-on-`done_entries` check naturally blocks
 /// TRUNCATE while a closure has not yet been materialised. This is

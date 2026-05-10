@@ -193,6 +193,34 @@ materialiser inline once on first start of the new binary, against
 all closures whose done_entries row is missing). Encoded as a
 data-migration step in the install path.
 
+## Still to land before flipping the default
+
+The branch as committed enables the deferred path under the
+`QueueStorageConfig.deferred_done_entries` flag (default false). The
+hot-path skip, materialiser, and rotation guard are correct and
+tested. The remaining production-readiness gate is **read-side
+projection updates** — under `deferred=true`, callers that read
+`done_entries` directly may briefly miss a completed job during the
+materialiser cadence window.
+
+Affected read paths (each must UNION in a synthesised projection
+from `lease_claim_closures` ⨝ `lease_claims` ⨝ `ready_entries`
+WHERE `done_entries.lane_seq IS NULL`):
+
+1. `awa.jobs_compat()` in v012 — the user-facing `awa.jobs` view's
+   backing function. Currently UNIONs ready_entries + lease rows +
+   done_entries + dlq_entries; needs a fifth branch.
+2. `cli get-job <id>` — admin lookup. Routes through `jobs_compat`
+   today, picks up the fix automatically once the view is updated.
+3. `awa-ui` runtime API endpoints — same.
+
+A dedicated migration `v016_deferred_done_entries.sql` rewrites
+`awa.jobs_compat()` to add the synthesised branch. Until that
+migration ships, flipping `deferred_done_entries=true` is safe for
+bench/throughput experiments (the bench worker doesn't query
+`jobs_view`) but unsafe for production deployments that have
+operators or job state machinery polling `awa.jobs`.
+
 ## Validation
 
 - TLA+ spec at `correctness/storage/AwaDeferredMaterialize.tla`.
