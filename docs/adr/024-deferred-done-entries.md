@@ -98,30 +98,40 @@ Each pass:
 
 The pass is a single SQL statement — one round-trip per batch.
 
-### Rotation guard (new)
+### Rotation guard (already in place)
 
-Existing partition rotation in `prune_ready_segment` adds a precondition:
+Implementation note: a fresh review of `prune_oldest` in
+`awa-model/src/queue_storage.rs` showed the existing pre-TRUNCATE
+check already serves as the rotation guard the deferred path needs.
+Today's check counts ready_entries rows in the candidate partition
+that have no corresponding done_entries row:
 
 ```sql
-SELECT NOT EXISTS (
-    SELECT 1
-    FROM {schema}.lease_claim_closures AS closures
-    JOIN {schema}.lease_claims AS claims USING (claim_slot, job_id, run_lease)
-    LEFT JOIN {schema}.done_entries AS done
-      ON done.ready_slot = claims.ready_slot
-     AND done.queue = claims.queue
-     AND done.priority = claims.priority
-     AND done.lane_seq = claims.lane_seq
-    WHERE claims.ready_slot = $1
-      AND done.ready_slot IS NULL
-)
+SELECT count(*)::bigint
+FROM {ready_child} AS ready
+LEFT JOIN {done_child} AS done
+  ON done.ready_generation = ready.ready_generation
+ AND done.queue = ready.queue
+ AND done.priority = ready.priority
+ AND done.lane_seq = ready.lane_seq
+WHERE done.lane_seq IS NULL
 ```
 
-If any closure-without-done references the partition about to TRUNCATE,
-the prune call returns "not safe yet" and the rotation logic invokes
-the materialiser inline (a synchronous catch-up pass) before retrying.
-Rotation is already a coarse-grained event (seconds-to-minutes), so
-the synchronous catch-up is acceptable.
+Under the synchronous path this counted "still-running or never-started"
+work. Under the deferred path the same count *also* catches
+"completed-but-not-yet-materialised" — the closure has been written but
+done_entries lags. The prune returns
+`SkippedActive { reason: QueuePendingReady, count: N }` and the
+maintenance loop retries on the next vacuum tick.
+
+Once the materialiser drains the backlog (default cadence 100 ms), the
+LEFT JOIN matches, the count drops to zero, and the next
+`rotate_queue_storage_queue` tick prunes successfully. No new SQL
+needed; the `materialise_done_entries` task is the only addition.
+
+The dedicated helper `unmaterialised_closures_for_ready_partition`
+mirrors this check from the closure side; it's exposed for ops
+visibility but not on the prune hot path.
 
 ### Read-side projection
 

@@ -6018,3 +6018,75 @@ async fn test_unmaterialised_for_partition_drains_after_materialise() {
         .unwrap();
     assert_eq!(pending_after, 0, "guard must clear after materialise");
 }
+
+/// End-to-end rotation guard: under deferred mode, the existing
+/// `prune_oldest` JOIN-on-`done_entries` check naturally blocks
+/// TRUNCATE while a closure has not yet been materialised. This is
+/// the integration counterpart of the helper-only test above —
+/// proves the architectural claim that no new partition-prune logic
+/// was needed to keep the rotation safe.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_rotation_blocked_until_materialiser_drains() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_defer_rotation_blocked";
+    let schema = "awa_qs_defer_rotation_blocked";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            deferred_done_entries: true,
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 1)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch_with_aging_for_instance(
+            &pool,
+            queue,
+            1,
+            Duration::ZERO,
+            Duration::ZERO,
+            Uuid::new_v4(),
+            4,
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+        .await
+        .expect("claim");
+    assert_eq!(claimed.len(), 1);
+    store.complete_runtime_batch(&pool, &claimed).await.unwrap();
+
+    // Rotate so the partition we wrote into is no longer current.
+    let rotated = store.rotate(&pool).await.expect("rotate");
+    assert!(matches!(rotated, RotateOutcome::Rotated { .. }));
+
+    // Prune attempt #1 — the closure exists but done_entries does not,
+    // so the JOIN-pending check must block the TRUNCATE. The match is
+    // intentionally permissive on the slot field because rotate() may
+    // pick any slot; the contract is only that TRUNCATE is refused.
+    let prune_blocked = store.prune_oldest(&pool).await.expect("prune");
+    assert!(
+        matches!(prune_blocked, PruneOutcome::SkippedActive { .. }),
+        "expected SkippedActive while closure unmaterialised; got {prune_blocked:?}"
+    );
+
+    // Drain the backlog.
+    store.materialise_done_entries(&pool, 100).await.unwrap();
+
+    // Prune attempt #2 — done_entries now matches, partition can drop.
+    let prune_after = store.prune_oldest(&pool).await.expect("prune after");
+    assert!(
+        matches!(prune_after, PruneOutcome::Pruned { .. }),
+        "expected Pruned after materialise; got {prune_after:?}"
+    );
+}
