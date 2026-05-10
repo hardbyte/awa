@@ -10,10 +10,11 @@ This document is ordered by the questions operators and contributors usually
 need answered first:
 
 - What owns the runtime?
+- What deployment assumptions shape that runtime?
 - Where does state live?
 - How does a job move through storage?
-- How are partitions rotated and reclaimed?
 - How does Awa recover from crashes and stale attempts?
+- How are partitions rotated and reclaimed?
 - Which surfaces are operational rather than hot-path?
 
 For migration details see [migrations.md](migrations.md). For user-facing
@@ -34,6 +35,18 @@ heartbeat its own attempts, but exactly one elected maintenance leader runs
 cluster-wide promotion, rescue, queue/lease/claim ring rotation and prune, DLQ
 cleanup, descriptor cleanup, cron evaluation, metadata refresh, and
 queue-health publication.
+
+## Deployment Model
+
+- Awa assumes one shared Postgres database and any number of Rust or Python
+  worker processes.
+- Each process registers the queues and job kinds it can execute.
+- Queue work is awakened by `LISTEN/NOTIFY` with polling as the fallback.
+- The maintenance leader is elected inside the same worker fleet; no `pg_cron`
+  or external scheduler is required.
+- Long analytical reads should run on replicas or with disciplined timeouts,
+  because long-lived primary transactions can delay best-effort partition
+  prune.
 
 ## Storage Planes
 
@@ -171,6 +184,24 @@ rejected after a newer claim or terminal transition. The `awa-ui` HTTP callback
 receiver verifies `X-Awa-Signature` when `AWA_CALLBACK_HMAC_SECRET` is set;
 custom callback receivers must provide equivalent authentication.
 
+## Recovery Model
+
+Awa has three rescue paths:
+
+- **Stale heartbeat rescue.** Each worker heartbeats the attempts it owns.
+  The maintenance leader rescues attempts whose heartbeat is older than
+  `heartbeat_staleness` (default 90s).
+- **Hard deadline rescue.** Per-queue deadlines write `deadline_at` onto
+  receipt or lease rows. The maintenance leader closes expired attempts and
+  routes them through the normal retry/fail/DLQ path.
+- **Callback-timeout rescue.** Waiting attempts with expired callback timeouts
+  are moved back through the same guarded finalization machinery.
+
+Rescue closes the old attempt before making work available again. If the old
+handler later writes a completion, the `run_lease` guard rejects it as stale.
+When rescue happens in a process that still has the handler registered, the
+runtime also flips the in-memory cancellation flag.
+
 ## Partition Rotation And Reclamation
 
 Queue storage has three independent rings, each advanced by the elected
@@ -200,24 +231,6 @@ This is why queue storage's hot-path reclamation is a rotation-and-prune
 discipline, not ordinary row-by-row vacuum cleanup. Ordinary retention cleanup
 still exists for DLQ rows, stale descriptors, stale runtime snapshots, and the
 canonical compatibility path.
-
-## Recovery Model
-
-Awa has three rescue paths:
-
-- **Stale heartbeat rescue.** Each worker heartbeats the attempts it owns.
-  The maintenance leader rescues attempts whose heartbeat is older than
-  `heartbeat_staleness` (default 90s).
-- **Hard deadline rescue.** Per-queue deadlines write `deadline_at` onto
-  receipt or lease rows. The maintenance leader closes expired attempts and
-  routes them through the normal retry/fail/DLQ path.
-- **Callback-timeout rescue.** Waiting attempts with expired callback timeouts
-  are moved back through the same guarded finalization machinery.
-
-Rescue closes the old attempt before making work available again. If the old
-handler later writes a completion, the `run_lease` guard rejects it as stale.
-When rescue happens in a process that still has the handler registered, the
-runtime also flips the in-memory cancellation flag.
 
 ## Maintenance Leader
 
@@ -282,24 +295,6 @@ Periodic jobs are declared by worker code and synchronized to `cron_jobs`.
 Only the maintenance leader evaluates due schedules. Enqueue is atomic, so a
 crash between evaluation and insert cannot create half-visible work.
 
-## Crate Structure
-
-```text
-awa (workspace)
-├── awa-macros        proc macro: #[derive(JobArgs)]
-├── awa-model         types, SQL, migrations, insert/admin/cron APIs
-├── awa-worker        runtime: client, dispatcher, executor, heartbeat, maintenance
-├── awa               facade crate re-exporting model + worker APIs
-├── awa-testing       integration-test helpers
-├── awa-ui            axum API + embedded React dashboard
-├── awa-cli           migrations, admin, storage, and web UI CLI
-└── awa-python        PyO3 Python bindings
-```
-
-`awa-model` owns schema and storage APIs. `awa-worker` owns runtime behavior.
-`awa` is the normal Rust facade. `awa-python` embeds the same worker runtime
-behind Python bindings, so mixed Rust/Python fleets share storage semantics.
-
 ## Observability And Correctness
 
 Awa emits tracing spans and OpenTelemetry metrics for enqueue, claim,
@@ -323,14 +318,20 @@ The runtime tests replay representative storage traces against these models,
 and the benchmark notes document long-horizon partition and dead-tuple
 validation for ADR-019 and ADR-023.
 
-## Deployment Model
+## Crate Structure
 
-- Awa assumes one shared Postgres database and any number of Rust or Python
-  worker processes.
-- Each process registers the queues and job kinds it can execute.
-- Queue work is awakened by `LISTEN/NOTIFY` with polling as the fallback.
-- The maintenance leader is elected inside the same worker fleet; no `pg_cron`
-  or external scheduler is required.
-- Long analytical reads should run on replicas or with disciplined timeouts,
-  because long-lived primary transactions can delay best-effort partition
-  prune.
+```text
+awa (workspace)
+├── awa-macros        proc macro: #[derive(JobArgs)]
+├── awa-model         types, SQL, migrations, insert/admin/cron APIs
+├── awa-worker        runtime: client, dispatcher, executor, heartbeat, maintenance
+├── awa               facade crate re-exporting model + worker APIs
+├── awa-testing       integration-test helpers
+├── awa-ui            axum API + embedded React dashboard
+├── awa-cli           migrations, admin, storage, and web UI CLI
+└── awa-python        PyO3 Python bindings
+```
+
+`awa-model` owns schema and storage APIs. `awa-worker` owns runtime behavior.
+`awa` is the normal Rust facade. `awa-python` embeds the same worker runtime
+behind Python bindings, so mixed Rust/Python fleets share storage semantics.
