@@ -2,8 +2,57 @@
 
 ## Status
 
-Proposed (under feature flag `awa_deferred_done_entries`). Pre-0.6, so
-the schema and contract surface are still in flux.
+**Rejected (2026-05-11)** — investigated, prototyped, benchmarked, and
+backed out. Synchronous `done_entries` write on the completion hot
+path stays the only first-class implementation. The TLA+ spec under
+`correctness/storage/AwaDeferredMaterialize.tla` is preserved as a
+record of the design space; the runtime branching, materialiser
+task, and rotation guard added by this ADR have been removed.
+
+The motivation, design, and what we learned are kept below for
+reference.
+
+## Why rejected
+
+A/B benchmark on the same hardware as the 2026-05-09 sweep shape
+(producer-rate=50000, depth-target=4000, W=64, 30 s warmup +
+60 s clean):
+
+| mode | completion (jobs/s) | enqueue | depth | e2e p99 |
+|---|---:|---:|---:|---:|
+| sync (this branch) | **2,803** | 3,222 | 4,140 | 1,396 ms |
+| deferred (final design) | 1,839 | 2,023 | 3,895 | 1,954 ms |
+
+Deferred shipped **34 % lower** completion-rate and **40 % higher**
+p99. The first-attempt design (closure prune gated on materialiser)
+was even worse — multi-second stalls — and prompted a redesign to
+inline the materialise pass in `prune_oldest_claims` itself. That
+redesign removed the stalls but did not recover throughput parity
+with sync, let alone deliver lift.
+
+Why it didn't pan out, in retrospect:
+
+- **The `done_entries` INSERT is not the bottleneck on this
+  workload.** Sync mode at 2.8k jobs/s on macOS-docker / pg18 leaves
+  plenty of headroom; the JSONB write isn't where the time goes.
+- **The deferred design adds three coupled mechanisms** (periodic
+  materialiser timer, inline catch-up in `prune_oldest_claims`,
+  rotation guard via `prune_oldest`'s existing pending check). Each
+  mechanism is correct in isolation; together they introduce
+  partition-rotation contention that exceeds the saved hot-path WAL.
+- **The read-side migration was still pending** (`v016` UNION branch
+  in `awa.jobs_compat()`). The ADR could not flip the default
+  without it, and the bench numbers said it was not worth shipping
+  even if we did the read-side work.
+
+The simpler architecture wins: keep the synchronous receipt-ring
+complete path. The throughput gap to pgque (14k vs 40k in the
+sweep) is structural — pgque trades feature surface and per-job
+durability for throughput, awa keeps both. The right awa
+improvements live elsewhere — bloat-resistance under `idle_in_tx`
+and `active_readers` (75 % / 71 % drops in the sweep) are
+awa-specific and closeable; that's where the next investigation
+should look.
 
 ## Context
 

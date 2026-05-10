@@ -1,6 +1,13 @@
 ---- MODULE AwaDeferredMaterialize ----
 EXTENDS TLC, Naturals, FiniteSets
 
+\* ADR-024 was REJECTED 2026-05-11 after benchmarking showed the
+\* deferred design was 34% slower than the synchronous path on the
+\* sweep workload shape. This spec is preserved as a record of the
+\* design space — it captures the safety + liveness contract any
+\* future revisit would have to satisfy. The Rust implementation it
+\* described has been removed; do not assume it is in the codebase.
+\*
 \* Focused contract spec for deferred done_entries materialisation.
 \*
 \* Today (pre-change): completing a job atomically writes both the

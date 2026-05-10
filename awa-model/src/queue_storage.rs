@@ -41,21 +41,6 @@ pub struct QueueStorageConfig {
     /// Set to `false` to force every claim through the legacy
     /// `leases` materialization path.
     pub lease_claim_receipts: bool,
-    /// ADR-024: defer the `done_entries` write off the completion
-    /// hot path. When `true`, completing a job writes only the
-    /// `lease_claim_closures` row and `attempt_state` delete; a
-    /// periodic materialiser task joins closures with `lease_claims`
-    /// and `ready_entries` to backfill `done_entries`. The read-side
-    /// `jobs_view` UNIONs in not-yet-materialised closures so
-    /// callers never observe a stale state. The
-    /// `ready_entries`-partition rotation guard blocks TRUNCATE
-    /// while any closure still references the partition without a
-    /// corresponding `done_entries` row.
-    ///
-    /// Default `false` — pre-flighted under env flag
-    /// `AWA_DEFER_DONE_ENTRIES=1` until validation lands. See ADR-024
-    /// and `correctness/storage/AwaDeferredMaterialize.tla`.
-    pub deferred_done_entries: bool,
 }
 
 impl Default for QueueStorageConfig {
@@ -67,7 +52,6 @@ impl Default for QueueStorageConfig {
             claim_slot_count: DEFAULT_CLAIM_SLOT_COUNT,
             queue_stripe_count: DEFAULT_QUEUE_STRIPE_COUNT,
             lease_claim_receipts: true,
-            deferred_done_entries: false,
         }
     }
 }
@@ -1577,16 +1561,6 @@ impl QueueStorage {
 
     pub fn lease_claim_receipts(&self) -> bool {
         self.config.lease_claim_receipts
-    }
-
-    /// ADR-024: when true, the completion hot path skips the
-    /// `done_entries` write and a periodic materialiser fills it in
-    /// from `lease_claim_closures` ⨝ `lease_claims` ⨝
-    /// `ready_entries`. Read-side projections must UNION
-    /// closures-without-done so external callers don't observe a
-    /// stale state during the transient window.
-    pub fn deferred_done_entries(&self) -> bool {
-        self.config.deferred_done_entries
     }
 
     fn uses_queue_striping(&self) -> bool {
@@ -4413,18 +4387,16 @@ impl QueueStorage {
         Ok(rows.len())
     }
 
-    /// ADR-024: extracted from `insert_done_rows_tx` so the deferred
-    /// materialisation path can run the per-row unique-claim release
-    /// without writing the wide done_entries row. The materialiser
-    /// later fills in done_entries; the unique-claim release is tied
-    /// to the *claim* lifecycle, not to done_entries materialisation,
-    /// so it stays on the hot path.
-    async fn release_unique_claims_for_done_rows_tx<'a>(
+    async fn insert_done_rows_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: &[DoneJobRow],
         old_state: Option<JobState>,
-    ) -> Result<(), AwaError> {
+    ) -> Result<usize, AwaError> {
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
         for row in rows {
             self.sync_unique_claim(
                 tx,
@@ -4436,21 +4408,6 @@ impl QueueStorage {
             )
             .await?;
         }
-        Ok(())
-    }
-
-    async fn insert_done_rows_tx<'a>(
-        &self,
-        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        rows: &[DoneJobRow],
-        old_state: Option<JobState>,
-    ) -> Result<usize, AwaError> {
-        if rows.is_empty() {
-            return Ok(0);
-        }
-
-        self.release_unique_claims_for_done_rows_tx(tx, rows, old_state)
-            .await?;
 
         let schema = self.schema();
         let ready_payloads = if rows
@@ -5717,151 +5674,6 @@ impl QueueStorage {
             .collect())
     }
 
-    /// ADR-024: backfill `done_entries` from
-    /// `lease_claim_closures` ⨝ `lease_claims` ⨝ `ready_entries` for
-    /// completion closures whose terminal index row hasn't landed
-    /// yet.
-    ///
-    /// Designed to be invoked from the maintenance loop on a fast
-    /// cadence (default 100 ms). One SQL round-trip per pass; the
-    /// `LEFT JOIN done_entries IS NULL` filter is the idempotency
-    /// guard, so concurrent passes are safe.
-    ///
-    /// Returns the number of rows materialised; a return of 0 means
-    /// the backlog is drained and the cadence can stretch.
-    ///
-    /// Filters on `outcome = 'completed'`. Other closure outcomes
-    /// (`'cancelled'`, `'rescued'`, …) come from paths that still
-    /// write `done_entries` synchronously, so the LEFT JOIN
-    /// excludes them naturally — but the explicit filter on outcome
-    /// makes the contract obvious and lets a future change to those
-    /// paths opt in deliberately.
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.materialise_done_entries")]
-    pub async fn materialise_done_entries(
-        &self,
-        pool: &PgPool,
-        max_batch: i64,
-    ) -> Result<i64, AwaError> {
-        if max_batch <= 0 {
-            return Ok(0);
-        }
-        let schema = self.schema();
-        let materialised: i64 = sqlx::query_scalar(&format!(
-            r#"
-            WITH backlog AS (
-                SELECT
-                    closures.claim_slot,
-                    closures.job_id,
-                    closures.run_lease,
-                    closures.closed_at,
-                    claims.ready_slot,
-                    claims.ready_generation,
-                    claims.queue,
-                    claims.priority,
-                    claims.attempt,
-                    claims.max_attempts,
-                    claims.lane_seq
-                FROM {schema}.lease_claim_closures AS closures
-                JOIN {schema}.lease_claims AS claims
-                  ON claims.claim_slot = closures.claim_slot
-                 AND claims.job_id = closures.job_id
-                 AND claims.run_lease = closures.run_lease
-                LEFT JOIN {schema}.done_entries AS done
-                  ON done.ready_slot = claims.ready_slot
-                 AND done.queue = claims.queue
-                 AND done.priority = claims.priority
-                 AND done.lane_seq = claims.lane_seq
-                WHERE closures.outcome = 'completed'
-                  AND done.ready_slot IS NULL
-                ORDER BY closures.closed_at ASC
-                LIMIT $1
-            ),
-            ready_data AS (
-                SELECT
-                    backlog.*,
-                    ready.kind,
-                    ready.args,
-                    ready.run_at,
-                    ready.attempted_at,
-                    ready.created_at,
-                    ready.unique_key,
-                    ready.unique_states,
-                    ready.payload
-                FROM backlog
-                JOIN {schema}.ready_entries AS ready
-                  ON ready.ready_slot = backlog.ready_slot
-                 AND ready.ready_generation = backlog.ready_generation
-                 AND ready.queue = backlog.queue
-                 AND ready.priority = backlog.priority
-                 AND ready.lane_seq = backlog.lane_seq
-            ),
-            inserted AS (
-                INSERT INTO {schema}.done_entries (
-                    ready_slot, ready_generation, job_id, kind, queue, args, state,
-                    priority, attempt, run_lease, max_attempts, lane_seq, run_at,
-                    attempted_at, finalized_at, created_at, unique_key,
-                    unique_states, payload
-                )
-                SELECT
-                    ready_slot, ready_generation, job_id, kind, queue, args,
-                    'completed'::awa.job_state,
-                    priority, attempt, run_lease, max_attempts, lane_seq, run_at,
-                    attempted_at, closed_at, created_at, unique_key,
-                    unique_states, payload
-                FROM ready_data
-                ON CONFLICT (ready_slot, queue, priority, lane_seq) DO NOTHING
-                RETURNING job_id
-            )
-            SELECT count(*)::bigint FROM inserted
-            "#
-        ))
-        .bind(max_batch)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-        Ok(materialised)
-    }
-
-    /// ADR-024: rotation guard precondition. Returns the number of
-    /// completed closures that point into the given `ready_slot`
-    /// (partition) but do not yet have a corresponding
-    /// `done_entries` row. The TRUNCATE caller must drive
-    /// `materialise_done_entries` until this returns 0 before
-    /// dropping the partition; otherwise the source `args` /
-    /// `payload` data needed for materialisation disappears
-    /// permanently.
-    #[tracing::instrument(skip(self, pool), name = "queue_storage.unmaterialised_for_partition")]
-    pub async fn unmaterialised_closures_for_ready_partition(
-        &self,
-        pool: &PgPool,
-        ready_slot: i32,
-    ) -> Result<i64, AwaError> {
-        let schema = self.schema();
-        let pending: i64 = sqlx::query_scalar(&format!(
-            r#"
-            SELECT count(*)::bigint
-            FROM {schema}.lease_claim_closures AS closures
-            JOIN {schema}.lease_claims AS claims
-              ON claims.claim_slot = closures.claim_slot
-             AND claims.job_id = closures.job_id
-             AND claims.run_lease = closures.run_lease
-            LEFT JOIN {schema}.done_entries AS done
-              ON done.ready_slot = claims.ready_slot
-             AND done.queue = claims.queue
-             AND done.priority = claims.priority
-             AND done.lane_seq = claims.lane_seq
-            WHERE claims.ready_slot = $1
-              AND closures.outcome = 'completed'
-              AND done.ready_slot IS NULL
-            "#
-        ))
-        .bind(ready_slot)
-        .fetch_one(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-        Ok(pending)
-    }
-
     #[tracing::instrument(
         skip(self, pool, claimed),
         name = "queue_storage.complete_runtime_batch"
@@ -5954,23 +5766,9 @@ impl QueueStorage {
                             done_rows.push(runtime_job.into_done_row(finalized_at)?);
                         }
                     }
-                    if self.deferred_done_entries() {
-                        // ADR-024: closure is the source of truth; the
-                        // materialiser writes done_entries on its own
-                        // cadence. Still drive the unique-claim release
-                        // here so callers see the same contract — the
-                        // backing row in `awa.job_unique_claims` is
-                        // tied to the claim, not to done_entries.
-                        self.release_unique_claims_for_done_rows_tx(
-                            &mut tx,
-                            &done_rows,
-                            Some(JobState::Running),
-                        )
+
+                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
                         .await?;
-                    } else {
-                        self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
-                            .await?;
-                    }
                     updated_all.extend(updated);
                 }
 
