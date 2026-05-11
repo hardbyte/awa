@@ -1,35 +1,31 @@
 -- v016: Drop the redundant available_count cache from queue_lanes.
 --
--- Background: queue_lanes is the hottest counter table on the
--- runtime path. The 2026-05-10 investigation traced a 31 %
--- throughput drop under pinned xmin (idle_in_tx scenario) to
--- queue_lanes accumulating ~40k dead tuples in a 4 minute window
--- while every other warm counter table stayed under a thousand.
--- Live row count is ≈ 16 (one per (queue, priority)); the heap
--- bloat ratio peaks near 2,500×.
+-- queue_lanes.available_count was a denormalised cache of
+-- `queue_enqueue_heads.next_seq - queue_claim_heads.claim_seq` for
+-- the same (queue, priority). The two head tables already track
+-- every enqueue and claim independently, so the cache was a third
+-- counter that had to be UPDATEd on every enqueue, claim, and
+-- completion batch — at a multiple of its siblings' write rate.
+-- Under a pinned xmin (long-running reader transaction) this made
+-- queue_lanes the dominant source of heap bloat in the schema:
+-- live rows ≈ 16, dead tuples in the tens of thousands within
+-- minutes, with a measured throughput drop while the column
+-- existed.
 --
--- queue_lanes.available_count was a denormalised cache of the
--- difference `queue_enqueue_heads.next_seq -
--- queue_claim_heads.claim_seq` for the same (queue, priority).
--- The two head tables already track every enqueue and every claim;
--- storing a third counter that must also be UPDATEd on every
--- claim, enqueue, and completion batch triples the UPDATE rate on
--- queue_lanes versus its siblings and made it the dominant bloat
--- source.
+-- This migration removes the column. Readers derive the count
+-- on demand from the head-table difference. The compat functions
+-- (`insert_job_compat`, `delete_job_compat`) are replaced to drop
+-- their `available_count` mutations; their signatures stay
+-- byte-identical to v013's so CREATE OR REPLACE substitutes the
+-- body rather than installing a parallel overload.
 --
--- This migration drops the column entirely. Readers compute the
--- available count on-demand from the head-table difference. The
--- compat functions (`insert_job_compat`, `delete_job_compat`) are
--- replaced to remove their `available_count` mutations; their
--- signatures stay byte-identical to v013's so CREATE OR REPLACE
--- substitutes the body rather than installing a parallel overload.
---
--- For workloads with non-trivial admin DELETE traffic, the
--- difference `next_seq - claim_seq` over-counts by the number of
--- admin-deleted unclaimed rows. The hot-path dispatch signal
--- tolerates this drift — the claim attempt finds no rows and the
--- gap-recovery branch in `claim_ready_runtime` advances claim_seq
--- to catch up.
+-- Admin-side DELETE of an unclaimed row leaves the derived count
+-- transiently high (by 1 per deleted row): `next_seq` reflects the
+-- enqueue and `claim_seq` has not advanced. delete_job_compat
+-- advances claim_seq when the deleted lane is exactly at the head;
+-- non-head deletes leave a gap that the dispatcher's gap-recovery
+-- branch in `claim_ready_runtime` absorbs on the next claim
+-- attempt that finds no rows at the head.
 
 DO $$
 DECLARE
@@ -50,10 +46,10 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- Replace insert_job_compat — signature byte-identical to v013, body
--- minus the `UPDATE queue_lanes SET available_count = available_count + 1`
--- statement. The enqueue's contribution is already captured by the
--- `next_seq` advance.
+-- insert_job_compat: signature byte-identical to v013, body minus
+-- the queue_lanes.available_count mutation. The enqueue's
+-- contribution to the available count is now captured solely by
+-- the queue_enqueue_heads.next_seq advance below.
 CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_kind TEXT,
     p_queue TEXT DEFAULT 'default',
@@ -278,10 +274,6 @@ BEGIN
             v_payload
         );
 
-        -- v016: queue_lanes.available_count has been dropped. The
-        -- next_seq bump above is the only state change the read-side
-        -- derivation needs.
-
         PERFORM pg_notify('awa:' || v_queue, '');
         PERFORM set_config('search_path', v_old_search_path, true);
 
@@ -339,12 +331,13 @@ END;
 $$ LANGUAGE plpgsql VOLATILE
 SET search_path = pg_catalog, awa, public;
 
--- Replace delete_job_compat — signature unchanged from v013, body
--- minus the `UPDATE %I.queue_lanes SET available_count = ...`
--- block. The unclaimed delete leaves a transient over-count of 1
--- on the derived (next_seq - claim_seq) for that lane, which the
--- dispatcher's gap-recovery branch absorbs on the next claim
--- attempt.
+-- delete_job_compat: signature unchanged from v013, body adjusted
+-- so that admin-side deletion of an unclaimed row keeps the
+-- derived `next_seq - claim_seq` count honest:
+--   * head-lane delete → advance claim_seq past the deleted row;
+--   * non-head delete  → leave a gap; the dispatcher's gap-recovery
+--     branch in claim_ready_runtime closes it on the next attempt
+--     that finds no rows at the head.
 CREATE OR REPLACE FUNCTION awa.delete_job_compat(p_id BIGINT)
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -375,12 +368,10 @@ BEGIN
     GET DIAGNOSTICS v_rows = ROW_COUNT;
 
     IF v_rows > 0 THEN
-        -- v016: no available_count column to decrement. If the deleted
-        -- lane was *exactly* at the claim head, advance the head past
-        -- it so the derived `next_seq - claim_seq` count drops by 1
-        -- immediately. Otherwise leave the cursor alone — gap-recovery
-        -- in `claim_ready_runtime` absorbs the over-count when
-        -- claim_seq eventually catches up.
+        -- Keep the derived `next_seq - claim_seq` count honest when
+        -- the deleted lane was *exactly* at the claim head: advance
+        -- claim_seq past it. Non-head deletes leave a gap that the
+        -- gap-recovery branch in claim_ready_runtime closes.
         EXECUTE format(
             'UPDATE %I.queue_claim_heads
              SET claim_seq = claim_seq + 1

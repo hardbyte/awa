@@ -168,8 +168,8 @@ pub struct QueueCounts {
 /// Cheap available-only signal used by the dispatcher's claimer-sizing
 /// control loop. Derives the count from
 /// `queue_enqueue_heads.next_seq − queue_claim_heads.claim_seq`
-/// summed over the queue's physical stripes (ADR / v016) — two PK
-/// reads per lane, O(few rows) regardless of backlog size.
+/// summed over the queue's physical stripes — two PK reads per lane,
+/// O(few rows) regardless of backlog size.
 ///
 /// This is intentionally a separate type from [`QueueCounts`]: the
 /// dispatcher claim hot path only consumes the available count, and
@@ -2351,14 +2351,13 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            // queue_count_snapshots was the staleness-cached counterpart
-            // of queue_counts_exact when the dispatcher's claim hot path
-            // still polled exact counts. After the queue_counts perf
-            // fix the dispatcher derives the available count from the
-            // head tables (v016: `next_seq - claim_seq`) directly
-            // (O(few rows)), and nothing else needs the snapshot. Drop
-            // the table on every prepare_schema so an upgrade from a
-            // pre-fix install reclaims the storage.
+            // queue_count_snapshots was a staleness-cached counterpart
+            // of queue_counts_exact, used when the dispatcher's claim
+            // hot path still polled exact counts. The dispatcher now
+            // derives the available count directly from the head tables
+            // (`next_seq - claim_seq`, O(few rows)) and nothing else
+            // needs the snapshot. Drop it on every prepare_schema so
+            // an upgrade from an older install reclaims the storage.
             sqlx::query(&format!(
                 "DROP TABLE IF EXISTS {schema}.queue_count_snapshots"
             ))
@@ -2528,11 +2527,6 @@ impl QueueStorage {
             .execute(backfill_tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
-
-            // v016: queue_lanes.available_count was dropped; the reader
-            // derives the available count from queue_enqueue_heads.next_seq
-            // minus queue_claim_heads.claim_seq. No backfill is required —
-            // both head tables already maintain the source of truth.
 
             backfill_tx.commit().await.map_err(map_sqlx_error)?;
 
@@ -3438,16 +3432,14 @@ impl QueueStorage {
 
                 GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
 
-                -- v016: queue_lanes.available_count was dropped; the
-                -- derived count (next_seq - claim_seq) decreases naturally
-                -- as the `advanced` CTE above bumps claim_seq past the
-                -- claimed lane_seq. The only remaining branch is the
-                -- gap-recovery case below: if no rows were claimed but
+                -- The derived available count `next_seq - claim_seq`
+                -- decreases naturally as the `advanced` CTE above bumps
+                -- claim_seq past the claimed lane_seq. The only extra
+                -- branch is gap-recovery: if no rows were claimed but
                 -- the head says the queue is non-empty (next_seq >
-                -- claim_seq), there are deleted/missing lanes between
+                -- claim_seq), admin deletes have left a gap between
                 -- claim_seq and next_seq. Advance claim_seq to catch
-                -- up so subsequent reads of (next_seq - claim_seq)
-                -- don't over-count.
+                -- up so subsequent readers don't see a stale over-count.
                 IF v_claimed_count = 0 THEN
                     UPDATE {schema}.queue_claim_heads AS claims
                     SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
@@ -4058,10 +4050,6 @@ impl QueueStorage {
         self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
             .await?;
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
-        // v016: enqueue's contribution to the available count is
-        // captured by the next_seq advance that
-        // `execute_ready_inserts_tx` already drove. No separate
-        // counter to maintain.
         Ok(total_rows)
     }
 
@@ -4140,8 +4128,6 @@ impl QueueStorage {
         self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
             .await?;
         self.execute_ready_copy_tx(tx, &ready_rows).await?;
-        // v016: see equivalent comment above — enqueue's contribution
-        // to the available count flows through next_seq.
         Ok(total_rows)
     }
 
@@ -4217,8 +4203,6 @@ impl QueueStorage {
         }
 
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
-        // v016: see equivalent comment above — enqueue's contribution
-        // to the available count flows through next_seq.
         Ok(total_rows)
     }
 
@@ -4535,15 +4519,6 @@ impl QueueStorage {
 
         Ok(rows.len())
     }
-
-    // v016: `adjust_lane_counts` and `adjust_lane_counts_batch` were
-    // removed when `queue_lanes.available_count` was dropped. Every
-    // historical caller passed `pruned_completed_delta = 0`, so the
-    // entire helper collapsed to a no-op once `available_count` was
-    // gone. `queue_lanes.pruned_completed_count` is still mutated, but
-    // that happens via `adjust_terminal_rollups_batch` and the prune
-    // path's direct INSERT into `queue_terminal_rollups`. Available-
-    // count reads compute `next_seq - claim_seq` from the head tables.
 
     async fn adjust_terminal_rollups_batch<'a, I>(
         &self,
@@ -5223,13 +5198,13 @@ impl QueueStorage {
         signal: &AvailableSignal,
         max_claimers: i16,
     ) -> i16 {
-        // The signal source (`queue_enqueue_heads.next_seq -
-        // queue_claim_heads.claim_seq`, per v016) is the count of
-        // lane positions enqueued but not yet claimed, so we don't
-        // subtract a running count — already-claimed rows are excluded
-        // by the claim_seq advance. Keep the original `backlog` name
-        // in the threshold table so future tweaks can compare against
-        // the pre-fix shape.
+        // The signal source `queue_enqueue_heads.next_seq -
+        // queue_claim_heads.claim_seq` counts lane positions enqueued
+        // but not yet claimed, so we don't subtract a running count —
+        // already-claimed rows are excluded by the claim_seq advance.
+        // `backlog` is retained as a separate name in the threshold
+        // table to keep room for shape tweaks that diverge from
+        // `available` later.
         let available = signal.available.max(0) as u64;
         let backlog = available;
         let current = current_target.unwrap_or(1).clamp(1, max_claimers.max(1));
@@ -5340,6 +5315,19 @@ impl QueueStorage {
             .clamp(1, max_claimers.max(1)))
     }
 
+    /// Cheap, dispatcher-grade available-count signal.
+    ///
+    /// Sums `next_seq - claim_seq` across the queue's (queue, priority)
+    /// lanes — one PK read into each of the two head tables per lane
+    /// (typically ≤ 4 lanes per logical queue). The difference is an
+    /// upper bound on the count of unclaimed ready rows: admin DELETEs
+    /// of unclaimed jobs leave a gap between `claim_seq` and `next_seq`
+    /// until the next claim attempt's gap-recovery branch closes it.
+    /// The dispatcher tolerates this drift because the worst case is
+    /// one wasted claim attempt that finds no rows.
+    ///
+    /// For an exact count, use [`Self::queue_counts_exact`], which
+    /// scans `ready_entries`.
     async fn queue_claimer_signal(
         &self,
         pool: &PgPool,
@@ -5347,9 +5335,6 @@ impl QueueStorage {
     ) -> Result<AvailableSignal, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
-        // v016: derive available from the two head tables. Two PK
-        // reads per (queue, priority) lane via the JOIN; no longer
-        // touches the heavily-mutated queue_lanes heap.
         let available: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint
@@ -5943,6 +5928,11 @@ impl QueueStorage {
             .collect())
     }
 
+    /// Exact admin/UI-grade queue counts. Scans `ready_entries` rather
+    /// than reading the head tables — slower, but unaffected by the
+    /// transient gap between admin DELETE of an unclaimed row and the
+    /// dispatcher's next gap-recovery pass. Use [`Self::queue_claimer_signal`]
+    /// for the dispatcher hot path.
     async fn queue_counts_exact(
         &self,
         pool: &PgPool,
@@ -5953,13 +5943,13 @@ impl QueueStorage {
         let row: (i64, i64, i64) = sqlx::query_as(&format!(
             r#"
             WITH lane_counts AS (
-                -- v016: queue_lanes.available_count was dropped. The
-                -- admin-grade API needs an exact count, so we scan
-                -- ready_entries with the same lane_seq >= claim_seq
-                -- predicate the legacy ground-truth CTE used. The hot
-                -- path (queue_claimer_signal) takes the cheap
-                -- `next_seq - claim_seq` approximation; this slower
-                -- scan is reserved for admin / UI calls.
+                -- Exact count: a ready row is available iff its
+                -- lane_seq has not yet been passed by the lane's
+                -- claim_seq cursor. Equivalent to the dispatcher's
+                -- cheap `next_seq - claim_seq` signal in the absence
+                -- of admin DELETEs of unclaimed jobs, and tighter
+                -- when such deletes have occurred but gap-recovery
+                -- has not yet caught up.
                 SELECT COALESCE(count(*)::bigint, 0) AS available
                 FROM {schema}.ready_entries AS ready
                 JOIN {schema}.queue_claim_heads AS claims
@@ -6357,14 +6347,14 @@ impl QueueStorage {
                     .into_done_row(JobState::Cancelled, Utc::now(), ready.payload.clone());
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
-            // v016: if the cancelled lane was *exactly* at the claim
-            // head, advance the head past it so the derived
-            // `next_seq - claim_seq` count drops by 1 without waiting
-            // for the dispatcher's gap-recovery branch. When other
-            // unclaimed lanes still sit between claim_seq and the
-            // cancelled lane_seq, leave claim_seq alone — advancing
-            // would skip past those still-claimable rows. Gap-recovery
-            // absorbs the over-count later, when claim_seq catches up.
+            // If the cancelled lane was *exactly* at the claim head,
+            // advance the head past it so the derived
+            // `next_seq - claim_seq` count drops by 1 immediately.
+            // When other unclaimed lanes still sit between claim_seq
+            // and the cancelled lane_seq, leave claim_seq alone —
+            // advancing would skip past those still-claimable rows.
+            // The dispatcher's gap-recovery branch absorbs the
+            // transient over-count when claim_seq later catches up.
             sqlx::query(&format!(
                 r#"
                 UPDATE {schema}.queue_claim_heads
@@ -6798,14 +6788,14 @@ impl QueueStorage {
             });
         }
 
-        // v016: aging deletes ready rows from the source lane without
-        // moving the source's claim_seq, then re-inserts on the target
-        // lane (which bumps target's next_seq). Source's derived
-        // available (`next_seq - claim_seq`) over-counts by `moved`
-        // until the dispatcher's next claim attempt on that lane
-        // hits the gap-recovery branch in `claim_ready_runtime` and
-        // catches claim_seq up to next_seq. The drift is bounded by
-        // aging rate × poll interval and self-corrects.
+        // Aging deletes ready rows from the source lane without
+        // moving the source's claim_seq, then re-inserts on the
+        // target lane (which bumps target's next_seq). The source's
+        // derived `next_seq - claim_seq` over-counts by `moved` until
+        // the dispatcher's next claim attempt on that lane hits the
+        // gap-recovery branch in `claim_ready_runtime` and catches
+        // claim_seq up. The drift is bounded by aging rate × poll
+        // interval and self-corrects.
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
         self.notify_queues_tx(&mut tx, queues).await?;

@@ -327,9 +327,9 @@ async def test_enqueue_many_copy_queue_storage(client):
         """,
         queue,
     )
-    # v016: queue_lanes.available_count was dropped. Available count
-    # is derived from queue_enqueue_heads.next_seq -
-    # queue_claim_heads.claim_seq.
+    # Available count derives from queue_enqueue_heads.next_seq -
+    # queue_claim_heads.claim_seq; aliased to keep the historical
+    # `available_count` field name on the returned row.
     counts = await tx.fetch_one(
         f"""
         SELECT GREATEST(qe.next_seq - qc.claim_seq, 0) AS available_count

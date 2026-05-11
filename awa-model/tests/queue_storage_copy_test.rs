@@ -206,8 +206,7 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
     .expect("count deferred rows");
     assert_eq!(deferred_count, 1);
 
-    // v016: queue_lanes.available_count was dropped. Available count
-    // is derived from queue_enqueue_heads.next_seq -
+    // Available count is derived from queue_enqueue_heads.next_seq -
     // queue_claim_heads.claim_seq.
     let available_count: i64 = sqlx::query_scalar(&format!(
         "SELECT GREATEST(qe.next_seq - qc.claim_seq, 0)

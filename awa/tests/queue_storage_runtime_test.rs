@@ -3716,7 +3716,6 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
     let schema = "awa_qs_legacy_pruned_rollup";
     let store = create_store(&pool, schema).await;
 
-    // v016: queue_lanes.available_count was dropped.
     sqlx::query(&format!(
         r#"
         INSERT INTO {schema}.queue_lanes (
@@ -3773,12 +3772,11 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
 }
 
 /// Pin that prepare_schema removes the legacy queue_count_snapshots
-/// table. Runtimes upgraded from a pre-fix install used to carry the
-/// snapshot table alongside the queue-storage tables; with the
-/// dispatcher reading queue_lanes.available_count directly, the
-/// snapshot table is no longer populated and prepare_schema drops it
-/// to reclaim the storage and remove the misleading shape from psql
-/// inspections.
+/// table. Older runtimes carried this snapshot table to cache an exact
+/// queue_counts result; the dispatcher now derives the available count
+/// directly from the head tables, so the snapshot is no longer
+/// populated. prepare_schema drops it to reclaim the storage and to
+/// remove the misleading shape from psql inspections.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -3801,30 +3799,36 @@ async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() 
     assert!(
         !table_exists,
         "prepare_schema should drop the legacy queue_count_snapshots table — \
-         the dispatcher reads queue_lanes.available_count directly now"
+         the dispatcher derives the available count from the head tables now"
     );
 }
 
-/// Drift-detection guard for the queue_counts perf fix.
+/// Drift-detection guard for the head-table-derived available count.
 ///
-/// `queue_counts_exact` was migrated from a `count(*) FROM ready_entries
-/// WHERE lane_seq >= claim_seq` scan to `sum(queue_lanes.available_count)`.
-/// The two are only equivalent if every code path that adds or removes a
-/// "live" ready row maintains the counter. A missed call site would
-/// silently under-count forever — autovacuum doesn't rebuild a maintained
-/// counter, so divergence is permanent until someone runs the v012 / v013
-/// backfill.
+/// `queue_counts_exact` (admin API) scans `ready_entries` with
+/// `lane_seq >= claim_seq`; the dispatcher hot path reads the cheaper
+/// `sum(next_seq - claim_seq)` from the two head tables. The two are
+/// only equivalent when every lifecycle path that adds or removes a
+/// live ready row keeps the head tables honest:
 ///
-/// This test pins the equivalence at every steady state across the
-/// lifecycle paths the production runtime exercises: enqueue, claim
-/// (with priority aging), cancel of an available row, and the canonical-
-/// side `awa.insert_job_compat` / `awa.delete_job_compat` paths. At every
-/// checkpoint, all three numbers must agree:
+///   * enqueue → bumps queue_enqueue_heads.next_seq
+///   * claim   → bumps queue_claim_heads.claim_seq past the lane_seq
+///   * cancel / delete of an unclaimed head-lane → bumps claim_seq
+///   * cancel / delete of a non-head lane → leaves a gap that the
+///     dispatcher's gap-recovery branch in claim_ready_runtime closes
 ///
-///   - `sum(queue_lanes.available_count)` — what queue_counts_exact reads
-///   - `count(*) FROM ready_entries WHERE lane_seq >= claim_seq` — the
-///     legacy ground-truth CTE
-///   - `store.queue_counts(...).available` — the public API
+/// A missed bump would persistently over-count and burn dispatcher
+/// claim attempts on phantom availability. This test pins the
+/// invariants at every steady state across the lifecycle paths the
+/// production runtime exercises: enqueue, claim (with priority aging),
+/// cancel of an available row, and the canonical-side
+/// `awa.insert_job_compat` / `awa.delete_job_compat` paths.
+///
+/// At every checkpoint:
+///   - `store.queue_counts(...).available` (public API) ==
+///     `count(*) FROM ready_entries WHERE lane_seq >= claim_seq`
+///   - `sum(next_seq - claim_seq)` (hot-path approximation)
+///     `>= scan` (never under-counts)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_available_count_matches_ready_entries_scan() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -3855,10 +3859,9 @@ async fn test_available_count_matches_ready_entries_scan() {
         .await
         .expect("Failed to run legacy ready_entries scan");
 
-        // v016 design note: there are now TWO available-count
-        // formulations, and they only agree when no admin DELETE has
-        // punched a gap in the ready ring between claim_seq and
-        // next_seq.
+        // There are two available-count formulations and they only
+        // agree when no admin DELETE has punched a gap between
+        // claim_seq and next_seq:
         //
         // - Hot-path signal (queue_claimer_signal): cheap derived
         //   `sum(next_seq - claim_seq)`. Two PK reads per lane.
@@ -3869,10 +3872,10 @@ async fn test_available_count_matches_ready_entries_scan() {
         //   ready_entries with `lane_seq >= claim_seq`. Same
         //   predicate as the ground-truth scan below.
         //
-        // The test only pins API == scan (the admin contract). The
-        // hot-path approximation is allowed to drift by the number
-        // of mid-ring deletes since the last claim against that
-        // lane.
+        // The test pins API == scan (the admin contract) and only
+        // asserts a never-undercount invariant on the hot-path
+        // approximation, which is allowed to drift up by the number
+        // of mid-ring deletes since the last claim on that lane.
         let derived_approx: i64 = sqlx::query_scalar(&format!(
             "SELECT COALESCE(
                 sum(GREATEST(qe.next_seq - qc.claim_seq, 0)),
