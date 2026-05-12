@@ -177,18 +177,45 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 
 ## v017 sharded enqueue heads — operator notes
 
-Migration `v017` (landed with `0.6.0`) adds an `enqueue_shard` column and extends the primary keys of `queue_enqueue_heads`, `queue_claim_heads`, and `ready_entries`. The default per-queue value (`awa.queue_meta.enqueue_shards = 1`) is observationally identical to the pre-v017 layout — shard 0 is the only shard, and FIFO-within-lane is preserved.
-
-The migration also installs a `CHECK (enqueue_shards = 1)` constraint on `awa.queue_meta`. **Raising `enqueue_shards` above 1 is not supported in this release.** The constraint will be relaxed in a follow-up that threads `enqueue_shard` through the completion path, the receipts/lease plane, and the admin lookups; see [ADR-025](adr/025-sharded-enqueue-heads.md) § Implementation and Validation Status for the specific code paths involved.
-
-If you bypass the constraint (e.g. with a manual `UPDATE awa.queue_meta SET enqueue_shards = 4 ...` after dropping the constraint), the application will panic loudly the next time it picks a shard, and any rows that did get written to shards ≥ 1 will collide on `done_entries`' primary key when they complete. Don't.
+Migration `v017` adds an `enqueue_shard` column and extends the primary keys of `queue_enqueue_heads`, `queue_claim_heads`, `ready_entries`, `leases`, and `done_entries`. `lease_claims` carries the column as a regular column; its primary key stays `(claim_slot, job_id, run_lease)`. `awa.queue_meta.enqueue_shards` is the per-queue tunable (default 1, range 1..=64). The default value is observationally identical to the pre-v017 layout — shard 0 is the only shard, and FIFO-within-lane is preserved.
 
 When the migration runs:
 
-- **`canonical` state.** No queue-storage schema exists; the migration is a no-op for the queue-storage tables. `awa.queue_meta.enqueue_shards` is added with default 1 and the `= 1` constraint.
-- **`prepared` state.** Queue-storage schema exists but receives no live traffic. The PK reshape takes an `ACCESS EXCLUSIVE` lock; the tables are empty so the lock acquires immediately and the migration completes in milliseconds. Safe.
-- **`active` state.** Queue-storage is the live engine. The PK reshape still takes an `ACCESS EXCLUSIVE` lock, but on a live table it must wait for in-flight enqueue and claim transactions to finish, then will block new ones until the rewrite completes. On a quiet queue this is milliseconds; on a fully saturated queue with multi-million-row `ready_entries` it can be longer. Run the migration during a low-traffic window if practical.
+- **`canonical` state.** No queue-storage schema exists; the migration is a no-op for the queue-storage tables. `awa.queue_meta.enqueue_shards` is added with default 1 and the `BETWEEN 1 AND 64` constraint.
+- **`prepared` state.** Queue-storage schema exists but receives no live traffic. The PK reshape takes an `ACCESS EXCLUSIVE` lock; the tables are empty so the lock acquires immediately and the migration completes in milliseconds.
+- **`active` state.** Queue-storage is the live engine. The PK reshape still takes an `ACCESS EXCLUSIVE` lock, but on a live table it waits for in-flight enqueue and claim transactions to finish, then blocks new ones until the rewrite completes. On a quiet queue this is milliseconds; on a saturated queue with multi-million-row `ready_entries` it is longer. Run the migration during a low-traffic window.
 - **`mixed_transition` state.** The migration refuses to run and raises a 55000 error. Finalize the transition (or abort and re-enter `prepared`) first.
+
+### Raising `enqueue_shards`
+
+Opt a contended queue into multiple shards with a single UPDATE on `awa.queue_meta`:
+
+```sql
+UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
+```
+
+The producer-side rotor picks up the new shard count on the next enqueue. Existing in-flight rows on shard 0 continue to be claimed and drained; new rows fan out across shards 0..S-1.
+
+Trade-offs:
+
+- **FIFO ordering** is preserved within a shard. Cross-shard ordering at the lane level becomes approximate. Workloads that rely on strict per-lane FIFO pin `enqueue_shards = 1`.
+- **Throughput** scales near-linearly with shard count up to roughly one shard per two concurrent producers on a contended queue; the next bottleneck is WAL bandwidth.
+- **Claim cost** is `O(shard count)` per claim call: the claim path scans every shard's head row to pick a candidate. With `enqueue_shards = 64` and four priorities, that's 256 candidate rows — still trivial.
+
+See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and per-shard FIFO contract.
+
+### Lowering `enqueue_shards`
+
+Lowering is safe only after all `ready_entries` rows in the now-out-of-range shards have been claimed. The producer rotor stops emitting to those shards immediately, but existing rows still need a claimer. Confirm with:
+
+```sql
+SELECT enqueue_shard, count(*)
+FROM <queue_storage_schema>.ready_entries
+WHERE queue = 'my_hot_queue'
+GROUP BY enqueue_shard;
+```
+
+before lowering the value.
 
 ## Cross-references
 

@@ -78,17 +78,14 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- 1. Per-queue tunable on awa.queue_meta. SMALLINT, default 1.
---
--- The shape of the constraint allows a 1..=64 range, but for v017 the
--- value is fixed at 1: the downstream code paths (terminal storage on
--- done_entries, leases / lease_claims receipts, admin lookups by
--- queue_claim_heads) do not yet thread enqueue_shard through every
--- query, so values > 1 would corrupt completions and admin operations.
--- The constraint enforces enqueue_shards = 1 until those paths land in
--- a follow-up. The column is added now so the schema is forward-
--- compatible and the in-tree producer rotor (`shard_for_enqueue`,
--- `pick_shard`) can be exercised without further schema changes.
+-- 1. Per-queue tunable on awa.queue_meta. SMALLINT, default 1,
+-- bounded 1..=64. Each row in `queue_meta` describes one logical
+-- queue; raising `enqueue_shards` for that queue spreads producer
+-- writes across N independent shard rows in queue_enqueue_heads /
+-- queue_claim_heads, breaking the single-row lock-contention point
+-- on enqueue. Lowering the value is safe only once `ready_entries`
+-- has no rows in shards above the new bound; see ADR-025 for the
+-- semantic contract.
 ALTER TABLE awa.queue_meta
     ADD COLUMN IF NOT EXISTS enqueue_shards SMALLINT NOT NULL DEFAULT 1;
 
@@ -105,7 +102,7 @@ BEGIN
     ) THEN
         ALTER TABLE awa.queue_meta
             ADD CONSTRAINT queue_meta_enqueue_shards_range
-            CHECK (enqueue_shards = 1);
+            CHECK (enqueue_shards BETWEEN 1 AND 64);
     END IF;
 END
 $$ LANGUAGE plpgsql;
@@ -255,6 +252,124 @@ BEGIN
                 EXECUTE format(
                     'ALTER TABLE %I.ready_entries
                          ADD PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)',
+                    v_schema
+                );
+            END IF;
+        END IF;
+
+        -- done_entries (partitioned by ready_slot). Carries enqueue_shard
+        -- in its PK so terminal rows for two shards at the same
+        -- (ready_slot, queue, priority, lane_seq) don't collide on
+        -- completion.
+        IF to_regclass(format('%I.%I', v_schema, 'done_entries')) IS NOT NULL THEN
+            EXECUTE format(
+                'SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute a
+                     JOIN pg_class c ON c.oid = a.attrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = %L AND c.relname = %L
+                       AND a.attname = %L AND NOT a.attisdropped
+                 )',
+                v_schema, 'done_entries', 'enqueue_shard'
+            ) INTO v_has_col;
+
+            IF NOT v_has_col THEN
+                SELECT c.conname INTO v_pk_name
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = v_schema
+                  AND t.relname = 'done_entries'
+                  AND c.contype = 'p';
+
+                IF v_pk_name IS NOT NULL THEN
+                    EXECUTE format(
+                        'ALTER TABLE %I.done_entries DROP CONSTRAINT %I',
+                        v_schema, v_pk_name
+                    );
+                END IF;
+
+                EXECUTE format(
+                    'ALTER TABLE %I.done_entries
+                         ADD COLUMN enqueue_shard SMALLINT NOT NULL DEFAULT 0',
+                    v_schema
+                );
+
+                EXECUTE format(
+                    'ALTER TABLE %I.done_entries
+                         ADD PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)',
+                    v_schema
+                );
+            END IF;
+        END IF;
+
+        -- leases (partitioned by lease_slot). Same shape as
+        -- ready_entries / done_entries: shard joins the PK so two
+        -- shards' running rows don't collide.
+        IF to_regclass(format('%I.%I', v_schema, 'leases')) IS NOT NULL THEN
+            EXECUTE format(
+                'SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute a
+                     JOIN pg_class c ON c.oid = a.attrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = %L AND c.relname = %L
+                       AND a.attname = %L AND NOT a.attisdropped
+                 )',
+                v_schema, 'leases', 'enqueue_shard'
+            ) INTO v_has_col;
+
+            IF NOT v_has_col THEN
+                SELECT c.conname INTO v_pk_name
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = v_schema
+                  AND t.relname = 'leases'
+                  AND c.contype = 'p';
+
+                IF v_pk_name IS NOT NULL THEN
+                    EXECUTE format(
+                        'ALTER TABLE %I.leases DROP CONSTRAINT %I',
+                        v_schema, v_pk_name
+                    );
+                END IF;
+
+                EXECUTE format(
+                    'ALTER TABLE %I.leases
+                         ADD COLUMN enqueue_shard SMALLINT NOT NULL DEFAULT 0',
+                    v_schema
+                );
+
+                EXECUTE format(
+                    'ALTER TABLE %I.leases
+                         ADD PRIMARY KEY (lease_slot, queue, priority, enqueue_shard, lane_seq)',
+                    v_schema
+                );
+            END IF;
+        END IF;
+
+        -- lease_claims (partitioned by claim_slot). PK is
+        -- (claim_slot, job_id, run_lease) and stays that way — job_id
+        -- is globally unique, so the PK is already correct. The shard
+        -- is added as a column so the cancel-from-receipt path can
+        -- route the synthesized done_entries write to the right
+        -- shard.
+        IF to_regclass(format('%I.%I', v_schema, 'lease_claims')) IS NOT NULL THEN
+            EXECUTE format(
+                'SELECT EXISTS (
+                     SELECT 1 FROM pg_attribute a
+                     JOIN pg_class c ON c.oid = a.attrelid
+                     JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = %L AND c.relname = %L
+                       AND a.attname = %L AND NOT a.attisdropped
+                 )',
+                v_schema, 'lease_claims', 'enqueue_shard'
+            ) INTO v_has_col;
+
+            IF NOT v_has_col THEN
+                EXECUTE format(
+                    'ALTER TABLE %I.lease_claims
+                         ADD COLUMN enqueue_shard SMALLINT NOT NULL DEFAULT 0',
                     v_schema
                 );
             END IF;

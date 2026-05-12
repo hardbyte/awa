@@ -22,17 +22,21 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   `UPDATE queue_enqueue_heads` finds no row (the observable signal
   of an earlier ensure_lane that ran inside a rolled-back
   transaction), so correctness is preserved.
-- Shard `queue_enqueue_heads`, `queue_claim_heads`, and
-  `ready_entries` by `enqueue_shard` (migration `v017`). Producers
-  rotate across `awa.queue_meta.enqueue_shards` (default 1, range
-  1..=64) independent head rows per `(queue, priority)` so row-lock
-  contention on the single hot row is spread across N rows. With
-  the default `enqueue_shards = 1` the behaviour is observationally
-  identical to v016. Raising `enqueue_shards` per noisy queue
-  delivers near-linear throughput scaling on contended enqueue
-  workloads: a 16-producer same-queue local sweep measured 1.0×
-  → 1.76× → 3.05× → 4.84× at S=1/2/4/8. `lane_seq` is FIFO within a
-  shard; FIFO across shards becomes approximate at S>1.
+- Shard the queue-storage active plane by `enqueue_shard` (migration
+  `v017`). Producers rotate across `awa.queue_meta.enqueue_shards`
+  (default 1, range 1..=64) independent head rows per
+  `(queue, priority)` so row-lock contention on the single hot row
+  is spread across N rows. The shard column runs end-to-end:
+  `queue_enqueue_heads`, `queue_claim_heads`, `ready_entries`,
+  `leases`, and `done_entries` carry it in their primary keys;
+  `lease_claims` carries it as a regular column. With the default
+  `enqueue_shards = 1` the behaviour is observationally identical
+  to v016. Raising `enqueue_shards` per noisy queue delivers
+  near-linear throughput scaling on contended enqueue workloads: a
+  16-producer same-queue local sweep measured 1.0× → 1.60× → 2.75×
+  → 3.69× at S=1/2/4/8. `lane_seq` is FIFO within a shard; FIFO
+  across shards becomes approximate at S>1. See ADR-025 for the
+  full design.
 - Raise the completion-batcher defaults to `(batch=256, flush=5ms)`
   from `(batch=128, flush=1ms)`. Lets batches amortise the per-batch
   completion SQL over more rows at the cost of a small latency

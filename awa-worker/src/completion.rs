@@ -389,6 +389,7 @@ mod tests {
                 lease_generation: 0,
                 claim_slot,
                 lease_claim_receipt: true,
+                enqueue_shard: 0,
             }),
             runtime_job: None,
             response,

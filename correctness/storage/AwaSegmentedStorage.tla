@@ -54,6 +54,22 @@ EXTENDS TLC, Naturals, FiniteSets
 \* earlier open_receipt_claims INSERT+DELETE frontier: the entire
 \* receipt plane is reclaimed by partition rotation, which is what makes
 \* the 0.6 vacuum-aware story complete.
+\*
+\* Enqueue-shard modelling (ADR-025): `laneState` here represents one
+\* `(queue, priority, enqueue_shard)` triple. The Rust implementation
+\* allocates one shard row per triple, and shards within the same
+\* (queue, priority) are independent: each shard owns its own
+\* `appendSeq` / `claimSeq` counters, and producers pick a shard per
+\* batch via the rotor in `shard_for_enqueue`. The invariants
+\* `LaneStateMonotonic` (appendSeq strictly increases) and
+\* `LaneStateClaimNeverExceedsAppend` (claimSeq <= appendSeq) therefore
+\* apply per shard. Cross-shard ordering is not modeled here because
+\* the receipt-plane and terminal-plane row keys include `enqueue_shard`
+\* — at the model level, two shards form two disjoint copies of this
+\* state machine sharing the same `Jobs` set. The cross-shard
+\* invariant ("each enqueue transaction touches one shard's head
+\* rows") is modeled in AwaStorageLockOrder.tla as
+\* SingleShardPerTransaction.
 
 CONSTANTS Jobs,
           Workers,

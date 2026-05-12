@@ -5815,3 +5815,135 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
         "next_seq should reflect the three recovery jobs starting from a re-initialised head"
     );
 }
+
+/// At `enqueue_shards > 1` every plane carries a shard column:
+/// `queue_enqueue_heads`, `queue_claim_heads`, and `ready_entries`
+/// extend their primary keys to include it; `leases` and `done_entries`
+/// do too; `lease_claims` carries the shard as a regular column.
+/// This test seeds `queue_meta.enqueue_shards = 4`, enqueues enough
+/// jobs to land on every shard, drains them through a worker, and
+/// asserts:
+///
+/// 1. Every job completes.
+/// 2. `done_entries` rows are spread across all 4 shards (the producer
+///    rotor actually rotated, and the claim path returned the shard
+///    on the `ClaimedEntry` so the terminal row picked up the right
+///    `enqueue_shard`).
+/// 3. The `done_entries` primary key
+///    `(ready_slot, queue, priority, enqueue_shard, lane_seq)` carries
+///    multiple rows that share `(ready_slot, queue, priority,
+///    lane_seq)` across different shards — i.e. the shard column is
+///    load-bearing in the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_multi_shard_round_trip_through_completion() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(8).await;
+    let queue = "qs_multi_shard_round_trip";
+    let schema = "awa_qs_multi_shard_round_trip";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    // Opt the queue into 4 shards. Without this row the queue defaults
+    // to a single shard and the test wouldn't exercise the multi-shard
+    // path at all.
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards = 4");
+
+    // Enqueue enough jobs that the producer-side rotor visits every
+    // shard. 16 batches × 1 job = 16 producer-side calls; with the
+    // rotor at modulo 4 each shard sees 4 batches.
+    let mut job_ids = Vec::with_capacity(16);
+    for i in 0..16 {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: i },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        job_ids.push(job_id);
+    }
+
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+
+    for job_id in &job_ids {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+
+    // Every shard should hold at least one terminal row.
+    let shard_counts: Vec<(i16, i64)> = sqlx::query_as(&format!(
+        "SELECT enqueue_shard, count(*)::bigint
+         FROM {schema}.done_entries
+         WHERE queue = $1
+         GROUP BY enqueue_shard
+         ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("count done_entries per shard");
+
+    let shards_observed: Vec<i16> = shard_counts.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        shards_observed,
+        vec![0, 1, 2, 3],
+        "all four shards should hold terminal rows; got {shard_counts:?}",
+    );
+    let total: i64 = shard_counts.iter().map(|(_, c)| c).sum();
+    assert_eq!(
+        total, 16,
+        "exactly the enqueued jobs landed in done_entries"
+    );
+
+    // The shard column is load-bearing in the `done_entries` PK iff
+    // two distinct shards share a `(ready_slot, queue, priority,
+    // lane_seq)` tuple that would otherwise collide. Each shard's
+    // `lane_seq` starts independently at 1, so at S=4 with 4 jobs per
+    // shard there must be at least one tuple that repeats.
+    let max_dupes: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(max(c), 0)::bigint FROM (
+             SELECT count(*) AS c
+             FROM {schema}.done_entries
+             WHERE queue = $1
+             GROUP BY ready_slot, queue, priority, lane_seq
+         ) AS grouped"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count overlapping (slot, queue, priority, lane_seq) groups");
+    assert!(
+        max_dupes >= 2,
+        "at S=4 the shard column carries the PK — at least one (ready_slot, queue, priority, lane_seq) \
+         tuple should be reused across shards; got max group size {max_dupes}",
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
