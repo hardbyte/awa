@@ -2,9 +2,22 @@
 
 ## Status
 
-Accepted (implemented in migration `v017`). Default `enqueue_shards = 1`
-preserves pre-shard behaviour byte-for-byte; raising the per-queue value
-opts into the sharded contention path.
+Accepted in two stages.
+
+**v017 (this PR).** Schema reshape — the `enqueue_shard` column and the
+extended primary keys land — plus the producer-side selection rotor.
+A `CHECK (enqueue_shards = 1)` constraint pins every queue to a single
+shard. Code paths downstream of the claim (terminal storage on
+`done_entries`, receipts on `leases` / `lease_claims`, admin operations
+that read `queue_claim_heads`) do not yet thread `enqueue_shard`, so
+values > 1 would cause `done_entries` primary-key collisions on
+completion and cross-shard row mismatches on admin operations. The
+constraint enforces v017's actual safe operating point.
+
+**Follow-up.** Thread `enqueue_shard` through the receipts/lease plane
+and every admin lookup so the constraint can be relaxed to `BETWEEN 1
+AND 64` and the gains below are realisable. See the implementation-
+status section for the concrete code paths still to update.
 
 ## Context
 
@@ -77,10 +90,12 @@ coexist per `(queue, priority)`:
 - `ready_entries       (ready_slot, queue, priority, enqueue_shard, lane_seq)`
 
 Sharding is a per-queue tunable on `awa.queue_meta.enqueue_shards`
-(`SMALLINT NOT NULL DEFAULT 1 CHECK (BETWEEN 1 AND 64)`). With the
-default value of 1, only shard 0 exists and every code path reduces to
-the pre-v017 behaviour observationally. Operators raise the value on a
-queue they have measured as contended.
+(`SMALLINT NOT NULL DEFAULT 1`). The constraint shape is `BETWEEN 1 AND
+64`; v017 enforces the stricter `= 1` until the follow-up plumbing lands
+(see Status). With value 1, only shard 0 exists and every code path
+reduces to the pre-v017 behaviour observationally. The constraint will
+be relaxed when the receipts/lease plane and admin lookups thread the
+shard column through their queries.
 
 The producer-side helper `shard_for_enqueue` reads `enqueue_shards` for
 the queue (cached in-process, invalidated on `reset()`) and selects the
@@ -122,24 +137,36 @@ choose where on that trade-off it sits.
 
 ## Validation
 
+The S>1 cells in this table were measured by temporarily bypassing the
+`enqueue_shards = 1` constraint to drive the producer side at higher
+shard counts. They are **enqueue-rate only**: the harness drained the
+producer fleet but did not exercise the completion or admin paths,
+both of which currently mismatch at S>1. The cells stand as the
+projected upper bound once the follow-up plumbing lands; they are not
+representative of an operationally safe configuration today.
+
 Local A/B sweep on the in-tree `test_queue_storage_enqueue_contention`
 (16 producers × 15 k jobs each, same queue, 3 runs per cell, post-cache):
 
-| `enqueue_shards` | Mean throughput | vs S=1 |
-|---|--:|--:|
-| 1 (default) | 41,377 jobs/s | 1.00× |
-| 2 | 72,704 jobs/s | 1.76× |
-| 4 | 126,374 jobs/s | 3.05× |
-| 8 | 200,359 jobs/s | 4.84× |
+| `enqueue_shards` | Mean enqueue rate | vs S=1 | Notes |
+|---|--:|--:|---|
+| 1 (default, only safe value in v017) | 41,377 jobs/s | 1.00× | Live in v017. |
+| 2 | 72,704 jobs/s | 1.76× | Projected; constraint-gated. |
+| 4 | 126,374 jobs/s | 3.05× | Projected; constraint-gated. |
+| 8 | 200,359 jobs/s | 4.84× | Projected; constraint-gated. |
 
 Scaling stays near-linear up to `S=8` on a 2-producer-per-shard
-configuration. The knee where WAL bandwidth or producer-side coordination
-becomes the new bottleneck is past `S=8` for this concurrency; the
-published full-sweep numbers will fix the exact location.
+configuration on the enqueue side. The knee where WAL bandwidth or
+producer-side coordination becomes the new bottleneck is past `S=8`
+for this concurrency; the published full-sweep numbers will fix the
+exact location.
 
-Combined with the in-process `ensure_lane` cache landed in the same
-release, the total improvement on this workload is ~6.7× (pre-v016 +
-pre-cache baseline of ~30,000 jobs/s → 200,000 jobs/s at S=8).
+Combined with the in-process `ensure_lane` cache that landed in the
+same release, the projected total improvement on this workload at the
+follow-up's full plumbing is ~6.7× (pre-v016 + pre-cache baseline of
+~30,000 jobs/s → 200,000 jobs/s at S=8). The realised gain in v017
+itself is the ~62% from the cache alone, since the shard count is
+pinned at 1.
 
 ## Consequences
 
@@ -222,22 +249,66 @@ pre-cache baseline of ~30,000 jobs/s → 200,000 jobs/s at S=8).
 
 ## Implementation and Validation Status
 
+### Landed in v017
+
 - Migration `v017_shard_queue_enqueue_heads.sql` adds the column,
-  reshapes the PKs, and rewrites the `insert_job_compat`/
-  `delete_job_compat` compat functions to thread `enqueue_shard`.
-  Gated on `storage_transition_state != 'mixed_transition'` to avoid
-  reshaping under live traffic.
+  reshapes the PKs on `queue_enqueue_heads`, `queue_claim_heads`, and
+  `ready_entries` (including the partitioned parent PK on
+  `ready_entries`, which only-the-leaves drafts would have missed),
+  and rewrites the `insert_job_compat` / `delete_job_compat` compat
+  functions to thread `enqueue_shard`. Gated on
+  `storage_transition_state != 'mixed_transition'` to avoid reshaping
+  under live cutover traffic.
 - `awa-model/src/queue_storage.rs` threads `enqueue_shard` through
   `ensure_lane`, `advance_enqueue_head`, `claim_ready_runtime`, and
   the three `insert_*_tx` paths. Adds `shard_for_enqueue` (with a
   per-queue cache of `enqueue_shards`) and the `pick_shard` rotor.
 - The in-process lane cache moved from `(String, i16)` to
   `(String, i16, i16)` keying. The rollback-recovery retry path in
-  `advance_enqueue_head` invalidates by triple.
-- The in-tree A/B bench
-  `test_queue_storage_enqueue_contention` accepts
-  `AWA_QS_CONTENTION_SHARDS` to seed `queue_meta.enqueue_shards`
-  before driving the producer fleet.
-- TLA+ model updates and a focused FIFO-within-shard witness are
-  follow-ups before promoting `S > 1` as a documented operator
-  default.
+  `advance_enqueue_head` invalidates by triple and calls
+  `ensure_lane_inserts` directly so a concurrent re-marker cannot
+  trick it into skipping the repair.
+- A `CHECK (enqueue_shards = 1)` constraint pins every queue to a
+  single shard. `pick_shard` panics if it observes a value > 1, so a
+  direct UPDATE that bypasses the constraint fails loudly rather than
+  silently corrupting state.
+- The in-tree A/B bench `test_queue_storage_enqueue_contention`
+  accepts `AWA_QS_CONTENTION_SHARDS` to seed
+  `queue_meta.enqueue_shards`. Bench runs at S>1 require temporarily
+  relaxing the constraint and currently measure only the enqueue
+  rate; downstream paths are not safe to exercise yet.
+
+### Required before raising `enqueue_shards > 1`
+
+The reviewer on the v017 PR identified three code paths that still
+assume one head row per `(queue, priority)`. Each must be plumbed
+through before relaxing the constraint:
+
+- `done_entries` primary key. Two jobs from different shards can land
+  at the same `(ready_slot, queue, priority, lane_seq)`. Add
+  `enqueue_shard` to the column list and PK, thread it through the
+  `DoneJobRow` insert/COPY paths and every reader (`ready_payloads_
+  for_done_rows_tx`, the admin SELECTs in `queue_counts_exact`, etc.).
+- Receipts plane (`leases`, `lease_claims`). The receipt records the
+  partition the claim is running in, but currently omits the shard.
+  Add `enqueue_shard` to both tables, thread it through the
+  `claimed_cte` INSERTs in `claim_ready_runtime`, the
+  `DeletedLeaseRow` / `ReadySnapshotRow` / `LeaseTransitionRow`
+  rehydration paths, and the cancel-from-receipt flow that
+  reconstructs a `DoneJobRow` for `cancel_job_tx`.
+- Admin lookups. `queue_counts_exact`, `cancel_job_tx`,
+  `age_waiting_priorities`, and any other path that joins
+  `ready_entries` to `queue_claim_heads` without filtering on
+  `enqueue_shard` can match the wrong shard. Add the predicate at
+  every join.
+
+Once the above are in place, relax `queue_meta_enqueue_shards_range`
+to `BETWEEN 1 AND 64`, remove the `pick_shard` panic guard, and
+revisit this validation table with completion-path measurements.
+
+### TLA+
+
+Model updates and a focused FIFO-within-shard witness are still
+required before promoting `S > 1` as a documented operator default;
+they are tracked separately and are not on the critical path for the
+schema-only v017 landing.

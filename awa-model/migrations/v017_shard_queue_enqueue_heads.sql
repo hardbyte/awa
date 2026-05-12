@@ -78,7 +78,17 @@ BEGIN
 END
 $$ LANGUAGE plpgsql;
 
--- 1. Per-queue tunable on awa.queue_meta. SMALLINT, default 1, bounded 1..=64.
+-- 1. Per-queue tunable on awa.queue_meta. SMALLINT, default 1.
+--
+-- The shape of the constraint allows a 1..=64 range, but for v017 the
+-- value is fixed at 1: the downstream code paths (terminal storage on
+-- done_entries, leases / lease_claims receipts, admin lookups by
+-- queue_claim_heads) do not yet thread enqueue_shard through every
+-- query, so values > 1 would corrupt completions and admin operations.
+-- The constraint enforces enqueue_shards = 1 until those paths land in
+-- a follow-up. The column is added now so the schema is forward-
+-- compatible and the in-tree producer rotor (`shard_for_enqueue`,
+-- `pick_shard`) can be exercised without further schema changes.
 ALTER TABLE awa.queue_meta
     ADD COLUMN IF NOT EXISTS enqueue_shards SMALLINT NOT NULL DEFAULT 1;
 
@@ -95,7 +105,7 @@ BEGIN
     ) THEN
         ALTER TABLE awa.queue_meta
             ADD CONSTRAINT queue_meta_enqueue_shards_range
-            CHECK (enqueue_shards BETWEEN 1 AND 64);
+            CHECK (enqueue_shards = 1);
     END IF;
 END
 $$ LANGUAGE plpgsql;
@@ -198,7 +208,13 @@ BEGIN
             END IF;
         END IF;
 
-        -- ready_entries (partitioned by ready_slot; ADD COLUMN cascades to partitions).
+        -- ready_entries (partitioned by ready_slot). Dropping/adding a PK
+        -- on the partitioned parent cascades to every leaf partition, so
+        -- the parent operations cover all children; ADD COLUMN cascades
+        -- the same way. The parent PK must include `enqueue_shard` —
+        -- without it, two shards writing the same `lane_seq` collide on
+        -- the parent's unique constraint even when each leaf permits
+        -- the row.
         IF to_regclass(format('%I.%I', v_schema, 'ready_entries')) IS NOT NULL THEN
             EXECUTE format(
                 'SELECT EXISTS (
@@ -212,50 +228,35 @@ BEGIN
             ) INTO v_has_col;
 
             IF NOT v_has_col THEN
+                -- Drop the parent PK first so the children's inherited PKs
+                -- come along; you can't drop a child's inherited PK while
+                -- the parent's PK still exists.
+                SELECT c.conname INTO v_pk_name
+                FROM pg_constraint c
+                JOIN pg_class t ON t.oid = c.conrelid
+                JOIN pg_namespace n ON n.oid = t.relnamespace
+                WHERE n.nspname = v_schema
+                  AND t.relname = 'ready_entries'
+                  AND c.contype = 'p';
+
+                IF v_pk_name IS NOT NULL THEN
+                    EXECUTE format(
+                        'ALTER TABLE %I.ready_entries DROP CONSTRAINT %I',
+                        v_schema, v_pk_name
+                    );
+                END IF;
+
                 EXECUTE format(
                     'ALTER TABLE %I.ready_entries
                          ADD COLUMN enqueue_shard SMALLINT NOT NULL DEFAULT 0',
                     v_schema
                 );
 
-                -- Reshape PK on each partition. The partitioned parent's PK is
-                -- implemented as a PK on each leaf partition; drop and recreate
-                -- per leaf.
-                DECLARE
-                    v_part_name TEXT;
-                    v_part_schema TEXT;
-                BEGIN
-                    FOR v_part_schema, v_part_name IN
-                        SELECT n.nspname, c.relname
-                        FROM pg_inherits i
-                        JOIN pg_class c ON c.oid = i.inhrelid
-                        JOIN pg_namespace n ON n.oid = c.relnamespace
-                        JOIN pg_class p ON p.oid = i.inhparent
-                        JOIN pg_namespace pn ON pn.oid = p.relnamespace
-                        WHERE pn.nspname = v_schema AND p.relname = 'ready_entries'
-                    LOOP
-                        SELECT c.conname INTO v_pk_name
-                        FROM pg_constraint c
-                        JOIN pg_class t ON t.oid = c.conrelid
-                        JOIN pg_namespace n ON n.oid = t.relnamespace
-                        WHERE n.nspname = v_part_schema
-                          AND t.relname = v_part_name
-                          AND c.contype = 'p';
-
-                        IF v_pk_name IS NOT NULL THEN
-                            EXECUTE format(
-                                'ALTER TABLE %I.%I DROP CONSTRAINT %I',
-                                v_part_schema, v_part_name, v_pk_name
-                            );
-                        END IF;
-
-                        EXECUTE format(
-                            'ALTER TABLE %I.%I
-                                 ADD PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)',
-                            v_part_schema, v_part_name
-                        );
-                    END LOOP;
-                END;
+                EXECUTE format(
+                    'ALTER TABLE %I.ready_entries
+                         ADD PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)',
+                    v_schema
+                );
             END IF;
         END IF;
     END LOOP;

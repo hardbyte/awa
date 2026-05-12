@@ -1508,7 +1508,11 @@ pub struct QueueStorage {
     next_stripe_probe: AtomicUsize,
     /// Per-store rotor that selects the enqueue shard for the next batch.
     /// Rotated once per `shard_for_enqueue` call so producers spread their
-    /// writes across the per-(queue, priority) shard rows.
+    /// writes across the per-(queue, priority) shard rows. Currently
+    /// unused because `pick_shard` panics for `shards > 1` while the
+    /// `enqueue_shards = 1` CHECK constraint is in effect; preserved
+    /// because the follow-up that relaxes the constraint will need it.
+    #[allow(dead_code)]
     shard_rotor: AtomicU16,
     /// Cache of `awa.queue_meta.enqueue_shards` per queue. Populated lazily
     /// on the first `shard_for_enqueue` call for a queue and invalidated by
@@ -3934,13 +3938,23 @@ impl QueueStorage {
     }
 
     /// Rotate the per-store atomic counter and map it into `[0, shards)`.
+    ///
+    /// `enqueue_shards > 1` is a follow-up: the downstream code paths
+    /// (terminal storage on `done_entries`, receipts on `leases` /
+    /// `lease_claims`, admin lookups by `queue_claim_heads`) do not yet
+    /// thread `enqueue_shard` through every query. The v017 migration's
+    /// CHECK constraint pins `queue_meta.enqueue_shards = 1`, so the
+    /// `shards > 1` branch is unreachable from a healthy schema; the
+    /// `panic!` makes it loud if someone bypasses the check (e.g. by
+    /// direct UPDATE) before the follow-up lands.
     fn pick_shard(&self, shards: i16) -> i16 {
         if shards <= 1 {
             return 0;
         }
-        let raw = self.shard_rotor.fetch_add(1, Ordering::Relaxed) as i32;
-        let shards = shards as i32;
-        (raw.rem_euclid(shards)) as i16
+        panic!(
+            "queue_meta.enqueue_shards = {shards} is not yet supported; \
+             the v017 CHECK constraint should have rejected this value",
+        );
     }
 
     fn lane_is_cached(&self, queue: &str, priority: i16, enqueue_shard: i16) -> bool {
