@@ -10,6 +10,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -1499,6 +1500,14 @@ impl DeferredJobRow {
 pub struct QueueStorage {
     config: QueueStorageConfig,
     next_stripe_probe: AtomicUsize,
+    // Lane-presence cache: `(physical_queue, priority)` pairs we have
+    // previously inserted into queue_lanes / queue_enqueue_heads /
+    // queue_claim_heads at least once. Skips three round-trips per
+    // enqueue batch once the lane is established. Cleared on `reset()`
+    // because reset TRUNCATEs queue_lanes; the helper
+    // `advance_enqueue_head` repairs an entry that turns out to be
+    // stale (head row gone after a rolled-back ensure_lane).
+    ensured_lanes: Mutex<HashSet<(String, i16)>>,
 }
 
 impl QueueStorage {
@@ -1527,6 +1536,7 @@ impl QueueStorage {
         Ok(Self {
             config,
             next_stripe_probe: AtomicUsize::new(0),
+            ensured_lanes: Mutex::new(HashSet::new()),
         })
     }
 
@@ -3754,7 +3764,11 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
         }
 
-        tx.commit().await.map_err(map_sqlx_error)
+        tx.commit().await.map_err(map_sqlx_error)?;
+        // queue_lanes was TRUNCATEd above, so any cache entry that
+        // claims a lane row still exists is now wrong.
+        self.clear_lane_cache();
+        Ok(())
     }
 
     async fn ensure_lane<'a>(
@@ -3763,6 +3777,16 @@ impl QueueStorage {
         queue: &str,
         priority: i16,
     ) -> Result<(), AwaError> {
+        // Fast path: this store has previously written the three lane
+        // rows in some transaction. The cache is optimistic — if that
+        // earlier transaction rolled back, the head row is missing
+        // even though the cache says it exists. `advance_enqueue_head`
+        // detects that case via the empty UPDATE result and invalidates
+        // the cache entry before retrying.
+        if self.lane_is_cached(queue, priority) {
+            return Ok(());
+        }
+
         let schema = self.schema();
         sqlx::query(&format!(
             r#"
@@ -3802,7 +3826,83 @@ impl QueueStorage {
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
+        self.mark_lane_ensured(queue, priority);
         Ok(())
+    }
+
+    fn lane_is_cached(&self, queue: &str, priority: i16) -> bool {
+        let cache = self.ensured_lanes.lock().expect("ensured_lanes mutex");
+        cache.contains(&(queue.to_string(), priority))
+    }
+
+    fn mark_lane_ensured(&self, queue: &str, priority: i16) {
+        self.ensured_lanes
+            .lock()
+            .expect("ensured_lanes mutex")
+            .insert((queue.to_string(), priority));
+    }
+
+    fn invalidate_cached_lane(&self, queue: &str, priority: i16) {
+        self.ensured_lanes
+            .lock()
+            .expect("ensured_lanes mutex")
+            .remove(&(queue.to_string(), priority));
+    }
+
+    fn clear_lane_cache(&self) {
+        self.ensured_lanes
+            .lock()
+            .expect("ensured_lanes mutex")
+            .clear();
+    }
+
+    // Advances queue_enqueue_heads.next_seq for `(queue, priority)` by
+    // `count` and returns the lane sequence at which the caller's range
+    // starts. If the head row is missing — typically because a previous
+    // ensure_lane ran inside a transaction that ultimately rolled back,
+    // leaving a stale cache entry behind — the cache entry is
+    // invalidated, ensure_lane is re-run, and the UPDATE is retried
+    // exactly once. A second miss surfaces as RowNotFound.
+    async fn advance_enqueue_head<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queue: &str,
+        priority: i16,
+        count: i64,
+    ) -> Result<i64, AwaError> {
+        let schema = self.schema();
+        let sql = format!(
+            r#"
+            UPDATE {schema}.queue_enqueue_heads
+            SET next_seq = next_seq + $3
+            WHERE queue = $1 AND priority = $2
+            RETURNING next_seq - $3
+            "#
+        );
+
+        let maybe_start: Option<i64> = sqlx::query_scalar(&sql)
+            .bind(queue)
+            .bind(priority)
+            .bind(count)
+            .fetch_optional(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        if let Some(start) = maybe_start {
+            return Ok(start);
+        }
+
+        self.invalidate_cached_lane(queue, priority);
+        self.ensure_lane(tx, queue, priority).await?;
+        let start: i64 = sqlx::query_scalar(&sql)
+            .bind(queue)
+            .bind(priority)
+            .bind(count)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        Ok(start)
     }
 
     async fn current_queue_ring<'a>(
@@ -3989,7 +4089,6 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let schema = self.schema();
         let mut grouped: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
         for row in rows {
             grouped
@@ -4008,20 +4107,9 @@ impl QueueStorage {
             self.ensure_lane(tx, &queue, priority).await?;
 
             let count = lane_rows.len() as i64;
-            let start_seq: i64 = sqlx::query_scalar(&format!(
-                r#"
-                UPDATE {schema}.queue_enqueue_heads
-                SET next_seq = next_seq + $3
-                WHERE queue = $1 AND priority = $2
-                RETURNING next_seq - $3
-                "#
-            ))
-            .bind(&queue)
-            .bind(priority)
-            .bind(count)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            let start_seq = self
+                .advance_enqueue_head(tx, &queue, priority, count)
+                .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
                 let job_id = job_id_iter.next().ok_or_else(|| {
@@ -4063,7 +4151,6 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let schema = self.schema();
         let mut grouped: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
         for row in rows {
             grouped
@@ -4086,20 +4173,9 @@ impl QueueStorage {
             self.ensure_lane(tx, &queue, priority).await?;
 
             let count = lane_rows.len() as i64;
-            let start_seq: i64 = sqlx::query_scalar(&format!(
-                r#"
-                UPDATE {schema}.queue_enqueue_heads
-                SET next_seq = next_seq + $3
-                WHERE queue = $1 AND priority = $2
-                RETURNING next_seq - $3
-                "#
-            ))
-            .bind(&queue)
-            .bind(priority)
-            .bind(count)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            let start_seq = self
+                .advance_enqueue_head(tx, &queue, priority, count)
+                .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
                 let job_id = job_id_iter.next().ok_or_else(|| {
@@ -4141,7 +4217,6 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let schema = self.schema();
         let mut grouped: BTreeMap<(String, i16), Vec<ExistingReadyRow>> = BTreeMap::new();
         for row in rows {
             grouped
@@ -4157,20 +4232,9 @@ impl QueueStorage {
             self.ensure_lane(tx, &queue, priority).await?;
 
             let count = lane_rows.len() as i64;
-            let start_seq: i64 = sqlx::query_scalar(&format!(
-                r#"
-                UPDATE {schema}.queue_enqueue_heads
-                SET next_seq = next_seq + $3
-                WHERE queue = $1 AND priority = $2
-                RETURNING next_seq - $3
-                "#
-            ))
-            .bind(&queue)
-            .bind(priority)
-            .bind(count)
-            .fetch_one(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+            let start_seq = self
+                .advance_enqueue_head(tx, &queue, priority, count)
+                .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
                 self.sync_unique_claim(

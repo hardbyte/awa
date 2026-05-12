@@ -9,7 +9,19 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-const COMPLETION_BATCH_SIZE: usize = 128;
+// Default completion batch size and flush cadence. The defaults trade
+// a small amount of finalization latency for fewer per-job round trips
+// on the completion SQL when workers are saturated. The 1 ms flush
+// fires before most batches have time to fill at high throughput,
+// which forces small batches and amortises the per-batch cost over
+// fewer rows. A 5 ms flush gives a batch most of the time it needs
+// to reach `COMPLETION_BATCH_SIZE` before a time-based flush forces
+// it out; on the in-tree throughput bench this lifts steady-state
+// throughput a few percent at the cost of a comparable bump to
+// completion latency. Tunable per-deployment via
+// `AWA_COMPLETION_BATCH_SIZE` / `AWA_COMPLETION_FLUSH_MS`.
+const COMPLETION_BATCH_SIZE: usize = 256;
+const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
 
 fn completion_batch_size() -> usize {
@@ -26,7 +38,7 @@ fn completion_flush_interval() -> Duration {
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
         .map(Duration::from_millis)
-        .unwrap_or_else(|| Duration::from_millis(1))
+        .unwrap_or(COMPLETION_FLUSH_INTERVAL)
 }
 
 fn completion_shards(storage: &RuntimeStorage) -> usize {

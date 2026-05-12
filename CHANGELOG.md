@@ -14,6 +14,19 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   source under pinned-xmin workloads (long-running reader
   transactions) without changing public API behaviour. See ADR-019
   § `lane_state` and segment cursor tables.
+- Cache `(queue, priority)` lane presence in-process on the
+  queue-storage path so subsequent enqueue batches skip the three
+  `INSERT ... ON CONFLICT DO NOTHING` round-trips on
+  `queue_lanes` / `queue_enqueue_heads` / `queue_claim_heads`. The
+  cache invalidates and re-runs `ensure_lane` if a subsequent
+  `UPDATE queue_enqueue_heads` finds no row (the observable signal
+  of an earlier ensure_lane that ran inside a rolled-back
+  transaction), so correctness is preserved.
+- Raise the completion-batcher defaults to `(batch=256, flush=5ms)`
+  from `(batch=128, flush=1ms)`. Lets batches amortise the per-batch
+  completion SQL over more rows at the cost of a small latency
+  bump. Tunable via `AWA_COMPLETION_BATCH_SIZE` and
+  `AWA_COMPLETION_FLUSH_MS`.
 
 ## [0.6.0-alpha.9] — 2026-05-08
 

@@ -1404,3 +1404,112 @@ async fn test_enqueue_contention_matrix() {
         .await;
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// Test 6: queue-storage multi-producer enqueue contention
+// ═══════════════════════════════════════════════════════════════════════
+//
+// Targets `queue_storage::enqueue_params_batch` and `enqueue_params_copy`
+// with N concurrent producers on the same `(queue, priority)`, exercising
+// the path identified in issue #246 as the hottest hot-path query
+// (`UPDATE queue_enqueue_heads` at mean 14.8–18.0 ms in the published
+// pg_stat_statements snapshot). The existing
+// `test_enqueue_contention_matrix` only hits the canonical `jobs_hot`
+// path, so it leaves the queue_storage contention story unmeasured by
+// in-tree benches.
+//
+// Tunables:
+//   AWA_QS_CONTENTION_PRODUCERS            (default 16)
+//   AWA_QS_CONTENTION_JOBS_PER_PRODUCER    (default 20_000)
+//   AWA_QS_CONTENTION_BATCH_SIZE           (default 500)
+//   AWA_QS_CONTENTION_USE_COPY             (default 0 = INSERT batch)
+//   AWA_VA_RUNTIME_STORAGE_SCHEMA          (default awa_queue_storage)
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore]
+async fn test_queue_storage_enqueue_contention() {
+    let producers = env_usize("AWA_QS_CONTENTION_PRODUCERS", 16);
+    let jobs_per_producer = env_i64("AWA_QS_CONTENTION_JOBS_PER_PRODUCER", 20_000);
+    let batch_size = env_usize("AWA_QS_CONTENTION_BATCH_SIZE", 500);
+    let use_copy = env_usize("AWA_QS_CONTENTION_USE_COPY", 0) != 0;
+    let storage_schema = env_string("AWA_VA_RUNTIME_STORAGE_SCHEMA", "awa_queue_storage");
+
+    let pool = setup((producers as u32 * 4).max(20)).await;
+    reset_runtime_state(&pool).await;
+
+    let store_config = QueueStorageConfig {
+        schema: storage_schema,
+        queue_slot_count: 16,
+        lease_slot_count: 4,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = QueueStorage::new(store_config).expect("build queue storage store");
+    recreate_queue_storage_schema(&pool, &store).await;
+    store.install(&pool).await.expect("install queue storage");
+    store.reset(&pool).await.expect("reset queue storage");
+    activate_queue_storage_transition(&pool, store.schema()).await;
+
+    let queue = "qs_enqueue_contention_shared";
+    let barrier = Arc::new(tokio::sync::Barrier::new(producers + 1));
+    let store = Arc::new(store);
+
+    let mut tasks = Vec::with_capacity(producers);
+    for producer_idx in 0..producers {
+        let pool = pool.clone();
+        let store = Arc::clone(&store);
+        let barrier = Arc::clone(&barrier);
+        let queue = queue.to_string();
+        let start_seq = producer_idx as i64 * jobs_per_producer;
+        let params: Vec<InsertParams> = (0..jobs_per_producer)
+            .map(|offset| {
+                awa::model::insert::params_with(
+                    &BenchJob {
+                        seq: start_seq + offset,
+                    },
+                    InsertOpts {
+                        queue: queue.clone(),
+                        ..Default::default()
+                    },
+                )
+                .unwrap()
+            })
+            .collect();
+
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            for chunk in params.chunks(batch_size) {
+                if use_copy {
+                    store
+                        .enqueue_params_copy(&pool, chunk)
+                        .await
+                        .expect("queue_storage enqueue_params_copy");
+                } else {
+                    store
+                        .enqueue_params_batch(&pool, chunk)
+                        .await
+                        .expect("queue_storage enqueue_params_batch");
+                }
+            }
+        }));
+    }
+
+    let start = Instant::now();
+    barrier.wait().await;
+    for task in tasks {
+        task.await.expect("queue-storage contention task panicked");
+    }
+    let elapsed = start.elapsed();
+
+    let seeded = (producers as i64) * jobs_per_producer;
+    let rate = seeded as f64 / elapsed.as_secs_f64();
+    println!(
+        "[qs-enqueue-bench] mode={} producers={} batch_size={} seeded={} elapsed={:.2}s rate={:.0}/s",
+        if use_copy { "copy" } else { "insert" },
+        producers,
+        batch_size,
+        seeded,
+        elapsed.as_secs_f64(),
+        rate,
+    );
+}

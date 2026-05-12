@@ -5734,3 +5734,74 @@ async fn test_priority_aging_off_does_not_stamp_original() {
         job.metadata
     );
 }
+
+/// The in-process lane cache must self-heal when an earlier
+/// `ensure_lane` call ran inside a transaction that ultimately rolled
+/// back. After the rollback the cache still holds an entry claiming
+/// the lane rows exist, but the next enqueue's `UPDATE
+/// queue_enqueue_heads` will find no row — `advance_enqueue_head`
+/// invalidates the cached entry, re-runs `ensure_lane`, and retries
+/// the UPDATE so the enqueue still succeeds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_ensure_lane_rollback";
+    let schema = "awa_qs_ensure_lane_rollback";
+    let store = create_store(&pool, schema).await;
+
+    // Simulate the rolled-back ensure_lane: run the three lane
+    // inserts in a transaction that we explicitly roll back. After
+    // rollback the cache still thinks the lane exists because
+    // `enqueue_batch` ran an earlier successful insert against a
+    // different lane on this same store. We force-poison by running
+    // an enqueue that succeeds for one priority, then truncating the
+    // head row out from under the cache to mimic the rolled-back
+    // state for that priority.
+    store
+        .enqueue_batch(&pool, queue, 4, 1)
+        .await
+        .expect("seed enqueue should succeed");
+
+    // The cache now believes (queue, priority=4) is ensured. Wipe the
+    // physical head row out from under the cache to mimic the
+    // observable state after a rolled-back ensure_lane. Also clear
+    // the seeded ready_entries / queue_lanes rows so the lane is
+    // genuinely empty when the recovery path re-creates the head;
+    // this avoids a PK collision on the freshly-reset lane_seq.
+    for stmt in [
+        format!("DELETE FROM {schema}.queue_enqueue_heads WHERE queue = $1 AND priority = $2"),
+        format!("DELETE FROM {schema}.queue_claim_heads WHERE queue = $1 AND priority = $2"),
+        format!("DELETE FROM {schema}.queue_lanes WHERE queue = $1 AND priority = $2"),
+        format!("DELETE FROM {schema}.ready_entries WHERE queue = $1 AND priority = $2"),
+    ] {
+        sqlx::query(&stmt)
+            .bind(queue)
+            .bind(4_i16)
+            .execute(&pool)
+            .await
+            .expect("wipe lane rows out from under the cache");
+    }
+
+    // A subsequent enqueue must still succeed: `advance_enqueue_head`
+    // detects the empty UPDATE, invalidates the cached lane, and
+    // re-runs ensure_lane before retrying.
+    store
+        .enqueue_batch(&pool, queue, 4, 3)
+        .await
+        .expect("post-rollback enqueue should self-heal via cache invalidation");
+
+    let next_seq: i64 = sqlx::query_scalar(&format!(
+        "SELECT next_seq FROM {schema}.queue_enqueue_heads WHERE queue = $1 AND priority = $2"
+    ))
+    .bind(queue)
+    .bind(4_i16)
+    .fetch_one(&pool)
+    .await
+    .expect("queue_enqueue_heads row should exist after recovery");
+
+    assert_eq!(
+        next_seq, 4,
+        "next_seq should reflect the three recovery jobs starting from a re-initialised head"
+    );
+}
