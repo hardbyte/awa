@@ -14,14 +14,25 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   source under pinned-xmin workloads (long-running reader
   transactions) without changing public API behaviour. See ADR-019
   § `lane_state` and segment cursor tables.
-- Cache `(queue, priority)` lane presence in-process on the
-  queue-storage path so subsequent enqueue batches skip the three
-  `INSERT ... ON CONFLICT DO NOTHING` round-trips on
+- Cache `(queue, priority, enqueue_shard)` lane presence in-process
+  on the queue-storage path so subsequent enqueue batches skip the
+  three `INSERT ... ON CONFLICT DO NOTHING` round-trips on
   `queue_lanes` / `queue_enqueue_heads` / `queue_claim_heads`. The
   cache invalidates and re-runs `ensure_lane` if a subsequent
   `UPDATE queue_enqueue_heads` finds no row (the observable signal
   of an earlier ensure_lane that ran inside a rolled-back
   transaction), so correctness is preserved.
+- Shard `queue_enqueue_heads`, `queue_claim_heads`, and
+  `ready_entries` by `enqueue_shard` (migration `v017`). Producers
+  rotate across `awa.queue_meta.enqueue_shards` (default 1, range
+  1..=64) independent head rows per `(queue, priority)` so row-lock
+  contention on the single hot row is spread across N rows. With
+  the default `enqueue_shards = 1` the behaviour is observationally
+  identical to v016. Raising `enqueue_shards` per noisy queue
+  delivers near-linear throughput scaling on contended enqueue
+  workloads: a 16-producer same-queue local sweep measured 1.0×
+  → 1.76× → 3.05× → 4.84× at S=1/2/4/8. `lane_seq` is FIFO within a
+  shard; FIFO across shards becomes approximate at S>1.
 - Raise the completion-batcher defaults to `(batch=256, flush=5ms)`
   from `(batch=128, flush=1ms)`. Lets batches amortise the per-batch
   completion SQL over more rows at the cost of a small latency

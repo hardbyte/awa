@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 16;
+pub const CURRENT_VERSION: i32 = 17;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -68,6 +68,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Drop redundant queue_lanes.available_count cache; reader derives from heads",
         &[V16_UP],
     ),
+    (
+        17,
+        "Shard queue_enqueue_heads/queue_claim_heads/ready_entries by enqueue_shard",
+        &[V17_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -85,6 +90,7 @@ const V13_UP: &str = include_str!("../migrations/v013_storage_auto_finalize.sql"
 const V14_UP: &str = include_str!("../migrations/v014_storage_transition_role.sql");
 const V15_UP: &str = include_str!("../migrations/v015_cron_missed_fire_policy.sql");
 const V16_UP: &str = include_str!("../migrations/v016_drop_queue_lanes_available_count.sql");
+const V17_UP: &str = include_str!("../migrations/v017_shard_queue_enqueue_heads.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.

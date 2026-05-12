@@ -9,7 +9,7 @@ use sqlx::{PgPool, Postgres, QueryBuilder};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 use uuid::Uuid;
@@ -661,6 +661,8 @@ fn write_ready_copy_row(
     buf.push(b',');
     buf.extend_from_slice(row.lane_seq.to_string().as_bytes());
     buf.push(b',');
+    buf.extend_from_slice(row.enqueue_shard.to_string().as_bytes());
+    buf.push(b',');
     write_copy_datetime(buf, row.run_at);
     buf.push(b',');
     write_copy_optional_datetime(buf, row.attempted_at);
@@ -974,6 +976,10 @@ struct RuntimeReadyInsert {
     run_at: DateTime<Utc>,
     attempted_at: Option<DateTime<Utc>>,
     lane_seq: i64,
+    /// Enqueue shard the row belongs to. Selected per-batch by
+    /// `shard_for_enqueue`; defaults to 0 when the queue's
+    /// `enqueue_shards` is 1 (the default).
+    enqueue_shard: i16,
     created_at: DateTime<Utc>,
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
@@ -1500,14 +1506,23 @@ impl DeferredJobRow {
 pub struct QueueStorage {
     config: QueueStorageConfig,
     next_stripe_probe: AtomicUsize,
-    // Lane-presence cache: `(physical_queue, priority)` pairs we have
-    // previously inserted into queue_lanes / queue_enqueue_heads /
-    // queue_claim_heads at least once. Skips three round-trips per
-    // enqueue batch once the lane is established. Cleared on `reset()`
-    // because reset TRUNCATEs queue_lanes; the helper
-    // `advance_enqueue_head` repairs an entry that turns out to be
-    // stale (head row gone after a rolled-back ensure_lane).
-    ensured_lanes: Mutex<HashSet<(String, i16)>>,
+    /// Per-store rotor that selects the enqueue shard for the next batch.
+    /// Rotated once per `shard_for_enqueue` call so producers spread their
+    /// writes across the per-(queue, priority) shard rows.
+    shard_rotor: AtomicU16,
+    /// Cache of `awa.queue_meta.enqueue_shards` per queue. Populated lazily
+    /// on the first `shard_for_enqueue` call for a queue and invalidated by
+    /// `reset()`. With the default `enqueue_shards = 1`, the cache holds 1
+    /// and `pick_shard` returns 0 unconditionally.
+    enqueue_shards_cache: Mutex<HashMap<String, i16>>,
+    /// Lane-presence cache: `(physical_queue, priority, enqueue_shard)`
+    /// triples whose three lane rows (queue_lanes, queue_enqueue_heads,
+    /// queue_claim_heads) we have previously inserted. Skips the three
+    /// `INSERT … ON CONFLICT DO NOTHING` round-trips on subsequent enqueue
+    /// batches to a known lane/shard. Cleared on `reset()` because reset
+    /// TRUNCATEs queue_lanes; `advance_enqueue_head` repairs a stale entry
+    /// (head row gone after a rolled-back ensure_lane).
+    ensured_lanes: Mutex<HashSet<(String, i16, i16)>>,
 }
 
 impl QueueStorage {
@@ -1536,6 +1551,8 @@ impl QueueStorage {
         Ok(Self {
             config,
             next_stripe_probe: AtomicUsize::new(0),
+            shard_rotor: AtomicU16::new(0),
+            enqueue_shards_cache: Mutex::new(HashMap::new()),
             ensured_lanes: Mutex::new(HashSet::new()),
         })
     }
@@ -2287,8 +2304,9 @@ impl QueueStorage {
             CREATE TABLE IF NOT EXISTS {schema}.queue_enqueue_heads (
                 queue           TEXT NOT NULL,
                 priority        SMALLINT NOT NULL,
+                enqueue_shard   SMALLINT NOT NULL DEFAULT 0,
                 next_seq        BIGINT NOT NULL DEFAULT 1,
-                PRIMARY KEY (queue, priority)
+                PRIMARY KEY (queue, priority, enqueue_shard)
             )
             "#
             ))
@@ -2323,8 +2341,9 @@ impl QueueStorage {
             CREATE TABLE IF NOT EXISTS {schema}.queue_claim_heads (
                 queue           TEXT NOT NULL,
                 priority        SMALLINT NOT NULL,
+                enqueue_shard   SMALLINT NOT NULL DEFAULT 0,
                 claim_seq       BIGINT NOT NULL DEFAULT 1,
-                PRIMARY KEY (queue, priority)
+                PRIMARY KEY (queue, priority, enqueue_shard)
             )
             "#
             ))
@@ -2468,14 +2487,16 @@ impl QueueStorage {
             INSERT INTO {schema}.queue_enqueue_heads AS heads (
                 queue,
                 priority,
+                enqueue_shard,
                 next_seq
             )
             SELECT
                 queue,
                 priority,
+                0::smallint,
                 next_seq
             FROM {schema}.queue_lanes
-            ON CONFLICT (queue, priority) DO UPDATE
+            ON CONFLICT (queue, priority, enqueue_shard) DO UPDATE
             SET next_seq = GREATEST(heads.next_seq, EXCLUDED.next_seq)
             "#
             ))
@@ -2488,14 +2509,16 @@ impl QueueStorage {
             INSERT INTO {schema}.queue_claim_heads AS heads (
                 queue,
                 priority,
+                enqueue_shard,
                 claim_seq
             )
             SELECT
                 queue,
                 priority,
+                0::smallint,
                 claim_seq
             FROM {schema}.queue_lanes
-            ON CONFLICT (queue, priority) DO UPDATE
+            ON CONFLICT (queue, priority, enqueue_shard) DO UPDATE
             SET claim_seq = GREATEST(heads.claim_seq, EXCLUDED.claim_seq)
             "#
             ))
@@ -2936,13 +2959,14 @@ impl QueueStorage {
                 run_lease         BIGINT NOT NULL DEFAULT 0,
                 max_attempts      SMALLINT NOT NULL DEFAULT 25,
                 lane_seq          BIGINT NOT NULL,
+                enqueue_shard     SMALLINT NOT NULL DEFAULT 0,
                 run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 attempted_at      TIMESTAMPTZ,
                 created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
                 unique_key        BYTEA,
                 unique_states     TEXT,
                 payload           JSONB,
-                PRIMARY KEY (ready_slot, queue, priority, lane_seq)
+                PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
             ) PARTITION BY LIST (ready_slot)
             "#
             ))
@@ -3263,6 +3287,7 @@ impl QueueStorage {
             AS $func$
             DECLARE
                 v_lane_priority SMALLINT;
+                v_lane_shard SMALLINT;
                 v_lane_claim_seq BIGINT;
                 v_lane_next_seq BIGINT;
                 v_claim_limit BIGINT;
@@ -3274,13 +3299,15 @@ impl QueueStorage {
             BEGIN
                 SELECT
                     claims.priority,
+                    claims.enqueue_shard,
                     claims.claim_seq,
                     enqueues.next_seq
-                INTO v_lane_priority, v_lane_claim_seq, v_lane_next_seq
+                INTO v_lane_priority, v_lane_shard, v_lane_claim_seq, v_lane_next_seq
                 FROM {schema}.queue_claim_heads AS claims
                 JOIN {schema}.queue_enqueue_heads AS enqueues
                   ON enqueues.queue = claims.queue
                  AND enqueues.priority = claims.priority
+                 AND enqueues.enqueue_shard = claims.enqueue_shard
                 JOIN LATERAL (
                     SELECT
                         ready.ready_slot,
@@ -3298,6 +3325,7 @@ impl QueueStorage {
                     FROM {schema}.ready_entries AS ready
                     WHERE ready.queue = p_queue
                       AND ready.priority = claims.priority
+                      AND ready.enqueue_shard = claims.enqueue_shard
                       AND ready.lane_seq >= claims.claim_seq
                     ORDER BY ready.lane_seq ASC
                     LIMIT 1
@@ -3323,6 +3351,7 @@ impl QueueStorage {
                 FROM {schema}.ready_entries AS ready
                 WHERE ready.queue = p_queue
                   AND ready.priority = v_lane_priority
+                  AND ready.enqueue_shard = v_lane_shard
                   AND ready.lane_seq >= v_lane_claim_seq
                 ORDER BY ready.lane_seq ASC
                 LIMIT 1;
@@ -3331,7 +3360,8 @@ impl QueueStorage {
                     UPDATE {schema}.queue_claim_heads AS claims
                     SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
                     WHERE claims.queue = p_queue
-                      AND claims.priority = v_lane_priority;
+                      AND claims.priority = v_lane_priority
+                      AND claims.enqueue_shard = v_lane_shard;
                     RETURN;
                 END IF;
 
@@ -3383,6 +3413,7 @@ impl QueueStorage {
                     FROM {schema}.ready_entries AS ready
                     WHERE ready.queue = p_queue
                       AND ready.priority = v_lane_priority
+                      AND ready.enqueue_shard = v_lane_shard
                       AND ready.ready_slot = v_target_slot
                       AND ready.ready_generation = v_target_generation
                       AND ready.lane_seq >= v_lane_claim_seq
@@ -3397,6 +3428,7 @@ impl QueueStorage {
                         )
                     WHERE claims.queue = p_queue
                       AND claims.priority = v_lane_priority
+                      AND claims.enqueue_shard = v_lane_shard
                     RETURNING claims.priority
                 ),
                 {claimed_cte}
@@ -3454,7 +3486,8 @@ impl QueueStorage {
                     UPDATE {schema}.queue_claim_heads AS claims
                     SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
                     WHERE claims.queue = p_queue
-                      AND claims.priority = v_lane_priority;
+                      AND claims.priority = v_lane_priority
+                      AND claims.enqueue_shard = v_lane_shard;
                 END IF;
             END;
             $func$
@@ -3765,9 +3798,16 @@ impl QueueStorage {
         }
 
         tx.commit().await.map_err(map_sqlx_error)?;
-        // queue_lanes was TRUNCATEd above, so any cache entry that
-        // claims a lane row still exists is now wrong.
+
+        // queue_lanes was TRUNCATEd above and queue_meta may have a new
+        // shard configuration for the next round. Clear both caches so
+        // the next ensure_lane / shard_for_enqueue calls re-observe DB
+        // state.
         self.clear_lane_cache();
+        self.enqueue_shards_cache
+            .lock()
+            .expect("enqueue_shards_cache poisoned")
+            .clear();
         Ok(())
     }
 
@@ -3776,19 +3816,21 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queue: &str,
         priority: i16,
+        enqueue_shard: i16,
     ) -> Result<(), AwaError> {
         // Fast path: this store has previously written the three lane
-        // rows in some transaction. The cache is optimistic — if that
-        // earlier transaction rolled back, the head row is missing
-        // even though the cache says it exists. `advance_enqueue_head`
-        // detects that case via the empty UPDATE result, invalidates
-        // the cache entry, and re-runs `ensure_lane_inserts` directly
-        // (bypassing the fast path).
-        if self.lane_is_cached(queue, priority) {
+        // rows for this `(queue, priority, shard)` triple. The cache is
+        // optimistic — if that earlier transaction rolled back, the head
+        // row is missing even though the cache says it exists.
+        // `advance_enqueue_head` detects that case via the empty UPDATE
+        // result, invalidates the cache entry, and re-runs
+        // `ensure_lane_inserts` directly (bypassing this fast path).
+        if self.lane_is_cached(queue, priority, enqueue_shard) {
             return Ok(());
         }
 
-        self.ensure_lane_inserts(tx, queue, priority).await
+        self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
+            .await
     }
 
     /// Run the three lane-row inserts unconditionally and mark the
@@ -3801,6 +3843,7 @@ impl QueueStorage {
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queue: &str,
         priority: i16,
+        enqueue_shard: i16,
     ) -> Result<(), AwaError> {
         let schema = self.schema();
         sqlx::query(&format!(
@@ -3818,51 +3861,105 @@ impl QueueStorage {
 
         sqlx::query(&format!(
             r#"
-            INSERT INTO {schema}.queue_enqueue_heads (queue, priority)
-            VALUES ($1, $2)
-            ON CONFLICT (queue, priority) DO NOTHING
+            INSERT INTO {schema}.queue_enqueue_heads (queue, priority, enqueue_shard)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
             "#
         ))
         .bind(queue)
         .bind(priority)
+        .bind(enqueue_shard)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
         sqlx::query(&format!(
             r#"
-            INSERT INTO {schema}.queue_claim_heads (queue, priority)
-            VALUES ($1, $2)
-            ON CONFLICT (queue, priority) DO NOTHING
+            INSERT INTO {schema}.queue_claim_heads (queue, priority, enqueue_shard)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
             "#
         ))
         .bind(queue)
         .bind(priority)
+        .bind(enqueue_shard)
         .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
-        self.mark_lane_ensured(queue, priority);
+        self.mark_lane_ensured(queue, priority, enqueue_shard);
         Ok(())
     }
 
-    fn lane_is_cached(&self, queue: &str, priority: i16) -> bool {
+    /// Pick the enqueue shard for the next batch on `(queue, priority)`.
+    ///
+    /// Reads `awa.queue_meta.enqueue_shards` (default 1) and rotates the
+    /// returned shard via the per-store atomic counter. With the default
+    /// `enqueue_shards = 1`, this always returns 0, preserving the
+    /// pre-shard single-row behaviour.
+    async fn shard_for_enqueue(
+        &self,
+        pool_executor: impl sqlx::PgExecutor<'_>,
+        queue: &str,
+    ) -> Result<i16, AwaError> {
+        if let Some(cached) = self
+            .enqueue_shards_cache
+            .lock()
+            .expect("enqueue_shards_cache poisoned")
+            .get(queue)
+            .copied()
+        {
+            return Ok(self.pick_shard(cached));
+        }
+
+        let shards: i16 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(MAX(enqueue_shards), 1)::smallint
+            FROM awa.queue_meta
+            WHERE queue = $1
+            "#,
+        )
+        .bind(queue)
+        .fetch_one(pool_executor)
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let shards = shards.max(1);
+        self.enqueue_shards_cache
+            .lock()
+            .expect("enqueue_shards_cache poisoned")
+            .insert(queue.to_string(), shards);
+
+        Ok(self.pick_shard(shards))
+    }
+
+    /// Rotate the per-store atomic counter and map it into `[0, shards)`.
+    fn pick_shard(&self, shards: i16) -> i16 {
+        if shards <= 1 {
+            return 0;
+        }
+        let raw = self.shard_rotor.fetch_add(1, Ordering::Relaxed) as i32;
+        let shards = shards as i32;
+        (raw.rem_euclid(shards)) as i16
+    }
+
+    fn lane_is_cached(&self, queue: &str, priority: i16, enqueue_shard: i16) -> bool {
         let cache = self.ensured_lanes.lock().expect("ensured_lanes mutex");
-        cache.contains(&(queue.to_string(), priority))
+        cache.contains(&(queue.to_string(), priority, enqueue_shard))
     }
 
-    fn mark_lane_ensured(&self, queue: &str, priority: i16) {
+    fn mark_lane_ensured(&self, queue: &str, priority: i16, enqueue_shard: i16) {
         self.ensured_lanes
             .lock()
             .expect("ensured_lanes mutex")
-            .insert((queue.to_string(), priority));
+            .insert((queue.to_string(), priority, enqueue_shard));
     }
 
-    fn invalidate_cached_lane(&self, queue: &str, priority: i16) {
+    fn invalidate_cached_lane(&self, queue: &str, priority: i16, enqueue_shard: i16) {
         self.ensured_lanes
             .lock()
             .expect("ensured_lanes mutex")
-            .remove(&(queue.to_string(), priority));
+            .remove(&(queue.to_string(), priority, enqueue_shard));
     }
 
     fn clear_lane_cache(&self) {
@@ -3872,33 +3969,36 @@ impl QueueStorage {
             .clear();
     }
 
-    // Advances queue_enqueue_heads.next_seq for `(queue, priority)` by
-    // `count` and returns the lane sequence at which the caller's range
-    // starts. If the head row is missing — typically because a previous
-    // ensure_lane ran inside a transaction that ultimately rolled back,
-    // leaving a stale cache entry behind — the cache entry is
-    // invalidated, ensure_lane is re-run, and the UPDATE is retried
-    // exactly once. A second miss surfaces as RowNotFound.
+    // Advance `queue_enqueue_heads.next_seq` for a specific
+    // `(queue, priority, shard)` triple and return the lane sequence at
+    // which the caller's range starts. If the head row is missing —
+    // typically because a previous ensure_lane ran inside a transaction
+    // that ultimately rolled back, leaving a stale cache entry behind —
+    // the cache entry is invalidated, ensure_lane is re-run, and the
+    // UPDATE is retried exactly once. A second miss surfaces as
+    // RowNotFound.
     async fn advance_enqueue_head<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         queue: &str,
         priority: i16,
+        enqueue_shard: i16,
         count: i64,
     ) -> Result<i64, AwaError> {
         let schema = self.schema();
         let sql = format!(
             r#"
             UPDATE {schema}.queue_enqueue_heads
-            SET next_seq = next_seq + $3
-            WHERE queue = $1 AND priority = $2
-            RETURNING next_seq - $3
+            SET next_seq = next_seq + $4
+            WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
+            RETURNING next_seq - $4
             "#
         );
 
         let maybe_start: Option<i64> = sqlx::query_scalar(&sql)
             .bind(queue)
             .bind(priority)
+            .bind(enqueue_shard)
             .bind(count)
             .fetch_optional(tx.as_mut())
             .await
@@ -3915,11 +4015,13 @@ impl QueueStorage {
         // another concurrent transaction has re-marked the cache but
         // not yet committed its inserts, leaving us in the same
         // failure state.
-        self.invalidate_cached_lane(queue, priority);
-        self.ensure_lane_inserts(tx, queue, priority).await?;
+        self.invalidate_cached_lane(queue, priority, enqueue_shard);
+        self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
+            .await?;
         let start: i64 = sqlx::query_scalar(&sql)
             .bind(queue)
             .bind(priority)
+            .bind(enqueue_shard)
             .bind(count)
             .fetch_one(tx.as_mut())
             .await
@@ -4034,7 +4136,7 @@ impl QueueStorage {
         let schema = self.schema();
         let ring = self.current_queue_ring(tx).await?;
         let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, run_at, attempted_at, created_at, unique_key, unique_states, payload) "
+            "INSERT INTO {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) "
         ));
         builder.push_values(rows.iter(), |mut b, row| {
             b.push_bind(ring.0)
@@ -4048,6 +4150,7 @@ impl QueueStorage {
                 .push_bind(row.run_lease)
                 .push_bind(row.max_attempts)
                 .push_bind(row.lane_seq)
+                .push_bind(row.enqueue_shard)
                 .push_bind(row.run_at)
                 .push_bind(row.attempted_at)
                 .push_bind(row.created_at)
@@ -4076,7 +4179,7 @@ impl QueueStorage {
         let schema = self.schema();
         let ring = self.current_queue_ring(tx).await?;
         let copy_sql = format!(
-            "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
+            "COPY {schema}.ready_entries (ready_slot, ready_generation, job_id, kind, queue, args, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, created_at, unique_key, unique_states, payload) FROM STDIN WITH (FORMAT csv, NULL '{COPY_NULL_SENTINEL}')"
         );
         let mut copy_in = tx
             .as_mut()
@@ -4126,11 +4229,13 @@ impl QueueStorage {
         let mut ready_rows = Vec::with_capacity(total_rows);
 
         for ((queue, priority), lane_rows) in grouped {
-            self.ensure_lane(tx, &queue, priority).await?;
+            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue).await?;
+            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+                .await?;
 
             let count = lane_rows.len() as i64;
             let start_seq = self
-                .advance_enqueue_head(tx, &queue, priority, count)
+                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
                 .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
@@ -4149,6 +4254,7 @@ impl QueueStorage {
                     run_at: row.run_at,
                     attempted_at: row.attempted_at,
                     lane_seq: start_seq + offset as i64,
+                    enqueue_shard,
                     created_at: row.created_at,
                     unique_key: row.unique_key,
                     unique_states: row.unique_states,
@@ -4192,11 +4298,13 @@ impl QueueStorage {
         let mut ready_rows = Vec::with_capacity(total_rows);
 
         for ((queue, priority), lane_rows) in grouped {
-            self.ensure_lane(tx, &queue, priority).await?;
+            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue).await?;
+            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+                .await?;
 
             let count = lane_rows.len() as i64;
             let start_seq = self
-                .advance_enqueue_head(tx, &queue, priority, count)
+                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
                 .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
@@ -4215,6 +4323,7 @@ impl QueueStorage {
                     run_at: row.run_at,
                     attempted_at: row.attempted_at,
                     lane_seq: start_seq + offset as i64,
+                    enqueue_shard,
                     created_at: row.created_at,
                     unique_key: row.unique_key,
                     unique_states: row.unique_states,
@@ -4251,11 +4360,13 @@ impl QueueStorage {
         let mut ready_rows = Vec::with_capacity(total_rows);
 
         for ((queue, priority), lane_rows) in grouped {
-            self.ensure_lane(tx, &queue, priority).await?;
+            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue).await?;
+            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+                .await?;
 
             let count = lane_rows.len() as i64;
             let start_seq = self
-                .advance_enqueue_head(tx, &queue, priority, count)
+                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
                 .await?;
 
             for (offset, row) in lane_rows.into_iter().enumerate() {
@@ -4280,6 +4391,7 @@ impl QueueStorage {
                     run_at: row.run_at,
                     attempted_at: row.attempted_at,
                     lane_seq: start_seq + offset as i64,
+                    enqueue_shard,
                     created_at: row.created_at,
                     unique_key: row.unique_key,
                     unique_states: row.unique_states,
@@ -6713,7 +6825,10 @@ impl QueueStorage {
 
         if let Some(deferred) = deferred {
             let (ready_slot, ready_generation) = self.current_queue_ring(tx).await?;
-            self.ensure_lane(tx, &deferred.queue, deferred.priority)
+            // Deferred-cancel goes straight to done_entries (not sharded);
+            // we still need the head rows so the queue lane is registered.
+            // Shard 0 is the canonical default shard for every (queue, priority).
+            self.ensure_lane(tx, &deferred.queue, deferred.priority, 0)
                 .await?;
             let done = DoneJobRow {
                 ready_slot,

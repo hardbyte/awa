@@ -175,9 +175,44 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 - **Held-tx during finalize.** A long-running canonical transaction (e.g., reporting query) blocks vacuum, which can stall partition prune in the queue-storage tables. `awa.maintenance.prune.attempts{awa_ring_outcome="blocked"}` will rise. Identify and terminate the held-tx; prune resumes on the next maintenance tick.
 - **0.6 rollback after queue-storage work.** Not supported via `awa storage abort` once any rows exist in queue-storage tables. Plan accordingly: keep `0.6` workers available throughout the transition window. Only emergency rollback path is database restore.
 
+## v017 sharded enqueue heads — operator notes
+
+Migration `v017` (landed with `0.6.0`) adds an `enqueue_shard` column and extends the primary keys of `queue_enqueue_heads`, `queue_claim_heads`, and `ready_entries`. The default per-queue value (`awa.queue_meta.enqueue_shards = 1`) is observationally identical to the pre-v017 layout — shard 0 is the only shard, and FIFO-within-lane is preserved.
+
+When the migration runs:
+
+- **`canonical` state.** No queue-storage schema exists; the migration is a no-op for the queue-storage tables. `awa.queue_meta.enqueue_shards` is added with default 1.
+- **`prepared` state.** Queue-storage schema exists but receives no live traffic. The PK reshape takes an `ACCESS EXCLUSIVE` lock; the tables are empty so the lock acquires immediately and the migration completes in milliseconds. Safe.
+- **`active` state.** Queue-storage is the live engine. The PK reshape still takes an `ACCESS EXCLUSIVE` lock, but on a live table it must wait for in-flight enqueue and claim transactions to finish, then will block new ones until the rewrite completes. On a quiet queue this is milliseconds; on a fully saturated queue with multi-million-row `ready_entries` it can be longer. Run the migration during a low-traffic window if practical.
+- **`mixed_transition` state.** The migration refuses to run and raises a 55000 error. Finalize the transition (or abort and re-enter `prepared`) first.
+
+Raising `enqueue_shards` per queue is an operator decision, not part of the migration:
+
+```sql
+-- For a contended same-queue producer fleet, opt the queue into N shards.
+UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
+```
+
+Trade-offs at `enqueue_shards > 1` are documented in [`docs/adr/025-sharded-enqueue-heads.md`](adr/025-sharded-enqueue-heads.md). The headline:
+
+- **Throughput** scales near-linearly with shard count up to roughly one shard per two concurrent producers on a contended queue.
+- **FIFO ordering** is preserved within a shard. Cross-shard ordering at the lane level is approximate.
+
+Lowering `enqueue_shards` (e.g. 4 → 1) is safe **only after** all `ready_entries` rows in the now-out-of-range shards have been claimed. The producer rotor will stop emitting to those shards immediately, but existing rows still need a claimer. Confirm with:
+
+```sql
+SELECT enqueue_shard, count(*)
+FROM <queue_storage_schema>.ready_entries
+WHERE queue = 'my_hot_queue'
+GROUP BY enqueue_shard;
+```
+
+before lowering the value.
+
 ## Cross-references
 
 - [migrations.md](migrations.md) — full migration story including SQL-level identities
 - [configuration.md](configuration.md) — claim-ring / lease-ring sizing knobs
 - [`docs/adr/023-receipt-plane-ring-partitioning.md`](adr/023-receipt-plane-ring-partitioning.md) — receipt-plane partition design and reverse-migration recipe
+- [`docs/adr/025-sharded-enqueue-heads.md`](adr/025-sharded-enqueue-heads.md) — enqueue-head sharding design and FIFO contract
 - [`docs/grafana/awa-dashboard.json`](grafana/awa-dashboard.json) — Prometheus dashboard with the rotation/prune panels
