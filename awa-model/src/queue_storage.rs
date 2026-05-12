@@ -3781,12 +3781,27 @@ impl QueueStorage {
         // rows in some transaction. The cache is optimistic — if that
         // earlier transaction rolled back, the head row is missing
         // even though the cache says it exists. `advance_enqueue_head`
-        // detects that case via the empty UPDATE result and invalidates
-        // the cache entry before retrying.
+        // detects that case via the empty UPDATE result, invalidates
+        // the cache entry, and re-runs `ensure_lane_inserts` directly
+        // (bypassing the fast path).
         if self.lane_is_cached(queue, priority) {
             return Ok(());
         }
 
+        self.ensure_lane_inserts(tx, queue, priority).await
+    }
+
+    /// Run the three lane-row inserts unconditionally and mark the
+    /// `(queue, priority)` pair as cached on success. Skips the cache
+    /// fast path so callers in the rollback-recovery path can force a
+    /// re-insert without racing another transaction that has marked
+    /// the lane but not yet committed its inserts.
+    async fn ensure_lane_inserts<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        queue: &str,
+        priority: i16,
+    ) -> Result<(), AwaError> {
         let schema = self.schema();
         sqlx::query(&format!(
             r#"
@@ -3893,8 +3908,15 @@ impl QueueStorage {
             return Ok(start);
         }
 
+        // Recovery path: a prior ensure_lane marked the cache and
+        // then rolled back, leaving the head row missing. Bypass the
+        // cache fast path here and run the inserts unconditionally —
+        // calling `ensure_lane` would re-take the fast path if
+        // another concurrent transaction has re-marked the cache but
+        // not yet committed its inserts, leaving us in the same
+        // failure state.
         self.invalidate_cached_lane(queue, priority);
-        self.ensure_lane(tx, queue, priority).await?;
+        self.ensure_lane_inserts(tx, queue, priority).await?;
         let start: i64 = sqlx::query_scalar(&sql)
             .bind(queue)
             .bind(priority)

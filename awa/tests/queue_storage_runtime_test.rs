@@ -5740,8 +5740,18 @@ async fn test_priority_aging_off_does_not_stamp_original() {
 /// back. After the rollback the cache still holds an entry claiming
 /// the lane rows exist, but the next enqueue's `UPDATE
 /// queue_enqueue_heads` will find no row — `advance_enqueue_head`
-/// invalidates the cached entry, re-runs `ensure_lane`, and retries
-/// the UPDATE so the enqueue still succeeds.
+/// invalidates the cached entry, re-runs the lane inserts (bypassing
+/// the cache fast path), and retries the UPDATE so the enqueue still
+/// succeeds.
+///
+/// This test exercises the single-threaded shape of the recovery.
+/// The concurrent shape — another transaction re-marks the cache
+/// between the invalidate and the retry — is handled by
+/// `advance_enqueue_head` calling `ensure_lane_inserts` directly
+/// rather than `ensure_lane` (which would re-take the fast path).
+/// That race is hard to reproduce deterministically from a single
+/// test without exposing the cache, so the invariant lives in the
+/// helper's comment.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
