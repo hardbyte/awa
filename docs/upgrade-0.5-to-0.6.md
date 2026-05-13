@@ -177,7 +177,9 @@ If any of these go wrong **before** any queue-storage work is accepted, `awa sto
 
 ## v017 sharded enqueue heads — operator notes
 
-Migration `v017` adds an `enqueue_shard` column and extends the primary keys of `queue_enqueue_heads`, `queue_claim_heads`, `ready_entries`, `leases`, and `done_entries`. `lease_claims` carries the column as a regular column; its primary key stays `(claim_slot, job_id, run_lease)`. `awa.queue_meta.enqueue_shards` is the per-queue tunable (default 1, range 1..=64). The default value is observationally identical to the pre-v017 layout — shard 0 is the only shard, and FIFO-within-lane is preserved.
+Migration `v017` adds an `enqueue_shard` column and extends the primary keys of `queue_enqueue_heads`, `queue_claim_heads`, `ready_entries`, `leases`, and `done_entries`. `lease_claims` carries the column as a regular column; its primary key stays `(claim_slot, job_id, run_lease)`. `awa.queue_meta.enqueue_shards` is the per-queue tunable (default 1, range 1..=64). The default value is observationally identical to the pre-v017 layout — shard 0 is the only shard, and strict FIFO per `(queue, priority)` is preserved.
+
+`enqueue_shards > 1` is a semantic mode switch, comparable to choosing SQS Standard over SQS FIFO, raising Kafka partition count, or using Pub/Sub ordering keys instead of global ordering. The queue's ordering contract changes from strict FIFO per lane to **partitioned FIFO**: strict FIFO within `(queue, priority, enqueue_shard)`, no ordering promised across shards. Operators opt in per queue; the default keeps the legacy contract.
 
 When the migration runs:
 
@@ -196,31 +198,62 @@ UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
 
 The producer-side rotor picks up the new shard count on the next enqueue. Existing in-flight rows on shard 0 continue to be claimed and drained; new rows fan out across shards 0..S-1.
 
-Trade-offs:
+Ordering contract and trade-offs:
 
-- **FIFO ordering** is preserved within a shard. Cross-shard ordering at the lane level becomes approximate. Workloads that rely on strict per-lane FIFO pin `enqueue_shards = 1`.
+- **Partitioned FIFO.** Strict FIFO is preserved within each `(queue, priority, enqueue_shard)`. Cross-shard ordering is not guaranteed. Workloads that need strict cross-producer FIFO at the lane level keep `enqueue_shards = 1`. Workloads that need per-key FIFO (per customer, per order, per account) pass `InsertOpts::ordering_key` when enqueuing — rows sharing a key hash to the same shard and inherit that shard's strict FIFO contract.
 - **Throughput** scales near-linearly with shard count up to roughly one shard per two concurrent producers on a contended queue; the next bottleneck is WAL bandwidth.
 - **Claim cost** is `O(shard count)` per claim call: the claim path scans every shard's head row to pick a candidate. With `enqueue_shards = 64` and four priorities, that's 256 candidate rows — still trivial.
 
-See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and per-shard FIFO contract.
+See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and the partitioned-FIFO contract.
+
+### Routing related jobs to the same shard
+
+For independent jobs, the default per-store rotor spreads producer rows uniformly across shards. For jobs that must observe each other in order — successive events for the same customer, sequential steps in a workflow, all writes for one account — set `InsertOpts::ordering_key` to the bytes of the partition identifier:
+
+```rust
+let opts = InsertOpts {
+    queue: "events".into(),
+    ordering_key: Some(customer_id.as_bytes().to_vec()),
+    ..Default::default()
+};
+```
+
+The key bytes are mapped by Awa's portable shard hash and reduced modulo the queue's `enqueue_shards`, so two enqueues with the same key always land on the same shard regardless of which producer or batch boundary they sit on. Rust, SQL, and Python enqueue paths use the same byte-level routing. At `enqueue_shards = 1` the key is ignored (every job lands on shard 0 anyway).
 
 ### Lowering `enqueue_shards`
 
-Lowering is safe only after all `ready_entries` rows in the now-out-of-range shards have been claimed. The producer rotor stops emitting to those shards immediately, but existing rows still need a claimer. Confirm with:
+Lowering is safe at any time: every claim, rescue, and admin path joins `queue_claim_heads` to `queue_enqueue_heads` without filtering on the current shard count, so rows on now-out-of-range shards continue to drain through the same code paths. There is no risk of orphaning in-flight rows on shards `>= newS`.
 
-```sql
-SELECT enqueue_shard, count(*)
-FROM <queue_storage_schema>.ready_entries
-WHERE queue = 'my_hot_queue'
-GROUP BY enqueue_shard;
-```
+The only operator-visible caveat is the per-runtime `enqueue_shards_cache`: a runtime that cached the old value keeps producing to the old shard count until that cache is invalidated. The cache is correctness-safe (producers and claimers agree on the value at row-write time) but operator-intent-stale. Procedure:
 
-before lowering the value.
+1. Lower the value:
+
+   ```sql
+   UPDATE awa.queue_meta SET enqueue_shards = 2 WHERE queue = 'my_hot_queue';
+   ```
+
+2. Restart worker processes (or rely on the next deploy) so the in-process cache observes the new value.
+3. Optionally watch per-shard lag drain to zero:
+
+   ```sql
+   SELECT priority, enqueue_shard,
+          enqueues.next_seq, claims.claim_seq,
+          enqueues.next_seq - claims.claim_seq AS lag
+   FROM <queue_storage_schema>.queue_claim_heads AS claims
+   JOIN <queue_storage_schema>.queue_enqueue_heads AS enqueues
+     USING (queue, priority, enqueue_shard)
+   WHERE queue = 'my_hot_queue'
+   ORDER BY priority, enqueue_shard;
+   ```
+
+   The `queue_*_heads` rows for shards `>= newS` linger as empty heads after the drain. They are harmless — a handful of tiny rows with no effect on throughput.
+
+The audit and drain contract are pinned by `test_queue_storage_lowering_enqueue_shards_drains_existing_rows` in `awa/tests/queue_storage_runtime_test.rs`.
 
 ## Cross-references
 
 - [migrations.md](migrations.md) — full migration story including SQL-level identities
 - [configuration.md](configuration.md) — claim-ring / lease-ring sizing knobs
 - [`docs/adr/023-receipt-plane-ring-partitioning.md`](adr/023-receipt-plane-ring-partitioning.md) — receipt-plane partition design and reverse-migration recipe
-- [`docs/adr/025-sharded-enqueue-heads.md`](adr/025-sharded-enqueue-heads.md) — enqueue-head sharding design and FIFO contract
+- [`docs/adr/025-sharded-enqueue-heads.md`](adr/025-sharded-enqueue-heads.md) — enqueue-head sharding design and partitioned-FIFO contract
 - [`docs/grafana/awa-dashboard.json`](grafana/awa-dashboard.json) — Prometheus dashboard with the rotation/prune panels

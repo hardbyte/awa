@@ -57,7 +57,8 @@ pub mod tokio_pg {
         $8,
         $9::text[],
         $10,
-        $11::text::bit(8)
+        $11::text::bit(8),
+        $12
     )
     "#;
 
@@ -120,6 +121,7 @@ pub mod tokio_pg {
                     &prepared.tags,
                     &prepared.unique_key,
                     &prepared.unique_states,
+                    &prepared.ordering_key,
                 ],
             )
             .await

@@ -23,20 +23,41 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   of an earlier ensure_lane that ran inside a rolled-back
   transaction), so correctness is preserved.
 - Shard the queue-storage active plane by `enqueue_shard` (migration
-  `v017`). Producers rotate across `awa.queue_meta.enqueue_shards`
-  (default 1, range 1..=64) independent head rows per
-  `(queue, priority)` so row-lock contention on the single hot row
-  is spread across N rows. The shard column runs end-to-end:
+  `v017`). `awa.queue_meta.enqueue_shards` (default 1, range 1..=64)
+  is a per-queue semantic mode switch — comparable to choosing SQS
+  Standard over SQS FIFO, raising Kafka partition count, or using
+  Pub/Sub ordering keys. The ordering contract at `enqueue_shards = 1`
+  is unchanged (strict FIFO per `(queue, priority)`); at
+  `enqueue_shards > 1` it becomes **partitioned FIFO** — strict FIFO
+  within `(queue, priority, enqueue_shard)`, no order promised
+  across shards. The shard column runs end-to-end:
   `queue_enqueue_heads`, `queue_claim_heads`, `ready_entries`,
   `leases`, and `done_entries` carry it in their primary keys;
-  `lease_claims` carries it as a regular column. With the default
-  `enqueue_shards = 1` the behaviour is observationally identical
-  to v016. Raising `enqueue_shards` per noisy queue delivers
-  near-linear throughput scaling on contended enqueue workloads: a
-  16-producer same-queue local sweep measured 1.0× → 1.60× → 2.75×
-  → 3.69× at S=1/2/4/8. `lane_seq` is FIFO within a shard; FIFO
-  across shards becomes approximate at S>1. See ADR-025 for the
-  full design.
+  `lease_claims` carries it as a regular column. Raising the value
+  per noisy queue delivers near-linear throughput scaling on
+  contended enqueue workloads: a 16-producer same-queue local sweep
+  measured 1.0× → 1.60× → 2.75× → 3.69× at S=1/2/4/8. Scope: this
+  addresses producer-side enqueue contention. The
+  high-worker-count rescue-path regression (1 replica × 256
+  workers, receipts on, `LEASE_DEADLINE_MS` A/B) is a separate
+  effect on the claim / rescue side and remains open for follow-up
+  measurement. See ADR-025 for the full design.
+
+### Added
+- `InsertOpts::ordering_key: Option<Vec<u8>>` pins related jobs to
+  the same shard at `enqueue_shards > 1`. The key bytes are mapped
+  by Awa's portable shard hash and reduced modulo the queue's shard
+  count, so Rust, SQL, and Python enqueue paths agree on routing.
+  Use it as a Kafka-partition-key analogue: jobs for the same
+  customer / order / account share a shard and inherit that shard's
+  strict FIFO. `None` falls back to the per-row rotor. Ignored at
+  `enqueue_shards = 1`.
+- `awa.job.claimed` counter now carries an `awa.enqueue.shard`
+  attribute on the queue-storage claim path so dashboards can see
+  per-shard claim throughput. Canonical claims continue to emit the
+  un-decorated series; the two attribute sets do not overlap, so
+  Prometheus `sum by (awa_enqueue_shard)(rate(awa_job_claimed[1m]))`
+  is the per-shard fairness panel.
 - Raise the completion-batcher defaults to `(batch=256, flush=5ms)`
   from `(batch=128, flush=1ms)`. Lets batches amortise the per-batch
   completion SQL over more rows at the cost of a small latency

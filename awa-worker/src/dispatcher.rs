@@ -634,8 +634,28 @@ impl Dispatcher {
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
         if !jobs.is_empty() {
-            self.metrics
-                .record_job_claimed(&self.queue, jobs.len() as u64);
+            // Queue-storage carries an `enqueue_shard` on every claim;
+            // bucket the batch so dashboards can sum
+            // `awa.job.claimed` by `awa.enqueue.shard` and confirm the
+            // claim ordering rotates across shards. Canonical claims
+            // have no shard and report through the un-decorated form.
+            let mut by_shard: std::collections::BTreeMap<i16, u64> =
+                std::collections::BTreeMap::new();
+            let mut canonical_count: u64 = 0;
+            for dispatched in &jobs {
+                match &dispatched.queue_storage_claim {
+                    Some(claim) => *by_shard.entry(claim.enqueue_shard).or_default() += 1,
+                    None => canonical_count += 1,
+                }
+            }
+            for (shard, count) in by_shard {
+                self.metrics
+                    .record_job_claimed_by_shard(&self.queue, shard, count);
+            }
+            if canonical_count > 0 {
+                self.metrics
+                    .record_job_claimed(&self.queue, canonical_count);
+            }
             // Wait duration = created_at → now() (claim moment).
             //
             // Earlier this used `attempted_at - created_at`, but the

@@ -82,7 +82,10 @@ FROM awa.insert_job_compat(
     $6::smallint,
     $7::timestamptz,
     $8::jsonb,
-    $9::text[]
+    $9::text[],
+    NULL,
+    NULL::bit(8),
+    $10::bytea
 )
 """
 
@@ -99,7 +102,10 @@ FROM awa.insert_job_compat(
     %s::smallint,
     %s::timestamptz,
     %s::jsonb,
-    %s::text[]
+    %s::text[],
+    NULL,
+    NULL::bit(8),
+    %s::bytea
 )
 """
 
@@ -116,7 +122,10 @@ FROM awa.insert_job_compat(
     CAST(:max_attempts AS smallint),
     CAST(:run_at AS timestamptz),
     CAST(:metadata AS jsonb),
-    :tags
+    :tags,
+    NULL,
+    CAST(NULL AS bit(8)),
+    :ordering_key
 )
 """
 
@@ -208,6 +217,18 @@ def _normalize_run_at(run_at: str | datetime | None) -> datetime | None:
     raise TypeError(f"run_at must be a string or datetime, got {type(run_at).__name__}")
 
 
+def _normalize_ordering_key(ordering_key: bytes | str | None) -> bytes | None:
+    if ordering_key is None:
+        return None
+    if isinstance(ordering_key, str):
+        return ordering_key.encode()
+    if isinstance(ordering_key, (bytes, bytearray, memoryview)):
+        return bytes(ordering_key)
+    raise TypeError(
+        f"ordering_key must be bytes-like or str, got {type(ordering_key).__name__}"
+    )
+
+
 def _prepare_values(
     args: Any,
     *,
@@ -218,6 +239,7 @@ def _prepare_values(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     run_at: str | datetime | None = None,
+    ordering_key: bytes | str | None = None,
 ) -> dict[str, Any]:
     """Prepare shared insert values for all bridge backends."""
     args_data = _coerce_job_data(args)
@@ -228,6 +250,7 @@ def _prepare_values(
     resolved_kind = _derive_kind(args, kind)
     state = _determine_state(run_at)
     run_at_dt = _normalize_run_at(run_at)
+    ordering_key_bytes = _normalize_ordering_key(ordering_key)
     resolved_tags = tags if tags is not None else []
 
     return {
@@ -242,6 +265,7 @@ def _prepare_values(
         "metadata_data": metadata_data,
         "metadata_json": json.dumps(metadata_data, default=str),
         "tags": resolved_tags,
+        "ordering_key": ordering_key_bytes,
     }
 
 
@@ -320,13 +344,14 @@ def _sqlalchemy_text() -> Any:
     """Build the typed SQLAlchemy text statement lazily."""
     from sqlalchemy import bindparam, text
     from sqlalchemy.dialects.postgresql import ARRAY, JSONB
-    from sqlalchemy.types import DateTime, String
+    from sqlalchemy.types import DateTime, LargeBinary, String
 
     return text(_INSERT_SQL_NAMED).bindparams(
         bindparam("args", type_=JSONB),
         bindparam("metadata", type_=JSONB),
         bindparam("tags", type_=ARRAY(String())),
         bindparam("run_at", type_=DateTime(timezone=True)),
+        bindparam("ordering_key", type_=LargeBinary),
     )
 
 
@@ -341,6 +366,7 @@ def _sqlalchemy_params(values: dict[str, Any]) -> dict[str, Any]:
         "run_at": values["run_at"],
         "metadata": values["metadata_data"],
         "tags": values["tags"],
+        "ordering_key": values["ordering_key"],
     }
 
 
@@ -359,6 +385,7 @@ async def insert_job(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     run_at: str | datetime | None = None,
+    ordering_key: bytes | str | None = None,
 ) -> dict[str, Any]:
     """Insert an Awa job using an existing database connection.
 
@@ -378,6 +405,7 @@ async def insert_job(
         tags=tags,
         metadata=metadata,
         run_at=run_at,
+        ordering_key=ordering_key,
     )
 
     driver = _detect_driver(conn)
@@ -394,6 +422,7 @@ async def insert_job(
             values["run_at"],
             values["metadata_json"],
             values["tags"],
+            values["ordering_key"],
         )
         return _row_to_dict(row, driver)
 
@@ -410,6 +439,7 @@ async def insert_job(
                 values["run_at"],
                 values["metadata_json"],
                 values["tags"],
+                values["ordering_key"],
             ),
         )
         row = await cursor.fetchone()
@@ -442,6 +472,7 @@ def insert_job_sync(
     tags: list[str] | None = None,
     metadata: dict[str, Any] | None = None,
     run_at: str | datetime | None = None,
+    ordering_key: bytes | str | None = None,
 ) -> dict[str, Any]:
     """Insert an Awa job using a synchronous psycopg3 connection.
 
@@ -459,6 +490,7 @@ def insert_job_sync(
         tags=tags,
         metadata=metadata,
         run_at=run_at,
+        ordering_key=ordering_key,
     )
 
     driver = _detect_driver(conn)
@@ -476,6 +508,7 @@ def insert_job_sync(
                 values["run_at"],
                 values["metadata_json"],
                 values["tags"],
+                values["ordering_key"],
             ),
         )
         row = cursor.fetchone()
@@ -499,6 +532,7 @@ def insert_job_sync(
                     values["run_at"],
                     values["metadata_json"],
                     values["tags"],
+                    values["ordering_key"],
                 ),
             )
             row = cursor.fetchone()

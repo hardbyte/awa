@@ -120,7 +120,7 @@ impl PyTransaction {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
@@ -134,6 +134,7 @@ impl PyTransaction {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         let prepared = Python::attach(|py| {
@@ -143,6 +144,12 @@ impl PyTransaction {
             unique_opts
                 .as_ref()
                 .map(|value| parse_unique_opts(py, value.bind(py)))
+                .transpose()
+        })?;
+        let ordering_key = Python::attach(|py| {
+            ordering_key
+                .as_ref()
+                .map(|value| parse_ordering_key(py, value.bind(py)))
                 .transpose()
         })?;
 
@@ -161,6 +168,7 @@ impl PyTransaction {
                     metadata: prepared.metadata_json,
                     tags,
                     unique,
+                    ordering_key,
                     ..Default::default()
                 },
             )
@@ -170,7 +178,7 @@ impl PyTransaction {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many<'py>(
         &self,
@@ -183,6 +191,7 @@ impl PyTransaction {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let tx = self.tx.clone();
         let prepared_jobs = Python::attach(|py| {
@@ -197,6 +206,12 @@ impl PyTransaction {
                     )
                 })
                 .collect::<PyResult<Vec<_>>>()
+        })?;
+        let ordering_key = Python::attach(|py| {
+            ordering_key
+                .as_ref()
+                .map(|value| parse_ordering_key(py, value.bind(py)))
+                .transpose()
         })?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -215,6 +230,7 @@ impl PyTransaction {
                         run_at: prepared.run_at,
                         metadata: prepared.metadata_json,
                         tags: tags.clone(),
+                        ordering_key: ordering_key.clone(),
                         ..Default::default()
                     },
                 )
@@ -379,6 +395,16 @@ pub fn parse_unique_opts(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<
     Ok(opts)
 }
 
+pub fn parse_ordering_key(_py: Python<'_>, value: &Bound<'_, PyAny>) -> PyResult<Vec<u8>> {
+    if let Ok(bytes) = value.extract::<Vec<u8>>() {
+        return Ok(bytes);
+    }
+    if let Ok(text) = value.extract::<String>() {
+        return Ok(text.into_bytes());
+    }
+    Err(validation_error("ordering_key must be bytes-like or str"))
+}
+
 pub async fn insert_raw_job<'e, E>(
     executor: E,
     kind: &str,
@@ -425,7 +451,8 @@ where
             $8,
             $9,
             $10,
-            $11::bit(8)
+            $11::bit(8),
+            $12
         )
         "#,
     )
@@ -440,6 +467,7 @@ where
     .bind(&opts.tags)
     .bind(&unique_key)
     .bind(&unique_states)
+    .bind(&opts.ordering_key)
     .fetch_one(executor)
     .await
     .map_err(awa_model::AwaError::from)
@@ -595,7 +623,7 @@ impl PySyncTransaction {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert(
         &self,
@@ -609,11 +637,16 @@ impl PySyncTransaction {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let prepared = prepare_insert(py, args.bind(py), kind, metadata.as_ref(), run_at.as_ref())?;
         let unique = unique_opts
             .as_ref()
             .map(|value| parse_unique_opts(py, value.bind(py)))
+            .transpose()?;
+        let ordering_key = ordering_key
+            .as_ref()
+            .map(|value| parse_ordering_key(py, value.bind(py)))
             .transpose()?;
         let tx = self.tx.clone();
         py.detach(|| {
@@ -632,6 +665,7 @@ impl PySyncTransaction {
                         metadata: prepared.metadata_json,
                         tags,
                         unique,
+                        ordering_key,
                         ..Default::default()
                     },
                 )
@@ -642,7 +676,7 @@ impl PySyncTransaction {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many(
         &self,
@@ -655,6 +689,7 @@ impl PySyncTransaction {
         tags: Vec<String>,
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Vec<PyJob>> {
         let prepared_jobs = jobs
             .iter()
@@ -668,6 +703,10 @@ impl PySyncTransaction {
                 )
             })
             .collect::<PyResult<Vec<_>>>()?;
+        let ordering_key = ordering_key
+            .as_ref()
+            .map(|value| parse_ordering_key(py, value.bind(py)))
+            .transpose()?;
         let tx = self.tx.clone();
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -686,6 +725,7 @@ impl PySyncTransaction {
                             run_at: prepared.run_at,
                             metadata: prepared.metadata_json,
                             tags: tags.clone(),
+                            ordering_key: ordering_key.clone(),
                             ..Default::default()
                         },
                     )

@@ -489,6 +489,23 @@ Use the defaults unless you have a reason not to:
 - Increase rotation intervals to reduce partition churn and metadata activity.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 
+### Sharding the enqueue head per queue
+
+Each queue's `awa.queue_meta.enqueue_shards` (default `1`, range `1..=64`) governs how many independent enqueue head rows the queue has. With the default value, the queue uses a single head row and the ordering contract is strict FIFO per `(queue, priority)` — identical to v016.
+
+Raising `enqueue_shards` is a **semantic mode switch**, not a hidden performance knob. The queue's contract becomes **partitioned FIFO** — strict order within `(queue, priority, enqueue_shard)`, no order promised across shards. It is the same kind of decision as choosing SQS Standard over SQS FIFO, raising Kafka partition count, or using Pub/Sub ordering keys.
+
+```sql
+-- Opt a contended queue into 4 shards.
+UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
+```
+
+A 16-producer same-queue local sweep measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1 (per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust) or `ordering_key=...` (Python) on insert — jobs sharing the key always land on the same shard regardless of which producer batch emitted them.
+
+Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
+
+Lowering the value is safe at any time — see [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#lowering-enqueue_shards). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
+
 ### Internal hot-queue claim control
 
 Queue storage also uses an internal bounded-claimer control plane

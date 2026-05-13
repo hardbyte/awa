@@ -315,6 +315,78 @@ def test_enqueue_many_copy_sync_queue_storage(client):
     assert counts["available_count"] == 3
 
 
+def test_ordering_key_routes_all_sync_python_insert_paths(client):
+    schema = "awa_py_sync_ordering_key"
+    queue = "sync_ordering_key"
+    client.install_queue_storage(schema=schema, reset=True)
+
+    tx = client.transaction()
+    tx.execute(
+        """
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        """,
+        queue,
+    )
+    tx.commit()
+
+    key = b"account-42"
+    expected_jobs = [
+        client.insert(
+            SyncEmail(to="key-client@example.com", subject="Client"),
+            queue=queue,
+            ordering_key=key,
+        )
+    ]
+
+    tx = client.transaction()
+    expected_jobs.append(
+        tx.insert(
+            SyncEmail(to="key-tx@example.com", subject="Tx"),
+            queue=queue,
+            ordering_key="account-42",
+        )
+    )
+    tx.commit()
+
+    expected_jobs.extend(
+        client.insert_many_copy(
+            [
+                SyncEmail(to="key-copy-1@example.com", subject="Copy 1"),
+                SyncEmail(to="key-copy-2@example.com", subject="Copy 2"),
+            ],
+            queue=queue,
+            ordering_key=key,
+        )
+    )
+    count = client.enqueue_many_copy(
+        [
+            SyncEmail(to="key-enqueue-1@example.com", subject="Enqueue 1"),
+            SyncEmail(to="key-enqueue-2@example.com", subject="Enqueue 2"),
+        ],
+        queue=queue,
+        ordering_key="account-42",
+    )
+    assert count == 2
+
+    tx = client.transaction()
+    rows = tx.fetch_all(
+        f"""
+        SELECT enqueue_shard
+        FROM {schema}.ready_entries
+        WHERE queue = $1
+        ORDER BY job_id
+        """,
+        queue,
+    )
+    tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    tx.commit()
+
+    assert len(rows) == len(expected_jobs) + count
+    assert len({row["enqueue_shard"] for row in rows}) == 1
+
+
 # -- Test 25: JobState.__str__ returns lowercase --
 
 

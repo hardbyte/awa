@@ -61,6 +61,12 @@ harness that verifies concrete runtime-test event sequences against the spec.
 - **No lost work under failure** takes priority over clever fast paths. If a
   design weakens crash/restart safety, it loses even if the benchmark looks
   better.
+- **Strict FIFO per `(queue, priority)` by default.** Operators can opt a
+  contended queue into **partitioned FIFO** by raising
+  `awa.queue_meta.enqueue_shards` — the same kind of trade as choosing SQS
+  Standard over SQS FIFO, or raising Kafka partition count. Producers pin
+  related jobs to one shard with `ordering_key`. See
+  [ADR-025](docs/adr/025-sharded-enqueue-heads.md).
 
 ## Benchmarks
 

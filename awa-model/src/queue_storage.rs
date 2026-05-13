@@ -23,6 +23,29 @@ const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
 
+/// Deterministically map an ordering key to a shard in `[0, shards)`.
+///
+/// Inputs sharing a key always produce the same shard, which is what
+/// lets producers preserve FIFO within a key when the destination
+/// queue is sharded. `shards <= 1` returns shard 0 unconditionally.
+///
+/// The hash is a portable 64-bit rolling hash over the raw key bytes.
+/// It is intentionally simple enough to implement byte-for-byte in
+/// `awa.insert_job_compat`, so SQL, Rust, and Python producers that
+/// pass the same ordering-key bytes land jobs on the same shard.
+pub fn shard_for_ordering_key(ordering_key: &[u8], shards: i16) -> i16 {
+    if shards <= 1 {
+        return 0;
+    }
+    let mut hash: u128 = 14_695_981_039_346_656_037;
+    const PRIME: u128 = 1_099_511_628_211;
+    const MASK: u128 = u64::MAX as u128;
+    for byte in ordering_key {
+        hash = hash.wrapping_mul(PRIME).wrapping_add(*byte as u128) & MASK;
+    }
+    (hash % (shards as u128)) as i16
+}
+
 #[derive(Debug, Clone)]
 pub struct QueueStorageConfig {
     pub schema: String,
@@ -352,6 +375,47 @@ fn oldest_initialized_ring_slot(
     }
 
     Some((oldest_slot, oldest_generation))
+}
+
+#[cfg(test)]
+mod shard_routing_tests {
+    use super::shard_for_ordering_key;
+    use std::collections::HashSet;
+
+    #[test]
+    fn shards_le_one_collapse_to_zero() {
+        assert_eq!(shard_for_ordering_key(b"customer-42", 1), 0);
+        assert_eq!(shard_for_ordering_key(b"", 1), 0);
+        assert_eq!(shard_for_ordering_key(b"customer-42", 0), 0);
+    }
+
+    #[test]
+    fn same_key_lands_on_same_shard() {
+        let key = b"customer-42";
+        let first = shard_for_ordering_key(key, 8);
+        for _ in 0..100 {
+            assert_eq!(shard_for_ordering_key(key, 8), first);
+        }
+    }
+
+    #[test]
+    fn shard_is_within_range() {
+        for n in 0..256u32 {
+            let key = format!("order-{n}");
+            let shard = shard_for_ordering_key(key.as_bytes(), 8);
+            assert!((0..8).contains(&shard));
+        }
+    }
+
+    #[test]
+    fn distinct_keys_spread_across_shards() {
+        let mut hit: HashSet<i16> = HashSet::new();
+        for n in 0..1024u32 {
+            let key = format!("order-{n}");
+            hit.insert(shard_for_ordering_key(key.as_bytes(), 8));
+        }
+        assert_eq!(hit.len(), 8, "1024 distinct keys should cover all 8 shards");
+    }
 }
 
 #[cfg(test)]
@@ -972,6 +1036,11 @@ struct RuntimeReadyRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+    /// Optional caller-supplied key. When the destination queue has
+    /// `enqueue_shards > 1`, all rows sharing the same key route to
+    /// the same shard so FIFO within the key is preserved. `None`
+    /// falls back to the per-store rotor.
+    ordering_key: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone)]
@@ -987,7 +1056,7 @@ struct RuntimeReadyInsert {
     run_at: DateTime<Utc>,
     attempted_at: Option<DateTime<Utc>>,
     lane_seq: i64,
-    /// Enqueue shard the row belongs to. Selected per-batch by
+    /// Enqueue shard the row belongs to. Selected per row by
     /// `shard_for_enqueue`; defaults to 0 when the queue's
     /// `enqueue_shards` is 1 (the default).
     enqueue_shard: i16,
@@ -3920,16 +3989,24 @@ impl QueueStorage {
         Ok(())
     }
 
-    /// Pick the enqueue shard for the next batch on `(queue, priority)`.
+    /// Pick the enqueue shard for a row on `queue`.
     ///
-    /// Reads `awa.queue_meta.enqueue_shards` (default 1) and rotates the
-    /// returned shard via the per-store atomic counter. With the default
-    /// `enqueue_shards = 1`, this always returns 0, preserving the
-    /// pre-shard single-row behaviour.
+    /// Reads `awa.queue_meta.enqueue_shards` (default 1, cached
+    /// in-process). With `enqueue_shards = 1` the result is always 0.
+    /// With `enqueue_shards > 1`:
+    ///
+    /// - If `ordering_key` is `Some(k)`, the shard is a stable hash
+    ///   of `k` modulo the shard count. Two rows sharing an
+    ///   ordering key always land on the same shard, which preserves
+    ///   FIFO within the key.
+    /// - If `ordering_key` is `None`, the shard comes from the
+    ///   per-store rotor, which spreads consecutive picks across
+    ///   shards.
     async fn shard_for_enqueue(
         &self,
         pool_executor: impl sqlx::PgExecutor<'_>,
         queue: &str,
+        ordering_key: Option<&[u8]>,
     ) -> Result<i16, AwaError> {
         if let Some(cached) = self
             .enqueue_shards_cache
@@ -3938,7 +4015,7 @@ impl QueueStorage {
             .get(queue)
             .copied()
         {
-            return Ok(self.pick_shard(cached));
+            return Ok(self.pick_shard(cached, ordering_key));
         }
 
         let shards: i16 = sqlx::query_scalar(
@@ -3959,20 +4036,27 @@ impl QueueStorage {
             .expect("enqueue_shards_cache poisoned")
             .insert(queue.to_string(), shards);
 
-        Ok(self.pick_shard(shards))
+        Ok(self.pick_shard(shards, ordering_key))
     }
 
-    /// Rotate the per-store atomic counter and map it into `[0, shards)`.
-    /// Each call advances the rotor so consecutive batches on the same
-    /// store spread across shards; this is per-batch (not per-row) so
-    /// every job in one `insert_*_tx` call lands on the same shard.
-    fn pick_shard(&self, shards: i16) -> i16 {
+    /// Map a row to its shard.
+    ///
+    /// At `shards <= 1` every row goes to shard 0. Otherwise the
+    /// caller-supplied `ordering_key` hashes deterministically into
+    /// `[0, shards)` via [`shard_for_ordering_key`]; rows without a key
+    /// fall back to the per-store rotor, which advances on every call
+    /// so consecutive picks spread across shards.
+    fn pick_shard(&self, shards: i16, ordering_key: Option<&[u8]>) -> i16 {
         if shards <= 1 {
             return 0;
         }
-        let raw = self.shard_rotor.fetch_add(1, Ordering::Relaxed) as i32;
-        let shards = shards as i32;
-        raw.rem_euclid(shards) as i16
+        match ordering_key {
+            Some(key) => shard_for_ordering_key(key, shards),
+            None => {
+                let raw = self.shard_rotor.fetch_add(1, Ordering::Relaxed) as i32;
+                raw.rem_euclid(shards as i32) as i16
+            }
+        }
     }
 
     fn lane_is_cached(&self, queue: &str, priority: i16, enqueue_shard: i16) -> bool {
@@ -4247,22 +4331,14 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut grouped: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
-        for row in rows {
-            grouped
-                .entry((row.queue.clone(), row.priority))
-                .or_default()
-                .push(row);
-        }
-
+        let grouped = self.group_ready_rows_by_shard(tx, rows).await?;
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         let job_ids = self.next_job_ids(tx, total_rows).await?;
         let mut job_id_iter = job_ids.into_iter();
 
         let mut ready_rows = Vec::with_capacity(total_rows);
 
-        for ((queue, priority), lane_rows) in grouped {
-            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue).await?;
+        for ((queue, priority, enqueue_shard), lane_rows) in grouped {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
                 .await?;
 
@@ -4302,6 +4378,32 @@ impl QueueStorage {
         Ok(total_rows)
     }
 
+    /// Re-group rows by `(queue, priority, enqueue_shard)` so each
+    /// resulting bucket targets exactly one head row. The shard for a
+    /// row comes from `shard_for_enqueue`, which honours the row's
+    /// `ordering_key`: rows sharing a key land on the same shard, so
+    /// every `(queue, priority, key)` lane is its own bucket and its
+    /// `advance_enqueue_head` allocates a contiguous `lane_seq`
+    /// range. Rows without an `ordering_key` follow the per-store
+    /// rotor independently and spread across shards within a batch.
+    async fn group_ready_rows_by_shard<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: Vec<RuntimeReadyRow>,
+    ) -> Result<BTreeMap<(String, i16, i16), Vec<RuntimeReadyRow>>, AwaError> {
+        let mut grouped: BTreeMap<(String, i16, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
+        for row in rows {
+            let shard = self
+                .shard_for_enqueue(tx.as_mut(), &row.queue, row.ordering_key.as_deref())
+                .await?;
+            grouped
+                .entry((row.queue.clone(), row.priority, shard))
+                .or_default()
+                .push(row);
+        }
+        Ok(grouped)
+    }
+
     async fn insert_ready_rows_copy_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
@@ -4312,13 +4414,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let mut grouped: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
-        for row in rows {
-            grouped
-                .entry((row.queue.clone(), row.priority))
-                .or_default()
-                .push(row);
-        }
+        let grouped = self.group_ready_rows_by_shard(tx, rows).await?;
 
         let total_rows: usize = grouped.values().map(Vec::len).sum();
         if job_ids.len() != total_rows {
@@ -4330,8 +4426,7 @@ impl QueueStorage {
 
         let mut ready_rows = Vec::with_capacity(total_rows);
 
-        for ((queue, priority), lane_rows) in grouped {
-            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue).await?;
+        for ((queue, priority, enqueue_shard), lane_rows) in grouped {
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
                 .await?;
 
@@ -4393,7 +4488,15 @@ impl QueueStorage {
         let mut ready_rows = Vec::with_capacity(total_rows);
 
         for ((queue, priority), lane_rows) in grouped {
-            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue).await?;
+            // Re-enqueue paths (retry-after, age-waiting, DLQ retry,
+            // callback resume) do not carry the producer's original
+            // `ordering_key`: the row came back from terminal storage
+            // or from a deferred row, where the key was not retained.
+            // Fall back to the rotor so the retry batch picks a shard
+            // uniformly. Workloads that need ordering preserved across
+            // retries must re-enqueue with the original key from the
+            // application layer.
+            let enqueue_shard = self.shard_for_enqueue(tx.as_mut(), &queue, None).await?;
             self.ensure_lane(tx, &queue, priority, enqueue_shard)
                 .await?;
 
@@ -4888,6 +4991,7 @@ impl QueueStorage {
                 unique_key: None,
                 unique_states: None,
                 payload: RuntimePayload::default().into_json(),
+                ordering_key: None,
             })
             .collect();
         self.enqueue_runtime_rows(pool, rows)
@@ -4928,6 +5032,7 @@ impl QueueStorage {
                 unique_key: prepared.unique_key,
                 unique_states: prepared.unique_states,
                 payload: payload.clone(),
+                ordering_key: prepared.ordering_key,
             };
 
             match prepared.state {
@@ -5026,6 +5131,7 @@ impl QueueStorage {
                 unique_key: prepared.unique_key,
                 unique_states: prepared.unique_states,
                 payload: payload.clone(),
+                ordering_key: prepared.ordering_key,
             };
 
             match prepared.state {

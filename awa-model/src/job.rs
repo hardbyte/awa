@@ -128,6 +128,12 @@ pub struct InsertOpts {
     pub metadata: serde_json::Value,
     pub tags: Vec<String>,
     pub unique: Option<UniqueOpts>,
+    /// Routes the job to a specific enqueue shard when the destination
+    /// queue has `enqueue_shards > 1`. Jobs sharing an `ordering_key`
+    /// land on the same shard, which preserves FIFO within that key.
+    /// `None` falls back to the per-store rotor that spreads batches
+    /// across shards. Ignored at `enqueue_shards = 1`. See ADR-025.
+    pub ordering_key: Option<Vec<u8>>,
 }
 
 impl Default for InsertOpts {
@@ -141,6 +147,7 @@ impl Default for InsertOpts {
             metadata: serde_json::json!({}),
             tags: Vec::new(),
             unique: None,
+            ordering_key: None,
         }
     }
 }

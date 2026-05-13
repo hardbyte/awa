@@ -19,7 +19,8 @@ const INSERT_COMPAT_SQL: &str = r#"
         $8,
         $9,
         $10,
-        $11::text::bit(8)
+        $11::text::bit(8),
+        $12
     )
 "#;
 
@@ -76,6 +77,7 @@ pub(crate) struct PreparedRow {
     pub tags: Vec<String>,
     pub unique_key: Option<Vec<u8>>,
     pub unique_states: Option<String>,
+    pub ordering_key: Option<Vec<u8>>,
 }
 
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
@@ -91,17 +93,17 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
 
 fn build_multi_insert_query(count: usize) -> String {
     let mut query = String::from(
-        "WITH input (ord, kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) AS (VALUES ",
+        "WITH input (ord, kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key) AS (VALUES ",
     );
 
-    let params_per_row = 11u32;
+    let params_per_row = 12u32;
     let mut param_index = 1u32;
     for i in 0..count {
         if i > 0 {
             query.push_str(", ");
         }
         query.push_str(&format!(
-            "({}, ${}, ${}::text, ${}::jsonb, ${}::awa.job_state, ${}::smallint, ${}::smallint, ${}::timestamptz, ${}::jsonb, ${}::text[], ${}, ${}::bit(8))",
+            "({}, ${}, ${}::text, ${}::jsonb, ${}::awa.job_state, ${}::smallint, ${}::smallint, ${}::timestamptz, ${}::jsonb, ${}::text[], ${}, ${}::bit(8), ${})",
             i,
             param_index,
             param_index + 1,
@@ -114,6 +116,7 @@ fn build_multi_insert_query(count: usize) -> String {
             param_index + 8,
             param_index + 9,
             param_index + 10,
+            param_index + 11,
         ));
         param_index += params_per_row;
     }
@@ -132,7 +135,8 @@ fn build_multi_insert_query(count: usize) -> String {
              input.metadata, \
              input.tags, \
              input.unique_key, \
-             input.unique_states\
+             input.unique_states, \
+             input.ordering_key\
          ) AS inserted \
          ORDER BY input.ord",
     );
@@ -210,6 +214,7 @@ pub(crate) fn prepare_row_raw(
         tags: opts.tags,
         unique_key,
         unique_states,
+        ordering_key: opts.ordering_key,
     })
 }
 
@@ -246,6 +251,7 @@ where
         .bind(&row.tags)
         .bind(&row.unique_key)
         .bind(&row.unique_states)
+        .bind(&row.ordering_key)
         .fetch_one(executor)
         .await
         .map_err(map_sqlx_error)
@@ -288,7 +294,8 @@ where
             .bind(&row.metadata)
             .bind(&row.tags)
             .bind(&row.unique_key)
-            .bind(&row.unique_states);
+            .bind(&row.unique_states)
+            .bind(&row.ordering_key);
     }
 
     let results = sql_query.fetch_all(executor).await?;
@@ -331,7 +338,8 @@ pub async fn insert_many_copy(
             metadata    JSONB NOT NULL,
             tags        TEXT[] NOT NULL,
             unique_key  BYTEA,
-            unique_states BIT(8)
+            unique_states BIT(8),
+            ordering_key BYTEA
         ) ON COMMIT DELETE ROWS
         "#,
     )
@@ -346,7 +354,7 @@ pub async fn insert_many_copy(
 
     let mut copy_in = conn
         .copy_in_raw(
-            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
+            "COPY pg_temp.awa_copy_staging (kind, queue, args, state, priority, max_attempts, run_at, metadata, tags, unique_key, unique_states, ordering_key) FROM STDIN WITH (FORMAT csv, NULL '__AWA_NULL__')",
         )
         .await?;
     copy_in.send(csv_buf).await?;
@@ -374,6 +382,7 @@ pub async fn insert_many_copy(
                 Vec<String>,
                 Option<Vec<u8>>,
                 Option<String>,
+                Option<Vec<u8>>,
             ),
         >(
             r#"
@@ -388,7 +397,8 @@ pub async fn insert_many_copy(
                 metadata,
                 tags,
                 unique_key,
-                unique_states::text
+                unique_states::text,
+                ordering_key
             FROM pg_temp.awa_copy_staging
             "#,
         )
@@ -408,6 +418,7 @@ pub async fn insert_many_copy(
             tags,
             unique_key,
             unique_states,
+            ordering_key,
         ) in staged_rows
         {
             sqlx::query("SAVEPOINT awa_copy_unique_row")
@@ -426,6 +437,7 @@ pub async fn insert_many_copy(
                 .bind(&tags)
                 .bind(&unique_key)
                 .bind(&unique_states)
+                .bind(&ordering_key)
                 .fetch_one(&mut *conn)
                 .await;
 
@@ -479,7 +491,8 @@ pub async fn insert_many_copy(
                 staged.metadata,
                 staged.tags,
                 staged.unique_key,
-                staged.unique_states
+                staged.unique_states,
+                staged.ordering_key
             ) AS inserted
             ORDER BY staged.ord
         "#;
@@ -567,6 +580,15 @@ fn write_csv_row(buf: &mut Vec<u8>, row: &PreparedRow) {
     // unique_states (bit string, or the COPY null sentinel)
     match &row.unique_states {
         Some(bits) => write_csv_field(buf, bits),
+        None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
+    }
+    buf.push(b',');
+    // ordering_key (bytea hex format, or the COPY null sentinel)
+    match &row.ordering_key {
+        Some(key) => {
+            let bytea_hex = format!("\\x{}", hex::encode(key));
+            write_csv_field(buf, &bytea_hex);
+        }
         None => buf.extend_from_slice(COPY_NULL_SENTINEL.as_bytes()),
     }
     buf.push(b'\n');

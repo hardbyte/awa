@@ -87,10 +87,10 @@ producer writes across the configured shard count.
 
 The producer-side helper `shard_for_enqueue` reads the per-queue
 shard count once (cached in-process, invalidated on `reset()`) and
-selects a shard for each enqueue batch by advancing a per-store
-`AtomicU16` counter modulo the shard count. Selection is per-batch,
-not per-row, so every job in one `insert_*_tx` call lands on the
-same shard.
+selects a shard for each enqueue row by advancing a per-store
+`AtomicU16` counter modulo the shard count. Rows with an
+`ordering_key` bypass the rotor and route by the deterministic
+key hash.
 
 The claim-side function `claim_ready_runtime` walks every shard row
 for a `(queue, priority)` via a `lane_candidates` CTE, picks one
@@ -115,26 +115,60 @@ or move rows from the wrong shard.
 `dlq_entries` is unsharded: its PK is `job_id`, which is globally
 unique.
 
-### Lane-sequence semantics
+### Ordering contract: partitioned FIFO
+
+`enqueue_shards > 1` is a semantic mode switch, not a hidden
+performance optimization. It changes the ordering contract the queue
+offers and operators opt into it per queue. The peer comparison is
+SQS Standard vs FIFO, Kafka partitions, Pub/Sub ordering keys, and
+RabbitMQ sharded queues: a partition is the ordering scope, the
+operator picks how many partitions, and producers route into them.
 
 `lane_seq` is allocated by `UPDATE queue_enqueue_heads SET
 next_seq = ...` keyed by `(queue, priority, enqueue_shard)`. Each
-shard has its own independent strictly-increasing sequence. The
-consequences:
+shard owns an independent strictly-increasing sequence. The contract:
 
-- **FIFO within a shard.** Two rows enqueued to the same shard, in
-  order, are claimable in the same order. This is identical to the
-  pre-shard contract restricted to a single shard.
-- **FIFO across shards is approximate** at `enqueue_shards > 1`. Two
+- **`enqueue_shards = 1` (default): strict FIFO per
+  `(queue, priority)`.** Identical to the pre-shard contract.
+  Workloads that depend on cross-producer FIFO at the lane level
+  stay here.
+- **`enqueue_shards > 1`: partitioned FIFO per
+  `(queue, priority, enqueue_shard)`.** Strict FIFO is preserved
+  within each shard. No ordering is promised across shards. Two
   rows enqueued to different shards may be claimed in either order
-  depending on which shard the claim path picks first. Ordering at
-  the application boundary depends on producer batch boundaries and
-  the claim rotor.
-- **Strict per-`(queue, priority)` FIFO** is the contract at
-  `enqueue_shards = 1`. Workloads that depend on it pin S=1.
+  depending on which shard the claim path visits first.
+
+Choosing `S > 1` is the same kind of decision as choosing SQS
+Standard over SQS FIFO: lock contention scales with the shard count
+and ordering scope shrinks to one shard. Choosing `S = 1` is the
+SQS-FIFO-equivalent contract.
+
+### Routing producers into shards
+
+Two modes share the `shard_for_enqueue` entry point:
+
+1. **Rotor (default).** When the caller does not supply an
+   `ordering_key`, the per-store `AtomicU16` rotor selects a shard
+   modulo the queue's shard count. Selection is per row, so producer
+   batches spread uniformly across the available shards.
+   This is the right choice when jobs are independent and the
+   operator only cares about throughput.
+
+2. **`InsertOpts::ordering_key` (hash-routed).** When the
+   caller pins a key, `shard_for_ordering_key` maps the key bytes
+   into `[0, shards)` deterministically. Awa uses a portable 64-bit
+   rolling hash implemented in Rust and in the SQL compatibility
+   function, so Rust, SQL, and Python producers route the same key
+   bytes to the same shard without relying on a PostgreSQL extension.
+
+   `ordering_key` is the same primitive as Kafka partition keys or
+   Pub/Sub ordering keys: jobs that share a key share a shard, which
+   preserves partitioned FIFO for that key even across separate
+   `insert_*` calls. At `enqueue_shards = 1` the key is ignored
+   (every key collapses to shard 0).
 
 This trade is the point of the design: lifting the lock contention
-requires giving up cross-shard FIFO, and sharding lets each queue
+requires shrinking the ordering scope, and sharding lets each queue
 choose where on that trade-off it sits.
 
 ## Validation
@@ -169,6 +203,104 @@ shards — i.e. the shard column is load-bearing in the PK and the
 end-to-end path correctly carries `enqueue_shard` from claim into
 the terminal write.
 
+### What this ADR does not validate
+
+The validation here is the producer-side enqueue-contention story.
+It does not replicate the high-worker-count rescue-path regression
+that motivated the original perf investigation (1 replica × 256
+workers, receipts on, `LEASE_DEADLINE_MS=0` vs default A/B). That
+regression is on the claim / rescue side of the queue-storage
+engine; sharding the enqueue head row is a necessary but not
+sufficient fix. The A/B against the rescue-path workload is left
+for a follow-up so that the two effects can be measured
+independently.
+
+## Fairness and observability
+
+The claim-path SQL orders candidate shard heads by
+`(effective_priority, run_at, priority)` — `run_at` is the natural
+fairness mechanism. Under steady-state load every shard accumulates
+its own pending rows; the shard whose oldest waiting row has the
+earliest `run_at` wins the next claim, its lane head advances, and
+another shard's oldest row becomes the next pick. Concurrent claimers
+add a second fairness mechanism: `FOR UPDATE OF claims SKIP LOCKED`
+sends each claimer to a different shard's head.
+
+The audit is enforced by
+`test_queue_storage_multi_shard_claim_path_does_not_starve_shards`,
+which loads four shards equally and asserts every shard's
+`claim_seq` advanced to its `next_seq` after a worker drains the
+queue.
+
+Per-shard observability:
+
+- `awa.job.claimed` (counter) carries an `awa.enqueue.shard`
+  attribute on the queue-storage path. Operators sum by that label
+  to see per-shard claim throughput and spot any shard that flatlines
+  while its peers are draining.
+- Ad-hoc inspection during incident response is a direct SQL query
+  against `queue_enqueue_heads` and `queue_claim_heads`:
+
+  ```sql
+  SELECT priority, enqueue_shard,
+         enqueues.next_seq, claims.claim_seq,
+         enqueues.next_seq - claims.claim_seq AS lag
+  FROM <schema>.queue_claim_heads AS claims
+  JOIN <schema>.queue_enqueue_heads AS enqueues USING (queue, priority, enqueue_shard)
+  WHERE queue = 'my_hot_queue'
+  ORDER BY priority, enqueue_shard;
+  ```
+
+  A non-zero `lag` that stays non-zero on one shard while peers
+  drain indicates a starved shard — but the in-tree fairness test
+  exercises the contract and the `awa.job.claimed` per-shard
+  counter is the live signal.
+
+## Lowering `enqueue_shards`
+
+Lowering is safe in the steady state because every claim, rescue,
+and admin path joins `queue_claim_heads` to `queue_enqueue_heads`
+on `(queue, priority, enqueue_shard)` without any `shard <
+current_count` predicate. Concretely:
+
+- The claim function `claim_ready_runtime` walks every row in
+  `queue_claim_heads` for the queue. Rows for shards `>= newS`
+  continue to be picked up and drained as long as their
+  `claim_seq < next_seq`.
+- Heartbeat / deadline / callback rescue read the shard from the
+  in-flight `leases` or `lease_claims` row, so a rescued job
+  re-enters the lane it came from regardless of the current shard
+  count.
+- The promotion path (`deferred_jobs` → `ready_entries`) calls
+  `shard_for_enqueue` with the *current* shard count, so promoted
+  rows land on `[0, newS)`. They cannot leak onto out-of-range
+  shards.
+- DLQ is unsharded; its PK is `job_id`.
+
+The in-process `enqueue_shards_cache` on `QueueStorage` is the only
+caveat: a running runtime that cached the old shard count keeps
+producing to shards `>= newS` until the cache is invalidated by
+`reset()` or process restart. That is operator-intent-stale but
+correctness-safe — the rows still claim, run, and finalise through
+the same code paths. Operators rolling out a `S` reduction restart
+runtimes (or trigger `reset()`) so producers immediately observe
+the new value.
+
+Operational procedure:
+
+1. `UPDATE awa.queue_meta SET enqueue_shards = <newS> WHERE queue = '<q>';`
+2. Restart runtime processes (or rely on natural restart cadence)
+   so the in-process cache observes the new value.
+3. Optionally watch the per-shard SQL above until `lag` reaches 0
+   on shards `>= newS`. The shards' `queue_*_heads` rows linger as
+   harmless empty heads — they cost a few small rows and have no
+   effect on throughput.
+
+The contract is enforced by
+`test_queue_storage_lowering_enqueue_shards_drains_existing_rows`,
+which seeds rows on every shard at `S = 4`, lowers to `S = 2`, and
+asserts every row drains to `done_entries`.
+
 ## Consequences
 
 ### Positive
@@ -192,11 +324,15 @@ the terminal write.
 
 ### Negative
 
-- **FIFO-within-lane is downgraded to FIFO-within-shard once
-  `enqueue_shards > 1`.** Applications that document or rely on
-  strict cross-producer FIFO at the lane level pin `S=1`. Priority
-  aging, deadline rescue, callback resume, and DLQ semantics are
-  unaffected.
+- **Ordering scope shrinks from the lane to the shard at
+  `enqueue_shards > 1`.** The contract becomes partitioned FIFO:
+  strict order within `(queue, priority, enqueue_shard)`, no order
+  promised across shards. Applications that document or rely on
+  strict cross-producer FIFO at the lane level pin `S = 1`.
+  Applications that need per-key FIFO (per customer, per order,
+  per account) pass `InsertOpts::ordering_key` so rows for that
+  key collapse onto one shard. Priority aging, deadline rescue,
+  callback resume, and DLQ semantics are unaffected.
 - **Claim-side cost is `O(S)` per claim call.** Each
   `claim_ready_runtime` invocation scans up to S candidate shard
   heads. With `S=64` and four priorities this is 256 candidate rows;
@@ -242,6 +378,11 @@ the terminal write.
   effective priority. The `claim_ready_runtime` per-shard candidate
   walk inherits the same aging clause; FIFO-within-shard does not
   change the aging contract.
+- **ADR-002 (BLAKE3 uniqueness hashing).** `ordering_key` routing is
+  deliberately separate from ADR-002 unique-key fingerprints. Shard
+  routing needs a small, portable hash that can run identically in
+  Rust and inside `awa.insert_job_compat`; uniqueness keeps using the
+  BLAKE3 fingerprint contract from ADR-002.
 
 ## Implementation
 

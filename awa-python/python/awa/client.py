@@ -86,6 +86,7 @@ class AsyncClient:
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
         return await self._raw.insert(
@@ -98,6 +99,7 @@ class AsyncClient:
             metadata=metadata,
             run_at=run_at,
             unique_opts=unique_opts,
+            ordering_key=ordering_key,
         )
 
     async def insert_many_copy(
@@ -112,6 +114,7 @@ class AsyncClient:
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> list[Job]:
         """Bulk insert jobs using COPY for high throughput."""
         return await self._raw.insert_many_copy(
@@ -124,6 +127,7 @@ class AsyncClient:
             metadata=metadata,
             run_at=run_at,
             unique_opts=unique_opts,
+            ordering_key=ordering_key,
         )
 
     async def enqueue_many_copy(
@@ -138,6 +142,7 @@ class AsyncClient:
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> int:
         """Enqueue jobs into active queue storage using direct COPY."""
         return await self._raw.enqueue_many_copy(
@@ -150,6 +155,7 @@ class AsyncClient:
             metadata=metadata,
             run_at=run_at,
             unique_opts=unique_opts,
+            ordering_key=ordering_key,
         )
 
     async def migrate(self) -> None:
@@ -759,6 +765,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> Job:
         """Insert a job. Returns a ``Job`` object."""
         return self._raw.insert_sync(
@@ -771,6 +778,7 @@ class Client:
             metadata=metadata,
             run_at=run_at,
             unique_opts=unique_opts,
+            ordering_key=ordering_key,
         )
 
     def insert_many_copy(
@@ -785,6 +793,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> list[Job]:
         """Bulk insert jobs using COPY for high throughput."""
         return self._raw.insert_many_copy_sync(
@@ -797,6 +806,7 @@ class Client:
             metadata=metadata,
             run_at=run_at,
             unique_opts=unique_opts,
+            ordering_key=ordering_key,
         )
 
     def enqueue_many_copy(
@@ -811,6 +821,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> int:
         """Enqueue jobs into active queue storage using direct COPY."""
         return self._raw.enqueue_many_copy_sync(
@@ -823,6 +834,7 @@ class Client:
             metadata=metadata,
             run_at=run_at,
             unique_opts=unique_opts,
+            ordering_key=ordering_key,
         )
 
     def migrate(self) -> None:

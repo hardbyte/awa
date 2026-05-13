@@ -187,6 +187,7 @@ class Transaction:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def insert_many(
         self,
@@ -199,6 +200,7 @@ class Transaction:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     async def commit(self) -> None: ...
     async def rollback(self) -> None: ...
@@ -227,6 +229,7 @@ class SyncTransaction:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> Job[dict[str, Any]]: ...
     def insert_many(
         self,
@@ -239,6 +242,7 @@ class SyncTransaction:
         tags: list[str] = [],
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...
@@ -267,6 +271,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> Job[dict[str, Any]]: ...
     async def migrate(self) -> None: ...
     async def install_queue_storage(
@@ -438,6 +443,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     async def enqueue_many_copy(
         self,
@@ -451,6 +457,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> int: ...
     def periodic(
         self,
@@ -536,6 +543,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> Job[dict[str, Any]]: ...
     def close_sync(self) -> None: ...
     def migrate_sync(self) -> None: ...
@@ -596,6 +604,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> list[Job[dict[str, Any]]]: ...
     def enqueue_many_copy_sync(
         self,
@@ -609,6 +618,7 @@ class Client:
         metadata: dict[str, Any] | None = None,
         run_at: datetime.datetime | None = None,
         unique_opts: dict[str, Any] | None = None,
+        ordering_key: bytes | str | None = None,
     ) -> int: ...
     # External callback completion (sync)
     def complete_external_sync(
