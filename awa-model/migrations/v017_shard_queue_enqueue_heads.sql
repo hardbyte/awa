@@ -383,6 +383,15 @@ $$ LANGUAGE plpgsql;
 --    path picks the shard by `MOD(pg_backend_pid()::bigint, v_enqueue_shards)`
 --    rather than a cross-call atomic; backend-pid rotation is stable enough
 --    to spread connection-pinned producers across shards.
+--
+--    The new signature adds `p_ordering_key` at the end. PostgreSQL does
+--    not treat that as a replacement of the v016 11-arg signature, so
+--    drop the old function first to avoid an ambiguous overload when a
+--    caller invokes it with the legacy 11 positional arguments.
+DROP FUNCTION IF EXISTS awa.insert_job_compat(
+    TEXT, TEXT, JSONB, awa.job_state, SMALLINT, SMALLINT,
+    TIMESTAMPTZ, JSONB, TEXT[], BYTEA, BIT(8)
+);
 CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_kind TEXT,
     p_queue TEXT DEFAULT 'default',
@@ -394,7 +403,8 @@ CREATE OR REPLACE FUNCTION awa.insert_job_compat(
     p_metadata JSONB DEFAULT '{}'::jsonb,
     p_tags TEXT[] DEFAULT ARRAY[]::TEXT[],
     p_unique_key BYTEA DEFAULT NULL,
-    p_unique_states BIT(8) DEFAULT NULL
+    p_unique_states BIT(8) DEFAULT NULL,
+    p_ordering_key BYTEA DEFAULT NULL
 )
 RETURNS awa.jobs
 AS $$
@@ -421,6 +431,8 @@ DECLARE
     v_old_search_path TEXT;
     v_enqueue_shards SMALLINT;
     v_enqueue_shard SMALLINT;
+    v_hash NUMERIC;
+    v_i INT;
     inserted awa.jobs%ROWTYPE;
 BEGIN
     IF length(p_kind) > 200 THEN
@@ -554,9 +566,26 @@ BEGIN
         WHERE meta.queue = v_queue;
         v_enqueue_shards := COALESCE(v_enqueue_shards, 1);
 
-        -- Backend-pid rotation: stable within a connection, distributed across
-        -- a producer pool. With v_enqueue_shards=1 this always picks shard 0.
-        v_enqueue_shard := MOD(pg_backend_pid()::bigint, v_enqueue_shards)::smallint;
+        IF p_ordering_key IS NOT NULL THEN
+            -- Keep SQL compatibility producers aligned with the Rust
+            -- `shard_for_ordering_key` implementation: the same
+            -- portable 64-bit rolling hash over raw key bytes, reduced
+            -- modulo the queue's shard count.
+            v_hash := 14695981039346656037;
+            IF length(p_ordering_key) > 0 THEN
+                FOR v_i IN 0..length(p_ordering_key) - 1 LOOP
+                    v_hash := MOD(
+                        (v_hash * 1099511628211) + get_byte(p_ordering_key, v_i),
+                        18446744073709551616
+                    );
+                END LOOP;
+            END IF;
+            v_enqueue_shard := MOD(v_hash, v_enqueue_shards)::smallint;
+        ELSE
+            -- Backend-pid rotation: stable within a connection, distributed across
+            -- a producer pool. With v_enqueue_shards=1 this always picks shard 0.
+            v_enqueue_shard := MOD(pg_backend_pid()::bigint, v_enqueue_shards)::smallint;
+        END IF;
 
         INSERT INTO queue_lanes (queue, priority)
         VALUES (v_queue, v_priority)
