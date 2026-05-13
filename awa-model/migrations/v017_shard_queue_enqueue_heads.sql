@@ -681,8 +681,14 @@ $$ LANGUAGE plpgsql VOLATILE
 SET search_path = pg_catalog, awa, public;
 
 -- 4. Reshape delete_job_compat. The head-lane delete branch now scopes the
---    claim_seq bump to the deleted row's enqueue_shard. With S=1 there is
---    one shard and the WHERE clause is unchanged from v016 in effect.
+--    claim_seq bump to the deleted row's enqueue_shard. The leases branch
+--    propagates enqueue_shard through the deleted CTE and joins
+--    ready_entries on (ready_slot, ready_generation, queue, priority,
+--    enqueue_shard, lane_seq, job_id) — at S>1 the older 5-column tuple
+--    is no longer unique across shards, so omitting enqueue_shard would
+--    let the JOIN pick another shard's row and release the wrong
+--    unique_key. With S=1 the WHERE clauses are unchanged from v016 in
+--    effect.
 CREATE OR REPLACE FUNCTION awa.delete_job_compat(p_id BIGINT)
 RETURNS BOOLEAN AS $$
 DECLARE
@@ -765,6 +771,7 @@ BEGIN
                  leases.job_id,
                  leases.queue,
                  leases.priority,
+                 leases.enqueue_shard,
                  leases.lane_seq,
                  leases.run_lease,
                  leases.state
@@ -787,7 +794,9 @@ BEGIN
           AND ready.ready_generation = deleted.ready_generation
           AND ready.queue = deleted.queue
           AND ready.priority = deleted.priority
-          AND ready.lane_seq = deleted.lane_seq',
+          AND ready.enqueue_shard = deleted.enqueue_shard
+          AND ready.lane_seq = deleted.lane_seq
+          AND ready.job_id = deleted.job_id',
         v_schema
     )
     INTO v_queue, v_priority, v_state, v_unique_key, v_unique_states
