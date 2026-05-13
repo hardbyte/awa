@@ -4039,13 +4039,15 @@ impl QueueStorage {
         Ok(self.pick_shard(shards, ordering_key))
     }
 
-    /// Map a row to its shard.
+    /// Map a row (or a no-key sub-batch) to its shard.
     ///
     /// At `shards <= 1` every row goes to shard 0. Otherwise the
     /// caller-supplied `ordering_key` hashes deterministically into
-    /// `[0, shards)` via [`shard_for_ordering_key`]; rows without a key
-    /// fall back to the per-store rotor, which advances on every call
-    /// so consecutive picks spread across shards.
+    /// `[0, shards)` via [`shard_for_ordering_key`]; an absent key
+    /// advances the per-store rotor once and returns the next shard.
+    /// Callers route a whole no-key sub-batch through a single
+    /// `pick_shard(_, None)` so the rotor amortises across the batch
+    /// rather than firing per row.
     fn pick_shard(&self, shards: i16, ordering_key: Option<&[u8]>) -> i16 {
         if shards <= 1 {
             return 0;
@@ -4379,27 +4381,64 @@ impl QueueStorage {
     }
 
     /// Re-group rows by `(queue, priority, enqueue_shard)` so each
-    /// resulting bucket targets exactly one head row. The shard for a
-    /// row comes from `shard_for_enqueue`, which honours the row's
-    /// `ordering_key`: rows sharing a key land on the same shard, so
-    /// every `(queue, priority, key)` lane is its own bucket and its
-    /// `advance_enqueue_head` allocates a contiguous `lane_seq`
-    /// range. Rows without an `ordering_key` follow the per-store
-    /// rotor independently and spread across shards within a batch.
+    /// resulting bucket targets exactly one head row.
+    ///
+    /// The two routing modes are amortised differently:
+    ///
+    /// - **Rows with `ordering_key`** are hashed per row via
+    ///   `shard_for_ordering_key`, so jobs that share a key always
+    ///   land on the same shard. Each distinct key may produce its
+    ///   own sub-bucket inside one batch.
+    /// - **Rows without `ordering_key`** share **one rotor pick per
+    ///   `(queue, priority)` per call**. A batch of 500 rotor-routed
+    ///   rows produces one `advance_enqueue_head` UPDATE and one
+    ///   INSERT, not 500. The rotor still advances per batch, so
+    ///   successive batches spread across shards; the per-batch
+    ///   amortisation is what makes `enqueue_shards > 1` net-faster
+    ///   than `S = 1` at moderate concurrency.
+    ///
+    /// Mixing keyed and rotor rows in one call is supported — the
+    /// keyed rows fan out by key while the rotor rows collapse into
+    /// a single shard-sub-batch.
     async fn group_ready_rows_by_shard<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         rows: Vec<RuntimeReadyRow>,
     ) -> Result<BTreeMap<(String, i16, i16), Vec<RuntimeReadyRow>>, AwaError> {
-        let mut grouped: BTreeMap<(String, i16, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
+        // Partition by (queue, priority) first so the rotor pick for
+        // the no-key sub-batch can amortise over every row that shares
+        // its destination lane.
+        let mut by_queue_priority: BTreeMap<(String, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
         for row in rows {
-            let shard = self
-                .shard_for_enqueue(tx.as_mut(), &row.queue, row.ordering_key.as_deref())
-                .await?;
-            grouped
-                .entry((row.queue.clone(), row.priority, shard))
+            by_queue_priority
+                .entry((row.queue.clone(), row.priority))
                 .or_default()
                 .push(row);
+        }
+
+        let mut grouped: BTreeMap<(String, i16, i16), Vec<RuntimeReadyRow>> = BTreeMap::new();
+        for ((queue, priority), bucket) in by_queue_priority {
+            let mut rotor_rows: Vec<RuntimeReadyRow> = Vec::with_capacity(bucket.len());
+            for row in bucket {
+                if row.ordering_key.is_some() {
+                    let shard = self
+                        .shard_for_enqueue(tx.as_mut(), &queue, row.ordering_key.as_deref())
+                        .await?;
+                    grouped
+                        .entry((queue.clone(), priority, shard))
+                        .or_default()
+                        .push(row);
+                } else {
+                    rotor_rows.push(row);
+                }
+            }
+            if !rotor_rows.is_empty() {
+                let shard = self.shard_for_enqueue(tx.as_mut(), &queue, None).await?;
+                grouped
+                    .entry((queue.clone(), priority, shard))
+                    .or_default()
+                    .extend(rotor_rows);
+            }
         }
         Ok(grouped)
     }

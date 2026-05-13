@@ -149,10 +149,17 @@ Two modes share the `shard_for_enqueue` entry point:
 
 1. **Rotor (default).** When the caller does not supply an
    `ordering_key`, the per-store `AtomicU16` rotor selects a shard
-   modulo the queue's shard count. Selection is per row, so producer
-   batches spread uniformly across the available shards.
-   This is the right choice when jobs are independent and the
-   operator only cares about throughput.
+   modulo the queue's shard count. Selection is **per
+   `(queue, priority)` sub-batch within a single `insert_*_tx`
+   call** — all rotor-routed rows that share a destination lane in
+   one batch collapse onto the same shard so a 500-row batch issues
+   one `advance_enqueue_head` UPDATE and one INSERT instead of
+   500. The rotor advances on each pick, so successive batches
+   spread across shards. This per-batch amortisation is what makes
+   `enqueue_shards > 1` net-faster than `S = 1` at moderate
+   producer concurrency; per-row pick was measured to invert the
+   curve (S>1 slower than S=1) because each batch fanned into S
+   sub-INSERTs.
 
 2. **`InsertOpts::ordering_key` (hash-routed).** When the
    caller pins a key, `shard_for_ordering_key` maps the key bytes
