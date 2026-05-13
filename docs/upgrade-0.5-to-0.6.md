@@ -196,7 +196,7 @@ Opt a contended queue into multiple shards with a single UPDATE on `awa.queue_me
 UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
 ```
 
-The producer-side rotor picks up the new shard count on the next enqueue. Existing in-flight rows on shard 0 continue to be claimed and drained; new rows fan out across shards 0..S-1.
+The producer-side rotor picks up the new shard count on the next enqueue. Existing in-flight rows on shard 0 continue to be claimed and drained; new no-key batches spread across shards 0..S-1 over time.
 
 Ordering contract and trade-offs:
 
@@ -208,7 +208,7 @@ See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and the part
 
 ### Routing related jobs to the same shard
 
-For independent jobs, the default per-store rotor spreads producer rows uniformly across shards. For jobs that must observe each other in order — successive events for the same customer, sequential steps in a workflow, all writes for one account — set `InsertOpts::ordering_key` to the bytes of the partition identifier:
+For independent jobs, the default per-store rotor uses one shard pick per `(queue, priority)` sub-batch, then spreads successive batches across shards. For jobs that must observe each other in order — successive events for the same customer, sequential steps in a workflow, all writes for one account — set `InsertOpts::ordering_key` to the bytes of the partition identifier:
 
 ```rust
 let opts = InsertOpts {

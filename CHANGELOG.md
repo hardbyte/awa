@@ -50,8 +50,8 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
   count, so Rust, SQL, and Python enqueue paths agree on routing.
   Use it as a Kafka-partition-key analogue: jobs for the same
   customer / order / account share a shard and inherit that shard's
-  strict FIFO. `None` falls back to the per-row rotor. Ignored at
-  `enqueue_shards = 1`.
+  strict FIFO. `None` falls back to one rotor pick per `(queue,
+  priority)` sub-batch. Ignored at `enqueue_shards = 1`.
 - `awa.job.claimed` counter now carries an `awa.enqueue.shard`
   attribute on the queue-storage claim path so dashboards can see
   per-shard claim throughput. Canonical claims continue to emit the

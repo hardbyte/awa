@@ -87,10 +87,10 @@ producer writes across the configured shard count.
 
 The producer-side helper `shard_for_enqueue` reads the per-queue
 shard count once (cached in-process, invalidated on `reset()`) and
-selects a shard for each enqueue row by advancing a per-store
-`AtomicU16` counter modulo the shard count. Rows with an
-`ordering_key` bypass the rotor and route by the deterministic
-key hash.
+selects a shard for each no-key `(queue, priority)` sub-batch by
+advancing a per-store `AtomicU16` counter modulo the shard count.
+Rows with an `ordering_key` bypass the rotor and route by the
+deterministic key hash.
 
 The claim-side function `claim_ready_runtime` walks every shard row
 for a `(queue, priority)` via a `lane_candidates` CTE, picks one
