@@ -148,8 +148,10 @@ Claim is cursor-based rather than heap-scan based:
 - The dispatcher pre-acquires execution permits before claiming, so every
   claimed `running` job has reserved local capacity.
 - Queue striping and bounded claimers reduce contention on very hot logical
-  queues, but they do not own jobs. Recovery still follows the receipt/lease
-  state in Postgres.
+  queues. Per-queue `claimers` can add dispatcher/claimer loops inside one
+  runtime, but those loops share the queue's worker permits and rate limiter;
+  they do not own jobs. Recovery still follows the receipt/lease state in
+  Postgres.
 
 Priority ordering is by `(queue, priority, lane_seq)`. With queue storage,
 priority aging is applied at claim time rather than by physically rewriting
@@ -311,6 +313,7 @@ Core safety invariants are modeled in TLA+:
 | [`AwaBatcher`](../correctness/core/AwaBatcher.tla) | guarded completion batching and stale-result rejection |
 | [`AwaSegmentedStorage`](../correctness/storage/AwaSegmentedStorage.tla) | queue-storage lifecycle, rotate/prune safety, DLQ round-trip, receipt rescue |
 | [`AwaSegmentedStorageRaces`](../correctness/storage/AwaSegmentedStorageRaces.tla) | claim-vs-rotate/prune interleavings |
+| [`AwaShardedPrune`](../correctness/storage/AwaShardedPrune.tla) | cross-shard ready/done prune matching by `enqueue_shard` |
 | [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across claim, rotate, and prune |
 | [`AwaCbk`](../correctness/races/AwaCbk.tla) | callback registration/resume/finalization races |
 

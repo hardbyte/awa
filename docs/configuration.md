@@ -129,6 +129,13 @@ The key `QueueConfig` fields:
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
 | `claim_batch_size` | `128` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Benchmark before raising; larger batches can increase contention once multiple claimers are active. |
 
+Defaults intentionally favor the smallest blast radius:
+`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 128`. Raise
+`enqueue_shards` only when the queue can accept partitioned FIFO semantics.
+Raise `claimers` first when a single hot queue is drain-bound; local no-op
+benchmarks showed the useful step was `1 -> 4` claimers, while larger claim
+batches did not help once multiple claimers were active.
+
 ### Python
 
 Tuple form for simple cases, dict form for full control:
@@ -517,9 +524,11 @@ hot queue's claim path at once. For a single hot queue, raising
 while still sharing the queue's `max_workers` / `min_workers` permits.
 
 Keep `claimers` modest. Local no-op throughput tests improved materially from
-`1` to `4`, while higher values showed diminishing returns and more database
-contention. For extreme single-queue workloads, benchmark `claimers = 2` and
-`4` before reaching for queue striping.
+`1` to `4`, while higher values are expected to show diminishing returns and
+more database contention. For extreme single-queue workloads, benchmark
+`claimers = 2` and `4` before reaching for queue striping. Keep
+`claim_batch_size = 128` unless a workload-specific benchmark proves a larger
+batch helps.
 
 ## Dead Letter Queue
 

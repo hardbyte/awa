@@ -424,12 +424,22 @@ asserts every row drains to `done_entries`.
 
 ## TLA+
 
-`correctness/storage/AwaSegmentedStorage.tla` and
-`AwaStorageLockOrder.tla` carry the per-shard model. `laneState` is
-indexed by `(queue, priority, shard)`; FIFO-within-lane invariants
-are weakened to FIFO-within-shard; new invariants enforce per-shard
-append monotonicity, per-shard `claim_seq <= next_seq`, and
-single-shard-per-transaction (an enqueue tx touches one shard's
-head rows, never two). The checked configs include both S=1 (the
-legacy contract) and S=2 (the smallest case where cross-shard
-ordering relaxes).
+`correctness/storage/AwaSegmentedStorage.tla` models one
+`(queue, priority, enqueue_shard)` lane. That keeps the lifecycle
+state-space small while still checking the per-shard FIFO, lease,
+receipt, terminal, DLQ, and rotate/prune invariants.
+
+The cross-shard invariant lives in
+`correctness/storage/AwaShardedPrune.tla`. It models two shards with
+independent sequence counters, so both shards can legitimately contain
+`lane_seq = 1`. The passing config requires queue-ring prune to match
+ready rows to done rows by `(enqueue_shard, lane_seq)`. The broken
+config intentionally drops `enqueue_shard` from that match and produces
+the counterexample where shard 0's completed row masks shard 1's
+pending ready row.
+
+`correctness/storage/AwaStorageLockOrder.tla` carries the lock-order
+side. At the lock abstraction level, each shard is a disjoint copy of
+the same row-level resources; enqueue touches one shard's head rows per
+transaction, and claim touches one physical claim row at a time, so the
+existing deadlock proof composes across shards.
