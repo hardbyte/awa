@@ -126,6 +126,8 @@ The key `QueueConfig` fields:
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims. |
 | `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
+| `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
+| `claim_batch_size` | `128` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Benchmark before raising; larger batches can increase contention once multiple claimers are active. |
 
 ### Python
 
@@ -506,13 +508,18 @@ Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard`
 
 Lowering the value is safe at any time — see [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#lowering-enqueue_shards). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
 
-### Internal hot-queue claim control
+### Hot-Queue Claim Control
 
-Queue storage also uses an internal bounded-claimer control plane
+Queue storage also uses a bounded-claimer control plane
 (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a
-hot queue's claim path at once. This is not a public `QueueConfig` knob in
-0.6; tune queue pressure first with ordinary worker counts and, for extreme
-single-queue workloads, `queue_stripe_count`.
+hot queue's claim path at once. For a single hot queue, raising
+`QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops
+while still sharing the queue's `max_workers` / `min_workers` permits.
+
+Keep `claimers` modest. Local no-op throughput tests improved materially from
+`1` to `4`, while higher values showed diminishing returns and more database
+contention. For extreme single-queue workloads, benchmark `claimers = 2` and
+`4` before reaching for queue striping.
 
 ## Dead Letter Queue
 

@@ -1560,6 +1560,12 @@ impl PyClient {
             if let Some(ms) = config.deadline_duration_ms {
                 queue_config.deadline_duration = Duration::from_millis(ms);
             }
+            if let Some(claimers) = config.claimers {
+                queue_config.claimers = claimers;
+            }
+            if let Some(claim_batch_size) = config.claim_batch_size {
+                queue_config.claim_batch_size = claim_batch_size;
+            }
             builder = builder.queue(config.name.clone(), queue_config);
         }
         if let Some(global_max) = global_max_workers {
@@ -2898,6 +2904,12 @@ struct ParsedQueueConfig {
     /// `QueueConfig` default (5m); `Some(0)` skips the deadline
     /// rescue path for this queue.
     deadline_duration_ms: Option<u64>,
+    /// Number of dispatcher/claimer loops for this queue. `None` keeps
+    /// the Rust `QueueConfig` default.
+    claimers: Option<u16>,
+    /// Maximum jobs claimed per dispatcher round-trip. `None` keeps the
+    /// Rust `QueueConfig` default.
+    claim_batch_size: Option<usize>,
 }
 
 /// Parse queue configs from Python input (list of tuples or dicts).
@@ -2938,6 +2950,8 @@ fn parse_queue_configs(
                 rate_limit: None,
                 priority_aging_interval_ms: None,
                 deadline_duration_ms: None,
+                claimers: None,
+                claim_batch_size: None,
             });
             continue;
         }
@@ -3016,6 +3030,24 @@ fn parse_queue_configs(
             .get_item("deadline_duration_ms")?
             .map(|v| v.extract())
             .transpose()?;
+        let claimers: Option<u16> = dict
+            .get_item("claimers")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let claim_batch_size: Option<usize> = dict
+            .get_item("claim_batch_size")?
+            .map(|v| v.extract())
+            .transpose()?;
+        if claimers == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "claimers must be > 0",
+            ));
+        }
+        if claim_batch_size == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "claim_batch_size must be > 0",
+            ));
+        }
 
         configs.push(ParsedQueueConfig {
             name,
@@ -3025,6 +3057,8 @@ fn parse_queue_configs(
             rate_limit,
             priority_aging_interval_ms,
             deadline_duration_ms,
+            claimers,
+            claim_batch_size,
         });
     }
 
@@ -3053,6 +3087,8 @@ fn normalize_queue_configs(
                     rate_limit: None,
                     priority_aging_interval_ms: None,
                     deadline_duration_ms: None,
+                    claimers: None,
+                    claim_batch_size: None,
                 });
             }
         }

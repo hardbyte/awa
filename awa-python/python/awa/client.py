@@ -698,6 +698,11 @@ class AsyncClient:
         Set ``queue_storage_schema`` to override the schema name; all workers
         participating in the same storage transition should agree on that
         target schema.
+
+        Queue dicts also accept ``claimers`` and ``claim_batch_size`` for hot
+        queue-storage queues. ``claimers`` adds dispatcher/claimer loops that
+        share the queue's worker permits; benchmark ``2`` or ``4`` before
+        raising it further.
         """
         return await self._raw.start(
             queues,

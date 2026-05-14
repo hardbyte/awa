@@ -5,7 +5,7 @@
 
 use awa::model::{
     admin, insert, migrations, storage, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig,
-    RotateOutcome,
+    RotateOutcome, SkipReason,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -3728,6 +3728,109 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
     assert_eq!(counts_after_prune.completed, 1);
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_prune_pending_shard_scope";
+    let schema = "awa_qs_prune_pending_shard_scope";
+    let store = create_store(&pool, schema).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 2)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to seed enqueue_shards = 2");
+
+    let _first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let ready_heads: Vec<(i16, i64)> = sqlx::query_as(&format!(
+        "SELECT enqueue_shard, lane_seq FROM {schema}.ready_entries WHERE queue = $1 ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to inspect seeded ready rows");
+    assert_eq!(ready_heads.len(), 2);
+    assert_ne!(
+        ready_heads[0].0, ready_heads[1].0,
+        "test setup needs two ready rows routed to different shards"
+    );
+    assert_eq!(
+        ready_heads[0].1, ready_heads[1].1,
+        "test setup needs duplicate lane_seq values across shards"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("Failed to claim one row");
+    assert_eq!(claimed.len(), 1);
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("Failed to complete one row");
+    assert_eq!(completed.len(), 1);
+
+    let rotated = store
+        .rotate(&pool)
+        .await
+        .expect("Failed to rotate queue ring");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let prune = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune oldest queue slot");
+    assert!(
+        matches!(
+            prune,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueuePendingReady,
+                count: 1
+            }
+        ),
+        "prune must not let a done row from one shard satisfy a pending ready row from another shard: {prune:?}"
+    );
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to sample queue counts");
+    assert_eq!(counts.available, 1);
+    assert_eq!(counts.running, 0);
+    assert_eq!(counts.completed, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -10614,6 +10614,7 @@ impl QueueStorage {
               ON done.ready_generation = ready.ready_generation
              AND done.queue = ready.queue
              AND done.priority = ready.priority
+             AND done.enqueue_shard = ready.enqueue_shard
              AND done.lane_seq = ready.lane_seq
             WHERE done.lane_seq IS NULL
             "#

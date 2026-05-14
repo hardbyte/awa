@@ -1169,6 +1169,10 @@ pub struct QueueRuntimeConfigSnapshot {
     pub deadline_duration_secs: u64,
     pub priority_aging_interval_secs: u64,
     #[serde(default)]
+    pub claimers: Option<u16>,
+    #[serde(default)]
+    pub claim_batch_size: Option<usize>,
+    #[serde(default)]
     pub dlq_enabled: Option<bool>,
     pub rate_limit: Option<RateLimitSnapshot>,
 }

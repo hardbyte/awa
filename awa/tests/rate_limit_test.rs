@@ -341,3 +341,35 @@ async fn test_zero_weight_rejected() {
 
     assert!(matches!(result, Err(BuildError::InvalidWeight)));
 }
+
+#[tokio::test]
+async fn test_zero_claimers_rejected() {
+    let pool = setup().await;
+    let result = Client::builder(pool)
+        .queue(
+            "rl_zero_claimers",
+            QueueConfig {
+                claimers: 0,
+                ..Default::default()
+            },
+        )
+        .build();
+
+    assert!(matches!(result, Err(BuildError::InvalidClaimers)));
+}
+
+#[tokio::test]
+async fn test_zero_claim_batch_size_rejected() {
+    let pool = setup().await;
+    let result = Client::builder(pool)
+        .queue(
+            "rl_zero_claim_batch",
+            QueueConfig {
+                claim_batch_size: 0,
+                ..Default::default()
+            },
+        )
+        .build();
+
+    assert!(matches!(result, Err(BuildError::InvalidClaimBatchSize)));
+}
