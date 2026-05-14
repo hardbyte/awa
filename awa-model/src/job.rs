@@ -20,16 +20,7 @@ pub enum JobState {
 
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JobState::Scheduled => write!(f, "scheduled"),
-            JobState::Available => write!(f, "available"),
-            JobState::Running => write!(f, "running"),
-            JobState::Completed => write!(f, "completed"),
-            JobState::Retryable => write!(f, "retryable"),
-            JobState::Failed => write!(f, "failed"),
-            JobState::Cancelled => write!(f, "cancelled"),
-            JobState::WaitingExternal => write!(f, "waiting_external"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -52,6 +43,20 @@ impl std::str::FromStr for JobState {
 }
 
 impl JobState {
+    /// Canonical snake_case representation used by Postgres and JSON.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            JobState::Scheduled => "scheduled",
+            JobState::Available => "available",
+            JobState::Running => "running",
+            JobState::Completed => "completed",
+            JobState::Retryable => "retryable",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+            JobState::WaitingExternal => "waiting_external",
+        }
+    }
+
     /// Bit position for unique_states bitmask.
     pub fn bit_position(&self) -> u8 {
         match self {

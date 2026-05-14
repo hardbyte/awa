@@ -28,7 +28,7 @@ in-place as historical context.
 | 013 | [Run lease and guarded finalization](013-run-lease-and-guarded-finalization.md) | Accepted | `run_lease` is the per-attempt identity; every finalize matches on it | Composite key on `active_leases` per ADR-019 |
 | 014 | [Structured progress and metadata](014-structured-progress.md) | Accepted | JSONB progress buffer with heartbeat piggyback + atomic state-transition flush | Progress storage moved to `attempt_state` per ADR-019 |
 | 015 | [Builder-side lifecycle hooks](015-post-commit-lifecycle-hooks.md) | Accepted | Builder-side hooks fire after claim start and guarded finalization commits | Guard lives on `active_leases` per ADR-019 |
-| 016 | [Shared insert preparation and tokio-postgres adapter](016-bridge-adapters.md) | Accepted | Factor insert preparation into `PreparedRow`; tokio-postgres enqueue adapter | — |
+| 016 | [Public Rust Postgres enqueue adapter API](016-rust-postgres-enqueue-adapter-api.md) | Accepted | Public Postgres insert-preparation contract plus built-in tokio-postgres adapter | Enables external Rust enqueue adapters |
 | 017 | [Python insert-only transaction bridging](017-python-transaction-bridging.md) | Accepted | Python `awa.Transaction` is a thin wrapper over the Rust insert path | — |
 | 018 | [HTTP Worker for serverless job dispatch](018-http-worker.md) | Accepted | `Worker` impl that dispatches to Lambda / Cloud Run via HTTP + HMAC-BLAKE3 | Uses callback surface from ADR-021 |
 | 019 | [Queue Storage Engine](019-queue-storage-redesign.md) | Accepted | Append-only ready / terminal entries, narrow `active_leases`, optional `attempt_state`, rotating segments | Supersedes ADR-012 |

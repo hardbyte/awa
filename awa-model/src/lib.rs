@@ -1,3 +1,4 @@
+pub mod adapter;
 pub mod admin;
 pub mod bridge;
 pub mod cron;
@@ -12,6 +13,7 @@ pub mod storage;
 pub mod unique;
 
 // Re-exports for ergonomics
+pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
 pub use admin::{
     CallbackConfig, DefaultAction, JobKindDescriptor, JobKindOverview, ListJobsFilter,
     QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,

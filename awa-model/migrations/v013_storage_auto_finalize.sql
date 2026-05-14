@@ -607,6 +607,13 @@ BEGIN
        AND to_regclass(format('%I.%I', v_schema, 'queue_lanes')) IS NOT NULL
        AND to_regclass(format('%I.%I', v_schema, 'ready_entries')) IS NOT NULL
        AND to_regclass(format('%I.%I', v_schema, 'queue_claim_heads')) IS NOT NULL
+       AND EXISTS (
+           SELECT 1
+           FROM information_schema.columns
+           WHERE table_schema = v_schema
+             AND table_name = 'queue_lanes'
+             AND column_name = 'available_count'
+       )
     THEN
         EXECUTE format(
             'UPDATE %1$I.queue_lanes AS lanes

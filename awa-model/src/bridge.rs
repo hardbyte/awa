@@ -6,9 +6,9 @@
 //! jobs within their existing transactions.
 //!
 //! All adapters share the same preparation logic in
-//! [`crate::insert::prepare_row`] — validation, state determination, and
-//! unique key computation happen exactly once, avoiding semantic drift
-//! between drivers.
+//! [`crate::adapter::postgres::prepare_job_insert`] — validation, state
+//! determination, unique key computation, and ordering-key propagation happen
+//! exactly once, avoiding semantic drift between drivers.
 //!
 //! # Available adapters
 //!
@@ -32,35 +32,13 @@
 /// functions.
 #[cfg(feature = "tokio-postgres")]
 pub mod tokio_pg {
+    use crate::adapter::postgres::{
+        prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert, INSERT_JOB_SQL,
+    };
     use crate::error::AwaError;
-    use crate::insert::{prepare_row, prepare_row_raw, PreparedRow};
     use crate::job::{InsertOpts, JobRow, JobState};
     use crate::JobArgs;
     use ::tokio_postgres::GenericClient;
-
-    /// INSERT with `RETURNING *` plus `state::text` for enum parsing.
-    ///
-    /// Double-casts (`$4::text::awa.job_state`, `$11::text::bit(8)`) ensure
-    /// tokio-postgres accepts plain TEXT parameters for the custom enum and
-    /// bit columns. `state::text AS state_str` gives us a readable string
-    /// alongside the full row.
-    const INSERT_SQL: &str = r#"
-    SELECT *, state::text AS state_str
-    FROM awa.insert_job_compat(
-        $1,
-        $2,
-        $3,
-        $4::text::awa.job_state,
-        $5::smallint,
-        $6::smallint,
-        $7,
-        $8,
-        $9::text[],
-        $10,
-        $11::text::bit(8),
-        $12
-    )
-    "#;
 
     /// Insert a job with default options.
     ///
@@ -82,7 +60,7 @@ pub mod tokio_pg {
         args: &impl JobArgs,
         opts: InsertOpts,
     ) -> Result<JobRow, AwaError> {
-        let prepared = prepare_row(args, opts)?;
+        let prepared = prepare_job_insert(args, opts)?;
         execute(client, &prepared).await
     }
 
@@ -96,19 +74,19 @@ pub mod tokio_pg {
         args: serde_json::Value,
         opts: InsertOpts,
     ) -> Result<JobRow, AwaError> {
-        let prepared = prepare_row_raw(kind, args, opts)?;
+        let prepared = prepare_raw_job_insert(kind, args, opts)?;
         execute(client, &prepared).await
     }
 
     async fn execute<C: GenericClient>(
         client: &C,
-        prepared: &PreparedRow,
+        prepared: &PreparedJobInsert,
     ) -> Result<JobRow, AwaError> {
-        let state_str = prepared.state.to_string();
+        let state_str = prepared.state_db_str();
 
         let row = client
             .query_one(
-                INSERT_SQL,
+                INSERT_JOB_SQL,
                 &[
                     &prepared.kind,
                     &prepared.queue,

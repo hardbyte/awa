@@ -24,6 +24,34 @@ const INSERT_COMPAT_SQL: &str = r#"
     )
 "#;
 
+/// Canonical SQL for inserting one prepared Awa job through a Postgres driver.
+///
+/// This statement accepts simple driver-friendly bind values for the custom
+/// Awa enum and bitmask columns:
+///
+/// - `$4`: state as text, cast to `awa.job_state`
+/// - `$11`: unique states as a text bit-string, cast to `bit(8)`
+///
+/// `state::text AS state_str` is included for drivers that cannot decode the
+/// custom enum directly. SQLx callers can ignore the extra column.
+pub(crate) const POSTGRES_INSERT_JOB_SQL: &str = r#"
+    SELECT *, state::text AS state_str
+    FROM awa.insert_job_compat(
+        $1,
+        $2,
+        $3,
+        $4::text::awa.job_state,
+        $5::smallint,
+        $6::smallint,
+        $7,
+        $8,
+        $9::text[],
+        $10,
+        $11::text::bit(8),
+        $12
+    )
+"#;
+
 // ── Shared insert preparation ───────────────────────────────────────────
 //
 // Single source of truth for computing all derived insert values:
@@ -64,20 +92,92 @@ pub(crate) fn reject_null_bytes(value: &serde_json::Value) -> Result<(), AwaErro
 
 /// Pre-computed values for a single job row, ready to bind into any driver.
 ///
-/// This is the shared internal representation used by all insert paths.
-pub(crate) struct PreparedRow {
-    pub kind: String,
-    pub queue: String,
-    pub args: serde_json::Value,
-    pub state: JobState,
-    pub priority: i16,
-    pub max_attempts: i16,
-    pub run_at: Option<chrono::DateTime<chrono::Utc>>,
-    pub metadata: serde_json::Value,
-    pub tags: Vec<String>,
-    pub unique_key: Option<Vec<u8>>,
-    pub unique_states: Option<String>,
-    pub ordering_key: Option<Vec<u8>>,
+/// External adapters should construct this with [`prepare_job_insert`] or
+/// [`prepare_raw_job_insert`], then bind values to
+/// [`crate::adapter::postgres::INSERT_JOB_SQL`] in the getter order below.
+#[derive(Debug, Clone)]
+pub struct PreparedJobInsert {
+    pub(crate) kind: String,
+    pub(crate) queue: String,
+    pub(crate) args: serde_json::Value,
+    pub(crate) state: JobState,
+    pub(crate) priority: i16,
+    pub(crate) max_attempts: i16,
+    pub(crate) run_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub(crate) metadata: serde_json::Value,
+    pub(crate) tags: Vec<String>,
+    pub(crate) unique_key: Option<Vec<u8>>,
+    pub(crate) unique_states: Option<String>,
+    pub(crate) ordering_key: Option<Vec<u8>>,
+}
+
+pub(crate) type PreparedRow = PreparedJobInsert;
+
+impl PreparedJobInsert {
+    /// Job kind string.
+    pub fn kind(&self) -> &str {
+        &self.kind
+    }
+
+    /// Queue name.
+    pub fn queue(&self) -> &str {
+        &self.queue
+    }
+
+    /// Serialized job arguments.
+    pub fn args(&self) -> &serde_json::Value {
+        &self.args
+    }
+
+    /// Initial job state.
+    pub fn state(&self) -> JobState {
+        self.state
+    }
+
+    /// Initial job state as the canonical Postgres enum text value.
+    pub fn state_db_str(&self) -> &'static str {
+        self.state.as_str()
+    }
+
+    /// Initial priority.
+    pub fn priority(&self) -> i16 {
+        self.priority
+    }
+
+    /// Maximum attempts.
+    pub fn max_attempts(&self) -> i16 {
+        self.max_attempts
+    }
+
+    /// Optional scheduled run time.
+    pub fn run_at(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        self.run_at
+    }
+
+    /// Job metadata JSON.
+    pub fn metadata(&self) -> &serde_json::Value {
+        &self.metadata
+    }
+
+    /// Job tags.
+    pub fn tags(&self) -> &[String] {
+        &self.tags
+    }
+
+    /// Precomputed unique key bytes.
+    pub fn unique_key(&self) -> Option<&[u8]> {
+        self.unique_key.as_deref()
+    }
+
+    /// Precomputed unique-state bit mask as a Postgres `bit(8)` text value.
+    pub fn unique_states_bit_string(&self) -> Option<&str> {
+        self.unique_states.as_deref()
+    }
+
+    /// Optional ordering key used by sharded queue storage.
+    pub fn ordering_key(&self) -> Option<&[u8]> {
+        self.ordering_key.as_deref()
+    }
 }
 
 fn map_sqlx_error(err: sqlx::Error) -> AwaError {
@@ -176,21 +276,32 @@ fn compute_unique_fields(
     (unique_key, unique_states)
 }
 
-/// Prepare a single row from typed job args and options.
+/// Prepare a single job insert from typed job args and options.
 ///
-/// Validates null bytes, determines state, computes unique key.
-pub(crate) fn prepare_row(args: &impl JobArgs, opts: InsertOpts) -> Result<PreparedRow, AwaError> {
+/// This is the stable preparation entry point for external adapters. It
+/// performs the same validation and derived-field computation as
+/// [`insert_with`].
+pub fn prepare_job_insert(
+    args: &impl JobArgs,
+    opts: InsertOpts,
+) -> Result<PreparedJobInsert, AwaError> {
     let kind = args.kind_str().to_string();
     let args_value = args.to_args()?;
-    prepare_row_raw(kind, args_value, opts)
+    prepare_raw_job_insert(kind, args_value, opts)
 }
 
-/// Prepare a single row from raw kind, JSON args, and options.
-pub(crate) fn prepare_row_raw(
-    kind: String,
-    args: serde_json::Value,
+/// Prepare a single job insert from raw kind, JSON args, and options.
+///
+/// Use this when building adapters for dynamic producers that do not have a
+/// Rust [`JobArgs`] implementation.
+pub fn prepare_raw_job_insert(
+    kind: impl Into<String>,
+    args: impl Into<serde_json::Value>,
     opts: InsertOpts,
-) -> Result<PreparedRow, AwaError> {
+) -> Result<PreparedJobInsert, AwaError> {
+    let kind = kind.into();
+    let args = args.into();
+
     reject_null_bytes(&args)?;
     reject_null_bytes(&opts.metadata)?;
 
@@ -202,7 +313,7 @@ pub(crate) fn prepare_row_raw(
 
     let (unique_key, unique_states) = compute_unique_fields(&kind, &args, &opts);
 
-    Ok(PreparedRow {
+    Ok(PreparedJobInsert {
         kind,
         queue: opts.queue,
         args,
@@ -216,6 +327,20 @@ pub(crate) fn prepare_row_raw(
         unique_states,
         ordering_key: opts.ordering_key,
     })
+}
+
+/// Prepare a single row from typed job args and options.
+pub(crate) fn prepare_row(args: &impl JobArgs, opts: InsertOpts) -> Result<PreparedRow, AwaError> {
+    prepare_job_insert(args, opts)
+}
+
+/// Prepare a single row from raw kind, JSON args, and options.
+pub(crate) fn prepare_row_raw(
+    kind: String,
+    args: serde_json::Value,
+    opts: InsertOpts,
+) -> Result<PreparedRow, AwaError> {
+    prepare_raw_job_insert(kind, args, opts)
 }
 
 // ── sqlx insert functions ───────────────────────────────────────────────
@@ -425,7 +550,7 @@ pub async fn insert_many_copy(
                 .execute(&mut *conn)
                 .await?;
 
-            let result = sqlx::query_as::<_, JobRow>(INSERT_COMPAT_SQL)
+            let result = sqlx::query_as::<_, JobRow>(POSTGRES_INSERT_JOB_SQL)
                 .bind(&kind)
                 .bind(&queue)
                 .bind(&args)
@@ -668,4 +793,85 @@ pub fn params_with(args: &impl JobArgs, opts: InsertOpts) -> Result<InsertParams
         args: args.to_args()?,
         opts,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::job::UniqueOpts;
+    use chrono::TimeZone;
+
+    #[derive(serde::Serialize)]
+    struct SendEmail {
+        to: String,
+        subject: String,
+    }
+
+    impl JobArgs for SendEmail {
+        fn kind() -> &'static str {
+            "send_email"
+        }
+    }
+
+    #[test]
+    fn prepare_job_insert_exposes_canonical_adapter_values() {
+        let run_at = chrono::Utc.with_ymd_and_hms(2026, 5, 15, 12, 0, 0).unwrap();
+        let prepared = prepare_job_insert(
+            &SendEmail {
+                to: "ada@example.com".to_string(),
+                subject: "hello".to_string(),
+            },
+            InsertOpts {
+                queue: "email".to_string(),
+                priority: 1,
+                max_attempts: 3,
+                run_at: Some(run_at),
+                metadata: serde_json::json!({"source": "test"}),
+                tags: vec!["welcome".to_string(), "external".to_string()],
+                unique: Some(UniqueOpts {
+                    by_queue: true,
+                    by_args: true,
+                    by_period: Some(60),
+                    states: 0b1000_0001,
+                }),
+                ordering_key: Some(vec![1, 2, 3]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(prepared.kind(), "send_email");
+        assert_eq!(prepared.queue(), "email");
+        assert_eq!(prepared.args()["to"], "ada@example.com");
+        assert_eq!(prepared.state(), JobState::Scheduled);
+        assert_eq!(prepared.state_db_str(), "scheduled");
+        assert_eq!(prepared.priority(), 1);
+        assert_eq!(prepared.max_attempts(), 3);
+        assert_eq!(prepared.run_at(), Some(run_at));
+        assert_eq!(prepared.metadata()["source"], "test");
+        assert_eq!(prepared.tags(), ["welcome", "external"]);
+        assert!(prepared.unique_key().is_some());
+        assert_eq!(prepared.unique_states_bit_string(), Some("10000001"));
+        assert_eq!(prepared.ordering_key(), Some(&[1, 2, 3][..]));
+    }
+
+    #[test]
+    fn prepare_raw_job_insert_reuses_null_byte_validation() {
+        let err = prepare_raw_job_insert(
+            "send_email",
+            serde_json::json!({"subject": "hello\u{0000}world"}),
+            InsertOpts::default(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, AwaError::Validation(_)));
+    }
+
+    #[test]
+    fn postgres_adapter_sql_uses_driver_friendly_casts() {
+        assert!(POSTGRES_INSERT_JOB_SQL.contains("state::text AS state_str"));
+        assert!(POSTGRES_INSERT_JOB_SQL.contains("$4::text::awa.job_state"));
+        assert!(POSTGRES_INSERT_JOB_SQL.contains("$11::text::bit(8)"));
+        assert!(POSTGRES_INSERT_JOB_SQL.contains("$12"));
+    }
 }
