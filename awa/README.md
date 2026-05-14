@@ -11,13 +11,13 @@ applications depend on directly.
 
 ```toml
 [dependencies]
-awa = "0.6"
+awa = "0.6.0-alpha.9"
 ```
 
 ## Quick start
 
 ```rust
-use awa::{Client, JobArgs, JobContext, JobResult, QueueConfig};
+use awa::{Client, JobArgs, JobResult, QueueConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, JobArgs)]
@@ -26,19 +26,16 @@ struct SendEmail {
     subject: String,
 }
 
-async fn send_email(ctx: JobContext<SendEmail>) -> JobResult {
-    println!("sending to {}: {}", ctx.args.to, ctx.args.subject);
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let pool = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     let client = Client::builder(pool.clone())
         .queue("email", QueueConfig::default())
-        .register_handler::<SendEmail, _, _>(send_email)
-        .build()
-        .await?;
+        .register::<SendEmail, _, _>(|args, _ctx| async move {
+            println!("sending to {}: {}", args.to, args.subject);
+            Ok(JobResult::Completed)
+        })
+        .build()?;
 
     client.enqueue(SendEmail {
         to: "ada@example.com".into(),
@@ -75,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
 - [Configuration](../docs/configuration.md)
 - [Architecture](../docs/architecture.md)
 - [Migrations](../docs/migrations.md)
+- [Bridge adapters](../docs/bridge-adapters.md)
 - [Upgrading 0.5.x → 0.6](../docs/upgrade-0.5-to-0.6.md)
 - [Dead Letter Queue](../docs/dead-letter-queue.md)
 - [Deployment](../docs/deployment.md)

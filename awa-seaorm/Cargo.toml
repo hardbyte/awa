@@ -1,0 +1,19 @@
+[package]
+name = "awa-seaorm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SeaORM integration helpers for the Awa job queue"
+repository.workspace = true
+readme = "README.md"
+
+[dependencies]
+awa.workspace = true
+sea-orm.workspace = true
+sqlx.workspace = true
+
+[dev-dependencies]
+awa-testing = { path = "../awa-testing", version = "0.6.0-alpha.9" }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
