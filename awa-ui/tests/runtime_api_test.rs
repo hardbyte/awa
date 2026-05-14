@@ -85,6 +85,8 @@ fn weighted_config(weight: u32) -> QueueRuntimeConfigSnapshot {
         poll_interval_ms: 200,
         deadline_duration_secs: 300,
         priority_aging_interval_secs: 60,
+        claimers: Some(1),
+        claim_batch_size: Some(128),
         dlq_enabled: Some(true),
         rate_limit: Some(RateLimitSnapshot {
             max_rate: 5.5,

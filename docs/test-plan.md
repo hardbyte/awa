@@ -240,6 +240,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
 | TLA7 | AwaSegmentedStorage | Segmented storage safety, waiting flow, optional attempt-state, prune safety |
 | TLA8 | AwaSegmentedStorageInterleavings | Two-worker segmented-storage interleavings |
+| TLA9 | AwaShardedPrune | Cross-shard ready/done prune matching by `enqueue_shard` |
 
 ## Running Tests
 

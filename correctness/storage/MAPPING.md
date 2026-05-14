@@ -87,9 +87,9 @@ for backfill / fallback reads during upgrades.
 | `DlqHasNoLiveRuntime` | same, for dlq path |
 | `DlqAndTerminalDisjoint` | `move_failed_to_dlq` uses `DELETE FROM done_entries ... RETURNING` then `INSERT INTO dlq_entries` in one tx; no intermediate state where both hold the same job_id |
 | `StaleCompleteRejected` precondition | `WHERE run_lease = $2 AND state = 'running'` clauses on every completion UPDATE |
-| `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, lane_seq)` on `ready_entries` child partitions |
+| `ReadyLaneSeqUnique` | `UNIQUE(queue, priority, enqueue_shard, lane_seq)` on `ready_entries` child partitions; `AwaSegmentedStorage` checks the per-shard uniqueness shape and `AwaShardedPrune` checks the cross-shard duplicate-`lane_seq` case |
 | `ClaimCursorBounded` | `queue_lanes.claim_seq <= queue_lanes.append_seq` should be a CHECK constraint (currently implicit; worth adding) |
-| `PrunedXSegmentsAreEmpty` | ready, lease, terminal, and claim prune require no-live-row preconditions before TRUNCATE; `deferred_jobs` and `dlq_entries` are unpartitioned backlog row-vacuum tables and are covered by `AwaDeadTupleContract` |
+| `PrunedXSegmentsAreEmpty` | ready, lease, terminal, and claim prune require no-live-row preconditions before TRUNCATE; queue-slot prune checks pending ready rows by `(queue, priority, enqueue_shard, lane_seq)` so a done row from one shard cannot satisfy a pending ready row from another; `deferred_jobs` and `dlq_entries` are unpartitioned backlog row-vacuum tables and are covered by `AwaDeadTupleContract` |
 | `PrunedClaimSegmentsAreEmpty` (ADR-023) | `prune_oldest_claims` requires no open claim in the partition before TRUNCATE; rescue-before-truncate closes stragglers in the same transaction |
 | `NoLostClaim` (ADR-023) | receipts and their closures both live in `claim_slot`-partitioned tables; partitions only truncate once all their receipts are closed, so no open claim is physically dropped |
 | `ClaimOpenAndClosedDisjoint` (ADR-023) | closure insertion and receipt-clearing are a single transaction; a partition's receipt+closure pair is either both present or both dropped by `TRUNCATE` |
@@ -161,6 +161,28 @@ The model's enqueue preconditions start after a job has been admitted to
 the storage state, so batching uniqueness claims changes implementation
 granularity rather than the modeled lifecycle, lane, lease, or prune
 invariants.
+
+## Enqueue-shard prune note
+
+`AwaSegmentedStorage.tla` models a single `(queue, priority, enqueue_shard)`
+lane. That keeps the lifecycle state-space small and is enough for per-shard
+FIFO, lease, receipt, terminal, DLQ, and prune safety. It does not model two
+shards whose `lane_seq` values collide by design.
+
+`AwaShardedPrune.tla` is the focused cross-shard companion. It models two
+independent shard counters and the queue-ring prune anti-join. The production
+predicate is:
+
+```sql
+done.ready_generation = ready.ready_generation
+AND done.queue = ready.queue
+AND done.priority = ready.priority
+AND done.enqueue_shard = ready.enqueue_shard
+AND done.lane_seq = ready.lane_seq
+```
+
+Dropping `done.enqueue_shard = ready.enqueue_shard` is exactly the historical
+bug reproduced by `AwaShardedPruneBroken.cfg`.
 
 ## Known modelling gaps with implementation implications
 
@@ -427,7 +449,7 @@ Invariants added:
 
 Model checking results:
 
-- `AwaSegmentedStorage.cfg`: 33,152 distinct states, clean. Admin
+- `AwaSegmentedStorage.cfg`: 33,920 distinct states, clean. Admin
   cancel actions (`CancelRunningToTerminal`,
   `CancelReceiptOnlyToTerminal`) clear all workers' `taskLease`
   snapshots since admin cancel has no worker context, preserving
@@ -445,7 +467,14 @@ Model checking results:
 - `AwaSegmentedStorageRacesSafe.cfg`: safe commit, clean.
 - `AwaSegmentedStorageRacesMultiWorker.cfg`: safe commit with 3 workers,
   clean.
-- `AwaStorageLockOrder.cfg`: 39,040 distinct states, clean. Models
+- `AwaShardedPrune.cfg`: 1,028 distinct states, clean. This checks the
+  fixed queue-ring prune predicate that matches ready rows to done rows by
+  `(enqueue_shard, lane_seq)`.
+- `AwaShardedPruneBroken.cfg`: expected failure. It ignores
+  `enqueue_shard` in the ready/done match and produces the counterexample
+  where shard 0's completed `lane_seq = 1` row masks shard 1's still-pending
+  `lane_seq = 1` row.
+- `AwaStorageLockOrder.cfg`: 69,057 distinct states, clean. Models
   the receipts and legacy claim modes separately, plus
   `CloseReceiptPlan`, `RescueReceiptsPlan`, `EnsureRunningPlan`,
   `CancelReceiptOnlyPlan`, and `CancelRunningPlan`.

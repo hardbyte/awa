@@ -36,6 +36,8 @@ in-place as historical context.
 | 021 | [Sequential callbacks and callback heartbeats](021-enhanced-external-wait.md) | Accepted | `wait_for_callback()` + `resume_external()` for multi-step orchestration; `heartbeat_callback` for long-running externals | Callback state moved to `active_leases` per ADR-019 |
 | 022 | [Descriptor catalog](022-descriptor-catalog.md) | Accepted | `queue_descriptors` / `job_kind_descriptors` tables, BLAKE3-hashed, code-declared, off the hot path | Off the queue-storage hot path |
 | 023 | [Receipt plane ring partitioning](023-receipt-plane-ring-partitioning.md) | Accepted | Partitioned `lease_claims` / `lease_claim_closures` ring replaces `open_receipt_claims`; receipts default on in 0.6 | Refines ADR-019 receipt plane |
+| 024 | Deferred `done_entries` materialisation | Rejected | Investigated as a rotation guard; reverted in `053fec1` once a simpler integration test gave equivalent coverage | Historical |
+| 025 | [Sharded enqueue heads](025-sharded-enqueue-heads.md) | Accepted | Per-queue `enqueue_shards` (default 1) spreads `queue_enqueue_heads` row-lock contention across N rows; FIFO becomes per-shard at S>1 | Refines ADR-019 enqueue path |
 
 ## Validation artifacts
 

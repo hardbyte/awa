@@ -351,6 +351,81 @@ async def test_enqueue_many_copy_queue_storage(client):
 
 
 @pytest.mark.asyncio
+async def test_ordering_key_routes_all_async_python_insert_paths(client):
+    """ordering_key pins native async client, tx, and COPY inserts."""
+    schema = "awa_py_ordering_key"
+    queue = "py_ordering_key"
+    await client.install_queue_storage(schema=schema, reset=True)
+
+    tx = await client.transaction()
+    await tx.execute(
+        """
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        """,
+        queue,
+    )
+    await tx.commit()
+
+    key = b"account-42"
+    expected_jobs = []
+    expected_jobs.append(
+        await client.insert(
+            SendEmail(to="key-client@example.com", subject="Client"),
+            queue=queue,
+            ordering_key=key,
+        )
+    )
+
+    tx = await client.transaction()
+    expected_jobs.append(
+        await tx.insert(
+            SendEmail(to="key-tx@example.com", subject="Tx"),
+            queue=queue,
+            ordering_key="account-42",
+        )
+    )
+    await tx.commit()
+
+    expected_jobs.extend(
+        await client.insert_many_copy(
+            [
+                SendEmail(to="key-copy-1@example.com", subject="Copy 1"),
+                SendEmail(to="key-copy-2@example.com", subject="Copy 2"),
+            ],
+            queue=queue,
+            ordering_key=key,
+        )
+    )
+    count = await client.enqueue_many_copy(
+        [
+            SendEmail(to="key-enqueue-1@example.com", subject="Enqueue 1"),
+            SendEmail(to="key-enqueue-2@example.com", subject="Enqueue 2"),
+        ],
+        queue=queue,
+        ordering_key="account-42",
+    )
+    assert count == 2
+
+    tx = await client.transaction()
+    rows = await tx.fetch_all(
+        f"""
+        SELECT enqueue_shard
+        FROM {schema}.ready_entries
+        WHERE queue = $1
+        ORDER BY job_id
+        """,
+        queue,
+    )
+    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+    await tx.commit()
+
+    assert len(rows) == len(expected_jobs) + count
+    assert len({row["enqueue_shard"] for row in rows}) == 1
+
+
+@pytest.mark.asyncio
 async def test_enqueue_many_copy_requires_queue_storage(client):
     """Direct COPY enqueue fails clearly unless queue_storage is active."""
     with pytest.raises(awa.ValidationError, match="active queue_storage backend"):

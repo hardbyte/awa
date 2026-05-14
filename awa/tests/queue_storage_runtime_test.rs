@@ -5,7 +5,7 @@
 
 use awa::model::{
     admin, insert, migrations, storage, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig,
-    RotateOutcome,
+    RotateOutcome, SkipReason,
 };
 use awa::{
     Client, InsertOpts, JobArgs, JobContext, JobError, JobResult, JobRow, JobState, QueueConfig,
@@ -333,6 +333,28 @@ async fn create_store(pool: &sqlx::PgPool, schema: &str) -> QueueStorage {
         },
     )
     .await
+}
+
+/// Scan candidate keys until every shard in `[0, shards)` has a
+/// representative ordering key that hashes to it. Used by shard
+/// fairness / shard-lowering tests so the test setup doesn't depend
+/// on which strings happen to route to which shard.
+fn build_keys_per_shard(shards: i16) -> std::collections::HashMap<i16, Vec<u8>> {
+    let mut keys: std::collections::HashMap<i16, Vec<u8>> = std::collections::HashMap::new();
+    for n in 0..1_000_000u64 {
+        if keys.len() as i16 == shards {
+            break;
+        }
+        let key = format!("shard-fixture-{n}");
+        let shard = awa_model::queue_storage::shard_for_ordering_key(key.as_bytes(), shards);
+        keys.entry(shard).or_insert_with(|| key.into_bytes());
+    }
+    assert_eq!(
+        keys.len() as i16,
+        shards,
+        "test setup should find one key per shard",
+    );
+    keys
 }
 
 async fn attempt_state_count(pool: &sqlx::PgPool, store: &QueueStorage) -> i64 {
@@ -3709,6 +3731,109 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_prune_pending_shard_scope";
+    let schema = "awa_qs_prune_pending_shard_scope";
+    let store = create_store(&pool, schema).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 2)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("Failed to seed enqueue_shards = 2");
+
+    let _first = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 1 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+    let _second = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 2 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let ready_heads: Vec<(i16, i64)> = sqlx::query_as(&format!(
+        "SELECT enqueue_shard, lane_seq FROM {schema}.ready_entries WHERE queue = $1 ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("Failed to inspect seeded ready rows");
+    assert_eq!(ready_heads.len(), 2);
+    assert_ne!(
+        ready_heads[0].0, ready_heads[1].0,
+        "test setup needs two ready rows routed to different shards"
+    );
+    assert_eq!(
+        ready_heads[0].1, ready_heads[1].1,
+        "test setup needs duplicate lane_seq values across shards"
+    );
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(300))
+        .await
+        .expect("Failed to claim one row");
+    assert_eq!(claimed.len(), 1);
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("Failed to complete one row");
+    assert_eq!(completed.len(), 1);
+
+    let rotated = store
+        .rotate(&pool)
+        .await
+        .expect("Failed to rotate queue ring");
+    assert!(
+        matches!(rotated, RotateOutcome::Rotated { slot: 1, .. }),
+        "unexpected rotate outcome: {rotated:?}"
+    );
+
+    let prune = store
+        .prune_oldest(&pool)
+        .await
+        .expect("Failed to prune oldest queue slot");
+    assert!(
+        matches!(
+            prune,
+            PruneOutcome::SkippedActive {
+                slot: 0,
+                reason: SkipReason::QueuePendingReady,
+                count: 1
+            }
+        ),
+        "prune must not let a done row from one shard satisfy a pending ready row from another shard: {prune:?}"
+    );
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to sample queue counts");
+    assert_eq!(counts.available, 1);
+    assert_eq!(counts.running, 0);
+    assert_eq!(counts.completed, 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills_them() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -5814,4 +5939,510 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
         next_seq, 4,
         "next_seq should reflect the three recovery jobs starting from a re-initialised head"
     );
+}
+
+/// At `enqueue_shards > 1` every plane carries a shard column:
+/// `queue_enqueue_heads`, `queue_claim_heads`, and `ready_entries`
+/// extend their primary keys to include it; `leases` and `done_entries`
+/// do too; `lease_claims` carries the shard as a regular column.
+/// This test seeds `queue_meta.enqueue_shards = 4`, enqueues enough
+/// jobs to land on every shard, drains them through a worker, and
+/// asserts:
+///
+/// 1. Every job completes.
+/// 2. `done_entries` rows are spread across all 4 shards (the producer
+///    rotor actually rotated, and the claim path returned the shard
+///    on the `ClaimedEntry` so the terminal row picked up the right
+///    `enqueue_shard`).
+/// 3. The `done_entries` primary key
+///    `(ready_slot, queue, priority, enqueue_shard, lane_seq)` carries
+///    multiple rows that share `(ready_slot, queue, priority,
+///    lane_seq)` across different shards — i.e. the shard column is
+///    load-bearing in the key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_multi_shard_round_trip_through_completion() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(8).await;
+    let queue = "qs_multi_shard_round_trip";
+    let schema = "awa_qs_multi_shard_round_trip";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    // Opt the queue into 4 shards. Without this row the queue defaults
+    // to a single shard and the test wouldn't exercise the multi-shard
+    // path at all.
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards = 4");
+
+    // Enqueue enough jobs that the producer-side rotor visits every
+    // shard. 16 batches × 1 job = 16 producer-side calls; with the
+    // rotor at modulo 4 each shard sees 4 batches.
+    let mut job_ids = Vec::with_capacity(16);
+    for i in 0..16 {
+        let job_id = enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: i },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+        job_ids.push(job_id);
+    }
+
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+
+    for job_id in &job_ids {
+        wait_for_job_state(
+            &store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            Duration::from_secs(15),
+        )
+        .await;
+    }
+
+    // Every shard should hold at least one terminal row.
+    let shard_counts: Vec<(i16, i64)> = sqlx::query_as(&format!(
+        "SELECT enqueue_shard, count(*)::bigint
+         FROM {schema}.done_entries
+         WHERE queue = $1
+         GROUP BY enqueue_shard
+         ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("count done_entries per shard");
+
+    let shards_observed: Vec<i16> = shard_counts.iter().map(|(s, _)| *s).collect();
+    assert_eq!(
+        shards_observed,
+        vec![0, 1, 2, 3],
+        "all four shards should hold terminal rows; got {shard_counts:?}",
+    );
+    let total: i64 = shard_counts.iter().map(|(_, c)| c).sum();
+    assert_eq!(
+        total, 16,
+        "exactly the enqueued jobs landed in done_entries"
+    );
+
+    // The shard column is load-bearing in the `done_entries` PK iff
+    // two distinct shards share a `(ready_slot, queue, priority,
+    // lane_seq)` tuple that would otherwise collide. Each shard's
+    // `lane_seq` starts independently at 1, so at S=4 with 4 jobs per
+    // shard there must be at least one tuple that repeats.
+    let max_dupes: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(max(c), 0)::bigint FROM (
+             SELECT count(*) AS c
+             FROM {schema}.done_entries
+             WHERE queue = $1
+             GROUP BY ready_slot, queue, priority, lane_seq
+         ) AS grouped"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count overlapping (slot, queue, priority, lane_seq) groups");
+    assert!(
+        max_dupes >= 2,
+        "at S=4 the shard column carries the PK — at least one (ready_slot, queue, priority, lane_seq) \
+         tuple should be reused across shards; got max group size {max_dupes}",
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// `ordering_key` pins a job to a deterministic shard based on a
+/// portable hash of the key bytes. Producers can use it to keep jobs
+/// for the same logical partition (customer, order, account) on the
+/// same shard, which preserves partitioned FIFO across batches even
+/// when the per-store rotor would otherwise spread them.
+///
+/// This test enqueues batches with distinct ordering keys into a
+/// 4-shard queue and asserts:
+/// 1. All rows for the same key share one shard.
+/// 2. That shard matches `shard_for_ordering_key(key, 4)`.
+/// 3. Across enough distinct keys every shard is visited.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_ordering_key_routes_to_stable_shard() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let queue = "qs_ordering_key_routes";
+    let schema = "awa_qs_ordering_key_routes";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards = 4");
+
+    let keys: [&[u8]; 16] = [
+        b"customer-1",
+        b"customer-2",
+        b"customer-3",
+        b"customer-4",
+        b"customer-5",
+        b"customer-6",
+        b"customer-7",
+        b"customer-8",
+        b"order-100",
+        b"order-101",
+        b"order-200",
+        b"order-201",
+        b"account-a",
+        b"account-b",
+        b"account-c",
+        b"account-d",
+    ];
+
+    let mut expected_per_job: Vec<(i64, i16)> = Vec::new();
+    for (idx, key) in keys.iter().enumerate() {
+        let expected_shard = awa_model::queue_storage::shard_for_ordering_key(key, 4);
+        for rep in 0..3 {
+            let opts = InsertOpts {
+                queue: queue.into(),
+                ordering_key: Some(key.to_vec()),
+                ..Default::default()
+            };
+            let job_id = enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob {
+                    id: (idx * 100 + rep) as i64,
+                },
+                opts,
+            )
+            .await;
+            expected_per_job.push((job_id, expected_shard));
+        }
+    }
+
+    let rows: Vec<(i64, i16)> = sqlx::query_as(&format!(
+        "SELECT job_id, enqueue_shard FROM {schema}.ready_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read ready_entries rows");
+
+    let observed: std::collections::HashMap<i64, i16> = rows.into_iter().collect();
+    for (job_id, expected_shard) in &expected_per_job {
+        let got = observed
+            .get(job_id)
+            .copied()
+            .unwrap_or_else(|| panic!("job {job_id} should be in ready_entries"));
+        assert_eq!(
+            got, *expected_shard,
+            "job {job_id} should land on shard {expected_shard} (ordering-key derived), got {got}",
+        );
+    }
+
+    let shards_hit: HashSet<i16> = expected_per_job.iter().map(|(_, s)| *s).collect();
+    assert_eq!(
+        shards_hit.len(),
+        4,
+        "16 distinct keys should reach all 4 shards via shard-key routing; got {shards_hit:?}",
+    );
+}
+
+/// At `enqueue_shards > 1` the claim ordering is
+/// `(effective_priority, run_at, priority)` across every shard's
+/// candidate head. Older rows beat younger rows regardless of which
+/// shard they sit on, so the natural fairness mechanism is run_at —
+/// the shard whose oldest waiting row has the earliest run_at wins
+/// the next claim, the other shards' rows age and win their turn
+/// next. This test drives a steady producer load that touches every
+/// shard, drains it through a worker, and asserts every shard's
+/// `claim_seq` ended at its `next_seq` — i.e. no shard was starved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(8).await;
+    let queue = "qs_shard_fairness";
+    let schema = "awa_qs_shard_fairness";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards = 4");
+
+    // Build one ordering key per target shard by scanning candidate
+    // strings until each shard has a key.
+    let keys_per_shard = build_keys_per_shard(4);
+
+    let mut job_ids = Vec::with_capacity(64);
+    for shard in 0..4i16 {
+        let key = keys_per_shard.get(&shard).expect("key for shard").clone();
+        for rep in 0..16u64 {
+            let job_id = enqueue_job(
+                &pool,
+                &store,
+                &CompleteJob {
+                    id: (shard as i64) * 100 + rep as i64,
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    ordering_key: Some(key.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            job_ids.push(job_id);
+        }
+    }
+
+    let pre_counts: Vec<(i16, i64)> = sqlx::query_as(&format!(
+        "SELECT enqueue_shard, count(*)::bigint
+         FROM {schema}.ready_entries
+         WHERE queue = $1
+         GROUP BY enqueue_shard
+         ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read pre-drain shard counts");
+    assert_eq!(
+        pre_counts.iter().map(|(s, _)| *s).collect::<Vec<_>>(),
+        vec![0, 1, 2, 3],
+        "every shard should hold rows pre-drain",
+    );
+
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let done_count: i64 = sqlx::query_scalar(&format!(
+            "SELECT count(*)::bigint
+             FROM {schema}.done_entries
+             WHERE queue = $1"
+        ))
+        .bind(queue)
+        .fetch_one(&pool)
+        .await
+        .expect("read done count while waiting for fairness drain");
+        if done_count == job_ids.len() as i64 {
+            break;
+        }
+        assert!(
+            Instant::now() <= deadline,
+            "Timed out waiting for fairness drain: done_count {done_count} != expected {}",
+            job_ids.len(),
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    let heads: Vec<(i16, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT claims.enqueue_shard,
+                claims.claim_seq,
+                enqueues.next_seq
+         FROM {schema}.queue_claim_heads AS claims
+         JOIN {schema}.queue_enqueue_heads AS enqueues
+           ON enqueues.queue = claims.queue
+          AND enqueues.priority = claims.priority
+          AND enqueues.enqueue_shard = claims.enqueue_shard
+         WHERE claims.queue = $1
+         ORDER BY claims.enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read post-drain claim heads");
+
+    assert_eq!(heads.len(), 4, "all four shard heads should exist");
+    for (shard, claim_seq, next_seq) in &heads {
+        assert!(
+            *claim_seq > 0,
+            "shard {shard} was starved — claim_seq still at 0 after drain",
+        );
+        assert_eq!(
+            *claim_seq, *next_seq,
+            "shard {shard} did not fully drain — claim_seq {claim_seq} != next_seq {next_seq}",
+        );
+    }
+
+    client.shutdown(Duration::from_secs(5)).await;
+}
+
+/// Lowering `awa.queue_meta.enqueue_shards` is safe as long as every
+/// row in flight on a now-out-of-range shard still gets claimed and
+/// finalised. The claim path joins `queue_claim_heads` to
+/// `queue_enqueue_heads` without filtering on the current shard
+/// count, so this should be automatic. This test:
+///
+/// 1. Seeds `enqueue_shards = 4` and enqueues with keys routed to
+///    every shard.
+/// 2. Confirms all 4 shards hold ready rows.
+/// 3. Drops `enqueue_shards` to 2 and constructs a fresh store
+///    (the in-process cache holds the old value on the original
+///    handle — a fresh handle observes the new value and exercises
+///    the same code path a restarted worker would take).
+/// 4. Starts a worker on the fresh handle and asserts every job
+///    completes — including the ones on shards 2 and 3 that the
+///    fresh runtime would never enqueue to.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_lowering_enqueue_shards_drains_existing_rows() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(8).await;
+    let queue = "qs_shard_lowering";
+    let schema = "awa_qs_shard_lowering";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let producer_store = create_store_with_config(&pool, store_config.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards = 4");
+
+    let keys_per_shard = build_keys_per_shard(4);
+
+    let mut job_ids = Vec::with_capacity(16);
+    for shard in 0..4i16 {
+        let key = keys_per_shard.get(&shard).expect("key for shard").clone();
+        for rep in 0..4u64 {
+            let job_id = enqueue_job(
+                &pool,
+                &producer_store,
+                &CompleteJob {
+                    id: (shard as i64) * 100 + rep as i64,
+                },
+                InsertOpts {
+                    queue: queue.into(),
+                    ordering_key: Some(key.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+            job_ids.push(job_id);
+        }
+    }
+
+    let pre_shards: Vec<i16> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT enqueue_shard
+         FROM {schema}.ready_entries
+         WHERE queue = $1
+         ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read pre-lower shard set");
+    assert_eq!(
+        pre_shards,
+        vec![0, 1, 2, 3],
+        "all four shards should hold rows before the lowering",
+    );
+
+    sqlx::query("UPDATE awa.queue_meta SET enqueue_shards = 2 WHERE queue = $1")
+        .bind(queue)
+        .execute(&pool)
+        .await
+        .expect("lower queue_meta.enqueue_shards to 2");
+
+    // A fresh handle stands in for a restarted worker: the existing
+    // `producer_store` has cached `enqueue_shards = 4`, so to exercise
+    // the post-lowering code path we construct a new handle that reads
+    // the new value. The schema already exists; we just need a fresh
+    // QueueStorage value bound to the same schema.
+    let drain_store =
+        QueueStorage::new(store_config.clone()).expect("Failed to create drain QueueStorage");
+
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    client.start().await.expect("client start");
+
+    for job_id in &job_ids {
+        wait_for_job_state(
+            &drain_store,
+            &pool,
+            *job_id,
+            &[JobState::Completed],
+            Duration::from_secs(30),
+        )
+        .await;
+    }
+
+    let done_shards: Vec<i16> = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT enqueue_shard
+         FROM {schema}.done_entries
+         WHERE queue = $1
+         ORDER BY enqueue_shard"
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read post-drain shard set");
+    assert_eq!(
+        done_shards,
+        vec![0, 1, 2, 3],
+        "every shard's rows including the out-of-range ones should drain to done_entries",
+    );
+
+    client.shutdown(Duration::from_secs(5)).await;
 }

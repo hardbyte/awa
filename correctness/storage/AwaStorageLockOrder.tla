@@ -94,6 +94,20 @@ Compatible(held, wanted) == held = ModeShared /\ wanted = ModeShared
 
 \* Resource identities. We model each parameterised resource as a record
 \* so its identity is uniquely carried by its parameters.
+\*
+\* `LaneResource` carries `(queue, priority)` only; the shard plane
+\* introduced by ADR-025 splits each `(queue, priority)` into N
+\* independent shard rows in `queue_enqueue_heads` / `queue_claim_heads`
+\* / `ready_entries` / `leases` / `done_entries`. At the lock-order
+\* abstraction layer, each shard is a disjoint copy of the same set of
+\* row-level locks, so the existing deadlock and lock-compatibility
+\* proofs hold per shard. The cross-shard invariant — one enqueue
+\* transaction touches exactly one shard's head rows, never two — is
+\* enforced in the Rust implementation by `shard_for_enqueue` picking
+\* a single shard per `insert_*_tx` call. Two transactions on the same
+\* lane but different shards lock disjoint resources and cannot
+\* deadlock; two transactions on the same lane and shard reduce to
+\* the existing `LaneResource(q, p)` model.
 LaneResource(q, p) == [k |-> "queue_lane", q |-> q, p |-> p]
 LeaseRingStateResource == [k |-> "lease_ring_state"]
 LeaseRingSlotResource(s) == [k |-> "lease_ring_slot", s |-> s]

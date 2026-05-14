@@ -2,7 +2,8 @@ use crate::args::{derive_kind, get_type_class_name, serialize_args};
 use crate::errors::{map_awa_error, map_connect_error, map_sqlx_error, state_error};
 use crate::job::{py_to_json, PyJob};
 use crate::transaction::{
-    insert_raw_job, parse_run_at, parse_unique_opts, PySyncTransaction, PyTransaction,
+    insert_raw_job, parse_ordering_key, parse_run_at, parse_unique_opts, PySyncTransaction,
+    PyTransaction,
 };
 use crate::worker::PythonWorker;
 use awa_model::admin::{JobKindDescriptor, ListJobsFilter, QueueDescriptor};
@@ -415,7 +416,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert<'py>(
         &self,
@@ -429,40 +430,47 @@ impl PyClient {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let (kind_str, args_json, metadata_json, run_at, unique) = Python::attach(|py| {
-                let args_bound = args.bind(py);
-                let kind_str = match kind {
-                    Some(k) => k,
-                    None => {
-                        let class_name = get_type_class_name(args_bound.get_type().as_any())?;
-                        derive_kind(&class_name)
-                    }
-                };
-                let metadata_json = metadata
-                    .as_ref()
-                    .map(|value| py_to_json(py, value.bind(py)))
-                    .transpose()?
-                    .unwrap_or(serde_json::json!({}));
-                let run_at = run_at
-                    .as_ref()
-                    .map(|value| parse_run_at(py, value.bind(py)))
-                    .transpose()?;
-                let unique = unique_opts
-                    .as_ref()
-                    .map(|value| parse_unique_opts(py, value.bind(py)))
-                    .transpose()?;
-                Ok::<_, PyErr>((
-                    kind_str,
-                    serialize_args(py, args_bound)?,
-                    metadata_json,
-                    run_at,
-                    unique,
-                ))
-            })?;
+            let (kind_str, args_json, metadata_json, run_at, unique, ordering_key) =
+                Python::attach(|py| {
+                    let args_bound = args.bind(py);
+                    let kind_str = match kind {
+                        Some(k) => k,
+                        None => {
+                            let class_name = get_type_class_name(args_bound.get_type().as_any())?;
+                            derive_kind(&class_name)
+                        }
+                    };
+                    let metadata_json = metadata
+                        .as_ref()
+                        .map(|value| py_to_json(py, value.bind(py)))
+                        .transpose()?
+                        .unwrap_or(serde_json::json!({}));
+                    let run_at = run_at
+                        .as_ref()
+                        .map(|value| parse_run_at(py, value.bind(py)))
+                        .transpose()?;
+                    let unique = unique_opts
+                        .as_ref()
+                        .map(|value| parse_unique_opts(py, value.bind(py)))
+                        .transpose()?;
+                    let ordering_key = ordering_key
+                        .as_ref()
+                        .map(|value| parse_ordering_key(py, value.bind(py)))
+                        .transpose()?;
+                    Ok::<_, PyErr>((
+                        kind_str,
+                        serialize_args(py, args_bound)?,
+                        metadata_json,
+                        run_at,
+                        unique,
+                        ordering_key,
+                    ))
+                })?;
 
             let row = insert_raw_job(
                 &pool,
@@ -476,6 +484,7 @@ impl PyClient {
                     metadata: metadata_json,
                     tags,
                     unique,
+                    ordering_key,
                     ..Default::default()
                 },
             )
@@ -1551,6 +1560,12 @@ impl PyClient {
             if let Some(ms) = config.deadline_duration_ms {
                 queue_config.deadline_duration = Duration::from_millis(ms);
             }
+            if let Some(claimers) = config.claimers {
+                queue_config.claimers = claimers;
+            }
+            if let Some(claim_batch_size) = config.claim_batch_size {
+                queue_config.claim_batch_size = claim_batch_size;
+            }
             builder = builder.queue(config.name.clone(), queue_config);
         }
         if let Some(global_max) = global_max_workers {
@@ -2010,7 +2025,7 @@ impl PyClient {
 
     // ── COPY batch insert/enqueue (async + sync) ────────────────────
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many_copy<'py>(
         &self,
@@ -2024,6 +2039,7 @@ impl PyClient {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2037,6 +2053,7 @@ impl PyClient {
             metadata.as_ref(),
             run_at.as_ref(),
             unique_opts.as_ref(),
+            ordering_key.as_ref(),
         )?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2053,7 +2070,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_many_copy_sync(
         &self,
@@ -2067,6 +2084,7 @@ impl PyClient {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Vec<PyJob>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2080,6 +2098,7 @@ impl PyClient {
             metadata.as_ref(),
             run_at.as_ref(),
             unique_opts.as_ref(),
+            ordering_key.as_ref(),
         )?;
 
         py.detach(|| {
@@ -2092,7 +2111,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_many_copy<'py>(
         &self,
@@ -2106,6 +2125,7 @@ impl PyClient {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<Bound<'py, PyAny>> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2119,6 +2139,7 @@ impl PyClient {
             metadata.as_ref(),
             run_at.as_ref(),
             unique_opts.as_ref(),
+            ordering_key.as_ref(),
         )?;
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -2139,7 +2160,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_many_copy_sync(
         &self,
@@ -2153,6 +2174,7 @@ impl PyClient {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<usize> {
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
@@ -2166,6 +2188,7 @@ impl PyClient {
             metadata.as_ref(),
             run_at.as_ref(),
             unique_opts.as_ref(),
+            ordering_key.as_ref(),
         )?;
 
         py.detach(|| {
@@ -2189,7 +2212,7 @@ impl PyClient {
 
     // ── Sync counterparts ───────────────────────────────────────────
 
-    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None))]
+    #[pyo3(signature = (args, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
     #[allow(clippy::too_many_arguments)]
     fn insert_sync(
         &self,
@@ -2203,6 +2226,7 @@ impl PyClient {
         metadata: Option<Py<PyAny>>,
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
+        ordering_key: Option<Py<PyAny>>,
     ) -> PyResult<PyJob> {
         let pool = self.pool.clone();
         let args_bound = args.bind(py);
@@ -2227,6 +2251,10 @@ impl PyClient {
             .as_ref()
             .map(|value| parse_unique_opts(py, value.bind(py)))
             .transpose()?;
+        let ordering_key = ordering_key
+            .as_ref()
+            .map(|value| parse_ordering_key(py, value.bind(py)))
+            .transpose()?;
 
         py.detach(|| {
             pyo3_async_runtimes::tokio::get_runtime().block_on(async {
@@ -2242,6 +2270,7 @@ impl PyClient {
                         metadata: metadata_json,
                         tags,
                         unique,
+                        ordering_key,
                         ..Default::default()
                     },
                 )
@@ -2814,6 +2843,7 @@ fn prepare_insert_many_params(
     metadata: Option<&Py<PyAny>>,
     run_at: Option<&Py<PyAny>>,
     unique_opts: Option<&Py<PyAny>>,
+    ordering_key: Option<&Py<PyAny>>,
 ) -> PyResult<Vec<InsertParams>> {
     let metadata_json = metadata
         .map(|value| py_to_json(py, value.bind(py)))
@@ -2824,6 +2854,9 @@ fn prepare_insert_many_params(
         .transpose()?;
     let unique = unique_opts
         .map(|value| parse_unique_opts(py, value.bind(py)))
+        .transpose()?;
+    let ordering_key = ordering_key
+        .map(|value| parse_ordering_key(py, value.bind(py)))
         .transpose()?;
 
     jobs.iter()
@@ -2848,6 +2881,7 @@ fn prepare_insert_many_params(
                     metadata: metadata_json.clone(),
                     tags: tags.to_vec(),
                     unique: unique.clone(),
+                    ordering_key: ordering_key.clone(),
                     ..Default::default()
                 },
             })
@@ -2870,6 +2904,12 @@ struct ParsedQueueConfig {
     /// `QueueConfig` default (5m); `Some(0)` skips the deadline
     /// rescue path for this queue.
     deadline_duration_ms: Option<u64>,
+    /// Number of dispatcher/claimer loops for this queue. `None` keeps
+    /// the Rust `QueueConfig` default.
+    claimers: Option<u16>,
+    /// Maximum jobs claimed per dispatcher round-trip. `None` keeps the
+    /// Rust `QueueConfig` default.
+    claim_batch_size: Option<usize>,
 }
 
 /// Parse queue configs from Python input (list of tuples or dicts).
@@ -2910,6 +2950,8 @@ fn parse_queue_configs(
                 rate_limit: None,
                 priority_aging_interval_ms: None,
                 deadline_duration_ms: None,
+                claimers: None,
+                claim_batch_size: None,
             });
             continue;
         }
@@ -2988,6 +3030,24 @@ fn parse_queue_configs(
             .get_item("deadline_duration_ms")?
             .map(|v| v.extract())
             .transpose()?;
+        let claimers: Option<u16> = dict
+            .get_item("claimers")?
+            .map(|v| v.extract())
+            .transpose()?;
+        let claim_batch_size: Option<usize> = dict
+            .get_item("claim_batch_size")?
+            .map(|v| v.extract())
+            .transpose()?;
+        if claimers == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "claimers must be > 0",
+            ));
+        }
+        if claim_batch_size == Some(0) {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "claim_batch_size must be > 0",
+            ));
+        }
 
         configs.push(ParsedQueueConfig {
             name,
@@ -2997,6 +3057,8 @@ fn parse_queue_configs(
             rate_limit,
             priority_aging_interval_ms,
             deadline_duration_ms,
+            claimers,
+            claim_batch_size,
         });
     }
 
@@ -3025,6 +3087,8 @@ fn normalize_queue_configs(
                     rate_limit: None,
                     priority_aging_interval_ms: None,
                     deadline_duration_ms: None,
+                    claimers: None,
+                    claim_batch_size: None,
                 });
             }
         }

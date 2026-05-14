@@ -109,6 +109,60 @@ async def test_asyncpg_insert_job(awa_client):
 
 
 @pytest.mark.asyncio
+async def test_bridge_ordering_key_routes_to_same_shard_asyncpg(awa_client):
+    """Pure-Python bridge forwards ordering_key bytes to insert_job_compat."""
+    import asyncpg
+
+    schema = "awa_py_bridge_ordering_key"
+    queue = "bridge_ordering_key"
+    awa_client.install_queue_storage(schema=schema, reset=True)
+    tx = awa_client.transaction()
+    tx.execute(
+        """
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        """,
+        queue,
+    )
+    tx.commit()
+
+    conn = await asyncpg.connect(_DSN)
+    try:
+        async with conn.transaction():
+            first = await insert_job(
+                conn,
+                BridgeEmail(to="bridge-key-1@example.com", subject="One"),
+                queue=queue,
+                ordering_key=b"account-42",
+            )
+        async with conn.transaction():
+            second = await insert_job(
+                conn,
+                BridgeEmail(to="bridge-key-2@example.com", subject="Two"),
+                queue=queue,
+                ordering_key="account-42",
+            )
+
+        rows = await conn.fetch(
+            f"""
+            SELECT enqueue_shard
+            FROM {schema}.ready_entries
+            WHERE job_id = ANY($1::bigint[])
+            ORDER BY job_id
+            """,
+            [first["id"], second["id"]],
+        )
+        assert len(rows) == 2
+        assert len({row["enqueue_shard"] for row in rows}) == 1
+    finally:
+        tx = awa_client.transaction()
+        tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        tx.commit()
+        await conn.close()
+
+
+@pytest.mark.asyncio
 async def test_asyncpg_transaction_rollback(awa_client):
     """Jobs inserted in a rolled-back asyncpg transaction should not exist."""
     import asyncpg

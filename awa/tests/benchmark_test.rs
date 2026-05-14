@@ -1431,6 +1431,7 @@ async fn test_queue_storage_enqueue_contention() {
     let jobs_per_producer = env_i64("AWA_QS_CONTENTION_JOBS_PER_PRODUCER", 20_000);
     let batch_size = env_usize("AWA_QS_CONTENTION_BATCH_SIZE", 500);
     let use_copy = env_usize("AWA_QS_CONTENTION_USE_COPY", 0) != 0;
+    let enqueue_shards = env_usize("AWA_QS_CONTENTION_SHARDS", 1).clamp(1, 64) as i16;
     let storage_schema = env_string("AWA_VA_RUNTIME_STORAGE_SCHEMA", "awa_queue_storage");
 
     let pool = setup((producers as u32 * 4).max(20)).await;
@@ -1451,6 +1452,22 @@ async fn test_queue_storage_enqueue_contention() {
     activate_queue_storage_transition(&pool, store.schema()).await;
 
     let queue = "qs_enqueue_contention_shared";
+
+    // Seed queue_meta so `shard_for_enqueue` observes the desired shard
+    // count. Default (omit AWA_QS_CONTENTION_SHARDS) is 1, i.e. current
+    // single-row behaviour.
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, $2)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .bind(enqueue_shards)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards");
     let barrier = Arc::new(tokio::sync::Barrier::new(producers + 1));
     let store = Arc::new(store);
 
@@ -1504,9 +1521,10 @@ async fn test_queue_storage_enqueue_contention() {
     let seeded = (producers as i64) * jobs_per_producer;
     let rate = seeded as f64 / elapsed.as_secs_f64();
     println!(
-        "[qs-enqueue-bench] mode={} producers={} batch_size={} seeded={} elapsed={:.2}s rate={:.0}/s",
+        "[qs-enqueue-bench] mode={} producers={} shards={} batch_size={} seeded={} elapsed={:.2}s rate={:.0}/s",
         if use_copy { "copy" } else { "insert" },
         producers,
+        enqueue_shards,
         batch_size,
         seeded,
         elapsed.as_secs_f64(),

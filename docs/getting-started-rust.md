@@ -151,6 +151,23 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.
 
+## Routing related jobs to the same shard
+
+By default, a queue is strict FIFO per `(queue, priority)`. Operators can opt a contended queue into **partitioned FIFO** by raising `awa.queue_meta.enqueue_shards` — order is then preserved within each shard, but not across shards. If your producer enqueues jobs that must be processed in order (per-customer events, sequential workflow steps), pass `InsertOpts::ordering_key` so they all land on one shard:
+
+```rust
+use awa::InsertOpts;
+
+let opts = InsertOpts {
+    queue: "customer-updates".into(),
+    ordering_key: Some(format!("customer-{customer_id}").into_bytes()),
+    ..Default::default()
+};
+client.insert_with(UpdateCustomer { customer_id, payload }, opts).await?;
+```
+
+At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#raising-enqueue_shards) for the operator-side knob.
+
 ## Next
 
 - [Configuration reference](configuration.md)

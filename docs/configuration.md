@@ -126,6 +126,15 @@ The key `QueueConfig` fields:
 | `deadline_duration` | `5m` | Hard upper bound on a single attempt. Set to `Duration::ZERO` to skip the deadline rescue path; receipts mode (the 0.6 default storage) supports both shapes — the deadline lands on `lease_claims.deadline_at` and the maintenance rescue path force-closes expired claims. |
 | `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
+| `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
+| `claim_batch_size` | `128` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Benchmark before raising; larger batches can increase contention once multiple claimers are active. |
+
+Defaults intentionally favor the smallest blast radius:
+`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 128`. Raise
+`enqueue_shards` only when the queue can accept partitioned FIFO semantics.
+Raise `claimers` first when a single hot queue is drain-bound; local no-op
+benchmarks showed the useful step was `1 -> 4` claimers, while larger claim
+batches did not help once multiple claimers were active.
 
 ### Python
 
@@ -489,13 +498,37 @@ Use the defaults unless you have a reason not to:
 - Increase rotation intervals to reduce partition churn and metadata activity.
 - Decrease rotation intervals to tighten dead-tuple bounds at the cost of more frequent rotate/prune work.
 
-### Internal hot-queue claim control
+### Sharding the enqueue head per queue
 
-Queue storage also uses an internal bounded-claimer control plane
+Each queue's `awa.queue_meta.enqueue_shards` (default `1`, range `1..=64`) governs how many independent enqueue head rows the queue has. With the default value, the queue uses a single head row and the ordering contract is strict FIFO per `(queue, priority)` — identical to v016.
+
+Raising `enqueue_shards` is a **semantic mode switch**, not a hidden performance knob. The queue's contract becomes **partitioned FIFO** — strict order within `(queue, priority, enqueue_shard)`, no order promised across shards. It is the same kind of decision as choosing SQS Standard over SQS FIFO, raising Kafka partition count, or using Pub/Sub ordering keys.
+
+```sql
+-- Opt a contended queue into 4 shards.
+UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
+```
+
+A 16-producer same-queue local sweep measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1 (per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust) or `ordering_key=...` (Python) on insert — jobs sharing the key always land on the same shard regardless of which producer batch emitted them.
+
+Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
+
+Lowering the value is safe at any time — see [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#lowering-enqueue_shards). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the full design and contract.
+
+### Hot-Queue Claim Control
+
+Queue storage also uses a bounded-claimer control plane
 (`queue_claimer_state` / `queue_claimer_leases`) so not every replica hammers a
-hot queue's claim path at once. This is not a public `QueueConfig` knob in
-0.6; tune queue pressure first with ordinary worker counts and, for extreme
-single-queue workloads, `queue_stripe_count`.
+hot queue's claim path at once. For a single hot queue, raising
+`QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops
+while still sharing the queue's `max_workers` / `min_workers` permits.
+
+Keep `claimers` modest. Local no-op throughput tests improved materially from
+`1` to `4`, while higher values are expected to show diminishing returns and
+more database contention. For extreme single-queue workloads, benchmark
+`claimers = 2` and `4` before reaching for queue striping. Keep
+`claim_batch_size = 128` unless a workload-specific benchmark proves a larger
+batch helps.
 
 ## Dead Letter Queue
 

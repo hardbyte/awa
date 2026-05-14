@@ -333,6 +333,49 @@ async def test_per_queue_priority_aging_and_deadline_in_dict_config(client):
 
 
 @pytest.mark.asyncio
+async def test_per_queue_claimer_knobs_in_dict_config(client):
+    """Dict form accepts per-queue claim parallelism knobs."""
+    queue = "cfg_per_queue_claimer_knobs"
+    seen = asyncio.Event()
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        seen.set()
+        return None
+
+    await client.start(
+        [
+            {
+                "name": queue,
+                "max_workers": 4,
+                "claimers": 2,
+                "claim_batch_size": 256,
+            }
+        ]
+    )
+    try:
+        await client.insert(ConfigTestJob(value="claimers"), queue=queue)
+        await asyncio.wait_for(seen.wait(), timeout=5.0)
+    finally:
+        await client.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_per_queue_invalid_claimer_knobs_raise(client):
+    queue = "cfg_per_queue_bad_claimer_knobs"
+
+    @client.task(ConfigTestJob, queue=queue)
+    async def handle(job):
+        return None
+
+    with pytest.raises(ValueError, match="claimers"):
+        await client.start([{"name": queue, "max_workers": 4, "claimers": 0}])
+
+    with pytest.raises(ValueError, match="claim_batch_size"):
+        await client.start([{"name": queue, "max_workers": 4, "claim_batch_size": 0}])
+
+
+@pytest.mark.asyncio
 async def test_per_queue_aging_zero_disables_escalation(client):
     """`priority_aging_interval_ms=0` and `deadline_duration_ms=0`
     are meaningful values (not "use default"). The worker should
