@@ -20,16 +20,7 @@ pub enum JobState {
 
 impl fmt::Display for JobState {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            JobState::Scheduled => write!(f, "scheduled"),
-            JobState::Available => write!(f, "available"),
-            JobState::Running => write!(f, "running"),
-            JobState::Completed => write!(f, "completed"),
-            JobState::Retryable => write!(f, "retryable"),
-            JobState::Failed => write!(f, "failed"),
-            JobState::Cancelled => write!(f, "cancelled"),
-            JobState::WaitingExternal => write!(f, "waiting_external"),
-        }
+        f.write_str(self.as_str())
     }
 }
 
@@ -52,6 +43,20 @@ impl std::str::FromStr for JobState {
 }
 
 impl JobState {
+    /// Canonical snake_case representation used by Postgres and JSON.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            JobState::Scheduled => "scheduled",
+            JobState::Available => "available",
+            JobState::Running => "running",
+            JobState::Completed => "completed",
+            JobState::Retryable => "retryable",
+            JobState::Failed => "failed",
+            JobState::Cancelled => "cancelled",
+            JobState::WaitingExternal => "waiting_external",
+        }
+    }
+
     /// Bit position for unique_states bitmask.
     pub fn bit_position(&self) -> u8 {
         match self {
@@ -128,6 +133,12 @@ pub struct InsertOpts {
     pub metadata: serde_json::Value,
     pub tags: Vec<String>,
     pub unique: Option<UniqueOpts>,
+    /// Routes the job to a specific enqueue shard when the destination
+    /// queue has `enqueue_shards > 1`. Jobs sharing an `ordering_key`
+    /// land on the same shard, which preserves FIFO within that key.
+    /// `None` falls back to the per-store rotor that spreads batches
+    /// across shards. Ignored at `enqueue_shards = 1`. See ADR-025.
+    pub ordering_key: Option<Vec<u8>>,
 }
 
 impl Default for InsertOpts {
@@ -141,6 +152,7 @@ impl Default for InsertOpts {
             metadata: serde_json::json!({}),
             tags: Vec::new(),
             unique: None,
+            ordering_key: None,
         }
     }
 }

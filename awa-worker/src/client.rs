@@ -1,5 +1,7 @@
 use crate::completion::CompletionBatcher;
-use crate::dispatcher::{ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig};
+use crate::dispatcher::{
+    shared_rate_limiter, ConcurrencyMode, Dispatcher, OverflowPool, QueueConfig,
+};
 use crate::events::{BoxedUntypedEventHandler, JobEvent, UntypedJobEvent};
 use crate::executor::{BoxedWorker, DlqPolicy, JobError, JobExecutor, JobResult, Worker};
 use crate::heartbeat::HeartbeatService;
@@ -39,6 +41,10 @@ pub enum BuildError {
     InvalidRateLimit,
     #[error("queue weight must be > 0")]
     InvalidWeight,
+    #[error("queue claimers must be > 0")]
+    InvalidClaimers,
+    #[error("queue claim_batch_size must be > 0")]
+    InvalidClaimBatchSize,
     #[error("cleanup_batch_size must be > 0")]
     InvalidBatchSize,
     #[error("dlq_cleanup_batch_size must be > 0")]
@@ -595,6 +601,12 @@ impl ClientBuilder {
             }
             if config.weight == 0 {
                 return Err(BuildError::InvalidWeight);
+            }
+            if config.claimers == 0 {
+                return Err(BuildError::InvalidClaimers);
+            }
+            if config.claim_batch_size == 0 {
+                return Err(BuildError::InvalidClaimBatchSize);
             }
         }
 
@@ -1227,7 +1239,7 @@ impl Client {
             maintenance.run().await;
         }));
 
-        // Start a dispatcher per queue (uses dispatch_cancel — stops claiming first)
+        // Start dispatcher/claimer loops per queue (uses dispatch_cancel — stops claiming first).
         let mut dispatcher_handles = self.dispatcher_handles.write().await;
         for (queue_name, config) in &self.queues {
             let alive = self
@@ -1235,17 +1247,46 @@ impl Client {
                 .get(queue_name)
                 .cloned()
                 .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
+            let claimers = usize::from(config.claimers.max(1));
+            let capacity_wake = Arc::new(tokio::sync::Notify::new());
+            let rate_limiter = shared_rate_limiter(config);
 
-            let dispatcher = if let Some(overflow_pool) = &self.overflow_pool {
-                // Weighted mode
-                let concurrency = ConcurrencyMode::Weighted {
-                    local_semaphore: Arc::new(tokio::sync::Semaphore::new(
-                        config.min_workers as usize,
-                    )),
-                    overflow_pool: overflow_pool.clone(),
-                    queue_name: queue_name.clone(),
+            let hard_reserved = self
+                .overflow_pool
+                .is_none()
+                .then(|| Arc::new(tokio::sync::Semaphore::new(config.max_workers as usize)));
+            let weighted_local = self
+                .overflow_pool
+                .as_ref()
+                .map(|_| Arc::new(tokio::sync::Semaphore::new(config.min_workers as usize)));
+
+            for claimer_idx in 0..claimers {
+                let concurrency = if let Some(overflow_pool) = &self.overflow_pool {
+                    ConcurrencyMode::Weighted {
+                        local_semaphore: weighted_local
+                            .as_ref()
+                            .expect("weighted local semaphore should exist")
+                            .clone(),
+                        overflow_pool: overflow_pool.clone(),
+                        queue_name: queue_name.clone(),
+                    }
+                } else {
+                    ConcurrencyMode::HardReserved {
+                        semaphore: hard_reserved
+                            .as_ref()
+                            .expect("hard-reserved semaphore should exist")
+                            .clone(),
+                    }
                 };
-                Dispatcher::with_concurrency(
+                let claimer_owner_id = if claimer_idx == 0 {
+                    self.runtime_instance_id
+                } else {
+                    // queue_claimer_leases owner ids are independent lease tokens.
+                    // Extra dispatcher loops in the same runtime need distinct tokens
+                    // so they can hold separate bounded-claimer slots.
+                    Uuid::new_v4()
+                };
+                let dispatcher = Dispatcher::with_concurrency(
                     queue_name.clone(),
                     self.runtime_instance_id,
                     config.clone(),
@@ -1253,31 +1294,19 @@ impl Client {
                     executor.clone(),
                     self.metrics.clone(),
                     self.in_flight.clone(),
-                    alive,
+                    alive.clone(),
                     self.dispatch_cancel.clone(),
                     self.job_set.clone(),
                     concurrency,
+                    rate_limiter.clone(),
+                    capacity_wake.clone(),
+                    claimer_owner_id,
                     effective_storage.clone(),
-                )
-            } else {
-                // Hard-reserved mode (default)
-                Dispatcher::new(
-                    queue_name.clone(),
-                    self.runtime_instance_id,
-                    config.clone(),
-                    self.pool.clone(),
-                    executor.clone(),
-                    self.metrics.clone(),
-                    self.in_flight.clone(),
-                    alive,
-                    self.dispatch_cancel.clone(),
-                    self.job_set.clone(),
-                    effective_storage.clone(),
-                )
-            };
-            dispatcher_handles.push(tokio::spawn(async move {
-                dispatcher.run().await;
-            }));
+                );
+                dispatcher_handles.push(tokio::spawn(async move {
+                    dispatcher.run().await;
+                }));
+            }
         }
 
         self.publish_runtime_snapshot().await;
@@ -1562,6 +1591,8 @@ impl RuntimeReporterState {
                 poll_interval_ms: config.poll_interval.as_millis() as u64,
                 deadline_duration_secs: config.deadline_duration.as_secs(),
                 priority_aging_interval_secs: config.priority_aging_interval.as_secs(),
+                claimers: Some(config.claimers),
+                claim_batch_size: Some(config.claim_batch_size),
                 dlq_enabled: Some(self.dlq_policy.enabled_for(queue)),
                 rate_limit: config.rate_limit.as_ref().map(|rl| RateLimitSnapshot {
                     max_rate: rl.max_rate,

@@ -28,7 +28,7 @@ in-place as historical context.
 | 013 | [Run lease and guarded finalization](013-run-lease-and-guarded-finalization.md) | Accepted | `run_lease` is the per-attempt identity; every finalize matches on it | Composite key on `active_leases` per ADR-019 |
 | 014 | [Structured progress and metadata](014-structured-progress.md) | Accepted | JSONB progress buffer with heartbeat piggyback + atomic state-transition flush | Progress storage moved to `attempt_state` per ADR-019 |
 | 015 | [Builder-side lifecycle hooks](015-post-commit-lifecycle-hooks.md) | Accepted | Builder-side hooks fire after claim start and guarded finalization commits | Guard lives on `active_leases` per ADR-019 |
-| 016 | [Shared insert preparation and tokio-postgres adapter](016-bridge-adapters.md) | Accepted | Factor insert preparation into `PreparedRow`; tokio-postgres enqueue adapter | — |
+| 016 | [Public Rust Postgres enqueue adapter API](016-rust-postgres-enqueue-adapter-api.md) | Accepted | Public Postgres insert-preparation contract plus built-in tokio-postgres adapter | Enables external Rust enqueue adapters |
 | 017 | [Python insert-only transaction bridging](017-python-transaction-bridging.md) | Accepted | Python `awa.Transaction` is a thin wrapper over the Rust insert path | — |
 | 018 | [HTTP Worker for serverless job dispatch](018-http-worker.md) | Accepted | `Worker` impl that dispatches to Lambda / Cloud Run via HTTP + HMAC-BLAKE3 | Uses callback surface from ADR-021 |
 | 019 | [Queue Storage Engine](019-queue-storage-redesign.md) | Accepted | Append-only ready / terminal entries, narrow `active_leases`, optional `attempt_state`, rotating segments | Supersedes ADR-012 |
@@ -36,6 +36,8 @@ in-place as historical context.
 | 021 | [Sequential callbacks and callback heartbeats](021-enhanced-external-wait.md) | Accepted | `wait_for_callback()` + `resume_external()` for multi-step orchestration; `heartbeat_callback` for long-running externals | Callback state moved to `active_leases` per ADR-019 |
 | 022 | [Descriptor catalog](022-descriptor-catalog.md) | Accepted | `queue_descriptors` / `job_kind_descriptors` tables, BLAKE3-hashed, code-declared, off the hot path | Off the queue-storage hot path |
 | 023 | [Receipt plane ring partitioning](023-receipt-plane-ring-partitioning.md) | Accepted | Partitioned `lease_claims` / `lease_claim_closures` ring replaces `open_receipt_claims`; receipts default on in 0.6 | Refines ADR-019 receipt plane |
+| 024 | Deferred `done_entries` materialisation | Rejected | Investigated as a rotation guard; reverted in `053fec1` once a simpler integration test gave equivalent coverage | Historical |
+| 025 | [Sharded enqueue heads](025-sharded-enqueue-heads.md) | Accepted | Per-queue `enqueue_shards` (default 1) spreads `queue_enqueue_heads` row-lock contention across N rows; FIFO becomes per-shard at S>1 | Refines ADR-019 enqueue path |
 
 ## Validation artifacts
 

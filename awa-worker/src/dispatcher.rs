@@ -5,7 +5,7 @@ use awa_model::JobRow;
 use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, Semaphore};
 use tokio::task::JoinSet;
@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const CLAIM_BATCH_LIMIT: usize = 128;
+const DEFAULT_CLAIM_BATCH_LIMIT: usize = 128;
 const MAX_CLAIMERS_PER_QUEUE: i16 = 4;
 const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
 const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);
@@ -75,7 +75,7 @@ pub struct RateLimit {
 }
 
 /// Internal token bucket state for rate limiting.
-struct TokenBucket {
+pub(crate) struct TokenBucket {
     tokens: f64,
     max_tokens: f64,
     refill_rate: f64,
@@ -110,6 +110,18 @@ impl TokenBucket {
     fn consume(&mut self, n: u32) {
         self.tokens -= n as f64;
     }
+
+    fn refund(&mut self, n: u32) {
+        self.tokens = (self.tokens + n as f64).min(self.max_tokens);
+    }
+}
+
+pub(crate) fn shared_rate_limiter(config: &QueueConfig) -> Option<Arc<StdMutex<TokenBucket>>> {
+    config
+        .rate_limit
+        .as_ref()
+        .map(TokenBucket::new)
+        .map(|bucket| Arc::new(StdMutex::new(bucket)))
 }
 
 /// Configuration for a single queue.
@@ -125,6 +137,14 @@ pub struct QueueConfig {
     pub min_workers: u32,
     /// Weight for overflow allocation in weighted mode (default: 1).
     pub weight: u32,
+    /// Number of dispatcher/claimer loops for this queue.
+    ///
+    /// `max_workers` / `min_workers` still define total queue capacity;
+    /// claimers share those permits. Raising this above 1 lets one runtime
+    /// use multiple queue-storage claimer leases for hot queues.
+    pub claimers: u16,
+    /// Maximum jobs a dispatcher attempts to claim in one DB round-trip.
+    pub claim_batch_size: usize,
 }
 
 impl Default for QueueConfig {
@@ -137,6 +157,8 @@ impl Default for QueueConfig {
             rate_limit: None,
             min_workers: 0,
             weight: 1,
+            claimers: 1,
+            claim_batch_size: DEFAULT_CLAIM_BATCH_LIMIT,
         }
     }
 }
@@ -283,48 +305,13 @@ pub struct Dispatcher {
     alive: Arc<AtomicBool>,
     cancel: CancellationToken,
     job_set: Arc<Mutex<JoinSet<()>>>,
-    rate_limiter: Option<TokenBucket>,
+    rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
     storage: RuntimeStorage,
     capacity_wake: Arc<Notify>,
+    claimer_owner_id: Uuid,
 }
 
 impl Dispatcher {
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn new(
-        queue: String,
-        runtime_instance_id: Uuid,
-        config: QueueConfig,
-        pool: PgPool,
-        executor: Arc<JobExecutor>,
-        metrics: crate::metrics::AwaMetrics,
-        in_flight: InFlightMap,
-        alive: Arc<AtomicBool>,
-        cancel: CancellationToken,
-        job_set: Arc<Mutex<JoinSet<()>>>,
-        storage: RuntimeStorage,
-    ) -> Self {
-        let concurrency = ConcurrencyMode::HardReserved {
-            semaphore: Arc::new(Semaphore::new(config.max_workers as usize)),
-        };
-        let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
-        Self {
-            queue,
-            runtime_instance_id,
-            config,
-            pool,
-            executor,
-            metrics,
-            _in_flight: in_flight,
-            concurrency,
-            alive,
-            cancel,
-            job_set,
-            rate_limiter,
-            storage,
-            capacity_wake: Arc::new(Notify::new()),
-        }
-    }
-
     /// Create a dispatcher with a specific concurrency mode (used for weighted mode).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn with_concurrency(
@@ -339,9 +326,11 @@ impl Dispatcher {
         cancel: CancellationToken,
         job_set: Arc<Mutex<JoinSet<()>>>,
         concurrency: ConcurrencyMode,
+        rate_limiter: Option<Arc<StdMutex<TokenBucket>>>,
+        capacity_wake: Arc<Notify>,
+        claimer_owner_id: Uuid,
         storage: RuntimeStorage,
     ) -> Self {
-        let rate_limiter = config.rate_limit.as_ref().map(TokenBucket::new);
         Self {
             queue,
             runtime_instance_id,
@@ -356,7 +345,8 @@ impl Dispatcher {
             job_set,
             rate_limiter,
             storage,
-            capacity_wake: Arc::new(Notify::new()),
+            capacity_wake,
+            claimer_owner_id,
         }
     }
 
@@ -366,6 +356,8 @@ impl Dispatcher {
         self.alive.store(true, Ordering::SeqCst);
         info!(
             queue = %self.queue,
+            runtime_instance_id = %self.runtime_instance_id,
+            claimer_owner_id = %self.claimer_owner_id,
             poll_interval_ms = self.config.poll_interval.as_millis(),
             "Dispatcher started"
         );
@@ -446,7 +438,7 @@ impl Dispatcher {
         let mut permits = Vec::new();
         match &self.concurrency {
             ConcurrencyMode::HardReserved { semaphore } => {
-                for _ in 0..CLAIM_BATCH_LIMIT {
+                for _ in 0..self.config.claim_batch_size {
                     match semaphore.clone().try_acquire_owned() {
                         Ok(p) => permits.push(DispatchPermit::Hard(p)),
                         Err(_) => break,
@@ -459,14 +451,15 @@ impl Dispatcher {
                 queue_name,
             } => {
                 // First: local (guaranteed) permits
-                for _ in 0..CLAIM_BATCH_LIMIT {
+                for _ in 0..self.config.claim_batch_size {
                     match local_semaphore.clone().try_acquire_owned() {
                         Ok(p) => permits.push(DispatchPermit::Local(p)),
                         Err(_) => break,
                     }
                 }
                 // Then: overflow permits up to the claim batch limit.
-                let overflow_wanted = (CLAIM_BATCH_LIMIT.saturating_sub(permits.len())) as u32;
+                let overflow_wanted =
+                    (self.config.claim_batch_size.saturating_sub(permits.len())) as u32;
                 let granted = overflow_pool.try_acquire(queue_name, overflow_wanted);
                 for _ in 0..granted {
                     permits.push(DispatchPermit::Overflow {
@@ -477,6 +470,16 @@ impl Dispatcher {
             }
         }
         permits
+    }
+
+    fn refund_rate_limit(&self, n: usize) {
+        if n == 0 {
+            return;
+        }
+        if let Some(rate_limiter) = &self.rate_limiter {
+            let mut rate_limiter = rate_limiter.lock().expect("rate limiter lock poisoned");
+            rate_limiter.refund(n as u32);
+        }
     }
 
     /// Drain immediately available work after a wake-up until the queue is empty,
@@ -516,12 +519,20 @@ impl Dispatcher {
         }
 
         // Phase 2: Apply rate limit
-        let rate_available = self
-            .rate_limiter
-            .as_mut()
-            .map(|rl| rl.available() as usize)
-            .unwrap_or(usize::MAX);
-        let batch_size = permits.len().min(rate_available).min(CLAIM_BATCH_LIMIT);
+        let batch_size = if let Some(rate_limiter) = &self.rate_limiter {
+            let mut rate_limiter = rate_limiter.lock().expect("rate limiter lock poisoned");
+            let rate_available = rate_limiter.available() as usize;
+            let batch_size = permits
+                .len()
+                .min(rate_available)
+                .min(self.config.claim_batch_size);
+            if batch_size > 0 {
+                rate_limiter.consume(batch_size as u32);
+            }
+            batch_size
+        } else {
+            permits.len().min(self.config.claim_batch_size)
+        };
         if batch_size == 0 {
             // Drop all permits — rate limited
             if let Some((reason, _)) = wake_context {
@@ -595,6 +606,7 @@ impl Dispatcher {
                     .collect(),
                 Err(err) => {
                     warn!(queue = %self.queue, error = %err, "Failed to claim jobs");
+                    self.refund_rate_limit(batch_size);
                     return false;
                 }
             },
@@ -606,8 +618,8 @@ impl Dispatcher {
                     batch_size as i64,
                     self.config.deadline_duration,
                     self.config.priority_aging_interval,
-                    self.runtime_instance_id,
-                    max_claimers_per_queue(),
+                    self.claimer_owner_id,
+                    max_claimers_per_queue().max(self.config.claimers as i16),
                     CLAIMER_LEASE_TTL,
                     CLAIMER_IDLE_THRESHOLD,
                 )
@@ -627,6 +639,7 @@ impl Dispatcher {
                         error = %err,
                         "Failed to claim queue storage jobs"
                     );
+                    self.refund_rate_limit(batch_size);
                     return false;
                 }
             },
@@ -634,8 +647,28 @@ impl Dispatcher {
         self.metrics
             .record_claim_batch(&self.queue, jobs.len() as u64, claim_start.elapsed());
         if !jobs.is_empty() {
-            self.metrics
-                .record_job_claimed(&self.queue, jobs.len() as u64);
+            // Queue-storage carries an `enqueue_shard` on every claim;
+            // bucket the batch so dashboards can sum
+            // `awa.job.claimed` by `awa.enqueue.shard` and confirm the
+            // claim ordering rotates across shards. Canonical claims
+            // have no shard and report through the un-decorated form.
+            let mut by_shard: std::collections::BTreeMap<i16, u64> =
+                std::collections::BTreeMap::new();
+            let mut canonical_count: u64 = 0;
+            for dispatched in &jobs {
+                match &dispatched.queue_storage_claim {
+                    Some(claim) => *by_shard.entry(claim.enqueue_shard).or_default() += 1,
+                    None => canonical_count += 1,
+                }
+            }
+            for (shard, count) in by_shard {
+                self.metrics
+                    .record_job_claimed_by_shard(&self.queue, shard, count);
+            }
+            if canonical_count > 0 {
+                self.metrics
+                    .record_job_claimed(&self.queue, canonical_count);
+            }
             // Wait duration = created_at → now() (claim moment).
             //
             // Earlier this used `attempted_at - created_at`, but the
@@ -656,6 +689,9 @@ impl Dispatcher {
                     self.metrics.record_wait_duration(&self.queue, wait_secs);
                 }
             }
+        }
+        if jobs.len() < batch_size {
+            self.refund_rate_limit(batch_size - jobs.len());
         }
 
         // Phase 4: Release excess permits if DB had fewer jobs
@@ -687,12 +723,7 @@ impl Dispatcher {
 
         debug!(queue = %self.queue, count = jobs.len(), "Claimed jobs");
 
-        // Phase 6: Consume rate limit tokens
-        if let Some(rl) = &mut self.rate_limiter {
-            rl.consume(jobs.len() as u32);
-        }
-
-        // Phase 7: Dispatch (each job takes one pre-acquired permit)
+        // Phase 6: Dispatch (each job takes one pre-acquired permit)
         let mut set = self.job_set.lock().await;
         // Reap completed task handles. JoinSet retains JoinHandles (and the
         // task Cell they keep alive) until join_next() consumes them; under

@@ -4,6 +4,56 @@ Insert Awa jobs within existing transactions from non-sqlx Postgres libraries.
 
 The core `awa::insert` and `awa::insert_with` functions require sqlx's `PgExecutor` trait. Bridge adapters let users of other libraries enqueue jobs without depending on sqlx directly. All adapters share the same preparation logic (validation, state determination, unique key computation) as the sqlx path — no semantic drift between drivers.
 
+## Rust: external adapter API
+
+External Rust integration crates can reuse Awa's canonical insert preparation
+without depending on sqlx executors. The stable surface is
+`awa::adapter::postgres`:
+
+```rust
+use awa::adapter::postgres::{
+    prepare_job_insert, INSERT_JOB_SQL, UNIQUE_VIOLATION_SQLSTATE,
+};
+use awa::InsertOpts;
+
+let prepared = prepare_job_insert(&args, InsertOpts::default())?;
+
+// Execute INSERT_JOB_SQL with your driver's transaction or connection type.
+// Bind values in this order:
+// 1. prepared.kind()
+// 2. prepared.queue()
+// 3. prepared.args()
+// 4. prepared.state_db_str()
+// 5. prepared.priority()
+// 6. prepared.max_attempts()
+// 7. prepared.run_at()
+// 8. prepared.metadata()
+// 9. prepared.tags()
+// 10. prepared.unique_key()
+// 11. prepared.unique_states_bit_string()
+// 12. prepared.ordering_key()
+```
+
+`prepare_job_insert` and `prepare_raw_job_insert` apply the same validation,
+scheduled-state selection, unique-key computation, unique-state bitmask
+formatting, and sharded enqueue ordering-key propagation as Awa's built-in
+sqlx insert path. Adapters should map Postgres SQLSTATE
+`UNIQUE_VIOLATION_SQLSTATE` to `AwaError::UniqueConflict`.
+
+This API is intentionally single-row. High-throughput bulk ingestion remains
+on Awa's native SQLx-backed APIs (`insert_many_copy_from_pool`) and the
+queue-storage-native COPY path (`QueueStorage::enqueue_params_copy`), because
+COPY support, row return semantics, and uniqueness handling are
+driver-specific.
+
+Worker polling, heartbeating, claiming, and completion remain on the Awa
+runtime. That does not prevent applications from using their existing
+database stack inside job handlers: pass a SeaORM connection, Diesel pool, or
+other app dependency through `Client::builder(...).state(...)` and extract it
+from `JobContext`. Integration crates can provide ergonomic helpers for this
+handler dependency wiring, but should not reimplement Awa's lease/runtime
+storage engine.
+
 ## Rust: tokio-postgres
 
 ### Dependencies

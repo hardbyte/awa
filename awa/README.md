@@ -66,6 +66,30 @@ async fn main() -> anyhow::Result<()> {
 - **First-class Python bindings** — same engine, same SQL, same defaults;
   see [awa-pg on PyPI](https://pypi.org/project/awa-pg/).
 
+## Partitioned FIFO and ordering keys
+
+Queues default to strict FIFO per `(queue, priority)`. Operators
+can raise `awa.queue_meta.enqueue_shards` on a contended queue to
+trade strict FIFO for throughput; the contract then becomes
+**partitioned FIFO** — strict order within each shard, no ordering
+promised across shards. Producers can pin related jobs to the same
+shard with `InsertOpts::ordering_key`:
+
+```rust
+let opts = InsertOpts {
+    queue: "customer-updates".into(),
+    ordering_key: Some(format!("customer-{customer_id}").into_bytes()),
+    ..Default::default()
+};
+client.insert_with(UpdateCustomer { ... }, opts).await?;
+```
+
+Jobs sharing an `ordering_key` always pick the same shard, so the
+shard's strict FIFO carries over to per-key FIFO. At
+`enqueue_shards = 1` the key is ignored. See
+[ADR-025](../docs/adr/025-sharded-enqueue-heads.md) for the full
+contract.
+
 ## Documentation
 
 - [Getting started (Rust)](../docs/getting-started-rust.md)

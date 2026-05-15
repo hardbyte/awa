@@ -64,3 +64,11 @@ Expose a public Python bridge module, `awa.bridge`, with insert-only helpers tha
 - The supported bridge surfaces become a compatibility commitment and must stay exercised in CI.
 - ADR-006 remains valid for the core principle that Awa should not share database connections across drivers or become an ORM integration layer.
 - The bridge has a broader support matrix than `AwaTransaction`, so semantic drift is the main maintenance risk; parity tests are the primary mitigation.
+
+## Relationship to ADR-016
+
+ADR-016 applies the same insert-only bridge principle to Rust driver
+integrations. Rust adapters use the public `awa::adapter::postgres`
+preparation and SQL contract; Python bridges keep their Python-facing API but
+must preserve the same validation, state selection, uniqueness, and
+transaction-participation semantics.

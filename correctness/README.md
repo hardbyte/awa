@@ -76,6 +76,15 @@ What is intentionally not modeled:
   commit and passes. Production uses CAS on ring state plus child-partition
   locks and busy checks, not `FOR SHARE` on `lease_ring_state` — see
   `storage/MAPPING.md` for the full analysis.
+- `storage/AwaShardedPrune.tla` /
+  `storage/AwaShardedPrune.cfg` /
+  `storage/AwaShardedPruneBroken.cfg`: focused ADR-025 regression model for
+  queue-ring prune across enqueue shards. The passing config requires ready
+  rows to match done rows by `(enqueue_shard, lane_seq)` before prune can drop
+  a sealed queue slot. The broken config intentionally ignores
+  `enqueue_shard` and produces the historical counterexample: shard 0 has a
+  done row at `lane_seq = 1`, shard 1 still has a pending ready row at
+  `lane_seq = 1`, and broken prune drops both.
 - `storage/AwaStorageLockOrder.tla` / `storage/AwaStorageLockOrder.cfg` /
   `storage/AwaStorageLockOrderDeadlockDemo.cfg` /
   `storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg`: lock-ordering protocol
@@ -150,6 +159,8 @@ From the repository root:
 ./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
 ./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
+./correctness/run-tlc.sh storage/AwaShardedPrune.tla
+./correctness/run-tlc.sh storage/AwaShardedPrune.tla storage/AwaShardedPruneBroken.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
 ./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
@@ -209,8 +220,11 @@ so TLC explores a finite reclaim/finalize surface instead of an unbounded loop.
 - `leader` as the abstract maintenance lease holder
 - local permit floors via `MinWorkers`
 - weighted overflow via `Weight`, `GlobalOverflow`, and derived queue contention
-- `BatchMax` and per-instance `rateBudget[i][q]` as bounded abstractions of
-  dispatcher batching and queue-level rate limiting
+- `BatchMax` and per-runtime `rateBudget[i][q]` as bounded abstractions of
+  dispatcher batching and queue-level rate limiting. Multiple dispatcher
+  claimers inside one runtime refine this same abstraction: they share the
+  runtime's worker permits and queue rate limiter, so they increase claim
+  parallelism without increasing modeled capacity.
 - `DeferredRowsIdle`, which captures the hot/deferred storage split by requiring
   `retryable` jobs to have no live owner, permit, or in-flight task
 - `DrainTimeout(i)`, `Abandoned(j)`, and `RecoverableAbandoned(j)` so one
@@ -233,6 +247,12 @@ invariants are that `attempt_state` can only exist for live leases, waiting is
 a lease state rather than a separate table, deferred jobs hold no live runtime
 state, and ready/lease/terminal/claim segments cannot be pruned while they
 still own live rows.
+
+`AwaShardedPrune` covers the cross-shard prune property that the lifecycle
+model deliberately abstracts away: `lane_seq` values are only unique within an
+`enqueue_shard`, so any ready/done anti-join used for queue-slot prune must
+include `enqueue_shard`. The passing config checks the fixed predicate; the
+broken config remains as a regression witness.
 
 `AwaBatcher` models the async completion path between handler return and DB
 update. In the real system (`awa-worker/src/completion.rs`), completed jobs

@@ -127,6 +127,20 @@ python -m awa --database-url "$DATABASE_URL" serve
 - `awa.Client` provides a synchronous API for Django or Flask — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`, `client.transaction()`).
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
 
+### Routing related jobs to the same shard
+
+By default, a queue is strict FIFO per `(queue, priority)`. Operators can opt a contended queue into **partitioned FIFO** by raising `awa.queue_meta.enqueue_shards` — order is then preserved within each shard, but not across shards. If your producer enqueues jobs that must be processed in order (per-customer events, sequential workflow steps), pass `ordering_key` so they all land on one shard:
+
+```python
+await client.insert(
+    UpdateCustomer(customer_id=42, payload=...),
+    queue="customer-updates",
+    ordering_key=b"customer-42",  # str also accepted; UTF-8 encoded
+)
+```
+
+At the default `enqueue_shards = 1` the key is ignored (everything is on shard 0 anyway). See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#raising-enqueue_shards) for the operator-side knob.
+
 ### Exporting OpenTelemetry metrics
 
 awa records 20+ metrics (throughput, pickup latency, in-flight jobs, rescues, …) on the Rust side. Python workers enable OTLP export by calling `awa.init_telemetry(...)` once before the worker starts:

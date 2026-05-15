@@ -61,6 +61,12 @@ harness that verifies concrete runtime-test event sequences against the spec.
 - **No lost work under failure** takes priority over clever fast paths. If a
   design weakens crash/restart safety, it loses even if the benchmark looks
   better.
+- **Strict FIFO per `(queue, priority)` by default.** Operators can opt a
+  contended queue into **partitioned FIFO** by raising
+  `awa.queue_meta.enqueue_shards` — the same kind of trade as choosing SQS
+  Standard over SQS FIFO, or raising Kafka partition count. Producers pin
+  related jobs to one shard with `ordering_key`. See
+  [ADR-025](docs/adr/025-sharded-enqueue-heads.md).
 
 ## Benchmarks
 
@@ -412,7 +418,7 @@ Rust and Python workers coexist on the same queues. See
 - [013: Durable run leases and guarded finalization](docs/adr/013-run-lease-and-guarded-finalization.md)
 - [014: Structured progress and metadata](docs/adr/014-structured-progress.md)
 - [015: Builder-side lifecycle hooks](docs/adr/015-post-commit-lifecycle-hooks.md)
-- [016: Shared insert preparation and tokio-postgres adapter](docs/adr/016-bridge-adapters.md)
+- [016: Public Rust Postgres enqueue adapter API](docs/adr/016-rust-postgres-enqueue-adapter-api.md)
 - [017: Python insert-only transaction bridging](docs/adr/017-python-transaction-bridging.md)
 - [018: HTTP Worker for serverless job dispatch](docs/adr/018-http-worker.md)
 - [019: Queue Storage Engine](docs/adr/019-queue-storage-redesign.md)

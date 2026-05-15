@@ -72,6 +72,36 @@ Existing 0.5.x installations should follow
 [`docs/upgrade-0.5-to-0.6.md`](https://github.com/hardbyte/awa/blob/main/docs/upgrade-0.5-to-0.6.md)
 for the staged transition.
 
+## Partitioned FIFO and ordering keys
+
+Queues default to strict FIFO per `(queue, priority)`. Operators
+can raise `awa.queue_meta.enqueue_shards` on a contended queue to
+trade strict FIFO for throughput; the contract then becomes
+**partitioned FIFO** — strict order within each shard, no ordering
+promised across shards. This is the same kind of decision as
+choosing SQS Standard over SQS FIFO, raising Kafka partition
+count, or using Pub/Sub ordering keys.
+
+If your producer enqueues *related* jobs that must execute in
+order — events for one customer, steps in one workflow, writes for
+one account — pass `ordering_key` so all jobs sharing that key
+land on the same shard:
+
+```python
+await client.insert(
+    UpdateCustomer(customer_id=42, payload=...),
+    queue="customer-updates",
+    ordering_key=b"customer-42",
+)
+```
+
+The key can be `bytes` or `str` (encoded UTF-8). Two enqueues with
+the same key always pick the same shard regardless of which
+producer process or batch they came from. At `enqueue_shards = 1`
+(the default) the key is ignored. See
+[`docs/adr/025-sharded-enqueue-heads.md`](https://github.com/hardbyte/awa/blob/main/docs/adr/025-sharded-enqueue-heads.md)
+for the full contract.
+
 ## Documentation
 
 - [Getting started (Python)](https://github.com/hardbyte/awa/blob/main/docs/getting-started-python.md)

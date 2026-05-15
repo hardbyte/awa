@@ -473,11 +473,41 @@ impl AwaMetrics {
     }
 
     /// Record a job claimed from queue.
+    ///
+    /// Use this for the canonical engine, which has no per-shard
+    /// concept. The queue-storage engine uses
+    /// [`record_job_claimed_by_shard`][Self::record_job_claimed_by_shard]
+    /// so dashboards can read per-shard fairness directly.
     pub fn record_job_claimed(&self, queue: &str, batch_size: u64) {
         let attrs = [opentelemetry::KeyValue::new(
             "awa.job.queue",
             queue.to_string(),
         )];
+        self.jobs_claimed.add(batch_size, &attrs);
+    }
+
+    /// Record a job claimed from queue, decorated with the enqueue shard.
+    ///
+    /// Used by the queue-storage path so dashboards can sum
+    /// `awa.job.claimed` by `awa.enqueue.shard` and confirm the claim
+    /// ordering is rotating across shards rather than starving the
+    /// higher-numbered ones. At `enqueue_shards > 1` this is the only
+    /// fairness signal that the operator gets from telemetry alone; at
+    /// `enqueue_shards = 1` the attribute is always `0` and the series
+    /// is identical to the un-decorated form.
+    ///
+    /// Call sites must not double-emit — invoke either this OR
+    /// `record_job_claimed`, never both for the same claim, or the
+    /// `awa.job.claimed` total will count each claim twice when
+    /// dashboards sum across all attribute combinations.
+    pub fn record_job_claimed_by_shard(&self, queue: &str, enqueue_shard: i16, batch_size: u64) {
+        if batch_size == 0 {
+            return;
+        }
+        let attrs = [
+            opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
+            opentelemetry::KeyValue::new("awa.enqueue.shard", enqueue_shard as i64),
+        ];
         self.jobs_claimed.add(batch_size, &attrs);
     }
 

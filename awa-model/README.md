@@ -36,8 +36,9 @@ against the admin API.
   `ready_entries` / `deferred_jobs`.
 - **Storage status** (`storage`) — `StorageStatus` and the
   transition-state primitives the `awa storage` CLI surfaces.
-- **Bridge adapters** (`bridge`) — `PreparedRow` and friends used by
-  the Python and tokio-postgres enqueue bridges.
+- **Adapter API** (`adapter`) — stable Postgres insert preparation and SQL
+  contract for external enqueue bridges.
+- **Bridge adapters** (`bridge`) — built-in tokio-postgres enqueue bridge.
 - **Errors** — `AwaError`, the single error type shared across the
   workspace.
 
