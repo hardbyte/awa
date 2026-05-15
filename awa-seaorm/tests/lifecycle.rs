@@ -1,4 +1,4 @@
-use awa::{InsertOpts, JobState, ListJobsFilter};
+use awa::{AwaError, InsertOpts, InsertParams, JobState, ListJobsFilter};
 use awa_seaorm::{migrate, JobRepository};
 use sea_orm::DatabaseConnection;
 use uuid::Uuid;
@@ -155,6 +155,57 @@ async fn bulk_retry_clears_callback_fields() {
     assert_eq!(retried[0].callback_on_complete, None);
     assert_eq!(retried[0].callback_on_fail, None);
     assert_eq!(retried[0].callback_transform, None);
+}
+
+#[tokio::test]
+async fn repository_insert_many_is_atomic() {
+    let queue = "seaorm_lifecycle_insert_many";
+    let (pool, db) = setup_database(queue).await;
+    let repo = JobRepository::new(&db);
+
+    let inserted = repo
+        .insert_many(&[
+            InsertParams {
+                kind: "seaorm_insert_many_ok".to_string(),
+                args: serde_json::json!({"n": 1}),
+                opts: opts(queue),
+            },
+            InsertParams {
+                kind: "seaorm_insert_many_ok".to_string(),
+                args: serde_json::json!({"n": 2}),
+                opts: opts(queue),
+            },
+        ])
+        .await
+        .expect("insert_many success");
+    assert_eq!(inserted.len(), 2);
+    assert!(inserted.iter().all(|row| row.state == JobState::Available));
+
+    let err = repo
+        .insert_many(&[
+            InsertParams {
+                kind: "seaorm_insert_many_rollback".to_string(),
+                args: serde_json::json!({"n": 1}),
+                opts: opts(queue),
+            },
+            InsertParams {
+                kind: "seaorm_insert_many_rollback".to_string(),
+                args: serde_json::json!({"bad": "hello\u{0000}world"}),
+                opts: opts(queue),
+            },
+        ])
+        .await
+        .expect_err("invalid second row should fail insert_many");
+    assert!(matches!(err, AwaError::Validation(_)));
+
+    let rolled_back: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs WHERE queue = $1 AND kind = 'seaorm_insert_many_rollback'",
+    )
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("count rolled-back insert_many rows");
+    assert_eq!(rolled_back, 0);
 }
 
 #[tokio::test]

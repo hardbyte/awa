@@ -4,12 +4,13 @@ use awa::adapter::postgres::{
     prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert, INSERT_JOB_SQL,
 };
 use awa::{
-    AwaError, CallbackConfig, CallbackPollResult, DefaultAction, InsertOpts, InsertParams, JobArgs,
-    JobDump, JobRow, JobState, ListJobsFilter, ResolveOutcome, RunDump,
+    AwaError, CallbackConfig, CallbackPollResult, DefaultAction, DlqMetadata, InsertOpts,
+    InsertParams, JobArgs, JobDump, JobRow, JobState, ListJobsFilter, ResolveOutcome, RunDump,
 };
 use sea_orm::{ConnectionTrait, Statement, TransactionSession, TransactionTrait};
 use uuid::Uuid;
 
+/// SeaORM-backed repository for Awa job enqueue and lifecycle operations.
 pub struct JobRepository<'db, C> {
     db: &'db C,
 }
@@ -18,14 +19,17 @@ impl<'db, C> JobRepository<'db, C>
 where
     C: ConnectionTrait,
 {
+    /// Create a repository over a SeaORM connection or transaction.
     pub fn new(db: &'db C) -> Self {
         Self { db }
     }
 
+    /// Insert a job using the type-provided job kind and serialized arguments.
     pub async fn insert(&self, args: &impl JobArgs) -> Result<JobRow, AwaError> {
         self.insert_with(args, InsertOpts::default()).await
     }
 
+    /// Insert a job with explicit enqueue options.
     pub async fn insert_with(
         &self,
         args: &impl JobArgs,
@@ -35,6 +39,7 @@ where
         self.insert_prepared(&prepared).await
     }
 
+    /// Insert a job from a raw kind name, JSON-compatible arguments, and options.
     pub async fn insert_raw(
         &self,
         kind: impl Into<String>,
@@ -45,17 +50,7 @@ where
         self.insert_prepared(&prepared).await
     }
 
-    pub async fn insert_many(&self, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError> {
-        let mut rows = Vec::with_capacity(jobs.len());
-        for job in jobs {
-            rows.push(
-                self.insert_raw(job.kind.clone(), job.args.clone(), job.opts.clone())
-                    .await?,
-            );
-        }
-        Ok(rows)
-    }
-
+    /// Fetch a job by id.
     pub async fn get_job(&self, job_id: i64) -> Result<JobRow, AwaError> {
         let sql = format!("SELECT {JOB_COLUMNS} FROM awa.jobs WHERE id = $1");
         self.query_optional_job(&sql, vec![job_id.into()])
@@ -63,6 +58,7 @@ where
             .ok_or(AwaError::JobNotFound { id: job_id })
     }
 
+    /// List jobs using the same filter shape as Awa admin helpers.
     pub async fn list_jobs(&self, filter: &ListJobsFilter) -> Result<Vec<JobRow>, AwaError> {
         let state = filter.state.map(|state| state.as_str().to_string());
         let limit = filter.limit.unwrap_or(100).clamp(1, 1000);
@@ -93,16 +89,20 @@ where
         .await
     }
 
+    /// Build an administrative dump for one job, including DLQ metadata when present.
     pub async fn dump_job(&self, job_id: i64) -> Result<JobDump, AwaError> {
         let job = self.get_job(job_id).await?;
-        Ok(awa::admin::build_job_dump_from_row(job, None))
+        let dlq = self.get_dlq_metadata(job_id).await?;
+        Ok(awa::admin::build_job_dump_from_row(job, dlq))
     }
 
+    /// Build an administrative run dump for the current or selected attempt.
     pub async fn dump_run(&self, job_id: i64, attempt: Option<i16>) -> Result<RunDump, AwaError> {
         let job = self.get_job(job_id).await?;
         awa::admin::build_run_dump_from_row(&job, attempt)
     }
 
+    /// Retry a failed, cancelled, or external-waiting job.
     pub async fn retry(&self, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let sql = format!(
             r#"
@@ -122,6 +122,7 @@ where
             .map(Some)
     }
 
+    /// Cancel a non-terminal job and notify running or externally waiting workers.
     pub async fn cancel(&self, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let sql = format!(
             r#"
@@ -129,6 +130,7 @@ where
                 SELECT id, state AS prior_state
                 FROM awa.jobs
                 WHERE id = $1
+                FOR UPDATE
             ),
             updated AS (
                 UPDATE awa.jobs AS jobs
@@ -159,6 +161,7 @@ where
             .map(Some)
     }
 
+    /// Retry all retryable jobs in the provided id list.
     pub async fn bulk_retry(&self, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -178,6 +181,7 @@ where
         self.query_jobs(&sql, vec![ids.to_vec().into()]).await
     }
 
+    /// Cancel all non-terminal jobs in the provided id list.
     pub async fn bulk_cancel(&self, ids: &[i64]) -> Result<Vec<JobRow>, AwaError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -196,6 +200,7 @@ where
         self.query_jobs(&sql, vec![ids.to_vec().into()]).await
     }
 
+    /// Cancel the first active job matching the computed unique key.
     pub async fn cancel_by_unique_key(
         &self,
         kind: &str,
@@ -229,6 +234,7 @@ where
         }
     }
 
+    /// Retry failed jobs with the given kind.
     pub async fn retry_failed_by_kind(&self, kind: &str) -> Result<Vec<JobRow>, AwaError> {
         let sql = format!(
             r#"
@@ -242,6 +248,7 @@ where
         self.query_jobs(&sql, vec![kind.into()]).await
     }
 
+    /// Retry failed jobs in the given queue.
     pub async fn retry_failed_by_queue(&self, queue: &str) -> Result<Vec<JobRow>, AwaError> {
         let sql = format!(
             r#"
@@ -255,6 +262,7 @@ where
         self.query_jobs(&sql, vec![queue.into()]).await
     }
 
+    /// Delete failed jobs with the given kind and return the affected row count.
     pub async fn discard_failed(&self, kind: &str) -> Result<u64, AwaError> {
         self.execute(
             "DELETE FROM awa.jobs WHERE kind = $1 AND state = 'failed'",
@@ -263,6 +271,7 @@ where
         .await
     }
 
+    /// Mark a queue as paused.
     pub async fn pause_queue(&self, queue: &str, paused_by: Option<&str>) -> Result<(), AwaError> {
         self.execute(
             r#"
@@ -277,6 +286,7 @@ where
         Ok(())
     }
 
+    /// Mark a queue as resumed.
     pub async fn resume_queue(&self, queue: &str) -> Result<(), AwaError> {
         self.execute(
             "UPDATE awa.queue_meta SET paused = FALSE WHERE queue = $1",
@@ -286,6 +296,7 @@ where
         Ok(())
     }
 
+    /// Cancel all queued or waiting jobs in a queue.
     pub async fn drain_queue(&self, queue: &str) -> Result<u64, AwaError> {
         self.execute(
             r#"
@@ -302,6 +313,7 @@ where
         .await
     }
 
+    /// Register a callback token for a running job.
     pub async fn register_callback(
         &self,
         job_id: i64,
@@ -312,6 +324,7 @@ where
             .await
     }
 
+    /// Register a callback token and optional CEL resolution configuration.
     pub async fn register_callback_with_config(
         &self,
         job_id: i64,
@@ -358,6 +371,7 @@ where
         Ok(callback_id)
     }
 
+    /// Complete an external callback without resuming the worker.
     pub async fn complete_external(
         &self,
         callback_id: Uuid,
@@ -368,6 +382,7 @@ where
             .await
     }
 
+    /// Resume a job from external wait and store the callback payload for polling.
     pub async fn resume_external(
         &self,
         callback_id: Uuid,
@@ -378,6 +393,7 @@ where
             .await
     }
 
+    /// Mark an externally waiting or running callback job as failed.
     pub async fn fail_external(
         &self,
         callback_id: Uuid,
@@ -415,6 +431,7 @@ where
         .ok_or_else(|| callback_not_found(callback_id))
     }
 
+    /// Return an externally waiting callback job to the available queue.
     pub async fn retry_external(
         &self,
         callback_id: Uuid,
@@ -445,6 +462,7 @@ where
             .ok_or_else(|| callback_not_found(callback_id))
     }
 
+    /// Extend the timeout for an externally waiting callback.
     pub async fn heartbeat_callback(
         &self,
         callback_id: Uuid,
@@ -463,6 +481,7 @@ where
             .ok_or_else(|| callback_not_found(callback_id))
     }
 
+    /// Clear a running job's registered callback token.
     pub async fn cancel_callback(&self, job_id: i64, run_lease: i64) -> Result<bool, AwaError> {
         let updated = self
             .execute(
@@ -483,6 +502,7 @@ where
         Ok(updated > 0)
     }
 
+    /// Move a running job with a registered callback into external wait.
     pub async fn enter_callback_wait(
         &self,
         job_id: i64,
@@ -505,6 +525,7 @@ where
         Ok(updated > 0)
     }
 
+    /// Poll the current state for a callback token.
     pub async fn check_callback_state(
         &self,
         job_id: i64,
@@ -552,6 +573,7 @@ where
         }
     }
 
+    /// Take and clear a stored callback result payload from job metadata.
     pub async fn take_callback_payload(
         &self,
         job_id: i64,
@@ -744,6 +766,55 @@ where
             .transpose()
     }
 
+    async fn active_queue_storage_schema(&self) -> Result<Option<String>, AwaError> {
+        self.query_optional(
+            "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
+            Vec::new(),
+        )
+        .await?
+        .map(|row| {
+            row.try_get("", "schema_name").map_err(|err| {
+                AwaError::Validation(format!("failed to decode column schema_name: {err}"))
+            })
+        })
+        .transpose()
+    }
+
+    async fn get_dlq_metadata(&self, job_id: i64) -> Result<Option<DlqMetadata>, AwaError> {
+        let Some(schema) = self.active_queue_storage_schema().await? else {
+            return Ok(None);
+        };
+        let schema = quote_identifier(&schema);
+        let sql = format!(
+            r#"
+            SELECT dlq_reason, dlq_at, original_run_lease
+            FROM {schema}.dlq_entries
+            WHERE job_id = $1
+            ORDER BY dlq_at DESC
+            LIMIT 1
+            "#
+        );
+
+        self.query_optional(&sql, vec![job_id.into()])
+            .await?
+            .map(|row| {
+                Ok(DlqMetadata {
+                    reason: row.try_get("", "dlq_reason").map_err(|err| {
+                        AwaError::Validation(format!("failed to decode column dlq_reason: {err}"))
+                    })?,
+                    dlq_at: row.try_get("", "dlq_at").map_err(|err| {
+                        AwaError::Validation(format!("failed to decode column dlq_at: {err}"))
+                    })?,
+                    original_run_lease: row.try_get("", "original_run_lease").map_err(|err| {
+                        AwaError::Validation(format!(
+                            "failed to decode column original_run_lease: {err}"
+                        ))
+                    })?,
+                })
+            })
+            .transpose()
+    }
+
     async fn execute(&self, sql: &str, values: Vec<sea_orm::Value>) -> Result<u64, AwaError> {
         self.db
             .execute_raw(statement(self.db, sql, values))
@@ -757,6 +828,39 @@ impl<'db, C> JobRepository<'db, C>
 where
     C: ConnectionTrait + TransactionTrait,
 {
+    /// Insert multiple jobs atomically in a SeaORM transaction.
+    pub async fn insert_many(&self, jobs: &[InsertParams]) -> Result<Vec<JobRow>, AwaError> {
+        if jobs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let txn = self.db.begin().await.map_err(map_db_err)?;
+        let result: Result<Vec<JobRow>, AwaError> = async {
+            let repo = JobRepository::new(&txn);
+            let mut rows = Vec::with_capacity(jobs.len());
+            for job in jobs {
+                rows.push(
+                    repo.insert_raw(job.kind.clone(), job.args.clone(), job.opts.clone())
+                        .await?,
+                );
+            }
+            Ok(rows)
+        }
+        .await;
+
+        match result {
+            Ok(rows) => {
+                txn.commit().await.map_err(map_db_err)?;
+                Ok(rows)
+            }
+            Err(err) => {
+                txn.rollback().await.map_err(map_db_err)?;
+                Err(err)
+            }
+        }
+    }
+
+    /// Resolve a callback using configured expressions inside one transaction.
     pub async fn resolve_callback(
         &self,
         callback_id: Uuid,
@@ -816,6 +920,10 @@ where
     C: ConnectionTrait,
 {
     Statement::from_sql_and_values(db.get_database_backend(), sql, values)
+}
+
+fn quote_identifier(identifier: &str) -> String {
+    format!("\"{}\"", identifier.replace('"', "\"\""))
 }
 
 fn callback_not_found(callback_id: Uuid) -> AwaError {

@@ -1,3 +1,4 @@
+/// Projection used by repository queries that must return a complete job row.
 pub const JOB_COLUMNS: &str = r#"
     id,
     kind,

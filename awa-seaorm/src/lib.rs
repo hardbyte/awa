@@ -3,11 +3,13 @@
 //! This crate provides a SeaORM-first repository for Awa job administration
 //! while preserving the original transactional insert helpers.
 
+/// SeaORM entity definitions for the Awa schema.
 pub mod entity;
 mod mapping;
 mod repo;
 mod sql;
 
+/// SeaORM-backed repository for job enqueue and lifecycle operations.
 pub use repo::JobRepository;
 
 use awa::{AwaError, Client, ClientBuilder, InsertOpts, JobArgs, JobRow};

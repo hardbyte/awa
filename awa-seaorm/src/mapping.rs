@@ -3,6 +3,7 @@ use sea_orm::{DbErr, QueryResult, SqlErr};
 use std::ops::Deref;
 use std::sync::Arc;
 
+/// Convert a SeaORM database error into Awa's public error type.
 pub fn map_db_err(err: DbErr) -> AwaError {
     if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
         return AwaError::UniqueConflict {
@@ -34,6 +35,7 @@ fn unique_constraint_name(err: &DbErr) -> Option<String> {
     }
 }
 
+/// Decode a SeaORM query result into an Awa job row.
 pub fn job_row_from_query_result(row: &QueryResult) -> Result<JobRow, AwaError> {
     let state_str: String = col(row, "state_str")?;
     let state = state_str
@@ -77,6 +79,7 @@ pub fn job_row_from_query_result(row: &QueryResult) -> Result<JobRow, AwaError> 
     })
 }
 
+/// Decode multiple SeaORM query results into Awa job rows.
 pub fn job_rows_from_query_results(rows: Vec<QueryResult>) -> Result<Vec<JobRow>, AwaError> {
     rows.iter().map(job_row_from_query_result).collect()
 }
