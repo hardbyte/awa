@@ -593,6 +593,56 @@ async fn failed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &st
     .expect("Failed to count failed done rows")
 }
 
+async fn wait_for_dlq_count(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    expected: i64,
+    timeout: Duration,
+) {
+    let start = Instant::now();
+
+    loop {
+        let count = dlq_count(pool, store, queue).await;
+        if count == expected {
+            return;
+        }
+
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for {expected} dlq rows in queue {queue}; last_count={count}",
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
+async fn wait_for_failed_done_count(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    expected: i64,
+    timeout: Duration,
+) {
+    let start = Instant::now();
+
+    loop {
+        let count = failed_done_count(pool, store, queue).await;
+        if count == expected {
+            return;
+        }
+
+        if start.elapsed() > timeout {
+            panic!(
+                "Timed out waiting for {expected} failed done rows in queue {queue}; last_count={count}",
+            );
+        }
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 async fn completed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(&format!(
         "SELECT count(*)::bigint FROM {}.done_entries WHERE queue = $1 AND state = 'completed'",
@@ -805,6 +855,8 @@ impl Worker for CompleteWorker {
 
 struct ReceiptRescueWorker {
     release: Arc<tokio::sync::Notify>,
+    first_attempt_finished: Arc<AtomicBool>,
+    first_attempt_wake: Arc<tokio::sync::Notify>,
 }
 
 #[async_trait::async_trait]
@@ -818,6 +870,8 @@ impl Worker for ReceiptRescueWorker {
             return Ok(JobResult::Completed);
         }
         self.release.notified().await;
+        self.first_attempt_finished.store(true, Ordering::SeqCst);
+        self.first_attempt_wake.notify_one();
         Ok(JobResult::Completed)
     }
 }
@@ -2378,9 +2432,9 @@ async fn test_queue_storage_dlq_and_retry_race_has_single_winner() {
             .expect("Failed to load retried job")
             .expect("Expected retried job to exist");
         assert_eq!(current.state, JobState::Retryable);
-        assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+        wait_for_dlq_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
     } else {
-        assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+        wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
     }
 }
 
@@ -2858,8 +2912,17 @@ async fn test_queue_storage_receipt_deadline_rescue_force_closes_expired_claim()
         "deadline_at must be set on the claim when deadline_duration > 0"
     );
 
-    // Wait for the deadline to pass, then run the rescue path.
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.lease_claims \
+         SET deadline_at = clock_timestamp() - interval '1 millisecond' \
+         WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(claimed[0].job.run_lease)
+    .execute(&pool)
+    .await
+    .expect("Failed to expire lease claim deadline");
+
     let rescued = store
         .rescue_expired_deadlines(&pool)
         .await
@@ -3266,6 +3329,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     )
     .await;
     let release = Arc::new(Notify::new());
+    let first_attempt_finished = Arc::new(AtomicBool::new(false));
+    let first_attempt_wake = Arc::new(Notify::new());
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -3291,6 +3356,8 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
         .claim_rotate_interval(Duration::from_secs(60))
         .register_worker(ReceiptRescueWorker {
             release: release.clone(),
+            first_attempt_finished: first_attempt_finished.clone(),
+            first_attempt_wake: first_attempt_wake.clone(),
         })
         .promote_interval(Duration::from_millis(25))
         .leader_election_interval(Duration::from_millis(100))
@@ -3352,7 +3419,20 @@ async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     assert_eq!(lease_claim_closure_count(&pool, &store).await, 2);
 
     release.notify_waiters();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        if first_attempt_finished.load(Ordering::SeqCst) {
+            break;
+        }
+
+        let now = Instant::now();
+        assert!(
+            now < deadline,
+            "timed out waiting for rescued first attempt to return"
+        );
+        let remaining = deadline.saturating_duration_since(now);
+        let _ = tokio::time::timeout(remaining, first_attempt_wake.notified()).await;
+    }
 
     let current = store
         .load_job(&pool, job_id)
@@ -4896,8 +4976,8 @@ async fn test_queue_storage_runtime_terminal_failure_moves_to_dlq() {
     )
     .await;
     assert_eq!(failed.state, JobState::Failed);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 0);
+    wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
+    wait_for_failed_done_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
     assert_eq!(dlq_reason(&pool, &store, job_id).await, "terminal_error");
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -4981,19 +5061,8 @@ async fn test_queue_storage_runtime_callback_timeout_moves_to_dlq() {
     )
     .await;
     assert_eq!(failed.state, JobState::Failed);
-    let dlq_deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        if dlq_count(&pool, &store, queue).await == 1
-            && failed_done_count(&pool, &store, queue).await == 0
-        {
-            break;
-        }
-        assert!(
-            Instant::now() <= dlq_deadline,
-            "timed out waiting for callback timeout failure to move into DLQ"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
+    wait_for_failed_done_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
     assert_eq!(dlq_reason(&pool, &store, job_id).await, "callback_timeout");
 
     client.shutdown(Duration::from_secs(5)).await;
@@ -5156,8 +5225,8 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
     )
     .await;
     assert_eq!(failed.state, JobState::Failed);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 1);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+    wait_for_failed_done_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
+    wait_for_dlq_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
 
     client.shutdown(Duration::from_secs(5)).await;
 
@@ -5170,8 +5239,8 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
         .await
         .expect("Failed to bulk-move failed rows into the DLQ");
     assert_eq!(moved, 1);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 0);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+    wait_for_failed_done_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
+    wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
 
     let empty_filter = awa::model::ListDlqFilter::default();
     let retry_err = awa::model::dlq::bulk_retry_from_dlq(&pool, &empty_filter, false)
@@ -5183,7 +5252,7 @@ async fn test_queue_storage_dlq_bulk_move_and_bulk_retry() {
         .await
         .expect("Failed to bulk-retry DLQ rows");
     assert_eq!(retried, 1);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+    wait_for_dlq_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
 
     let revived = admin::get_job(&pool, job_id)
         .await
@@ -5254,7 +5323,7 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
     )
     .await;
     assert_eq!(failed.state, JobState::Failed);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+    wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
 
     client.shutdown(Duration::from_secs(5)).await;
 
@@ -5268,7 +5337,7 @@ async fn test_queue_storage_dlq_purge_guard_and_filtered_purge() {
         .await
         .expect("Failed to purge filtered DLQ rows");
     assert_eq!(purged, 1);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+    wait_for_dlq_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5409,7 +5478,7 @@ async fn test_queue_storage_admin_bulk_retry_rolls_back_on_unique_conflict() {
         .expect("Second failed job missing after retry rollback");
     assert_eq!(first_after.state, JobState::Failed);
     assert_eq!(second_after.state, JobState::Failed);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 2);
+    wait_for_failed_done_count(&pool, &store, queue, 2, Duration::from_secs(5)).await;
     assert_eq!(
         store
             .queue_counts(&pool, queue)
@@ -5486,7 +5555,7 @@ async fn test_queue_storage_admin_retry_failed_by_kind_rolls_back_on_unique_conf
         .expect("Second failed job missing after retry rollback");
     assert_eq!(first_after.state, JobState::Failed);
     assert_eq!(second_after.state, JobState::Failed);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 2);
+    wait_for_failed_done_count(&pool, &store, queue, 2, Duration::from_secs(5)).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -5527,7 +5596,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
     assert_eq!(failed.state, JobState::Failed);
     client.shutdown(Duration::from_secs(5)).await;
 
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 1);
+    wait_for_failed_done_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
     assert_eq!(
         store
             .queue_counts(&pool, queue)
@@ -5541,7 +5610,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
         .await
         .expect("Failed to discard failed jobs");
     assert_eq!(discarded, 1);
-    assert_eq!(failed_done_count(&pool, &store, queue).await, 0);
+    wait_for_failed_done_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
     assert_eq!(
         store
             .queue_counts(&pool, queue)
@@ -5613,13 +5682,13 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_dlq
     assert_eq!(failed.state, JobState::Failed);
     client.shutdown(Duration::from_secs(5)).await;
 
-    assert_eq!(dlq_count(&pool, &store, queue).await, 1);
+    wait_for_dlq_count(&pool, &store, queue, 1, Duration::from_secs(5)).await;
 
     let discarded = admin::discard_failed(&pool, TerminalFailureWorker.kind())
         .await
         .expect("Failed to discard dlq jobs");
     assert_eq!(discarded, 1);
-    assert_eq!(dlq_count(&pool, &store, queue).await, 0);
+    wait_for_dlq_count(&pool, &store, queue, 0, Duration::from_secs(5)).await;
 
     let reinserted = insert::insert_with(&pool, &DlqJob { id: 8 }, opts)
         .await
@@ -5748,9 +5817,9 @@ async fn test_queue_storage_jobs_view_insert_select_delete_compat() {
 /// without this test, a future change to the SQL aging clause could
 /// silently break aging without breaking any other test.
 ///
-/// We use a 100 ms aging interval and sleep 250 ms before claiming so
-/// that a priority-4 job's effective priority drops by at least one
-/// step (`floor(elapsed / interval) = 2`, capped at min priority 1).
+/// We use a 100 ms aging interval and backdate the ready row by 250 ms so
+/// that a priority-4 job's effective priority drops by at least one step
+/// (`floor(elapsed / interval) = 2`, capped at min priority 1).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_priority_aging_lifts_effective_priority_and_records_original() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
@@ -5766,10 +5835,15 @@ async fn test_priority_aging_lifts_effective_priority_and_records_original() {
         .await
         .expect("Failed to enqueue priority-4 job");
 
-    // Sleep past two aging windows so floor(elapsed / interval) = 2,
+    // Backdate past two aging windows so floor(elapsed / interval) = 2,
     // i.e. a priority-4 row's effective priority becomes 2.
     let aging_interval = Duration::from_millis(100);
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.ready_entries SET run_at = clock_timestamp() - interval '250 milliseconds'"
+    ))
+    .execute(&pool)
+    .await
+    .expect("Failed to backdate ready row for priority aging test");
 
     let claimed = store
         .claim_runtime_batch_with_aging_for_instance(
