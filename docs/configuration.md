@@ -406,11 +406,19 @@ Retention depends on the storage path.
 Queue storage is the worker engine in `0.6`: ordinary terminal snapshots
 (`completed`, non-DLQ `failed`, and `cancelled`) live in the rotating
 `done_entries_*` partitions and are reclaimed by queue-ring prune after the
-matching ready segment is no longer live. The `completed_retention` and
-`failed_retention` knobs apply to the canonical compatibility path, not to
-queue-storage terminal history. In queue storage, use the queue-ring sizing and
-rotation knobs below to control how much ordinary terminal history remains
-queryable.
+matching ready segment is no longer live. Most terminal rows are narrow:
+the durable terminal fact lives in `done_entries_*`, while immutable job-body
+fields are hydrated from the retained `ready_entries_*` row until queue prune
+reclaims both together. Direct SQL against `done_entries` should therefore
+expect nullable body columns and join to `ready_entries` when it needs the full
+job body. Public Awa APIs perform that hydration, and
+`{schema}.terminal_jobs` exposes the same hydrated terminal shape for
+read-only SQL inspection.
+
+The `completed_retention` and `failed_retention` knobs apply to the canonical
+compatibility path, not to queue-storage terminal history. In queue storage,
+use the queue-ring sizing and rotation knobs below to control how much
+ordinary terminal history remains queryable.
 
 DLQ rows are different: `dlq_entries` is a separate hold table and the
 maintenance leader deletes rows older than `dlq_retention` in bounded cleanup
@@ -473,7 +481,7 @@ await client.start(
 
 | Knob | Default | What it controls |
 |---|---|---|
-| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. |
+| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows rely on the matching ready partition until queue prune reclaims both. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
 | `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. |
@@ -523,12 +531,26 @@ hot queue's claim path at once. For a single hot queue, raising
 `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops
 while still sharing the queue's `max_workers` / `min_workers` permits.
 
-Keep `claimers` modest. Local no-op throughput tests improved materially from
-`1` to `4`, while higher values are expected to show diminishing returns and
-more database contention. For extreme single-queue workloads, benchmark
-`claimers = 2` and `4` before reaching for queue striping. Keep
-`claim_batch_size = 128` unless a workload-specific benchmark proves a larger
-batch helps.
+Keep `claimers` modest. In the 2026-05 hot-queue measurements,
+`enqueue_shards = 4` was the change that turned overload into bounded
+end-to-end throughput; raising `claimers` to `4` increased transaction
+pressure and worsened tail latency in that shape. For extreme single-queue
+workloads, raise `enqueue_shards` first when the ordering contract allows
+partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific
+reason, and judge the result by durable completion rate, p99 end-to-end
+latency, queue depth, WAL bytes per completed job, transaction commits per
+completed job, and dead tuples. Keep `claim_batch_size = 128` unless a
+workload-specific benchmark proves a larger batch helps.
+
+Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` (`8` on canonical
+storage). Extra completion flushers can improve some single-process shapes, but
+they also multiply terminal-write contention across a worker fleet. Raise this
+only after measuring the same north-star metrics for the target topology.
+
+The terminal write path is already narrow for running/waiting jobs: it stores
+the terminal fact in `done_entries_*` and avoids duplicating immutable ready
+body fields. That keeps the default completion settings conservative without
+giving up durable terminal history.
 
 ## Dead Letter Queue
 

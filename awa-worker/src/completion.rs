@@ -18,11 +18,21 @@ use tracing::{debug, warn};
 // to reach `COMPLETION_BATCH_SIZE` before a time-based flush forces
 // it out; on the in-tree throughput bench this lifts steady-state
 // throughput a few percent at the cost of a comparable bump to
-// completion latency. Tunable per-deployment via
-// `AWA_COMPLETION_BATCH_SIZE` / `AWA_COMPLETION_FLUSH_MS`.
+// completion latency. Queue storage defaults to one completion shard:
+// the queue-storage SQL already batches aggressively, and extra flushers
+// can multiply fleet-wide contention in multi-process deployments.
+// Tunable per-deployment via `AWA_COMPLETION_BATCH_SIZE`,
+// `AWA_COMPLETION_FLUSH_MS`, and `AWA_COMPLETION_SHARDS`.
 const COMPLETION_BATCH_SIZE: usize = 256;
 const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
+
+fn default_completion_shards(storage: &RuntimeStorage) -> usize {
+    match storage {
+        RuntimeStorage::Canonical => 8,
+        RuntimeStorage::QueueStorage(_) => 1,
+    }
+}
 
 fn completion_batch_size() -> usize {
     env::var("AWA_COMPLETION_BATCH_SIZE")
@@ -46,10 +56,7 @@ fn completion_shards(storage: &RuntimeStorage) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(match storage {
-            RuntimeStorage::Canonical => 8,
-            RuntimeStorage::QueueStorage(_) => 4,
-        })
+        .unwrap_or_else(|| default_completion_shards(storage))
 }
 const COMPLETE_BATCH_SQL: &str = r#"
     WITH completed (id, run_lease) AS (
@@ -417,6 +424,25 @@ mod tests {
             })
             .collect();
         assert_eq!(ordered, vec![(1, 2, 1), (3, 1, 1), (3, 10, 1)]);
+    }
+
+    #[test]
+    fn queue_storage_defaults_to_one_completion_shard() {
+        let runtime = crate::storage::QueueStorageRuntime::new(
+            awa_model::QueueStorageConfig::default(),
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .expect("queue storage runtime config should be valid");
+
+        assert_eq!(
+            default_completion_shards(&crate::storage::RuntimeStorage::Canonical),
+            8
+        );
+        assert_eq!(
+            default_completion_shards(&crate::storage::RuntimeStorage::QueueStorage(runtime)),
+            1
+        );
     }
 
     async fn clean_queue(pool: &PgPool, queue: &str) {

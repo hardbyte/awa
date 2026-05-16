@@ -62,18 +62,19 @@ which matches the write-amplification model from issue #207: fewer
 completion statements and less terminal payload work improve throughput,
 but the binding resource is still the WAL/fsync plane.
 
-## Not Shipped In This Follow-Up
+## Later Follow-Up: ADR-026
 
-A narrower default-success receipt instead of a full `done_entries` row
-is still plausible, but it is a schema/API contract change rather than a
-local hot-path optimization. To make it viable, the success receipt would
-need enough information for:
+ADR-026 shipped the safe version of the narrower terminal-history idea. It
+does not remove `done_entries`; it keeps a durable terminal fact and hydrates
+duplicated immutable body fields from the retained `ready_entries` row for
+ready-backed terminal transitions.
+
+The design keeps enough information for:
 
 - queue counts after ready partitions rotate
 - terminal retention and pruning
 - `load_job` / admin inspection of completed jobs
 - retry/replay tooling that expects terminal job identity and timing
 
-Until that shape is designed, `done_entries` remains the materialized
-terminal record and the safe optimization is to keep its unchanged
-payload column `NULL`.
+Transitions without a retained ready row, such as cancelling an unclaimed
+available job, still write a wide `done_entries` row.

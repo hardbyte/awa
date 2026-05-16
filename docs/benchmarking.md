@@ -29,6 +29,28 @@ These are local engineering benchmarks, not published vendor-style numbers. The
 main goal is to compare shapes, validate architecture changes, and catch
 regressions.
 
+## North-Star Metrics
+
+Awa's performance target is sustainable end-to-end queue work, not the largest
+enqueue-only number. A benchmark table should lead with:
+
+- **completed jobs/sec** — durable terminal transitions, not just handler
+  returns
+- **p99 end-to-end latency** — producer enqueue to durable completion
+- **queue depth / backlog growth** — whether offered load is being absorbed or
+  stored as future latency
+- **WAL bytes per completed job** — the main Postgres durability budget for the
+  hot path
+- **transaction commits per completed job** — connection and commit pressure
+- **dead tuples and prune lag** — whether churn stays bounded under overlap
+  readers, retries, and terminal bursts
+
+Producer throughput is still measured, especially for `INSERT` vs `COPY` and
+`enqueue_shards` sweeps, but it is a secondary producer-path diagnostic. A
+configuration that can enqueue `50k/s` and complete `5k/s` is a backlog and
+latency problem unless the workload is intentionally bursty and has enough
+headroom to drain before the SLA window closes.
+
 ## Positioning Proof Checklist
 
 Queue storage changes Awa's comparison set.
@@ -50,10 +72,12 @@ reference points:
 The benchmark set should include:
 
 - idle pickup latency
-- sustained runtime throughput
+- sustained runtime throughput and durable completion throughput
 - overlap readers / MVCC horizon pressure
 - mixed workload soak
 - terminal-failure burst
+- WAL bytes/job, commit pressure, queue depth, and dead-tuple pressure for every
+  headline table
 
 Operational differences should be called out, not hidden:
 
@@ -218,9 +242,27 @@ Key observations:
   dead tuples around `396`, validating the ADR-019 / ADR-023 hot-path
   dead-tuple promise under sustained churn.
 
-Follow-up tuning should focus on the multi-process completion path: either
-attenuating default completion shards by fleet topology, coordinating flushers
-more explicitly, or reducing the per-flush contention footprint further.
+Later 2026-05 local Awa-only runs moved the first tuning step from completion
+flusher topology to queue-lane sharding: `enqueue_shards = 4` plus larger
+completion batches sustained about `7.9k` completed jobs/s on the test
+machine with roughly `200ms` p99 end-to-end latency and bounded depth.
+Increasing `claimers` or `claim_batch_size` did not materially improve that
+shape. First-principles WAL accounting then compared the production path, a
+narrow `done_entries` row, and a deliberately non-production path that skipped
+`done_entries` entirely:
+
+| Shape | Completed jobs/s | p99 e2e | WAL/job |
+|---|---:|---:|---:|
+| Tuned production queue storage | ~7,885/s | ~203 ms | ~2,241 B |
+| Narrow terminal history | ~8,337/s | ~205 ms | ~1,932 B |
+| Skip `done_entries` entirely | ~8,402/s | ~230 ms | ~1,441 B |
+
+The shipped design is the middle row: keep the durable terminal fact, but avoid
+duplicating immutable ready-body fields on ready-backed terminal rows. The
+skip-`done_entries` experiment remains rejected because it weakens the
+terminal-history contract, and its small throughput gain over narrow terminal
+history points at durable WAL write/sync pressure rather than a hidden per-job
+query loop as the next ceiling.
 
 ### Queue-storage striping reference
 
@@ -400,16 +442,17 @@ fix (v0.5.0) eliminated the bottleneck entirely.
 - `PROMOTE_BATCH_SIZE` (default `4,096`): rows per promotion batch
 - `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
-- `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
-- `AWA_COMPLETION_BATCH_SIZE` (default `128`): max rows per completion-batcher
-  flush. Lowered from `512` after multi-replica matrix runs showed `128`
-  delivered the lowest p99 across the 1–4 worker-process band; `512` did
-  not buy throughput and worsened tail latency.
+- `AWA_COMPLETION_FLUSH_MS` (default `5 ms`): completion batcher flush interval
+- `AWA_COMPLETION_BATCH_SIZE` (default `256`): max rows per completion-batcher
+  flush. The default favors durable completion throughput while keeping the
+  extra finalization lag small enough for ordinary job-queue use.
 - `AWA_COMPLETION_SHARDS`: number of parallel completion flushers. The
-  runtime default is storage-dependent: `8` for canonical storage and `4`
-  for queue storage. The effective fleet-wide flusher count is
-  `processes × AWA_COMPLETION_SHARDS`, so tune accordingly for
-  multi-process deployments in either storage mode.
+  runtime default is storage-dependent: `8` for canonical storage and `1`
+  for queue storage. Queue storage starts conservative because the terminal /
+  receipt path already batches heavily and the effective fleet-wide flusher
+  count is `processes × AWA_COMPLETION_SHARDS`. Increase only after measuring
+  end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the
+  target worker-process topology.
 
 ### Concurrent Multi-Queue Lifecycle
 

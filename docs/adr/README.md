@@ -38,6 +38,7 @@ in-place as historical context.
 | 023 | [Receipt plane ring partitioning](023-receipt-plane-ring-partitioning.md) | Accepted | Partitioned `lease_claims` / `lease_claim_closures` ring replaces `open_receipt_claims`; receipts default on in 0.6 | Refines ADR-019 receipt plane |
 | 024 | Deferred `done_entries` materialisation | Rejected | Investigated as a rotation guard; reverted in `053fec1` once a simpler integration test gave equivalent coverage | Historical |
 | 025 | [Sharded enqueue heads](025-sharded-enqueue-heads.md) | Accepted | Per-queue `enqueue_shards` (default 1) spreads `queue_enqueue_heads` row-lock contention across N rows; FIFO becomes per-shard at S>1 | Refines ADR-019 enqueue path |
+| 026 | [Narrow terminal history](026-narrow-terminal-history.md) | Accepted | Ready-backed terminal rows store only terminal facts and hydrate immutable body fields from retained `ready_entries` until queue prune | Refines ADR-019 terminal path |
 
 ## Validation artifacts
 

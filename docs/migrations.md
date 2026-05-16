@@ -96,6 +96,15 @@ into the extracted migration SQL itself.
 only materializes the queue-storage schema. It does **not** change
 `awa.storage_transition_state` and it does **not** activate routing.
 
+Queue-storage schema preparation may also relax the physical `done_entries`
+body columns (`args`, `max_attempts`, `run_at`, `created_at`) to allow narrow
+terminal history. This is part of the queue-storage operational DDL, not an
+additive canonical `awa.jobs` migration: public Awa APIs still hydrate terminal
+jobs through the retained ready row, while direct SQL against `done_entries`
+must tolerate nullable duplicated body fields. Preparation also creates or
+replaces the read-only `{schema}.terminal_jobs` compatibility view, which is
+the preferred SQL surface for hydrated terminal history.
+
 On the `0.5.x` prep release these SQL identities existed as stubs. On this
 `0.6` branch they are implemented:
 

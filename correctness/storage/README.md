@@ -140,6 +140,13 @@ This removes the previous gap where `terminal_entries` was the only
 reclaim story with the other families, matching the ADR-019 retention
 model.
 
+ADR-026 adds the retained-body shape for ready-backed terminal rows.
+`TerminalHasRetainedReadyBody` asserts that every modelled terminal fact keeps
+its ready row and lane key until a terminal delete path or queue prune removes
+both. `MoveFailedToDlq` now clears that ready backing row after hydrating the
+DLQ row, and `PruneReadySegment` removes terminal facts in the pruned ready
+segment so the model matches queue-ring reclamation.
+
 ## Mapping to Rust code
 
 See [`MAPPING.md`](./MAPPING.md) for the action-by-action correspondence

@@ -32,12 +32,12 @@ EXTENDS TLC, Naturals, FiniteSets
 \* (awa dlq move) land rows into dlq_entries. RetryFromDlq re-appends a
 \* fresh runnable entry with runLease reset to zero, matching the Rust contract.
 \*
-\* Terminal family modelling: terminal_entries is its own rotating
-\* segmented family, matching ADR-019's "retention via partition
-\* rotation, not row-by-row cleanup" intent. Successful completions and
-\* cancel-from-waiting land into the current open terminal segment.
-\* MoveFailedToDlq removes from the terminal family and clears the
-\* segment pointer before re-appending to DLQ.
+\* Terminal family modelling: terminal_entries is the durable terminal fact.
+\* Its row is intentionally narrow: immutable job-body fields are retained in
+\* ready_entries and hydrated by joining on the ready segment + lane key while
+\* the queue-ring slot remains visible. Queue-ring prune reclaims the retained
+\* ready body and the terminal fact together; MoveFailedToDlq removes from the
+\* terminal family before re-appending to DLQ.
 \*
 \* Claim family modelling (ADR-023): every Claim action opens an
 \* append-only receipt in the current claim segment, and every
@@ -170,7 +170,16 @@ NextLeaseSegment(s) == IF s = LeaseSegmentCount THEN 1 ELSE s + 1
 NextTerminalSegment(s) == IF s = TerminalSegmentCount THEN 1 ELSE s + 1
 NextClaimSegment(s) == IF s = ClaimSegmentCount THEN 1 ELSE s + 1
 
-CurrentReady == ((((readyEntries \ terminalEntries) \ activeLeases) \ deferredEntries) \ dlqEntries)
+ReceiptClaimJobs == {j \in Jobs : \E r \in RunLeaseValues : <<j, r>> \in claimOpen}
+
+CurrentReady ==
+    {j \in readyEntries :
+        /\ j \notin terminalEntries
+        /\ j \notin activeLeases
+        /\ j \notin ReceiptClaimJobs
+        /\ j \notin deferredEntries
+        /\ j \notin dlqEntries
+        /\ laneSeq[j] >= laneState.claimSeq}
 
 JobsInReadySegment(seg) == {j \in Jobs : readySegmentOf[j] = seg}
 JobsInTerminalSegment(seg) == {j \in Jobs : terminalSegmentOf[j] = seg}
@@ -600,9 +609,6 @@ FastComplete(w, j) ==
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ taskLease' = [taskLease EXCEPT ![w][j] = 0]
     /\ heartbeatFresh' = heartbeatFresh \ {j}
-    /\ readyEntries' = readyEntries \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
@@ -613,6 +619,9 @@ FastComplete(w, j) ==
                    runLease,
                    attemptState,
                    progressTouched,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
                    claimSegmentOf>>
     /\ UnchangedSegmentState
 
@@ -632,9 +641,6 @@ StatefulComplete(w, j) ==
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ progressTouched' = progressTouched \ {j}
-    /\ readyEntries' = readyEntries \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
@@ -643,6 +649,9 @@ StatefulComplete(w, j) ==
                    waitingLeases,
                    dlqEntries,
                    runLease,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
                    claimSegmentOf>>
     /\ UnchangedSegmentState
 
@@ -787,14 +796,11 @@ CancelWaitingToTerminal(j) ==
     /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
     /\ activeLeases' = activeLeases \ {j}
     /\ waitingLeases' = waitingLeases \ {j}
-    /\ readyEntries' = readyEntries \ {j}
     /\ leaseOwner' = [leaseOwner EXCEPT ![j] = NoWorker]
     /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ progressTouched' = progressTouched \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
@@ -802,6 +808,9 @@ CancelWaitingToTerminal(j) ==
     /\ UNCHANGED <<deferredEntries,
                    dlqEntries,
                    runLease,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
                    claimSegmentOf>>
     /\ UnchangedSegmentState
 
@@ -832,9 +841,6 @@ CancelRunningToTerminal(j) ==
     /\ attemptState' = attemptState \ {j}
     /\ heartbeatFresh' = heartbeatFresh \ {j}
     /\ progressTouched' = progressTouched \ {j}
-    /\ readyEntries' = readyEntries \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ leaseSegmentOf' = [leaseSegmentOf EXCEPT ![j] = NoLeaseSegment]
     /\ claimOpen' = claimOpen \ {<<j, runLease[j]>>}
     /\ claimClosed' = claimClosed \cup {<<j, runLease[j]>>}
@@ -843,6 +849,9 @@ CancelRunningToTerminal(j) ==
                    waitingLeases,
                    dlqEntries,
                    runLease,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
                    claimSegmentOf>>
     /\ UnchangedSegmentState
 
@@ -860,9 +869,6 @@ CancelReceiptOnlyToTerminal(j) ==
     /\ terminalSegments[terminalSegmentCursor] = "open"
     /\ terminalEntries' = terminalEntries \cup {j}
     /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = terminalSegmentCursor]
-    /\ readyEntries' = readyEntries \ {j}
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     \* Same rationale as CancelRunningToTerminal: zero every worker's
     \* taskLease snapshot since admin cancel has no worker context.
     /\ taskLease' = [w \in Workers |-> [taskLease[w] EXCEPT ![j] = 0]]
@@ -877,6 +883,9 @@ CancelReceiptOnlyToTerminal(j) ==
                    attemptState,
                    heartbeatFresh,
                    progressTouched,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
                    leaseSegmentOf,
                    claimSegmentOf,
                    laneState>>
@@ -916,8 +925,10 @@ MoveFailedToDlq(j) ==
     /\ terminalEntries' = terminalEntries \ {j}
     /\ terminalSegmentOf' = [terminalSegmentOf EXCEPT ![j] = NoTerminalSegment]
     /\ dlqEntries' = dlqEntries \cup {j}
-    /\ UNCHANGED <<readyEntries,
-                   deferredEntries,
+    /\ readyEntries' = readyEntries \ {j}
+    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
+    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
+    /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
                    activeLeases,
                    leaseOwner,
@@ -926,8 +937,6 @@ MoveFailedToDlq(j) ==
                    attemptState,
                    heartbeatFresh,
                    progressTouched,
-                   laneSeq,
-                   readySegmentOf,
                    leaseSegmentOf,
                    laneState>>
     /\ UnchangedSegmentState
@@ -1129,14 +1138,15 @@ RotateClaimSegments ==
 PruneReadySegment(seg) ==
     /\ seg \in ReadySegments
     /\ readySegments[seg] = "sealed"
-    /\ \A j \in Jobs : readySegmentOf[j] = seg => j \notin CurrentReady /\ j \notin activeLeases
+    /\ \A j \in Jobs : readySegmentOf[j] = seg => j \notin CurrentReady /\ j \notin activeLeases /\ j \notin ReceiptClaimJobs
     /\ readyEntries' = readyEntries \ JobsInReadySegment(seg)
+    /\ terminalEntries' = terminalEntries \ JobsInReadySegment(seg)
     /\ laneSeq' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoLaneSeq ELSE laneSeq[j]]
     /\ readySegmentOf' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoReadySegment ELSE readySegmentOf[j]]
+    /\ terminalSegmentOf' = [j \in Jobs |-> IF readySegmentOf[j] = seg THEN NoTerminalSegment ELSE terminalSegmentOf[j]]
     /\ readySegments' = [readySegments EXCEPT ![seg] = "pruned"]
     /\ UNCHANGED <<deferredEntries,
                    waitingLeases,
-                   terminalEntries,
                    dlqEntries,
                    activeLeases,
                    leaseOwner,
@@ -1146,7 +1156,6 @@ PruneReadySegment(seg) ==
                    heartbeatFresh,
                    progressTouched,
                    leaseSegmentOf,
-                   terminalSegmentOf,
                    leaseSegments,
                    terminalSegments,
                    claimSegments,
@@ -1377,8 +1386,14 @@ TerminalHasNoLiveRuntime ==
         /\ j \notin activeLeases
         /\ j \notin attemptState
         /\ j \notin waitingLeases
-        /\ j \notin readyEntries
+        /\ j \notin ReceiptClaimJobs
         /\ j \notin deferredEntries
+
+TerminalHasRetainedReadyBody ==
+    \A j \in Jobs : j \in terminalEntries =>
+        /\ j \in readyEntries
+        /\ laneSeq[j] # NoLaneSeq
+        /\ readySegmentOf[j] # NoReadySegment
 
 DlqHasNoLiveRuntime ==
     \A j \in Jobs : j \in dlqEntries =>

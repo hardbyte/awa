@@ -70,10 +70,11 @@ stay narrow because they are the coordination surface dispatchers and
 maintenance touch most often.
 
 ADR-019 is the storage-engine source of truth; ADR-023 supersedes it for the
-receipt plane:
+receipt plane, and ADR-026 refines terminal history:
 
 - [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
 - [ADR-023: Receipt Plane Ring Partitioning](adr/023-receipt-plane-ring-partitioning.md)
+- [ADR-026: Narrow Terminal History](adr/026-narrow-terminal-history.md)
 
 ## Job Lifecycle
 
@@ -101,6 +102,12 @@ Terminal rows differ by storage backend:
 
 - In queue storage, `completed`, ordinary `failed`, and `cancelled` snapshots
   live in `done_entries_*` and are reclaimed by queue-ring prune.
+  Ready-backed terminal rows are narrow: immutable job-body fields stay in the
+  retained `ready_entries_*` row and public/admin reads hydrate by joining on
+  the ready slot plus lane key. The `{schema}.terminal_jobs` view exposes that
+  hydrated read-only shape for SQL tooling. If a transition deletes the ready
+  row first, such as cancelling an unclaimed available job, the terminal row is
+  written wide instead.
 - DLQ-enabled terminal failures are copied into `dlq_entries`; that table has
   explicit retention cleanup plus operator retry/purge.
 - In the canonical compatibility path, terminal rows in `awa.jobs_hot` use
@@ -211,7 +218,7 @@ maintenance leader:
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 |---|---|---:|---|---|
-| Queue | `ready_entries_*`, `done_entries_*` | `1000ms` | incoming ready/done slot is empty | oldest non-current slot has no active leases and no pending ready rows |
+| Queue | `ready_entries_*`, `done_entries_*` | `1000ms` | incoming ready/done slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `50ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure |
 
