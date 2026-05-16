@@ -214,6 +214,7 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
          JOIN {schema}.queue_claim_heads AS qc
            ON qc.queue = qe.queue
           AND qc.priority = qe.priority
+          AND qc.enqueue_shard = qe.enqueue_shard
          WHERE qe.queue = $1 AND qe.priority = 1",
         schema = store.schema()
     ))
@@ -268,7 +269,7 @@ async fn queue_storage_copy_rolls_back_on_unique_conflict() {
     assert_eq!(ready_count, 0);
 
     let lane_available: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority WHERE qe.queue = $1",
+        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
         store.schema()
     ))
     .bind(queue)
@@ -322,7 +323,7 @@ async fn queue_storage_batch_rolls_back_on_batched_unique_conflict() {
     assert_eq!(ready_count, 0);
 
     let lane_available: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority WHERE qe.queue = $1",
+        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
         store.schema()
     ))
     .bind(queue)
@@ -376,7 +377,7 @@ async fn queue_storage_copy_rolls_back_on_existing_unique_conflict() {
     assert_eq!(ready_count, 1);
 
     let lane_available: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority WHERE qe.queue = $1",
+        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
         store.schema()
     ))
     .bind(queue)
@@ -440,7 +441,7 @@ async fn queue_storage_copy_concurrent_lane_seq_is_dense() {
     }
 
     let available_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority WHERE qe.queue = $1",
+        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
         store.schema()
     ))
     .bind(queue)
@@ -485,7 +486,7 @@ async fn queue_storage_copy_distributes_across_stripes() {
     }
 
     let available_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority WHERE qe.queue = ANY($1)",
+        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = ANY($1)",
         store.schema()
     ))
     .bind((0..4).map(|stripe| format!("{queue}#{stripe}")).collect::<Vec<_>>())

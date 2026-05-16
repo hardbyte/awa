@@ -259,13 +259,12 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
         let sql = format!(
             "SELECT state::text, count(*)::bigint FROM ( \
-                 SELECT state FROM awa.jobs WHERE queue = $1 \
-                 UNION ALL \
                  SELECT 'available'::awa.job_state AS state \
                  FROM {schema}.ready_entries AS ready \
                  JOIN {schema}.queue_claim_heads AS claims \
                    ON claims.queue = ready.queue \
                   AND claims.priority = ready.priority \
+                  AND claims.enqueue_shard = ready.enqueue_shard \
                  WHERE ready.queue = $1 \
                    AND ready.lane_seq >= claims.claim_seq \
                  UNION ALL \

@@ -172,6 +172,7 @@ async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
                  JOIN {schema}.queue_claim_heads AS claims \
                    ON claims.queue = ready.queue \
                   AND claims.priority = ready.priority \
+                  AND claims.enqueue_shard = ready.enqueue_shard \
                  WHERE ready.queue = $1 \
                    AND ready.lane_seq >= claims.claim_seq \
                  UNION ALL \
@@ -245,6 +246,7 @@ async fn queue_state_breakdown(pool: &sqlx::PgPool, queue: &str) -> Vec<(String,
                  JOIN {schema}.queue_claim_heads AS claims \
                    ON claims.queue = ready.queue \
                   AND claims.priority = ready.priority \
+                  AND claims.enqueue_shard = ready.enqueue_shard \
                  WHERE ready.queue = $1 \
                    AND ready.lane_seq >= claims.claim_seq \
                  UNION ALL \

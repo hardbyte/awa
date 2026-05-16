@@ -9212,6 +9212,7 @@ impl QueueStorage {
              AND ready.ready_generation = lease.ready_generation
              AND ready.queue = lease.queue
              AND ready.priority = lease.priority
+             AND ready.enqueue_shard = lease.enqueue_shard
              AND ready.lane_seq = lease.lane_seq
             LEFT JOIN {schema}.attempt_state AS attempt
               ON attempt.job_id = lease.job_id

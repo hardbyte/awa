@@ -4,7 +4,7 @@
 //! nightly/manual chaos lane.
 
 use async_trait::async_trait;
-use awa::model::{insert_with, migrations, InsertOpts};
+use awa::model::{insert_with, migrations, InsertOpts, QueueStorageConfig};
 use awa::{Client, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker};
 use chrono::{Duration as ChronoDuration, Utc};
 use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData};
@@ -77,13 +77,12 @@ async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String,
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
         let sql = format!(
             "SELECT state::text, count(*)::bigint FROM ( \
-                 SELECT state FROM awa.jobs WHERE queue = $1 \
-                 UNION ALL \
                  SELECT 'available'::awa.job_state AS state \
                  FROM {schema}.ready_entries AS ready \
                  JOIN {schema}.queue_claim_heads AS claims \
                    ON claims.queue = ready.queue \
                   AND claims.priority = ready.priority \
+                  AND claims.enqueue_shard = ready.enqueue_shard \
                  WHERE ready.queue = $1 \
                    AND ready.lane_seq >= claims.claim_seq \
                  UNION ALL \
@@ -229,6 +228,313 @@ async fn wait_for_counts(
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+async fn wait_for_kind_state_count(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    kind: &str,
+    state: &str,
+    min_count: i64,
+    timeout: Duration,
+) -> i64 {
+    let timeout = scaled_timeout(timeout);
+    let start = Instant::now();
+    loop {
+        let count = kind_state_count(pool, queue, kind, state).await;
+
+        if count >= min_count {
+            return count;
+        }
+
+        assert!(
+            start.elapsed() < timeout,
+            "Timed out waiting for at least {min_count} {kind} jobs in state {state}; last count: {count}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &str) -> i64 {
+    if state == "running" {
+        if let Some(schema) = active_queue_storage_schema(pool).await {
+            let sql = format!(
+                r#"
+                SELECT count(*)::bigint
+                FROM {schema}.lease_claims AS claims
+                JOIN {schema}.ready_entries AS ready
+                  ON ready.ready_slot = claims.ready_slot
+                 AND ready.ready_generation = claims.ready_generation
+                 AND ready.queue = claims.queue
+                 AND ready.priority = claims.priority
+                 AND ready.enqueue_shard = claims.enqueue_shard
+                 AND ready.lane_seq = claims.lane_seq
+                 AND ready.job_id = claims.job_id
+                WHERE claims.queue = $1
+                  AND ready.kind = $2
+                  AND NOT EXISTS (
+                    SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                    WHERE closures.claim_slot = claims.claim_slot
+                      AND closures.job_id = claims.job_id
+                      AND closures.run_lease = claims.run_lease
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1 FROM {schema}.leases AS lease
+                    WHERE lease.job_id = claims.job_id
+                      AND lease.run_lease = claims.run_lease
+                  )
+                "#,
+            );
+            return sqlx::query_scalar(&sql)
+                .bind(queue)
+                .bind(kind)
+                .fetch_one(pool)
+                .await
+                .expect("Failed to query queue-storage running kind count");
+        }
+    }
+
+    sqlx::query_scalar(
+        r#"
+        SELECT count(*)::bigint
+        FROM awa.jobs
+        WHERE queue = $1
+          AND kind = $2
+          AND state = $3::awa.job_state
+        "#,
+    )
+    .bind(queue)
+    .bind(kind)
+    .bind(state)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to query job kind state count")
+}
+
+async fn backdate_running_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> u64 {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        let receipt_sql = format!(
+            r#"
+            UPDATE {schema}.lease_claims AS claims
+            SET claimed_at = clock_timestamp() - interval '10 minutes',
+                deadline_at = LEAST(
+                    COALESCE(deadline_at, 'infinity'::timestamptz),
+                    clock_timestamp() - interval '1 minute'
+                )
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.ready_slot = claims.ready_slot
+              AND ready.ready_generation = claims.ready_generation
+              AND ready.queue = claims.queue
+              AND ready.priority = claims.priority
+              AND ready.enqueue_shard = claims.enqueue_shard
+              AND ready.lane_seq = claims.lane_seq
+              AND ready.job_id = claims.job_id
+              AND claims.queue = $1
+              AND ready.kind = $2
+              AND NOT EXISTS (
+                SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                WHERE closures.claim_slot = claims.claim_slot
+                  AND closures.job_id = claims.job_id
+                  AND closures.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM {schema}.leases AS lease
+                WHERE lease.job_id = claims.job_id
+                  AND lease.run_lease = claims.run_lease
+              )
+            "#,
+        );
+        let receipt_rows = sqlx::query(&receipt_sql)
+            .bind(queue)
+            .bind(kind)
+            .execute(pool)
+            .await
+            .expect("Failed to backdate queue-storage receipt claims")
+            .rows_affected();
+
+        let lease_sql = format!(
+            r#"
+            UPDATE {schema}.leases AS leases
+            SET heartbeat_at = clock_timestamp() - interval '10 minutes',
+                deadline_at = LEAST(
+                    COALESCE(deadline_at, 'infinity'::timestamptz),
+                    clock_timestamp() - interval '1 minute'
+                )
+            FROM {schema}.ready_entries AS ready
+            WHERE ready.ready_slot = leases.ready_slot
+              AND ready.ready_generation = leases.ready_generation
+              AND ready.queue = leases.queue
+              AND ready.priority = leases.priority
+              AND ready.enqueue_shard = leases.enqueue_shard
+              AND ready.lane_seq = leases.lane_seq
+              AND ready.job_id = leases.job_id
+              AND leases.queue = $1
+              AND ready.kind = $2
+              AND leases.state = 'running'
+            "#,
+        );
+        let lease_rows = sqlx::query(&lease_sql)
+            .bind(queue)
+            .bind(kind)
+            .execute(pool)
+            .await
+            .expect("Failed to backdate queue-storage materialized leases")
+            .rows_affected();
+
+        return receipt_rows + lease_rows;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET heartbeat_at = now() - interval '10 minutes',
+            deadline_at = now() - interval '1 minute'
+        WHERE queue = $1
+          AND kind = $2
+          AND state = 'running'
+        "#,
+    )
+    .bind(queue)
+    .bind(kind)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate canonical running jobs")
+    .rows_affected()
+}
+
+async fn backdate_running_jobs(pool: &sqlx::PgPool, queue: &str) -> u64 {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        let receipt_sql = format!(
+            r#"
+            UPDATE {schema}.lease_claims AS claims
+            SET claimed_at = clock_timestamp() - interval '10 minutes',
+                deadline_at = LEAST(
+                    COALESCE(deadline_at, 'infinity'::timestamptz),
+                    clock_timestamp() - interval '1 minute'
+                )
+            WHERE claims.queue = $1
+              AND NOT EXISTS (
+                SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                WHERE closures.claim_slot = claims.claim_slot
+                  AND closures.job_id = claims.job_id
+                  AND closures.run_lease = claims.run_lease
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM {schema}.leases AS lease
+                WHERE lease.job_id = claims.job_id
+                  AND lease.run_lease = claims.run_lease
+              )
+            "#,
+        );
+        let receipt_rows = sqlx::query(&receipt_sql)
+            .bind(queue)
+            .execute(pool)
+            .await
+            .expect("Failed to backdate queue-storage receipt claims")
+            .rows_affected();
+
+        let lease_sql = format!(
+            r#"
+            UPDATE {schema}.leases
+            SET heartbeat_at = clock_timestamp() - interval '10 minutes',
+                deadline_at = LEAST(
+                    COALESCE(deadline_at, 'infinity'::timestamptz),
+                    clock_timestamp() - interval '1 minute'
+                )
+            WHERE queue = $1
+              AND state = 'running'
+            "#,
+        );
+        let lease_rows = sqlx::query(&lease_sql)
+            .bind(queue)
+            .execute(pool)
+            .await
+            .expect("Failed to backdate queue-storage materialized leases")
+            .rows_affected();
+
+        return receipt_rows + lease_rows;
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET heartbeat_at = now() - interval '10 minutes',
+            deadline_at = now() - interval '1 minute'
+        WHERE queue = $1
+          AND state = 'running'
+        "#,
+    )
+    .bind(queue)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate canonical running jobs")
+    .rows_affected()
+}
+
+async fn backdate_retryable_kind(pool: &sqlx::PgPool, queue: &str, kind: &str) -> u64 {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        let sql = format!(
+            r#"
+            UPDATE {schema}.deferred_jobs
+            SET run_at = clock_timestamp() - interval '1 minute'
+            WHERE queue = $1
+              AND kind = $2
+              AND state = 'retryable'
+            "#,
+        );
+        return sqlx::query(&sql)
+            .bind(queue)
+            .bind(kind)
+            .execute(pool)
+            .await
+            .expect("Failed to backdate queue-storage retryable jobs")
+            .rows_affected();
+    }
+
+    sqlx::query(
+        r#"
+        UPDATE awa.jobs
+        SET run_at = now() - interval '1 minute'
+        WHERE queue = $1
+          AND kind = $2
+          AND state = 'retryable'
+        "#,
+    )
+    .bind(queue)
+    .bind(kind)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate canonical retryable jobs")
+    .rows_affected()
+}
+
+async fn backdate_callback_timeouts(pool: &sqlx::PgPool, queue: &str) -> u64 {
+    if let Some(schema) = active_queue_storage_schema(pool).await {
+        let sql = format!(
+            r#"
+            UPDATE {schema}.leases
+            SET callback_timeout_at = clock_timestamp() - interval '1 second'
+            WHERE queue = $1
+              AND state = 'waiting_external'
+            "#,
+        );
+        return sqlx::query(&sql)
+            .bind(queue)
+            .execute(pool)
+            .await
+            .expect("Failed to backdate queue-storage callback timeouts")
+            .rows_affected();
+    }
+
+    sqlx::query(
+        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
+         WHERE queue = $1 AND state = 'waiting_external'",
+    )
+    .bind(queue)
+    .execute(pool)
+    .await
+    .expect("Failed to backdate canonical callback timeouts")
+    .rows_affected()
 }
 
 async fn wait_for_single_leader(clients: &[&Client], timeout: Duration) -> usize {
@@ -563,8 +869,8 @@ fn complete_client(pool: sqlx::PgPool, queue: &str) -> Client {
         .expect("Failed to build complete client")
 }
 
-fn mixed_client(pool: sqlx::PgPool, queue: &str) -> Client {
-    Client::builder(pool)
+fn mixed_client(pool: sqlx::PgPool, queue: &str, queue_storage_schema: Option<&str>) -> Client {
+    let mut builder = Client::builder(pool)
         .queue(
             queue,
             QueueConfig {
@@ -581,9 +887,20 @@ fn mixed_client(pool: sqlx::PgPool, queue: &str) -> Client {
         .leader_election_interval(Duration::from_millis(100))
         .leader_check_interval(Duration::from_millis(100))
         .register_worker(CompleteWorker)
-        .register_worker(MixedChaosWorker)
-        .build()
-        .expect("Failed to build mixed chaos client")
+        .register_worker(MixedChaosWorker);
+
+    if let Some(schema) = queue_storage_schema {
+        builder = builder.queue_storage(
+            QueueStorageConfig {
+                schema: schema.to_string(),
+                ..QueueStorageConfig::default()
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        );
+    }
+
+    builder.build().expect("Failed to build mixed chaos client")
 }
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
@@ -659,20 +976,6 @@ impl Worker for MixedChaosWorker {
             }
             "deadline_hang" => {
                 if ctx.job.attempt == 1 {
-                    sqlx::query(
-                        r#"
-                        UPDATE awa.jobs
-                        SET deadline_at = now() + make_interval(secs => $2)
-                        WHERE id = $1 AND run_lease = $3
-                        "#,
-                    )
-                    .bind(ctx.job.id)
-                    .bind(0.15_f64)
-                    .bind(ctx.job.run_lease)
-                    .execute(ctx.pool())
-                    .await
-                    .map_err(JobError::retryable)?;
-
                     for _ in 0..200 {
                         if ctx.is_cancelled() {
                             break;
@@ -749,6 +1052,7 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_mixed");
     clean_queue(&pool, &queue).await;
+    let active_queue_storage_schema = active_queue_storage_schema(&pool).await;
 
     let exporter = InMemoryMetricExporter::default();
     let meter_provider = SdkMeterProvider::builder()
@@ -756,12 +1060,13 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
         .build();
     opentelemetry::global::set_meter_provider(meter_provider.clone());
 
-    let client = Client::builder(pool.clone())
+    let mut builder = Client::builder(pool.clone())
         .queue(
             &queue,
             QueueConfig {
                 max_workers: 8,
                 poll_interval: Duration::from_millis(25),
+                deadline_duration: Duration::from_millis(150),
                 ..QueueConfig::default()
             },
         )
@@ -770,9 +1075,18 @@ async fn test_mixed_workload_soak_tracks_recovery_and_metrics() {
         .deadline_rescue_interval(Duration::from_millis(100))
         .callback_rescue_interval(Duration::from_millis(100))
         .leader_election_interval(Duration::from_millis(100))
-        .register_worker(MixedChaosWorker)
-        .build()
-        .expect("Failed to build chaos client");
+        .register_worker(MixedChaosWorker);
+    if let Some(schema) = active_queue_storage_schema {
+        builder = builder.queue_storage(
+            QueueStorageConfig {
+                schema,
+                ..QueueStorageConfig::default()
+            },
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        );
+    }
+    let client = builder.build().expect("Failed to build chaos client");
 
     client.start().await.expect("Failed to start chaos client");
 
@@ -875,16 +1189,25 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     let node_b_app = format!("chaos_node_b_{}", &Uuid::new_v4().simple().to_string()[..8]);
     let node_a_pool = pool_with_url(&database_url_with_app_name(&node_a_app), 20).await;
     let node_b_pool = pool_with_url(&database_url_with_app_name(&node_b_app), 20).await;
+    let active_queue_storage_schema = active_queue_storage_schema(&pool).await;
 
-    let client_a = mixed_client(node_a_pool.clone(), &queue);
-    let client_b = mixed_client(node_b_pool.clone(), &queue);
-
-    let mut python_worker = start_python_helper(
-        "worker_simple_chaos_job",
+    let client_a = mixed_client(
+        node_a_pool.clone(),
         &queue,
-        &[("MIXED_SIMPLE_SLEEP_MS", "400".to_string())],
-    )
-    .await;
+        active_queue_storage_schema.as_deref(),
+    );
+    let client_b = mixed_client(
+        node_b_pool.clone(),
+        &queue,
+        active_queue_storage_schema.as_deref(),
+    );
+
+    let mut python_env = vec![("MIXED_SIMPLE_SLEEP_MS", "2000".to_string())];
+    if let Some(schema) = &active_queue_storage_schema {
+        python_env.push(("MIXED_QS_SCHEMA", schema.clone()));
+    }
+    let mut python_worker =
+        start_python_helper("worker_simple_chaos_job", &queue, &python_env).await;
 
     python_worker
         .wait_for_line(
@@ -957,16 +1280,31 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     insert_wave(&pool, &queue, &mut seq).await;
     insert_wave(&pool, &queue, &mut seq).await;
 
-    // Confirm Python is mid-execution on at least one simple job.
+    // Confirm Python is mid-execution on at least one simple job. The stdout
+    // line proves the helper entered the handler; the database predicate is
+    // the durable synchronization point that makes the later rescue assertion
+    // independent of stdout scheduling.
     python_worker
         .wait_for_line(
             "START mode=worker_simple_chaos_job",
             Duration::from_secs(10),
         )
         .await;
+    let running_before_kill = wait_for_kind_state_count(
+        &pool,
+        &queue,
+        "simple_chaos_job",
+        "running",
+        1,
+        Duration::from_secs(10),
+    )
+    .await;
 
-    // Now start Rust clients. They handle chaos_jobs from the waves and
-    // will also pick up simple_chaos_jobs — but Python already owns several.
+    // Kill Python while it has in-flight simple jobs.
+    python_worker.stop().await;
+
+    // Now start Rust clients. They handle chaos_jobs from the waves and rescue
+    // the simple_chaos_job left behind by the dead Python helper.
     client_a
         .start()
         .await
@@ -976,24 +1314,13 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
         .await
         .expect("Failed to start mixed chaos client B");
 
-    // Kill Python while it has in-flight simple jobs.
-    python_worker.stop().await;
-
     let _ = wait_for_single_leader(&[&client_a, &client_b], Duration::from_secs(5)).await;
 
-    sqlx::query(
-        r#"
-        UPDATE awa.jobs
-        SET heartbeat_at = now() - interval '10 minutes'
-        WHERE queue = $1
-          AND kind = 'simple_chaos_job'
-          AND state = 'running'
-        "#,
-    )
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate heartbeat_at for Python-owned running jobs");
+    let backdated = backdate_running_kind(&pool, &queue, "simple_chaos_job").await;
+    assert!(
+        backdated > 0,
+        "Expected to backdate at least one Python-owned running simple job; running before kill: {running_before_kill}"
+    );
 
     wait_for_counts(
         &pool,
@@ -1040,32 +1367,9 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     )
     .await;
 
-    sqlx::query(
-        r#"
-        UPDATE awa.jobs
-        SET heartbeat_at = now() - interval '10 minutes'
-        WHERE queue = $1
-          AND state = 'running'
-        "#,
-    )
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate heartbeat_at for disconnect-stranded running jobs");
+    backdate_running_jobs(&pool, &queue).await;
 
-    sqlx::query(
-        r#"
-        UPDATE awa.jobs
-        SET run_at = now() - interval '1 minute'
-        WHERE queue = $1
-          AND kind = 'chaos_job'
-          AND state = 'retryable'
-        "#,
-    )
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate run_at for retryable chaos jobs");
+    backdate_retryable_kind(&pool, &queue, "chaos_job").await;
 
     // 1 sentinel + 5 per wave (2 simple + 2 complete + 1 retry_once_manual)
     let expected_completed = 1 + (total_waves * 5);
@@ -1579,9 +1883,10 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     let pool = setup(20).await;
     let queue = chaos_queue("chaos_callback_failover");
     clean_queue(&pool, &queue).await;
+    let active_queue_storage_schema = active_queue_storage_schema(&pool).await;
 
     let build_callback_client = |pool: sqlx::PgPool| {
-        Client::builder(pool)
+        let mut builder = Client::builder(pool)
             .queue(
                 &queue,
                 QueueConfig {
@@ -1595,7 +1900,18 @@ async fn test_leader_failover_rescues_callback_timeouts() {
             .callback_rescue_interval(Duration::from_millis(100))
             .leader_election_interval(Duration::from_millis(100))
             .leader_check_interval(Duration::from_millis(100))
-            .register_worker(CallbackTimeoutWorker)
+            .register_worker(CallbackTimeoutWorker);
+        if let Some(schema) = &active_queue_storage_schema {
+            builder = builder.queue_storage(
+                QueueStorageConfig {
+                    schema: schema.clone(),
+                    ..QueueStorageConfig::default()
+                },
+                Duration::from_millis(1_000),
+                Duration::from_millis(50),
+            );
+        }
+        builder
             .build()
             .expect("Failed to build callback failover client")
     };
@@ -1650,14 +1966,8 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     // timing race where the original leader rescues them before we kill it.
     // Now that the leader is dead and the follower has taken over, we expire
     // the callbacks by moving their timeout into the past.
-    sqlx::query(
-        "UPDATE awa.jobs SET callback_timeout_at = now() - interval '1 second' \
-         WHERE queue = $1 AND state = 'waiting_external'",
-    )
-    .bind(&queue)
-    .execute(&pool)
-    .await
-    .expect("Failed to backdate callback_timeout_at");
+    let expired = backdate_callback_timeouts(&pool, &queue).await;
+    assert_eq!(expired, 12, "expected to expire all waiting callbacks");
 
     // After leader failover, the follower must: win election, start rescue
     // timer, rescue 12 timed-out callbacks (retryable → promoted → claimed →
