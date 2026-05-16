@@ -341,6 +341,47 @@ fn done_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.done_entries_{slot}")
 }
 
+fn done_ready_join(schema: &str, done_alias: &str, ready_alias: &str) -> String {
+    format!(
+        r#"
+            LEFT JOIN {schema}.ready_entries AS {ready_alias}
+              ON {ready_alias}.ready_slot = {done_alias}.ready_slot
+             AND {ready_alias}.ready_generation = {done_alias}.ready_generation
+             AND {ready_alias}.queue = {done_alias}.queue
+             AND {ready_alias}.priority = {done_alias}.priority
+             AND {ready_alias}.enqueue_shard = {done_alias}.enqueue_shard
+             AND {ready_alias}.lane_seq = {done_alias}.lane_seq
+        "#
+    )
+}
+
+fn done_row_projection(done_alias: &str, ready_alias: &str) -> String {
+    format!(
+        r#"
+                {done_alias}.ready_slot,
+                {done_alias}.ready_generation,
+                {done_alias}.job_id,
+                {done_alias}.kind,
+                {done_alias}.queue,
+                COALESCE({done_alias}.args, {ready_alias}.args, '{{}}'::jsonb) AS args,
+                {done_alias}.state,
+                {done_alias}.priority,
+                {done_alias}.attempt,
+                {done_alias}.run_lease,
+                COALESCE({done_alias}.max_attempts, {ready_alias}.max_attempts, 25::smallint) AS max_attempts,
+                {done_alias}.lane_seq,
+                {done_alias}.enqueue_shard,
+                COALESCE({done_alias}.run_at, {ready_alias}.run_at, {done_alias}.finalized_at) AS run_at,
+                COALESCE({done_alias}.attempted_at, {ready_alias}.attempted_at) AS attempted_at,
+                {done_alias}.finalized_at,
+                COALESCE({done_alias}.created_at, {ready_alias}.created_at, {done_alias}.finalized_at) AS created_at,
+                COALESCE({done_alias}.unique_key, {ready_alias}.unique_key) AS unique_key,
+                COALESCE({done_alias}.unique_states, {ready_alias}.unique_states) AS unique_states,
+                COALESCE({done_alias}.payload, {ready_alias}.payload, '{{}}'::jsonb) AS payload
+        "#
+    )
+}
+
 fn lease_child_name(schema: &str, slot: usize) -> String {
     format!("{schema}.leases_{slot}")
 }
@@ -3077,23 +3118,62 @@ impl QueueStorage {
                 job_id            BIGINT NOT NULL,
                 kind              TEXT NOT NULL,
                 queue             TEXT NOT NULL,
-                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+                args              JSONB,
                 state             awa.job_state NOT NULL DEFAULT 'completed',
                 priority          SMALLINT NOT NULL,
                 attempt           SMALLINT NOT NULL DEFAULT 1,
                 run_lease         BIGINT NOT NULL DEFAULT 1,
-                max_attempts      SMALLINT NOT NULL DEFAULT 25,
+                max_attempts      SMALLINT,
                 lane_seq          BIGINT NOT NULL,
                 enqueue_shard     SMALLINT NOT NULL DEFAULT 0,
-                run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                run_at            TIMESTAMPTZ,
                 attempted_at      TIMESTAMPTZ,
                 finalized_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+                created_at        TIMESTAMPTZ,
                 unique_key        BYTEA,
                 unique_states     TEXT,
                 payload           JSONB,
                 PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
             ) PARTITION BY LIST (ready_slot)
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Narrow terminal history: ready-backed terminal rows keep the
+            // durable terminal fact plus payload delta, and hydrate immutable
+            // job-body fields from ready_entries while the shared queue-ring
+            // slot is retained. Existing installs created these columns as
+            // NOT NULL with defaults; relaxing them is backwards-compatible
+            // with older wide writers and lets new writers avoid duplicated
+            // row/WAL budget.
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.done_entries
+                ALTER COLUMN args DROP NOT NULL,
+                ALTER COLUMN args DROP DEFAULT,
+                ALTER COLUMN max_attempts DROP NOT NULL,
+                ALTER COLUMN max_attempts DROP DEFAULT,
+                ALTER COLUMN run_at DROP NOT NULL,
+                ALTER COLUMN run_at DROP DEFAULT,
+                ALTER COLUMN created_at DROP NOT NULL,
+                ALTER COLUMN created_at DROP DEFAULT
+            "#
+            ))
+            .execute(pool)
+            .await
+            .map_err(map_sqlx_error)?;
+
+            let done_projection = done_row_projection("done", "ready");
+            let ready_join = done_ready_join(schema, "done", "ready");
+            sqlx::query(&format!(
+                r#"
+            CREATE OR REPLACE VIEW {schema}.terminal_jobs AS
+            SELECT
+                {done_projection}
+            FROM {schema}.done_entries AS done
+            {ready_join}
             "#
             ))
             .execute(pool)
@@ -4698,6 +4778,10 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
+        let keep_ready_backing = matches!(
+            old_state,
+            Some(JobState::Running | JobState::WaitingExternal)
+        );
         let ready_payloads = if rows
             .iter()
             .any(|row| !is_storage_payload_empty(&row.payload))
@@ -4718,47 +4802,135 @@ impl QueueStorage {
                 row.job_id,
             )
         });
-        let mut builder = QueryBuilder::<Postgres>::new(format!(
-            "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) "
-        ));
-        builder.push_values(ordered_rows, |mut b, row| {
-            let ready_key = (
-                row.ready_slot,
-                row.ready_generation,
-                row.queue.as_str(),
-                row.priority,
-                row.enqueue_shard,
-                row.lane_seq,
-            );
-            let ready_payload = ready_payloads.get(&ready_key);
-            b.push_bind(row.ready_slot)
-                .push_bind(row.ready_generation)
-                .push_bind(row.job_id)
-                .push_bind(&row.kind)
-                .push_bind(&row.queue)
-                .push_bind(&row.args)
-                .push_bind(row.state)
-                .push_bind(row.priority)
-                .push_bind(row.attempt)
-                .push_bind(row.run_lease)
-                .push_bind(row.max_attempts)
-                .push_bind(row.lane_seq)
-                .push_bind(row.enqueue_shard)
-                .push_bind(row.run_at)
-                .push_bind(row.attempted_at)
-                .push_bind(row.finalized_at)
-                .push_bind(row.created_at)
-                .push_bind(&row.unique_key)
-                .push_bind(&row.unique_states)
-                .push_bind(terminal_storage_payload(&row.payload, ready_payload));
-        });
-        builder
-            .build()
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
+        let (ready_backed, synthetic): (Vec<_>, Vec<_>) = ordered_rows
+            .into_iter()
+            .partition(|row| keep_ready_backing && row.lane_seq >= 0);
+
+        if !ready_backed.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(format!(
+                "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, state, priority, attempt, run_lease, lane_seq, enqueue_shard, attempted_at, finalized_at, payload) "
+            ));
+            builder.push_values(ready_backed, |mut b, row| {
+                let ready_key = (
+                    row.ready_slot,
+                    row.ready_generation,
+                    row.queue.as_str(),
+                    row.priority,
+                    row.enqueue_shard,
+                    row.lane_seq,
+                );
+                let ready_payload = ready_payloads.get(&ready_key);
+                b.push_bind(row.ready_slot)
+                    .push_bind(row.ready_generation)
+                    .push_bind(row.job_id)
+                    .push_bind(&row.kind)
+                    .push_bind(&row.queue)
+                    .push_bind(row.state)
+                    .push_bind(row.priority)
+                    .push_bind(row.attempt)
+                    .push_bind(row.run_lease)
+                    .push_bind(row.lane_seq)
+                    .push_bind(row.enqueue_shard)
+                    .push_bind(row.attempted_at)
+                    .push_bind(row.finalized_at)
+                    .push_bind(terminal_storage_payload(&row.payload, ready_payload));
+            });
+            builder
+                .build()
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
+
+        if !synthetic.is_empty() {
+            let mut builder = QueryBuilder::<Postgres>::new(format!(
+                "INSERT INTO {schema}.done_entries (ready_slot, ready_generation, job_id, kind, queue, args, state, priority, attempt, run_lease, max_attempts, lane_seq, enqueue_shard, run_at, attempted_at, finalized_at, created_at, unique_key, unique_states, payload) "
+            ));
+            builder.push_values(synthetic, |mut b, row| {
+                let ready_key = (
+                    row.ready_slot,
+                    row.ready_generation,
+                    row.queue.as_str(),
+                    row.priority,
+                    row.enqueue_shard,
+                    row.lane_seq,
+                );
+                let ready_payload = ready_payloads.get(&ready_key);
+                b.push_bind(row.ready_slot)
+                    .push_bind(row.ready_generation)
+                    .push_bind(row.job_id)
+                    .push_bind(&row.kind)
+                    .push_bind(&row.queue)
+                    .push_bind(&row.args)
+                    .push_bind(row.state)
+                    .push_bind(row.priority)
+                    .push_bind(row.attempt)
+                    .push_bind(row.run_lease)
+                    .push_bind(row.max_attempts)
+                    .push_bind(row.lane_seq)
+                    .push_bind(row.enqueue_shard)
+                    .push_bind(row.run_at)
+                    .push_bind(row.attempted_at)
+                    .push_bind(row.finalized_at)
+                    .push_bind(row.created_at)
+                    .push_bind(&row.unique_key)
+                    .push_bind(&row.unique_states)
+                    .push_bind(terminal_storage_payload(&row.payload, ready_payload));
+            });
+            builder
+                .build()
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+        }
 
         Ok(rows.len())
+    }
+
+    async fn delete_ready_backing_rows_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DoneJobRow],
+    ) -> Result<u64, AwaError> {
+        let rows: Vec<&DoneJobRow> = rows.iter().filter(|row| row.lane_seq >= 0).collect();
+        if rows.is_empty() {
+            return Ok(0);
+        }
+
+        let schema = self.schema();
+        let ready_slots: Vec<i32> = rows.iter().map(|row| row.ready_slot).collect();
+        let ready_generations: Vec<i64> = rows.iter().map(|row| row.ready_generation).collect();
+        let queues: Vec<&str> = rows.iter().map(|row| row.queue.as_str()).collect();
+        let priorities: Vec<i16> = rows.iter().map(|row| row.priority).collect();
+        let enqueue_shards: Vec<i16> = rows.iter().map(|row| row.enqueue_shard).collect();
+        let lane_seqs: Vec<i64> = rows.iter().map(|row| row.lane_seq).collect();
+
+        let result = sqlx::query(&format!(
+            r#"
+            WITH refs(ready_slot, ready_generation, queue, priority, enqueue_shard, lane_seq) AS (
+                SELECT * FROM unnest($1::int[], $2::bigint[], $3::text[], $4::smallint[], $5::smallint[], $6::bigint[])
+            )
+            DELETE FROM {schema}.ready_entries AS ready
+            USING refs
+            WHERE ready.ready_slot = refs.ready_slot
+              AND ready.ready_generation = refs.ready_generation
+              AND ready.queue = refs.queue
+              AND ready.priority = refs.priority
+              AND ready.enqueue_shard = refs.enqueue_shard
+              AND ready.lane_seq = refs.lane_seq
+            "#
+        ))
+        .bind(&ready_slots)
+        .bind(&ready_generations)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&enqueue_shards)
+        .bind(&lane_seqs)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        Ok(result.rows_affected())
     }
 
     async fn ready_payloads_for_done_rows_tx<'a, 'r>(
@@ -5916,11 +6088,208 @@ impl QueueStorage {
             .collect())
     }
 
+    fn receipt_fast_complete_candidate(entry: &ClaimedRuntimeJob) -> bool {
+        entry.claim.lease_claim_receipt
+            && entry.job.unique_key.is_none()
+            && is_empty_json_object(&entry.job.metadata)
+            && entry.job.tags.is_empty()
+            && entry.job.errors.as_ref().is_none_or(Vec::is_empty)
+    }
+
+    async fn complete_receipt_runtime_batch_fast(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = self.schema();
+        let finalized_at = Utc::now();
+        let claim_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.claim_slot).collect();
+        let ready_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.ready_slot).collect();
+        let ready_generations: Vec<i64> = claimed
+            .iter()
+            .map(|entry| entry.claim.ready_generation)
+            .collect();
+        let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
+        let kinds: Vec<String> = claimed.iter().map(|entry| entry.job.kind.clone()).collect();
+        let queues: Vec<String> = claimed
+            .iter()
+            .map(|entry| entry.job.queue.clone())
+            .collect();
+        let priorities: Vec<i16> = claimed.iter().map(|entry| entry.claim.priority).collect();
+        let attempts: Vec<i16> = claimed.iter().map(|entry| entry.job.attempt).collect();
+        let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
+        let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
+        let enqueue_shards: Vec<i16> = claimed
+            .iter()
+            .map(|entry| entry.claim.enqueue_shard)
+            .collect();
+        let attempted_ats: Vec<Option<DateTime<Utc>>> =
+            claimed.iter().map(|entry| entry.job.attempted_at).collect();
+        let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; claimed.len()];
+        let payloads: Vec<Option<serde_json::Value>> = vec![None; claimed.len()];
+
+        sqlx::query_as(&format!(
+            r#"
+            WITH completed(
+                claim_slot,
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                priority,
+                attempt,
+                run_lease,
+                lane_seq,
+                enqueue_shard,
+                attempted_at,
+                finalized_at,
+                payload
+            ) AS (
+                SELECT *
+                FROM unnest(
+                    $1::int[],
+                    $2::int[],
+                    $3::bigint[],
+                    $4::bigint[],
+                    $5::text[],
+                    $6::text[],
+                    $7::smallint[],
+                    $8::smallint[],
+                    $9::bigint[],
+                    $10::bigint[],
+                    $11::smallint[],
+                    $12::timestamptz[],
+                    $13::timestamptz[],
+                    $14::jsonb[]
+                )
+            ),
+            locked_claims AS (
+                SELECT claims.claim_slot, claims.job_id, claims.run_lease
+                FROM {schema}.lease_claims AS claims
+                JOIN completed
+                  ON completed.claim_slot = claims.claim_slot
+                 AND completed.job_id = claims.job_id
+                 AND completed.run_lease = claims.run_lease
+                FOR UPDATE OF claims
+            ),
+            closed AS (
+                INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                SELECT locked_claims.claim_slot, locked_claims.job_id, locked_claims.run_lease, 'completed', clock_timestamp()
+                FROM locked_claims
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING job_id, run_lease
+            ),
+            deleted_attempts AS (
+                DELETE FROM {schema}.attempt_state AS attempt
+                USING closed
+                WHERE attempt.job_id = closed.job_id
+                  AND attempt.run_lease = closed.run_lease
+                RETURNING attempt.job_id
+            ),
+            terminal AS (
+                INSERT INTO {schema}.done_entries (
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    kind,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    lane_seq,
+                    enqueue_shard,
+                    attempted_at,
+                    finalized_at,
+                    payload
+                )
+                SELECT
+                    completed.ready_slot,
+                    completed.ready_generation,
+                    completed.job_id,
+                    completed.kind,
+                    completed.queue,
+                    'completed'::awa.job_state,
+                    completed.priority,
+                    completed.attempt,
+                    completed.run_lease,
+                    completed.lane_seq,
+                    completed.enqueue_shard,
+                    completed.attempted_at,
+                    completed.finalized_at,
+                    completed.payload
+                FROM completed
+                JOIN closed
+                  ON closed.job_id = completed.job_id
+                 AND closed.run_lease = completed.run_lease
+                RETURNING job_id, run_lease
+            )
+            SELECT job_id, run_lease
+            FROM terminal
+            "#
+        ))
+        .bind(&claim_slots)
+        .bind(&ready_slots)
+        .bind(&ready_generations)
+        .bind(&job_ids)
+        .bind(&kinds)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&attempts)
+        .bind(&run_leases)
+        .bind(&lane_seqs)
+        .bind(&enqueue_shards)
+        .bind(&attempted_ats)
+        .bind(&finalized_ats)
+        .bind(&payloads)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     #[tracing::instrument(
         skip(self, pool, claimed),
         name = "queue_storage.complete_runtime_batch"
     )]
     pub async fn complete_runtime_batch(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.lease_claim_receipts() && claimed.iter().all(Self::receipt_fast_complete_candidate)
+        {
+            let mut updated = self
+                .complete_receipt_runtime_batch_fast(pool, claimed)
+                .await?;
+            if updated.len() == claimed.len() {
+                return Ok(updated);
+            }
+
+            let updated_pairs: BTreeSet<(i64, i64)> = updated.iter().copied().collect();
+            let missed: Vec<_> = claimed
+                .iter()
+                .filter(|entry| !updated_pairs.contains(&(entry.job.id, entry.job.run_lease)))
+                .cloned()
+                .collect();
+            if !missed.is_empty() {
+                updated.extend(self.complete_runtime_batch_slow(pool, &missed).await?);
+            }
+            return Ok(updated);
+        }
+
+        self.complete_runtime_batch_slow(pool, claimed).await
+    }
+
+    async fn complete_runtime_batch_slow(
         &self,
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
@@ -6532,10 +6901,13 @@ impl QueueStorage {
             ));
         }
 
+        let done_projection = done_row_projection("done", "ready");
+        let ready_join = done_ready_join(schema, "done", "ready");
         let terminal: Option<DoneJobRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.done_entries
-            WHERE (job_id, finalized_at) IN (
+            WITH deleted AS (
+                DELETE FROM {schema}.done_entries
+                WHERE (job_id, finalized_at) IN (
                 SELECT job_id, finalized_at
                 FROM {schema}.done_entries
                 WHERE job_id = $1
@@ -6544,27 +6916,11 @@ impl QueueStorage {
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
             )
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                run_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                COALESCE(payload, '{{}}'::jsonb) AS payload
+                RETURNING *
+            )
+            SELECT {done_projection}
+            FROM deleted AS done
+            {ready_join}
             "#
         ))
         .bind(job_id)
@@ -6573,6 +6929,8 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if let Some(terminal) = terminal {
+            self.delete_ready_backing_rows_tx(tx, std::slice::from_ref(&terminal))
+                .await?;
             let ready_row = ExistingReadyRow {
                 job_id: terminal.job_id,
                 kind: terminal.kind,
@@ -8374,34 +8732,27 @@ impl QueueStorage {
         let done_rows: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
-                done.ready_slot,
-                done.ready_generation,
-                done.job_id,
-                done.kind,
-                done.queue,
-                done.args,
-                done.state,
-                done.priority,
-                done.attempt,
-                done.run_lease,
-                done.max_attempts,
-                done.lane_seq,
-                done.enqueue_shard,
-                done.run_at,
-                done.attempted_at,
-                done.finalized_at,
-                done.created_at,
-                done.unique_key,
-                done.unique_states,
-                COALESCE(done.payload, ready.payload, '{{}}'::jsonb) AS payload
-            FROM {schema}.done_entries AS done
-            LEFT JOIN {schema}.ready_entries AS ready
-              ON ready.ready_slot = done.ready_slot
-             AND ready.ready_generation = done.ready_generation
-             AND ready.queue = done.queue
-             AND ready.priority = done.priority
-             AND ready.enqueue_shard = done.enqueue_shard
-             AND ready.lane_seq = done.lane_seq
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                enqueue_shard,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            FROM {schema}.terminal_jobs AS done
             WHERE done.job_id = $1
             ORDER BY done.run_lease DESC, done.finalized_at DESC
             "#,
@@ -9555,39 +9906,26 @@ impl QueueStorage {
     ) -> Result<Option<JobRow>, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let done_projection = done_row_projection("done", "ready");
+        let ready_join = done_ready_join(schema, "done", "ready");
         let moved: Option<DoneJobRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.done_entries
-            WHERE (job_id, finalized_at) IN (
-                SELECT job_id, finalized_at
-                FROM {schema}.done_entries
-                WHERE job_id = $1
-                  AND state = 'failed'
-                ORDER BY finalized_at DESC
-                LIMIT 1
-                FOR UPDATE SKIP LOCKED
+            WITH deleted AS (
+                DELETE FROM {schema}.done_entries
+                WHERE (job_id, finalized_at) IN (
+                    SELECT job_id, finalized_at
+                    FROM {schema}.done_entries
+                    WHERE job_id = $1
+                      AND state = 'failed'
+                    ORDER BY finalized_at DESC
+                    LIMIT 1
+                    FOR UPDATE SKIP LOCKED
+                )
+                RETURNING *
             )
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                run_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                COALESCE(payload, '{{}}'::jsonb) AS payload
+            SELECT {done_projection}
+            FROM deleted AS done
+            {ready_join}
             "#
         ))
         .bind(job_id)
@@ -9600,6 +9938,8 @@ impl QueueStorage {
             return Ok(None);
         };
 
+        self.delete_ready_backing_rows_tx(&mut tx, std::slice::from_ref(&moved))
+            .await?;
         let dlq_row = moved
             .clone()
             .into_dlq_row(dlq_reason.to_string(), Utc::now());
@@ -9623,33 +9963,20 @@ impl QueueStorage {
     ) -> Result<u64, AwaError> {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let done_projection = done_row_projection("done", "ready");
+        let ready_join = done_ready_join(schema, "done", "ready");
         let moved: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.done_entries
-            WHERE state = 'failed'
-              AND ($1::text IS NULL OR kind = $1)
-              AND ($2::text IS NULL OR queue = $2)
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                run_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                COALESCE(payload, '{{}}'::jsonb) AS payload
+            WITH deleted AS (
+                DELETE FROM {schema}.done_entries
+                WHERE state = 'failed'
+                  AND ($1::text IS NULL OR kind = $1)
+                  AND ($2::text IS NULL OR queue = $2)
+                RETURNING *
+            )
+            SELECT {done_projection}
+            FROM deleted AS done
+            {ready_join}
             "#
         ))
         .bind(kind)
@@ -9663,6 +9990,7 @@ impl QueueStorage {
             return Ok(0);
         }
 
+        self.delete_ready_backing_rows_tx(&mut tx, &moved).await?;
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
             .into_iter()
@@ -9851,32 +10179,19 @@ impl QueueStorage {
         let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
+        let done_projection = done_row_projection("done", "ready");
+        let ready_join = done_ready_join(schema, "done", "ready");
         let deleted_done: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
-            DELETE FROM {schema}.done_entries
-            WHERE kind = $1
-              AND state = 'failed'
-            RETURNING
-                ready_slot,
-                ready_generation,
-                job_id,
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                attempt,
-                run_lease,
-                max_attempts,
-                lane_seq,
-                enqueue_shard,
-                run_at,
-                attempted_at,
-                finalized_at,
-                created_at,
-                unique_key,
-                unique_states,
-                COALESCE(payload, '{{}}'::jsonb) AS payload
+            WITH deleted AS (
+                DELETE FROM {schema}.done_entries
+                WHERE kind = $1
+                  AND state = 'failed'
+                RETURNING *
+            )
+            SELECT {done_projection}
+            FROM deleted AS done
+            {ready_join}
             "#
         ))
         .bind(kind)
@@ -9914,6 +10229,9 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
+
+        self.delete_ready_backing_rows_tx(&mut tx, &deleted_done)
+            .await?;
 
         for row in &deleted_done {
             self.sync_unique_claim(

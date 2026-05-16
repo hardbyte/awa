@@ -69,11 +69,32 @@ with their own promotion, retry, purge, and retention paths. Control tables
 stay narrow because they are the coordination surface dispatchers and
 maintenance touch most often.
 
+## Storage Surfaces
+
+Most applications should use the Rust, Python, CLI, or UI APIs rather than
+querying queue-storage tables directly. The SQL objects still matter for
+operators, adapters, and incident read-outs, so Awa separates read surfaces from
+physical transition surfaces:
+
+| Surface | Role | Consumer contract |
+|---|---|---|
+| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. | Public compatibility surface. Prefer the Rust/Python/adapter APIs for writes; do not depend on physical queue-storage tables for enqueue. |
+| `{schema}.terminal_jobs` | Read-only hydrated view over queue-storage terminal history. It joins narrow `done_entries_*` rows back to retained `ready_entries_*` bodies. | Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface. |
+| `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
+| `done_entries_*` | Physical terminal fact ring. Ready-backed terminal rows can intentionally omit duplicated body columns. | Internal storage. Direct readers must tolerate nullable duplicated body fields; use `{schema}.terminal_jobs` for hydrated terminal rows. |
+| `deferred_jobs` | Physical scheduled/retryable backlog table. | Internal storage. Promotion, retry, snooze, and cancellation own its transitions. |
+| `dlq_entries` | Durable operator hold table for DLQ-enabled terminal failures. | Operator surface through CLI/UI/API; direct SQL inspection is reasonable, direct mutation is not. |
+| `lease_claims_*` / `lease_claim_closures_*` | Receipt-plane execution history for short attempts. | Internal storage. Live receipt attempts are claims without matching closures. |
+| `leases_*` / `attempt_state` | Materialized execution state for heartbeat, callbacks, progress, and other mutable attempt data. | Internal storage. Runtime and rescue paths own mutations. |
+| `queue_lanes`, queue heads, ring-state tables, `queue_meta` | Claim cursors, enqueue heads, rotation/prune state, and queue storage configuration. | Internal control surface except documented configuration fields such as `queue_meta.enqueue_shards`. |
+| descriptors, runtime snapshots, cron tables | Operator metadata and scheduler declarations. | Public through Awa APIs and UI; SQL reads are acceptable for reporting. Writes should go through the corresponding Awa APIs. |
+
 ADR-019 is the storage-engine source of truth; ADR-023 supersedes it for the
-receipt plane:
+receipt plane, and ADR-026 refines terminal history:
 
 - [ADR-019: Queue Storage Engine](adr/019-queue-storage-redesign.md)
 - [ADR-023: Receipt Plane Ring Partitioning](adr/023-receipt-plane-ring-partitioning.md)
+- [ADR-026: Narrow Terminal History](adr/026-narrow-terminal-history.md)
 
 ## Job Lifecycle
 
@@ -100,7 +121,12 @@ callback resumes lose after rescue, admin cancellation, or re-claim.
 Terminal rows differ by storage backend:
 
 - In queue storage, `completed`, ordinary `failed`, and `cancelled` snapshots
-  live in `done_entries_*` and are reclaimed by queue-ring prune.
+  live in `done_entries_*` and are reclaimed by queue-ring prune. Ready-backed
+  terminal rows are narrow: immutable job-body fields stay in the retained
+  `ready_entries_*` row and public/admin reads hydrate through the storage
+  surfaces described above. If a transition deletes the ready row first, such
+  as cancelling an unclaimed available job, the terminal row is written wide
+  instead.
 - DLQ-enabled terminal failures are copied into `dlq_entries`; that table has
   explicit retention cleanup plus operator retry/purge.
 - In the canonical compatibility path, terminal rows in `awa.jobs_hot` use
@@ -211,7 +237,7 @@ maintenance leader:
 
 | Ring | Partitions | Default cadence | Rotate requires | Prune requires |
 |---|---|---:|---|---|
-| Queue | `ready_entries_*`, `done_entries_*` | `1000ms` | incoming ready/done slot is empty | oldest non-current slot has no active leases and no pending ready rows |
+| Queue | `ready_entries_*`, `done_entries_*` | `1000ms` | incoming ready/done slot is empty | oldest non-current slot has no active leases and no pending ready rows; terminal rows in that ready segment are reclaimed with their retained ready bodies |
 | Lease | `leases_*` | `50ms` | incoming lease slot is empty | oldest initialized non-current lease slot is empty |
 | Claim | `lease_claims_*`, `lease_claim_closures_*` | matches queue ring | incoming claims/closures slot is empty | every claim in the oldest non-current slot has a matching closure |
 

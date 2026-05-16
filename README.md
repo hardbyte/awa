@@ -70,16 +70,23 @@ harness that verifies concrete runtime-test event sequences against the spec.
 
 ## Benchmarks
 
-Local queue-storage soak, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95
-pickup**, **417 exact final dead tuples**. Enqueue: ~30k/s single-producer,
-~100k/s multi-producer.
+The north-star benchmark is not enqueue-only speed. Awa is judged by
+end-to-end completion throughput, p99 end-to-end latency, queue depth under
+oversupply, WAL bytes per completed job, transaction commits per completed job,
+and dead tuples / prune lag. Enqueue-only rates are reported separately for
+producer-path regressions.
+
+Queue-storage soak reference, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95
+pickup**, **417 exact final dead tuples**. Enqueue reference: ~30k/s
+single-producer, ~100k/s multi-producer.
 
 A phase-driven portable benchmark harness comparing Awa against pgque,
 procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres
 instance lives in its own repository:
 [hardbyte/postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
 It records producer, subscriber, and end-to-end delivery latency
-alongside throughput, queue depth, and dead tuples over time.
+alongside throughput, queue depth, dead tuples, WAL pressure, and transaction
+pressure over time.
 
 Methodology and caveats live in
 [benchmarking notes](docs/benchmarking.md). Validation artifacts:

@@ -13,7 +13,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const DEFAULT_CLAIM_BATCH_LIMIT: usize = 128;
+const DEFAULT_CLAIM_BATCH_LIMIT: usize = 512;
 const MAX_CLAIMERS_PER_QUEUE: i16 = 4;
 const CLAIMER_LEASE_TTL: Duration = Duration::from_secs(3);
 const CLAIMER_IDLE_THRESHOLD: Duration = Duration::from_millis(500);

@@ -15,10 +15,11 @@ use awa::model::{
 use awa::{
     Client, InsertOpts, InsertParams, JobArgs, JobContext, JobError, JobResult, QueueConfig, Worker,
 };
-use bench_output::{BenchMetrics, BenchmarkResult, SCHEMA_VERSION};
+use bench_output::{BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -691,11 +692,18 @@ async fn test_throughput_rust_workers_queue_storage() {
     let queue = "bench_throughput_queue_storage";
     let total_jobs: i64 = env_i64("AWA_VA_RUNTIME_TOTAL_JOBS", 5_000);
     let batch_size = env_usize("AWA_VA_RUNTIME_BATCH_SIZE", 500);
+    let use_copy = env_usize("AWA_VA_RUNTIME_USE_COPY", 0) != 0;
     let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
     let lease_slot_count = env_usize("AWA_VA_RUNTIME_LEASE_SLOTS", 4);
     let queue_stripe_count = env_usize("AWA_VA_RUNTIME_QUEUE_STRIPES", 1);
     let storage_schema = env_string("AWA_VA_RUNTIME_STORAGE_SCHEMA", "awa_queue_storage");
     let max_workers = env_usize("AWA_VA_RUNTIME_MAX_WORKERS", 100);
+    let claimers = env_usize("AWA_VA_RUNTIME_CLAIMERS", 1);
+    let claim_batch_size = env_usize(
+        "AWA_VA_RUNTIME_CLAIM_BATCH_SIZE",
+        QueueConfig::default().claim_batch_size,
+    );
+    let poll_ms = env_i64("AWA_VA_RUNTIME_POLL_MS", 100).max(1) as u64;
     let queue_rotate_ms = env_i64("AWA_VA_RUNTIME_QUEUE_ROTATE_MS", 1_000);
     let lease_rotate_ms = env_i64("AWA_VA_RUNTIME_LEASE_ROTATE_MS", 50);
 
@@ -725,6 +733,8 @@ async fn test_throughput_rust_workers_queue_storage() {
             queue,
             QueueConfig {
                 max_workers: max_workers.try_into().expect("max workers must fit in u32"),
+                claimers: claimers.try_into().expect("claimers must fit in u16"),
+                claim_batch_size,
                 poll_interval: Duration::from_millis(50),
                 deadline_duration: Duration::ZERO,
                 ..QueueConfig::default()
@@ -744,6 +754,7 @@ async fn test_throughput_rust_workers_queue_storage() {
         .await
         .expect("Failed to start queue storage client");
 
+    let db_profile_start = capture_db_profile(&pool).await;
     let benchmark_start = Instant::now();
     let insert_start = Instant::now();
     for batch_start in (0..total_jobs).step_by(batch_size) {
@@ -761,10 +772,17 @@ async fn test_throughput_rust_workers_queue_storage() {
             })
             .collect();
 
-        store
-            .enqueue_params_batch(&pool, &params)
-            .await
-            .expect("Failed to enqueue queue storage runtime batch");
+        if use_copy {
+            store
+                .enqueue_params_copy(&pool, &params)
+                .await
+                .expect("Failed to enqueue queue storage runtime COPY batch");
+        } else {
+            store
+                .enqueue_params_batch(&pool, &params)
+                .await
+                .expect("Failed to enqueue queue storage runtime batch");
+        }
     }
     let insert_elapsed = insert_start.elapsed();
     println!(
@@ -791,7 +809,7 @@ async fn test_throughput_rust_workers_queue_storage() {
             );
         }
 
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        tokio::time::sleep(Duration::from_millis(poll_ms)).await;
         let counts = store
             .queue_counts(&pool, queue)
             .await
@@ -844,6 +862,87 @@ async fn test_throughput_rust_workers_queue_storage() {
                     + attempt_state_dead.unwrap_or(0),
             );
 
+            let mut metadata = serde_json::json!({
+                "measurement": "e2e",
+                "profile": "queue_storage_runtime",
+                "queue": queue,
+                "storage_schema": store.schema(),
+                "total_jobs": total_jobs,
+                "insert_batch_size": batch_size,
+                "enqueue_mode": if use_copy { "copy" } else { "insert" },
+                "max_workers": max_workers,
+                "claimers": claimers,
+                "claim_batch_size": claim_batch_size,
+                "completion_poll_ms": poll_ms,
+                "queue_slot_count": queue_slot_count,
+                "lease_slot_count": lease_slot_count,
+                "queue_stripe_count": queue_stripe_count,
+                "queue_rotate_ms": queue_rotate_ms,
+                "lease_rotate_ms": lease_rotate_ms,
+                "completion_shards_env": std::env::var("AWA_COMPLETION_SHARDS").ok(),
+                "post_insert_throughput_per_s": throughput,
+                "end_to_end_throughput_per_s": end_to_end_throughput,
+                "insert_elapsed_s": insert_elapsed.as_secs_f64(),
+                "processing_elapsed_s": processing_elapsed.as_secs_f64(),
+                "end_to_end_elapsed_s": end_to_end_elapsed.as_secs_f64(),
+                "exact_dead_tuples": {
+                    "queue_lanes": queue_lanes_dead.unwrap_or(-1),
+                    "ready": ready_dead.unwrap_or(-1),
+                    "done": done_dead.unwrap_or(-1),
+                    "leases": leases_dead.unwrap_or(-1),
+                    "attempt_state": attempt_state_dead.unwrap_or(-1),
+                    "total": queue_lanes_dead.unwrap_or(0)
+                        + ready_dead.unwrap_or(0)
+                        + done_dead.unwrap_or(0)
+                        + leases_dead.unwrap_or(0)
+                        + attempt_state_dead.unwrap_or(0),
+                },
+            });
+            if let Some(start) = db_profile_start.as_ref() {
+                if let Some(db_profile) = capture_db_profile_delta(&pool, start).await {
+                    if let Some(wal_bytes) = db_profile
+                        .get("wal_bytes")
+                        .and_then(serde_json::Value::as_i64)
+                    {
+                        metadata
+                            .as_object_mut()
+                            .expect("benchmark metadata should be an object")
+                            .insert(
+                                "wal_bytes_per_completed_job".to_string(),
+                                serde_json::json!(wal_bytes as f64 / total_jobs as f64),
+                            );
+                    }
+                    metadata
+                        .as_object_mut()
+                        .expect("benchmark metadata should be an object")
+                        .insert("db_profile".to_string(), db_profile);
+                }
+            }
+
+            let mut outcomes = HashMap::new();
+            outcomes.insert("completed".to_string(), total_jobs as u64);
+            outcomes.insert("available".to_string(), 0);
+            outcomes.insert("running".to_string(), 0);
+            BenchmarkResult {
+                schema_version: SCHEMA_VERSION,
+                scenario: "queue_storage_runtime".to_string(),
+                language: "rust".to_string(),
+                seeded: total_jobs as u64,
+                metrics: BenchMetrics {
+                    throughput: Some(BenchThroughput {
+                        handler_per_s: throughput,
+                        db_finalized_per_s: throughput,
+                    }),
+                    enqueue_per_s: Some(total_jobs as f64 / insert_elapsed.as_secs_f64()),
+                    drain_time_s: Some(end_to_end_elapsed.as_secs_f64()),
+                    latency_ms: None,
+                    rescue: None,
+                },
+                outcomes,
+                metadata: Some(metadata),
+            }
+            .emit();
+
             assert!(
                 throughput >= 3000.0,
                 "Vacuum-aware throughput {:.0} jobs/sec is below minimum threshold of 3000 jobs/sec",
@@ -865,6 +964,289 @@ async fn test_throughput_rust_workers_queue_storage() {
             last_completed = counts.completed;
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct OfferedRateSample {
+    second: u64,
+    seeded: i64,
+    completed: i64,
+    completed_delta: i64,
+    available: i64,
+    running: i64,
+}
+
+async fn queue_storage_offered_rate_producer(
+    pool: sqlx::PgPool,
+    store: Arc<QueueStorage>,
+    queue: String,
+    offered_rate: u64,
+    tick: Duration,
+    seeded: Arc<AtomicI64>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) {
+    let tick_ms = tick.as_millis().max(1) as u64;
+    let jobs_per_tick = ((offered_rate * tick_ms) / 1_000).max(1);
+    let mut next_seq = 0_i64;
+    let mut interval = tokio::time::interval(tick);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        tokio::select! {
+            _ = stop.changed() => {
+                if *stop.borrow() {
+                    break;
+                }
+            }
+            _ = interval.tick() => {
+                let start = next_seq;
+                let end = start + jobs_per_tick as i64;
+                next_seq = end;
+                let params: Vec<_> = (start..end)
+                    .map(|i| {
+                        awa::model::insert::params_with(
+                            &BenchJob { seq: i },
+                            InsertOpts {
+                                queue: queue.clone(),
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                    })
+                    .collect();
+                store
+                    .enqueue_params_batch(&pool, &params)
+                    .await
+                    .expect("Failed to enqueue offered-rate queue storage batch");
+                seeded.fetch_add(params.len() as i64, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+#[ignore]
+async fn test_queue_storage_runtime_offered_rate() {
+    let pool = setup(24).await;
+    ensure_pgstattuple(&pool).await;
+    reset_runtime_state(&pool).await;
+
+    let queue = "bench_queue_storage_offered_rate";
+    let offered_rate = env_i64("AWA_VA_OFFERED_RATE", 10_000).max(1) as u64;
+    let producer_tick_ms = env_i64("AWA_VA_OFFERED_TICK_MS", 50).max(1) as u64;
+    let window_secs = env_i64("AWA_VA_OFFERED_WINDOW_SECS", 10).max(1) as u64;
+    let drain_timeout_secs = env_i64("AWA_VA_OFFERED_DRAIN_TIMEOUT_SECS", 20).max(1) as u64;
+    let queue_slot_count = env_usize("AWA_VA_RUNTIME_QUEUE_SLOTS", 16);
+    let lease_slot_count = env_usize("AWA_VA_RUNTIME_LEASE_SLOTS", 8);
+    let storage_schema = env_string("AWA_VA_RUNTIME_STORAGE_SCHEMA", "awa_queue_storage_offered");
+    let max_workers = env_usize("AWA_VA_RUNTIME_MAX_WORKERS", 1024);
+    let claimers = env_usize("AWA_VA_RUNTIME_CLAIMERS", 1);
+    let claim_batch_size = env_usize(
+        "AWA_VA_RUNTIME_CLAIM_BATCH_SIZE",
+        QueueConfig::default().claim_batch_size,
+    );
+
+    let store_config = QueueStorageConfig {
+        schema: storage_schema,
+        queue_slot_count,
+        lease_slot_count,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = Arc::new(
+        QueueStorage::new(store_config.clone()).expect("Failed to build queue storage store"),
+    );
+    recreate_queue_storage_schema(&pool, &store).await;
+    store
+        .install(&pool)
+        .await
+        .expect("Failed to install queue storage store");
+    store
+        .reset(&pool)
+        .await
+        .expect("Failed to reset queue storage store");
+    activate_queue_storage_transition(&pool, store.schema()).await;
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                max_workers: max_workers.try_into().expect("max workers must fit in u32"),
+                claimers: claimers.try_into().expect("claimers must fit in u16"),
+                claim_batch_size,
+                poll_interval: Duration::from_millis(50),
+                deadline_duration: Duration::ZERO,
+                ..QueueConfig::default()
+            },
+        )
+        .queue_storage(
+            store_config,
+            Duration::from_millis(1_000),
+            Duration::from_millis(50),
+        )
+        .register_worker(BenchWorker)
+        .build()
+        .expect("Failed to build queue storage offered-rate client");
+
+    client
+        .start()
+        .await
+        .expect("Failed to start queue storage offered-rate client");
+
+    let seeded = Arc::new(AtomicI64::new(0));
+    let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
+    let producer = tokio::spawn(queue_storage_offered_rate_producer(
+        pool.clone(),
+        store.clone(),
+        queue.to_string(),
+        offered_rate,
+        Duration::from_millis(producer_tick_ms),
+        seeded.clone(),
+        stop_rx,
+    ));
+
+    let db_profile_start = capture_db_profile(&pool).await;
+    let benchmark_start = Instant::now();
+    let mut samples = Vec::new();
+    let mut previous_completed = 0_i64;
+
+    for second in 1..=window_secs {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let counts = store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("Failed to sample queue storage offered-rate counts");
+        let completed_delta = counts.completed.saturating_sub(previous_completed);
+        previous_completed = counts.completed;
+        println!(
+            "[bench-va-offered] second={second:>2} seeded={} completed={} (+{}) available={} running={}",
+            seeded.load(Ordering::Relaxed),
+            counts.completed,
+            completed_delta,
+            counts.available,
+            counts.running,
+        );
+        samples.push(OfferedRateSample {
+            second,
+            seeded: seeded.load(Ordering::Relaxed),
+            completed: counts.completed,
+            completed_delta,
+            available: counts.available,
+            running: counts.running,
+        });
+    }
+
+    let _ = stop_tx.send(true);
+    producer
+        .await
+        .expect("queue storage offered-rate producer task failed");
+
+    let seeded_total = seeded.load(Ordering::Relaxed);
+    let drain_start = Instant::now();
+    let final_counts = loop {
+        let counts = store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("Failed to sample final offered-rate counts");
+        if counts.completed >= seeded_total
+            || drain_start.elapsed() >= Duration::from_secs(drain_timeout_secs)
+        {
+            break counts;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let elapsed = benchmark_start.elapsed();
+    client.shutdown(Duration::from_secs(5)).await;
+
+    let completed_during_window: i64 = samples.iter().map(|sample| sample.completed_delta).sum();
+    let completed_per_s = completed_during_window as f64 / window_secs as f64;
+    let actual_enqueue_per_s = seeded_total as f64 / window_secs as f64;
+    let final_backlog = final_counts.available + final_counts.running;
+
+    println!(
+        "[bench-va-offered] offered={} actual_enqueue={:.0}/s completed_window={:.0}/s seeded={} completed={} backlog={} elapsed={:.2}s",
+        offered_rate,
+        actual_enqueue_per_s,
+        completed_per_s,
+        seeded_total,
+        final_counts.completed,
+        final_backlog,
+        elapsed.as_secs_f64(),
+    );
+
+    let mut outcomes = HashMap::new();
+    outcomes.insert("completed".to_string(), final_counts.completed as u64);
+    outcomes.insert("available".to_string(), final_counts.available as u64);
+    outcomes.insert("running".to_string(), final_counts.running as u64);
+
+    let mut metadata = serde_json::json!({
+        "measurement": "offered_rate",
+        "profile": "queue_storage_runtime",
+        "queue": queue,
+        "storage_schema": store.schema(),
+        "offered_rate_per_s": offered_rate,
+        "actual_enqueue_per_s": actual_enqueue_per_s,
+        "completed_window_per_s": completed_per_s,
+        "producer_tick_ms": producer_tick_ms,
+        "window_secs": window_secs,
+        "drain_timeout_secs": drain_timeout_secs,
+        "max_workers": max_workers,
+        "claimers": claimers,
+        "claim_batch_size": claim_batch_size,
+        "queue_slot_count": queue_slot_count,
+        "lease_slot_count": lease_slot_count,
+        "completion_shards_env": std::env::var("AWA_COMPLETION_SHARDS").ok(),
+        "seeded": seeded_total,
+        "final_backlog": final_backlog,
+        "samples": samples,
+    });
+    if let Some(start) = db_profile_start.as_ref() {
+        if let Some(db_profile) = capture_db_profile_delta(&pool, start).await {
+            let completed = final_counts.completed.max(1);
+            if let Some(wal_bytes) = db_profile
+                .get("wal_bytes")
+                .and_then(serde_json::Value::as_i64)
+            {
+                metadata
+                    .as_object_mut()
+                    .expect("benchmark metadata should be an object")
+                    .insert(
+                        "wal_bytes_per_completed_job".to_string(),
+                        serde_json::json!(wal_bytes as f64 / completed as f64),
+                    );
+            }
+            metadata
+                .as_object_mut()
+                .expect("benchmark metadata should be an object")
+                .insert("db_profile".to_string(), db_profile);
+        }
+    }
+
+    BenchmarkResult {
+        schema_version: SCHEMA_VERSION,
+        scenario: "queue_storage_offered_rate".to_string(),
+        language: "rust".to_string(),
+        seeded: seeded_total as u64,
+        metrics: BenchMetrics {
+            throughput: Some(BenchThroughput {
+                handler_per_s: completed_per_s,
+                db_finalized_per_s: completed_per_s,
+            }),
+            enqueue_per_s: Some(actual_enqueue_per_s),
+            drain_time_s: Some(elapsed.as_secs_f64()),
+            latency_ms: None,
+            rescue: None,
+        },
+        outcomes,
+        metadata: Some(metadata),
+    }
+    .emit();
+
+    assert_eq!(
+        final_backlog, 0,
+        "offered-rate benchmark left {final_backlog} live jobs after drain"
+    );
 }
 
 // ═══════════════════════════════════════════════════════════════════════

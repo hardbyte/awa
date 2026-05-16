@@ -1,20 +1,23 @@
 # Benchmarking Notes
 
 This document captures the benchmark harnesses used in the repo and a few
-reference results from local runs and dedicated-server enqueue comparisons.
+reference results from named development and comparison environments.
 
-## Test Environment
+## Reference Environments
 
-- Local machine: Apple M5 MacBook Air (16 GB)
-- Local runtime: PostgreSQL 17 in Docker (OrbStack)
-- Local database URL used for the example commands:
-  `postgres://postgres:test@localhost:15432/awa_test`
-- Cross-system long-horizon comparisons run from a separate repo:
+- **Developer laptop reference**: Apple M5 MacBook Air (16 GB), PostgreSQL 17
+  in Docker (OrbStack). Several awa-only regression examples below come from
+  this environment.
+- **Dedicated enqueue reference**: PostgreSQL 17 on a separate Linux host.
+  These runs are useful for producer-path shape comparisons and are not
+  published throughput claims.
+- **Cross-system comparison reference**:
   [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
-  Default Postgres image is 17.2; `--pg-image postgres:18-alpine` selects PG18.
-- Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
-  a separate Linux host. Those numbers are used only for shape comparison and
-  should not be treated as published throughput claims.
+  That repo owns fair-comparison hardware, adapter configuration, raw output,
+  and result summaries. Its default Postgres image is 17.2; `--pg-image
+  postgres:18-alpine` selects PG18.
+- Example commands assume a developer database URL:
+  `postgres://postgres:test@localhost:15432/awa_test`
 - Benchmarks live in:
   `awa/tests/benchmark_test.rs`
   `awa/tests/scheduling_benchmark_test.rs`
@@ -25,9 +28,33 @@ reference results from local runs and dedicated-server enqueue comparisons.
   `awa/tests/bench_output.rs` (Rust)
   `awa-python/scripts/bench_output.py` (Python)
 
-These are local engineering benchmarks, not published vendor-style numbers. The
-main goal is to compare shapes, validate architecture changes, and catch
-regressions.
+These are engineering benchmarks, not published vendor-style numbers. The main
+goal is to compare shapes, validate architecture changes, and catch
+regressions. Treat each result as tied to the environment named beside it; do
+not compare numbers from different sections as though they came from one
+machine.
+
+## North-Star Metrics
+
+Awa's performance target is sustainable end-to-end queue work, not the largest
+enqueue-only number. A benchmark table should lead with:
+
+- **completed jobs/sec** — durable terminal transitions, not just handler
+  returns
+- **p99 end-to-end latency** — producer enqueue to durable completion
+- **queue depth / backlog growth** — whether offered load is being absorbed or
+  stored as future latency
+- **WAL bytes per completed job** — the main Postgres durability budget for the
+  hot path
+- **transaction commits per completed job** — connection and commit pressure
+- **dead tuples and prune lag** — whether churn stays bounded under overlap
+  readers, retries, and terminal bursts
+
+Producer throughput is still measured, especially for `INSERT` vs `COPY` and
+`enqueue_shards` sweeps, but it is a secondary producer-path diagnostic. A
+configuration that can enqueue `50k/s` and complete `5k/s` is a backlog and
+latency problem unless the workload is intentionally bursty and has enough
+headroom to drain before the SLA window closes.
 
 ## Positioning Proof Checklist
 
@@ -50,10 +77,12 @@ reference points:
 The benchmark set should include:
 
 - idle pickup latency
-- sustained runtime throughput
+- sustained runtime throughput and durable completion throughput
 - overlap readers / MVCC horizon pressure
 - mixed workload soak
 - terminal-failure burst
+- WAL bytes/job, commit pressure, queue depth, and dead-tuple pressure for every
+  headline table
 
 Operational differences should be called out, not hidden:
 
@@ -139,7 +168,7 @@ guardrails on `dead_tup_delta` and `max_available`.
 That nightly profile is intentionally short. It checks that Awa still behaves
 reasonably under overlapping analytical readers, but it is not the same thing
 as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a
-closer local reproduction, increase duration and reader hold times and keep the
+closer reproduction, increase duration and reader hold times and keep the
 readers in `active_scan` mode so queries overlap continuously rather than
 simulating only `idle in transaction`.
 
@@ -218,9 +247,36 @@ Key observations:
   dead tuples around `396`, validating the ADR-019 / ADR-023 hot-path
   dead-tuple promise under sustained churn.
 
-Follow-up tuning should focus on the multi-process completion path: either
-attenuating default completion shards by fleet topology, coordinating flushers
-more explicitly, or reducing the per-flush contention footprint further.
+Queue-storage e2e sweeps separate tuning from storage design. For the hot
+single-queue shape, `enqueue_shards = 4` plus larger completion batches
+sustained `7.9k` completed jobs/s with `200ms` p99 end-to-end latency and
+bounded depth. Increasing `claimers` did not materially improve that shape.
+
+The offered-rate benchmark exercises absorption directly and samples WAL. With
+one claimer, `claim_batch_size = 512`, `AWA_COMPLETION_BATCH_SIZE = 512`, the
+fused receipt completion path, and `max_workers = 1024`, a 10-second no-op run
+at `10k/s` offered load keeps durable completions at the offered rate, drains
+to zero backlog, and writes `1.80 KiB` WAL per completed job. `max_workers =
+512` is close but does not consistently meet the 10k offered target, because
+no-op handlers hold permits while waiting for durable completion
+acknowledgement.
+
+First-principles WAL accounting then compared the production path, a narrow
+`done_entries` row, and a deliberately non-production path that skipped
+`done_entries` entirely:
+
+| Shape | Completed jobs/s | p99 e2e | WAL/job |
+|---|---:|---:|---:|
+| Tuned production queue storage | `7,885/s` | `203 ms` | `2,241 B` |
+| Narrow terminal history | `8,337/s` | `205 ms` | `1,932 B` |
+| Skip `done_entries` entirely | `8,402/s` | `230 ms` | `1,441 B` |
+
+The shipped design is the middle row: keep the durable terminal fact, but avoid
+duplicating immutable ready-body fields on ready-backed terminal rows. The
+skip-`done_entries` experiment remains rejected because it weakens the
+terminal-history contract, and its small throughput gain over narrow terminal
+history points at durable WAL write/sync pressure rather than a hidden per-job
+query loop as the next ceiling.
 
 ### Queue-storage striping reference
 
@@ -282,10 +338,9 @@ properties:
 - COPY staging now reuses a session-local temp table and stages typed values
   instead of reparsing text on the final `INSERT ... SELECT`
 
-Example reference results from one local laptop run and one dedicated server
-run:
+Example reference result from the developer laptop reference:
 
-- local laptop (`Apple M5`, release build, v0.5.0-alpha.0):
+- developer laptop reference (`Apple M5`, release build, v0.5.0-alpha.0):
   - `insert_only_single`: about `30k inserts/s`
   - `copy_single`: about `43k inserts/s`
   - `insert_contention_distinct` (4 producers x 3k): about `46k inserts/s`
@@ -304,21 +359,22 @@ Measured with `test_runtime_sustained_hot_path` after resetting runtime state:
 - measurement window: 10s
 - queue size seeded: 200,000 immediately-available jobs
 
-Example reference result from one local run (release mode, v0.5.0-alpha.0):
+Example reference result from the developer laptop reference (release mode,
+v0.5.0-alpha.0):
 
 - handler returns: about `5.6k jobs/s`
 - DB `completed` transitions: about `5.6k jobs/s`
 
 This benchmark enables the in-memory OpenTelemetry exporter and the
 production alerting metrics path (queue depth, lag, wait-duration histogram).
-Back-to-back A/B testing shows v0.5.0 is ~44% faster than v0.4.1 on the
-same hardware (5.9k vs 4.1k/s) — the promotion query optimizations more
-than offset the metrics instrumentation cost.
+Back-to-back A/B testing in the same reference environment shows v0.5.0 is
+~44% faster than v0.4.1 (5.9k vs 4.1k/s) — the promotion query optimizations
+more than offset the metrics instrumentation cost.
 
 ### Python Runtime Baseline
 
-Measured with `awa-python/scripts/benchmark_runtime.py` on the same local
-database:
+Measured with `awa-python/scripts/benchmark_runtime.py` on the developer
+laptop reference database:
 
 - `insert_many_copy`: about `16.2k jobs/s` (`50,000` jobs in `3.09s`)
 - sustained hot path:
@@ -400,16 +456,18 @@ fix (v0.5.0) eliminated the bottleneck entirely.
 - `PROMOTE_BATCH_SIZE` (default `4,096`): rows per promotion batch
 - `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
-- `COMPLETION_FLUSH_INTERVAL` (default `1 ms`): completion batcher flush interval
-- `AWA_COMPLETION_BATCH_SIZE` (default `128`): max rows per completion-batcher
-  flush. Lowered from `512` after multi-replica matrix runs showed `128`
-  delivered the lowest p99 across the 1–4 worker-process band; `512` did
-  not buy throughput and worsened tail latency.
+- `AWA_COMPLETION_FLUSH_MS` (default `1 ms`): completion batcher flush interval
+- `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher
+  flush. Queue-storage short-job completion uses a fused receipt-close +
+  terminal-insert statement, so the default keeps finalization latency low
+  while still amortising durable completion work under load.
 - `AWA_COMPLETION_SHARDS`: number of parallel completion flushers. The
-  runtime default is storage-dependent: `8` for canonical storage and `4`
-  for queue storage. The effective fleet-wide flusher count is
-  `processes × AWA_COMPLETION_SHARDS`, so tune accordingly for
-  multi-process deployments in either storage mode.
+  runtime default is storage-dependent: `8` for canonical storage and `1`
+  for queue storage. Queue storage starts conservative because the terminal /
+  receipt path already batches heavily and the effective fleet-wide flusher
+  count is `processes × AWA_COMPLETION_SHARDS`. Increase only after measuring
+  end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the
+  target worker-process topology.
 
 ### Concurrent Multi-Queue Lifecycle
 
@@ -554,8 +612,9 @@ Some practical guidelines:
   path. Global background work can distort results.
 - Prefer the `db_completed_delta` view when you care about end-to-end queue
   completion, not just handler return rate.
-- Treat the numbers here as machine-local reference points, not portable
-  guarantees.
+- Treat the numbers here as environment-specific reference points, not portable
+  guarantees. For cross-system claims, use the companion comparison repo and
+  its recorded environment.
 
 ## How To Run
 
@@ -653,7 +712,9 @@ PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_tes
 
 ## Caveats
 
-- These numbers are from one local machine and one local Postgres setup.
+- Each number is tied to the environment stated near the result. The developer
+  commands use a localhost database URL for convenience, but that URL is not a
+  claim about where every result was produced.
 - Ignored benchmark tests are not part of the normal unit/integration test pass.
 - The current focus is relative behavior and architectural validation, not
   cross-machine leaderboard comparisons.

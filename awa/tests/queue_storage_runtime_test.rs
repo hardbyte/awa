@@ -654,6 +654,60 @@ async fn completed_done_count(pool: &sqlx::PgPool, store: &QueueStorage, queue: 
     .expect("Failed to count completed done rows")
 }
 
+async fn done_body_columns(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+) -> (
+    Option<serde_json::Value>,
+    Option<i16>,
+    Option<DateTime<Utc>>,
+    Option<DateTime<Utc>>,
+    Option<serde_json::Value>,
+) {
+    sqlx::query_as(&format!(
+        r#"
+        SELECT args, max_attempts, run_at, created_at, payload
+        FROM {}.done_entries
+        WHERE job_id = $1
+        ORDER BY finalized_at DESC
+        LIMIT 1
+        "#,
+        store.schema()
+    ))
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to fetch done row body columns")
+}
+
+async fn terminal_view_body_columns(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    job_id: i64,
+) -> (
+    serde_json::Value,
+    i16,
+    DateTime<Utc>,
+    DateTime<Utc>,
+    serde_json::Value,
+) {
+    sqlx::query_as(&format!(
+        r#"
+        SELECT args, max_attempts, run_at, created_at, payload
+        FROM {}.terminal_jobs
+        WHERE job_id = $1
+        ORDER BY finalized_at DESC
+        LIMIT 1
+        "#,
+        store.schema()
+    ))
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("Failed to fetch terminal_jobs view body columns")
+}
+
 async fn dlq_reason(pool: &sqlx::PgPool, store: &QueueStorage, job_id: i64) -> String {
     sqlx::query_scalar::<_, String>(&format!(
         "SELECT dlq_reason FROM {}.dlq_entries WHERE job_id = $1 ORDER BY dlq_at DESC LIMIT 1",
@@ -851,6 +905,206 @@ impl Worker for CompleteWorker {
     async fn perform(&self, _ctx: &JobContext) -> Result<JobResult, JobError> {
         Ok(JobResult::Completed)
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_completed_done_row_is_narrow_and_hydrates_from_ready() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_narrow_done_complete";
+    let schema = "awa_qs_narrow_done_complete";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 42 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim narrow done job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+    store
+        .complete_runtime_batch(&pool, std::slice::from_ref(&claimed))
+        .await
+        .expect("Failed to complete narrow done job");
+
+    let (args, max_attempts, run_at, created_at, payload) =
+        done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        args.is_none(),
+        "ready-backed completed rows should not duplicate args"
+    );
+    assert!(
+        max_attempts.is_none(),
+        "ready-backed completed rows should not duplicate max_attempts"
+    );
+    assert!(
+        run_at.is_none(),
+        "ready-backed completed rows should not duplicate run_at"
+    );
+    assert!(
+        created_at.is_none(),
+        "ready-backed completed rows should not duplicate created_at"
+    );
+    assert!(
+        payload.is_none(),
+        "unchanged terminal payload should be elided and hydrated from ready_entries"
+    );
+    let (view_args, view_max_attempts, view_run_at, view_created_at, view_payload) =
+        terminal_view_body_columns(&pool, &store, job_id).await;
+    assert_eq!(view_args["id"], serde_json::json!(42));
+    assert_eq!(view_max_attempts, claimed.job.max_attempts);
+    assert_eq!(view_run_at, claimed.job.run_at);
+    assert_eq!(view_created_at, claimed.job.created_at);
+    assert_eq!(view_payload, serde_json::json!({}));
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load completed narrow done job")
+        .expect("completed job should be loadable");
+    assert_eq!(loaded.state, JobState::Completed);
+    assert_eq!(loaded.args["id"], serde_json::json!(42));
+    assert_eq!(loaded.max_attempts, claimed.job.max_attempts);
+    assert_eq!(loaded.created_at, claimed.job.created_at);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_failed_narrow_done_row_can_retry_from_ready_hydration() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_narrow_done_retry";
+    let schema = "awa_qs_narrow_done_retry";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 77 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim narrow failed job");
+    let claimed = claimed.into_iter().next().expect("missing claimed job");
+    store
+        .fail_terminal(&pool, job_id, claimed.job.run_lease, "boom", None)
+        .await
+        .expect("Failed to fail narrow done job")
+        .expect("running job should fail");
+
+    let (args, max_attempts, run_at, created_at, payload) =
+        done_body_columns(&pool, &store, job_id).await;
+    assert!(
+        args.is_none(),
+        "ready-backed failed rows should not duplicate args"
+    );
+    assert!(
+        max_attempts.is_none(),
+        "ready-backed failed rows should not duplicate max_attempts"
+    );
+    assert!(
+        run_at.is_none(),
+        "ready-backed failed rows should not duplicate run_at"
+    );
+    assert!(
+        created_at.is_none(),
+        "ready-backed failed rows should not duplicate created_at"
+    );
+    assert!(
+        payload.is_some(),
+        "failed rows still store terminal payload delta with error history"
+    );
+
+    let retried = store
+        .retry_job(&pool, job_id)
+        .await
+        .expect("Failed to retry failed narrow done row")
+        .expect("failed narrow done row should retry");
+    assert_eq!(retried.state, JobState::Available);
+    assert_eq!(retried.args["id"], serde_json::json!(77));
+    assert_eq!(retried.max_attempts, claimed.job.max_attempts);
+    assert_eq!(retried.created_at, claimed.job.created_at);
+
+    let counts = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("Failed to count retried queue");
+    assert_eq!(
+        counts.available, 1,
+        "retry must delete the retained terminal backing row before re-enqueue"
+    );
+    let retried_claims = store
+        .claim_runtime_batch(&pool, queue, 10, Duration::from_secs(30))
+        .await
+        .expect("Failed to claim retried narrow done job");
+    assert_eq!(retried_claims.len(), 1);
+    assert_eq!(retried_claims[0].job.id, job_id);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_cancel_available_done_row_is_wide_without_ready_backing() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(6).await;
+    let queue = "qs_wide_available_cancel";
+    let schema = "awa_qs_wide_available_cancel";
+    let store = create_store(&pool, schema).await;
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 88 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let cancelled = store
+        .cancel_job(&pool, job_id)
+        .await
+        .expect("Failed to cancel available job")
+        .expect("available job should cancel");
+    assert_eq!(cancelled.state, JobState::Cancelled);
+
+    let (args, max_attempts, run_at, created_at, _payload) =
+        done_body_columns(&pool, &store, job_id).await;
+    assert_eq!(
+        args.expect("available-cancel terminal row should retain args")["id"],
+        serde_json::json!(88)
+    );
+    assert!(
+        max_attempts.is_some(),
+        "available-cancel terminal row cannot rely on a deleted ready backing row"
+    );
+    assert!(
+        run_at.is_some(),
+        "available-cancel terminal row cannot rely on a deleted ready backing row"
+    );
+    assert!(
+        created_at.is_some(),
+        "available-cancel terminal row cannot rely on a deleted ready backing row"
+    );
+
+    let loaded = store
+        .load_job(&pool, job_id)
+        .await
+        .expect("Failed to load cancelled available job")
+        .expect("cancelled available job should be loadable");
+    assert_eq!(loaded.state, JobState::Cancelled);
+    assert_eq!(loaded.args["id"], serde_json::json!(88));
 }
 
 struct ReceiptRescueWorker {

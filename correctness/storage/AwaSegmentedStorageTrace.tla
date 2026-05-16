@@ -129,7 +129,8 @@ BrokenTrace == <<
 
 \* Trace-only scaffolding for the receipt-only short path. It represents
 \* a claim receipt that has advanced the claim cursor and left an open
-\* receipt, but has no materialized lease row. The main spec keeps this
+\* receipt, but has no materialized lease row. The ready row is retained
+\* as immutable body storage, matching ADR-026. The main spec keeps this
 \* window abstract; the trace harness needs it to replay receipt rescue.
 SeedOpenReceiptOnlyClaim(w, j) ==
     LET newKey == <<j, runLease[j] + 1>>
@@ -139,10 +140,7 @@ SeedOpenReceiptOnlyClaim(w, j) ==
     /\ laneSeq[j] = laneState.claimSeq
     /\ runLease[j] < MaxRunLease
     /\ claimSegments[claimSegmentCursor] = "open"
-    /\ readyEntries' = readyEntries \ {j}
     /\ runLease' = [runLease EXCEPT ![j] = runLease[j] + 1]
-    /\ laneSeq' = [laneSeq EXCEPT ![j] = NoLaneSeq]
-    /\ readySegmentOf' = [readySegmentOf EXCEPT ![j] = NoReadySegment]
     /\ claimSegmentOf' = [claimSegmentOf EXCEPT ![newKey] = claimSegmentCursor]
     /\ claimOpen' = claimOpen \cup {newKey}
     /\ UNCHANGED claimClosed
@@ -159,6 +157,9 @@ SeedOpenReceiptOnlyClaim(w, j) ==
                    attemptState,
                    heartbeatFresh,
                    progressTouched,
+                   readyEntries,
+                   laneSeq,
+                   readySegmentOf,
                    leaseSegmentOf,
                    terminalSegmentOf>>
     /\ UnchangedSegmentState

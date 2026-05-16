@@ -231,11 +231,10 @@ harness used for the ADR-019 baseline:
 - Rescue gains a partition-aware variant and must run before prune takes
   `ACCESS EXCLUSIVE`. The interaction point is small but adds a
   prune-path precondition not present for `ready` / `done`.
-- The default-success path still appends a `done_entries` row. Replacing
-  that with an even narrower success receipt would require a schema and
-  admin-contract change, because queue counts, retention, `load_job`, and
-  terminal inspection currently use `done_entries` as the materialized
-  terminal record.
+- The default-success path still appends a `done_entries` row. ADR-026 later
+  narrowed that row by hydrating duplicated immutable body fields from the
+  retained ready row, but kept `done_entries` as the durable terminal record
+  used by queue counts, retention, `load_job`, and terminal inspection.
 
 ## Alternatives Considered
 

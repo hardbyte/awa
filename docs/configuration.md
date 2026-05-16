@@ -127,14 +127,15 @@ The key `QueueConfig` fields:
 | `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
-| `claim_batch_size` | `128` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Benchmark before raising; larger batches can increase contention once multiple claimers are active. |
+| `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
 
 Defaults intentionally favor the smallest blast radius:
-`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 128`. Raise
+`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise
 `enqueue_shards` only when the queue can accept partitioned FIFO semantics.
-Raise `claimers` first when a single hot queue is drain-bound; local no-op
-benchmarks showed the useful step was `1 -> 4` claimers, while larger claim
-batches did not help once multiple claimers were active.
+For a single hot queue, a larger claim batch usually helps before extra
+claimers: it reduces claim round-trips without adding more concurrent head
+coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot
+keep worker permits full.
 
 ### Python
 
@@ -406,11 +407,19 @@ Retention depends on the storage path.
 Queue storage is the worker engine in `0.6`: ordinary terminal snapshots
 (`completed`, non-DLQ `failed`, and `cancelled`) live in the rotating
 `done_entries_*` partitions and are reclaimed by queue-ring prune after the
-matching ready segment is no longer live. The `completed_retention` and
-`failed_retention` knobs apply to the canonical compatibility path, not to
-queue-storage terminal history. In queue storage, use the queue-ring sizing and
-rotation knobs below to control how much ordinary terminal history remains
-queryable.
+matching ready segment is no longer live. Most terminal rows are narrow:
+the durable terminal fact lives in `done_entries_*`, while immutable job-body
+fields are hydrated from the retained `ready_entries_*` row until queue prune
+reclaims both together. Direct SQL against `done_entries` should therefore
+expect nullable body columns and join to `ready_entries` when it needs the full
+job body. Public Awa APIs perform that hydration, and
+`{schema}.terminal_jobs` exposes the same hydrated terminal shape for
+read-only SQL inspection.
+
+The `completed_retention` and `failed_retention` knobs apply to the canonical
+compatibility path, not to queue-storage terminal history. In queue storage,
+use the queue-ring sizing and rotation knobs below to control how much
+ordinary terminal history remains queryable.
 
 DLQ rows are different: `dlq_entries` is a separate hold table and the
 maintenance leader deletes rows older than `dlq_retention` in bounded cleanup
@@ -473,7 +482,7 @@ await client.start(
 
 | Knob | Default | What it controls |
 |---|---|---|
-| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. |
+| `queue_slot_count` | `16` | Number of rotating ready/terminal queue partitions. Together with queue rotation cadence and how quickly segments become prunable, this bounds ordinary terminal-history visibility in queue storage. Ready-backed terminal rows rely on the matching ready partition until queue prune reclaims both. |
 | `lease_slot_count` | `8` | Number of rotating lease partitions |
 | `claim_slot_count` | `8` | Number of rotating ADR-023 claim-ring partitions (`lease_claims` + `lease_claim_closures` children). Both tables share the same `claim_slot` so each partition's claims and closures are reclaimed together by `TRUNCATE`. |
 | `queue_stripe_count` / `queue_storage_queue_stripe_count` | `1` | Number of physical stripes behind each logical queue. `1` is the normal unstriped path. For a single very hot queue on many small replicas, `2` is the current tuned recommendation; higher values should be benchmarked before use. |
@@ -509,7 +518,11 @@ Raising `enqueue_shards` is a **semantic mode switch**, not a hidden performance
 UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
 ```
 
-A 16-producer same-queue local sweep measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1 (per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust) or `ordering_key=...` (Python) on insert — jobs sharing the key always land on the same shard regardless of which producer batch emitted them.
+A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× /
+3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1
+(per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust)
+or `ordering_key=...` (Python) on insert — jobs sharing the key always land on
+the same shard regardless of which producer batch emitted them.
 
 Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
 
@@ -523,12 +536,38 @@ hot queue's claim path at once. For a single hot queue, raising
 `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops
 while still sharing the queue's `max_workers` / `min_workers` permits.
 
-Keep `claimers` modest. Local no-op throughput tests improved materially from
-`1` to `4`, while higher values are expected to show diminishing returns and
-more database contention. For extreme single-queue workloads, benchmark
-`claimers = 2` and `4` before reaching for queue striping. Keep
-`claim_batch_size = 128` unless a workload-specific benchmark proves a larger
-batch helps.
+Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4`
+is the change that turns overload into bounded end-to-end throughput; raising
+`claimers` to `4` increases transaction pressure and worsens tail latency in
+that shape. For extreme single-queue workloads, raise `enqueue_shards` first
+when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2`
+or `4` only for a workload-specific reason, and judge the result by durable
+completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed
+job, transaction commits per completed job, and dead tuples. Lower
+`claim_batch_size` from `512` for small or latency-sensitive queues; raise
+claimers only with workload-specific evidence.
+
+Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` (`8` on canonical
+storage). Extra completion flushers can improve some single-process shapes, but
+they also multiply terminal-write contention across a worker fleet. Raise this
+only after measuring the same north-star metrics for the target topology.
+
+`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS`
+defaults to `1`. The queue-storage short-job path fuses receipt closure and
+terminal insertion into one statement, so the lower flush interval reduces the
+worker capacity tied up waiting for durable completion while the batch size
+still amortises the claim/complete path under load. That pairing is what moves
+the lower WAL budget into durable throughput.
+
+For very high-throughput no-op queues, size `max_workers` for durable
+completion latency, not handler CPU alone. The `10k/s` offered-rate reference
+shape needs 1,024 in-flight worker permits to absorb the load consistently;
+real jobs with non-trivial handler time need workload-specific sizing.
+
+The terminal write path is already narrow for running/waiting jobs: it stores
+the terminal fact in `done_entries_*` and avoids duplicating immutable ready
+body fields. That keeps the default completion settings conservative without
+giving up durable terminal history.
 
 ## Dead Letter Queue
 
