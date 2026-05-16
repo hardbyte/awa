@@ -246,9 +246,18 @@ Later 2026-05 local Awa-only runs moved the first tuning step from completion
 flusher topology to queue-lane sharding: `enqueue_shards = 4` plus larger
 completion batches sustained about `7.9k` completed jobs/s on the test
 machine with roughly `200ms` p99 end-to-end latency and bounded depth.
-Increasing `claimers` or `claim_batch_size` did not materially improve that
-shape. First-principles WAL accounting then compared the production path, a
-narrow `done_entries` row, and a deliberately non-production path that skipped
+Increasing `claimers` did not materially improve that shape. Later e2e runs
+showed that a single claimer with `claim_batch_size = 512`,
+`AWA_COMPLETION_BATCH_SIZE = 512`, and the fused receipt completion path
+reduced claim/completion round trips enough to absorb about `10k/s` offered
+load on the same machine for a no-op workload. The offered-rate benchmark
+samples WAL directly: a 10-second run at `10k/s` offered completed about
+`10.3k/s`, drained to zero backlog, and wrote about `1.80 KiB` WAL per
+completed job with `max_workers = 1024`. `max_workers = 512` was close but
+not reliably enough for the 10k offered target on this machine, because no-op
+handlers hold permits while waiting for durable completion acknowledgement.
+First-principles WAL accounting then compared the production path, a narrow
+`done_entries` row, and a deliberately non-production path that skipped
 `done_entries` entirely:
 
 | Shape | Completed jobs/s | p99 e2e | WAL/job |
@@ -442,10 +451,11 @@ fix (v0.5.0) eliminated the bottleneck entirely.
 - `PROMOTE_BATCH_SIZE` (default `4,096`): rows per promotion batch
 - `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
-- `AWA_COMPLETION_FLUSH_MS` (default `5 ms`): completion batcher flush interval
-- `AWA_COMPLETION_BATCH_SIZE` (default `256`): max rows per completion-batcher
-  flush. The default favors durable completion throughput while keeping the
-  extra finalization lag small enough for ordinary job-queue use.
+- `AWA_COMPLETION_FLUSH_MS` (default `1 ms`): completion batcher flush interval
+- `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher
+  flush. Queue-storage short-job completion uses a fused receipt-close +
+  terminal-insert statement, so the default keeps finalization latency low
+  while still amortising durable completion work under load.
 - `AWA_COMPLETION_SHARDS`: number of parallel completion flushers. The
   runtime default is storage-dependent: `8` for canonical storage and `1`
   for queue storage. Queue storage starts conservative because the terminal /

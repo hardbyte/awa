@@ -6088,11 +6088,208 @@ impl QueueStorage {
             .collect())
     }
 
+    fn receipt_fast_complete_candidate(entry: &ClaimedRuntimeJob) -> bool {
+        entry.claim.lease_claim_receipt
+            && entry.job.unique_key.is_none()
+            && is_empty_json_object(&entry.job.metadata)
+            && entry.job.tags.is_empty()
+            && entry.job.errors.as_ref().map_or(true, Vec::is_empty)
+    }
+
+    async fn complete_receipt_runtime_batch_fast(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let schema = self.schema();
+        let finalized_at = Utc::now();
+        let claim_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.claim_slot).collect();
+        let ready_slots: Vec<i32> = claimed.iter().map(|entry| entry.claim.ready_slot).collect();
+        let ready_generations: Vec<i64> = claimed
+            .iter()
+            .map(|entry| entry.claim.ready_generation)
+            .collect();
+        let job_ids: Vec<i64> = claimed.iter().map(|entry| entry.job.id).collect();
+        let kinds: Vec<String> = claimed.iter().map(|entry| entry.job.kind.clone()).collect();
+        let queues: Vec<String> = claimed
+            .iter()
+            .map(|entry| entry.job.queue.clone())
+            .collect();
+        let priorities: Vec<i16> = claimed.iter().map(|entry| entry.claim.priority).collect();
+        let attempts: Vec<i16> = claimed.iter().map(|entry| entry.job.attempt).collect();
+        let run_leases: Vec<i64> = claimed.iter().map(|entry| entry.job.run_lease).collect();
+        let lane_seqs: Vec<i64> = claimed.iter().map(|entry| entry.claim.lane_seq).collect();
+        let enqueue_shards: Vec<i16> = claimed
+            .iter()
+            .map(|entry| entry.claim.enqueue_shard)
+            .collect();
+        let attempted_ats: Vec<Option<DateTime<Utc>>> =
+            claimed.iter().map(|entry| entry.job.attempted_at).collect();
+        let finalized_ats: Vec<DateTime<Utc>> = vec![finalized_at; claimed.len()];
+        let payloads: Vec<Option<serde_json::Value>> = vec![None; claimed.len()];
+
+        sqlx::query_as(&format!(
+            r#"
+            WITH completed(
+                claim_slot,
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                priority,
+                attempt,
+                run_lease,
+                lane_seq,
+                enqueue_shard,
+                attempted_at,
+                finalized_at,
+                payload
+            ) AS (
+                SELECT *
+                FROM unnest(
+                    $1::int[],
+                    $2::int[],
+                    $3::bigint[],
+                    $4::bigint[],
+                    $5::text[],
+                    $6::text[],
+                    $7::smallint[],
+                    $8::smallint[],
+                    $9::bigint[],
+                    $10::bigint[],
+                    $11::smallint[],
+                    $12::timestamptz[],
+                    $13::timestamptz[],
+                    $14::jsonb[]
+                )
+            ),
+            locked_claims AS (
+                SELECT claims.claim_slot, claims.job_id, claims.run_lease
+                FROM {schema}.lease_claims AS claims
+                JOIN completed
+                  ON completed.claim_slot = claims.claim_slot
+                 AND completed.job_id = claims.job_id
+                 AND completed.run_lease = claims.run_lease
+                FOR UPDATE OF claims
+            ),
+            closed AS (
+                INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome, closed_at)
+                SELECT locked_claims.claim_slot, locked_claims.job_id, locked_claims.run_lease, 'completed', clock_timestamp()
+                FROM locked_claims
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                RETURNING job_id, run_lease
+            ),
+            deleted_attempts AS (
+                DELETE FROM {schema}.attempt_state AS attempt
+                USING closed
+                WHERE attempt.job_id = closed.job_id
+                  AND attempt.run_lease = closed.run_lease
+                RETURNING attempt.job_id
+            ),
+            terminal AS (
+                INSERT INTO {schema}.done_entries (
+                    ready_slot,
+                    ready_generation,
+                    job_id,
+                    kind,
+                    queue,
+                    state,
+                    priority,
+                    attempt,
+                    run_lease,
+                    lane_seq,
+                    enqueue_shard,
+                    attempted_at,
+                    finalized_at,
+                    payload
+                )
+                SELECT
+                    completed.ready_slot,
+                    completed.ready_generation,
+                    completed.job_id,
+                    completed.kind,
+                    completed.queue,
+                    'completed'::awa.job_state,
+                    completed.priority,
+                    completed.attempt,
+                    completed.run_lease,
+                    completed.lane_seq,
+                    completed.enqueue_shard,
+                    completed.attempted_at,
+                    completed.finalized_at,
+                    completed.payload
+                FROM completed
+                JOIN closed
+                  ON closed.job_id = completed.job_id
+                 AND closed.run_lease = completed.run_lease
+                RETURNING job_id, run_lease
+            )
+            SELECT job_id, run_lease
+            FROM terminal
+            "#
+        ))
+        .bind(&claim_slots)
+        .bind(&ready_slots)
+        .bind(&ready_generations)
+        .bind(&job_ids)
+        .bind(&kinds)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&attempts)
+        .bind(&run_leases)
+        .bind(&lane_seqs)
+        .bind(&enqueue_shards)
+        .bind(&attempted_ats)
+        .bind(&finalized_ats)
+        .bind(&payloads)
+        .fetch_all(pool)
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     #[tracing::instrument(
         skip(self, pool, claimed),
         name = "queue_storage.complete_runtime_batch"
     )]
     pub async fn complete_runtime_batch(
+        &self,
+        pool: &PgPool,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if claimed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.lease_claim_receipts() && claimed.iter().all(Self::receipt_fast_complete_candidate)
+        {
+            let mut updated = self
+                .complete_receipt_runtime_batch_fast(pool, claimed)
+                .await?;
+            if updated.len() == claimed.len() {
+                return Ok(updated);
+            }
+
+            let updated_pairs: BTreeSet<(i64, i64)> = updated.iter().copied().collect();
+            let missed: Vec<_> = claimed
+                .iter()
+                .filter(|entry| !updated_pairs.contains(&(entry.job.id, entry.job.run_lease)))
+                .cloned()
+                .collect();
+            if !missed.is_empty() {
+                updated.extend(self.complete_runtime_batch_slow(pool, &missed).await?);
+            }
+            return Ok(updated);
+        }
+
+        self.complete_runtime_batch_slow(pool, claimed).await
+    }
+
+    async fn complete_runtime_batch_slow(
         &self,
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],

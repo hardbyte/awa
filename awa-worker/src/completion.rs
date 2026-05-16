@@ -9,22 +9,16 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
-// Default completion batch size and flush cadence. The defaults trade
-// a small amount of finalization latency for fewer per-job round trips
-// on the completion SQL when workers are saturated. The 1 ms flush
-// fires before most batches have time to fill at high throughput,
-// which forces small batches and amortises the per-batch cost over
-// fewer rows. A 5 ms flush gives a batch most of the time it needs
-// to reach `COMPLETION_BATCH_SIZE` before a time-based flush forces
-// it out; on the in-tree throughput bench this lifts steady-state
-// throughput a few percent at the cost of a comparable bump to
-// completion latency. Queue storage defaults to one completion shard:
-// the queue-storage SQL already batches aggressively, and extra flushers
-// can multiply fleet-wide contention in multi-process deployments.
-// Tunable per-deployment via `AWA_COMPLETION_BATCH_SIZE`,
-// `AWA_COMPLETION_FLUSH_MS`, and `AWA_COMPLETION_SHARDS`.
-const COMPLETION_BATCH_SIZE: usize = 256;
-const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(5);
+// Default completion batch size and flush cadence. Queue storage short-job
+// completion uses a fused receipt-close + terminal-insert statement, so the
+// default can keep finalization latency low while still batching enough work
+// to amortise the durable completion path. Queue storage defaults to one
+// completion shard: extra flushers can multiply fleet-wide contention in
+// multi-process deployments. Tunable per-deployment via
+// `AWA_COMPLETION_BATCH_SIZE`, `AWA_COMPLETION_FLUSH_MS`, and
+// `AWA_COMPLETION_SHARDS`.
+const COMPLETION_BATCH_SIZE: usize = 512;
+const COMPLETION_FLUSH_INTERVAL: Duration = Duration::from_millis(1);
 const COMPLETION_CHANNEL_CAPACITY: usize = 4096;
 
 fn default_completion_shards(storage: &RuntimeStorage) -> usize {
@@ -443,6 +437,12 @@ mod tests {
             default_completion_shards(&crate::storage::RuntimeStorage::QueueStorage(runtime)),
             1
         );
+    }
+
+    #[test]
+    fn completion_defaults_use_throughput_oriented_batch_size() {
+        assert_eq!(COMPLETION_BATCH_SIZE, 512);
+        assert_eq!(COMPLETION_FLUSH_INTERVAL, Duration::from_millis(1));
     }
 
     async fn clean_queue(pool: &PgPool, queue: &str) {

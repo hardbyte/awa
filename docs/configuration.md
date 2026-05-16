@@ -127,14 +127,15 @@ The key `QueueConfig` fields:
 | `poll_interval` | `200ms` | Tune if NOTIFY latency matters (rare) |
 | `min_workers` / `weight` | `0` / `1` | Only in weighted mode |
 | `claimers` | `1` | Hot queue-storage queues that need more than one dispatcher/claimer loop inside a single runtime. Claimers share the queue's worker permits. |
-| `claim_batch_size` | `128` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Benchmark before raising; larger batches can increase contention once multiple claimers are active. |
+| `claim_batch_size` | `512` | Maximum jobs each dispatcher tries to claim in one DB round-trip. Lower this for latency-sensitive small queues; benchmark before combining large batches with multiple claimers. |
 
 Defaults intentionally favor the smallest blast radius:
-`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 128`. Raise
+`enqueue_shards = 1`, `claimers = 1`, and `claim_batch_size = 512`. Raise
 `enqueue_shards` only when the queue can accept partitioned FIFO semantics.
-Raise `claimers` first when a single hot queue is drain-bound; local no-op
-benchmarks showed the useful step was `1 -> 4` claimers, while larger claim
-batches did not help once multiple claimers were active.
+For a single hot queue, a larger claim batch usually helps before extra
+claimers: it reduces claim round-trips without adding more concurrent head
+coordinators. Benchmark `claimers = 2` or `4` only when a single claimer cannot
+keep worker permits full.
 
 ### Python
 
@@ -539,13 +540,26 @@ workloads, raise `enqueue_shards` first when the ordering contract allows
 partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific
 reason, and judge the result by durable completion rate, p99 end-to-end
 latency, queue depth, WAL bytes per completed job, transaction commits per
-completed job, and dead tuples. Keep `claim_batch_size = 128` unless a
-workload-specific benchmark proves a larger batch helps.
+completed job, and dead tuples. Lower `claim_batch_size` from `512` for small
+or latency-sensitive queues; raise claimers only with workload-specific
+evidence.
 
 Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` (`8` on canonical
 storage). Extra completion flushers can improve some single-process shapes, but
 they also multiply terminal-write contention across a worker fleet. Raise this
 only after measuring the same north-star metrics for the target topology.
+
+`AWA_COMPLETION_BATCH_SIZE` defaults to `512` and `AWA_COMPLETION_FLUSH_MS`
+defaults to `1`. The queue-storage short-job path fuses receipt closure and
+terminal insertion into one statement, so the lower flush interval reduces the
+worker capacity tied up waiting for durable completion while the batch size
+still amortises the claim/complete path under load. That pairing is what moves
+the lower WAL budget into durable throughput.
+
+For very high-throughput no-op queues, size `max_workers` for durable
+completion latency, not handler CPU alone. Local 10k/s offered-rate runs needed
+roughly 1k in-flight worker permits to absorb the load consistently; real jobs
+with non-trivial handler time need workload-specific sizing.
 
 The terminal write path is already narrow for running/waiting jobs: it stores
 the terminal fact in `done_entries_*` and avoids duplicating immutable ready

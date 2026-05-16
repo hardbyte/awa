@@ -117,15 +117,60 @@ keeping one durable terminal family.
 
 ## Defaults
 
-This ADR does not change user-facing defaults:
+This ADR changes the batching defaults that determine whether lower WAL turns
+into durable throughput:
 
 - `enqueue_shards = 1` remains the strict-FIFO default; use more shards only
   when partitioned FIFO is acceptable.
-- `claimers = 1` and `claim_batch_size = 128` remain the queue defaults.
-- `AWA_COMPLETION_BATCH_SIZE = 256`, `AWA_COMPLETION_FLUSH_MS = 5`, and
+- `claimers = 1` and `claim_batch_size = 512` remain the queue defaults.
+- `AWA_COMPLETION_BATCH_SIZE = 512`, `AWA_COMPLETION_FLUSH_MS = 1`, and
   queue-storage `AWA_COMPLETION_SHARDS = 1` remain the completion defaults.
 - `queue_slot_count = 16`, `lease_slot_count = 8`, `claim_slot_count = 8`,
   and `lease_claim_receipts = true` remain the queue-storage defaults.
+
+The queue-storage short-job completion path also uses one fused statement for
+the common receipt-backed, payload-empty terminal transition: close the receipt
+in `lease_claim_closures` and insert the narrow `done_entries` fact from the
+claimed runtime snapshot in the same SQL statement. Jobs with unique-key
+transitions, terminal payload metadata, materialized heartbeat/progress state,
+or missed receipt closures keep the general transaction path.
+
+Local offered-rate validation on 2026-05-16 showed this moves the WAL
+reduction into sustained throughput: with one queue shard, one claimer,
+`claim_batch_size = 512`, queue-storage completion shards at `1`, and
+`max_workers = 1024`, a 10-second `10k/s` offered workload completed about
+`10.1k/s`, drained to zero backlog, and wrote about `1.8 KiB` WAL per
+completed job. Raising the offered rate to `12k/s` grew backlog during the
+window and then drained afterward, so the local knee is around `10k/s` for
+this no-op workload on this machine.
+
+## Relationship to Rejected ADR-024
+
+The relevant historical ADR-024 was **Deferred `done_entries`
+Materialisation**, proposed and then rejected in May 2026. It removed the
+`done_entries` insert from receipt completion entirely, treated
+`lease_claim_closures` as the immediate completion source of truth, and added a
+background materializer plus read-side synthetic projections and prune guards.
+That prototype benchmarked worse than the synchronous path: `1,839/s` vs
+`2,803/s` on its A/B shape, with higher p99 latency. It also added new moving
+parts: a materializer cadence, materializer lag monitoring, rotation catch-up,
+and temporary closure-without-terminal read semantics.
+
+ADR-026 deliberately keeps the opposite contract:
+
+- completion still writes the durable terminal fact synchronously;
+- `done_entries` remains the terminal source of truth for counts, admin reads,
+  retries, DLQ moves, discard, and retention;
+- there is no materializer, no lag window, and no extra prune precondition;
+- the fast path is an implementation detail of the same logical transition:
+  only claims that are successfully closed in `lease_claim_closures` are
+  inserted into `done_entries`.
+
+The overlap with ADR-024 is the insight that duplicating ready-body JSONB is
+wasteful. The difference is where the system draws the safety boundary:
+ADR-024 deferred the terminal fact; ADR-026 keeps the terminal fact durable and
+only narrows its payload, then fuses the receipt-close and terminal-insert SQL
+so the synchronous contract is cheap enough to hit the throughput target.
 
 The first tuning move for overload remains semantic enqueue sharding when the
 workload can accept partitioned FIFO. This ADR lowers the durable completion
@@ -155,3 +200,5 @@ write budget underneath those defaults.
   claim and writes a durable terminal fact.
 - Complements ADR-025: enqueue sharding attacks producer head-row contention;
   this ADR reduces completion-side WAL/row pressure.
+- Supersedes the useful part of the rejected ADR-024 deferred-materialisation
+  experiment without adopting its asynchronous terminal-history contract.

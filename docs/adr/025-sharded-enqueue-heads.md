@@ -57,8 +57,9 @@ do not address the head row directly:
 - A per-store in-process cache of `(queue, priority, shard)` lane
   presence so subsequent enqueue batches skip the three
   `INSERT ... ON CONFLICT DO NOTHING` round-trips for known lane rows.
-- Completion-batcher defaults of `(batch=256, flush=5ms)` so the
-  completion path amortises per-batch SQL over more rows.
+- Completion-batcher defaults of `(batch=512, flush=1ms)` plus the
+  queue-storage fused receipt completion statement, so the completion path
+  keeps worker permit latency low while still amortising per-batch SQL.
 
 ## Decision
 

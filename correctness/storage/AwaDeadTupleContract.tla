@@ -207,8 +207,10 @@ ClaimLegacyTx == <<
     Mut("Update", "queue_claim_heads")
 >>
 
-\* complete_runtime_batch (receipts mode) — queue_storage.rs:4677
-\* The Phase-4 hot path: append-only on the receipt plane.
+\* complete_runtime_batch (receipts mode)
+\* The hot path fuses receipt closure and narrow terminal insertion into
+\* one SQL statement, but the logical mutation set remains append-only on
+\* the receipt/terminal plane.
 CompleteReceiptsTx == <<
     Mut("Insert", "lease_claim_closures"),
     Mut("Insert", "done_entries"),

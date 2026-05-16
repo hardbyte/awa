@@ -168,6 +168,16 @@ struct ExactDeadTuples {
     attempt_state: i64,
 }
 
+#[derive(Debug, Clone)]
+struct DbProfileSnapshot {
+    wal_insert_lsn: String,
+    xact_commit: i64,
+    xact_rollback: i64,
+    tup_inserted: i64,
+    temp_bytes: i64,
+    temp_files: i64,
+}
+
 #[derive(Default)]
 struct MaintenanceCounters {
     queue_prune_ok: AtomicU64,
@@ -187,6 +197,64 @@ async fn ensure_pgstattuple(pool: &sqlx::PgPool) {
         .execute(pool)
         .await
         .expect("Failed to create pgstattuple extension for queue-storage benchmark sampling");
+}
+
+async fn capture_db_profile(pool: &sqlx::PgPool) -> Option<DbProfileSnapshot> {
+    let _ = sqlx::query("SELECT pg_stat_force_next_flush()")
+        .execute(pool)
+        .await;
+    let _ = sqlx::query("SELECT pg_stat_clear_snapshot()")
+        .execute(pool)
+        .await;
+
+    let row = sqlx::query_as::<_, (String, i64, i64, i64, i64, i64)>(
+        r#"
+        SELECT
+            pg_current_wal_insert_lsn()::text,
+            COALESCE(xact_commit, 0),
+            COALESCE(xact_rollback, 0),
+            COALESCE(tup_inserted, 0),
+            COALESCE(temp_bytes, 0),
+            COALESCE(temp_files, 0)
+        FROM pg_stat_database
+        WHERE datname = current_database()
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .ok()??;
+
+    Some(DbProfileSnapshot {
+        wal_insert_lsn: row.0,
+        xact_commit: row.1,
+        xact_rollback: row.2,
+        tup_inserted: row.3,
+        temp_bytes: row.4,
+        temp_files: row.5,
+    })
+}
+
+async fn capture_db_profile_delta(
+    pool: &sqlx::PgPool,
+    start: &DbProfileSnapshot,
+) -> Option<serde_json::Value> {
+    let end = capture_db_profile(pool).await?;
+    let wal_bytes: i64 =
+        sqlx::query_scalar("SELECT pg_wal_lsn_diff($1::pg_lsn, $2::pg_lsn)::bigint")
+            .bind(&end.wal_insert_lsn)
+            .bind(&start.wal_insert_lsn)
+            .fetch_one(pool)
+            .await
+            .ok()?;
+
+    Some(serde_json::json!({
+        "wal_bytes": wal_bytes,
+        "xact_commit_delta": end.xact_commit - start.xact_commit,
+        "xact_rollback_delta": end.xact_rollback - start.xact_rollback,
+        "tup_inserted_delta": end.tup_inserted - start.tup_inserted,
+        "temp_bytes_delta": end.temp_bytes - start.temp_bytes,
+        "temp_files_delta": end.temp_files - start.temp_files,
+    }))
 }
 
 async fn recreate_store_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
@@ -726,7 +794,7 @@ async fn test_queue_storage_storage_benchmark() {
     let priority = env_u32("AWA_VA_PRIORITY", 2) as i16;
     let producer_rate = env_u64("AWA_VA_ENQUEUE_RATE", 4_000);
     let producer_tick_ms = env_u64("AWA_VA_PRODUCER_TICK_MS", 50);
-    let claim_batch_size = env_u64("AWA_VA_CLAIM_BATCH_SIZE", 256) as i64;
+    let claim_batch_size = env_u64("AWA_VA_CLAIM_BATCH_SIZE", 512) as i64;
     let baseline_secs = env_u64("AWA_VA_BASELINE_SECS", 4);
     let overlap_secs = env_u64("AWA_VA_OVERLAP_SECS", 8);
     let cooldown_secs = env_u64("AWA_VA_COOLDOWN_SECS", 4);
@@ -794,6 +862,7 @@ async fn test_queue_storage_storage_benchmark() {
     ));
 
     let initial = sample_snapshot(&pool, &store, &queue).await;
+    let db_profile_start = capture_db_profile(&pool).await;
     let mut samples = Vec::with_capacity(total_secs as usize);
     let mut overlap_handles = Vec::new();
     let benchmark_started = Instant::now();
@@ -974,6 +1043,71 @@ async fn test_queue_storage_storage_benchmark() {
     outcomes.insert("available".to_string(), final_snapshot.available as u64);
     outcomes.insert("running".to_string(), final_snapshot.running as u64);
 
+    let mut metadata = serde_json::json!({
+        "profile": "queue_storage_storage",
+        "queue": queue,
+        "priority": priority,
+        "queue_slot_count": store.queue_slot_count(),
+        "lease_slot_count": store.lease_slot_count(),
+        "producer_rate_per_s": producer_rate,
+        "claim_batch_size": claim_batch_size,
+        "baseline_secs": baseline_secs,
+        "overlap_secs": overlap_secs,
+        "cooldown_secs": cooldown_secs,
+        "overlap_readers": overlap_readers,
+        "overlap_hold_secs": overlap_hold_secs,
+        "overlap_stagger_secs": overlap_stagger_secs,
+        "reader_mode": reader_mode,
+        "queue_rotate_interval_ms": queue_rotate_interval_ms,
+        "lease_rotate_interval_ms": lease_rotate_interval_ms,
+        "vacuum_leases": vacuum_interval.is_some(),
+        "vacuum_interval_ms": vacuum_interval.map(|d| d.as_millis() as u64),
+        "baseline_completed_per_s": baseline_rate,
+        "overlap_completed_per_s": overlap_rate,
+        "cooldown_completed_per_s": cooldown_rate,
+        "initial_total_dead_tup": initial.queue_lanes_dead_tup + initial.ready_dead_tup + initial.done_dead_tup + initial.leases_dead_tup + initial.attempt_state_dead_tup,
+        "max_total_dead_tup": max_total_dead_tup,
+        "final_total_dead_tup": final_total_dead_tup,
+        "final_queue_lanes_dead_tup": final_snapshot.queue_lanes_dead_tup,
+        "final_ready_dead_tup": final_snapshot.ready_dead_tup,
+        "final_done_dead_tup": final_snapshot.done_dead_tup,
+        "final_leases_dead_tup": final_snapshot.leases_dead_tup,
+        "final_attempt_state_dead_tup": final_snapshot.attempt_state_dead_tup,
+        "exact_final_dead_tuples": final_exact_dead,
+        "queue_prune_ok": maintenance_counters.queue_prune_ok.load(Ordering::Relaxed),
+        "queue_prune_blocked": maintenance_counters.queue_prune_blocked.load(Ordering::Relaxed),
+        "queue_prune_skipped_active": maintenance_counters.queue_prune_skipped_active.load(Ordering::Relaxed),
+        "queue_rotate_ok": maintenance_counters.queue_rotate_ok.load(Ordering::Relaxed),
+        "queue_rotate_skipped_busy": maintenance_counters.queue_rotate_skipped_busy.load(Ordering::Relaxed),
+        "lease_prune_ok": maintenance_counters.lease_prune_ok.load(Ordering::Relaxed),
+        "lease_prune_blocked": maintenance_counters.lease_prune_blocked.load(Ordering::Relaxed),
+        "lease_prune_skipped_active": maintenance_counters.lease_prune_skipped_active.load(Ordering::Relaxed),
+        "lease_rotate_ok": maintenance_counters.lease_rotate_ok.load(Ordering::Relaxed),
+        "lease_rotate_skipped_busy": maintenance_counters.lease_rotate_skipped_busy.load(Ordering::Relaxed),
+        "samples": samples,
+    });
+    if let Some(start) = db_profile_start.as_ref() {
+        if let Some(db_profile) = capture_db_profile_delta(&pool, start).await {
+            let completed = completed.load(Ordering::Relaxed).max(1);
+            if let Some(wal_bytes) = db_profile
+                .get("wal_bytes")
+                .and_then(serde_json::Value::as_i64)
+            {
+                metadata
+                    .as_object_mut()
+                    .expect("benchmark metadata should be an object")
+                    .insert(
+                        "wal_bytes_per_completed_job".to_string(),
+                        serde_json::json!(wal_bytes as f64 / completed as f64),
+                    );
+            }
+            metadata
+                .as_object_mut()
+                .expect("benchmark metadata should be an object")
+                .insert("db_profile".to_string(), db_profile);
+        }
+    }
+
     BenchmarkResult {
         schema_version: SCHEMA_VERSION,
         scenario: format!("queue_storage_{}", reader_mode),
@@ -990,49 +1124,7 @@ async fn test_queue_storage_storage_benchmark() {
             rescue: None,
         },
         outcomes,
-        metadata: Some(serde_json::json!({
-            "profile": "queue_storage_storage",
-            "queue": queue,
-            "priority": priority,
-            "queue_slot_count": store.queue_slot_count(),
-            "lease_slot_count": store.lease_slot_count(),
-            "producer_rate_per_s": producer_rate,
-            "claim_batch_size": claim_batch_size,
-            "baseline_secs": baseline_secs,
-            "overlap_secs": overlap_secs,
-            "cooldown_secs": cooldown_secs,
-            "overlap_readers": overlap_readers,
-            "overlap_hold_secs": overlap_hold_secs,
-            "overlap_stagger_secs": overlap_stagger_secs,
-            "reader_mode": reader_mode,
-            "queue_rotate_interval_ms": queue_rotate_interval_ms,
-            "lease_rotate_interval_ms": lease_rotate_interval_ms,
-            "vacuum_leases": vacuum_interval.is_some(),
-            "vacuum_interval_ms": vacuum_interval.map(|d| d.as_millis() as u64),
-            "baseline_completed_per_s": baseline_rate,
-            "overlap_completed_per_s": overlap_rate,
-            "cooldown_completed_per_s": cooldown_rate,
-            "initial_total_dead_tup": initial.queue_lanes_dead_tup + initial.ready_dead_tup + initial.done_dead_tup + initial.leases_dead_tup + initial.attempt_state_dead_tup,
-            "max_total_dead_tup": max_total_dead_tup,
-            "final_total_dead_tup": final_total_dead_tup,
-            "final_queue_lanes_dead_tup": final_snapshot.queue_lanes_dead_tup,
-            "final_ready_dead_tup": final_snapshot.ready_dead_tup,
-            "final_done_dead_tup": final_snapshot.done_dead_tup,
-            "final_leases_dead_tup": final_snapshot.leases_dead_tup,
-            "final_attempt_state_dead_tup": final_snapshot.attempt_state_dead_tup,
-            "exact_final_dead_tuples": final_exact_dead,
-            "queue_prune_ok": maintenance_counters.queue_prune_ok.load(Ordering::Relaxed),
-            "queue_prune_blocked": maintenance_counters.queue_prune_blocked.load(Ordering::Relaxed),
-            "queue_prune_skipped_active": maintenance_counters.queue_prune_skipped_active.load(Ordering::Relaxed),
-            "queue_rotate_ok": maintenance_counters.queue_rotate_ok.load(Ordering::Relaxed),
-            "queue_rotate_skipped_busy": maintenance_counters.queue_rotate_skipped_busy.load(Ordering::Relaxed),
-            "lease_prune_ok": maintenance_counters.lease_prune_ok.load(Ordering::Relaxed),
-            "lease_prune_blocked": maintenance_counters.lease_prune_blocked.load(Ordering::Relaxed),
-            "lease_prune_skipped_active": maintenance_counters.lease_prune_skipped_active.load(Ordering::Relaxed),
-            "lease_rotate_ok": maintenance_counters.lease_rotate_ok.load(Ordering::Relaxed),
-            "lease_rotate_skipped_busy": maintenance_counters.lease_rotate_skipped_busy.load(Ordering::Relaxed),
-            "samples": samples,
-        })),
+        metadata: Some(metadata),
     }
     .emit();
 }

@@ -1775,6 +1775,13 @@ mod tests {
             .expect("lazy pool should build")
     }
 
+    #[test]
+    fn queue_config_defaults_use_throughput_oriented_claim_batch() {
+        let config = QueueConfig::default();
+        assert_eq!(config.claimers, 1);
+        assert_eq!(config.claim_batch_size, 512);
+    }
+
     fn base_database_url() -> String {
         std::env::var("DATABASE_URL")
             .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
