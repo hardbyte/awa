@@ -518,7 +518,11 @@ Raising `enqueue_shards` is a **semantic mode switch**, not a hidden performance
 UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
 ```
 
-A 16-producer same-queue local sweep measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1 (per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust) or `ordering_key=...` (Python) on insert — jobs sharing the key always land on the same shard regardless of which producer batch emitted them.
+A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× /
+3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1
+(per-customer, per-order, per-account) pass `InsertOpts::ordering_key` (Rust)
+or `ordering_key=...` (Python) on insert — jobs sharing the key always land on
+the same shard regardless of which producer batch emitted them.
 
 Observability: the `awa.job.claimed` OTel counter carries an `awa.enqueue.shard` attribute on the queue-storage claim path. Dashboards can sum by that attribute to confirm the claim ordering is rotating fairly across shards.
 
@@ -532,17 +536,16 @@ hot queue's claim path at once. For a single hot queue, raising
 `QueueConfig.claimers` lets one runtime run multiple dispatcher/claimer loops
 while still sharing the queue's `max_workers` / `min_workers` permits.
 
-Keep `claimers` modest. In the 2026-05 hot-queue measurements,
-`enqueue_shards = 4` was the change that turned overload into bounded
-end-to-end throughput; raising `claimers` to `4` increased transaction
-pressure and worsened tail latency in that shape. For extreme single-queue
-workloads, raise `enqueue_shards` first when the ordering contract allows
-partitioned FIFO. Benchmark `claimers = 2` or `4` only for a workload-specific
-reason, and judge the result by durable completion rate, p99 end-to-end
-latency, queue depth, WAL bytes per completed job, transaction commits per
-completed job, and dead tuples. Lower `claim_batch_size` from `512` for small
-or latency-sensitive queues; raise claimers only with workload-specific
-evidence.
+Keep `claimers` modest. In the hot-queue reference shape, `enqueue_shards = 4`
+is the change that turns overload into bounded end-to-end throughput; raising
+`claimers` to `4` increases transaction pressure and worsens tail latency in
+that shape. For extreme single-queue workloads, raise `enqueue_shards` first
+when the ordering contract allows partitioned FIFO. Benchmark `claimers = 2`
+or `4` only for a workload-specific reason, and judge the result by durable
+completion rate, p99 end-to-end latency, queue depth, WAL bytes per completed
+job, transaction commits per completed job, and dead tuples. Lower
+`claim_batch_size` from `512` for small or latency-sensitive queues; raise
+claimers only with workload-specific evidence.
 
 Queue storage defaults `AWA_COMPLETION_SHARDS` to `1` (`8` on canonical
 storage). Extra completion flushers can improve some single-process shapes, but
@@ -557,9 +560,9 @@ still amortises the claim/complete path under load. That pairing is what moves
 the lower WAL budget into durable throughput.
 
 For very high-throughput no-op queues, size `max_workers` for durable
-completion latency, not handler CPU alone. Local 10k/s offered-rate runs needed
-roughly 1k in-flight worker permits to absorb the load consistently; real jobs
-with non-trivial handler time need workload-specific sizing.
+completion latency, not handler CPU alone. The `10k/s` offered-rate reference
+shape needs 1,024 in-flight worker permits to absorb the load consistently;
+real jobs with non-trivial handler time need workload-specific sizing.
 
 The terminal write path is already narrow for running/waiting jobs: it stores
 the terminal fact in `done_entries_*` and avoids duplicating immutable ready

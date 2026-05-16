@@ -14,14 +14,14 @@ completion path: `args`, `max_attempts`, `run_at`, `created_at`, uniqueness
 metadata, and often an unchanged runtime payload are written once in
 `ready_entries` and then again in `done_entries`.
 
-The duplication is visible in the WAL and row-size budget. Local Awa-only
-experiments on 2026-05 measured:
+The duplication is visible in the WAL and row-size budget. Reference
+queue-storage runs showed this shape:
 
 | Shape | Completed jobs/s | p99 e2e | WAL/job |
 |---|---:|---:|---:|
-| Tuned production queue storage | ~7,885/s | ~203 ms | ~2,241 B |
-| Narrow terminal history prototype | ~8,337/s | ~205 ms | ~1,932 B |
-| Skip `done_entries` entirely | ~8,402/s | ~230 ms | ~1,441 B |
+| Tuned production queue storage | `7,885/s` | `203 ms` | `2,241 B` |
+| Narrow terminal history | `8,337/s` | `205 ms` | `1,932 B` |
+| Skip `done_entries` entirely | `8,402/s` | `230 ms` | `1,441 B` |
 
 Skipping `done_entries` is not acceptable: it weakens the durable terminal
 history contract and removes the operator/API source of truth. The useful
@@ -106,7 +106,7 @@ extra WAL and heap bytes on every terminal transition.
 
 This produced the lowest WAL/job result in experiment, but it removes the
 durable terminal fact that queue counts, `load_job`, admin inspection, and
-retention currently rely on. It is rejected.
+retention rely on. It is rejected.
 
 ### Store a separate success-receipt table
 
@@ -135,24 +135,23 @@ claimed runtime snapshot in the same SQL statement. Jobs with unique-key
 transitions, terminal payload metadata, materialized heartbeat/progress state,
 or missed receipt closures keep the general transaction path.
 
-Local offered-rate validation on 2026-05-16 showed this moves the WAL
-reduction into sustained throughput: with one queue shard, one claimer,
-`claim_batch_size = 512`, queue-storage completion shards at `1`, and
-`max_workers = 1024`, a 10-second `10k/s` offered workload completed about
-`10.1k/s`, drained to zero backlog, and wrote about `1.8 KiB` WAL per
-completed job. Raising the offered rate to `12k/s` grew backlog during the
-window and then drained afterward, so the local knee is around `10k/s` for
-this no-op workload on this machine.
+The offered-rate benchmark turns that lower write budget into an explicit
+capacity check. With one queue shard, one claimer, `claim_batch_size = 512`,
+queue-storage completion shards at `1`, and `max_workers = 1024`, a 10-second
+`10k/s` no-op workload keeps durable completions at the offered rate, drains to
+zero backlog, and writes `1.8 KiB` WAL per completed job. A `12k/s` offered
+workload exceeds that reference configuration and accumulates backlog during
+the offer window before draining afterward.
 
 ## Relationship to Rejected ADR-024
 
 The relevant historical ADR-024 was **Deferred `done_entries`
-Materialisation**, proposed and then rejected in May 2026. It removed the
-`done_entries` insert from receipt completion entirely, treated
+Materialisation**. It removed the `done_entries` insert from receipt completion
+entirely, treated
 `lease_claim_closures` as the immediate completion source of truth, and added a
 background materializer plus read-side synthetic projections and prune guards.
-That prototype benchmarked worse than the synchronous path: `1,839/s` vs
-`2,803/s` on its A/B shape, with higher p99 latency. It also added new moving
+Its A/B benchmark was worse than the synchronous path: `1,839/s` vs `2,803/s`,
+with higher p99 latency. It also added new moving
 parts: a materializer cadence, materializer lag monitoring, rotation catch-up,
 and temporary closure-without-terminal read semantics.
 

@@ -6093,7 +6093,7 @@ impl QueueStorage {
             && entry.job.unique_key.is_none()
             && is_empty_json_object(&entry.job.metadata)
             && entry.job.tags.is_empty()
-            && entry.job.errors.as_ref().map_or(true, Vec::is_empty)
+            && entry.job.errors.as_ref().is_none_or(Vec::is_empty)
     }
 
     async fn complete_receipt_runtime_batch_fast(
@@ -8729,14 +8729,30 @@ impl QueueStorage {
             candidates.push(row.into_job_row()?);
         }
 
-        let done_projection = done_row_projection("done", "ready");
-        let ready_join = done_ready_join(schema, "done", "ready");
         let done_rows: Vec<DoneJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
-                {done_projection}
-            FROM {schema}.done_entries AS done
-            {ready_join}
+                ready_slot,
+                ready_generation,
+                job_id,
+                kind,
+                queue,
+                args,
+                state,
+                priority,
+                attempt,
+                run_lease,
+                max_attempts,
+                lane_seq,
+                enqueue_shard,
+                run_at,
+                attempted_at,
+                finalized_at,
+                created_at,
+                unique_key,
+                unique_states,
+                payload
+            FROM {schema}.terminal_jobs AS done
             WHERE done.job_id = $1
             ORDER BY done.run_lease DESC, done.finalized_at DESC
             "#,

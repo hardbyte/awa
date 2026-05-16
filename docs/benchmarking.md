@@ -242,29 +242,29 @@ Key observations:
   dead tuples around `396`, validating the ADR-019 / ADR-023 hot-path
   dead-tuple promise under sustained churn.
 
-Later 2026-05 local Awa-only runs moved the first tuning step from completion
-flusher topology to queue-lane sharding: `enqueue_shards = 4` plus larger
-completion batches sustained about `7.9k` completed jobs/s on the test
-machine with roughly `200ms` p99 end-to-end latency and bounded depth.
-Increasing `claimers` did not materially improve that shape. Later e2e runs
-showed that a single claimer with `claim_batch_size = 512`,
-`AWA_COMPLETION_BATCH_SIZE = 512`, and the fused receipt completion path
-reduced claim/completion round trips enough to absorb about `10k/s` offered
-load on the same machine for a no-op workload. The offered-rate benchmark
-samples WAL directly: a 10-second run at `10k/s` offered completed about
-`10.3k/s`, drained to zero backlog, and wrote about `1.80 KiB` WAL per
-completed job with `max_workers = 1024`. `max_workers = 512` was close but
-not reliably enough for the 10k offered target on this machine, because no-op
-handlers hold permits while waiting for durable completion acknowledgement.
+Queue-storage e2e sweeps separate tuning from storage design. For the hot
+single-queue shape, `enqueue_shards = 4` plus larger completion batches
+sustained `7.9k` completed jobs/s with `200ms` p99 end-to-end latency and
+bounded depth. Increasing `claimers` did not materially improve that shape.
+
+The offered-rate benchmark exercises absorption directly and samples WAL. With
+one claimer, `claim_batch_size = 512`, `AWA_COMPLETION_BATCH_SIZE = 512`, the
+fused receipt completion path, and `max_workers = 1024`, a 10-second no-op run
+at `10k/s` offered load keeps durable completions at the offered rate, drains
+to zero backlog, and writes `1.80 KiB` WAL per completed job. `max_workers =
+512` is close but does not consistently meet the 10k offered target, because
+no-op handlers hold permits while waiting for durable completion
+acknowledgement.
+
 First-principles WAL accounting then compared the production path, a narrow
 `done_entries` row, and a deliberately non-production path that skipped
 `done_entries` entirely:
 
 | Shape | Completed jobs/s | p99 e2e | WAL/job |
 |---|---:|---:|---:|
-| Tuned production queue storage | ~7,885/s | ~203 ms | ~2,241 B |
-| Narrow terminal history | ~8,337/s | ~205 ms | ~1,932 B |
-| Skip `done_entries` entirely | ~8,402/s | ~230 ms | ~1,441 B |
+| Tuned production queue storage | `7,885/s` | `203 ms` | `2,241 B` |
+| Narrow terminal history | `8,337/s` | `205 ms` | `1,932 B` |
+| Skip `done_entries` entirely | `8,402/s` | `230 ms` | `1,441 B` |
 
 The shipped design is the middle row: keep the durable terminal fact, but avoid
 duplicating immutable ready-body fields on ready-backed terminal rows. The
