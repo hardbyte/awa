@@ -1,20 +1,23 @@
 # Benchmarking Notes
 
 This document captures the benchmark harnesses used in the repo and a few
-reference results from local runs and dedicated-server enqueue comparisons.
+reference results from named development and comparison environments.
 
-## Test Environment
+## Reference Environments
 
-- Local machine: Apple M5 MacBook Air (16 GB)
-- Local runtime: PostgreSQL 17 in Docker (OrbStack)
-- Local database URL used for the example commands:
-  `postgres://postgres:test@localhost:15432/awa_test`
-- Cross-system long-horizon comparisons run from a separate repo:
+- **Developer laptop reference**: Apple M5 MacBook Air (16 GB), PostgreSQL 17
+  in Docker (OrbStack). Several awa-only regression examples below come from
+  this environment.
+- **Dedicated enqueue reference**: PostgreSQL 17 on a separate Linux host.
+  These runs are useful for producer-path shape comparisons and are not
+  published throughput claims.
+- **Cross-system comparison reference**:
   [postgresql-job-queue-benchmarking](https://github.com/hardbyte/postgresql-job-queue-benchmarking).
-  Default Postgres image is 17.2; `--pg-image postgres:18-alpine` selects PG18.
-- Dedicated-server enqueue comparisons were also run against PostgreSQL 17 on
-  a separate Linux host. Those numbers are used only for shape comparison and
-  should not be treated as published throughput claims.
+  That repo owns fair-comparison hardware, adapter configuration, raw output,
+  and result summaries. Its default Postgres image is 17.2; `--pg-image
+  postgres:18-alpine` selects PG18.
+- Example commands assume a developer database URL:
+  `postgres://postgres:test@localhost:15432/awa_test`
 - Benchmarks live in:
   `awa/tests/benchmark_test.rs`
   `awa/tests/scheduling_benchmark_test.rs`
@@ -25,9 +28,11 @@ reference results from local runs and dedicated-server enqueue comparisons.
   `awa/tests/bench_output.rs` (Rust)
   `awa-python/scripts/bench_output.py` (Python)
 
-These are local engineering benchmarks, not published vendor-style numbers. The
-main goal is to compare shapes, validate architecture changes, and catch
-regressions.
+These are engineering benchmarks, not published vendor-style numbers. The main
+goal is to compare shapes, validate architecture changes, and catch
+regressions. Treat each result as tied to the environment named beside it; do
+not compare numbers from different sections as though they came from one
+machine.
 
 ## North-Star Metrics
 
@@ -163,7 +168,7 @@ guardrails on `dead_tup_delta` and `max_available`.
 That nightly profile is intentionally short. It checks that Awa still behaves
 reasonably under overlapping analytical readers, but it is not the same thing
 as the 15-minute mixed-workload soak discussed in the PlanetScale post. For a
-closer local reproduction, increase duration and reader hold times and keep the
+closer reproduction, increase duration and reader hold times and keep the
 readers in `active_scan` mode so queries overlap continuously rather than
 simulating only `idle in transaction`.
 
@@ -333,10 +338,9 @@ properties:
 - COPY staging now reuses a session-local temp table and stages typed values
   instead of reparsing text on the final `INSERT ... SELECT`
 
-Example reference results from one local laptop run and one dedicated server
-run:
+Example reference result from the developer laptop reference:
 
-- local laptop (`Apple M5`, release build, v0.5.0-alpha.0):
+- developer laptop reference (`Apple M5`, release build, v0.5.0-alpha.0):
   - `insert_only_single`: about `30k inserts/s`
   - `copy_single`: about `43k inserts/s`
   - `insert_contention_distinct` (4 producers x 3k): about `46k inserts/s`
@@ -355,21 +359,22 @@ Measured with `test_runtime_sustained_hot_path` after resetting runtime state:
 - measurement window: 10s
 - queue size seeded: 200,000 immediately-available jobs
 
-Example reference result from one local run (release mode, v0.5.0-alpha.0):
+Example reference result from the developer laptop reference (release mode,
+v0.5.0-alpha.0):
 
 - handler returns: about `5.6k jobs/s`
 - DB `completed` transitions: about `5.6k jobs/s`
 
 This benchmark enables the in-memory OpenTelemetry exporter and the
 production alerting metrics path (queue depth, lag, wait-duration histogram).
-Back-to-back A/B testing shows v0.5.0 is ~44% faster than v0.4.1 on the
-same hardware (5.9k vs 4.1k/s) — the promotion query optimizations more
-than offset the metrics instrumentation cost.
+Back-to-back A/B testing in the same reference environment shows v0.5.0 is
+~44% faster than v0.4.1 (5.9k vs 4.1k/s) — the promotion query optimizations
+more than offset the metrics instrumentation cost.
 
 ### Python Runtime Baseline
 
-Measured with `awa-python/scripts/benchmark_runtime.py` on the same local
-database:
+Measured with `awa-python/scripts/benchmark_runtime.py` on the developer
+laptop reference database:
 
 - `insert_many_copy`: about `16.2k jobs/s` (`50,000` jobs in `3.09s`)
 - sustained hot path:
@@ -607,8 +612,9 @@ Some practical guidelines:
   path. Global background work can distort results.
 - Prefer the `db_completed_delta` view when you care about end-to-end queue
   completion, not just handler return rate.
-- Treat the numbers here as machine-local reference points, not portable
-  guarantees.
+- Treat the numbers here as environment-specific reference points, not portable
+  guarantees. For cross-system claims, use the companion comparison repo and
+  its recorded environment.
 
 ## How To Run
 
@@ -706,7 +712,9 @@ PYTHONPATH=scripts DATABASE_URL=postgres://postgres:test@localhost:15432/awa_tes
 
 ## Caveats
 
-- These numbers are from one local machine and one local Postgres setup.
+- Each number is tied to the environment stated near the result. The developer
+  commands use a localhost database URL for convenience, but that URL is not a
+  claim about where every result was produced.
 - Ignored benchmark tests are not part of the normal unit/integration test pass.
 - The current focus is relative behavior and architectural validation, not
   cross-machine leaderboard comparisons.
