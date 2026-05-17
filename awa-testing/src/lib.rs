@@ -40,13 +40,11 @@ impl TestClient {
 
     /// Clean the awa schema (for test isolation).
     pub async fn clean(&self) -> Result<(), AwaError> {
+        crate::setup::reset_runtime_backend(&self.pool).await;
         sqlx::query("DELETE FROM awa.jobs")
             .execute(&self.pool)
             .await?;
         sqlx::query("DELETE FROM awa.queue_meta")
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
             .execute(&self.pool)
             .await?;
         Ok(())

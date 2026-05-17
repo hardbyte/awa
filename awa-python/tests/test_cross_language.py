@@ -12,6 +12,7 @@ import pytest
 
 import awa
 from awa._awa import derive_kind
+from storage_reset import reset_async
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -22,8 +23,8 @@ DATABASE_URL = os.environ.get(
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await reset_async(c)
     tx = await c.transaction()
-    await tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
     await tx.execute("DELETE FROM awa.jobs")
     await tx.execute("DELETE FROM awa.queue_meta")
     await tx.commit()

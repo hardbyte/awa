@@ -13,6 +13,7 @@ import pytest
 
 import awa
 from awa.bridge import insert_job, insert_job_sync
+from storage_reset import reset_sync
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -45,6 +46,7 @@ def awa_client():
     """Awa sync client for verifying job insertion."""
     c = awa.Client(DATABASE_URL)
     c.migrate()
+    reset_sync(c)
     return c
 
 
@@ -156,9 +158,7 @@ async def test_bridge_ordering_key_routes_to_same_shard_asyncpg(awa_client):
         assert len(rows) == 2
         assert len({row["enqueue_shard"] for row in rows}) == 1
     finally:
-        tx = awa_client.transaction()
-        tx.execute("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        tx.commit()
+        reset_sync(awa_client)
         await conn.close()
 
 

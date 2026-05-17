@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import pytest
 
 import awa
+from storage_reset import reset_async, reset_sync
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -21,6 +22,7 @@ DATABASE_URL = os.environ.get(
 async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
+    await reset_async(c)
     tx = await c.transaction()
     await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'uniq_%'")
     await tx.commit()
@@ -294,6 +296,7 @@ def test_unique_insert_sync():
     """Sync insert with unique_opts works."""
     c = awa.Client(DATABASE_URL)
     c.migrate()
+    reset_sync(c)
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_sync'")
     tx.commit()
@@ -368,6 +371,7 @@ def test_unique_insert_in_sync_transaction():
     """Sync transactional unique insert works."""
     c = awa.Client(DATABASE_URL)
     c.migrate()
+    reset_sync(c)
     tx = c.transaction()
     tx.execute("DELETE FROM awa.jobs WHERE queue = 'uniq_stx'")
     tx.commit()
