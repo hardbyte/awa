@@ -258,68 +258,101 @@ async fn wait_for_writable(database_url: &str, timeout: Duration) {
 async fn queue_state_counts(pool: &sqlx::PgPool, queue: &str) -> HashMap<String, i64> {
     if let Some(schema) = queue_storage_schema_for_counts(pool).await {
         let sql = format!(
-            "SELECT state::text, count(*)::bigint FROM ( \
-                 SELECT 'available'::awa.job_state AS state \
-                 FROM {schema}.ready_entries AS ready \
-                 JOIN {schema}.queue_claim_heads AS claims \
-                   ON claims.queue = ready.queue \
-                  AND claims.priority = ready.priority \
-                  AND claims.enqueue_shard = ready.enqueue_shard \
-                 WHERE ready.queue = $1 \
-                   AND ready.lane_seq >= claims.claim_seq \
+            "WITH live_counts AS ( \
+                 SELECT state::text, count(*)::bigint AS count \
+                 FROM ( \
+                     SELECT 'available'::awa.job_state AS state \
+                     FROM {schema}.ready_entries AS ready \
+                     JOIN {schema}.queue_claim_heads AS claims \
+                       ON claims.queue = ready.queue \
+                      AND claims.priority = ready.priority \
+                      AND claims.enqueue_shard = ready.enqueue_shard \
+                     WHERE ready.queue = $1 \
+                       AND ready.lane_seq >= claims.claim_seq \
+                     UNION ALL \
+                     SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
+                     UNION ALL \
+                     SELECT state FROM {schema}.leases WHERE queue = $1 \
+                     UNION ALL \
+                     SELECT 'running'::awa.job_state AS state \
+                     FROM {schema}.lease_claims AS lc \
+                     WHERE lc.queue = $1 \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.lease_claim_closures AS cx \
+                         WHERE cx.claim_slot = lc.claim_slot \
+                           AND cx.job_id = lc.job_id \
+                           AND cx.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.leases AS lease \
+                         WHERE lease.job_id = lc.job_id \
+                           AND lease.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.deferred_jobs AS deferred \
+                         WHERE deferred.job_id = lc.job_id \
+                           AND deferred.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.done_entries AS done \
+                         WHERE done.job_id = lc.job_id \
+                           AND done.run_lease = lc.run_lease \
+                       ) \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.dlq_entries AS dlq \
+                         WHERE dlq.job_id = lc.job_id \
+                           AND dlq.run_lease = lc.run_lease \
+                       ) \
+                     UNION ALL \
+                     SELECT 'completed'::awa.job_state AS state \
+                     FROM {schema}.lease_claims AS lc \
+                     JOIN {schema}.lease_claim_closures AS cx \
+                       ON cx.claim_slot = lc.claim_slot \
+                      AND cx.job_id = lc.job_id \
+                      AND cx.run_lease = lc.run_lease \
+                     WHERE lc.queue = $1 \
+                       AND cx.outcome = 'completed' \
+                       AND NOT EXISTS ( \
+                         SELECT 1 FROM {schema}.done_entries AS done \
+                         WHERE done.job_id = lc.job_id \
+                           AND done.run_lease = lc.run_lease \
+                       ) \
+                     UNION ALL \
+                     SELECT state FROM {schema}.done_entries WHERE queue = $1 \
+                     UNION ALL \
+                     SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
+                 ) AS jobs \
+                 GROUP BY state \
+             ), \
+             pruned_terminal AS ( \
+                 SELECT 'completed'::text AS state, \
+                        COALESCE( \
+                            sum( \
+                                GREATEST( \
+                                    COALESCE(lanes.pruned_completed_count, 0), \
+                                    COALESCE(rollups.pruned_completed_count, 0) \
+                                ) \
+                            ), \
+                            0 \
+                        )::bigint AS count \
+                 FROM ( \
+                     SELECT queue, priority, pruned_completed_count \
+                     FROM {schema}.queue_lanes \
+                     WHERE queue = $1 \
+                 ) AS lanes \
+                 FULL OUTER JOIN ( \
+                     SELECT queue, priority, pruned_completed_count \
+                     FROM {schema}.queue_terminal_rollups \
+                     WHERE queue = $1 \
+                 ) AS rollups \
+                 USING (queue, priority) \
+             ) \
+             SELECT state, sum(count)::bigint AS count \
+             FROM ( \
+                 SELECT state, count FROM live_counts \
                  UNION ALL \
-                 SELECT state FROM {schema}.deferred_jobs WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.leases WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT 'running'::awa.job_state AS state \
-                 FROM {schema}.lease_claims AS lc \
-                 WHERE lc.queue = $1 \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.lease_claim_closures AS cx \
-                     WHERE cx.claim_slot = lc.claim_slot \
-                       AND cx.job_id = lc.job_id \
-                       AND cx.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.leases AS lease \
-                     WHERE lease.job_id = lc.job_id \
-                       AND lease.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.deferred_jobs AS deferred \
-                     WHERE deferred.job_id = lc.job_id \
-                       AND deferred.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.done_entries AS done \
-                     WHERE done.job_id = lc.job_id \
-                       AND done.run_lease = lc.run_lease \
-                   ) \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.dlq_entries AS dlq \
-                     WHERE dlq.job_id = lc.job_id \
-                       AND dlq.run_lease = lc.run_lease \
-                   ) \
-                 UNION ALL \
-                 SELECT 'completed'::awa.job_state AS state \
-                 FROM {schema}.lease_claims AS lc \
-                 JOIN {schema}.lease_claim_closures AS cx \
-                   ON cx.claim_slot = lc.claim_slot \
-                  AND cx.job_id = lc.job_id \
-                  AND cx.run_lease = lc.run_lease \
-                 WHERE lc.queue = $1 \
-                   AND cx.outcome = 'completed' \
-                   AND NOT EXISTS ( \
-                     SELECT 1 FROM {schema}.done_entries AS done \
-                     WHERE done.job_id = lc.job_id \
-                       AND done.run_lease = lc.run_lease \
-                   ) \
-                 UNION ALL \
-                 SELECT state FROM {schema}.done_entries WHERE queue = $1 \
-                 UNION ALL \
-                 SELECT state FROM {schema}.dlq_entries WHERE queue = $1 \
-             ) AS jobs \
+                 SELECT state, count FROM pruned_terminal WHERE count > 0 \
+             ) AS counts \
              GROUP BY state"
         );
         let rows: Vec<(String, i64)> = sqlx::query_as(&sql)
@@ -413,7 +446,27 @@ async fn storage_debug(pool: &sqlx::PgPool, queue: &str) -> String {
                     AND lc.job_id = cx.job_id \
                     AND lc.run_lease = cx.run_lease \
                   WHERE lc.queue = $1) + \
-                 (SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1)"
+                 (SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1) + \
+                 (SELECT COALESCE( \
+                     sum( \
+                         GREATEST( \
+                             COALESCE(lanes.pruned_completed_count, 0), \
+                             COALESCE(rollups.pruned_completed_count, 0) \
+                         ) \
+                     ), \
+                     0 \
+                 )::bigint \
+                  FROM ( \
+                      SELECT queue, priority, pruned_completed_count \
+                      FROM {schema}.queue_lanes \
+                      WHERE queue = $1 \
+                  ) AS lanes \
+                  FULL OUTER JOIN ( \
+                      SELECT queue, priority, pruned_completed_count \
+                      FROM {schema}.queue_terminal_rollups \
+                      WHERE queue = $1 \
+                  ) AS rollups \
+                  USING (queue, priority))"
         );
         sqlx::query_scalar::<_, i64>(&sql)
             .bind(queue)
