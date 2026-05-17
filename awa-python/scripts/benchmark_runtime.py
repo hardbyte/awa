@@ -96,9 +96,14 @@ async def reset_storage_transition_state(client: awa.AsyncClient) -> None:
     await execute(client, "DELETE FROM awa.runtime_instances")
 
 
-async def reset_runtime_state(client: awa.AsyncClient, *, queue_storage: bool = False) -> None:
+async def reset_runtime_state(
+    client: awa.AsyncClient,
+    *,
+    queue_storage: bool = False,
+    queue_storage_schema: str = "awa_qs_py_bench",
+) -> None:
     if queue_storage:
-        await client.install_queue_storage(reset=True)
+        await client.install_queue_storage(schema=queue_storage_schema, reset=True)
         return
 
     await reset_storage_transition_state(client)
@@ -141,15 +146,18 @@ async def run_copy_benchmark(
     chunk_size: int,
 ) -> None:
     queue = "py_bench_copy"
-    await reset_runtime_state(client, queue_storage=True)
+    await reset_runtime_state(
+        client,
+        queue_storage=True,
+        queue_storage_schema="awa_qs_py_bench_copy",
+    )
 
     started = asyncio.get_running_loop().time()
     inserted = 0
     for chunk_start in range(0, total_jobs, chunk_size):
         chunk_end = min(chunk_start + chunk_size, total_jobs)
         jobs = [TimingJob(seq=i) for i in range(chunk_start, chunk_end)]
-        rows = await client.insert_many_copy(jobs, queue=queue)
-        inserted += len(rows)
+        inserted += await client.enqueue_many_copy(jobs, queue=queue)
     elapsed = asyncio.get_running_loop().time() - started
 
     throughput = inserted / elapsed

@@ -11,8 +11,14 @@ use std::collections::HashMap;
 use tower::util::ServiceExt;
 use uuid::Uuid;
 
+static TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 async fn setup_pool() -> sqlx::PgPool {
     awa_testing::setup::setup(4).await
+}
+
+async fn runtime_api_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    TEST_LOCK.lock().await
 }
 
 async fn clean_runtime_snapshots_for_queue(pool: &sqlx::PgPool, queue: &str) {
@@ -97,6 +103,7 @@ fn weighted_config(weight: u32) -> QueueRuntimeConfigSnapshot {
 
 #[tokio::test]
 async fn test_get_runtime_endpoint_returns_runtime_overview() {
+    let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_overview";
     let instance_id = seed_runtime_snapshot(&pool, queue, "runtime-api-worker").await;
@@ -138,6 +145,7 @@ async fn test_get_runtime_endpoint_returns_runtime_overview() {
 
 #[tokio::test]
 async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live_counts() {
+    let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_stale";
     clean_runtime_snapshots_for_queue(&pool, queue).await;
@@ -253,6 +261,7 @@ async fn test_runtime_endpoint_marks_stale_instances_and_excludes_them_from_live
 
 #[tokio::test]
 async fn test_get_queue_runtime_endpoint_returns_queue_summary() {
+    let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_queue_summary";
     seed_runtime_snapshot(&pool, queue, "runtime-queue-worker").await;
@@ -316,6 +325,7 @@ async fn test_get_queue_runtime_endpoint_returns_queue_summary() {
 
 #[tokio::test]
 async fn test_queue_runtime_endpoint_treats_unknown_dlq_policy_as_rollout_compatible() {
+    let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_queue_dlq_rollout";
     clean_runtime_snapshots_for_queue(&pool, queue).await;
@@ -426,6 +436,7 @@ async fn test_queue_runtime_endpoint_treats_unknown_dlq_policy_as_rollout_compat
 
 #[tokio::test]
 async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_mismatch() {
+    let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
     let queue = "ui_runtime_api_queue_mismatch";
     clean_runtime_snapshots_for_queue(&pool, queue).await;
@@ -593,6 +604,7 @@ async fn test_queue_runtime_endpoint_aggregates_live_instances_and_flags_config_
 
 #[tokio::test]
 async fn test_storage_endpoint_returns_canonical_baseline_report() {
+    let _guard = runtime_api_test_guard().await;
     let pool = setup_pool().await;
     // `storage_abort()` only returns to canonical from `prepared` or
     // `mixed_transition`. With v013's auto-finalize-on-fresh-DB

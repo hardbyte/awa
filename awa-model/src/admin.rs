@@ -269,6 +269,7 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
             JOIN {schema}.queue_claim_heads AS claims
               ON claims.queue = ready.queue
              AND claims.priority = ready.priority
+             AND claims.enqueue_shard = ready.enqueue_shard
             WHERE ready.lane_seq >= claims.claim_seq
         ),
         current_jobs AS (
@@ -292,6 +293,7 @@ fn queue_storage_current_jobs_cte(schema: &str) -> String {
              AND ready.ready_generation = leases.ready_generation
              AND ready.queue = leases.queue
              AND ready.priority = leases.priority
+             AND ready.enqueue_shard = leases.enqueue_shard
              AND ready.lane_seq = leases.lane_seq
             UNION ALL
             SELECT job_id, kind, queue, state, created_at, run_at, finalized_at
@@ -542,6 +544,7 @@ pub async fn cancel_by_unique_key(
                 JOIN {schema}.queue_claim_heads AS claims
                   ON claims.queue = ready.queue
                  AND claims.priority = ready.priority
+                 AND claims.enqueue_shard = ready.enqueue_shard
                 WHERE ready.lane_seq >= claims.claim_seq
             ),
             candidates AS (
@@ -2280,6 +2283,7 @@ pub async fn state_counts(pool: &PgPool) -> Result<HashMap<JobState, i64>, AwaEr
                     JOIN {schema}.queue_claim_heads AS claims
                       ON claims.queue = ready.queue
                      AND claims.priority = ready.priority
+                     AND claims.enqueue_shard = ready.enqueue_shard
                     WHERE ready.lane_seq >= claims.claim_seq
                 ), 0) AS available,
                 COALESCE((SELECT count(*)::bigint FROM {schema}.leases WHERE state = 'running'), 0) AS running,

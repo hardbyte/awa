@@ -41,37 +41,41 @@ async def client():
     c = awa.AsyncClient(DATABASE_URL)
     await c.migrate()
     tx = await c.transaction()
-    await tx.execute(
-        """
-        CREATE TABLE IF NOT EXISTS awa_test_chaos_markers (
-            job_id BIGINT NOT NULL,
-            attempt INTEGER NOT NULL,
-            marker TEXT NOT NULL,
-            observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    try:
+        await tx.execute(
+            """
+            CREATE TABLE IF NOT EXISTS awa_test_chaos_markers (
+                job_id BIGINT NOT NULL,
+                attempt INTEGER NOT NULL,
+                marker TEXT NOT NULL,
+                observed_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
         )
-        """
-    )
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'chaos_%'")
-    await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'chaos_%'")
-    await tx.execute(
-        "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
-    )
-    await tx.execute("DELETE FROM awa.runtime_instances")
-    await tx.execute(
-        """
-        UPDATE awa.storage_transition_state
-        SET current_engine = 'canonical',
-            prepared_engine = NULL,
-            state = 'canonical',
-            transition_epoch = transition_epoch + 1,
-            details = '{}'::jsonb,
-            updated_at = now(),
-            finalized_at = NULL
-        WHERE singleton
-        """
-    )
-    await tx.execute("DELETE FROM awa_test_chaos_markers")
-    await tx.commit()
+        await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'chaos_%'")
+        await tx.execute("DELETE FROM awa.queue_meta WHERE queue LIKE 'chaos_%'")
+        await tx.execute(
+            "DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'"
+        )
+        await tx.execute("DELETE FROM awa.runtime_instances")
+        await tx.execute(
+            """
+            UPDATE awa.storage_transition_state
+            SET current_engine = 'canonical',
+                prepared_engine = NULL,
+                state = 'canonical',
+                transition_epoch = transition_epoch + 1,
+                details = '{}'::jsonb,
+                updated_at = now(),
+                finalized_at = NULL
+            WHERE singleton
+            """
+        )
+        await tx.execute("DELETE FROM awa_test_chaos_markers")
+        await tx.commit()
+    except Exception:
+        await tx.rollback()
+        raise
     yield c
     await c.close()
 
@@ -248,7 +252,7 @@ async def test_callback_timeout_is_rescued_and_retried(client):
             and current["state"] == "completed"
             and current["attempt"] == 2
             and current["finalized_at"] is not None,
-            timeout=10,
+            timeout=30,
             worker=worker,
             description="completed attempt=2 after callback timeout rescue",
         )

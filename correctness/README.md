@@ -112,13 +112,20 @@ What is intentionally not modeled:
   `storage/AwaSegmentedStorageTrace.cfg` /
   `storage/AwaSegmentedStorageTraceReceiptRescue.cfg` /
   `storage/AwaSegmentedStorageTraceRunningCancel.cfg` /
+  `storage/AwaSegmentedStorageTraceReceiptOnlyCancel.cfg` /
+  `storage/AwaSegmentedStorageTraceCallbackWait.cfg` /
   `storage/AwaSegmentedStorageTraceDlqRetry.cfg` /
+  `storage/AwaSegmentedStorageTraceDlqPurge.cfg` /
   `storage/AwaSegmentedStorageTraceBroken.cfg`: trace-validation
   harness. Takes hand-transcribed sequences of queue-storage runtime
   events and verifies each transition is accepted by the storage spec.
   Current positive traces cover snooze, receipt rescue, running cancel,
-  and DLQ retry. A deliberately-broken variant trips deadlock at
-  traceIdx = 2 to confirm the checker rejects invalid sequences.
+  receipt-only cancel, callback wait/resume, DLQ retry, and DLQ purge.
+  A deliberately-broken variant trips deadlock at traceIdx = 2 to confirm
+  the checker rejects invalid sequences.
+- `storage/AwaDeadTupleContract.tla` / `storage/AwaDeadTupleContract.cfg`:
+  static architectural contract for table reclaim kinds, hot mutation
+  surfaces, and partition-truncate wiring.
 - `AwaExtended.tla` / `AwaExtended.cfg`: multi-instance model for shutdown
   sequencing, split permit/claim/execute stages, leader failover, weighted
   overflow capacity, bounded batch behavior, abstract rate limiting, and
@@ -153,42 +160,78 @@ What is intentionally not modeled:
 
 From the repository root:
 
+Passing configs:
+
 ```bash
 ./correctness/run-tlc.sh core/AwaCore.tla
-./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
-./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
-./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
-./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
-./correctness/run-tlc.sh storage/AwaShardedPrune.tla
-./correctness/run-tlc.sh storage/AwaShardedPrune.tla storage/AwaShardedPruneBroken.cfg
-./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
-./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
-./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
-./correctness/run-tlc.sh storage/AwaStorageTransition.tla
-./correctness/run-tlc.sh storage/AwaStorageTransition.tla storage/AwaStorageTransitionCurrentGate.cfg
-./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla
-./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptRescue.cfg
-./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceRunningCancel.cfg
-./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceDlqRetry.cfg
-./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg
 ./correctness/run-tlc.sh core/AwaBatcher.tla
 ./correctness/run-tlc.sh core/AwaBatcher.tla core/AwaBatcherLiveness.cfg
 ./correctness/run-tlc.sh protocol/AwaExtended.tla
 ./correctness/run-tlc.sh races/AwaCbk.tla
 ./correctness/run-tlc.sh races/AwaCbk.tla races/AwaCbkLiveness.cfg
-./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
+./correctness/run-tlc.sh races/AwaCron.tla
+./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
 ./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimNew.cfg
 ./correctness/run-tlc.sh races/AwaViewTrigger.tla
-./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
-./correctness/run-tlc.sh races/AwaCron.tla races/AwaCronLiveness.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorage.tla storage/AwaSegmentedStorageInterleavings.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesSafe.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRacesMultiWorker.cfg
+./correctness/run-tlc.sh storage/AwaDeadTupleContract.tla
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla
+./correctness/run-tlc.sh storage/AwaStorageTransition.tla
+./correctness/run-tlc.sh storage/AwaShardedPrune.tla
 ```
+
+Expected counterexample or positive-witness configs:
+
+```bash
+./correctness/run-tlc.sh races/AwaDispatchClaim.tla races/AwaDispatchClaimOld.cfg
+./correctness/run-tlc.sh races/AwaViewTrigger.tla races/AwaViewTriggerOld.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageRaces.tla storage/AwaSegmentedStorageRaces.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptRescue.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceRunningCancel.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceReceiptOnlyCancel.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceCallbackWait.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceDlqRetry.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceDlqPurge.cfg
+./correctness/run-tlc.sh storage/AwaSegmentedStorageTrace.tla storage/AwaSegmentedStorageTraceBroken.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderDeadlockDemo.cfg
+./correctness/run-tlc.sh storage/AwaStorageLockOrder.tla storage/AwaStorageLockOrderOldStripedClaimDeadlock.cfg
+./correctness/run-tlc.sh storage/AwaStorageTransition.tla storage/AwaStorageTransitionCurrentGate.cfg
+./correctness/run-tlc.sh storage/AwaShardedPrune.tla storage/AwaShardedPruneBroken.cfg
+```
+
+The `AwaSegmentedStorageTrace*` positive configs intentionally assert a
+`TraceIncomplete` invariant. A valid trace reaches the end and violates that
+invariant; a broken trace deadlocks at the first invalid step. The `Old`,
+`Broken`, `DeadlockDemo`, and `CurrentGate` configs are historical regression
+witnesses and should keep producing the named counterexamples.
+
+`AwaExtended` is the broadest state-space model. For local validation, prefer
+running it with TLC parallel workers, for example:
+
+```bash
+docker build -t awa-tlaplus -f correctness/Dockerfile correctness
+docker run --rm -v "$PWD/correctness:/work" awa-tlaplus \
+  -workers auto \
+  -config /work/protocol/AwaExtended.cfg \
+  /work/protocol/AwaExtended.tla
+```
+
+The focused models above are the release-critical executable regression suite
+for the concrete storage, callback, cron, trigger, and transition bugs. If the
+full `AwaExtended` run becomes too large to close on typical developer
+hardware, reduce it by splitting a smaller exhaustive config rather than
+weakening the focused models.
 
 Or directly:
 
 ```bash
 docker build -t awa-tlaplus -f correctness/Dockerfile correctness
 docker run --rm -v "$PWD/correctness:/work" awa-tlaplus \
-  -config /work/AwaExtended.cfg /work/AwaExtended.tla
+  -config /work/protocol/AwaExtended.cfg /work/protocol/AwaExtended.tla
 ```
 
 ## Model Notes
@@ -397,6 +440,10 @@ needs an extra environment assumption such as "some instance remains running".
 - Permit ownership is modeled at the job-row level. This is accurate enough for
   the checked invariants, but it is still an abstraction of the real Rust task
   handles and `DispatchPermit` lifetimes.
+- Public SQL projections (`awa.jobs`, `jobs_compat()`, admin state counts, and
+  worker health checks) are not modelled as separate derived views. The storage
+  specs cover the lifecycle state underneath them; projection exactness remains
+  a Rust SQL regression-test obligation.
 
 ## Bugs the Models Did Not Catch
 

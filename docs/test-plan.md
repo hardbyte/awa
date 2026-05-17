@@ -241,6 +241,18 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA7 | AwaSegmentedStorage | Segmented storage safety, waiting flow, optional attempt-state, prune safety |
 | TLA8 | AwaSegmentedStorageInterleavings | Two-worker segmented-storage interleavings |
 | TLA9 | AwaShardedPrune | Cross-shard ready/done prune matching by `enqueue_shard` |
+| TLA10 | AwaSegmentedStorageRaces | Claim-vs-rotate/prune race exposure and checked-commit safety |
+| TLA11 | AwaSegmentedStorageTrace | Runtime trace acceptance for snooze, receipt rescue, cancel, callback wait, DLQ retry, and DLQ purge paths |
+| TLA12 | AwaStorageLockOrder | Postgres lock ordering across claim, complete, cancel, rescue, rotate, and prune |
+| TLA13 | AwaStorageTransition | Storage-transition prepare, mixed-entry, finalize, and abort gates |
+| TLA14 | AwaDeadTupleContract | Hot-table reclaim-kind and partition-truncate contract |
+
+The formal suite includes passing configs and expected-counterexample configs.
+The expected-counterexample configs keep historical bugs executable: old
+dispatch claim, old view trigger, naive segment race, old storage-transition
+gate, shard-ignorant prune, and deliberate lock-order cycles. Trace configs
+use a `TraceIncomplete` invariant as a positive witness: a valid trace violates
+that invariant after TLC consumes every event.
 
 ## Running Tests
 

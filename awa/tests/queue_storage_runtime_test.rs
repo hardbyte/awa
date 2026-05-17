@@ -4310,6 +4310,7 @@ async fn test_available_count_matches_ready_entries_scan() {
              JOIN {schema}.queue_claim_heads AS claims
                ON claims.queue = ready.queue
               AND claims.priority = ready.priority
+              AND claims.enqueue_shard = ready.enqueue_shard
              WHERE ready.queue = $1
                AND ready.lane_seq >= claims.claim_seq"
         ))
@@ -4344,6 +4345,7 @@ async fn test_available_count_matches_ready_entries_scan() {
              JOIN {schema}.queue_claim_heads AS qc
                ON qc.queue = qe.queue
               AND qc.priority = qe.priority
+              AND qc.enqueue_shard = qe.enqueue_shard
              WHERE qe.queue = $1"
         ))
         .bind(queue)
@@ -4410,6 +4412,7 @@ async fn test_available_count_matches_ready_entries_scan() {
          JOIN {schema}.queue_claim_heads AS claims
            ON claims.queue = ready.queue
           AND claims.priority = ready.priority
+          AND claims.enqueue_shard = ready.enqueue_shard
          WHERE ready.queue = $1
            AND ready.priority = 2
            AND ready.lane_seq >= claims.claim_seq
@@ -6399,6 +6402,87 @@ async fn test_queue_storage_multi_shard_round_trip_through_completion() {
     );
 
     client.shutdown(Duration::from_secs(5)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_queue_storage_multi_shard_public_available_counts_are_exact() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(8).await;
+    let queue = "qs_multi_shard_public_counts";
+    let schema = "awa_qs_multi_shard_public_counts";
+    let store_config = QueueStorageConfig {
+        schema: schema.to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        queue_stripe_count: 1,
+        lease_claim_receipts: true,
+        claim_slot_count: 2,
+    };
+    let store = create_store_with_config(&pool, store_config.clone()).await;
+
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, 4)
+        ON CONFLICT (queue) DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed queue_meta.enqueue_shards = 4");
+
+    for i in 0..16 {
+        enqueue_job(
+            &pool,
+            &store,
+            &CompleteJob { id: i },
+            InsertOpts {
+                queue: queue.into(),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+
+    let direct_ready_count: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint FROM {schema}.ready_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read ready_entries count");
+    assert_eq!(direct_ready_count, 16);
+
+    let state_counts = admin::state_counts(&pool)
+        .await
+        .expect("read queue-storage state counts");
+    assert_eq!(
+        state_counts.get(&JobState::Available).copied().unwrap_or(0),
+        16,
+        "admin state_counts must not multiply ready rows by other shard cursors",
+    );
+
+    let overview = admin::queue_overview(&pool, queue)
+        .await
+        .expect("read queue overview")
+        .expect("queue overview should include enqueued queue");
+    assert_eq!(overview.available, 16);
+    assert_eq!(overview.total_queued, 16);
+
+    let client = queue_storage_client(&pool, queue, store_config, CompleteWorker);
+    let health = client.health_check().await;
+    assert_eq!(
+        health
+            .queues
+            .get(queue)
+            .expect("queue health should include configured queue")
+            .available,
+        16,
+        "client health should report exact ready rows across enqueue shards",
+    );
+
+    client.shutdown(Duration::from_secs(1)).await;
 }
 
 /// `ordering_key` pins a job to a deterministic shard based on a

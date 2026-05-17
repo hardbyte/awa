@@ -53,10 +53,38 @@ pub async fn setup(max_connections: u32) -> PgPool {
 /// start from the canonical compatibility surface unless they opt into a
 /// queue-storage runtime explicitly.
 pub async fn reset_runtime_backend(pool: &PgPool) {
+    let mut tx = pool
+        .begin()
+        .await
+        .expect("Failed to start runtime backend reset transaction");
+
+    sqlx::query(
+        r#"
+        UPDATE awa.storage_transition_state
+        SET current_engine = 'canonical',
+            prepared_engine = NULL,
+            state = 'canonical',
+            transition_epoch = transition_epoch + 1,
+            details = '{}'::jsonb,
+            updated_at = now(),
+            finalized_at = NULL
+        WHERE singleton
+        "#,
+    )
+    .execute(&mut *tx)
+    .await
+    .expect("Failed to reset storage transition state for test setup");
     sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .expect("Failed to reset active runtime backend for test setup");
+    sqlx::query("DELETE FROM awa.runtime_instances")
+        .execute(&mut *tx)
+        .await
+        .expect("Failed to reset runtime instances for test setup");
+    tx.commit()
+        .await
+        .expect("Failed to commit runtime backend reset transaction");
 }
 
 /// Delete all jobs, queue metadata, and admin caches for a specific queue.

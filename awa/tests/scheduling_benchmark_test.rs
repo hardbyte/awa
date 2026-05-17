@@ -1207,6 +1207,7 @@ async fn run_runtime_sustained_hot_path(max_conns: u32) {
         .expect("Failed to get finished metrics");
     print_runtime_metrics(&resource_metrics);
     let _ = meter_provider.shutdown();
+    clean_queue(&pool, queue).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

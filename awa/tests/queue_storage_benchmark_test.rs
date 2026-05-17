@@ -614,6 +614,7 @@ async fn overlap_reader(
                          JOIN {schema}.queue_claim_heads AS claims \
                            ON claims.queue = ready.queue \
                           AND claims.priority = ready.priority \
+                          AND claims.enqueue_shard = ready.enqueue_shard \
                          WHERE ready.queue = $1 \
                            AND ready.lane_seq >= claims.claim_seq\
                      ), pruned AS (\

@@ -337,15 +337,26 @@ Core safety invariants are modeled in TLA+:
 |---|---|
 | [`AwaCore`](../correctness/core/AwaCore.tla) | job lifecycle, retry/fail/cancel transitions, callback states |
 | [`AwaBatcher`](../correctness/core/AwaBatcher.tla) | guarded completion batching and stale-result rejection |
+| [`AwaExtended`](../correctness/protocol/AwaExtended.tla) | multi-instance shutdown, rescue, permit, leadership, and bounded fairness protocol |
 | [`AwaSegmentedStorage`](../correctness/storage/AwaSegmentedStorage.tla) | queue-storage lifecycle, rotate/prune safety, DLQ round-trip, receipt rescue |
 | [`AwaSegmentedStorageRaces`](../correctness/storage/AwaSegmentedStorageRaces.tla) | claim-vs-rotate/prune interleavings |
+| [`AwaSegmentedStorageTrace`](../correctness/storage/AwaSegmentedStorageTrace.tla) | concrete runtime trace acceptance for representative queue-storage flows |
 | [`AwaShardedPrune`](../correctness/storage/AwaShardedPrune.tla) | cross-shard ready/done prune matching by `enqueue_shard` |
 | [`AwaStorageLockOrder`](../correctness/storage/AwaStorageLockOrder.tla) | Postgres lock ordering across claim, rotate, and prune |
+| [`AwaStorageTransition`](../correctness/storage/AwaStorageTransition.tla) | queue-storage transition prepare, mixed-entry, finalize, and abort gates |
+| [`AwaDeadTupleContract`](../correctness/storage/AwaDeadTupleContract.tla) | hot-table reclaim-kind contract for partition truncate and bounded warm tables |
 | [`AwaCbk`](../correctness/races/AwaCbk.tla) | callback registration/resume/finalization races |
+| [`AwaDispatchClaim`](../correctness/races/AwaDispatchClaim.tla) | availability re-check at dispatch claim commit |
+| [`AwaViewTrigger`](../correctness/races/AwaViewTrigger.tla) | `awa.jobs` view trigger concurrency and version checks |
+| [`AwaCron`](../correctness/races/AwaCron.tla) | cron double-fire prevention under leader failover |
 
-The runtime tests replay representative storage traces against these models,
-and the benchmark notes document long-horizon partition and dead-tuple
-validation for ADR-019 and ADR-023.
+The storage model-to-code correspondence is maintained in
+[`correctness/storage/MAPPING.md`](../correctness/storage/MAPPING.md). Runtime
+tests replay representative storage traces against these models, and the
+benchmark notes document long-horizon partition and dead-tuple validation for
+ADR-019 and ADR-023. Public SQL projections such as `awa.jobs` and admin
+counts are treated as refinements over the modeled storage state; they need
+code-level regression tests as well as TLA+ lifecycle coverage.
 
 ## Crate Structure
 
