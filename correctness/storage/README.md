@@ -411,6 +411,19 @@ description of how to transcribe and add a new trace.
 
 See [`../README.md`](../README.md) for the full Known Divergences list.
 Specific to this spec:
+
+- **Public SQL projections are not modelled as separate views.**
+  `AwaSegmentedStorage` models the storage state and invariants underneath
+  `ready_entries`, `leases`, `done_entries`, `dlq_entries`, and receipt
+  partitions. It does not separately derive `awa.jobs`, `terminal_jobs`,
+  admin state counts, or health-check availability. Those projection paths
+  are covered by Rust regression tests and the correspondence notes in
+  [`MAPPING.md`](./MAPPING.md#public-read-and-compatibility-surfaces).
+- **Enqueue-shard routing is split across specs.** The base storage model
+  uses one `(queue, priority, enqueue_shard)` lane. Cross-shard `lane_seq`
+  collisions are checked by `AwaShardedPrune`, but the producer shard chooser,
+  per-queue `enqueue_shards` changes, and projection exactness across shards
+  remain code-tested rather than represented in a single unified TLA+ state.
 - **DLQ bulk ops are modelled as quantified single-row actions.** The Rust
   `bulk_retry_from_dlq` / `purge_dlq` paths are transactionally atomic across
   the matching rows; the spec explores arbitrary interleavings of individual

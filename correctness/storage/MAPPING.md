@@ -24,7 +24,7 @@ onto the current Rust / SQL implementation.
 | `runLease[j]` | `run_lease` column on the lease/ready/deferred row |
 | `taskLease[w][j]` | `ctx.job.run_lease` snapshot captured at claim time in `awa-worker/src/executor.rs` |
 | `heartbeatFresh` | `heartbeat_at` on the lease row + the maintenance cutoff (see `rescue_stale_heartbeats` in `queue_storage.rs:8575`) |
-| `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq` |
+| `laneState.appendSeq` / `claimSeq` | `{schema}.queue_enqueue_heads.next_seq` / `{schema}.queue_claim_heads.claim_seq`, keyed by `(queue, priority, enqueue_shard)` |
 | `readySegmentCursor` etc. | `{schema}.queue_ring_state.current_slot` / `lease_ring_state.current_slot` |
 | `readySegments[seg]` state | partition presence + contents (`open` ≈ current write target, `sealed` ≈ rotated out but not pruned, `pruned` ≈ TRUNCATEd) |
 | `claimSegmentOf[<<j, r>>]` | the `claim_slot` column on the `(job_id, run_lease)` claim row in `{schema}.lease_claims` (ADR-023); closure rows in `{schema}.lease_claim_closures` share the same `claim_slot`. The spec keys claim bookkeeping by `(job, run_lease)` rather than by `job` alone so that an old attempt's receipt survives the next claim into a newer partition — Rust's `(claim_slot, job_id, run_lease)` triplet is the actual partition-side unique key, but the model abstracts the `claim_slot` half away into `claimSegmentOf`. |
@@ -42,7 +42,7 @@ for backfill / fallback reads during upgrades.
 
 | TLA+ action | Rust function | SQL / DDL |
 |---|---|---|
-| `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` and `QueueStorage::insert_ready_rows_copy_tx`; producer entry points include `enqueue_batch`, `enqueue_runtime_rows`, `enqueue_params_batch`, and `enqueue_params_copy` | reserve `{schema}.queue_enqueue_heads.next_seq`, sync enqueue-time uniqueness claims, append to `{schema}.ready_entries` via INSERT or COPY, update lane counters, and notify logical queues in one tx |
+| `EnqueueReady(j)` | `QueueStorage::insert_ready_rows_tx` and `QueueStorage::insert_ready_rows_copy_tx`; producer entry points include `enqueue_batch`, `enqueue_runtime_rows`, `enqueue_params_batch`, and `enqueue_params_copy` | reserve `{schema}.queue_enqueue_heads.next_seq`, sync enqueue-time uniqueness claims, append to `{schema}.ready_entries` via INSERT or COPY, and notify logical queues in one tx |
 | `EnqueueDeferred(j)` | `QueueStorage::insert_deferred_rows_tx` and `QueueStorage::insert_deferred_rows_copy_tx`; producer entry points include `enqueue_params_batch` and `enqueue_params_copy` | allocate job ids, sync enqueue-time uniqueness claims, append to `{schema}.deferred_jobs` via INSERT or COPY in one tx |
 | `PromoteDeferred(j)` | maintenance promote loop in `awa-worker/src/maintenance.rs::promote_due_state` | `DELETE FROM deferred_jobs ... INSERT INTO ready_entries ...` in one tx |
 | `AdvanceClaimCursor` | claim path gap-skipping after rescue/prune holes | inside the inline claim CTE; logical `UPDATE queue_claim_heads SET claim_seq = claim_seq + 1 WHERE no row at claim_seq` |
@@ -79,7 +79,7 @@ for backfill / fallback reads during upgrades.
 
 | TLA+ invariant | Rust enforcement |
 |---|---|
-| `ActiveLeasesSubsetReadyEntries` | every `leases` row FK-references `ready_entries(queue, priority, lane_seq)` (check the CREATE TABLE DDL in the `install` fn) |
+| `ActiveLeasesSubsetReadyEntries` | every `leases` row FK-references `ready_entries(queue, priority, enqueue_shard, lane_seq)` (check the CREATE TABLE DDL in the `install` fn) |
 | `WaitingIsLeaseState` | `waiting_external` is represented by a row in `leases`, not by a separate waiting table |
 | `AttemptStateRequiresLiveLease` | callback/progress attempt state is associated with a live lease row and is deleted on terminal/retry/rescue paths |
 | `FreshHeartbeatRequiresLease` | `heartbeat_at` is a column on `leases`; `enter_callback_wait` clears it for waiting leases |
@@ -94,7 +94,30 @@ for backfill / fallback reads during upgrades.
 | `PrunedClaimSegmentsAreEmpty` (ADR-023) | `prune_oldest_claims` requires no open claim in the partition before TRUNCATE; rescue-before-truncate closes stragglers in the same transaction |
 | `NoLostClaim` (ADR-023) | receipts and their closures both live in `claim_slot`-partitioned tables; partitions only truncate once all their receipts are closed, so no open claim is physically dropped |
 | `ClaimOpenAndClosedDisjoint` (ADR-023) | closure insertion and receipt-clearing are a single transaction; a partition's receipt+closure pair is either both present or both dropped by `TRUNCATE` |
-| `LaneStateConsistent` | live availability reads `sum({schema}.queue_lanes.available_count)`; the queue-storage SQL functions keep that counter in lockstep with `ready_entries` inserts, claim-head advances, and rescue paths. Completed totals are *not* maintained as hot counters — Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
+| `LaneStateConsistent` | live availability is derived from `{schema}.queue_enqueue_heads.next_seq` minus `{schema}.queue_claim_heads.claim_seq` for the same `(queue, priority, enqueue_shard)` lane, plus exact scans of live ready/receipt/lease rows where needed. Rust's hot-path queue signal path (`QueueStorage::queue_claimer_signal`) and exact admin reads use the same shard-aware head identity rather than a mutable `available_count` cache. Completed totals are *not* maintained as hot counters — Rust derives them from live `done_entries` plus the cold `{schema}.queue_terminal_rollups` cache, with `queue_lanes.pruned_completed_count` read only as a transitional legacy fallback |
+
+## Public read and compatibility surfaces
+
+`AwaSegmentedStorage.tla` models storage state, not every SQL projection over
+that state. Public and admin reads are therefore refinement obligations on the
+SQL implementation:
+
+- `awa.jobs` / `awa.jobs_compat()` is the compatibility view used by SQL
+  adapters and operational queries. Migration
+  `awa-model/migrations/v019_queue_storage_jobs_compat_shard_joins.sql`
+  keeps queue-storage joins shard-aware: available rows join claim heads by
+  `(queue, priority, enqueue_shard)`, and lease-backed rows join ready bodies
+  by `(queue, priority, enqueue_shard, lane_seq)`.
+- `awa-model/src/admin.rs::queue_storage_current_jobs_cte`,
+  `awa-model/src/admin.rs::state_counts`, and
+  `awa-worker/src/client.rs::health_check` are the Rust read-side equivalents.
+  They must preserve the same enqueue-shard predicates or multi-shard queues
+  can overcount available rows or hydrate a row from the wrong shard.
+- `test_queue_storage_multi_shard_public_available_counts_are_exact` is the
+  code-level regression test for this projection boundary. A future TLA+
+  projection model could make this formal by deriving `JobsCompatAvailable`
+  from the storage variables and asserting it equals `CurrentReady`; the
+  current storage model stops at the underlying lifecycle and prune state.
 
 ## Storage-transition model mapping
 
