@@ -172,19 +172,7 @@ async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
 }
 
 async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> {
-    if let Some(schema) = active_queue_storage_schema(pool).await {
-        return Some(schema);
-    }
-    let default_exists: bool = sqlx::query_scalar(
-        "SELECT to_regclass('awa.ready_entries') IS NOT NULL \
-         AND to_regclass('awa.deferred_jobs') IS NOT NULL \
-         AND to_regclass('awa.leases') IS NOT NULL \
-         AND to_regclass('awa.done_entries') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("Failed to probe default queue storage schema");
-    default_exists.then_some("awa".to_string())
+    active_queue_storage_schema(pool).await
 }
 
 fn state_count(counts: &HashMap<String, i64>, state: &str) -> i64 {
@@ -554,6 +542,21 @@ async fn wait_for_single_leader(clients: &[&Client], timeout: Duration) -> usize
         assert!(
             start.elapsed() < timeout,
             "Timed out waiting for a single leader; leaders={leaders:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn wait_for_client_leader(client: &Client, timeout: Duration) {
+    let timeout = scaled_timeout(timeout);
+    let start = Instant::now();
+    loop {
+        if client.health_check().await.leader {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "Timed out waiting for follower to become leader"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -1375,21 +1378,32 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     let expected_completed = 1 + (total_waves * 5);
     let expected_failed = total_waves;
 
-    let counts = wait_for_counts(
-        &pool,
-        &queue,
-        |counts| {
-            state_count(counts, "completed") == expected_completed
-                && state_count(counts, "failed") == expected_failed
-                && state_count(counts, "running") == 0
-                && state_count(counts, "available") == 0
-                && state_count(counts, "retryable") == 0
-                && state_count(counts, "scheduled") == 0
-                && state_count(counts, "waiting_external") == 0
-        },
-        Duration::from_secs(45),
-    )
-    .await;
+    let final_timeout = scaled_timeout(Duration::from_secs(45));
+    let final_start = Instant::now();
+    let counts = loop {
+        // A final first-attempt retry can commit while this assertion loop is
+        // already running. Keep forcing retryable rows due so the test does
+        // not depend on the exact interleaving of the last completion batch.
+        backdate_retryable_kind(&pool, &queue, "chaos_job").await;
+
+        let counts = queue_state_counts(&pool, &queue).await;
+        if state_count(&counts, "completed") == expected_completed
+            && state_count(&counts, "failed") == expected_failed
+            && state_count(&counts, "running") == 0
+            && state_count(&counts, "available") == 0
+            && state_count(&counts, "retryable") == 0
+            && state_count(&counts, "scheduled") == 0
+            && state_count(&counts, "waiting_external") == 0
+        {
+            break counts;
+        }
+
+        assert!(
+            final_start.elapsed() < final_timeout,
+            "Timed out waiting for queue {queue} counts; last counts: {counts:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
 
     assert_eq!(state_count(&counts, "completed"), expected_completed);
     assert_eq!(state_count(&counts, "failed"), expected_failed);
@@ -1765,9 +1779,6 @@ async fn test_leader_failover_during_scheduled_promotion() {
     )
     .await;
 
-    let leader_pid = current_leader_backend_pid(&pool)
-        .await
-        .expect("Expected an advisory lock holder before shutting down the leader");
     if leader_idx == 0 {
         client_a.shutdown(Duration::from_secs(5)).await;
     } else {
@@ -1779,7 +1790,7 @@ async fn test_leader_failover_during_scheduled_promotion() {
     } else {
         &client_a
     };
-    let _ = wait_for_new_leader_backend_pid(&pool, leader_pid, Duration::from_secs(5)).await;
+    wait_for_client_leader(follower, Duration::from_secs(5)).await;
 
     let counts = wait_for_counts(
         &pool,
@@ -1945,9 +1956,6 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     )
     .await;
 
-    let leader_pid = current_leader_backend_pid(&pool)
-        .await
-        .expect("Expected an advisory lock holder before shutting down the leader");
     if leader_idx == 0 {
         client_a.shutdown(Duration::from_secs(5)).await;
     } else {
@@ -1959,7 +1967,7 @@ async fn test_leader_failover_rescues_callback_timeouts() {
     } else {
         &client_a
     };
-    let _ = wait_for_new_leader_backend_pid(&pool, leader_pid, Duration::from_secs(5)).await;
+    wait_for_client_leader(follower, Duration::from_secs(5)).await;
 
     // Backdate callback_timeout_at so the follower's rescue cycle picks them up.
     // The callbacks were registered with a very long timeout (1h) to avoid a

@@ -121,62 +121,29 @@ fn sqlstate_from_awa_error(err: &awa::AwaError) -> Option<String> {
 }
 
 async fn simulate_non_canonical_compat_routing(pool: &PgPool) {
-    sqlx::raw_sql(
+    sqlx::query("DROP SCHEMA IF EXISTS awa_queue_storage CASCADE")
+        .execute(pool)
+        .await
+        .expect("compat routing schema should drop cleanly");
+
+    let store = QueueStorage::from_existing_schema("awa_queue_storage")
+        .expect("compat routing queue storage schema should validate");
+    store
+        .prepare_schema(pool)
+        .await
+        .expect("compat routing queue storage schema should prepare cleanly");
+
+    sqlx::query(
         r#"
         UPDATE awa.storage_transition_state
-        SET prepared_engine = 'queue_storage',
+        SET current_engine = 'queue_storage',
+            prepared_engine = NULL,
             state = 'active',
             transition_epoch = transition_epoch + 1,
             details = '{"schema":"awa_queue_storage"}'::jsonb,
             updated_at = now(),
             finalized_at = now()
-        WHERE singleton;
-
-        CREATE OR REPLACE FUNCTION awa.insert_job_compat(
-            p_kind TEXT,
-            p_queue TEXT DEFAULT 'default',
-            p_args JSONB DEFAULT '{}'::jsonb,
-            p_state awa.job_state DEFAULT 'available',
-            p_priority SMALLINT DEFAULT 2,
-            p_max_attempts SMALLINT DEFAULT 25,
-            p_run_at TIMESTAMPTZ DEFAULT NULL,
-            p_metadata JSONB DEFAULT '{}'::jsonb,
-            p_tags TEXT[] DEFAULT ARRAY[]::TEXT[],
-            p_unique_key BYTEA DEFAULT NULL,
-            p_unique_states BIT(8) DEFAULT NULL
-        )
-        RETURNS awa.jobs
-        LANGUAGE sql
-        SET search_path = pg_catalog, awa
-        AS $$
-            INSERT INTO awa.jobs (
-                kind,
-                queue,
-                args,
-                state,
-                priority,
-                max_attempts,
-                run_at,
-                metadata,
-                tags,
-                unique_key,
-                unique_states
-            )
-            VALUES (
-                p_kind,
-                p_queue,
-                p_args,
-                p_state,
-                p_priority,
-                p_max_attempts,
-                p_run_at,
-                p_metadata,
-                p_tags,
-                p_unique_key,
-                p_unique_states
-            )
-            RETURNING *
-        $$;
+        WHERE singleton
         "#,
     )
     .execute(pool)
@@ -881,6 +848,65 @@ async fn test_install_queue_storage_backend_activates_routing_and_state() {
 
     let queue_storage_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM awa_queue_storage_active.ready_entries WHERE queue = 'install_queue'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(queue_storage_count, 1);
+}
+
+#[tokio::test]
+async fn test_active_queue_storage_schema_survives_missing_backend_marker() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    install_queue_storage_backend(&pool, "awa_queue_storage_missing_marker").await;
+    sqlx::query("DELETE FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        active_queue_storage_schema(&pool).await.as_deref(),
+        Some("awa_queue_storage_missing_marker"),
+        "active transition state should keep queue-storage routing authoritative"
+    );
+
+    sqlx::query_as::<_, awa::JobRow>(
+        r#"
+        SELECT *
+        FROM awa.insert_job_compat(
+            'missing_marker_routing_test',
+            'missing_marker_queue',
+            '{}'::jsonb,
+            'available'::awa.job_state,
+            2::smallint,
+            25::smallint,
+            NULL::timestamptz,
+            '{}'::jsonb,
+            ARRAY[]::text[],
+            NULL::bytea,
+            NULL::bit(8)
+        )
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let hot_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.jobs_hot WHERE queue = 'missing_marker_queue'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(hot_count, 0, "active queue storage should bypass jobs_hot");
+
+    let queue_storage_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa_queue_storage_missing_marker.ready_entries WHERE queue = 'missing_marker_queue'",
     )
     .fetch_one(&pool)
     .await

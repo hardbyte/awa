@@ -141,21 +141,7 @@ async fn active_queue_storage_schema(pool: &sqlx::PgPool) -> Option<String> {
 }
 
 async fn queue_storage_schema_for_counts(pool: &sqlx::PgPool) -> Option<String> {
-    if let Some(schema) = active_queue_storage_schema(pool).await {
-        return Some(schema);
-    }
-
-    let default_exists: bool = sqlx::query_scalar(
-        "SELECT to_regclass('awa.ready_entries') IS NOT NULL \
-         AND to_regclass('awa.deferred_jobs') IS NOT NULL \
-         AND to_regclass('awa.leases') IS NOT NULL \
-         AND to_regclass('awa.done_entries') IS NOT NULL",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("Failed to probe default queue storage schema");
-
-    default_exists.then_some("awa".to_string())
+    active_queue_storage_schema(pool).await
 }
 
 async fn queue_job_count(pool: &sqlx::PgPool, queue: &str, state: &str) -> i64 {
