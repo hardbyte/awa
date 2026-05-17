@@ -198,7 +198,8 @@ fn build_job_timeline(job: &JobRow) -> Vec<JobTimelineEvent> {
     events
 }
 
-fn build_job_dump(job: JobRow, dlq: Option<DlqMetadata>) -> JobDump {
+/// Build a read-only inspection snapshot from an already loaded job row.
+pub fn build_job_dump_from_row(job: JobRow, dlq: Option<DlqMetadata>) -> JobDump {
     let latest_error = job
         .errors
         .as_ref()
@@ -2132,7 +2133,7 @@ pub async fn get_job_with_source(
 /// Build a read-only inspection snapshot for one job.
 pub async fn dump_job(pool: &PgPool, job_id: i64) -> Result<JobDump, AwaError> {
     let (job, dlq) = get_job_with_source(pool, job_id).await?;
-    Ok(build_job_dump(job, dlq))
+    Ok(build_job_dump_from_row(job, dlq))
 }
 
 /// Build a read-only inspection snapshot for one attempt.
@@ -2146,6 +2147,11 @@ pub async fn dump_run(
     attempt: Option<i16>,
 ) -> Result<RunDump, AwaError> {
     let job = get_job(pool, job_id).await?;
+    build_run_dump_from_row(&job, attempt)
+}
+
+/// Build a read-only run snapshot from an already loaded job row.
+pub fn build_run_dump_from_row(job: &JobRow, attempt: Option<i16>) -> Result<RunDump, AwaError> {
     let selected_attempt = attempt.unwrap_or(job.attempt);
 
     if selected_attempt < 0 {
@@ -2211,15 +2217,15 @@ pub async fn dump_run(
 
     if selected_attempt == 0 {
         return Err(AwaError::Validation(format!(
-            "attempt {selected_attempt} is not available for job {job_id}; current attempt is {}",
-            job.attempt
+            "attempt {selected_attempt} is not available for job {}; current attempt is {}",
+            job.id, job.attempt
         )));
     }
 
     if job.attempt > 0 && selected_attempt > job.attempt {
         return Err(AwaError::Validation(format!(
-            "attempt {selected_attempt} is not available for job {job_id}; current attempt is {}",
-            job.attempt
+            "attempt {selected_attempt} is not available for job {}; current attempt is {}",
+            job.id, job.attempt
         )));
     }
 
@@ -2232,7 +2238,8 @@ pub async fn dump_run(
         .find(|entry| entry.attempt == Some(selected_attempt))
         .ok_or_else(|| {
             AwaError::Validation(format!(
-                "attempt {selected_attempt} is not present in the recorded error history for job {job_id}"
+                "attempt {selected_attempt} is not present in the recorded error history for job {}",
+                job.id
             ))
         })?;
 
@@ -3336,8 +3343,9 @@ pub async fn register_callback_with_config(
     Ok(callback_id)
 }
 
-/// Internal action decided by CEL evaluation or default.
-enum ResolveAction {
+/// Action decided by CEL evaluation or the configured default callback action.
+#[derive(Debug, Clone, PartialEq)]
+pub enum CallbackResolutionAction {
     Complete(Option<serde_json::Value>),
     Fail {
         error: String,
@@ -3366,10 +3374,10 @@ pub async fn resolve_callback(
                 callback_id: callback_id.to_string(),
             })?;
 
-        let action = evaluate_or_default(&job, &payload, default_action)?;
+        let action = evaluate_callback_resolution(&job, &payload, default_action)?;
 
         return match action {
-            ResolveAction::Complete(transformed_payload) => {
+            CallbackResolutionAction::Complete(transformed_payload) => {
                 let completed_job = store
                     .complete_external(pool, callback_id, None, run_lease, false)
                     .await?;
@@ -3378,7 +3386,7 @@ pub async fn resolve_callback(
                     job: completed_job,
                 })
             }
-            ResolveAction::Fail { error, expression } => {
+            CallbackResolutionAction::Fail { error, expression } => {
                 let mut error_json = serde_json::json!({
                     "error": error,
                     "attempt": job.attempt,
@@ -3393,7 +3401,7 @@ pub async fn resolve_callback(
                     .await?;
                 Ok(ResolveOutcome::Failed { job: failed_job })
             }
-            ResolveAction::Ignore(reason) => Ok(ResolveOutcome::Ignored { reason }),
+            CallbackResolutionAction::Ignore(reason) => Ok(ResolveOutcome::Ignored { reason }),
         };
     }
 
@@ -3421,10 +3429,10 @@ pub async fn resolve_callback(
         callback_id: callback_id.to_string(),
     })?;
 
-    let action = evaluate_or_default(&job, &payload, default_action)?;
+    let action = evaluate_callback_resolution(&job, &payload, default_action)?;
 
     match action {
-        ResolveAction::Complete(transformed_payload) => {
+        CallbackResolutionAction::Complete(transformed_payload) => {
             let completed_job = sqlx::query_as::<_, JobRow>(
                 r#"
                 UPDATE awa.jobs
@@ -3453,7 +3461,7 @@ pub async fn resolve_callback(
                 job: completed_job,
             })
         }
-        ResolveAction::Fail { error, expression } => {
+        CallbackResolutionAction::Fail { error, expression } => {
             let mut error_json = serde_json::json!({
                 "error": error,
                 "attempt": job.attempt,
@@ -3489,7 +3497,7 @@ pub async fn resolve_callback(
             tx.commit().await?;
             Ok(ResolveOutcome::Failed { job: failed_job })
         }
-        ResolveAction::Ignore(reason) => {
+        CallbackResolutionAction::Ignore(reason) => {
             // No state change — dropping tx releases FOR UPDATE lock
             Ok(ResolveOutcome::Ignored { reason })
         }
@@ -3497,11 +3505,11 @@ pub async fn resolve_callback(
 }
 
 /// Evaluate CEL expressions or fall through to default_action.
-fn evaluate_or_default(
+pub fn evaluate_callback_resolution(
     job: &JobRow,
     payload: &Option<serde_json::Value>,
     default_action: DefaultAction,
-) -> Result<ResolveAction, AwaError> {
+) -> Result<CallbackResolutionAction, AwaError> {
     let has_expressions = job.callback_filter.is_some()
         || job.callback_on_complete.is_some()
         || job.callback_on_fail.is_some()
@@ -3530,16 +3538,16 @@ fn evaluate_or_default(
 fn apply_default(
     default_action: DefaultAction,
     payload: &Option<serde_json::Value>,
-) -> ResolveAction {
+) -> CallbackResolutionAction {
     match default_action {
-        DefaultAction::Complete => ResolveAction::Complete(payload.clone()),
-        DefaultAction::Fail => ResolveAction::Fail {
+        DefaultAction::Complete => CallbackResolutionAction::Complete(payload.clone()),
+        DefaultAction::Fail => CallbackResolutionAction::Fail {
             error: "callback failed: default action".to_string(),
             expression: None,
         },
-        DefaultAction::Ignore => {
-            ResolveAction::Ignore("no expressions configured, default is ignore".to_string())
-        }
+        DefaultAction::Ignore => CallbackResolutionAction::Ignore(
+            "no expressions configured, default is ignore".to_string(),
+        ),
     }
 }
 
@@ -3548,7 +3556,7 @@ fn evaluate_cel(
     job: &JobRow,
     payload: &Option<serde_json::Value>,
     default_action: DefaultAction,
-) -> ResolveAction {
+) -> CallbackResolutionAction {
     let payload_value = payload.as_ref().cloned().unwrap_or(serde_json::Value::Null);
 
     // 1. Evaluate filter
@@ -3556,7 +3564,9 @@ fn evaluate_cel(
         match eval_bool(filter_expr, &payload_value, job.id, "filter") {
             Ok(true) => {} // pass through
             Ok(false) => {
-                return ResolveAction::Ignore("filter expression returned false".to_string());
+                return CallbackResolutionAction::Ignore(
+                    "filter expression returned false".to_string(),
+                );
             }
             Err(_) => {
                 // Fail-open: treat filter error as true (pass through)
@@ -3568,7 +3578,7 @@ fn evaluate_cel(
     if let Some(on_fail_expr) = &job.callback_on_fail {
         match eval_bool(on_fail_expr, &payload_value, job.id, "on_fail") {
             Ok(true) => {
-                return ResolveAction::Fail {
+                return CallbackResolutionAction::Fail {
                     error: "callback failed: on_fail expression matched".to_string(),
                     expression: Some(on_fail_expr.clone()),
                 };
@@ -3586,7 +3596,7 @@ fn evaluate_cel(
             Ok(true) => {
                 // Complete with optional transform
                 let transformed = apply_transform(job, &payload_value);
-                return ResolveAction::Complete(Some(transformed));
+                return CallbackResolutionAction::Complete(Some(transformed));
             }
             Ok(false) => {} // don't complete
             Err(_) => {

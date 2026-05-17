@@ -102,6 +102,7 @@ fn public_facade_prepares_canonical_bind_values() {
     assert_eq!(prepared.unique_states_bit_string(), Some("11111000"));
     assert_eq!(UNIQUE_VIOLATION_SQLSTATE, "23505");
     assert!(INSERT_JOB_SQL.contains("awa.insert_job_compat"));
+    assert!(INSERT_JOB_SQL.contains("unique_states::text AS unique_states_str"));
 
     let raw_args = serde_json::Map::from_iter([("x".to_string(), serde_json::json!(1))]);
     let raw = prepare_raw_job_insert("raw_adapter_job", raw_args, Default::default())

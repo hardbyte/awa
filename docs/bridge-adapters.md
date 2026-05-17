@@ -163,6 +163,94 @@ let job = tokio_pg::insert_job_raw(
 
 All functions return `awa::JobRow` with the full row from `RETURNING *` — same type as `awa::insert_with`. The only field not populated is `unique_states` (BIT(8), no direct tokio-postgres mapping). All other fields, including `errors`, are decoded from the database row.
 
+## Rust: SeaORM
+
+SeaORM already sits on top of SQLx, so this adapter keeps the integration
+thin: it surfaces the underlying `sqlx::PgPool` from
+`sea_orm::DatabaseConnection`, then reuses Awa's existing insert and
+migration helpers on that pool.
+
+The adapter lives in the optional `awa-seaorm` crate. Use the first
+pattern when you only need transactional enqueueing from SeaORM, and
+the second pattern when you want to build and run an Awa client from
+the same connection.
+
+```toml
+[dependencies]
+awa = "0.6.0-alpha.9"
+awa-seaorm = "0.6.0-alpha.9"
+sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+] }
+```
+
+### Transactional enqueue
+
+```rust
+use awa::JobArgs;
+use awa_seaorm::{insert, migrate};
+use sea_orm::Database;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct SendEmail {
+    to: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::connect(&std::env::var("DATABASE_URL")?).await?;
+    migrate(&db).await?;
+
+    insert(
+        &db,
+        &SendEmail {
+            to: "ada@example.com".into(),
+            subject: "hello".into(),
+        },
+    )
+    .await?;
+
+    Ok(())
+}
+```
+
+### Client builder
+
+```rust
+use awa::{JobArgs, QueueConfig};
+use awa_seaorm::{client_builder, migrate};
+use sea_orm::Database;
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct SendEmail {
+    to: String,
+    subject: String,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::connect(&std::env::var("DATABASE_URL")?).await?;
+    migrate(&db).await?;
+
+    let client = client_builder(&db)
+        .queue("email", QueueConfig::default())
+        .build()?;
+
+    client.enqueue(SendEmail {
+        to: "ada@example.com".into(),
+        subject: "hello".into(),
+    }).await?;
+
+    client.start().await?;
+
+    Ok(())
+}
+```
+
 ## Python: psycopg3, asyncpg, SQLAlchemy, Django
 
 See [Python getting started — ORM Transaction Bridging](getting-started-python.md#orm-transaction-bridging).

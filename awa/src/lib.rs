@@ -12,11 +12,12 @@ pub use awa_model;
 // Re-export core model types (includes JobArgs derive macro via awa-model)
 pub use awa_model::{
     self as model, adapter, admin, bridge, insert, insert_many, insert_many_copy,
-    insert_many_copy_from_pool, insert_with, migrations, prepare_job_insert,
-    prepare_raw_job_insert, storage, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow,
-    InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState, ListDlqFilter,
-    PreparedJobInsert, QueueDescriptor, ResolveOutcome, RetryFromDlqOpts, StorageCapability,
-    StorageStatus, UniqueOpts,
+    insert_many_copy_from_pool, insert_with, map_sqlx_error, migrations, prepare_job_insert,
+    prepare_raw_job_insert, storage, AwaError, CallbackConfig, CallbackPollResult,
+    CallbackResolutionAction, DefaultAction, DlqMetadata, DlqRow, InsertOpts, InsertParams,
+    JobArgs, JobDump, JobDumpSummary, JobKindDescriptor, JobRow, JobState, JobTimelineEvent,
+    ListDlqFilter, ListJobsFilter, PreparedJobInsert, QueueDescriptor, ResolveOutcome,
+    RetryFromDlqOpts, RunDump, RunDumpSource, StorageCapability, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime

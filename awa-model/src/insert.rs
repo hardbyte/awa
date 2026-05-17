@@ -1,4 +1,4 @@
-use crate::error::AwaError;
+use crate::error::{map_sqlx_error, AwaError};
 use crate::job::{InsertOpts, InsertParams, JobRow, JobState};
 use crate::unique::compute_unique_key;
 use crate::JobArgs;
@@ -32,10 +32,11 @@ const INSERT_COMPAT_SQL: &str = r#"
 /// - `$4`: state as text, cast to `awa.job_state`
 /// - `$11`: unique states as a text bit-string, cast to `bit(8)`
 ///
-/// `state::text AS state_str` is included for drivers that cannot decode the
-/// custom enum directly. SQLx callers can ignore the extra column.
+/// `state::text AS state_str` and `unique_states::text AS unique_states_str`
+/// are included for drivers that cannot decode the custom enum or bitmask
+/// directly. SQLx callers can ignore the extra columns.
 pub(crate) const POSTGRES_INSERT_JOB_SQL: &str = r#"
-    SELECT *, state::text AS state_str
+    SELECT *, state::text AS state_str, unique_states::text AS unique_states_str
     FROM awa.insert_job_compat(
         $1,
         $2,
@@ -178,17 +179,6 @@ impl PreparedJobInsert {
     pub fn ordering_key(&self) -> Option<&[u8]> {
         self.ordering_key.as_deref()
     }
-}
-
-fn map_sqlx_error(err: sqlx::Error) -> AwaError {
-    if let sqlx::Error::Database(ref db_err) = err {
-        if db_err.code().as_deref() == Some("23505") {
-            return AwaError::UniqueConflict {
-                constraint: db_err.constraint().map(|c| c.to_string()),
-            };
-        }
-    }
-    AwaError::Database(err)
 }
 
 fn build_multi_insert_query(count: usize) -> String {
@@ -870,6 +860,7 @@ mod tests {
     #[test]
     fn postgres_adapter_sql_uses_driver_friendly_casts() {
         assert!(POSTGRES_INSERT_JOB_SQL.contains("state::text AS state_str"));
+        assert!(POSTGRES_INSERT_JOB_SQL.contains("unique_states::text AS unique_states_str"));
         assert!(POSTGRES_INSERT_JOB_SQL.contains("$4::text::awa.job_state"));
         assert!(POSTGRES_INSERT_JOB_SQL.contains("$11::text::bit(8)"));
         assert!(POSTGRES_INSERT_JOB_SQL.contains("$12"));

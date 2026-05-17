@@ -36,3 +36,18 @@ impl From<sqlx::Error> for AwaError {
         AwaError::Database(err)
     }
 }
+
+/// Map SQLx database errors into Awa's public error surface.
+///
+/// Keep this helper as the single Rust-side place that turns Postgres unique
+/// violations into [`AwaError::UniqueConflict`].
+pub fn map_sqlx_error(err: sqlx::Error) -> AwaError {
+    if let sqlx::Error::Database(ref db_err) = err {
+        if db_err.code().as_deref() == Some("23505") {
+            return AwaError::UniqueConflict {
+                constraint: db_err.constraint().map(|c| c.to_string()),
+            };
+        }
+    }
+    AwaError::Database(err)
+}

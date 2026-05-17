@@ -15,10 +15,12 @@ pub mod unique;
 // Re-exports for ergonomics
 pub use adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
 pub use admin::{
-    CallbackConfig, DefaultAction, JobKindDescriptor, JobKindOverview, ListJobsFilter,
+    CallbackConfig, CallbackPollResult, CallbackResolutionAction, DefaultAction, JobDump,
+    JobDumpSummary, JobKindDescriptor, JobKindOverview, JobTimelineEvent, ListJobsFilter,
     QueueDescriptor, QueueOverview, QueueRuntimeConfigSnapshot, QueueRuntimeMode,
-    QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome, RuntimeInstance,
-    RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket, StorageCapability,
+    QueueRuntimeSnapshot, QueueRuntimeSummary, RateLimitSnapshot, ResolveOutcome, RunDump,
+    RunDumpSource, RuntimeInstance, RuntimeOverview, RuntimeSnapshotInput, StateTimeseriesBucket,
+    StorageCapability,
 };
 
 /// Deprecated alias preserved for one release so existing downstream code
@@ -29,7 +31,7 @@ pub use admin::{
 pub type QueueStats = QueueOverview;
 pub use cron::{CronJobRow, CronMissedFirePolicy, PeriodicJob, PeriodicJobBuilder};
 pub use dlq::{DlqMetadata, DlqRow, ListDlqFilter, RetryFromDlqOpts};
-pub use error::AwaError;
+pub use error::{map_sqlx_error, AwaError};
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
 pub use queue_storage::{
