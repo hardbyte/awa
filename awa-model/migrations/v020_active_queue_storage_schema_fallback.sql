@@ -13,12 +13,12 @@ DECLARE
     v_schema TEXT;
 BEGIN
     SELECT COALESCE(
+        NULLIF(sts.details->>'schema', ''),
         (
             SELECT rsb.schema_name
             FROM awa.runtime_storage_backends AS rsb
             WHERE rsb.backend = 'queue_storage'
         ),
-        NULLIF(sts.details->>'schema', ''),
         'awa'
     )
     INTO v_schema

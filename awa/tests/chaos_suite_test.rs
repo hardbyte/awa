@@ -249,28 +249,47 @@ async fn kind_state_count(pool: &sqlx::PgPool, queue: &str, kind: &str, state: &
             let sql = format!(
                 r#"
                 SELECT count(*)::bigint
-                FROM {schema}.lease_claims AS claims
-                JOIN {schema}.ready_entries AS ready
-                  ON ready.ready_slot = claims.ready_slot
-                 AND ready.ready_generation = claims.ready_generation
-                 AND ready.queue = claims.queue
-                 AND ready.priority = claims.priority
-                 AND ready.enqueue_shard = claims.enqueue_shard
-                 AND ready.lane_seq = claims.lane_seq
-                 AND ready.job_id = claims.job_id
-                WHERE claims.queue = $1
-                  AND ready.kind = $2
-                  AND NOT EXISTS (
-                    SELECT 1 FROM {schema}.lease_claim_closures AS closures
-                    WHERE closures.claim_slot = claims.claim_slot
-                      AND closures.job_id = claims.job_id
-                      AND closures.run_lease = claims.run_lease
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM {schema}.leases AS lease
-                    WHERE lease.job_id = claims.job_id
-                      AND lease.run_lease = claims.run_lease
-                  )
+                FROM (
+                    SELECT 1
+                    FROM {schema}.leases AS lease
+                    JOIN {schema}.ready_entries AS ready
+                      ON ready.ready_slot = lease.ready_slot
+                     AND ready.ready_generation = lease.ready_generation
+                     AND ready.queue = lease.queue
+                     AND ready.priority = lease.priority
+                     AND ready.enqueue_shard = lease.enqueue_shard
+                     AND ready.lane_seq = lease.lane_seq
+                     AND ready.job_id = lease.job_id
+                    WHERE lease.queue = $1
+                      AND ready.kind = $2
+                      AND lease.state = 'running'
+
+                    UNION ALL
+
+                    SELECT 1
+                    FROM {schema}.lease_claims AS claims
+                    JOIN {schema}.ready_entries AS ready
+                      ON ready.ready_slot = claims.ready_slot
+                     AND ready.ready_generation = claims.ready_generation
+                     AND ready.queue = claims.queue
+                     AND ready.priority = claims.priority
+                     AND ready.enqueue_shard = claims.enqueue_shard
+                     AND ready.lane_seq = claims.lane_seq
+                     AND ready.job_id = claims.job_id
+                    WHERE claims.queue = $1
+                      AND ready.kind = $2
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {schema}.lease_claim_closures AS closures
+                        WHERE closures.claim_slot = claims.claim_slot
+                          AND closures.job_id = claims.job_id
+                          AND closures.run_lease = claims.run_lease
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1 FROM {schema}.leases AS lease
+                        WHERE lease.job_id = claims.job_id
+                          AND lease.run_lease = claims.run_lease
+                      )
+                ) AS running_jobs
                 "#,
             );
             return sqlx::query_scalar(&sql)
