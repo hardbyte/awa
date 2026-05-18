@@ -136,7 +136,7 @@ def pctl_ms(samples: list[float], pct: int) -> float:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# Existing scenarios: copy, hot, scheduled
+# Existing scenarios: queue-storage copy, hot, scheduled
 # ═══════════════════════════════════════════════════════════════════════
 
 
@@ -175,7 +175,10 @@ async def run_copy_benchmark(
             drain_time_s=elapsed,
         ),
         outcomes={"inserted": inserted},
-        metadata={"chunk_size": chunk_size},
+        metadata={
+            "chunk_size": chunk_size,
+            "producer_path": "AsyncClient.enqueue_many_copy",
+        },
     ).emit()
 
 

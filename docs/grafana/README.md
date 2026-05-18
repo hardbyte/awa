@@ -125,6 +125,7 @@ All metrics use the `awa` OTel meter name and are exported via OTLP to your conf
 | `awa.job.claimed` | Counter | queue | Jobs claimed from DB |
 | `awa.job.in_flight` | UpDownCounter | queue | Currently executing |
 | `awa.job.duration` | Histogram (s) | kind, queue | Execution time |
+| `awa.job.wait_duration` | Histogram (s) | kind, queue | Time from creation to claim; explicit buckets include 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, and 1s |
 | `awa.job.waiting_external` | Counter | kind, queue | Parked for callback |
 
 ### Dispatcher

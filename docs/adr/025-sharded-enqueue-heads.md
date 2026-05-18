@@ -296,7 +296,15 @@ the new value.
 
 Operational procedure:
 
-1. `UPDATE awa.queue_meta SET enqueue_shards = <newS> WHERE queue = '<q>';`
+1. Upsert `awa.queue_meta.enqueue_shards` for the queue:
+
+   ```sql
+   INSERT INTO awa.queue_meta (queue, enqueue_shards)
+   VALUES ('<q>', <newS>)
+   ON CONFLICT (queue)
+   DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
+   ```
+
 2. Restart runtime processes (or rely on natural restart cadence)
    so the in-process cache observes the new value.
 3. Optionally watch the per-shard SQL above until `lag` reaches 0

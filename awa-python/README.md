@@ -45,9 +45,9 @@ codebases that aren't async-first.
   receipt ring keep dead-tuple pressure bounded under sustained load.
   See [ADR-019](https://github.com/hardbyte/awa/blob/main/docs/adr/019-queue-storage-redesign.md)
   and [ADR-023](https://github.com/hardbyte/awa/blob/main/docs/adr/023-receipt-plane-ring-partitioning.md).
-- **COPY ingestion** — `insert_many_copy` keeps the compatibility insert
-  surface fast, and `enqueue_many_copy` streams directly into queue storage
-  for high-volume Python producers.
+- **COPY ingestion** — `enqueue_many_copy` streams directly into queue
+  storage for high-volume Python producers. `insert_many_copy` remains the
+  compatibility insert surface for canonical-storage and adapter-style callers.
 - **Crash-safe execution** — heartbeat-based lease tracking; jobs whose
   workers vanish are rescued automatically.
 - **Per-queue policy** — priorities, priority aging, weighted concurrency,

@@ -16,7 +16,8 @@ against the admin API.
 - **Job model** — `JobRow`, `JobState`, `InsertOpts`, `UniqueOpts`,
   `InsertParams`.
 - **Insertion** — `insert`, `insert_with`, `insert_many`,
-  `insert_many_copy` (COPY-batched for large fan-outs).
+  `insert_many_copy` for the compatibility insert surface, and
+  `enqueue_many_copy` for direct queue-storage COPY ingestion.
 - **Migrations** — `migrations::run` applies the schema; `migrations`,
   `migrations_range`, and `current_migration_version` expose the
   catalog for tooling.
@@ -31,9 +32,7 @@ against the admin API.
 - **Cron** (`cron`) — `PeriodicJob`, `PeriodicJobBuilder`, `CronJobRow`.
 - **Queue storage** (`queue_storage`) — `QueueStorage`,
   `QueueStorageConfig`, `ClaimedRuntimeJob`, `RotateOutcome`,
-  `PruneOutcome`. The vacuum-aware engine introduced in 0.6, including
-  `QueueStorage::enqueue_params_copy` for direct COPY ingestion into
-  `ready_entries` / `deferred_jobs`.
+  `PruneOutcome`. The vacuum-aware engine introduced in 0.6.
 - **Storage status** (`storage`) — `StorageStatus` and the
   transition-state primitives the `awa storage` CLI surfaces.
 - **Adapter API** (`adapter`) — stable Postgres insert preparation and SQL

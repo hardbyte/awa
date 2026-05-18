@@ -428,12 +428,13 @@ where
     Ok(results)
 }
 
-/// Insert many jobs using COPY for high throughput.
+/// Insert many jobs through the compatibility COPY surface.
 ///
 /// Uses a temp staging table with no constraints for fast COPY ingestion,
-/// then INSERT...SELECT into `awa.jobs` with ON CONFLICT DO NOTHING for
-/// unique jobs. Accepts `&mut PgConnection` so callers can use pool
-/// connections or transactions (Transaction derefs to PgConnection).
+/// then routes staged rows through `awa.insert_job_compat`. Accepts
+/// `&mut PgConnection` so callers can use pool connections or transactions
+/// (Transaction derefs to PgConnection). For high-volume queue-storage
+/// producers, prefer [`crate::enqueue_many_copy`].
 #[tracing::instrument(skip(conn, jobs), fields(job.count = jobs.len()))]
 pub async fn insert_many_copy(
     conn: &mut PgConnection,

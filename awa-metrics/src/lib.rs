@@ -72,6 +72,10 @@ pub mod names {
     pub const RING_GENERATION: &str = "awa.ring.generation";
 }
 
+const WAIT_DURATION_BUCKETS_SECONDS: [f64; 14] = [
+    0.001, 0.005, 0.010, 0.025, 0.050, 0.100, 0.250, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
 /// Awa worker metrics backed by OpenTelemetry.
 #[derive(Clone)]
 pub struct AwaMetrics {
@@ -342,6 +346,7 @@ impl AwaMetrics {
                 .f64_histogram(names::JOB_WAIT_DURATION)
                 .with_description("Time from job creation to claim")
                 .with_unit("s")
+                .with_boundaries(WAIT_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             dlq_moved: meter
                 .u64_counter(names::JOB_DLQ_MOVED)

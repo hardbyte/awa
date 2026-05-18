@@ -116,6 +116,22 @@ pub struct QueueClaimerLease {
     pub lease_epoch: i64,
 }
 
+/// Enqueue many jobs into the active queue-storage backend using direct COPY.
+///
+/// This is the Rust producer fast path for high-volume queue-storage
+/// deployments. It resolves the active queue-storage schema from the
+/// transition state, then streams rows directly into `ready_entries` /
+/// `deferred_jobs` via [`QueueStorage::enqueue_params_copy`]. Use
+/// [`crate::insert_many_copy`] only when you specifically need the
+/// compatibility insert surface.
+pub async fn enqueue_many_copy(pool: &PgPool, jobs: &[InsertParams]) -> Result<usize, AwaError> {
+    let schema = QueueStorage::active_schema(pool).await?.ok_or_else(|| {
+        AwaError::Validation("enqueue_many_copy requires an active queue_storage backend".into())
+    })?;
+    let store = QueueStorage::from_existing_schema(schema)?;
+    store.enqueue_params_copy(pool, jobs).await
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, sqlx::FromRow)]
 struct QueueClaimerLeaseRow {
     claimer_slot: i16,

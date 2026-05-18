@@ -116,7 +116,7 @@ class AsyncClient:
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
     ) -> list[Job]:
-        """Bulk insert jobs using COPY for high throughput."""
+        """Bulk insert jobs through the compatibility COPY surface."""
         return await self._raw.insert_many_copy(
             jobs,
             kind=kind,
@@ -800,7 +800,7 @@ class Client:
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
     ) -> list[Job]:
-        """Bulk insert jobs using COPY for high throughput."""
+        """Bulk insert jobs through the compatibility COPY surface."""
         return self._raw.insert_many_copy_sync(
             jobs,
             kind=kind,

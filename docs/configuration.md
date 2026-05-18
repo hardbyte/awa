@@ -442,6 +442,18 @@ the defaults. Queue-storage tables live in the canonical `awa` schema; the
 main knobs are there for large fleets, very bursty queues, or operators who
 want to trade off the partition-reclaim window against rotation churn.
 
+### Producer path choice
+
+For bulk producers on queue storage, prefer direct queue-storage COPY:
+Python `enqueue_many_copy()` or Rust `awa::enqueue_many_copy()`. Those paths
+stream rows straight into `ready_entries` / `deferred_jobs` and use the
+queue-storage enqueue heads directly.
+
+`insert_many_copy()` is the compatibility insert API. It is still useful when a
+caller needs the canonical insert surface, but in queue-storage mode it routes
+through the compatibility function rather than being the primary producer fast
+path.
+
 ### Rust
 
 ```rust
@@ -515,8 +527,15 @@ Raising `enqueue_shards` is a **semantic mode switch**, not a hidden performance
 
 ```sql
 -- Opt a contended queue into 4 shards.
-UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
+INSERT INTO awa.queue_meta (queue, enqueue_shards)
+VALUES ('my_hot_queue', 4)
+ON CONFLICT (queue)
+DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 ```
+
+Use an upsert rather than a plain `UPDATE`: the first enqueue can create
+queue-storage lane rows before an operator-owned `queue_meta` row exists, so a
+plain `UPDATE` may quietly affect zero rows.
 
 A 16-producer same-queue reference sweep measured 1.0× / 1.60× / 2.75× /
 3.69× at S=1/2/4/8. Application authors who need per-key FIFO at S>1

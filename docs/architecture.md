@@ -149,7 +149,7 @@ sequenceDiagram
     participant R as Ring state
     participant E as Executor
 
-    P->>Q: insert / enqueue_many_copy inside app transaction
+    P->>Q: single insert or direct COPY enqueue inside app transaction
     Q->>Q: append ready_entries or deferred_jobs
     Q-->>D: NOTIFY awa:<queue>
     D->>D: pre-acquire local permits
