@@ -15,8 +15,8 @@ pub use awa_model::{
     insert_many_copy_from_pool, insert_with, migrations, prepare_job_insert,
     prepare_raw_job_insert, storage, AwaError, CallbackConfig, DefaultAction, DlqMetadata, DlqRow,
     InsertOpts, InsertParams, JobArgs, JobKindDescriptor, JobRow, JobState, ListDlqFilter,
-    PreparedJobInsert, QueueDescriptor, ResolveOutcome, RetryFromDlqOpts, StorageCapability,
-    StorageStatus, UniqueOpts,
+    PreparedJobInsert, QueueDescriptor, QueueStorage, QueueStorageConfig, ResolveOutcome,
+    RetryFromDlqOpts, StorageCapability, StorageStatus, UniqueOpts,
 };
 
 // Re-export worker runtime

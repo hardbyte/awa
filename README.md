@@ -80,6 +80,15 @@ Queue-storage soak reference, 5k-job runtime run: **9.5k jobs/s**, **22 ms p95
 pickup**, **417 exact final dead tuples**. Enqueue reference: ~30k/s
 single-producer, ~100k/s multi-producer.
 
+For high-volume queue-storage producers, use the direct queue-storage COPY
+path: Python `enqueue_many_copy()` or Rust
+`QueueStorage::enqueue_params_copy()`. Configure direct-copy producers with the
+same queue-storage routing knobs as the worker fleet, especially
+`queue_stripe_count` / `queue_storage_queue_stripe_count`. The older
+`insert_many_copy()` API is the compatibility insert surface; it remains useful
+for canonical-storage compatibility and adapters, but it is not the
+queue-storage producer fast path.
+
 A phase-driven portable benchmark harness comparing Awa against pgque,
 procrastinate, pg-boss, river, oban, and pgmq on a shared Postgres
 instance lives in its own repository:

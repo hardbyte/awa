@@ -104,13 +104,17 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-If you use the high-throughput `insert_many_copy` path (Rust `InsertOpts::copy()`), also grant:
+If you use the compatibility `insert_many_copy` path (Rust
+`InsertOpts::copy()`), also grant:
 
 ```sql
 GRANT TEMP ON DATABASE mydb TO awa_runtime;
 ```
 
 This allows creating temporary staging tables for the `COPY` bulk insert path.
+Queue-storage direct COPY (`QueueStorage::enqueue_params_copy` in Rust,
+`enqueue_many_copy` in Python) writes to the queue-storage tables directly and
+does not need this temporary-table grant.
 
 ### Custom queue-storage schema
 

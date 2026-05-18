@@ -78,7 +78,7 @@ physical transition surfaces:
 
 | Surface | Role | Consumer contract |
 |---|---|---|
-| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. | Public compatibility surface. Prefer the Rust/Python/adapter APIs for writes; do not depend on physical queue-storage tables for enqueue. |
+| `awa.jobs` / `awa.insert_job_compat()` | Canonical compatibility surface used during the storage transition and by SQL adapters that need the public job shape. When queue storage is active, the runtime does not claim or complete from `awa.jobs`; compatibility inserts route into the active backend. | Public compatibility surface. Prefer Rust/Python/adapter APIs for ordinary writes. For high-volume queue-storage producers, prefer configured direct COPY through `QueueStorage::enqueue_params_copy()` or Python `enqueue_many_copy()` rather than the compat COPY path. |
 | `{schema}.terminal_jobs` | Read-only hydrated view over queue-storage terminal history. It joins narrow `done_entries_*` rows back to retained `ready_entries_*` bodies. | Public read surface for SQL inspection and reporting of terminal queue-storage rows. It is not a write or transition surface. |
 | `ready_entries_*` | Physical runnable queue ring. | Internal storage. Read only for low-level debugging; writes must go through Awa enqueue, claim, retry, cancel, or maintenance paths. |
 | `done_entries_*` | Physical terminal fact ring. Ready-backed terminal rows can intentionally omit duplicated body columns. | Internal storage. Direct readers must tolerate nullable duplicated body fields; use `{schema}.terminal_jobs` for hydrated terminal rows. |
@@ -86,7 +86,7 @@ physical transition surfaces:
 | `dlq_entries` | Durable operator hold table for DLQ-enabled terminal failures. | Operator surface through CLI/UI/API; direct SQL inspection is reasonable, direct mutation is not. |
 | `lease_claims_*` / `lease_claim_closures_*` | Receipt-plane execution history for short attempts. | Internal storage. Live receipt attempts are claims without matching closures. |
 | `leases_*` / `attempt_state` | Materialized execution state for heartbeat, callbacks, progress, and other mutable attempt data. | Internal storage. Runtime and rescue paths own mutations. |
-| `queue_lanes`, queue heads, ring-state tables, `queue_meta` | Claim cursors, enqueue heads, rotation/prune state, and queue storage configuration. | Internal control surface except documented configuration fields such as `queue_meta.enqueue_shards`. |
+| `queue_lanes`, queue heads, ring-state tables, `queue_meta` | Claim cursors, enqueue heads, rotation/prune state, and queue storage configuration. | Internal control surface except documented configuration fields such as `queue_meta.enqueue_shards`. If no `queue_meta` row exists for a queue, enqueue defaults to one shard; operators should configure shard counts with an UPSERT before load tests or production traffic. |
 | descriptors, runtime snapshots, cron tables | Operator metadata and scheduler declarations. | Public through Awa APIs and UI; SQL reads are acceptable for reporting. Writes should go through the corresponding Awa APIs. |
 
 ADR-019 is the storage-engine source of truth; ADR-023 supersedes it for the
@@ -149,7 +149,7 @@ sequenceDiagram
     participant R as Ring state
     participant E as Executor
 
-    P->>Q: insert / enqueue_many_copy inside app transaction
+    P->>Q: single insert or direct COPY enqueue inside app transaction
     Q->>Q: append ready_entries or deferred_jobs
     Q-->>D: NOTIFY awa:<queue>
     D->>D: pre-acquire local permits
@@ -163,14 +163,30 @@ sequenceDiagram
 
 Enqueue is transactional: if the producer's outer transaction rolls back, the
 job never becomes visible. Immediate jobs append to `ready_entries_*`; future
-scheduled or retryable jobs append to `deferred_jobs`; COPY ingestion uses the
-same storage actions with larger batches.
+scheduled or retryable jobs append to `deferred_jobs`.
+
+There are two COPY-shaped producer paths:
+
+- Direct queue-storage COPY is the high-throughput path: Rust producers use a
+  configured `QueueStorage::enqueue_params_copy()`, and Python producers use
+  `enqueue_many_copy()`. Direct-copy producers must use the same queue-storage
+  configuration as the worker fleet, especially `queue_stripe_count` /
+  `queue_storage_queue_stripe_count`.
+- `insert_many_copy()` is the compatibility path. It stages rows with COPY but
+  then routes each row through `awa.insert_job_compat()`, so it preserves the
+  public compatibility surface rather than bypassing to the direct producer
+  path.
 
 Claim is cursor-based rather than heap-scan based:
 
-- `queue_enqueue_heads` allocates lane sequence ranges at enqueue time.
+- `queue_meta.enqueue_shards` controls how many independent enqueue/claim head
+  rows a queue has. The default is one shard. Raising it changes the ordering
+  contract to FIFO within `(queue, priority, enqueue_shard)`, with no global
+  ordering promise across shards.
+- `queue_enqueue_heads` allocates lane sequence ranges at enqueue time per
+  `(physical queue, priority, enqueue_shard)`.
 - `queue_claim_heads` advances monotonically during claim and is the authority
-  for the next claimable lane position.
+  for the next claimable lane position on the same shard-qualified lane.
 - The dispatcher pre-acquires execution permits before claiming, so every
   claimed `running` job has reserved local capacity.
 - Queue striping and bounded claimers reduce contention on very hot logical
@@ -179,9 +195,13 @@ Claim is cursor-based rather than heap-scan based:
   they do not own jobs. Recovery still follows the receipt/lease state in
   Postgres.
 
-Priority ordering is by `(queue, priority, lane_seq)`. With queue storage,
-priority aging is applied at claim time rather than by physically rewriting
-ready rows.
+Priority ordering is by effective priority first. Within one enqueue shard the
+lane sequence is FIFO; across enqueue shards, strict global lane order is not
+promised. With queue storage, priority aging is applied at claim time rather
+than by physically rewriting ready rows. The ready/done/lease partitions carry
+shard-aware lane indexes on `(queue, priority, enqueue_shard, lane_seq)` so
+deep backlog claim probes do not scan a non-shard-selective lane index and
+post-filter most rows.
 
 ## Completion And Callbacks
 

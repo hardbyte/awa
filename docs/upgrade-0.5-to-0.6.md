@@ -190,10 +190,13 @@ When the migration runs:
 
 ### Raising `enqueue_shards`
 
-Opt a contended queue into multiple shards with a single UPDATE on `awa.queue_meta`:
+Opt a contended queue into multiple shards by upserting `awa.queue_meta`:
 
 ```sql
-UPDATE awa.queue_meta SET enqueue_shards = 4 WHERE queue = 'my_hot_queue';
+INSERT INTO awa.queue_meta (queue, enqueue_shards)
+VALUES ('my_hot_queue', 4)
+ON CONFLICT (queue)
+DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
 ```
 
 The producer-side rotor picks up the new shard count on the next enqueue. Existing in-flight rows on shard 0 continue to be claimed and drained; new no-key batches spread across shards 0..S-1 over time.
@@ -229,7 +232,10 @@ The only operator-visible caveat is the per-runtime `enqueue_shards_cache`: a ru
 1. Lower the value:
 
    ```sql
-   UPDATE awa.queue_meta SET enqueue_shards = 2 WHERE queue = 'my_hot_queue';
+   INSERT INTO awa.queue_meta (queue, enqueue_shards)
+   VALUES ('my_hot_queue', 2)
+   ON CONFLICT (queue)
+   DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
    ```
 
 2. Restart worker processes (or rely on the next deploy) so the in-process cache observes the new value.

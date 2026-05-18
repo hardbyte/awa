@@ -2111,7 +2111,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, queue_storage_queue_stripe_count=1))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_many_copy<'py>(
         &self,
@@ -2126,7 +2126,14 @@ impl PyClient {
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
         ordering_key: Option<Py<PyAny>>,
+        queue_storage_queue_stripe_count: u32,
     ) -> PyResult<Bound<'py, PyAny>> {
+        if queue_storage_queue_stripe_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_queue_stripe_count must be > 0",
+            ));
+        }
+
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
             py,
@@ -2151,7 +2158,12 @@ impl PyClient {
                         "enqueue_many_copy requires an active queue_storage backend".into(),
                     ))
                 })?;
-            let store = QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
+            let store = QueueStorage::new(QueueStorageConfig {
+                schema,
+                queue_stripe_count: queue_storage_queue_stripe_count as usize,
+                ..Default::default()
+            })
+            .map_err(map_awa_error)?;
             let count = store
                 .enqueue_params_copy(&pool, &insert_params)
                 .await
@@ -2160,7 +2172,7 @@ impl PyClient {
         })
     }
 
-    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None))]
+    #[pyo3(signature = (jobs, *, kind=None, queue="default".to_string(), priority=2, max_attempts=25, tags=vec![], metadata=None, run_at=None, unique_opts=None, ordering_key=None, queue_storage_queue_stripe_count=1))]
     #[allow(clippy::too_many_arguments)]
     fn enqueue_many_copy_sync(
         &self,
@@ -2175,7 +2187,14 @@ impl PyClient {
         run_at: Option<Py<PyAny>>,
         unique_opts: Option<Py<PyAny>>,
         ordering_key: Option<Py<PyAny>>,
+        queue_storage_queue_stripe_count: u32,
     ) -> PyResult<usize> {
+        if queue_storage_queue_stripe_count == 0 {
+            return Err(pyo3::exceptions::PyValueError::new_err(
+                "queue_storage_queue_stripe_count must be > 0",
+            ));
+        }
+
         let pool = self.pool.clone();
         let insert_params = prepare_insert_many_params(
             py,
@@ -2201,7 +2220,12 @@ impl PyClient {
                             "enqueue_many_copy requires an active queue_storage backend".into(),
                         ))
                     })?;
-                let store = QueueStorage::from_existing_schema(schema).map_err(map_awa_error)?;
+                let store = QueueStorage::new(QueueStorageConfig {
+                    schema,
+                    queue_stripe_count: queue_storage_queue_stripe_count as usize,
+                    ..Default::default()
+                })
+                .map_err(map_awa_error)?;
                 store
                     .enqueue_params_copy(&pool, &insert_params)
                     .await

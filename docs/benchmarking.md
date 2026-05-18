@@ -310,7 +310,7 @@ reusing the same database-facing benchmark shapes as the Rust runtime:
 
 **Baseline scenarios** (`--scenario baseline`):
 
-- `copy`: Python client `insert_many_copy` throughput
+- `copy`: Python client `enqueue_many_copy` direct queue-storage COPY throughput
 - `hot`: sustained worker throughput over pre-seeded `awa.jobs_hot`
 - `scheduled`: sustained deferred promotion over pre-seeded `awa.scheduled_jobs`
 
@@ -376,13 +376,41 @@ more than offset the metrics instrumentation cost.
 Measured with `awa-python/scripts/benchmark_runtime.py` on the developer
 laptop reference database:
 
-- `insert_many_copy`: about `16.2k jobs/s` (`50,000` jobs in `3.09s`)
+- `enqueue_many_copy`: about `16.2k jobs/s` (`50,000` jobs in `3.09s`)
 - sustained hot path:
   - handler returns: about `3.2k jobs/s`
   - DB `completed` transitions: about `3.1k jobs/s`
 
-These runs isolate the Python worker path. Seed data is inserted with SQL so
-the runtime number is not dominated by Python-side enqueue serialization.
+The `copy` scenario measures producer serialization and direct queue-storage
+COPY. The worker-focused scenarios seed with SQL so the runtime number is not
+dominated by Python-side enqueue serialization.
+
+### Deep Backlog Drain
+
+`test_queue_storage_deep_backlog_drain_benchmark` is an ignored regression
+benchmark for the spike shape where a large ready backlog drains more slowly
+than the same fleet processes steady offered load. It seeds with direct
+queue-storage COPY, optionally analyzes `ready_entries`, then measures
+claim/complete throughput and claim latency while draining a fixed backlog.
+
+```bash
+DATABASE_URL_QUEUE_STORAGE=postgres://postgres:test@localhost:15432/awa_test_queue_storage \
+AWA_QS_DEEP_BACKLOG_JOBS=1000000 \
+AWA_QS_DEEP_BACKLOG_SECONDS=120 \
+AWA_QS_DEEP_BACKLOG_CONSUMERS=16 \
+AWA_QS_DEEP_BACKLOG_SHARDS=16 \
+cargo test --package awa --test queue_storage_benchmark_test \
+  test_queue_storage_deep_backlog_drain_benchmark -- --exact --ignored --nocapture
+```
+
+Useful knobs:
+
+- `AWA_QS_DEEP_BACKLOG_JOBS` — ready rows to seed (default `100000`)
+- `AWA_QS_DEEP_BACKLOG_COPY_BATCH` — direct COPY chunk size (default `1000`)
+- `AWA_QS_DEEP_BACKLOG_CONSUMERS` — concurrent claim/complete loops (default `8`)
+- `AWA_QS_DEEP_BACKLOG_CLAIM_BATCH_SIZE` — claim batch size (default `512`)
+- `AWA_QS_DEEP_BACKLOG_SHARDS` — `awa.queue_meta.enqueue_shards` upserted before seeding (default `16`)
+- `AWA_QS_DEEP_BACKLOG_ANALYZE` — run `ANALYZE` after seeding (default `1`)
 
 ### Large Deferred Frontier
 

@@ -9,7 +9,8 @@
 mod bench_output;
 
 use awa::model::{
-    migrations, AwaError, PruneOutcome, QueueStorage, QueueStorageConfig, RotateOutcome,
+    migrations, AwaError, InsertOpts, InsertParams, PruneOutcome, QueueStorage, QueueStorageConfig,
+    RotateOutcome,
 };
 use bench_output::{BenchLatency, BenchMetrics, BenchThroughput, BenchmarkResult, SCHEMA_VERSION};
 use serde::Serialize;
@@ -356,6 +357,59 @@ async fn sample_snapshot(
         leases_dead_tup,
         attempt_state_dead_tup,
     }
+}
+
+async fn upsert_enqueue_shards(pool: &sqlx::PgPool, queue: &str, enqueue_shards: i16) {
+    sqlx::query(
+        r#"
+        INSERT INTO awa.queue_meta (queue, enqueue_shards)
+        VALUES ($1, $2)
+        ON CONFLICT (queue)
+        DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards
+        "#,
+    )
+    .bind(queue)
+    .bind(enqueue_shards)
+    .execute(pool)
+    .await
+    .expect("Failed to configure queue_meta.enqueue_shards");
+}
+
+fn deep_backlog_job(queue: &str, priority: i16, seq: u64) -> InsertParams {
+    InsertParams {
+        kind: "deep_backlog_job".to_string(),
+        args: serde_json::json!({ "seq": seq }),
+        opts: InsertOpts {
+            queue: queue.to_string(),
+            priority,
+            ..Default::default()
+        },
+    }
+}
+
+async fn seed_deep_backlog_copy(
+    pool: &sqlx::PgPool,
+    store: &QueueStorage,
+    queue: &str,
+    priority: i16,
+    total_jobs: u64,
+    chunk_size: usize,
+) -> u64 {
+    let mut inserted = 0_u64;
+    let chunk_size = chunk_size.max(1);
+
+    for chunk_start in (0..total_jobs).step_by(chunk_size) {
+        let chunk_end = (chunk_start + chunk_size as u64).min(total_jobs);
+        let jobs: Vec<_> = (chunk_start..chunk_end)
+            .map(|seq| deep_backlog_job(queue, priority, seq))
+            .collect();
+        inserted += store
+            .enqueue_params_copy(pool, &jobs)
+            .await
+            .expect("Deep-backlog direct COPY seed failed") as u64;
+    }
+
+    inserted
 }
 
 fn percentile(values: &[f64], percentile: f64) -> Option<f64> {
@@ -1121,6 +1175,263 @@ async fn test_queue_storage_storage_benchmark() {
             }),
             enqueue_per_s: Some(producer_rate as f64),
             drain_time_s: Some(elapsed.as_secs_f64()),
+            latency_ms: Some(BenchLatency { p50, p95, p99 }),
+            rescue: None,
+        },
+        outcomes,
+        metadata: Some(metadata),
+    }
+    .emit();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore]
+async fn test_queue_storage_deep_backlog_drain_benchmark() {
+    let total_jobs = env_u64("AWA_QS_DEEP_BACKLOG_JOBS", 100_000);
+    let duration_secs = env_u64("AWA_QS_DEEP_BACKLOG_SECONDS", 60);
+    let copy_chunk_size = env_u64("AWA_QS_DEEP_BACKLOG_COPY_BATCH", 1_000) as usize;
+    let consumers = env_u32("AWA_QS_DEEP_BACKLOG_CONSUMERS", 8);
+    let claim_batch_size = env_u64("AWA_QS_DEEP_BACKLOG_CLAIM_BATCH_SIZE", 512) as i64;
+    let enqueue_shards = env_u32("AWA_QS_DEEP_BACKLOG_SHARDS", 16);
+    let queue_slot_count = env_u32("AWA_QS_DEEP_BACKLOG_QUEUE_SLOT_COUNT", 16);
+    let lease_slot_count = env_u32("AWA_QS_DEEP_BACKLOG_LEASE_SLOT_COUNT", 8);
+    let schema = env_string("AWA_QS_DEEP_BACKLOG_SCHEMA", "awa_qs_deep_backlog");
+    let queue = env_string("AWA_QS_DEEP_BACKLOG_QUEUE", "qs_deep_backlog");
+    let priority = env_u32("AWA_QS_DEEP_BACKLOG_PRIORITY", 2) as i16;
+    let analyze_ready = env_u32("AWA_QS_DEEP_BACKLOG_ANALYZE", 1) != 0;
+    let max_conns = env_u32("AWA_QS_DEEP_BACKLOG_POOL", consumers + 8);
+
+    assert!(total_jobs > 0, "AWA_QS_DEEP_BACKLOG_JOBS must be > 0");
+    assert!(duration_secs > 0, "AWA_QS_DEEP_BACKLOG_SECONDS must be > 0");
+    assert!(consumers > 0, "AWA_QS_DEEP_BACKLOG_CONSUMERS must be > 0");
+    assert!(
+        claim_batch_size > 0,
+        "AWA_QS_DEEP_BACKLOG_CLAIM_BATCH_SIZE must be > 0"
+    );
+    assert!(
+        (1..=64).contains(&enqueue_shards),
+        "AWA_QS_DEEP_BACKLOG_SHARDS must be between 1 and 64"
+    );
+    let enqueue_shards = enqueue_shards as i16;
+
+    let pool = pool_with(max_conns).await;
+    ensure_pgstattuple(&pool).await;
+    let store = Arc::new(
+        QueueStorage::new(QueueStorageConfig {
+            schema,
+            queue_slot_count: queue_slot_count as usize,
+            lease_slot_count: lease_slot_count as usize,
+            // This benchmark measures the ready-claim path under depth
+            // using `claim_batch` -> `complete_batch` directly. Keep the
+            // legacy lease-row completion path so completion bookkeeping
+            // does not short-circuit the harness.
+            lease_claim_receipts: false,
+            ..Default::default()
+        })
+        .expect("Failed to construct deep-backlog queue storage store"),
+    );
+
+    recreate_store_schema(&pool, &store).await;
+    store
+        .install(&pool)
+        .await
+        .expect("Failed to install deep-backlog queue storage store");
+    store
+        .reset(&pool)
+        .await
+        .expect("Failed to reset deep-backlog queue storage store");
+    upsert_enqueue_shards(&pool, &queue, enqueue_shards).await;
+
+    let seed_started = Instant::now();
+    let inserted =
+        seed_deep_backlog_copy(&pool, &store, &queue, priority, total_jobs, copy_chunk_size).await;
+    let seed_elapsed = seed_started.elapsed();
+    let seed_rate = inserted as f64 / seed_elapsed.as_secs_f64().max(0.001);
+
+    if analyze_ready {
+        sqlx::query(&format!("ANALYZE {}.ready_entries", store.schema()))
+            .execute(&pool)
+            .await
+            .expect("Failed to analyze ready_entries after deep-backlog seed");
+    }
+
+    println!(
+        "[queue storage deep backlog] seeded={} copy_batch={} enqueue_shards={} seed_elapsed={:.3}s seed_rate={:.0}/s analyze_ready={}",
+        inserted,
+        copy_chunk_size,
+        enqueue_shards,
+        seed_elapsed.as_secs_f64(),
+        seed_rate,
+        analyze_ready,
+    );
+
+    let initial = sample_snapshot(&pool, &store, &queue).await;
+    let db_profile_start = capture_db_profile(&pool).await;
+    let completed = Arc::new(AtomicU64::new(0));
+    let claim_latencies_ms = Arc::new(Mutex::new(Vec::new()));
+    let (consumer_tx, consumer_rx) = tokio::sync::watch::channel(false);
+    let mut consumer_handles = Vec::new();
+
+    for _ in 0..consumers {
+        consumer_handles.push(tokio::spawn(consumer_loop(
+            pool.clone(),
+            store.clone(),
+            queue.clone(),
+            claim_batch_size,
+            claim_latencies_ms.clone(),
+            completed.clone(),
+            consumer_rx.clone(),
+        )));
+    }
+
+    let drain_started = Instant::now();
+    let mut samples = Vec::with_capacity(duration_secs as usize);
+    let mut previous_completed = 0_u64;
+    for second in 1..=duration_secs {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let snapshot = sample_snapshot(&pool, &store, &queue).await;
+        let completed_total = completed.load(Ordering::Relaxed);
+        let completed_delta = completed_total.saturating_sub(previous_completed);
+        previous_completed = completed_total;
+
+        let sample = QueueStorageSample {
+            second,
+            seeded_total: inserted,
+            completed_total,
+            completed_delta,
+            available: snapshot.available,
+            running: snapshot.running,
+            completed: snapshot.completed,
+            queue_lanes_dead_tup: snapshot.queue_lanes_dead_tup,
+            ready_dead_tup: snapshot.ready_dead_tup,
+            done_dead_tup: snapshot.done_dead_tup,
+            leases_dead_tup: snapshot.leases_dead_tup,
+            attempt_state_dead_tup: snapshot.attempt_state_dead_tup,
+            queue_prune_ok: 0,
+            queue_prune_blocked: 0,
+            queue_prune_skipped_active: 0,
+            lease_prune_ok: 0,
+            lease_prune_blocked: 0,
+            lease_prune_skipped_active: 0,
+        };
+
+        println!(
+            "[queue storage deep backlog] second={:>3} completed={} (+{}) available={} running={} claim_samples={}",
+            sample.second,
+            sample.completed_total,
+            sample.completed_delta,
+            sample.available,
+            sample.running,
+            claim_latencies_ms
+                .lock()
+                .expect("claim latency lock poisoned")
+                .len(),
+        );
+
+        samples.push(sample);
+        if completed_total >= inserted {
+            break;
+        }
+    }
+
+    let _ = consumer_tx.send(true);
+    for handle in consumer_handles {
+        handle.await.expect("Deep-backlog consumer task failed");
+    }
+
+    let drain_elapsed = drain_started.elapsed();
+    let final_snapshot = sample_snapshot(&pool, &store, &queue).await;
+    let final_exact_dead = sample_exact_dead_tuples(&pool, &store).await;
+    let completed_total = completed.load(Ordering::Relaxed);
+    let observed_completed_per_s = average_completed_rate(&samples);
+    let elapsed_completed_per_s = completed_total as f64 / drain_elapsed.as_secs_f64().max(0.001);
+    let claim_latencies = claim_latencies_ms
+        .lock()
+        .expect("claim latency lock poisoned")
+        .clone();
+    let p50 = percentile(&claim_latencies, 0.50);
+    let p95 = percentile(&claim_latencies, 0.95);
+    let p99 = percentile(&claim_latencies, 0.99);
+
+    println!(
+        "[queue storage deep backlog] completed={} observed_rate={:.0}/s elapsed_rate={:.0}/s final_available={} final_running={} claim_latency_ms p50={:.3} p95={:.3} p99={:.3}",
+        completed_total,
+        observed_completed_per_s,
+        elapsed_completed_per_s,
+        final_snapshot.available,
+        final_snapshot.running,
+        p50.unwrap_or(0.0),
+        p95.unwrap_or(0.0),
+        p99.unwrap_or(0.0),
+    );
+    if let Some(exact) = final_exact_dead {
+        println!(
+            "[queue storage deep backlog] exact_dead_tuples queue_lanes={} ready={} done={} leases={} attempt_state={} total={}",
+            exact.queue_lanes,
+            exact.ready,
+            exact.done,
+            exact.leases,
+            exact.attempt_state,
+            exact.queue_lanes + exact.ready + exact.done + exact.leases + exact.attempt_state,
+        );
+    }
+
+    let mut outcomes = HashMap::new();
+    outcomes.insert("completed".to_string(), completed_total);
+    outcomes.insert("available".to_string(), final_snapshot.available as u64);
+    outcomes.insert("running".to_string(), final_snapshot.running as u64);
+
+    let mut metadata = serde_json::json!({
+        "profile": "queue_storage_deep_backlog_drain",
+        "queue": queue,
+        "priority": priority,
+        "queue_slot_count": store.queue_slot_count(),
+        "lease_slot_count": store.lease_slot_count(),
+        "claim_slot_count": store.claim_slot_count(),
+        "lease_claim_receipts": false,
+        "copy_chunk_size": copy_chunk_size,
+        "seed_elapsed_s": seed_elapsed.as_secs_f64(),
+        "seed_enqueue_per_s": seed_rate,
+        "consumers": consumers,
+        "claim_batch_size": claim_batch_size,
+        "enqueue_shards": enqueue_shards,
+        "duration_secs": duration_secs,
+        "observed_completed_per_s": observed_completed_per_s,
+        "elapsed_completed_per_s": elapsed_completed_per_s,
+        "initial_available": initial.available,
+        "initial_running": initial.running,
+        "initial_completed": initial.completed,
+        "final_available": final_snapshot.available,
+        "final_running": final_snapshot.running,
+        "final_completed": final_snapshot.completed,
+        "final_ready_dead_tup": final_snapshot.ready_dead_tup,
+        "final_done_dead_tup": final_snapshot.done_dead_tup,
+        "final_leases_dead_tup": final_snapshot.leases_dead_tup,
+        "exact_final_dead_tuples": final_exact_dead,
+        "samples": samples,
+    });
+    if let Some(start) = db_profile_start.as_ref() {
+        if let Some(db_profile) = capture_db_profile_delta(&pool, start).await {
+            metadata
+                .as_object_mut()
+                .expect("benchmark metadata should be an object")
+                .insert("db_profile".to_string(), db_profile);
+        }
+    }
+
+    BenchmarkResult {
+        schema_version: SCHEMA_VERSION,
+        scenario: "queue_storage_deep_backlog_drain".to_string(),
+        language: "rust".to_string(),
+        seeded: inserted,
+        metrics: BenchMetrics {
+            throughput: Some(BenchThroughput {
+                handler_per_s: observed_completed_per_s,
+                db_finalized_per_s: observed_completed_per_s,
+            }),
+            enqueue_per_s: Some(seed_rate),
+            drain_time_s: Some(drain_elapsed.as_secs_f64()),
             latency_ms: Some(BenchLatency { p50, p95, p99 }),
             rescue: None,
         },
