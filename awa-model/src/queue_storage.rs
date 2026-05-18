@@ -3295,10 +3295,17 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
+                // Includes enqueue_shard so `claim_ready_runtime`'s WHERE
+                // (queue, priority, enqueue_shard, lane_seq >= claim_seq)
+                // hits the index directly under enqueue_shards > 1. The
+                // narrow (queue, priority, lane_seq) shape that predated
+                // v017 caused the planner to post-filter shard and discard
+                // (shards-1)/shards of rows per partition per claim probe
+                // (see v021 migration for measurements).
                 sqlx::query(&format!(
                     r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_ready_{slot}_lane
-                    ON {} (queue, priority, lane_seq)
+                CREATE INDEX IF NOT EXISTS idx_{schema}_ready_{slot}_lane_shard
+                    ON {} (queue, priority, enqueue_shard, lane_seq)
                 "#,
                     ready_child_name(schema, slot)
                 ))
@@ -3328,10 +3335,12 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
+                // Mirror of the ready_entries shard-aware lane index;
+                // see the comment there for the rationale.
                 sqlx::query(&format!(
                     r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_done_{slot}_lane
-                    ON {} (queue, priority, lane_seq)
+                CREATE INDEX IF NOT EXISTS idx_{schema}_done_{slot}_lane_shard
+                    ON {} (queue, priority, enqueue_shard, lane_seq)
                 "#,
                     done_child_name(schema, slot)
                 ))
@@ -3363,10 +3372,12 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
+                // Mirror of the ready_entries shard-aware lane index;
+                // see the comment there for the rationale.
                 sqlx::query(&format!(
                     r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_lane
-                    ON {} (queue, priority, lane_seq)
+                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_lane_shard
+                    ON {} (queue, priority, enqueue_shard, lane_seq)
                 "#,
                     lease_child_name(schema, slot)
                 ))
