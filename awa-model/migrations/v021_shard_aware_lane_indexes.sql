@@ -25,11 +25,14 @@
 --   Create `idx_{schema}_{kind}_<slot>_lane_shard` on
 --   `(queue, priority, enqueue_shard, lane_seq)` on every partition of
 --   `ready_entries`, `done_entries`, and `leases` in every queue-storage
---   schema, and drop the old narrow `_lane` indexes. The old indexes are
---   a strict prefix of the new ones and so become redundant. We drop them
---   in the same migration because, even after `ANALYZE`, the planner
---   sometimes prefers the old narrower index on smaller-startup-cost
---   grounds — keeping both in place leaves the regression latent.
+--   schema, and drop the old narrow `_lane` indexes. The old index is not
+--   a prefix of the new one: `enqueue_shard` is inserted before
+--   `lane_seq`. It is redundant for the current queue-storage query set
+--   because all lane lookups that need this access path are
+--   shard-qualified. We drop it in the same migration because, even after
+--   `ANALYZE`, the planner sometimes prefers the old narrower index on
+--   smaller-startup-cost grounds — keeping both in place leaves the
+--   regression latent.
 --
 -- Safety:
 --   Index DDL only — no data rewrite. `CREATE INDEX IF NOT EXISTS` is
