@@ -17,7 +17,8 @@ against the admin API.
   `InsertParams`.
 - **Insertion** — `insert`, `insert_with`, `insert_many`,
   `insert_many_copy` for the compatibility insert surface, and
-  `enqueue_many_copy` for direct queue-storage COPY ingestion.
+  `QueueStorage::enqueue_params_copy` for direct queue-storage COPY ingestion
+  with an explicitly configured queue-storage engine.
 - **Migrations** — `migrations::run` applies the schema; `migrations`,
   `migrations_range`, and `current_migration_version` expose the
   catalog for tooling.

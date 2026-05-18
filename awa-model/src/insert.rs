@@ -434,7 +434,8 @@ where
 /// then routes staged rows through `awa.insert_job_compat`. Accepts
 /// `&mut PgConnection` so callers can use pool connections or transactions
 /// (Transaction derefs to PgConnection). For high-volume queue-storage
-/// producers, prefer [`crate::enqueue_many_copy`].
+/// producers, prefer [`QueueStorage::enqueue_params_copy`](crate::QueueStorage::enqueue_params_copy)
+/// on a `QueueStorage` built with the same config as the worker fleet.
 #[tracing::instrument(skip(conn, jobs), fields(job.count = jobs.len()))]
 pub async fn insert_many_copy(
     conn: &mut PgConnection,

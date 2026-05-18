@@ -445,9 +445,18 @@ want to trade off the partition-reclaim window against rotation churn.
 ### Producer path choice
 
 For bulk producers on queue storage, prefer direct queue-storage COPY:
-Python `enqueue_many_copy()` or Rust `awa::enqueue_many_copy()`. Those paths
-stream rows straight into `ready_entries` / `deferred_jobs` and use the
-queue-storage enqueue heads directly.
+Python `enqueue_many_copy()` or Rust `QueueStorage::enqueue_params_copy()`.
+Those paths stream rows straight into `ready_entries` / `deferred_jobs` and use
+the queue-storage enqueue heads directly.
+
+Direct-copy producers must use the same queue-storage routing config as the
+worker fleet. This matters most for `queue_stripe_count` /
+`queue_storage_queue_stripe_count`: a producer using the default unstriped
+config can write to `queue` while striped workers claim from `queue#0`,
+`queue#1`, etc. Rust producers should construct `QueueStorage` with the same
+`QueueStorageConfig` used by workers. Python producers should pass the same
+`queue_storage_queue_stripe_count` to `enqueue_many_copy()` when the fleet uses
+non-default striping.
 
 `insert_many_copy()` is the compatibility insert API. It is still useful when a
 caller needs the canonical insert surface, but in queue-storage mode it routes

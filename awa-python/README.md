@@ -48,6 +48,8 @@ codebases that aren't async-first.
 - **COPY ingestion** — `enqueue_many_copy` streams directly into queue
   storage for high-volume Python producers. `insert_many_copy` remains the
   compatibility insert surface for canonical-storage and adapter-style callers.
+  If workers use `queue_storage_queue_stripe_count > 1`, pass the same value
+  to `enqueue_many_copy`.
 - **Crash-safe execution** — heartbeat-based lease tracking; jobs whose
   workers vanish are rescued automatically.
 - **Per-queue policy** — priorities, priority aging, weighted concurrency,

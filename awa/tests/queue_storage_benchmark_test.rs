@@ -1192,7 +1192,7 @@ async fn test_queue_storage_deep_backlog_drain_benchmark() {
     let copy_chunk_size = env_u64("AWA_QS_DEEP_BACKLOG_COPY_BATCH", 1_000) as usize;
     let consumers = env_u32("AWA_QS_DEEP_BACKLOG_CONSUMERS", 8);
     let claim_batch_size = env_u64("AWA_QS_DEEP_BACKLOG_CLAIM_BATCH_SIZE", 512) as i64;
-    let enqueue_shards = env_u32("AWA_QS_DEEP_BACKLOG_SHARDS", 16).clamp(1, 64) as i16;
+    let enqueue_shards = env_u32("AWA_QS_DEEP_BACKLOG_SHARDS", 16);
     let queue_slot_count = env_u32("AWA_QS_DEEP_BACKLOG_QUEUE_SLOT_COUNT", 16);
     let lease_slot_count = env_u32("AWA_QS_DEEP_BACKLOG_LEASE_SLOT_COUNT", 8);
     let schema = env_string("AWA_QS_DEEP_BACKLOG_SCHEMA", "awa_qs_deep_backlog");
@@ -1203,6 +1203,16 @@ async fn test_queue_storage_deep_backlog_drain_benchmark() {
 
     assert!(total_jobs > 0, "AWA_QS_DEEP_BACKLOG_JOBS must be > 0");
     assert!(duration_secs > 0, "AWA_QS_DEEP_BACKLOG_SECONDS must be > 0");
+    assert!(consumers > 0, "AWA_QS_DEEP_BACKLOG_CONSUMERS must be > 0");
+    assert!(
+        claim_batch_size > 0,
+        "AWA_QS_DEEP_BACKLOG_CLAIM_BATCH_SIZE must be > 0"
+    );
+    assert!(
+        (1..=64).contains(&enqueue_shards),
+        "AWA_QS_DEEP_BACKLOG_SHARDS must be between 1 and 64"
+    );
+    let enqueue_shards = enqueue_shards as i16;
 
     let pool = pool_with(max_conns).await;
     ensure_pgstattuple(&pool).await;

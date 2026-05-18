@@ -143,6 +143,7 @@ class AsyncClient:
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        queue_storage_queue_stripe_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT,
     ) -> int:
         """Enqueue jobs into active queue storage using direct COPY."""
         return await self._raw.enqueue_many_copy(
@@ -156,6 +157,7 @@ class AsyncClient:
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
+            queue_storage_queue_stripe_count=queue_storage_queue_stripe_count,
         )
 
     async def migrate(self) -> None:
@@ -827,6 +829,7 @@ class Client:
         run_at: Any | None = None,
         unique_opts: dict[str, Any] | None = None,
         ordering_key: bytes | str | None = None,
+        queue_storage_queue_stripe_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT,
     ) -> int:
         """Enqueue jobs into active queue storage using direct COPY."""
         return self._raw.enqueue_many_copy_sync(
@@ -840,6 +843,7 @@ class Client:
             run_at=run_at,
             unique_opts=unique_opts,
             ordering_key=ordering_key,
+            queue_storage_queue_stripe_count=queue_storage_queue_stripe_count,
         )
 
     def migrate(self) -> None:

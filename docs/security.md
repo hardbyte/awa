@@ -112,7 +112,7 @@ GRANT TEMP ON DATABASE mydb TO awa_runtime;
 ```
 
 This allows creating temporary staging tables for the `COPY` bulk insert path.
-Queue-storage direct COPY (`awa::enqueue_many_copy` in Rust,
+Queue-storage direct COPY (`QueueStorage::enqueue_params_copy` in Rust,
 `enqueue_many_copy` in Python) writes to the queue-storage tables directly and
 does not need this temporary-table grant.
 

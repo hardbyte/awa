@@ -33,8 +33,8 @@ pub use error::AwaError;
 pub use insert::{insert, insert_many, insert_many_copy, insert_many_copy_from_pool, insert_with};
 pub use job::{InsertOpts, InsertParams, JobRow, JobState, UniqueOpts};
 pub use queue_storage::{
-    enqueue_many_copy, ClaimedEntry, ClaimedRuntimeJob, PruneOutcome, QueueCounts, QueueStorage,
-    QueueStorageConfig, RotateOutcome, SkipReason,
+    ClaimedEntry, ClaimedRuntimeJob, PruneOutcome, QueueCounts, QueueStorage, QueueStorageConfig,
+    RotateOutcome, SkipReason,
 };
 pub use storage::StorageStatus;
 
