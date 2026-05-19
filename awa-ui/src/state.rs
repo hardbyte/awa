@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use awa_metrics::AwaMetrics;
 use serde::Serialize;
 use sqlx::PgPool;
 
@@ -15,6 +16,10 @@ pub struct AppState {
     /// Suggested frontend poll interval — at least as long as the cache TTL
     /// so clients don't poll faster than the cache can refresh.
     pub poll_interval_ms: u64,
+    /// Cached `AwaMetrics` handle. `AwaMetrics::from_global()` rebuilds the
+    /// full instrument set on every call, so we construct it once here and
+    /// share it across request handlers.
+    pub metrics: AwaMetrics,
 }
 
 impl AppState {
@@ -31,6 +36,7 @@ impl AppState {
             cache: DashboardCache::new(cache_ttl),
             callback_hmac_secret,
             poll_interval_ms,
+            metrics: AwaMetrics::from_global(),
         }
     }
 

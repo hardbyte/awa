@@ -2,7 +2,6 @@ use axum::extract::{Path, Query, State};
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use awa_metrics::AwaMetrics;
 use awa_model::dlq::{self, DlqRow, ListDlqFilter, RetryFromDlqOpts};
 
 use crate::error::ApiError;
@@ -101,7 +100,7 @@ pub async fn retry_dlq_job(
         .map(|row| row.job.queue);
     let job = dlq::retry_from_dlq(&state.pool, job_id, &opts).await?;
     if job.is_some() {
-        AwaMetrics::from_global().record_dlq_retried(source_queue.as_deref(), 1);
+        state.metrics.record_dlq_retried(source_queue.as_deref(), 1);
     }
     Ok(Json(job))
 }
@@ -139,7 +138,9 @@ pub async fn bulk_retry_dlq(
     };
     let count = dlq::bulk_retry_from_dlq(&state.pool, &filter, payload.all).await?;
     if count > 0 {
-        AwaMetrics::from_global().record_dlq_retried(queue_attr.as_deref(), count);
+        state
+            .metrics
+            .record_dlq_retried(queue_attr.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -157,7 +158,7 @@ pub async fn purge_dlq_job(
     let deleted = dlq::purge_dlq_job(&state.pool, job_id).await?;
     let count = if deleted { 1 } else { 0 };
     if count > 0 {
-        AwaMetrics::from_global().record_dlq_purged(queue.as_deref(), count);
+        state.metrics.record_dlq_purged(queue.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -176,7 +177,9 @@ pub async fn bulk_purge_dlq(
     };
     let count = dlq::purge_dlq(&state.pool, &filter, payload.all).await?;
     if count > 0 {
-        AwaMetrics::from_global().record_dlq_purged(queue_attr.as_deref(), count);
+        state
+            .metrics
+            .record_dlq_purged(queue_attr.as_deref(), count);
     }
     Ok(Json(CountResponse { count }))
 }
@@ -215,7 +218,7 @@ pub async fn bulk_move_failed(
     )
     .await?;
     if count > 0 {
-        AwaMetrics::from_global().record_dlq_moved_bulk(
+        state.metrics.record_dlq_moved_bulk(
             payload.kind.as_deref(),
             payload.queue.as_deref(),
             &payload.reason,
