@@ -379,6 +379,11 @@ pub struct PyClient {
     job_kind_descriptors: Arc<Mutex<HashMap<String, JobKindDescriptor>>>,
     lifecycle: Arc<Mutex<RuntimeLifecycle>>,
     runtime: Arc<Mutex<Option<Arc<awa_worker::Client>>>>,
+    /// Cached `AwaMetrics` handle. `AwaMetrics::from_global()` builds the
+    /// full instrument set on every call; on hot paths (per-batch
+    /// `enqueue_many_copy` recording in particular) we keep one instance
+    /// and reuse it.
+    metrics: awa_worker::AwaMetrics,
 }
 
 #[pymethods]
@@ -413,6 +418,7 @@ impl PyClient {
             job_kind_descriptors: Arc::new(Mutex::new(HashMap::new())),
             lifecycle: Arc::new(Mutex::new(RuntimeLifecycle::Idle)),
             runtime: Arc::new(Mutex::new(None)),
+            metrics: awa_worker::AwaMetrics::from_global(),
         })
     }
 
@@ -2135,6 +2141,7 @@ impl PyClient {
         }
 
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let insert_params = prepare_insert_many_params(
             py,
             &jobs,
@@ -2169,11 +2176,7 @@ impl PyClient {
                 .enqueue_params_copy(&pool, &insert_params)
                 .await
                 .map_err(map_awa_error)?;
-            awa_worker::AwaMetrics::from_global().record_enqueue_batch(
-                &queue,
-                count as u64,
-                started.elapsed(),
-            );
+            metrics.record_enqueue_batch(&queue, count as u64, started.elapsed());
             Ok(count)
         })
     }
@@ -2202,6 +2205,7 @@ impl PyClient {
         }
 
         let pool = self.pool.clone();
+        let metrics = self.metrics.clone();
         let insert_params = prepare_insert_many_params(
             py,
             &jobs,
@@ -2237,11 +2241,7 @@ impl PyClient {
                     .enqueue_params_copy(&pool, &insert_params)
                     .await
                     .map_err(map_awa_error)?;
-                awa_worker::AwaMetrics::from_global().record_enqueue_batch(
-                    &queue,
-                    count as u64,
-                    started.elapsed(),
-                );
+                metrics.record_enqueue_batch(&queue, count as u64, started.elapsed());
                 Ok(count)
             })
         })
