@@ -2164,10 +2164,16 @@ impl PyClient {
                 ..Default::default()
             })
             .map_err(map_awa_error)?;
+            let started = std::time::Instant::now();
             let count = store
                 .enqueue_params_copy(&pool, &insert_params)
                 .await
                 .map_err(map_awa_error)?;
+            awa_worker::AwaMetrics::from_global().record_enqueue_batch(
+                &queue,
+                count as u64,
+                started.elapsed(),
+            );
             Ok(count)
         })
     }
@@ -2226,10 +2232,17 @@ impl PyClient {
                     ..Default::default()
                 })
                 .map_err(map_awa_error)?;
-                store
+                let started = std::time::Instant::now();
+                let count = store
                     .enqueue_params_copy(&pool, &insert_params)
                     .await
-                    .map_err(map_awa_error)
+                    .map_err(map_awa_error)?;
+                awa_worker::AwaMetrics::from_global().record_enqueue_batch(
+                    &queue,
+                    count as u64,
+                    started.elapsed(),
+                );
+                Ok(count)
             })
         })
     }
