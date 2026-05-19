@@ -176,6 +176,60 @@ async fn setup_pool(max_connections: u32) -> sqlx::PgPool {
     pool
 }
 
+#[tokio::test]
+async fn test_queue_storage_prepare_schema_completes_with_single_connection_pool() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(1).await;
+    let store =
+        QueueStorage::new(QueueStorageConfig::default()).expect("queue storage config is valid");
+
+    tokio::time::timeout(Duration::from_secs(30), store.prepare_schema(&pool))
+        .await
+        .expect("prepare_schema should not self-starve on a one-connection pool")
+        .expect("prepare_schema should succeed");
+
+    assert!(
+        storage::queue_storage_schema_ready(&pool, store.schema())
+            .await
+            .expect("schema readiness query should succeed"),
+        "prepared queue-storage schema should be reported as ready"
+    );
+}
+
+#[tokio::test]
+async fn test_queue_storage_prepare_schema_concurrent_startups_serialize() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+
+    let mut handles = Vec::new();
+    for _ in 0..4 {
+        let pool = pool.clone();
+        handles.push(tokio::spawn(async move {
+            let store = QueueStorage::new(QueueStorageConfig::default())
+                .expect("queue storage config is valid");
+            store.prepare_schema(&pool).await
+        }));
+    }
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for handle in handles {
+            handle
+                .await
+                .expect("prepare_schema task should not panic")
+                .expect("prepare_schema should succeed");
+        }
+    })
+    .await
+    .expect("concurrent prepare_schema calls should not deadlock");
+
+    assert!(
+        storage::queue_storage_schema_ready(&pool, "awa")
+            .await
+            .expect("schema readiness query should succeed"),
+        "prepared queue-storage schema should be reported as ready"
+    );
+}
+
 async fn recreate_store_schema(pool: &sqlx::PgPool, store: &QueueStorage) {
     let drop_sql = format!("DROP SCHEMA IF EXISTS {} CASCADE", store.schema());
     sqlx::query(&drop_sql)

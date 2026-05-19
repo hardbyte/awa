@@ -2008,17 +2008,23 @@ impl QueueStorage {
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
         let install_lock_name = format!("awa.queue_storage.install:{schema}");
-        let mut install_lock_conn = pool.acquire().await.map_err(map_sqlx_error)?;
+        let mut install_tx = pool.begin().await.map_err(map_sqlx_error)?;
 
-        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(&install_lock_name)
-            .execute(install_lock_conn.as_mut())
+            .execute(install_tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
+        macro_rules! install_db {
+            () => {
+                install_tx.as_mut()
+            };
+        }
+
         let install_result = async {
             sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -2041,14 +2047,14 @@ impl QueueStorage {
                 "#,
             )
             .bind(schema)
-            .fetch_one(pool)
+            .fetch_one(install_db!())
             .await
             .map_err(map_sqlx_error)?;
             if open_receipt_claims_exists {
                 let row_count: i64 = sqlx::query_scalar(&format!(
                     "SELECT count(*)::bigint FROM {schema}.open_receipt_claims"
                 ))
-                .fetch_one(pool)
+                .fetch_one(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
                 if row_count > 0 {
@@ -2062,7 +2068,7 @@ impl QueueStorage {
                 sqlx::query(&format!(
                     "DROP TABLE IF EXISTS {schema}.open_receipt_claims CASCADE"
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -2198,7 +2204,7 @@ impl QueueStorage {
                 CREATE SEQUENCE IF NOT EXISTS {schema}.job_id_seq
                 "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2212,7 +2218,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2232,7 +2238,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2244,7 +2250,7 @@ impl QueueStorage {
             "#
             ))
             .bind(self.queue_slot_count() as i32)
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2256,7 +2262,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2271,7 +2277,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2285,7 +2291,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2300,7 +2306,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2312,7 +2318,7 @@ impl QueueStorage {
             "#
             ))
             .bind(self.lease_slot_count() as i32)
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2324,7 +2330,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2339,7 +2345,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2359,7 +2365,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2374,7 +2380,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2386,7 +2392,7 @@ impl QueueStorage {
             "#
             ))
             .bind(self.claim_slot_count() as i32)
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2398,7 +2404,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2413,7 +2419,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2429,7 +2435,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2444,7 +2450,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2466,7 +2472,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2481,7 +2487,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2496,7 +2502,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2510,7 +2516,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2524,7 +2530,7 @@ impl QueueStorage {
             sqlx::query(&format!(
                 "DROP TABLE IF EXISTS {schema}.queue_count_snapshots"
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2542,7 +2548,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2564,7 +2570,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2577,7 +2583,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2601,7 +2607,7 @@ impl QueueStorage {
             DROP INDEX IF EXISTS {schema}.idx_{schema}_queue_claimer_leases_owner
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2611,11 +2617,10 @@ impl QueueStorage {
                 ON {schema}.queue_claimer_leases (queue, owner_instance_id)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
-            let mut backfill_tx = pool.begin().await.map_err(map_sqlx_error)?;
             sqlx::query(&format!(
                 r#"
             INSERT INTO {schema}.queue_enqueue_heads AS heads (
@@ -2634,7 +2639,7 @@ impl QueueStorage {
             SET next_seq = GREATEST(heads.next_seq, EXCLUDED.next_seq)
             "#
             ))
-            .execute(backfill_tx.as_mut())
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2656,7 +2661,7 @@ impl QueueStorage {
             SET claim_seq = GREATEST(heads.claim_seq, EXCLUDED.claim_seq)
             "#
             ))
-            .execute(backfill_tx.as_mut())
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2680,7 +2685,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(backfill_tx.as_mut())
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2691,11 +2696,9 @@ impl QueueStorage {
             WHERE pruned_completed_count > 0
             "#
             ))
-            .execute(backfill_tx.as_mut())
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
-
-            backfill_tx.commit().await.map_err(map_sqlx_error)?;
 
             sqlx::query(
                 r#"
@@ -2706,7 +2709,7 @@ impl QueueStorage {
             )
             "#,
             )
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2735,7 +2738,7 @@ impl QueueStorage {
             ) PARTITION BY LIST (lease_slot)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2757,7 +2760,7 @@ impl QueueStorage {
                 "#,
             )
             .bind(schema)
-            .fetch_optional(pool)
+            .fetch_optional(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2770,7 +2773,7 @@ impl QueueStorage {
                 "#,
             )
             .bind(schema)
-            .fetch_optional(pool)
+            .fetch_optional(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2780,7 +2783,7 @@ impl QueueStorage {
                 sqlx::query(&format!(
                     "ALTER TABLE {schema}.lease_claims RENAME TO lease_claims_legacy"
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -2788,7 +2791,7 @@ impl QueueStorage {
                 sqlx::query(&format!(
                     "ALTER TABLE {schema}.lease_claim_closures RENAME TO lease_claim_closures_legacy"
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -2814,7 +2817,7 @@ impl QueueStorage {
             ) PARTITION BY LIST (claim_slot)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2827,7 +2830,7 @@ impl QueueStorage {
                 ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2839,7 +2842,7 @@ impl QueueStorage {
                 "#,
                     claim_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -2850,7 +2853,7 @@ impl QueueStorage {
                 ON {schema}.lease_claims (materialized_at, claimed_at, job_id)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2865,7 +2868,7 @@ impl QueueStorage {
                 WITH (pages_per_range = 16)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2878,7 +2881,7 @@ impl QueueStorage {
                 ON {schema}.lease_claims (job_id, run_lease)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2898,12 +2901,12 @@ impl QueueStorage {
                 "#,
             )
             .bind(schema)
-            .fetch_one(pool)
+            .fetch_one(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
             if lease_claims_legacy_exists {
-                // Wrap the copy + drop in a single transaction so a
+                // The outer prepare_schema transaction keeps the copy + drop atomic so a
                 // crash between the two leaves the schema in one of
                 // exactly two states: pre-migration (legacy still
                 // there, partitioned parent empty) or post-migration
@@ -2912,7 +2915,6 @@ impl QueueStorage {
                 // and the next prepare_schema's
                 // `ON CONFLICT DO NOTHING` masks the inconsistency
                 // without surfacing it.
-                let mut migrate_tx = pool.begin().await.map_err(map_sqlx_error)?;
                 sqlx::query(&format!(
                     r#"
                 INSERT INTO {schema}.lease_claims (
@@ -2929,18 +2931,17 @@ impl QueueStorage {
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 "#
                 ))
-                .execute(migrate_tx.as_mut())
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
                 sqlx::query(&format!(
                     "DROP TABLE {schema}.lease_claims_legacy"
                 ))
-                .execute(migrate_tx.as_mut())
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
-                migrate_tx.commit().await.map_err(map_sqlx_error)?;
             }
 
             sqlx::query(&format!(
@@ -2955,7 +2956,7 @@ impl QueueStorage {
             ) PARTITION BY LIST (claim_slot)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2967,7 +2968,7 @@ impl QueueStorage {
                 "#,
                     closure_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -2981,7 +2982,7 @@ impl QueueStorage {
                 ON {schema}.lease_claim_closures (job_id, run_lease)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -2995,7 +2996,7 @@ impl QueueStorage {
                 "#,
             )
             .bind(schema)
-            .fetch_one(pool)
+            .fetch_one(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3004,7 +3005,6 @@ impl QueueStorage {
                 // above for the rationale: copy + drop must be atomic
                 // so a crash leaves the schema either fully migrated
                 // or fully not.
-                let mut migrate_tx = pool.begin().await.map_err(map_sqlx_error)?;
                 sqlx::query(&format!(
                     r#"
                 INSERT INTO {schema}.lease_claim_closures (
@@ -3017,18 +3017,17 @@ impl QueueStorage {
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 "#
                 ))
-                .execute(migrate_tx.as_mut())
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
                 sqlx::query(&format!(
                     "DROP TABLE {schema}.lease_claim_closures_legacy"
                 ))
-                .execute(migrate_tx.as_mut())
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
-                migrate_tx.commit().await.map_err(map_sqlx_error)?;
             }
 
             sqlx::query(&format!(
@@ -3048,7 +3047,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3058,7 +3057,7 @@ impl QueueStorage {
                 ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3077,7 +3076,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3106,7 +3105,7 @@ impl QueueStorage {
             ) PARTITION BY LIST (ready_slot)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3137,7 +3136,7 @@ impl QueueStorage {
             ) PARTITION BY LIST (ready_slot)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3161,7 +3160,7 @@ impl QueueStorage {
                 ALTER COLUMN created_at DROP DEFAULT
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3176,7 +3175,7 @@ impl QueueStorage {
             {ready_join}
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3204,7 +3203,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3214,7 +3213,7 @@ impl QueueStorage {
                 ON {schema}.deferred_jobs (state, run_at, queue, priority, job_id)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3224,7 +3223,7 @@ impl QueueStorage {
                 ON {schema}.deferred_jobs (unique_key)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3253,7 +3252,7 @@ impl QueueStorage {
             )
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3263,7 +3262,7 @@ impl QueueStorage {
                 ON {schema}.dlq_entries (queue, dlq_at DESC)
             "#
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3275,7 +3274,7 @@ impl QueueStorage {
                 "#,
                     ready_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3293,7 +3292,7 @@ impl QueueStorage {
                 "#,
                     ready_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3304,7 +3303,7 @@ impl QueueStorage {
                 "#,
                     ready_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3315,7 +3314,7 @@ impl QueueStorage {
                 "#,
                     done_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3328,7 +3327,7 @@ impl QueueStorage {
                 "#,
                     done_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3339,7 +3338,7 @@ impl QueueStorage {
                 "#,
                     done_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -3352,7 +3351,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3365,7 +3364,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3376,7 +3375,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3387,7 +3386,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3398,7 +3397,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3409,7 +3408,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3420,7 +3419,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
 
@@ -3431,7 +3430,7 @@ impl QueueStorage {
                 "#,
                     lease_child_name(schema, slot)
                 ))
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -3683,7 +3682,7 @@ impl QueueStorage {
             "#,
                 claimed_cte = claimed_cte
             ))
-            .execute(pool)
+            .execute(install_db!())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3697,7 +3696,7 @@ impl QueueStorage {
                 ))
                 .bind(slot as i32)
                 .bind(if slot == 0 { 0_i64 } else { -1_i64 })
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -3712,7 +3711,7 @@ impl QueueStorage {
                 ))
                 .bind(slot as i32)
                 .bind(if slot == 0 { 0_i64 } else { -1_i64 })
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -3727,7 +3726,7 @@ impl QueueStorage {
                 ))
                 .bind(slot as i32)
                 .bind(if slot == 0 { 0_i64 } else { -1_i64 })
-                .execute(pool)
+                .execute(install_db!())
                 .await
                 .map_err(map_sqlx_error)?;
             }
@@ -3736,18 +3735,12 @@ impl QueueStorage {
         }
         .await;
 
-        let unlock_result = sqlx::query("SELECT pg_advisory_unlock(hashtextextended($1, 0))")
-            .bind(&install_lock_name)
-            .execute(install_lock_conn.as_mut())
-            .await
-            .map(|_| ())
-            .map_err(map_sqlx_error);
-
-        match (install_result, unlock_result) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(err), Ok(())) => Err(err),
-            (Ok(()), Err(err)) => Err(err),
-            (Err(err), Err(_)) => Err(err),
+        match install_result {
+            Ok(()) => install_tx.commit().await.map_err(map_sqlx_error),
+            Err(err) => {
+                let _ = install_tx.rollback().await;
+                Err(err)
+            }
         }
     }
 
