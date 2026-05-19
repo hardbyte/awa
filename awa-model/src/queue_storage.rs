@@ -2004,6 +2004,23 @@ impl QueueStorage {
         self.sync_enqueue_unique_claims(tx, claims).await
     }
 
+    /// Idempotently install the queue-storage substrate (schema, tables,
+    /// indexes, functions) for this configuration.
+    ///
+    /// Runs entirely inside one transaction on a single pooled connection,
+    /// guarded by `pg_advisory_xact_lock` so concurrent worker startups
+    /// serialize cleanly rather than fighting over pool slots. The lock
+    /// auto-releases on COMMIT/ROLLBACK.
+    ///
+    /// **Note on index builds:** the `CREATE INDEX IF NOT EXISTS` calls
+    /// below are not `CONCURRENTLY` (Postgres bans `CONCURRENTLY` inside a
+    /// transaction). On a fresh install that's a no-op cost. On a redeploy
+    /// against a database that already has rows in the queue tables, each
+    /// fresh-index build takes `ShareUpdateExclusiveLock` on its table for
+    /// the duration of the build, and concurrent writers to that table
+    /// queue up. For typical operator scenarios this is bounded by the
+    /// `IF NOT EXISTS` guard — only the *new* indexes added by a runtime
+    /// upgrade get built; the rest are no-ops.
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prepare_schema")]
     pub async fn prepare_schema(&self, pool: &PgPool) -> Result<(), AwaError> {
         let schema = self.schema();
@@ -2016,6 +2033,11 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+        // Each query needs its own `&mut` reborrow of `install_tx`; a
+        // helper function returning `&mut Tx<…>` would tangle the borrow
+        // checker because the returned reference would alias the function's
+        // own parameter. A declarative macro emits a fresh reborrow at every
+        // call site, which is what we need here.
         macro_rules! install_db {
             () => {
                 install_tx.as_mut()
