@@ -791,6 +791,52 @@ async fn test_prepare_queue_storage_schema_does_not_activate_routing() {
 }
 
 #[tokio::test]
+async fn test_queue_storage_schema_ready_requires_sequence_and_claim_function() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    migrations::run(&pool).await.unwrap();
+
+    let schema = "awa_queue_storage_ready_probe";
+    prepare_queue_storage_schema(&pool, schema).await;
+
+    assert!(
+        storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable"),
+        "freshly prepared queue-storage schema should be ready"
+    );
+
+    sqlx::query(&format!("DROP SEQUENCE {schema}.job_id_seq CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("test sequence drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after sequence drop"),
+        "schema without job_id_seq must not be reported as ready"
+    );
+
+    prepare_queue_storage_schema(&pool, schema).await;
+    sqlx::query(&format!(
+        "DROP FUNCTION {schema}.claim_ready_runtime(text, bigint, double precision, double precision)"
+    ))
+        .execute(&pool)
+        .await
+        .expect("test claim function drop should succeed");
+
+    assert!(
+        !storage::queue_storage_schema_ready(&pool, schema)
+            .await
+            .expect("schema readiness should be queryable after function drop"),
+        "schema without claim_ready_runtime must not be reported as ready"
+    );
+}
+
+#[tokio::test]
 async fn test_install_queue_storage_backend_activates_routing_and_state() {
     let _guard = acquire_migration_guard().await;
     let pool = pool().await;

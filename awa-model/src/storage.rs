@@ -104,13 +104,32 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
     )
 }
 
+/// Returns true only when every queue-storage substrate object the
+/// runtime depends on is present. Workers and producers should treat
+/// `false` as "schema not installed yet" and either wait or trigger
+/// `QueueStorage::prepare_schema`.
+///
+/// The required objects (tables, the job-id sequence, the claim
+/// function and its exact signature) all originate from
+/// [`QueueStorage::prepare_schema`](crate::QueueStorage::prepare_schema).
+/// If you change a name or the `claim_ready_runtime` signature there,
+/// update this check at the same time — they are intentionally a
+/// single source of truth split across two files for readability.
 pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
     sqlx::query_scalar::<_, bool>(
         r#"
         SELECT
-            to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
+            to_regclass(format('%I.%I', $1, 'job_id_seq')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'queue_ring_state')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'ready_entries')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'done_entries')) IS NOT NULL
             AND to_regclass(format('%I.%I', $1, 'leases')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'deferred_jobs')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claims')) IS NOT NULL
+            AND to_regclass(format('%I.%I', $1, 'lease_claim_closures')) IS NOT NULL
+            AND to_regprocedure(
+                format('%I.%I(text,bigint,double precision,double precision)', $1, 'claim_ready_runtime')
+            ) IS NOT NULL
         "#,
     )
     .bind(schema)
