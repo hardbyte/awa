@@ -513,146 +513,152 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 },
 
-                Commands::Dlq { command } => match command {
-                    DlqCommands::List {
-                        kind,
-                        queue,
-                        tag,
-                        before_id,
-                        before_dlq_at,
-                        limit,
-                    } => {
-                        let filter = awa_model::dlq::ListDlqFilter {
+                Commands::Dlq { command } => {
+                    // Construct AwaMetrics once per `awa dlq` invocation —
+                    // `AwaMetrics::from_global()` rebuilds the entire instrument
+                    // set on each call. Cheap here since the CLI fires at most
+                    // one DLQ branch per invocation, but the pattern matches
+                    // the long-lived call sites.
+                    let metrics = awa_worker::AwaMetrics::from_global();
+                    match command {
+                        DlqCommands::List {
                             kind,
                             queue,
                             tag,
                             before_id,
                             before_dlq_at,
-                            limit: Some(limit),
-                        };
-                        let rows = awa_model::dlq::list_dlq(&pool, &filter).await?;
-                        if rows.is_empty() {
-                            println!("DLQ is empty (no matching rows).");
-                        } else {
-                            println!(
-                                "{:<8} {:<25} {:<10} {:<30} {:<25}",
-                                "ID", "KIND", "QUEUE", "REASON", "DLQ_AT"
-                            );
-                            for row in &rows {
-                                // Truncate by characters, not bytes: byte
-                                // slicing mid-codepoint panics on Unicode
-                                // reasons (e.g. an operator typing a
-                                // non-ASCII note).
-                                let char_count = row.reason.chars().count();
-                                let reason = if char_count > 30 {
-                                    let prefix: String = row.reason.chars().take(27).collect();
-                                    format!("{prefix}...")
-                                } else {
-                                    row.reason.clone()
-                                };
+                            limit,
+                        } => {
+                            let filter = awa_model::dlq::ListDlqFilter {
+                                kind,
+                                queue,
+                                tag,
+                                before_id,
+                                before_dlq_at,
+                                limit: Some(limit),
+                            };
+                            let rows = awa_model::dlq::list_dlq(&pool, &filter).await?;
+                            if rows.is_empty() {
+                                println!("DLQ is empty (no matching rows).");
+                            } else {
                                 println!(
                                     "{:<8} {:<25} {:<10} {:<30} {:<25}",
-                                    row.job.id, row.job.kind, row.job.queue, reason, row.dlq_at
+                                    "ID", "KIND", "QUEUE", "REASON", "DLQ_AT"
                                 );
-                            }
-                            println!("\n{} rows.", rows.len());
-                            if let Some(last) = rows.last() {
-                                println!(
-                                    "Next page: --before-id {} --before-dlq-at {}",
-                                    last.job.id, last.dlq_at
-                                );
+                                for row in &rows {
+                                    // Truncate by characters, not bytes: byte
+                                    // slicing mid-codepoint panics on Unicode
+                                    // reasons (e.g. an operator typing a
+                                    // non-ASCII note).
+                                    let char_count = row.reason.chars().count();
+                                    let reason = if char_count > 30 {
+                                        let prefix: String = row.reason.chars().take(27).collect();
+                                        format!("{prefix}...")
+                                    } else {
+                                        row.reason.clone()
+                                    };
+                                    println!(
+                                        "{:<8} {:<25} {:<10} {:<30} {:<25}",
+                                        row.job.id, row.job.kind, row.job.queue, reason, row.dlq_at
+                                    );
+                                }
+                                println!("\n{} rows.", rows.len());
+                                if let Some(last) = rows.last() {
+                                    println!(
+                                        "Next page: --before-id {} --before-dlq-at {}",
+                                        last.job.id, last.dlq_at
+                                    );
+                                }
                             }
                         }
-                    }
-                    DlqCommands::Depth { queue } => {
-                        if let Some(queue_name) = queue {
-                            let depth = awa_model::dlq::dlq_depth(&pool, Some(&queue_name)).await?;
-                            println!("{queue_name}: {depth}");
-                        } else {
-                            let total = awa_model::dlq::dlq_depth(&pool, None).await?;
-                            let by_queue = awa_model::dlq::dlq_depth_by_queue(&pool).await?;
-                            println!("Total: {total}");
-                            for (q, count) in &by_queue {
-                                println!("  {q}: {count}");
+                        DlqCommands::Depth { queue } => {
+                            if let Some(queue_name) = queue {
+                                let depth =
+                                    awa_model::dlq::dlq_depth(&pool, Some(&queue_name)).await?;
+                                println!("{queue_name}: {depth}");
+                            } else {
+                                let total = awa_model::dlq::dlq_depth(&pool, None).await?;
+                                let by_queue = awa_model::dlq::dlq_depth_by_queue(&pool).await?;
+                                println!("Total: {total}");
+                                for (q, count) in &by_queue {
+                                    println!("  {q}: {count}");
+                                }
                             }
                         }
-                    }
-                    DlqCommands::Retry { id } => {
-                        let opts = awa_model::dlq::RetryFromDlqOpts::default();
-                        match awa_model::dlq::retry_from_dlq(&pool, id, &opts).await? {
-                            Some(job) => {
-                                awa_worker::AwaMetrics::from_global()
-                                    .record_dlq_retried(Some(&job.queue), 1);
-                                println!("Retried DLQ job {id} → job state {}", job.state);
+                        DlqCommands::Retry { id } => {
+                            let opts = awa_model::dlq::RetryFromDlqOpts::default();
+                            match awa_model::dlq::retry_from_dlq(&pool, id, &opts).await? {
+                                Some(job) => {
+                                    metrics.record_dlq_retried(Some(&job.queue), 1);
+                                    println!("Retried DLQ job {id} → job state {}", job.state);
+                                }
+                                None => println!("No DLQ row with id {id}"),
                             }
-                            None => println!("No DLQ row with id {id}"),
                         }
-                    }
-                    DlqCommands::RetryBulk {
-                        kind,
-                        queue,
-                        tag,
-                        all,
-                    } => {
-                        let filter = awa_model::dlq::ListDlqFilter {
+                        DlqCommands::RetryBulk {
                             kind,
-                            queue: queue.clone(),
+                            queue,
                             tag,
-                            ..Default::default()
-                        };
-                        let count =
-                            awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
-                        if count > 0 {
-                            awa_worker::AwaMetrics::from_global()
-                                .record_dlq_retried(queue.as_deref(), count);
-                        }
-                        println!("Retried {count} DLQ rows.");
-                    }
-                    DlqCommands::Move {
-                        kind,
-                        queue,
-                        reason,
-                        all,
-                    } => {
-                        let count = awa_model::dlq::bulk_move_failed_to_dlq(
-                            &pool,
-                            kind.as_deref(),
-                            queue.as_deref(),
-                            &reason,
                             all,
-                        )
-                        .await?;
-                        // Emit the same `awa.job.dlq_moved` counter the
-                        // executor uses for automatic routing, so dashboards
-                        // and alerting see admin bulk moves too.
-                        awa_worker::AwaMetrics::from_global().record_dlq_moved_bulk(
-                            kind.as_deref(),
-                            queue.as_deref(),
-                            &reason,
-                            count,
-                        );
-                        println!("Moved {count} failed jobs into the DLQ.");
-                    }
-                    DlqCommands::Purge {
-                        kind,
-                        queue,
-                        tag,
-                        all,
-                    } => {
-                        let filter = awa_model::dlq::ListDlqFilter {
-                            kind,
-                            queue: queue.clone(),
-                            tag,
-                            ..Default::default()
-                        };
-                        let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
-                        if count > 0 {
-                            awa_worker::AwaMetrics::from_global()
-                                .record_dlq_purged(queue.as_deref(), count);
+                        } => {
+                            let filter = awa_model::dlq::ListDlqFilter {
+                                kind,
+                                queue: queue.clone(),
+                                tag,
+                                ..Default::default()
+                            };
+                            let count =
+                                awa_model::dlq::bulk_retry_from_dlq(&pool, &filter, all).await?;
+                            if count > 0 {
+                                metrics.record_dlq_retried(queue.as_deref(), count);
+                            }
+                            println!("Retried {count} DLQ rows.");
                         }
-                        println!("Purged {count} DLQ rows.");
+                        DlqCommands::Move {
+                            kind,
+                            queue,
+                            reason,
+                            all,
+                        } => {
+                            let count = awa_model::dlq::bulk_move_failed_to_dlq(
+                                &pool,
+                                kind.as_deref(),
+                                queue.as_deref(),
+                                &reason,
+                                all,
+                            )
+                            .await?;
+                            // Emit the same `awa.job.dlq_moved` counter the
+                            // executor uses for automatic routing, so dashboards
+                            // and alerting see admin bulk moves too.
+                            metrics.record_dlq_moved_bulk(
+                                kind.as_deref(),
+                                queue.as_deref(),
+                                &reason,
+                                count,
+                            );
+                            println!("Moved {count} failed jobs into the DLQ.");
+                        }
+                        DlqCommands::Purge {
+                            kind,
+                            queue,
+                            tag,
+                            all,
+                        } => {
+                            let filter = awa_model::dlq::ListDlqFilter {
+                                kind,
+                                queue: queue.clone(),
+                                tag,
+                                ..Default::default()
+                            };
+                            let count = awa_model::dlq::purge_dlq(&pool, &filter, all).await?;
+                            if count > 0 {
+                                metrics.record_dlq_purged(queue.as_deref(), count);
+                            }
+                            println!("Purged {count} DLQ rows.");
+                        }
                     }
-                },
+                }
 
                 Commands::Cron { command } => match command {
                     CronCommands::List => {

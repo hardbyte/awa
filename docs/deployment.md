@@ -260,6 +260,7 @@ If you expose the callback receiver endpoints for `HttpWorker`, also configure
 
 ## Next
 
+- [Deploying on managed Postgres](deploying-on-managed-postgres.md) — Cloud SQL / AlloyDB specifics, sizing data, IAM grants, auth-proxy sidecar
 - [PostgreSQL roles and privileges](security.md)
 - [Migration guide](migrations.md)
 - [Configuration](configuration.md)

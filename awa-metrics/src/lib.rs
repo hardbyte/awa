@@ -26,6 +26,8 @@ use std::time::Duration;
 /// exporter without copy-pasting string literals.
 pub mod names {
     pub const JOB_INSERTED: &str = "awa.job.inserted";
+    pub const ENQUEUE_BATCH_SIZE: &str = "awa.enqueue.batch_size";
+    pub const ENQUEUE_DURATION: &str = "awa.enqueue.duration";
     pub const JOB_COMPLETED: &str = "awa.job.completed";
     pub const JOB_FAILED: &str = "awa.job.failed";
     pub const JOB_RETRIED: &str = "awa.job.retried";
@@ -81,6 +83,17 @@ const WAIT_DURATION_BUCKETS_SECONDS: [f64; 14] = [
 pub struct AwaMetrics {
     /// Total jobs inserted.
     pub jobs_inserted: Counter<u64>,
+    /// Per-batch size distribution for the direct queue-storage COPY enqueue
+    /// path (`QueueStorage::enqueue_params_copy` / Python
+    /// `Client.enqueue_many_copy`). Lets producers see how chunky their
+    /// batches actually land — useful when a target enqueue rate isn't being
+    /// hit and you need to disambiguate "batches are tiny" from "batches are
+    /// slow."
+    pub enqueue_batch_size: Histogram<u64>,
+    /// Per-batch wall-clock duration for the direct queue-storage COPY
+    /// enqueue path. Pair with [`enqueue_batch_size`](Self::enqueue_batch_size)
+    /// to read jobs-per-second and per-batch latency in one Grafana row.
+    pub enqueue_duration_seconds: Histogram<f64>,
     /// Total jobs completed successfully.
     pub jobs_completed: Counter<u64>,
     /// Total jobs that failed (terminal).
@@ -206,6 +219,21 @@ impl AwaMetrics {
                 .u64_counter(names::JOB_INSERTED)
                 .with_description("Number of jobs inserted")
                 .with_unit("{job}")
+                .build(),
+            enqueue_batch_size: meter
+                .u64_histogram(names::ENQUEUE_BATCH_SIZE)
+                .with_description(
+                    "Direct queue-storage COPY enqueue: per-batch job count",
+                )
+                .with_unit("{job}")
+                .build(),
+            enqueue_duration_seconds: meter
+                .f64_histogram(names::ENQUEUE_DURATION)
+                .with_description(
+                    "Direct queue-storage COPY enqueue: per-batch wall-clock duration",
+                )
+                .with_unit("s")
+                .with_boundaries(WAIT_DURATION_BUCKETS_SECONDS.to_vec())
                 .build(),
             jobs_completed: meter
                 .u64_counter(names::JOB_COMPLETED)
@@ -475,6 +503,29 @@ impl AwaMetrics {
             opentelemetry::KeyValue::new("awa.job.queue", queue.to_string()),
         ];
         self.jobs_retried.add(1, &attrs);
+    }
+
+    /// Record a producer batch through the direct queue-storage COPY
+    /// enqueue path (`QueueStorage::enqueue_params_copy` / Python
+    /// `Client.enqueue_many_copy`).
+    ///
+    /// `batch_size` is the row count that COPY actually wrote; `duration`
+    /// is the wall-clock time the producer spent in the COPY call (start
+    /// to commit), not including pre-batch row preparation.
+    ///
+    /// At `batch_size = 0` this is a no-op — empty batches are valid
+    /// callers and don't need a metric sample.
+    pub fn record_enqueue_batch(&self, queue: &str, batch_size: u64, duration: Duration) {
+        if batch_size == 0 {
+            return;
+        }
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.job.queue",
+            queue.to_string(),
+        )];
+        self.enqueue_batch_size.record(batch_size, &attrs);
+        self.enqueue_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
     }
 
     /// Record a job claimed from queue.
