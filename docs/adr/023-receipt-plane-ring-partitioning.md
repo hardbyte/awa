@@ -8,12 +8,14 @@ evidence the design holds; this ADR is the architectural record.
 
 ## Context
 
-ADR-019 committed the queue storage engine to a vacuum-aware discipline:
-every hot table reclaims space by partition rotation and `TRUNCATE`, not by
-row-level `DELETE` or `UPDATE` churn. Queue entries, terminal entries, active
-leases, deferred jobs, and DLQ entries all follow that contract. The ADR-019
-validation artifact recorded 276 exact dead tuples across the entire schema
-after a 1000/s soak — `queue_lanes=19, ready=0, done=255, leases=2,
+ADR-019 committed the hot queue plane to a vacuum-aware discipline: ready and
+terminal queue entries reclaim space by partition rotation and `TRUNCATE`,
+not by row-level cleanup. The remaining planes have narrower, explicit churn:
+materialized leases live in a bounded mutable lease ring, `deferred_jobs` is a
+plain scheduled/retryable backlog table promoted by delete-and-insert, and
+`dlq_entries` is an operator hold table with bounded retention cleanup. The
+ADR-019 validation artifact recorded 276 exact dead tuples across the entire
+schema after a 1000/s soak — `queue_lanes=19, ready=0, done=255, leases=2,
 attempt_state=0` — consistent with the design intent.
 
 The experimental receipt-backed short-job path introduced after that
@@ -179,12 +181,13 @@ change.
    partitioned `lease_claims` / `lease_claim_closures` shapes.
 2. Existing `lease_claims` and `lease_claim_closures` rows are rewritten
    into the current slot of the new partitioned parents.
-3. `open_receipt_claims` remains readable through the migration window so
-   in-flight attempts are not stranded. Subsequent claim and complete
-   operations target only the partitioned tables; reads on rescue and
-   counts consult both sources until the window closes.
-4. `open_receipt_claims` and its indexes are dropped once no schema
-   revision in active use still consults it.
+3. The legacy `open_receipt_claims` table is not part of the live read path.
+   `prepare_schema()` drops it when empty, and refuses to proceed if it still
+   contains rows so an operator can drain or reverse-migrate those rows
+   deliberately.
+4. Subsequent claim, complete, rescue, and count paths target the partitioned
+   claim/closure tables; the live receipt set is derived as an anti-join over
+   the active claim-ring partitions.
 
 TLA+ coverage (`AwaSegmentedStorage`, `AwaStorageLockOrder`) is extended
 to model the claim-ring rotation and the rescue-before-truncate

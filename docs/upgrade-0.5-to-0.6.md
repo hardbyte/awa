@@ -146,8 +146,8 @@ awa --database-url "$DATABASE_URL" storage status
 | prepare-queue-storage-schema | `\dt awa.ready_entries` (and other queue-storage tables) exist in the `awa` schema |
 | prepare | `awa storage status` reports `state=prepared` |
 | start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
-| enter-mixed-transition | `awa.maintenance.rotate.attempts{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
-| watch canonical drain | `awa.queue_depth{awa_job_state="available"}` on the canonical side trending to 0 |
+| enter-mixed-transition | `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |
+| watch canonical drain | `awa_queue_depth{awa_job_state="available"}` on the canonical side trending to 0 |
 | finalize | `awa storage status` reports `state=active`; no canonical-state runtime instances heartbeating |
 
 ## Rollback boundaries
@@ -162,17 +162,17 @@ awa --database-url "$DATABASE_URL" storage status
 
 These are the metrics that distinguish "transition healthy" from "transition stuck", available on the OTel Prometheus dashboard (panel row "Ring rotation & prune (queue-storage)"):
 
-- `awa.maintenance.rotate.attempts{awa_ring="queue", awa_ring_outcome="rotated"}` should advance steadily — this is the headline "ring is rotating" signal
-- `awa.maintenance.rotate.attempts{awa_ring_outcome="skipped_busy"}` rate should stay flat — sustained `skipped_busy` traffic with `awa_ring_blocker="queue.ready_rows"` means producers are outpacing consumers
-- `awa.queue_lag_seconds` p95 should not climb past your latency SLO
-- `awa.maintenance.prune.attempts{awa_ring_outcome="blocked"}` rate should be near zero — non-zero `blocked` means a held-tx is preventing partition reclaim
+- `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` should advance steadily — this is the headline "ring is rotating" signal
+- `awa_maintenance_rotate_attempts_total{awa_ring_outcome="skipped_busy"}` rate should stay flat — sustained `skipped_busy` traffic with `awa_ring_blocker="queue.ready_rows"` means producers are outpacing consumers
+- `awa_queue_lag_seconds` p95 should not climb past your latency SLO
+- `awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}` rate should be near zero — non-zero `blocked` means a held-tx is preventing partition reclaim
 
 If any of these go wrong **before** any queue-storage work is accepted, `awa storage abort` is still available. After, you commit to forward-only.
 
 ## Known issues
 
 - **Python workers without claim-ring knobs.** Older Python wheels don't accept `queue_storage_claim_slot_count` / `queue_storage_claim_rotate_interval_ms` on `client.start()`. They'll still run with default values and the rollout will work, but operators wanting non-default ring sizing need a wheel that exposes those kwargs.
-- **Held-tx during finalize.** A long-running canonical transaction (e.g., reporting query) blocks vacuum, which can stall partition prune in the queue-storage tables. `awa.maintenance.prune.attempts{awa_ring_outcome="blocked"}` will rise. Identify and terminate the held-tx; prune resumes on the next maintenance tick.
+- **Held-tx during finalize.** A long-running canonical transaction (e.g., reporting query) blocks vacuum, which can stall partition prune in the queue-storage tables. `awa_maintenance_prune_attempts_total{awa_ring_outcome="blocked"}` will rise. Identify and terminate the held-tx; prune resumes on the next maintenance tick.
 - **0.6 rollback after queue-storage work.** Not supported via `awa storage abort` once any rows exist in queue-storage tables. Plan accordingly: keep `0.6` workers available throughout the transition window. Only emergency rollback path is database restore.
 
 ## v017 sharded enqueue heads — operator notes

@@ -23,9 +23,9 @@ and the version number is burned.
 
 ### Steps
 
-1. Bump version in **all six** locations:
-   - `Cargo.toml` (workspace `[workspace.package].version` **and** three
-     internal-crate deps under `[workspace.dependencies]`)
+1. Bump version in these release manifests:
+   - `Cargo.toml` (workspace `[workspace.package].version` and every
+     workspace dependency whose version points at an Awa crate being released)
    - `awa/Cargo.toml` (`awa-testing` dev-dependency version)
    - `awa-cli/Cargo.toml` (`awa-ui` dependency version)
    - `awa-cli/pyproject.toml` (`[project].version` — controls CLI wheel version on PyPI)

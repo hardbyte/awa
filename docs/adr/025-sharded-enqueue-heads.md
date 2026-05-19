@@ -95,12 +95,10 @@ deterministic key hash.
 
 The claim-side function `claim_ready_runtime` walks every shard row
 for a `(queue, priority)` via a `lane_candidates` CTE, picks one
-candidate (ordered by `(effective_priority, run_at, priority,
-enqueue_shard)`), locks that shard's `queue_claim_heads` row with
-`FOR UPDATE OF claims SKIP LOCKED`, and drains rows from that shard's
-`ready_entries` slice. Subsequent calls round-robin naturally
-because the candidate ordering breaks ties on `enqueue_shard`. Gap
-recovery is per-shard.
+candidate (ordered by effective priority, `run_at`, and priority),
+locks that shard's `queue_claim_heads` row with `FOR UPDATE OF claims
+SKIP LOCKED`, and drains rows from that shard's `ready_entries` slice.
+Gap recovery is per-shard.
 
 Receipts and leases carry the shard end-to-end: the claim's
 `enqueue_shard` rides on `ClaimedEntry`, gets inserted into

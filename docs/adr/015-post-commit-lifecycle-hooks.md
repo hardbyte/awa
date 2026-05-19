@@ -87,9 +87,9 @@ sub-builder. Handlers are still logically scoped by job kind, but the builder
 API keeps registration order flexible and avoids introducing a temporary
 registration type solely to attach hooks.
 
-Typed handlers deserialize args from the committed job row immediately before
-dispatch. This keeps hook dispatch aligned with the post-commit row snapshot
-instead of depending on executor-local typed state.
+Typed handlers deserialize args from the committed job snapshot immediately
+before dispatch. This keeps hook dispatch aligned with the post-commit storage
+snapshot instead of depending on executor-local typed state.
 
 ## Consequences
 

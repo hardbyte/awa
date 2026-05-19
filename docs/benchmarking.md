@@ -479,10 +479,8 @@ This rate was previously a documented scaling limit (only 20-57k of 60k
 promoted, promotion at 1.7-3.6s per batch). The literal-state promotion
 fix (v0.5.0) eliminated the bottleneck entirely.
 
-**Key tuning parameters for promotion throughput:**
+**Promotion and completion throughput knobs:**
 
-- `PROMOTE_BATCH_SIZE` (default `4,096`): rows per promotion batch
-- `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `AWA_COMPLETION_FLUSH_MS` (default `1 ms`): completion batcher flush interval
 - `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher
@@ -496,6 +494,11 @@ fix (v0.5.0) eliminated the bottleneck entirely.
   count is `processes × AWA_COMPLETION_SHARDS`. Increase only after measuring
   end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the
   target worker-process topology.
+
+Internal promotion constants are fixed in the runtime:
+`PROMOTE_BATCH_SIZE = 4,096` rows per promotion batch and
+`PROMOTE_MAX_BATCHES_PER_TICK = 32` batches per maintenance tick. They are not
+environment variables or builder options.
 
 ### Concurrent Multi-Queue Lifecycle
 
@@ -537,16 +540,23 @@ single-queue performance. This is tracked as a future optimization.
 
 ### Progress Feature Overhead
 
-The structured progress feature (ADR-014) adds a `progress JSONB` column
-and a two-tier heartbeat flush. Performance impact was validated:
+ADR-014 introduced the user-facing structured progress API and a two-tier
+heartbeat flush. In the current queue-storage engine, mutable progress lives in
+`{schema}.attempt_state` only after an attempt first needs per-attempt mutable
+state; short jobs that never report progress do not allocate an
+`attempt_state` row. Older benchmark notes refer to `progress` columns on
+`jobs_hot` / `scheduled_jobs`, which was the canonical-storage implementation.
+
+Performance impact was validated:
 
 - **Zero overhead when no progress is set.** The heartbeat service
-  partitions jobs by pending progress — jobs without mutations use the
-  original heartbeat-only query. `snapshot_pending_progress` returns empty
-  when no generation has been bumped.
-- **Completion batcher** adds `progress = NULL` to the batch UPDATE. This
-  is a constant-time write to a nullable column with no measurable impact
-  (batcher throughput remains ~78k/s in unit benchmarks).
+  partitions jobs by pending progress; jobs without mutations use the
+  heartbeat-only path, and `snapshot_pending_progress` returns empty when no
+  generation has been bumped.
+- **Completion remains narrow.** Successful completion clears the progress
+  snapshot while closing the attempt. On queue storage this is handled through
+  the attempt-state / terminal-snapshot path rather than rewriting the ready
+  row.
 - **Sustained hot-path throughput** was unchanged when the progress feature
   was added. Current hot-path throughput (~5.6k/s) reflects the additional
   v0.5.0 OTel metrics instrumentation, not progress overhead.
@@ -588,10 +598,10 @@ failure-mode subset via `--scenario failures`:
 - `callback_timeout_10pct`
 - `mixed_50pct`
 
-It does not yet include the Rust-only `deadline_hang`, `snooze_once`, or
-`stale_heartbeat_rescue` scenarios. The worker returns `RetryAfter`,
-`WaitForCallback`, `Cancel`, or raises exceptions based on the job's `mode`
-field.
+Python also includes heartbeat rescue via `--scenario rescue`. It still does
+not include the Rust-only `deadline_hang` and `snooze_once` scenarios. The
+worker returns `RetryAfter`, `WaitForCallback`, `Cancel`, or raises exceptions
+based on the job's `mode` field.
 
 ### Structured output
 

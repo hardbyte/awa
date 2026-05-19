@@ -60,8 +60,8 @@ storage engine.
 
 ```toml
 [dependencies]
-awa = { version = "0.4", features = ["tokio-postgres"] }
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1"] }
+awa = { version = "0.6.0-beta.1", features = ["tokio-postgres"] }
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
@@ -140,7 +140,7 @@ Pool wrappers like `deadpool_postgres::Client` or `bb8::PooledConnection` typica
 
 ```rust
 // deadpool-postgres
-let pool_client = pool.get().await?;
+let mut pool_client = pool.get().await?;
 let txn = pool_client.transaction().await?;
 tokio_pg::insert_job(&txn, &args).await?;
 txn.commit().await?;

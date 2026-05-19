@@ -52,15 +52,26 @@ After the initial migration, transfer object ownership to `awa_owner` so it's de
 ```sql
 ALTER SCHEMA awa OWNER TO awa_owner;
 
--- Transfer all tables, views, sequences, functions
+-- Transfer tables, partitioned tables, views, materialized views, and sequences.
 DO $$
 DECLARE r RECORD;
 BEGIN
-  FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'awa' LOOP
-    EXECUTE format('ALTER TABLE awa.%I OWNER TO awa_owner', r.tablename);
+  FOR r IN
+    SELECT c.relkind, c.oid::regclass AS obj
+    FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'awa'
+      AND c.relkind IN ('r', 'p', 'v', 'm', 'S')
+  LOOP
+    IF r.relkind = 'S' THEN
+      EXECUTE format('ALTER SEQUENCE %s OWNER TO awa_owner', r.obj);
+    ELSE
+      EXECUTE format('ALTER TABLE %s OWNER TO awa_owner', r.obj);
+    END IF;
   END LOOP;
 END$$;
 
+-- Transfer functions.
 DO $$
 DECLARE r RECORD;
 BEGIN
@@ -71,9 +82,21 @@ BEGIN
   END LOOP;
 END$$;
 
-ALTER VIEW awa.jobs OWNER TO awa_owner;
-ALTER SEQUENCE awa.jobs_id_seq OWNER TO awa_owner;
-ALTER TYPE awa.job_state OWNER TO awa_owner;
+-- Transfer standalone enum/domain types. Table row types and generated array
+-- types are owned through their base objects and should not be altered here.
+DO $$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT format('%I.%I', n.nspname, t.typname) AS typ
+    FROM pg_type t
+    JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE n.nspname = 'awa'
+      AND t.typtype IN ('d', 'e')
+  LOOP
+    EXECUTE format('ALTER TYPE %s OWNER TO awa_owner', r.typ);
+  END LOOP;
+END$$;
 ```
 
 ### 4. Grant runtime privileges
@@ -82,8 +105,9 @@ ALTER TYPE awa.job_state OWNER TO awa_owner;
 -- Schema access
 GRANT USAGE ON SCHEMA awa TO awa_runtime;
 
--- Sequence (job ID generation)
-GRANT USAGE, SELECT ON SEQUENCE awa.jobs_id_seq TO awa_runtime;
+-- Sequences: canonical `jobs_id_seq`, and queue-storage `job_id_seq`
+-- once prepare_schema has materialized it.
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA awa TO awa_runtime;
 
 -- All tables: the runtime needs full DML because triggers run as the
 -- invoking role (SECURITY INVOKER), so inserting a job also writes to
@@ -95,12 +119,21 @@ GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO aw
 -- Functions (trigger functions execute with invoker privileges)
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
 
--- Default privileges for future migrations
+-- Default privileges for future migrations.
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
   GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
+  GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
+
+-- If migrations run as awa_migrator without `SET ROLE awa_owner`, future
+-- objects are owned by awa_migrator, so set defaults for that role too.
+ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
+  GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
+  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA awa
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
@@ -128,12 +161,19 @@ the grant block against that schema:
 ```sql
 GRANT USAGE ON SCHEMA my_qs_schema TO awa_runtime;
 GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA my_qs_schema TO awa_runtime;
+GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA my_qs_schema TO awa_runtime;
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA my_qs_schema TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
   GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA my_qs_schema
+  GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
+  GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON TABLES TO awa_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
+  GRANT USAGE, SELECT ON SEQUENCES TO awa_runtime;
+ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
@@ -207,15 +247,21 @@ schemas:
     profiles: [runtime]
 
 roles:
+  - name: awa_owner
+    login: false
+  - name: awa_migrator
+    login: true
+    password:
+      from_env: AWA_MIGRATOR_PASSWORD
   - name: awa_runtime
     login: true
     password:
       from_env: AWA_RUNTIME_PASSWORD
 
 memberships:
-  - role: awa-runtime
+  - role: awa_owner
     members:
-      - name: awa_runtime
+      - name: awa_migrator
 ```
 
 `pgroles diff` shows planned changes, `pgroles apply` converges. You can also run `pgroles generate` against an existing AWA database to produce an initial manifest.
@@ -262,6 +308,8 @@ When using `HttpWorker` async mode, `awa-ui` exposes these callback receiver end
 - `POST /api/callbacks/:callback_id/heartbeat`
 
 These endpoints mutate job state and should not be exposed without protection.
+The full HTTP worker flow, callback payloads, and signature contract are
+documented in [HTTP workers and callback signatures](http-callbacks.md).
 
 ## Callback Signature Verification
 
@@ -270,6 +318,7 @@ Awa supports per-callback request authentication with a 32-byte BLAKE3 keyed has
 - Configure the callback receiver with `--callback-hmac-secret <64-hex-chars>` or `AWA_CALLBACK_HMAC_SECRET`.
 - Configure `HttpWorkerConfig.hmac_secret` with the same 32-byte key.
 - The worker signs the callback ID and sends the signature as `X-Awa-Signature`.
+- The function normally forwards that same header when it calls Awa back.
 - The callback receiver verifies that header before accepting `complete`, `fail`, or `heartbeat`.
 
 Example:
@@ -280,6 +329,9 @@ awa --database-url "$DATABASE_URL" serve --host 0.0.0.0 --port 3000
 ```
 
 If no callback secret is configured, signature verification is disabled. That is acceptable only for trusted internal deployments where the callback receiver is already protected by network boundaries or an authenticating proxy.
+
+The option name says `hmac` for operational familiarity, but the implementation
+uses BLAKE3 keyed hashing over the callback ID string, not RFC HMAC.
 
 ## Custom Callback Receivers
 

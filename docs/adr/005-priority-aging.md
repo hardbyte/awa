@@ -28,12 +28,13 @@ order using a single `FOR UPDATE SKIP LOCKED` index scan on
 This keeps the dispatch query simple and fast — a single index scan with no
 expression evaluation, which scales linearly with worker count.
 
-### Starvation prevention via maintenance-based aging
+### Starvation prevention via aging
 
-The maintenance leader runs a periodic `age_waiting_priorities` task at
-`priority_aging_interval` (default: 60 seconds). This task finds `available`
-jobs with `priority > 1` that have been waiting longer than their aging
-threshold and decrements their `priority` column.
+The queue-storage implementation computes effective priority at claim time.
+The canonical implementation uses a periodic `age_waiting_priorities` task at
+`priority_aging_interval` (default: 60 seconds) that finds `available` jobs
+with `priority > 1` that have been waiting longer than their aging threshold
+and decrements their `priority` column.
 
 The effective priority improves by one level for each `priority_aging_interval`
 that a job has waited:
@@ -59,15 +60,18 @@ tie — older jobs go first.
 
 The aging interval is configurable:
 
-- **Per maintenance service:** `MaintenanceService::priority_aging_interval()` (default: 60s)
-- **Per queue (dispatch config):** `QueueConfig::priority_aging_interval` (default: 60s, retained for per-queue overrides in future)
+- **Per queue:** `QueueConfig::priority_aging_interval` (default: 60s), used by
+  the queue-storage claim path.
+- **Canonical maintenance service:** `ClientBuilder::priority_aging_interval`
+  / `MaintenanceService::priority_aging_interval()` (default: 60s), used only
+  by the legacy canonical-storage physical aging pass.
 
 A shorter interval ages jobs faster (stronger starvation prevention, weaker
 priority enforcement). A longer interval ages jobs slower (stricter priority
 ordering, weaker starvation prevention). Setting the interval to a very large
 value effectively disables aging.
 
-### Why maintenance-based rather than query-time aging
+### Why the canonical engine used maintenance-based rather than query-time aging
 
 The original implementation computed aging at query time using a SQL expression:
 
@@ -118,8 +122,7 @@ This was moved to the maintenance task because:
 The starvation-prevention policy in this ADR still applies. The
 implementation detail changes under queue storage: the canonical engine
 aged rows in place on `awa.jobs_hot` with an `UPDATE ... SET priority =
-priority - 1`, while the queue storage engine ages work by rewriting
-entries through lane-local `laneSeq` advancement rather than mutating a
-single hot heap row. The dispatch ordering (`priority ASC, run_at ASC`)
-and the aging-interval contract are unchanged — see
-[ADR-019](019-queue-storage-redesign.md).
+priority - 1`, while the queue storage engine keeps ready rows in their
+original priority lanes and computes an effective priority in
+`claim_ready_runtime(...)` when choosing which lane to claim next. The
+aging-interval contract is unchanged — see [ADR-019](019-queue-storage-redesign.md).

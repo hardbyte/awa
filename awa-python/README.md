@@ -13,23 +13,33 @@ pip install awa-pg
 ```python
 import asyncio
 import os
+from dataclasses import dataclass
+
 from awa import AsyncClient
 
-async def send_email(args, ctx):
-    print(f"sending to {args['to']}: {args['subject']}")
+
+@dataclass
+class SendEmail:
+    to: str
+    subject: str
+
 
 async def main():
     client = AsyncClient(os.environ["DATABASE_URL"])
-    await client.register_kind("send_email", send_email)
-    await client.queue("email")
 
-    await client.enqueue(
-        "send_email",
-        {"to": "ada@example.com", "subject": "hello"},
+    @client.task(SendEmail, queue="email")
+    async def send_email(job):
+        print(f"sending to {job.args.to}: {job.args.subject}")
+
+    await client.start([("email", 4)])  # 4 workers on the email queue
+
+    await client.insert(
+        SendEmail(to="ada@example.com", subject="hello"),
         queue="email",
     )
 
-    await client.start([("email", 4)])  # 4 workers on the email queue
+    await asyncio.sleep(1)
+    await client.shutdown()
 
 asyncio.run(main())
 ```

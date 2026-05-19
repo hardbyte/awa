@@ -2,7 +2,10 @@
 
 ## Status
 
-Accepted
+Accepted. This ADR records the original canonical-storage implementation.
+Queue-storage deployments keep the user-facing progress API but store mutable
+progress snapshots in `{schema}.attempt_state`; see
+[Relationship to ADR-019](#relationship-to-adr-019).
 
 ## Context
 

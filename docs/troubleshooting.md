@@ -164,6 +164,88 @@ is lost. Long-running handlers that don't poll `ctx.is_cancelled()`
 between heartbeats won't notice the cancel until they finish or
 heartbeat-rescue fires.
 
+## Producer Enqueue Is Slower Than Expected
+
+### What It Usually Means
+
+Producers are enqueuing well below the rate the application offers, batches
+are taking longer than expected, or the consumer fleet is permanently
+undersaturated despite plenty of producer concurrency.
+
+### Reading The Producer Histograms
+
+The direct queue-storage COPY path
+(`QueueStorage::enqueue_params_copy` in Rust, `Client.enqueue_many_copy` in
+Python) records two histograms per batch:
+
+| Metric | What it measures |
+|---|---|
+| `awa.enqueue.batch_size` | Rows per COPY call |
+| `awa.enqueue.duration` | Wall-clock time per COPY call |
+
+Reading them together separates the two usual failure modes:
+
+- **Batches are tiny.** `batch_size` p50 sits at a handful of rows when the
+  upstream flow is bursty or chunked too aggressively. Throughput is bounded
+  by the per-batch round-trip cost, not the COPY itself. Increase chunk size
+  or batch the upstream side.
+- **Batches are slow.** `batch_size` p50 is reasonable (say ≥100) but
+  `duration` p99 is high. The COPY itself is contended on the DB side; see
+  the diagnoses below.
+
+### Diagnoses
+
+**1. Producer is going through the compatibility insert path.**
+
+`insert_many_copy_from_pool` / `client.insert_many_copy` routes every row
+through `awa.insert_job_compat()` once per row. On any database with
+non-trivial per-statement latency (auth-proxy hop, managed Postgres,
+network) the per-row function call dominates — measured at ~100–150 ms per
+row through a Cloud SQL Auth Proxy in staging, which caps a single producer
+at ~7 rows/sec regardless of batch or chunk size.
+
+Switch the producer to the direct queue-storage COPY entry point:
+
+- Rust: `QueueStorage::enqueue_params_copy(pool, &jobs)`
+- Python: `client.enqueue_many_copy(jobs)`
+
+See [Producer path choice](configuration.md#producer-path-choice).
+
+**2. `enqueue_shards` is `1` for the contended queue.**
+
+The default `enqueue_shards = 1` means every producer contends on a single
+enqueue-head row per `(queue, priority)`. Multi-producer enqueue serialises
+through that row. Check the live value:
+
+```sql
+SELECT queue, enqueue_shards FROM awa.queue_meta WHERE queue = '<queue>';
+```
+
+If no row is returned the queue is running with the default `1`. Raise it
+explicitly (a 16-producer same-queue reference sweep measured 1.0× → 1.60× →
+2.75× → 3.69× at `S = 1/2/4/8`):
+
+```sql
+INSERT INTO awa.queue_meta (queue, enqueue_shards)
+VALUES ('<queue>', 4)
+ON CONFLICT (queue)
+DO UPDATE SET enqueue_shards = EXCLUDED.enqueue_shards;
+```
+
+Use an upsert: first-enqueue may create lane rows before any operator
+inserts a `queue_meta` row, so a plain `UPDATE` quietly affects zero rows.
+Raising `enqueue_shards` is a semantic switch from strict to partitioned
+FIFO; see [ADR-025](adr/025-sharded-enqueue-heads.md).
+
+**3. WAL or commit pressure on the database.**
+
+If batch size and shard count both look healthy, sample `pg_stat_activity`
+for `LWLock:WALWrite` / `LWLock:WALSync` waits and confirm the database is
+sized for the offered rate. The per-vCPU sustained-completion and
+burst-enqueue numbers in
+[`docs/deploying-on-managed-postgres.md`](deploying-on-managed-postgres.md#pick-a-vcpu-size)
+are useful reference points.
+
 ## Leader Election Delays
 
 ### Expected Behavior
@@ -384,6 +466,31 @@ Fix:
 ```bash
 awa --database-url "$DATABASE_URL" migrate
 ```
+
+### `relation "awa.job_id_seq" does not exist`
+
+Cause:
+
+- A producer started before the queue-storage substrate had been
+  materialised on a fresh database, or the schema was dropped under a
+  running fleet.
+
+`awa.job_id_seq` is part of the queue-storage substrate created by the
+runtime's `prepare_schema` step the first time a worker boots against a
+schema — not by `awa migrate` alone, which builds the canonical surface.
+Migrations + worker startup together produce a usable schema.
+
+Fix:
+
+- Wait for the first consumer pod to log `Awa worker runtime started`
+  before scaling up producers.
+- If the schema was deliberately reset, re-run `awa migrate` **and** let
+  one worker pod boot to completion before resuming producer traffic.
+- If the error persists after both, the runtime may be pointing at a
+  different schema than the producer. Confirm with:
+  ```sql
+  SELECT awa.active_queue_storage_schema();
+  ```
 
 ### `register at least one worker before starting the runtime`
 

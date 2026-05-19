@@ -77,7 +77,7 @@ entries below remain as the granular development log.
   that queue to partitioned FIFO (strict within `(queue, priority,
   enqueue_shard)`, no order across shards) — comparable to choosing
   SQS Standard over FIFO.
-- **Completion-batcher defaults raised** to `(batch=256, flush=5ms)`.
+- **Queue-storage completion-batcher defaults tuned** to `(batch=512, flush=1ms)`.
   Tunable via `AWA_COMPLETION_BATCH_SIZE` and `AWA_COMPLETION_FLUSH_MS`.
 
 **Telemetry**
@@ -214,11 +214,11 @@ For users already running an alpha:
   un-decorated series; the two attribute sets do not overlap, so
   Prometheus `sum by (awa_enqueue_shard)(rate(awa_job_claimed[1m]))`
   is the per-shard fairness panel.
-- Raise the completion-batcher defaults to `(batch=256, flush=5ms)`
-  from `(batch=128, flush=1ms)`. Lets batches amortise the per-batch
-  completion SQL over more rows at the cost of a small latency
-  bump. Tunable via `AWA_COMPLETION_BATCH_SIZE` and
-  `AWA_COMPLETION_FLUSH_MS`.
+- Tune the queue-storage completion-batcher defaults to
+  `(batch=512, flush=1ms)`. The larger batch cap keeps the durable
+  completion path amortised under load, while the 1 ms flush keeps
+  low-latency finalization for short jobs. Tunable via
+  `AWA_COMPLETION_BATCH_SIZE` and `AWA_COMPLETION_FLUSH_MS`.
 - **Direct queue-storage COPY producer path is the documented
   high-volume entry point** ([#263](https://github.com/hardbyte/awa/pull/263)).
   Rust: `QueueStorage::enqueue_params_copy(pool, &jobs)`. Python:

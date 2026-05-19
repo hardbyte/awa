@@ -103,11 +103,12 @@ What is intentionally not modeled:
   0.5.x-to-0.6 storage transition control plane. It covers prepare,
   schema readiness, mixed-transition entry, canonical backlog drain,
   queue-storage routing, finalize, and abort interlocks. The desired
-  config requires a live queue-storage executor at the mixed-transition
-  gate and passes cleanly. The current-gate config intentionally models
-  the SQL capability-only gate and produces a witness where an auto
-  runtime started before mixed transition reports `queue_storage` while
-  prepared, then becomes drain-only after routing flips.
+  config matches the v014+ SQL gate: it requires a live queue-storage target
+  executor at mixed-transition entry and passes cleanly. The
+  `CurrentGate`-named config is now a historical pre-v014 regression witness:
+  it models the old capability-only gate where an auto runtime started before
+  mixed transition reports `queue_storage` while prepared, then becomes
+  drain-only after routing flips.
 - `storage/AwaSegmentedStorageTrace.tla` /
   `storage/AwaSegmentedStorageTrace.cfg` /
   `storage/AwaSegmentedStorageTraceReceiptRescue.cfg` /

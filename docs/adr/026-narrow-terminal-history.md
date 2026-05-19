@@ -91,7 +91,7 @@ terminal row has a retained ready body until queue prune removes both.
   `NULL` on ready-backed terminal rows. Use `{schema}.terminal_jobs` unless
   code intentionally needs the physical storage representation.
 - Terminal delete paths have one more responsibility: remove the retained
-  ready backing row before re-enqueueing, moving to DLQ, or discarding.
+  ready backing row before re-enqueuing, moving to DLQ, or discarding.
 - Queue-prune logic must continue treating ready and terminal rows as one
   retention unit.
 

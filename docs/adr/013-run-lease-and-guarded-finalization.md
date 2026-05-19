@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted. Queue storage keeps the same `run_lease` invariant, but the physical
+attempt identity is carried by queue-storage claim / lease state rather than by
+mutating a single canonical jobs heap row.
 
 ## Context
 
@@ -21,7 +23,7 @@ model.
 
 ## Decision
 
-Add a monotonic `run_lease` column to running job rows and require all
+Add a monotonic `run_lease` to the running attempt identity and require all
 heartbeat/finalization/callback state transitions to match on:
 
 - `id`
@@ -33,9 +35,9 @@ state is keyed by `(job_id, run_lease)`.
 
 ### Finalization Rule
 
-Finalization succeeds only if the current row still matches the claiming
-attempt's lease. If the guarded update affects zero rows, the result is stale
-and must be discarded.
+Finalization succeeds only if the current storage state still matches the
+claiming attempt's lease. If the guarded transition affects zero rows, the
+result is stale and must be discarded.
 
 ### Batched Completion
 

@@ -127,15 +127,18 @@ Terminal rows differ by storage backend:
   surfaces described above. If a transition deletes the ready row first, such
   as cancelling an unclaimed available job, the terminal row is written wide
   instead.
-- DLQ-enabled terminal failures are copied into `dlq_entries`; that table has
-  explicit retention cleanup plus operator retry/purge.
+- DLQ-enabled terminal failures are routed or moved into `dlq_entries`
+  instead of ordinary terminal history; that table has explicit retention
+  cleanup plus operator retry/purge.
 - In the canonical compatibility path, terminal rows in `awa.jobs_hot` use
   row-by-row retention cleanup.
 
 Progress is cleared on successful completion and preserved across retry,
-snooze, cancel, fail, and rescue. Cancellation is cooperative for live
-handlers: Rust handlers can poll `ctx.is_cancelled()`, Python handlers can poll
-`job.is_cancelled()`, and stale storage writes are still rejected by the
+snooze, cancel, fail, and rescue. On queue storage, mutable progress snapshots
+live in `attempt_state` once an attempt first needs that mutable state; they
+are not rewrites of the immutable ready row. Cancellation is cooperative for
+live handlers: Rust handlers can poll `ctx.is_cancelled()`, Python handlers can
+poll `job.is_cancelled()`, and stale storage writes are still rejected by the
 `run_lease` guard if a handler misses the signal.
 
 ## Enqueue And Claim
@@ -230,7 +233,9 @@ Two callback modes share the same attempt guard:
 Callback tokens are attempt-specific. Stale tokens and stale completions are
 rejected after a newer claim or terminal transition. The `awa-ui` HTTP callback
 receiver verifies `X-Awa-Signature` when `AWA_CALLBACK_HMAC_SECRET` is set;
-custom callback receivers must provide equivalent authentication.
+custom callback receivers must provide equivalent authentication. See
+[HTTP workers and callback signatures](http-callbacks.md) for the concrete
+endpoint and signing contract.
 
 ## Recovery Model
 

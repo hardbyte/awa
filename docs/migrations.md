@@ -8,12 +8,18 @@ Awa ships forward-only schema migrations.
 
 Current guarantees from the migration layer:
 
-- migrations are additive-only
+- migrations are forward-only and safe to re-run where possible
 - fresh installs bootstrap the full schema
 - rerunning migrations is safe
 - older pre-0.4 version numbering is normalized during upgrade
 
-The additive-only policy is what makes rolling upgrades practical.
+Most migrations are additive, but storage-engine migrations can be
+non-additive when they are protected by rollout gates. For example,
+queue-storage migrations reshape internal keys, drop obsolete columns, and
+`prepare_schema()` performs operational DDL for partitions, indexes,
+sequences, and helper functions. Rolling upgrades stay practical because those
+changes are forward-only, idempotent where possible, and gated by the storage
+transition state rather than by assuming every DDL step is additive.
 
 ## Fresh Install
 

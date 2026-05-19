@@ -33,8 +33,8 @@ pub struct HttpWorkerConfig {
     pub callback_timeout: Duration,
     /// Static headers to include in every request (e.g., auth tokens).
     pub headers: HashMap<String, String>,
-    /// HMAC signing key for callback authentication. When set, the worker
-    /// signs the callback ID with blake3 keyed hashing and includes the
+    /// Callback signing key. When set, the worker signs the callback ID with
+    /// BLAKE3 keyed hashing and includes the
     /// signature as `X-Awa-Signature`.
     pub hmac_secret: Option<[u8; 32]>,
     /// Base URL for the callback endpoint. The full callback URL is
@@ -189,7 +189,7 @@ impl HttpWorker {
             request = request.header(key.as_str(), value.as_str());
         }
 
-        // Add HMAC signature
+        // Add callback signature
         if let Some(signature) = self.sign_callback_id(&callback_id_str) {
             request = request.header("X-Awa-Signature", &signature);
         }

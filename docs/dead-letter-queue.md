@@ -67,6 +67,12 @@ with `attempt = 0` and `run_lease = 0`, ready for fresh processing. The
 retry is recorded in the job's error history; the original failure trail is
 preserved.
 
+The CLI retries with the stored queue, priority, and immediate `run_at`. The
+programmatic APIs can override those when reviving a DLQ row; use Python
+`retry_from_dlq(job_id, priority=..., queue=..., run_at=...)` or Rust
+`RetryFromDlqOpts` when recovery should promote, demote, reroute, or delay the
+job.
+
 ## Moving existing terminal failures into the DLQ
 
 If you turn on `dlq_enabled` for a queue that already has accumulated
@@ -108,9 +114,16 @@ queue-plane reclamation.
 
 ## Programmatic access
 
-The Rust API exposes the same operations through `awa::admin::dlq` (or via
-`awa-worker`'s `Client::dlq()` accessor). The Python bindings expose the
-same surface as `client.dlq()`; both wrap the same SQL helpers the CLI uses.
+Rust callers use `awa_model::dlq` directly, or `awa::model::dlq` through the
+facade crate, for DLQ list, retry, move, and purge helpers. Admin helpers
+such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and
+`bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
+
+Python callers use direct client methods:
+`list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`,
+`bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and
+`purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)`
+purges one DLQ row by job ID. These wrap the same SQL helpers the CLI uses.
 
 ## See also
 

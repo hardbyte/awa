@@ -190,14 +190,15 @@ The implementation and migrations use these physical names:
 ### Lifecycle mapping
 
 - Enqueue immediate job: append to `ready_entries`.
-- Claim: read `lane_state`, claim the next ready entries, insert
-  `active_leases`, increment `run_lease`, and advance the lane cursor based on
-  the rows actually selected.
-- Short zero-deadline claim: append a `lease_claims` receipt instead of an
-  immediate `active_leases` row.
-- Short zero-deadline rescue before first heartbeat: close the stale receipt
-  append-only and requeue it without first materializing a mutable
-  `active_leases` row.
+- Claim: lock the queue's `queue_claim_heads` row, join the matching
+  `queue_enqueue_heads` row, select the next ready entries, increment
+  `run_lease`, append a receipt into `lease_claims` by default, and advance the
+  claim cursor based on the rows actually selected.
+- Receipt-backed deadlines: per-queue deadlines live on
+  `lease_claims.deadline_at` until the attempt materializes into the lease
+  plane for callbacks, progress, or other mutable state.
+- Receipt rescue before materialization: close the stale receipt append-only
+  and requeue it without first materializing a mutable `leases` row.
 - Runtime reads that need the current live receipt-backed set (`queue_counts`,
   receipt rescue, and receipt-backed `load_job`) consult only the active
   claim-ring partitions, not the full append-only claim history. **historical:**
@@ -310,9 +311,10 @@ The decision above pins two hot-path requirements that surface repeatedly
 in implementation:
 
 - Claim runs as a single server-side step: one SQL function locks
-  `lane_state`, selects the oldest runnable segment-local entry, and inserts
-  the `active_leases` row. Dispatch must not round-trip between the cursor
-  read and the lease insert.
+  `queue_claim_heads`, selects the oldest runnable segment-local entry for the
+  shard-qualified lane, and appends either a `lease_claims` receipt or a
+  materialized `leases` row. Dispatch must not round-trip between the cursor
+  read and the claim insert.
 - Short successful completion carries the immutable claim-time job snapshot
   through the completion batcher so the terminal append does not reload
   `ready_entries`.
@@ -367,18 +369,14 @@ active partitions, eliminating the last MVCC churn source on the receipt
 plane. Further lease-plane work is still
 tracked in
 [`lease-plane-redesign-spike.md`](../archive/0.6-storage-design/lease-plane-redesign-spike.md).
-The current queue-level coordination track for the remaining many-small-replica
-blocker is
-[`bounded-claimers-plan.md`](../archive/0.6-storage-design/bounded-claimers-plan.md):
-bound how
-many replicas may actively claim from a hot queue at once, keep direct
-short-job starts, and avoid a second start-phase transaction. Because that
-controller still leaves hot-queue tails and crash/recovery behavior above the
-shipping bar, the next serious complementary design is now
-[`queue-striping-plan.md`](../archive/0.6-storage-design/queue-striping-plan.md):
-reduce single-queue
-coordination pressure by striping one logical queue across multiple physical
-coordination paths while preserving the existing attempt lifecycle.
+The remaining queue-level coordination controls are implemented as bounded
+claimers, queue striping (`queue_stripe_count`), and per-queue enqueue-head
+sharding (`queue_meta.enqueue_shards`). The archived
+[`bounded-claimers-plan.md`](../archive/0.6-storage-design/bounded-claimers-plan.md)
+and
+[`queue-striping-plan.md`](../archive/0.6-storage-design/queue-striping-plan.md)
+capture design history; current operator guidance lives in
+[`configuration.md`](../configuration.md#queue-storage-tuning).
 
 Spec-level safety is checked by the segmented-storage TLA+ family —
 `AwaSegmentedStorage`, `AwaSegmentedStorageRaces`, `AwaStorageLockOrder`,

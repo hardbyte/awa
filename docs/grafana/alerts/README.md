@@ -50,7 +50,11 @@ sed 's/DS_PROMETHEUS/prom/' docs/grafana/alerts/awa-alerts-prometheus.yaml \
 
 ## Validating the rules locally
 
-`tmp/test_alerts.sh` (not committed) can be used to exercise these rules against a local Grafana + otel-lgtm stack; see the "Dashboard screenshots" section of `docs/grafana/README.md` for the demo-data runner that makes them fire.
+For the Prometheus rule set, run the observability side-stack in
+`docker/observability/` and point a local worker or benchmark at
+`OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317`. For the Postgres rule set,
+provision a Postgres datasource that can read the Awa schema and use Grafana's
+rule test UI after replacing `DS_POSTGRES` with that datasource UID.
 
 ## Extending
 

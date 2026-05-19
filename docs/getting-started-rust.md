@@ -6,10 +6,10 @@ This guide takes you from `cargo add` to a job reaching `completed`.
 
 Before writing code, it helps to know what Awa is doing for you:
 
-- enqueueing inserts a durable row into Postgres; if your transaction rolls back, the job disappears too
-- workers claim runnable rows, increment the attempt, and keep the claim alive with heartbeats
-- retries, callback waits, and progress updates all land back on that same job row
-- inspection is row-centric: when something looks wrong, dump the job and inspect its current state, progress, callback config, and recorded errors
+- enqueuing persists durable job state in Postgres; if your transaction rolls back, the job disappears too
+- workers claim runnable jobs, increment the attempt, and keep the claim alive with heartbeats
+- retries, callback waits, and progress updates are persisted in Postgres and exposed as one hydrated job snapshot through the CLI, UI, and admin APIs
+- inspection is job-centric: when something looks wrong, dump the job and inspect its current state, progress, callback config, and recorded errors
 
 The important habit is to treat Postgres as the system of record for job execution, not worker memory.
 
@@ -140,7 +140,7 @@ awa --database-url "$DATABASE_URL" queue stats
 awa --database-url "$DATABASE_URL" serve
 ```
 
-`job dump` prints the full job snapshot as JSON. `job dump-run` prints one attempt-oriented view: the current attempt comes from the live job row, while older attempts are reconstructed from the recorded error history.
+`job dump` prints the full job snapshot as JSON. `job dump-run` prints one attempt-oriented view: the current attempt is hydrated from live storage state, while older attempts are reconstructed from the recorded error history.
 
 The UI starts on `http://127.0.0.1:3000` by default.
 
@@ -163,7 +163,7 @@ let opts = InsertOpts {
     ordering_key: Some(format!("customer-{customer_id}").into_bytes()),
     ..Default::default()
 };
-client.insert_with(UpdateCustomer { customer_id, payload }, opts).await?;
+awa::insert_with(&pool, &UpdateCustomer { customer_id, payload }, opts).await?;
 ```
 
 At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sharded-enqueue-heads.md) for the partitioned-FIFO contract and [`docs/upgrade-0.5-to-0.6.md`](upgrade-0.5-to-0.6.md#raising-enqueue_shards) for the operator-side knob.

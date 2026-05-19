@@ -66,6 +66,6 @@ claim, and completion never touch `awa.queue_descriptors` or
 the dispatcher's queue-state read. This preserves the ADR-019 property that
 operator-facing metadata changes cannot affect dispatch throughput.
 
-See [architecture.md → Control-plane descriptors](../architecture.md#control-plane-descriptors)
+See [architecture.md → Descriptors And Runtime Liveness](../architecture.md#descriptors-and-runtime-liveness)
 for the implementation details, hashing algorithm, and measured
 performance profile.

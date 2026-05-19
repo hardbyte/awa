@@ -20,7 +20,7 @@ against the admin API.
   `QueueStorage::enqueue_params_copy` for direct queue-storage COPY ingestion
   with an explicitly configured queue-storage engine.
 - **Migrations** — `migrations::run` applies the schema; `migrations`,
-  `migrations_range`, and `current_migration_version` expose the
+  `migration_sql`, `migration_sql_range`, and `current_version` expose the
   catalog for tooling.
 - **Admin** (`admin`) — retry, cancel (single, by unique key, bulk),
   pause/resume/drain queues, queue and job-kind overviews, runtime
@@ -48,7 +48,7 @@ so applications get the macro automatically.
 ## Example: enqueue-only producer
 
 ```rust
-use awa_model::{insert, InsertOpts, JobArgs};
+use awa_model::{insert_with, InsertOpts, JobArgs};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, JobArgs)]
@@ -62,10 +62,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let pool = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     awa_model::migrations::run(&pool).await?;
 
-    let job = insert(&pool, &SendEmail {
-        to: "ada@example.com".into(),
-        subject: "hi".into(),
-    }, InsertOpts::default()).await?;
+    let job = insert_with(
+        &pool,
+        &SendEmail {
+            to: "ada@example.com".into(),
+            subject: "hi".into(),
+        },
+        InsertOpts::default(),
+    ).await?;
 
     println!("enqueued {}", job.id);
     Ok(())

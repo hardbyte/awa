@@ -131,7 +131,7 @@ the worker role/effective-storage resolution in
 | TLA+ variable / action | Rust / SQL equivalent |
 |---|---|
 | `state`, `currentEngine`, `preparedEngine` | `awa.storage_transition_state.state`, `current_engine`, `prepared_engine` |
-| `preparedSchemaReady` | `queue_storage_schema_ready()` / SQL checks for `{schema}.queue_ring_state`, `ready_entries`, and `leases` |
+| `preparedSchemaReady` | `queue_storage_schema_ready()` / SQL checks for the queue-storage substrate needed by producers and claimers: `{schema}.job_id_seq`, `queue_ring_state`, `ready_entries`, `done_entries`, `leases`, `deferred_jobs`, `lease_claims`, `lease_claim_closures`, and `claim_ready_runtime(...)` |
 | `oldCanonicalLive` | live `awa.runtime_instances` rows with `storage_capability = 'canonical'` |
 | `autoPreMixedLive` | a 0.6 `TransitionWorkerRole::Auto` runtime that resolved effective storage to canonical before mixed transition; it reports `queue_storage` while prepared and `canonical_drain_only` once routing flips |
 | `queueTargetLive` | `TransitionWorkerRole::QueueStorageTarget`; the only modeled runtime population that can execute queue-storage work immediately after mixed transition |
