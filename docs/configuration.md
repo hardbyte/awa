@@ -269,7 +269,7 @@ effective priority used for that claim. In canonical storage, the maintenance
 leader physically rewrites waiting rows from priority N to N-1 and preserves
 the enqueue priority in `metadata._awa_original_priority`.
 
-The admin UI shows the priority on the current job row and, when
+The admin UI shows the priority on the current job snapshot and, when
 `_awa_original_priority` is present, the original enqueue priority as
 `(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or
 `priority_aging_interval_ms: 0` (Python) to disable escalation

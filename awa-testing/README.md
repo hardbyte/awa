@@ -18,8 +18,9 @@ port `15432`).
 - `TestClient` — synchronous-feeling wrapper around a `PgPool`:
   - `migrate()` runs the schema and resets the runtime backend so
     tests start from a known state.
-  - `clean()` truncates `awa.jobs`, `awa.queue_meta`, and the
-    runtime-storage backend rows for cross-test isolation.
+  - `clean()` resets the runtime backend and deletes through the
+    `awa.jobs` compatibility surface plus `awa.queue_meta` for
+    cross-test isolation.
   - `insert(&args)` enqueues one job.
   - `work_one(&worker)` / `work_one_in_queue(&worker, queue)` claim
     and execute exactly one job through the supplied `Worker`,
@@ -31,6 +32,11 @@ port `15432`).
 - `setup` module — `database_url()`, `database_url_with_app_name()`,
   `pool()`, `pool_with_url()` helpers and `reset_runtime_backend()`
   for explicit test cleanup.
+
+`TestClient` is intentionally a lightweight compatibility-surface harness. It
+does not exercise the full dispatcher, queue-storage receipt plane, or
+maintenance leader; use the worker runtime or integration benchmarks when a
+test needs production storage-path fidelity.
 
 ## Usage
 

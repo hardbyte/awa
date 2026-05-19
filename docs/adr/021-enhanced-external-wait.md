@@ -2,7 +2,9 @@
 
 ## Status
 
-Accepted
+Accepted. This ADR records the user-facing callback semantics. ADR-019 moved
+the physical callback fields from canonical storage onto queue-storage lease /
+attempt state; see [Relationship to ADR-019](#relationship-to-adr-019).
 
 ## Context
 
@@ -63,7 +65,7 @@ async def handle(job):
 
 **Implementation:** `wait_for_callback(token)` is a new method on `JobContext` / `Job` that:
 1. Transitions the job to `waiting_external` (same as today's `WaitForCallback` return)
-2. Suspends the handler's async task and polls the job row until the callback resolves
+2. Suspends the handler's async task and polls the storage-backed job snapshot until the callback resolves
 3. `resume_external(callback_id, payload)` transitions the job back to `running` and stores the payload in `metadata._awa_callback_result`
 4. The handler consumes that payload and resumes execution
 
@@ -140,7 +142,7 @@ No schema changes — reuses the existing `callback_timeout_at` column.
 ## Implementation Notes
 
 1. `heartbeat_callback` — new SQL function, admin endpoint, Python/Rust API method. No schema changes.
-2. `wait_for_callback` on JobContext/Job — transitions to `waiting_external`, then polls the job row until `resume_external` stores the callback payload and returns the job to `running`.
+2. `wait_for_callback` on JobContext/Job — transitions to `waiting_external`, then polls the storage-backed job snapshot until `resume_external` stores the callback payload and returns the job to `running`.
 3. Update TLA+ models for the new `waiting_external → running` resume transition.
 4. CLI/UI: add visibility for "waiting for callback #N" in the job detail view.
 5. Documented example patterns in `/docs/callbacks.md`.
@@ -157,11 +159,8 @@ No schema changes — reuses the existing `callback_timeout_at` column.
 
 ## Relationship to ADR-019
 
-ADR-019 moved callback state from the canonical `awa.jobs` row onto the
-queue-storage execution lease (`{schema}.active_leases`): the
-`callback_id`, `callback_timeout_at`, and `heartbeat_at` columns now live
-on the lease row keyed by `(job_id, run_lease)`. User-facing semantics
-are unchanged — sequential waits, callback heartbeats, and timeout
-handling remain exactly as described here. The SQL examples in the
-Implementation section above have been updated to target
-`active_leases`.
+ADR-019 moved callback state from the canonical `awa.jobs` row onto
+queue-storage execution state: `leases_*` holds the dispatch / timeout fields
+and `attempt_state` holds mutable per-attempt payloads keyed by
+`(job_id, run_lease)`. User-facing semantics are unchanged — sequential waits,
+callback heartbeats, and timeout handling remain exactly as described here.

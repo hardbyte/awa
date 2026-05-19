@@ -140,7 +140,7 @@ awa --database-url "$DATABASE_URL" queue stats
 awa --database-url "$DATABASE_URL" serve
 ```
 
-`job dump` prints the full job snapshot as JSON. `job dump-run` prints one attempt-oriented view: the current attempt comes from the live job row, while older attempts are reconstructed from the recorded error history.
+`job dump` prints the full job snapshot as JSON. `job dump-run` prints one attempt-oriented view: the current attempt is hydrated from live storage state, while older attempts are reconstructed from the recorded error history.
 
 The UI starts on `http://127.0.0.1:3000` by default.
 

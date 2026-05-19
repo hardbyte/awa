@@ -540,16 +540,23 @@ single-queue performance. This is tracked as a future optimization.
 
 ### Progress Feature Overhead
 
-The structured progress feature (ADR-014) adds a `progress JSONB` column
-and a two-tier heartbeat flush. Performance impact was validated:
+ADR-014 introduced the user-facing structured progress API and a two-tier
+heartbeat flush. In the current queue-storage engine, mutable progress lives in
+`{schema}.attempt_state` only after an attempt first needs per-attempt mutable
+state; short jobs that never report progress do not allocate an
+`attempt_state` row. Older benchmark notes refer to `progress` columns on
+`jobs_hot` / `scheduled_jobs`, which was the canonical-storage implementation.
+
+Performance impact was validated:
 
 - **Zero overhead when no progress is set.** The heartbeat service
-  partitions jobs by pending progress — jobs without mutations use the
-  original heartbeat-only query. `snapshot_pending_progress` returns empty
-  when no generation has been bumped.
-- **Completion batcher** adds `progress = NULL` to the batch UPDATE. This
-  is a constant-time write to a nullable column with no measurable impact
-  (batcher throughput remains ~78k/s in unit benchmarks).
+  partitions jobs by pending progress; jobs without mutations use the
+  heartbeat-only path, and `snapshot_pending_progress` returns empty when no
+  generation has been bumped.
+- **Completion remains narrow.** Successful completion clears the progress
+  snapshot while closing the attempt. On queue storage this is handled through
+  the attempt-state / terminal-snapshot path rather than rewriting the ready
+  row.
 - **Sustained hot-path throughput** was unchanged when the progress feature
   was added. Current hot-path throughput (~5.6k/s) reflects the additional
   v0.5.0 OTel metrics instrumentation, not progress overhead.

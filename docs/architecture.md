@@ -134,9 +134,11 @@ Terminal rows differ by storage backend:
   row-by-row retention cleanup.
 
 Progress is cleared on successful completion and preserved across retry,
-snooze, cancel, fail, and rescue. Cancellation is cooperative for live
-handlers: Rust handlers can poll `ctx.is_cancelled()`, Python handlers can poll
-`job.is_cancelled()`, and stale storage writes are still rejected by the
+snooze, cancel, fail, and rescue. On queue storage, mutable progress snapshots
+live in `attempt_state` once an attempt first needs that mutable state; they
+are not rewrites of the immutable ready row. Cancellation is cooperative for
+live handlers: Rust handlers can poll `ctx.is_cancelled()`, Python handlers can
+poll `job.is_cancelled()`, and stale storage writes are still rejected by the
 `run_lease` guard if a handler misses the signal.
 
 ## Enqueue And Claim

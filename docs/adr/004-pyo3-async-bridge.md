@@ -71,7 +71,7 @@ The `awa-python` crate (`awa-python/src/`) exposes:
 
 - `PyClient`: Connection pool management, job insertion, worker registration, admin operations.
 - `PyTransaction`: Async context manager wrapping a Postgres transaction for atomic enqueue.
-- `PyJob`: Read-only view of a job row with Python-native getters (args as dict, timestamps as ISO strings).
+- `PyJob`: Read-only view of a hydrated job snapshot with Python-native getters (args as dict, timestamps as ISO strings).
 - `PyJobState`: Enum matching Rust's `JobState`.
 - `PyRetryAfter`, `PySnooze`, `PyCancel`: Return types for worker handlers.
 
