@@ -24,7 +24,7 @@ port `15432`).
   - `work_one(&worker)` / `work_one_in_queue(&worker, queue)` claim
     and execute exactly one job through the supplied `Worker`,
     returning a `WorkResult` (`Completed`, `Failed`, `Snoozed`,
-    `Cancelled`, `WaitingExternal`, `NoJob`).
+    `Retryable`, `Cancelled`, `WaitingExternal`, `NoJob`).
   - `get_job(id)` returns the current `JobRow`.
 - `WorkResult` — enum with `is_completed()`, `is_failed()`,
   `is_waiting_external()`, `is_no_job()` predicates.
@@ -49,11 +49,12 @@ struct SendEmailWorker;
 
 #[async_trait::async_trait]
 impl awa::Worker for SendEmailWorker {
-    type Args = SendEmail;
     fn kind(&self) -> &'static str { "send_email" }
-    async fn perform(&self, ctx: &awa::JobContext<Self::Args>) -> awa::JobResult {
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<awa::JobResult, awa::JobError> {
+        let _args: SendEmail = serde_json::from_value(ctx.job.args.clone())
+            .map_err(|e| awa::JobError::terminal(e.to_string()))?;
         // ... run the side-effect under test ...
-        Ok(())
+        Ok(awa::JobResult::Completed)
     }
 }
 

@@ -259,7 +259,7 @@ Configs:
   requiring a live queue-storage executor at `EnterMixedTransition`. TLC
   completes cleanly with **222 distinct states**.
 - [`AwaStorageTransitionCurrentGate.cfg`](./AwaStorageTransitionCurrentGate.cfg):
-  expected failing witness for the current SQL-level capability-only gate.
+  historical pre-v014 failing witness for the old SQL-level capability-only gate.
   TLC trips `MixedHasQueueExecutor` in 5 steps: prepare queue storage,
   prepare schema, start an auto pre-mixed runtime, enter mixed transition,
   and end up with queue-storage routing but no queue executor.
@@ -358,9 +358,9 @@ This spec models the **architectural contract** for dead tuples.
 For partitioned hot tables it checks that a real truncate path exists.
 For `BacklogRowVacuum` tables it deliberately does not claim a static
 proof: the complementary numerical check (how many dead tuples does the
-system actually accumulate under load X?) lives in the bench harness; see
-`benchmarks/portable/long_horizon.py` and the per-table dead-tuple
-columns in the `summary.json` it produces.
+system actually accumulate under load X?) lives in the external
+`hardbyte/postgresql-job-queue-benchmarking` harness; see the long-horizon
+runner and the per-table dead-tuple columns in the `summary.json` it produces.
 
 ## Trace-validation harness
 

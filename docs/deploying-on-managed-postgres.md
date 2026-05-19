@@ -59,9 +59,13 @@ much smaller instances than their peak insertion rate would suggest.
 
 ## IAM and Cloud SQL connectivity
 
-The runtime needs schema-owner privileges to call `prepare_schema`
-(which idempotently creates partitions, indexes, and sequences during
-worker startup) and to run migrations.
+Migrations and queue-storage schema preparation need DDL-capable
+credentials. Ordinary workers can run with the runtime grants in
+[`security.md`](security.md) once `awa migrate` and
+`awa storage prepare-queue-storage-schema` have already materialized the
+schema. If you rely on fresh-install auto-prepare from the first worker
+startup instead, that worker connection also needs the DDL privileges required
+by `prepare_schema()`.
 
 ### Cloud SQL with IAM authentication
 
@@ -77,9 +81,9 @@ typically lives next to your Terraform that creates the IAM user:
 GRANT cloudsqlsuperuser TO "operator@PROJECT.iam";
 ```
 
-If you skip this, the first worker startup against a fresh DB will
-fail with `permission denied to create database` or similar, and your
-migrate job will hang waiting for DDL it can't issue.
+If you skip this for the role that runs migrations / schema preparation, the
+setup job can fail with ownership or DDL permission errors before workers ever
+reach the queue-storage engine.
 
 ### AlloyDB
 
@@ -128,13 +132,15 @@ The default `awa.queue_meta.enqueue_shards = 1` means every producer
 contends on a single enqueue-head row per `(queue, priority)`. With
 multiple concurrent producers this serialises the entire enqueue path.
 
-**Recommendation: insert a `queue_meta` row for every queue you create,
-with `enqueue_shards` set to at least 4.** A 16-producer same-queue
-sweep in awa's own benchmark measured 1.0× / 1.60× / 2.75× / 3.69× at
-S=1/2/4/8 — that's about a 2.75× lift from S=1 to S=4 on a contended
-queue. The staging benchmark sweep at S=4/8/16/32 (a different,
-4-producer setup with the producer not the bottleneck) showed no
-material difference between those values at 10 k offered.
+**Recommendation: insert a `queue_meta` row for every high-volume queue and
+set `enqueue_shards` to at least 4 only when that queue can accept
+partitioned FIFO.** Keep `enqueue_shards = 1` for queues that require strict
+FIFO across the whole `(queue, priority)` lane. A 16-producer same-queue sweep
+in awa's own benchmark measured 1.0× / 1.60× / 2.75× / 3.69× at S=1/2/4/8 —
+that's about a 2.75× lift from S=1 to S=4 on a contended queue. The staging
+benchmark sweep at S=4/8/16/32 (a different, 4-producer setup with the
+producer not the bottleneck) showed no material difference between those
+values at 10 k offered.
 
 ```sql
 INSERT INTO awa.queue_meta (queue, enqueue_shards)
@@ -180,19 +186,13 @@ full surface comparison.
 These all eventually have fixes or workarounds, but each one cost
 hours the first time:
 
-- **Concurrent worker startup on a fresh DB can hang `prepare_schema`.**
-  All N consumer pods race to do `CREATE SEQUENCE IF NOT EXISTS
-  awa.job_id_seq` and (especially on PG18) block indefinitely. Until
-  this is fixed in the runtime (tracked as
-  [#264](https://github.com/hardbyte/awa/issues/264)), bring the
-  runtime up with `replicas=1` first, let it finish `prepare_schema`,
-  then scale to your target replica count. Or pre-create
-  `awa.job_id_seq` as part of your deploy pipeline.
-
-- **`pg_stat_activity` shows nothing during the hang.** No active
-  query, no error log — just consumer pods sitting on "Starting Awa
-  worker runtime" forever. Don't waste time hunting for a stuck query;
-  go straight to a manual rollout / replica reduction.
+- **Concurrent worker startup on a fresh DB used to expose
+  `prepare_schema` races.** The #264 fix serializes schema preparation under a
+  transaction-scoped advisory lock and keeps the install body on that same
+  connection. Still prefer running `awa migrate` and
+  `awa storage prepare-queue-storage-schema` as an explicit rollout step in
+  production: it gives you one clear DDL owner, avoids first-request startup
+  surprises, and lets workers use runtime-only grants.
 
 - **PG18-on-AlloyDB upgrade preserves the schema and v021 indexes
   across the cut-over.** No re-bootstrap needed; just verify the

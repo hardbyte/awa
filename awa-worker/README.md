@@ -22,7 +22,7 @@ top of Awa.
 - **Handler results** — `JobResult` (`Completed`, `RetryAfter`,
   `Snooze`, `Cancel`, `WaitForCallback`) and `JobError`. Implement
   the `Worker` trait directly or register typed closures with
-  `register_handler`.
+  `ClientBuilder::register`.
 - **Queue configuration** — `QueueConfig` (concurrency, weighted mode,
   rate limiting, per-claim deadlines), `RateLimit`.
 - **Lifecycle hooks** — `JobEvent<T>` and `UntypedJobEvent` fire when

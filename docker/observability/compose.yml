@@ -1,9 +1,10 @@
 # Observability side-stack for the long-horizon bench.
 #
-# Start independently of `benchmarks/portable/docker-compose.yml` —
-# this stack is opt-in for capturing OTel metrics from awa-bench
-# replicas and visualising them through the dashboard the awa repo
-# already ships at `docs/grafana/awa-dashboard.json`.
+# Start independently of the workload under test. This stack is opt-in
+# for capturing OTel metrics from Awa workers or from the external
+# hardbyte/postgresql-job-queue-benchmarking harness, then visualising
+# them through the dashboard the awa repo already ships at
+# `docs/grafana/awa-dashboard.json`.
 #
 # Usage (from this directory):
 #
@@ -13,7 +14,7 @@
 #
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 #   OTEL_SERVICE_NAME=awa-portable-bench \
-#   uv run python ../../benchmarks/portable/long_horizon.py run ...
+#   uv run python long_horizon.py run ...
 #
 # Grafana lands at http://localhost:13000 (admin/admin), with the
 # Awa dashboard pre-loaded under "Awa / Awa Job Queue".

@@ -17,7 +17,7 @@ awa = "0.6"
 ## Quick start
 
 ```rust
-use awa::{Client, JobArgs, JobContext, JobResult, QueueConfig};
+use awa::{insert_with, Client, InsertOpts, JobArgs, JobResult, QueueConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, JobArgs)]
@@ -26,26 +26,32 @@ struct SendEmail {
     subject: String,
 }
 
-async fn send_email(ctx: JobContext<SendEmail>) -> JobResult {
-    println!("sending to {}: {}", ctx.args.to, ctx.args.subject);
-    Ok(())
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let pool = sqlx::PgPool::connect(&std::env::var("DATABASE_URL")?).await?;
     let client = Client::builder(pool.clone())
         .queue("email", QueueConfig::default())
-        .register_handler::<SendEmail, _, _>(send_email)
-        .build()
-        .await?;
-
-    client.enqueue(SendEmail {
-        to: "ada@example.com".into(),
-        subject: "hello".into(),
-    }).await?;
+        .register::<SendEmail, _, _>(|args, _ctx| async move {
+            println!("sending to {}: {}", args.to, args.subject);
+            Ok(JobResult::Completed)
+        })
+        .build()?;
 
     client.start().await?;
+
+    insert_with(
+        &pool,
+        &SendEmail {
+            to: "ada@example.com".into(),
+            subject: "hello".into(),
+        },
+        InsertOpts {
+            queue: "email".into(),
+            ..Default::default()
+        },
+    )
+    .await?;
+
     Ok(())
 }
 ```
@@ -84,7 +90,7 @@ let opts = InsertOpts {
     ordering_key: Some(format!("customer-{customer_id}").into_bytes()),
     ..Default::default()
 };
-client.insert_with(UpdateCustomer { ... }, opts).await?;
+awa::insert_with(&pool, &UpdateCustomer { ... }, opts).await?;
 ```
 
 Jobs sharing an `ordering_key` always pick the same shard, so the

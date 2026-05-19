@@ -9,7 +9,8 @@
 //! configure their exporter (Prometheus, OTLP, etc.) before starting the
 //! client.
 //!
-//! All metrics use the `awa` meter name and follow OTel semantic conventions:
+//! All metrics use the `awa` meter name and follow OpenTelemetry naming and
+//! unit guidance:
 //! - Dot-separated hierarchical namespaces (`awa.job.*`, `awa.dispatch.*`)
 //! - Singular nouns for namespaces (not pluralized)
 //! - Units declared via `.with_unit()` using UCUM notation

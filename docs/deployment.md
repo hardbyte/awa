@@ -56,15 +56,21 @@ schema name or segment sizing.
 
 Practical starting point, based on the current runtime internals:
 
-- each configured queue keeps one `LISTEN` connection open for wakeups
+- each active queue claimer keeps one `LISTEN` connection open for wakeups
+  (`sum(queue.claimers)`, which equals `queue_count` with default claimers)
+- one cancel listener keeps a `LISTEN` connection open for admin-cancel
+  notifications
 - the elected leader holds one advisory-lock connection while it remains leader
 - claim, heartbeat, completion, cleanup, and handler SQL all share the same pool
 
 Conservative starting heuristic, not a hard requirement:
 
 ```text
-max_connections >= queue_count + 4
+max_connections >= sum(queue.claimers) + 5
 ```
+
+With the default `claimers = 1`, this is the old shortcut:
+`max_connections >= queue_count + 5`.
 
 Then add headroom for:
 
@@ -256,7 +262,9 @@ This forces read-only even when the Postgres connection is fully writable — th
 
 If you expose the callback receiver endpoints for `HttpWorker`, also configure
 `AWA_CALLBACK_HMAC_SECRET` (or `--callback-hmac-secret`) so `awa-ui` verifies
-`X-Awa-Signature` on callback requests.
+`X-Awa-Signature` on callback requests. See
+[HTTP workers and callback signatures](http-callbacks.md) for the worker,
+function, and receiver contract.
 
 ## Next
 

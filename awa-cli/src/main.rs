@@ -110,10 +110,9 @@ enum Commands {
 }
 
 fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
-    let bytes =
-        hex::decode(secret).map_err(|_| "callback HMAC secret must be valid hex".to_string())?;
+    let bytes = hex::decode(secret).map_err(|_| "callback secret must be valid hex".to_string())?;
     <[u8; 32]>::try_from(bytes.as_slice())
-        .map_err(|_| "callback HMAC secret must be exactly 32 bytes (64 hex characters)".into())
+        .map_err(|_| "callback secret must be exactly 32 bytes (64 hex characters)".into())
 }
 
 #[derive(Subcommand)]
@@ -392,7 +391,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .as_deref()
                 .map(parse_callback_hmac_secret)
                 .transpose()
-                .map_err(|err| format!("invalid callback HMAC secret: {err}"))?;
+                .map_err(|err| format!("invalid callback secret: {err}"))?;
             let read_only_mode = if read_only {
                 awa_ui::state::ReadOnlyMode::ReadOnly
             } else {

@@ -1,8 +1,10 @@
 # Observability side-stack
 
-OTel collector + Prometheus + Grafana for visualising metrics from the
-long-horizon bench harness. Independent of `benchmarks/portable/docker-compose.yml`,
-so it can be brought up and down without disturbing the bench's postgres.
+OTel collector + Prometheus + Grafana for visualising metrics from Awa workers
+or from the external
+[`hardbyte/postgresql-job-queue-benchmarking`](https://github.com/hardbyte/postgresql-job-queue-benchmarking)
+harness. The stack is independent of the workload under test, so it can be
+brought up and down without disturbing the benchmark's Postgres.
 
 ## Quick start
 
@@ -12,10 +14,11 @@ cd docker/observability
 docker compose up -d
 ```
 
-Then run the bench with the OTLP endpoint set:
+Then run a worker or benchmark with the OTLP endpoint set. For example, from a
+checkout of the external benchmark harness:
 
 ```bash
-cd ../../benchmarks/portable
+cd /path/to/postgresql-job-queue-benchmarking
 OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
   OTEL_SERVICE_NAME=awa-portable-bench \
   uv run python long_horizon.py run \
@@ -32,8 +35,8 @@ endpoint is at <http://localhost:8889/metrics>.
 
 ## What it captures
 
-Every metric `awa-worker/src/metrics.rs` declares — including the ring-rotation
-and prune panels added in commit `3e8fb46`:
+Every metric `awa-metrics/src/lib.rs` declares, including ring-rotation and
+prune signals:
 
 - `awa_maintenance_rotate_attempts_total{awa_ring,awa_ring_outcome,awa_ring_blocker}`
 - `awa_maintenance_rotate_skipped_rows_bucket` (histogram)

@@ -100,7 +100,7 @@ Every queue needs a `QueueConfig`. The two fundamental choices are:
 ### Rust
 
 ```rust
-let client = Client::builder()
+let client = Client::builder(pool.clone())
     .queue("email", QueueConfig {
         max_workers: 20,
         rate_limit: Some(RateLimit { max_rate: 50.0, burst: 50 }),
@@ -113,8 +113,7 @@ let client = Client::builder()
     })
     .register::<SendEmail, _, _>(handle_email)
     .register::<GenerateReport, _, _>(handle_report)
-    .build(&pool)
-    .await?;
+    .build()?;
 ```
 
 The key `QueueConfig` fields:
@@ -202,7 +201,9 @@ priority). The default is `2`. Conventional usage:
 | `1` | Urgent / customer-facing / SLA-critical |
 | `2` | Default |
 | `3` | Background work |
-| `4`+ | Batch / catch-up / bulk reprocess |
+| `4` | Batch / catch-up / bulk reprocess |
+
+Values outside `1..=4` are rejected by the insert path.
 
 Priority enters the queue at insert time:
 
@@ -234,7 +235,7 @@ Without aging, a steady stream of priority-1 work can starve every
 priority-2 job behind it. AWA escalates priority over time — the
 longer a job has been waiting, the higher (numerically lower) its
 **effective priority** becomes at claim time. A priority-4 job that
-has waited `4 × aging_interval` ages all the way down to priority 1
+has waited `3 × aging_interval` ages all the way down to priority 1
 and is no longer starvable.
 
 The cadence is per-queue via `QueueConfig.priority_aging_interval`
@@ -261,11 +262,16 @@ await client.start([
 ])
 ```
 
-Aging is computed at claim time on queue-storage runtimes — the stored
-priority does not change, only the effective priority used for
-ordering. The admin UI surfaces both the original priority (so you can
-still see "this was enqueued as priority 4") and the current effective
-priority. Set the value to `Duration::ZERO` (Rust) or
+Aging is computed at claim time on queue-storage runtimes: ready rows keep
+their stored lane priority, and the claim SQL compares candidate lanes by
+effective priority. When a job is claimed, the live attempt records the
+effective priority used for that claim. In canonical storage, the maintenance
+leader physically rewrites waiting rows from priority N to N-1 and preserves
+the enqueue priority in `metadata._awa_original_priority`.
+
+The admin UI shows the priority on the current job row and, when
+`_awa_original_priority` is present, the original enqueue priority as
+`(enqueued as N)`. Set the value to `Duration::ZERO` (Rust) or
 `priority_aging_interval_ms: 0` (Python) to disable escalation
 entirely (strict static priority).
 
@@ -274,6 +280,31 @@ that controls the legacy canonical-storage maintenance pass that
 physically rewrites stored priorities. With queue storage (the 0.6
 default) it is a no-op; the per-queue setting above is the one to
 tune.
+
+### Changing priority after enqueue
+
+The ordinary job retry/cancel/admin path does **not** currently expose a
+general "reprioritize this queued job" operation. In queue storage, priority is
+part of the physical lane key (`queue`, `priority`, `enqueue_shard`,
+`lane_seq`), so changing an already-queued job's priority means moving it to a
+different lane and assigning a new lane sequence. That is a semantic operation,
+not a metadata update.
+
+Use one of these patterns instead:
+
+- Choose the priority when inserting the job, periodic schedule, or direct-COPY
+  batch.
+- Tune `priority_aging_interval` when the goal is fairness under sustained
+  high-priority load.
+- For DLQ recovery, use `retry_from_dlq(..., priority=...)` (Python) or
+  `RetryFromDlqOpts { priority: Some(...) }` (Rust/model API) to revive a DLQ
+  row at a different priority.
+- For a pending job that truly must move priority, cancel it and enqueue a
+  replacement with the new priority, after checking any uniqueness or
+  idempotency contract that applies to that job kind.
+
+Plain `retry` of a failed/cancelled/waiting job keeps the job's existing
+priority.
 
 ## Queue and job-kind descriptors
 

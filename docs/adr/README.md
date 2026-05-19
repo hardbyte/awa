@@ -17,7 +17,7 @@ in-place as historical context.
 | 002 | [BLAKE3 uniqueness](002-blake3-uniqueness.md) | Accepted | Uniqueness keys hashed with BLAKE3, claims in `awa.job_unique_claims` | — |
 | 003 | [Heartbeat + deadline hybrid](003-heartbeat-deadline-hybrid.md) | Accepted | Two independent rescue paths cover crash and runaway failure modes | Fields moved to `active_leases` per ADR-019 |
 | 004 | [PyO3 async bridge](004-pyo3-async-bridge.md) | Accepted | Python workers are callbacks invoked by the Rust runtime via PyO3 | — |
-| 005 | [Priority aging](005-priority-aging.md) | Accepted | Maintenance-based aging prevents starvation while keeping dispatch a clean index scan | Aging target changed under ADR-019 |
+| 005 | [Priority aging](005-priority-aging.md) | Accepted | Effective priority aging prevents starvation; canonical uses maintenance aging, queue storage uses claim-time aging | Aging target changed under ADR-019 |
 | 006 | [AwaTransaction as narrow SQL surface](006-awa-transaction.md) | Accepted | Python transaction bridge exposes only insert + commit/rollback | — |
 | 007 | [Periodic cron jobs](007-periodic-cron-jobs.md) | Accepted | Leader-elected scheduler with atomic CTE enqueue | — |
 | 008 | [COPY batch ingestion](008-copy-batch-ingestion.md) | Accepted | Session-local staging table + COPY for 10k+-row inserts | Routes through `insert_job_compat` under ADR-019 |
@@ -30,7 +30,7 @@ in-place as historical context.
 | 015 | [Builder-side lifecycle hooks](015-post-commit-lifecycle-hooks.md) | Accepted | Builder-side hooks fire after claim start and guarded finalization commits | Guard lives on `active_leases` per ADR-019 |
 | 016 | [Public Rust Postgres enqueue adapter API](016-rust-postgres-enqueue-adapter-api.md) | Accepted | Public Postgres insert-preparation contract plus built-in tokio-postgres adapter | Enables external Rust enqueue adapters |
 | 017 | [Python insert-only transaction bridging](017-python-transaction-bridging.md) | Accepted | Python `awa.Transaction` is a thin wrapper over the Rust insert path | — |
-| 018 | [HTTP Worker for serverless job dispatch](018-http-worker.md) | Accepted | `Worker` impl that dispatches to Lambda / Cloud Run via HTTP + HMAC-BLAKE3 | Uses callback surface from ADR-021 |
+| 018 | [HTTP Worker for serverless job dispatch](018-http-worker.md) | Accepted | `Worker` impl that dispatches to Lambda / Cloud Run via HTTP + BLAKE3-signed callbacks | Uses callback surface from ADR-021 |
 | 019 | [Queue Storage Engine](019-queue-storage-redesign.md) | Accepted | Append-only ready / terminal entries, narrow `active_leases`, optional `attempt_state`, rotating segments | Supersedes ADR-012 |
 | 020 | [Dead Letter Queue](020-dead-letter-queue.md) | Accepted | First-class DLQ storage family with per-queue opt-in, retention, and operator retry/purge | Lives inside ADR-019 |
 | 021 | [Sequential callbacks and callback heartbeats](021-enhanced-external-wait.md) | Accepted | `wait_for_callback()` + `resume_external()` for multi-step orchestration; `heartbeat_callback` for long-running externals | Callback state moved to `active_leases` per ADR-019 |

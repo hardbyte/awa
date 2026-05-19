@@ -73,9 +73,17 @@ This suits short-lived functions (< 30s) where the HTTP round-trip is acceptable
 
 ### Callback authentication
 
-The callback endpoint must verify that incoming requests are legitimate. The worker signs the callback ID using blake3 keyed hashing (already a workspace dependency via ADR-002) and includes the signature in the POST to the function. The function echoes the signature when calling back; the callback endpoint verifies it.
+The callback endpoint must verify that incoming requests are legitimate. The
+worker signs the callback ID using BLAKE3 keyed hashing (already a workspace
+dependency via ADR-002) and includes the signature in the POST to the function
+as `X-Awa-Signature`. The function normally forwards that same header when it
+calls back; the callback endpoint verifies it before accepting `complete`,
+`fail`, or `heartbeat`.
 
-This is simpler and more performant than JWT or OAuth for this use case: the signature is tied to a specific callback ID, is cheap to compute, and doesn't require key rotation infrastructure.
+This is simpler and more performant than JWT or OAuth for this use case: the
+signature is tied to a specific callback ID, is cheap to compute, and doesn't
+require key rotation infrastructure. The concrete endpoint and signature
+contract lives in [HTTP workers and callback signatures](../http-callbacks.md).
 
 ### Feature gating
 
@@ -100,7 +108,10 @@ Client::builder(pool)
         },
         ..Default::default()
     })
-    .queue("default", 4)
+    .queue("default", QueueConfig {
+        max_workers: 4,
+        ..Default::default()
+    })
     .build()?;
 ```
 
@@ -122,7 +133,7 @@ These are thin wrappers around the existing admin API. Users who don't run `awa-
 
 - **Zero new primitives.** `HttpWorker` is just a `Worker` implementation. No new job states, no schema changes, no migration.
 - **Serverless integration without custom glue.** Teams can dispatch to Lambda/Cloud Run/Azure Functions by declaring an `HttpWorkerConfig` rather than writing bespoke callback plumbing.
-- **Reuses battle-tested infrastructure.** Timeout rescue, heartbeat extension, HMAC auth, and at-most-once resolution (TLA+ verified) all apply to HTTP workers automatically.
+- **Reuses battle-tested infrastructure.** Timeout rescue, heartbeat extension, callback request signing, and at-most-once resolution (TLA+ verified) all apply to HTTP workers automatically.
 - **Mixed deployment.** Some job kinds run in-process, others dispatch to HTTP endpoints. One Awa client handles both.
 
 ### Negative

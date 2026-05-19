@@ -1,7 +1,9 @@
 # AWA — Validation Test Plan
 
-Tests run against real Postgres 15+ (not managed services). Dedicated test database.
-All tests are automated and run in CI.
+Tests run against real Postgres 15+ (not managed services) using a dedicated
+test database. Most Rust/Python rows below are automated in CI; heavyweight
+soak, failover, benchmark, TLA+, and managed-service checks are run manually or
+in scheduled lanes when they need special infrastructure.
 
 ## Test Matrix
 
@@ -142,7 +144,7 @@ Rust worker.
 | HW5 | Async mode 503 → retryable | ✓ | — |
 | HW6 | Async unreachable → retryable | ✓ | — |
 | HW7 | Custom headers | ✓ | — |
-| HW8 | HMAC signature | ✓ | — |
+| HW8 | BLAKE3 callback signature | ✓ | — |
 | HW9 | Callback URL construction | ✓ | — |
 
 *HTTPWorker is a Rust-only feature (ADR-018: serverless function dispatch). Not exposed to Python.*

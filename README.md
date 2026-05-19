@@ -27,7 +27,7 @@ without Redis or RabbitMQ, Awa is built for you.
 - **Runtime-owned maintenance** — dispatch, rescue, queue/lease/claim ring rotation, pruning, and cleanup run in the worker fleet; no `pg_cron` ticker required.
 - **Segmented queue storage** — append-only ready/terminal partitions, rotating lease and receipt rings, and separate deferred/DLQ tables keep queue history and execution churn off the dispatch path.
 - **LISTEN/NOTIFY wakeup** — millisecond-scale pickup latency.
-- **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with HMAC-BLAKE3 callback auth.
+- **HTTP Worker** — feature-gated worker that dispatches jobs to serverless functions (Lambda, Cloud Run) via HTTP with BLAKE3-signed callback auth.
 - **Weighted concurrency + rate limiting** — global worker pool with per-queue guarantees; per-queue token bucket.
 
 ### Operations
@@ -183,12 +183,12 @@ async def main():
     async def handle_email(job):
         print(f"Sending to {job.args.to}: {job.args.subject}")
 
+    await client.start([("email", 2)])
+
     await client.insert(
         SendEmail(to="alice@example.com", subject="Welcome"),
         queue="email",
     )
-
-    client.start([("email", 2)])
     await asyncio.sleep(1)
     await client.shutdown()
 
@@ -281,16 +281,8 @@ impl Worker for SendEmailWorker {
     }
 }
 
-// Insert a job (with uniqueness)
-awa::insert_with(&pool, &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() },
-    awa::InsertOpts { unique: Some(awa::UniqueOpts { by_args: true, ..Default::default() }), ..Default::default() },
-).await?;
-
-// Cancel by unique key (e.g., when the triggering condition is resolved)
-awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
-
 // Start workers with a typed lifecycle hook
-let client = Client::builder(pool)
+let client = Client::builder(pool.clone())
     .queue("default", QueueConfig::default())
     .register_worker(SendEmailWorker)
     .on_event::<SendEmail, _, _>(|event| async move {
@@ -300,6 +292,14 @@ let client = Client::builder(pool)
     })
     .build()?;
 client.start().await?;
+
+// Insert a job (with uniqueness)
+awa::insert_with(&pool, &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() },
+    awa::InsertOpts { unique: Some(awa::UniqueOpts { by_args: true, ..Default::default() }), ..Default::default() },
+).await?;
+
+// Cancel by unique key (e.g., when the triggering condition is resolved)
+awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;
 ```
 
 Lifecycle hooks receive `Started` after a claim commits as the worker handler
@@ -408,6 +408,7 @@ Rust and Python workers coexist on the same queues. See
 | [Migration guide](docs/migrations.md) | Fresh installs, upgrades, extracted SQL, rollback strategy |
 | [0.5 → 0.6 upgrade](docs/upgrade-0.5-to-0.6.md) | Step-by-step operator checklist for the staged storage transition |
 | [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
+| [HTTP workers and callbacks](docs/http-callbacks.md) | Serverless dispatch, callback receiver endpoints, signature verification |
 | [Security & Postgres roles](docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
 | [Troubleshooting](docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
 | [Architecture overview](docs/architecture.md) | System design, data flow, state machine, crash recovery |

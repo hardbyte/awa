@@ -479,10 +479,8 @@ This rate was previously a documented scaling limit (only 20-57k of 60k
 promoted, promotion at 1.7-3.6s per batch). The literal-state promotion
 fix (v0.5.0) eliminated the bottleneck entirely.
 
-**Key tuning parameters for promotion throughput:**
+**Promotion and completion throughput knobs:**
 
-- `PROMOTE_BATCH_SIZE` (default `4,096`): rows per promotion batch
-- `PROMOTE_MAX_BATCHES_PER_TICK` (default `32`): max batches per maintenance tick
 - `promote_interval` (default `250 ms`): how often promotion runs
 - `AWA_COMPLETION_FLUSH_MS` (default `1 ms`): completion batcher flush interval
 - `AWA_COMPLETION_BATCH_SIZE` (default `512`): max rows per completion-batcher
@@ -496,6 +494,11 @@ fix (v0.5.0) eliminated the bottleneck entirely.
   count is `processes × AWA_COMPLETION_SHARDS`. Increase only after measuring
   end-to-end throughput, p99 latency, WAL bytes/job, and dead tuples for the
   target worker-process topology.
+
+Internal promotion constants are fixed in the runtime:
+`PROMOTE_BATCH_SIZE = 4,096` rows per promotion batch and
+`PROMOTE_MAX_BATCHES_PER_TICK = 32` batches per maintenance tick. They are not
+environment variables or builder options.
 
 ### Concurrent Multi-Queue Lifecycle
 
@@ -588,10 +591,10 @@ failure-mode subset via `--scenario failures`:
 - `callback_timeout_10pct`
 - `mixed_50pct`
 
-It does not yet include the Rust-only `deadline_hang`, `snooze_once`, or
-`stale_heartbeat_rescue` scenarios. The worker returns `RetryAfter`,
-`WaitForCallback`, `Cancel`, or raises exceptions based on the job's `mode`
-field.
+Python also includes heartbeat rescue via `--scenario rescue`. It still does
+not include the Rust-only `deadline_hang` and `snooze_once` scenarios. The
+worker returns `RetryAfter`, `WaitForCallback`, `Cancel`, or raises exceptions
+based on the job's `mode` field.
 
 ### Structured output
 

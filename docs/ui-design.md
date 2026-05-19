@@ -40,10 +40,10 @@ POST /api/jobs/:id/retry
 POST /api/jobs/:id/cancel
 POST /api/jobs/bulk-retry               { ids: [...] }
 POST /api/jobs/bulk-cancel              { ids: [...] }
-POST /api/jobs/retry-failed             { kind?, queue? }
-POST /api/jobs/discard-failed           { kind? }
 
 GET  /api/queues
+GET  /api/queues/:name
+GET  /api/queues/runtime
 POST /api/queues/:name/pause
 POST /api/queues/:name/resume
 POST /api/queues/:name/drain
@@ -51,7 +51,9 @@ POST /api/queues/:name/drain
 GET  /api/kinds                         Job kinds with descriptor metadata
 
 GET  /api/runtime                       Worker instances and health
-GET  /api/runtime/:instance_id
+GET  /api/storage                       Storage transition status
+GET  /api/stats/kinds                   Distinct job kinds
+GET  /api/stats/queues                  Distinct queues
 
 GET  /api/cron
 POST /api/cron/:name/trigger
@@ -64,6 +66,10 @@ DELETE /api/dlq/:id
 POST   /api/dlq/bulk-retry              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-purge              { kind?, queue?, tag?, all? }
 POST   /api/dlq/bulk-move               { kind?, queue?, reason? }
+
+POST /api/callbacks/:callback_id/complete
+POST /api/callbacks/:callback_id/fail
+POST /api/callbacks/:callback_id/heartbeat
 
 GET  /api/capabilities                  Feature flags / read-only detection
 ```
