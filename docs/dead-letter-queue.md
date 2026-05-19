@@ -120,9 +120,10 @@ such as `awa::admin::fail_to_dlq`, `move_failed_to_dlq`, and
 `bulk_move_failed_to_dlq` route failed terminal jobs into the DLQ.
 
 Python callers use direct client methods:
-`list_dlq`, `get_dlq`, `dlq_depth`, `retry_from_dlq`,
+`list_dlq`, `get_dlq_job`, `dlq_depth`, `dlq_depth_by_queue`, `retry_from_dlq`,
 `bulk_retry_from_dlq`, `move_failed_to_dlq`, `purge_dlq`, and
-`bulk_purge_dlq`. These wrap the same SQL helpers the CLI uses.
+`purge_dlq_job`. `purge_dlq(...)` is the bulk purge helper; `purge_dlq_job(...)`
+purges one DLQ row by job ID. These wrap the same SQL helpers the CLI uses.
 
 ## See also
 

@@ -310,7 +310,7 @@ priority.
 
 Queues and job kinds can carry operator-facing metadata: display names, descriptions, owners, docs links, tags, and arbitrary JSON `extra`. This is separate from runtime scheduling config and drives the labels the admin UI / API surface.
 
-The runtime catalogs and propagates these — see [Architecture → Control-plane descriptors](architecture.md#control-plane-descriptors) for how sync, staleness, and drift detection work.
+The runtime catalogs and propagates these — see [Architecture → Descriptors And Runtime Liveness](architecture.md#descriptors-and-runtime-liveness) for how sync, staleness, and drift detection work.
 
 ### Rust
 

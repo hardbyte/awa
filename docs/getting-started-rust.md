@@ -6,7 +6,7 @@ This guide takes you from `cargo add` to a job reaching `completed`.
 
 Before writing code, it helps to know what Awa is doing for you:
 
-- enqueueing persists durable job state in Postgres; if your transaction rolls back, the job disappears too
+- enqueuing persists durable job state in Postgres; if your transaction rolls back, the job disappears too
 - workers claim runnable jobs, increment the attempt, and keep the claim alive with heartbeats
 - retries, callback waits, and progress updates are persisted in Postgres and exposed as one hydrated job snapshot through the CLI, UI, and admin APIs
 - inspection is job-centric: when something looks wrong, dump the job and inspect its current state, progress, callback config, and recorded errors

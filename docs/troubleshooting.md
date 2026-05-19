@@ -168,7 +168,7 @@ heartbeat-rescue fires.
 
 ### What It Usually Means
 
-Producers are enqueueing well below the rate the application offers, batches
+Producers are enqueuing well below the rate the application offers, batches
 are taking longer than expected, or the consumer fleet is permanently
 undersaturated despite plenty of producer concurrency.
 

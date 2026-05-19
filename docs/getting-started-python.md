@@ -6,7 +6,7 @@ This guide takes you from `pip install` to a job reaching `completed`.
 
 Before the code, here is the operational model Awa is built around:
 
-- inserting a job writes durable job state to Postgres, so enqueueing can live inside the same transaction as your application write
+- inserting a job writes durable job state to Postgres, so enqueuing can live inside the same transaction as your application write
 - workers claim runnable jobs, heartbeat while they execute, and rescue them if the worker dies
 - retries, callback waits, and progress checkpoints are persisted in Postgres and exposed as one hydrated job snapshot instead of being held only in memory
 - when you debug or operate the system, inspect the job first; the CLI and UI are designed around that read-only inspection path

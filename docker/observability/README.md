@@ -71,5 +71,5 @@ docker compose down -v    # discards tsdb volume too
 ## Cross-references
 
 - [`../../docs/grafana/awa-dashboard.json`](../../docs/grafana/awa-dashboard.json) — canonical dashboard (source of truth)
-- [`../../awa-worker/src/metrics.rs`](../../awa-worker/src/metrics.rs) — metric declarations
+- [`../../awa-metrics/src/lib.rs`](../../awa-metrics/src/lib.rs) — metric declarations
 - [`../../docs/upgrade-0.5-to-0.6.md`](../../docs/upgrade-0.5-to-0.6.md) — operator checklist with watch-list panel references

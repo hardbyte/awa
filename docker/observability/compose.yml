@@ -10,7 +10,8 @@
 #
 #   docker compose up -d
 #
-# Then run the bench with the OTLP endpoint set:
+# Then run the bench from the benchmarking harness checkout with the OTLP
+# endpoint set:
 #
 #   OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317 \
 #   OTEL_SERVICE_NAME=awa-portable-bench \
