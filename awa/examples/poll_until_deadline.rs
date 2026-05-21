@@ -1,17 +1,29 @@
 //! Deadline-bounded polling: try every X until it works or expires.
 //!
-//! Demonstrates how to compose `JobResult::RetryAfter` with a
-//! handler-side deadline check to get "poll an external system every
-//! 30 seconds for up to 30 minutes, then give up cleanly". awa has no
-//! built-in `retry_until: TIMESTAMPTZ` field — the pattern is to
-//! embed the deadline in the job args (so retries see the same
-//! cutoff) and have the handler enforce it.
+//! Demonstrates how to compose `JobResult::Snooze` with a handler-side
+//! deadline check to get "poll an external system every 30 seconds for
+//! up to 30 minutes, then give up cleanly". awa has no built-in
+//! `expire_at: TIMESTAMPTZ` field — the pattern is to embed the
+//! deadline in the job args (so retries see the same cutoff) and have
+//! the handler enforce it.
+//!
+//! Why `Snooze` and not `RetryAfter`:
+//! - `RetryAfter` means "this attempt failed; retry after delay" and
+//!   *increments* `attempt`. Sized for genuine failures.
+//! - `Snooze` means "this attempt didn't fail, it's just not time
+//!   yet" and *preserves* `attempt`. Sized for polling-style waits.
+//!
+//! Each probe of an unfinished upstream is a "not yet" observation,
+//! not a failed attempt — so `Snooze` is the semantically correct
+//! primitive. As a bonus, `max_attempts` keeps its default meaning
+//! ("bound on real failures") rather than having to be inflated to
+//! `ceil(window / interval)` to survive the polling window.
 //!
 //! What this example exercises:
-//! - `JobResult::RetryAfter` for fixed-interval polling
+//! - `JobResult::Snooze` for fixed-interval polling without burning attempts
 //! - `JobResult::Cancel` for graceful expiry (no DLQ, no error event)
 //! - `JobError::Terminal` for permanent upstream failures
-//! - Clamping the next-retry delay to the deadline so the cutoff
+//! - Clamping the next-snooze delay to the deadline so the cutoff
 //!   branch fires within one interval of the wall-clock deadline
 //!
 //! The "external service" is in-process — a `Mutex<HashMap>` that
@@ -122,14 +134,14 @@ impl Worker for PollExternalWorker {
                 args.external_id
             ))),
             ExternalStatus::Pending { .. } => {
-                // Clamp the next retry so it does not overshoot the
+                // Clamp the next snooze so it does not overshoot the
                 // deadline. Without this, a poll at deadline−1s would
                 // schedule the next attempt at deadline+(interval−1)s
-                // and the job would sit `retryable` past the cutoff.
+                // and the job would sit `scheduled` past the cutoff.
                 let nominal_next = now + ChronoDuration::seconds(args.poll_interval_secs as i64);
                 let next = nominal_next.min(args.deadline_at);
                 let delay = (next - now).to_std().unwrap_or(Duration::from_millis(1));
-                Ok(JobResult::RetryAfter(delay))
+                Ok(JobResult::Snooze(delay))
             }
         }
     }
@@ -169,14 +181,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Short cadences so the example finishes in a few seconds —
     // production would be poll_interval_secs=30, window=30 minutes.
+    // `max_attempts` keeps its default (25): Snooze does not burn
+    // attempts, so this only caps genuine repeated failures.
     let queue = "poll_example";
     let poll_interval_secs: u64 = 1;
     let window = ChronoDuration::seconds(5);
-    // `RetryAfter` consumes an attempt; size max_attempts above
-    // ceil(window / interval) with headroom for any transient
-    // upstream-5xx retries that use exponential backoff.
-    let nominal_polls = (window.num_seconds() as f64 / poll_interval_secs as f64).ceil() as i16;
-    let max_attempts = nominal_polls.saturating_mul(2).min(1000);
 
     let mut tx = pool.begin().await?;
     for external_id in ["eventually-ready", "never-ready", "upstream-broken"] {
@@ -189,7 +198,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
             InsertOpts {
                 queue: queue.into(),
-                max_attempts,
                 ..Default::default()
             },
         )

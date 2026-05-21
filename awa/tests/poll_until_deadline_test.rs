@@ -1,17 +1,20 @@
-//! Pattern test: deadline-bounded polling with `RetryAfter` + handler-side deadline check.
+//! Pattern test: deadline-bounded polling with `Snooze` + handler-side deadline check.
 //!
-//! awa supports retries by count (`max_attempts`) and per-attempt
-//! delay (exponential `awa.backoff_duration` or caller-controlled
-//! `JobResult::RetryAfter`), but has no first-class "retry until
-//! timestamp T" field. The recommended pattern is:
+//! awa has `max_attempts` and per-attempt-delay primitives (exponential
+//! `awa.backoff_duration` or caller-controlled `JobResult::RetryAfter`),
+//! but no first-class "give up at timestamp T" field. The recommended
+//! pattern for polling-style waits is:
 //!
 //!   1. Embed the deadline in the job args so retries see the same cutoff.
 //!   2. Have the handler check `Utc::now() >= deadline_at` at the top of
 //!      every attempt and return `JobResult::Cancel(reason)` past the cutoff.
-//!   3. Clamp the per-attempt `RetryAfter` delay so it does not overshoot
-//!      the deadline — otherwise a poll at deadline−1s schedules the next
-//!      attempt at deadline+(interval−1)s and the job sits `retryable` past
-//!      the cutoff.
+//!   3. While still pending, return `JobResult::Snooze(delay)` rather than
+//!      `RetryAfter`. Snooze preserves `attempt` (each probe is "not yet",
+//!      not "failed"), so `max_attempts` keeps its default meaning of
+//!      bounding genuine handler failures.
+//!   4. Clamp the snooze delay to the deadline so it does not overshoot —
+//!      otherwise a poll at deadline−1s schedules the next attempt at
+//!      deadline+(interval−1)s and the job sits `scheduled` past the cutoff.
 //!
 //! This file pins that pattern end-to-end with two cases:
 //!
@@ -112,7 +115,7 @@ impl Worker for PollExternalWorker {
                 let nominal_next = now + ChronoDuration::milliseconds(args.poll_interval_ms as i64);
                 let next = nominal_next.min(args.deadline_at);
                 let delay = (next - now).to_std().unwrap_or(Duration::from_millis(1));
-                Ok(JobResult::RetryAfter(delay))
+                Ok(JobResult::Snooze(delay))
             }
         }
     }
@@ -215,8 +218,9 @@ async fn test_poll_completes_when_external_becomes_ready_before_deadline() {
         },
         InsertOpts {
             queue: queue.clone(),
-            // Plenty of headroom: ~20 nominal polls in 1s × 50ms.
-            max_attempts: 100,
+            // Snooze does not consume an attempt, so the default
+            // `max_attempts` is plenty — it only needs to cover real
+            // handler failures, not the polling cadence.
             ..Default::default()
         },
     )
@@ -270,7 +274,6 @@ async fn test_poll_cancels_when_deadline_expires_before_external_ready() {
         },
         InsertOpts {
             queue: queue.clone(),
-            max_attempts: 100,
             ..Default::default()
         },
     )
@@ -303,16 +306,20 @@ async fn test_poll_cancels_when_deadline_expires_before_external_ready() {
         "cancellation reason should mention the deadline; got [{joined}]"
     );
 
-    // The job must have attempted at least once (the deadline branch
-    // fires *inside* the handler, so we always burn ≥1 attempt). Most
-    // runs see several attempts as RetryAfter cycles before the cutoff.
+    // Snooze-not-RetryAfter invariant: each poll decrements `attempt`
+    // by 1 (re-incremented on the next claim), so the steady-state
+    // attempt count stays at 1 across the ~8 polls this window allows.
+    // The terminal Cancel runs inside the most recent claim, so
+    // `attempt == 1` at terminal time. If the handler ever switched
+    // back to RetryAfter, this would balloon to ~8.
     let attempt: i16 = sqlx::query_scalar("SELECT attempt FROM awa.jobs WHERE id = $1")
         .bind(job.id)
         .fetch_one(&pool)
         .await
         .expect("read attempt");
     assert!(
-        attempt >= 1,
-        "expected at least one attempt before cancellation, got {attempt}"
+        (1..=2).contains(&attempt),
+        "Snooze should keep attempt at 1 (allow 2 for transient races); got {attempt}. \
+         If this is high, the handler likely regressed from Snooze back to RetryAfter."
     );
 }
