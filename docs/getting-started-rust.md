@@ -161,3 +161,15 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - [Deadline-bounded polling pattern](../awa/examples/poll_until_deadline.rs) —
   poll an external system every X until it's ready or the deadline
   expires, using `JobResult::Snooze` so polls don't burn attempts.
+  Screenshots of the example in the UI:
+  - [Dashboard](assets/poll-until-deadline/dashboard.png) — system-wide view
+    while three polling jobs are in flight (1 failed terminally, 1 scheduled
+    between snoozes, 1 completed).
+  - [Jobs list](assets/poll-until-deadline/jobs-list.png) — terminal-state
+    side-by-side: `failed` (upstream rejected), `cancelled`
+    (deadline-exceeded), `completed` (upstream ready). All three show
+    `attempt 1/25` — Snooze did not consume attempts.
+  - [Cancelled job detail](assets/poll-until-deadline/cancelled-job-detail.png) —
+    timeline, error message naming the deadline and poll count, progress bar
+    tracking the deadline window, and progress metadata `{"poll": 30}` proving
+    the per-job counter survived 30 Snooze cycles via `ctx.job.progress`.
