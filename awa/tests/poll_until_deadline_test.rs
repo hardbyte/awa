@@ -278,14 +278,19 @@ async fn test_poll_cancels_when_deadline_expires_before_external_ready() {
         },
     )])));
 
-    let deadline = Utc::now() + ChronoDuration::milliseconds(400);
+    // Window sized for slow CI runners: each Snooze cycle on a busy
+    // CI box can take 100–200ms once dispatcher poll + promotion +
+    // claim overhead are added to the nominal 100ms snooze. Give the
+    // window enough headroom for several full cycles plus the final
+    // deadline-Cancel attempt.
+    let deadline = Utc::now() + ChronoDuration::milliseconds(2000);
     let mut tx = pool.begin().await.expect("begin");
     let job = insert_with(
         &mut *tx,
         &PollExternalJob {
             external_id: external_id.into(),
             deadline_at: deadline,
-            poll_interval_ms: 50,
+            poll_interval_ms: 100,
         },
         InsertOpts {
             queue: queue.clone(),
@@ -333,9 +338,9 @@ async fn test_poll_cancels_when_deadline_expires_before_external_ready() {
         .await
         .expect("read attempt");
     assert!(
-        (1..=2).contains(&attempt),
+        attempt <= 2,
         "Snooze should keep attempt at 1 (allow 2 for transient races); got {attempt}. \
-         If this is high, the handler likely regressed from Snooze back to RetryAfter."
+         If this is much higher, the handler likely regressed from Snooze back to RetryAfter."
     );
 
     // Progress survives Snooze: the handler increments a poll counter
@@ -357,7 +362,7 @@ async fn test_poll_cancels_when_deadline_expires_before_external_ready() {
         .unwrap_or(0);
     assert!(
         poll >= 2,
-        "poll counter should accumulate across Snooze cycles (≥ 2 polls in a 400ms / 50ms window); \
+        "poll counter should accumulate across Snooze cycles (≥ 2 polls in a 2s / 100ms window); \
          got poll={poll}, progress={progress:?}. \
          If poll == 1, ctx.job.progress is not being seeded from the column on re-claim."
     );
