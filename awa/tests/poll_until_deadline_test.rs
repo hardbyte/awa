@@ -98,10 +98,22 @@ impl Worker for PollExternalWorker {
             .map_err(|err| JobError::terminal(format!("invalid args: {err}")))?;
         let now = Utc::now();
 
+        // Per-job poll counter, accumulated across Snooze cycles via
+        // `ctx.job.progress`. First attempt sees None → start at 0.
+        let poll = ctx
+            .job
+            .progress
+            .as_ref()
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("poll"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + 1;
+
         if now >= args.deadline_at {
             return Ok(JobResult::Cancel(format!(
-                "deadline {} exceeded after {} attempts; external_id={}",
-                args.deadline_at, ctx.job.attempt, args.external_id
+                "deadline {} exceeded after {} polls; external_id={}",
+                args.deadline_at, poll, args.external_id
             )));
         }
 
@@ -112,6 +124,9 @@ impl Worker for PollExternalWorker {
                 args.external_id
             ))),
             ExternalStatus::Pending { .. } => {
+                ctx.set_progress(0, &format!("poll {poll}: pending"));
+                ctx.update_metadata(serde_json::json!({"poll": poll}))
+                    .map_err(|e| JobError::terminal(e.to_string()))?;
                 let nominal_next = now + ChronoDuration::milliseconds(args.poll_interval_ms as i64);
                 let next = nominal_next.min(args.deadline_at);
                 let delay = (next - now).to_std().unwrap_or(Duration::from_millis(1));
@@ -321,5 +336,29 @@ async fn test_poll_cancels_when_deadline_expires_before_external_ready() {
         (1..=2).contains(&attempt),
         "Snooze should keep attempt at 1 (allow 2 for transient races); got {attempt}. \
          If this is high, the handler likely regressed from Snooze back to RetryAfter."
+    );
+
+    // Progress survives Snooze: the handler increments a poll counter
+    // in `ctx.job.progress.metadata.poll` on each pending attempt and
+    // reads it back on the next one. By the time Cancel fires the
+    // counter must reflect multiple polls — proving the cross-attempt
+    // accumulation worked.
+    let progress: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT progress FROM awa.jobs WHERE id = $1")
+            .bind(job.id)
+            .fetch_one(&pool)
+            .await
+            .expect("read progress");
+    let poll = progress
+        .as_ref()
+        .and_then(|p| p.get("metadata"))
+        .and_then(|m| m.get("poll"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    assert!(
+        poll >= 2,
+        "poll counter should accumulate across Snooze cycles (≥ 2 polls in a 400ms / 50ms window); \
+         got poll={poll}, progress={progress:?}. \
+         If poll == 1, ctx.job.progress is not being seeded from the column on re-claim."
     );
 }

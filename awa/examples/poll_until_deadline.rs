@@ -25,6 +25,10 @@
 //! - `JobError::Terminal` for permanent upstream failures
 //! - Clamping the next-snooze delay to the deadline so the cutoff
 //!   branch fires within one interval of the wall-clock deadline
+//! - `ctx.set_progress` + reading `ctx.job.progress` back on the next
+//!   attempt — Snooze persists `progress` to the row, so per-job
+//!   accumulating state (here, a poll counter) survives across
+//!   attempts without a separate database round-trip
 //!
 //! The "external service" is in-process — a `Mutex<HashMap>` that
 //! flips from `Pending` to `Ready` (or `Failed`) after a configurable
@@ -116,14 +120,29 @@ impl Worker for PollExternalWorker {
             .map_err(|err| JobError::terminal(format!("invalid args: {err}")))?;
         let now = Utc::now();
 
+        // Read the poll counter accumulated on previous attempts.
+        // `ctx.job.progress` survives Snooze (the executor snapshots it
+        // into the `progress` column at the end of each attempt), so it
+        // gives us a per-job counter without a database round-trip of
+        // our own. First attempt sees `None` → start at zero.
+        let poll = ctx
+            .job
+            .progress
+            .as_ref()
+            .and_then(|p| p.get("metadata"))
+            .and_then(|m| m.get("poll"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0)
+            + 1;
+
         // Deadline check first, on every attempt. `Cancel` is a
         // graceful give-up: state → 'cancelled', no DLQ routing, no
         // failure event. Use `JobError::Terminal` instead if you want
         // the job in the DLQ for inspection.
         if now >= args.deadline_at {
             return Ok(JobResult::Cancel(format!(
-                "deadline {} exceeded after {} attempts; external_id={}",
-                args.deadline_at, ctx.job.attempt, args.external_id
+                "deadline {} exceeded after {} polls; external_id={}",
+                args.deadline_at, poll, args.external_id
             )));
         }
 
@@ -134,6 +153,19 @@ impl Worker for PollExternalWorker {
                 args.external_id
             ))),
             ExternalStatus::Pending { .. } => {
+                // Persist what we just observed so the next attempt
+                // can read it back. The framework writes
+                // `progress` to the row when this handler returns
+                // (no `flush_progress` call needed unless you want
+                // intermediate visibility mid-attempt).
+                let pct = ((args.deadline_at - now).num_seconds().max(0) as f64
+                    / (args.deadline_at - ctx.job.created_at).num_seconds().max(1) as f64
+                    * 100.0)
+                    .clamp(0.0, 100.0) as u8;
+                ctx.set_progress(100 - pct, &format!("poll {poll}: pending"));
+                ctx.update_metadata(serde_json::json!({"poll": poll}))
+                    .map_err(|e| JobError::terminal(e.to_string()))?;
+
                 // Clamp the next snooze so it does not overshoot the
                 // deadline. Without this, a poll at deadline−1s would
                 // schedule the next attempt at deadline+(interval−1)s
