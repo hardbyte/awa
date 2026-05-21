@@ -159,4 +159,5 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - [Troubleshooting](troubleshooting.md)
 - [Advanced Rust example](../awa/examples/etl_pipeline.rs)
 - [Deadline-bounded polling pattern](../awa/examples/poll_until_deadline.rs) —
-  retry every X until it works or expires.
+  poll an external system every X until it's ready or the deadline
+  expires, using `JobResult::Snooze` so polls don't burn attempts.
