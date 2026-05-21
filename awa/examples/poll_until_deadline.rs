@@ -53,17 +53,20 @@ async fn probe(svc: &ExternalSvc, external_id: &str) -> ExternalStatus {
         .get(external_id)
         .cloned()
         .unwrap_or(ExternalStatus::Failed);
-    // Each call counts down `polls_remaining`; the entry flips to
-    // Ready once the counter hits zero.
-    if let ExternalStatus::Pending { polls_remaining } = &status {
-        let next = if *polls_remaining <= 1 {
+    // Each call counts down `polls_remaining` and returns the
+    // *effective* status for this probe — once the counter hits zero
+    // the probe both stores Ready and returns Ready, so the worker
+    // sees readiness on the same attempt rather than one later.
+    if let ExternalStatus::Pending { polls_remaining } = status {
+        let next = if polls_remaining <= 1 {
             ExternalStatus::Ready
         } else {
             ExternalStatus::Pending {
                 polls_remaining: polls_remaining - 1,
             }
         };
-        guard.insert(external_id.to_string(), next);
+        guard.insert(external_id.to_string(), next.clone());
+        return next;
     }
     status
 }

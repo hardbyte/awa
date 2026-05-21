@@ -53,15 +53,20 @@ async fn probe(svc: &ExternalSvc, external_id: &str) -> ExternalStatus {
         .get(external_id)
         .cloned()
         .unwrap_or(ExternalStatus::Failed);
-    if let ExternalStatus::Pending { polls_remaining } = &status {
-        let next = if *polls_remaining <= 1 {
+    // Return the effective status for this probe so the worker sees
+    // readiness on the same attempt that storage flipped to Ready —
+    // returning the pre-transition value would cost one extra retry
+    // and could hide deadline-edge behaviour.
+    if let ExternalStatus::Pending { polls_remaining } = status {
+        let next = if polls_remaining <= 1 {
             ExternalStatus::Ready
         } else {
             ExternalStatus::Pending {
                 polls_remaining: polls_remaining - 1,
             }
         };
-        guard.insert(external_id.to_string(), next);
+        guard.insert(external_id.to_string(), next.clone());
+        return next;
     }
     status
 }
