@@ -175,3 +175,24 @@ At the default `enqueue_shards = 1` the key is ignored. See [ADR-025](adr/025-sh
 - [Migration guide](migrations.md)
 - [Troubleshooting](troubleshooting.md)
 - [Advanced Rust example](../awa/examples/etl_pipeline.rs)
+- [Deadline-bounded polling pattern](../awa/examples/poll_until_deadline.rs) —
+  poll an external system every X until it's ready or the deadline
+  expires, using `JobResult::Snooze` so polls don't burn attempts.
+
+  **Dashboard mid-run** — three polling jobs in flight (1 failed terminally,
+  1 scheduled between snoozes, 1 completed).
+
+  ![AWA dashboard during deadline-bounded polling](assets/poll-until-deadline/dashboard.png)
+
+  **Jobs list at terminal state** — `failed` (upstream rejected),
+  `cancelled` (deadline exceeded), `completed` (upstream ready). All three
+  show `attempt 1/25` — Snooze did not consume attempts.
+
+  ![Jobs list showing failed, cancelled, and completed states side-by-side](assets/poll-until-deadline/jobs-list.png)
+
+  **Cancelled job detail** — timeline, error message naming the deadline
+  and poll count, progress bar tracking the deadline window, and progress
+  metadata `{"poll": 30}` proving the per-job counter survived 30 Snooze
+  cycles via `ctx.job.progress`.
+
+  ![Cancelled job detail with timeline, progress, and arguments](assets/poll-until-deadline/cancelled-job-detail.png)

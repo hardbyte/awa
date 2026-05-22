@@ -14,18 +14,46 @@ use tracing::{error, info, info_span, warn, Instrument};
 
 /// Result of executing a job handler.
 ///
-/// See also [`JobError`] for the error side — notably [`JobError::Retryable`]
-/// provides error-driven retry with database-computed backoff, while
-/// [`JobResult::RetryAfter`] is an explicit retry with caller-specified delay.
+/// # Picking the right variant for re-runs
+///
+/// Three primitives can put the job back on the queue. They differ in
+/// what they say about *why*:
+///
+/// | Primitive | Means | Increments `attempt` | Delay shape |
+/// |-----------|-------|----------------------|-------------|
+/// | [`JobError::Retryable`] | "this attempt failed; try again" | yes | DB-computed exponential backoff |
+/// | [`JobResult::RetryAfter`] | "this attempt failed; try again after delay X" | yes | caller-specified |
+/// | [`JobResult::Snooze`] | "this attempt didn't fail — it's just not time yet" | no | caller-specified |
+///
+/// Rule of thumb: if every "non-success" return is a "not yet" rather
+/// than a failure (polling, waiting for an upstream signal, rate
+/// limiting), use [`Snooze`] so `max_attempts` keeps its plain
+/// meaning of bounding genuine failures. If the handler observed a
+/// real failure and wants a specific retry delay rather than the
+/// default exponential backoff, use [`RetryAfter`]. See
+/// `awa/examples/poll_until_deadline.rs` for a deadline-bounded
+/// polling example.
+///
+/// [`Snooze`]: JobResult::Snooze
+/// [`RetryAfter`]: JobResult::RetryAfter
 #[derive(Debug)]
 pub enum JobResult {
     /// Job completed successfully.
     Completed,
-    /// Job should be retried after the given duration. Increments attempt.
+    /// Job should be retried after the given duration. Increments
+    /// `attempt`. Use when this attempt failed and you want a
+    /// caller-specified delay instead of the default exponential
+    /// backoff produced by [`JobError::Retryable`].
     RetryAfter(std::time::Duration),
-    /// Job should be snoozed (re-available after duration). Does NOT increment attempt.
+    /// Job should be re-scheduled after the given duration without
+    /// counting as a failed attempt. Use for polling-style waits
+    /// where each "not yet" probe is normal — `max_attempts` should
+    /// only bound genuine handler failures, not the polling cadence.
     Snooze(std::time::Duration),
-    /// Job should be cancelled.
+    /// Job should be cancelled. Records the reason in the job's
+    /// `errors` column and sets state to `cancelled` — no DLQ, no
+    /// failure event. Use for graceful give-up (e.g. handler-side
+    /// deadline expiry, user-requested abort).
     Cancel(String),
     /// Job is waiting for an external callback (webhook completion).
     ///
@@ -37,7 +65,7 @@ pub enum JobResult {
 /// Error type for job handlers — any error is retryable unless it's terminal.
 ///
 /// [`JobError::Retryable`] triggers retry with database-computed exponential backoff.
-/// For explicit caller-controlled retry delay, return [`Ok(JobResult::RetryAfter)`] instead.
+/// For explicit caller-controlled retry delay, return `Ok(`[`JobResult::RetryAfter`]`)` instead.
 #[derive(Debug, thiserror::Error)]
 pub enum JobError {
     /// Retryable error — will be retried if attempts remain.
