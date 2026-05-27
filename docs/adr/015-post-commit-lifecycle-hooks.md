@@ -42,12 +42,17 @@ Supported events are:
 - `Exhausted`
 - `Cancelled`
 
+> Later extended with `WaitingForCallback` and callback-resolution events —
+> see [Amendment: callback lifecycle events](#amendment-callback-lifecycle-events).
+
 No lifecycle outcome event is emitted for:
 
 - `Snooze`, because it is an internal reschedule rather than a meaningful
   outcome for observers
 - `WaitForCallback`, because the job has only parked; the meaningful outcome
   happens later when the callback completes, retries, fails, or is cancelled
+  (superseded by the amendment, which emits `WaitingForCallback` at park and a
+  terminal event at resolution)
 
 ### Emission Semantics
 
@@ -144,3 +149,80 @@ permit released, regardless of whether that commit targeted the canonical
 append. The guarded-finalization contract that gates hook emission lives on
 `(job_id, run_lease)` and is unchanged under queue storage. See
 [ADR-019](019-queue-storage-redesign.md).
+
+## Amendment: callback lifecycle events
+
+The original decision left `WaitForCallback` without any event, on the reasoning
+that "the meaningful outcome happens later when the callback completes, retries,
+fails, or is cancelled." In practice nothing was emitted at that later point
+either: callback resolution runs in `awa_model::admin` (the storage layer, which
+has no handler registry and is often invoked from a different process than the
+worker), so a job that parked on a callback could fire `Started` and then go
+silent through to its terminal state — invisible to lifecycle hooks. This
+amendment closes that gap.
+
+### `WaitingForCallback`
+
+A new event, emitted by the executor when a handler returns
+`JobResult::WaitForCallback` and the `waiting_external` transition commits. It
+carries the parked `JobRow` (so `job.state` is `waiting_external`, and
+`job.callback_id` / `job.callback_timeout_at` identify the pending callback).
+This makes the park observable and, paired with the resolution event below,
+lets callers measure external-wait latency. The supported event set becomes:
+
+- `Started`
+- `WaitingForCallback`
+- `Completed`
+- `Retried`
+- `Exhausted`
+- `Cancelled`
+
+`Snooze` remains event-free: it is an internal reschedule, not a job outcome.
+
+### Resolution events
+
+Callback resolution maps onto the existing terminal events rather than
+introducing callback-specific variants — an outcome is an outcome, and
+`WaitingForCallback` already marks that the job took the callback path:
+
+| Resolution | Event |
+|---|---|
+| callback completes the job | `Completed` |
+| callback fails the job (terminal) | `Exhausted` |
+| callback requeues the job for retry | `Retried` |
+| callback is cancelled | `Cancelled` |
+| callback resumes the job to `running` | none — the job re-enters execution and the executor emits `Started` plus a terminal event as usual |
+
+For a callback-driven `Completed`, the `duration` field is `Duration::ZERO`:
+no handler executed during this phase, and conflating it with the parked-wait
+time would overload the field's "handler execution time" meaning. If wait
+latency is needed later, it should be a dedicated field sourced from a recorded
+park timestamp, not this one.
+
+### Where resolution events are dispatched
+
+Resolution events are dispatched **in-process, at the resolving call site**, by
+worker-`Client` methods (`Client::resolve_callback`, `complete_external`,
+`fail_external`, `retry_external`). Each calls the corresponding
+`awa_model::admin` function and then, after the transition commits, dispatches
+the mapped event through the same guarded path as inline outcome hooks.
+
+This keeps the storage layer free of the handler registry and preserves
+at-most-once dispatch: exactly one process performs a given resolution, so
+exactly one dispatch occurs — mirroring how an inline outcome fires once from
+the single worker that claimed the job. A broadcast/NOTIFY fan-out (as used for
+`awa:cancel`) was rejected here precisely because it would re-fire the hook in
+every process that holds handlers, breaking at-most-once for metrics.
+
+The boundary is therefore: resolving a callback through the worker `Client`
+fires hooks; resolving it through the bare `awa_model::admin::*` functions, the
+CLI, or a process without the worker `Client` does not. This matches the
+existing contract that lifecycle hooks are a worker-side, best-effort,
+in-process facility.
+
+### Superseded consequences
+
+The original Negative bullet — "`Snooze` and `WaitForCallback` do not produce
+immediate notifications" — now applies only to `Snooze`. `WaitForCallback`
+produces a `WaitingForCallback` event at park and a terminal event at
+resolution (when resolved via the worker `Client`).
