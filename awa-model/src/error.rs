@@ -36,3 +36,23 @@ impl From<sqlx::Error> for AwaError {
         AwaError::Database(err)
     }
 }
+
+/// The single Rust-side mapping from a raw `sqlx::Error` to an [`AwaError`],
+/// translating a Postgres unique violation (SQLSTATE 23505) into
+/// [`AwaError::UniqueConflict`] with the offending constraint name.
+///
+/// Insert paths call this explicitly rather than relying on the blanket
+/// `From<sqlx::Error>` (which preserves the raw error for general `?` use).
+/// Database adapters running Awa's insert SQL through another driver should
+/// route the underlying sqlx error through here so their errors match the
+/// native path.
+pub fn map_sqlx_error(err: sqlx::Error) -> AwaError {
+    if let sqlx::Error::Database(ref db_err) = err {
+        if db_err.code().as_deref() == Some("23505") {
+            return AwaError::UniqueConflict {
+                constraint: db_err.constraint().map(|c| c.to_string()),
+            };
+        }
+    }
+    AwaError::Database(err)
+}

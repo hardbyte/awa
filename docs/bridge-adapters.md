@@ -163,6 +163,83 @@ let job = tokio_pg::insert_job_raw(
 
 All functions return `awa::JobRow` with the full row from `RETURNING *` — same type as `awa::insert_with`. The only field not populated is `unique_states` (BIT(8), no direct tokio-postgres mapping). All other fields, including `errors`, are decoded from the database row.
 
+## Rust: SeaORM
+
+SeaORM already sits on top of SQLx, so the integration is deliberately thin.
+A `sea_orm::DatabaseConnection` wraps a `sqlx::PgPool`, so for building a
+client, running migrations, or reading job state you can reach the pool
+directly (`awa_seaorm::pool(&db)` / `db.awa_pool()`) and use Awa's existing
+APIs unchanged.
+
+The part that needs a real adapter is **transactional enqueue**.
+`get_postgres_connection_pool()` hands back a *separate* pooled connection, so
+a job inserted through it commits independently of your ORM writes. The
+`insert` / `insert_with` / `insert_raw` helpers instead run Awa's canonical
+insert SQL through SeaORM's `ConnectionTrait`, so they bind to whatever you
+pass — a `DatabaseConnection` *or* a `DatabaseTransaction` — letting a job
+commit atomically with the rest of a transaction.
+
+The adapter lives in the optional `awa-seaorm` crate:
+
+```toml
+[dependencies]
+awa = "0.6.0-beta.1"
+awa-seaorm = "0.6.0-beta.1"
+sea-orm = { version = "=2.0.0-rc.38", default-features = false, features = [
+    "sqlx-postgres",
+    "runtime-tokio-rustls",
+] }
+```
+
+```rust
+use awa::JobArgs;
+use awa_seaorm::{insert, migrate};
+use sea_orm::{Database, TransactionTrait};
+use serde::{Deserialize, Serialize};
+
+#[derive(Debug, Serialize, Deserialize, JobArgs)]
+struct SendWelcomeEmail {
+    user_id: i64,
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let db = Database::connect(&std::env::var("DATABASE_URL")?).await?;
+    migrate(&db).await?;
+
+    // The user row and its welcome-email job commit together, or not at all.
+    let txn = db.begin().await?;
+    // ... insert your application rows via SeaORM on `txn` ...
+    insert(&txn, &SendWelcomeEmail { user_id: 42 }).await?;
+    txn.commit().await?;
+
+    Ok(())
+}
+```
+
+Without a transaction, pass the connection directly (`insert(&db, &job)`) to
+enqueue immediately, or use `client_builder(&db)` to build a worker client.
+
+### Why the adapter runs SQL rather than reusing `awa::insert_with`
+
+Awa's native `insert_with` is a *pull* API: hand it a `&mut sqlx::PgConnection`
+and it runs on it. A SeaORM `DatabaseTransaction` can't satisfy that. It owns
+the connection inside an `Arc<Mutex<…>>` and must keep it so a later
+`commit()`/`rollback()` runs on that same connection — so it never lends out a
+`&mut PgConnection`, and exposes no `Into`/`AsMut`/accessor for one. The only
+way it lets you use that connection is its `ConnectionTrait`, a *push* API:
+you give it a `Statement` and it runs it for you.
+
+So the adapter inverts the direction — it pushes Awa's canonical insert SQL
+(`awa::adapter::postgres::INSERT_JOB_SQL`, the same statement and bind order
+the native path and the tokio-postgres bridge use) through `ConnectionTrait`.
+The result row, however, *is* surrendered: `QueryResult::try_as_pg_row` yields
+the underlying `sqlx::PgRow`, which Awa's own `JobRow: FromRow` decodes — so
+the returned job is identical to one from `awa::insert`, with no parallel
+decoder to drift. This is also why the workspace enables SeaORM's `with-chrono`
+and `with-json` features: only so the timestamp and JSONB bind values can
+become `sea_orm::Value`.
+
 ## Python: psycopg3, asyncpg, SQLAlchemy, Django
 
 See [Python getting started — ORM Transaction Bridging](getting-started-python.md#orm-transaction-bridging).

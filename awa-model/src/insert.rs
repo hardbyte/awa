@@ -1,4 +1,4 @@
-use crate::error::AwaError;
+use crate::error::{map_sqlx_error, AwaError};
 use crate::job::{InsertOpts, InsertParams, JobRow, JobState};
 use crate::unique::compute_unique_key;
 use crate::JobArgs;
@@ -178,17 +178,6 @@ impl PreparedJobInsert {
     pub fn ordering_key(&self) -> Option<&[u8]> {
         self.ordering_key.as_deref()
     }
-}
-
-fn map_sqlx_error(err: sqlx::Error) -> AwaError {
-    if let sqlx::Error::Database(ref db_err) = err {
-        if db_err.code().as_deref() == Some("23505") {
-            return AwaError::UniqueConflict {
-                constraint: db_err.constraint().map(|c| c.to_string()),
-            };
-        }
-    }
-    AwaError::Database(err)
 }
 
 fn build_multi_insert_query(count: usize) -> String {
