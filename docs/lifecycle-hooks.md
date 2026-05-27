@@ -105,8 +105,12 @@ mechanism:
   ordering for short jobs.
 - A panicking hook is logged; later hooks for the same kind still run.
 
-If a side effect must fire exactly once or survive a crash, do not rely on a
-hook — enqueue another Awa job from the resolving transaction (a real outbox),
-or have the hook enqueue follow-up work whose own delivery Awa guarantees.
+If a side effect must fire exactly once or survive a crash, do not drive it
+from a hook at all — the dispatch may never run, and enqueueing the follow-up
+work *from* the hook just inherits that same unreliability. Drive it from
+something durable instead: enqueue the follow-up as an Awa job inside a
+transaction you control — for a callback, the very transaction that resolves it
+(a transactional outbox) — or make the job handler perform the side effect
+idempotently so re-execution is safe.
 
 See [ADR-015](adr/015-post-commit-lifecycle-hooks.md) for the design rationale.
