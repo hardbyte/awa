@@ -673,6 +673,9 @@ async fn test_stale_completion_does_not_fire_event() {
                     JobEvent::Cancelled { args, .. } => {
                         tx.send(format!("cancelled:{}", args.value)).unwrap()
                     }
+                    JobEvent::WaitingForCallback { args, .. } => {
+                        tx.send(format!("waiting:{}", args.value)).unwrap()
+                    }
                 }
             }
         })
@@ -809,6 +812,7 @@ async fn test_snooze_only_emits_started_event() {
             async move {
                 let label = match &event {
                     JobEvent::Started { .. } => "started",
+                    JobEvent::WaitingForCallback { .. } => "waiting",
                     JobEvent::Completed { .. } => "completed",
                     JobEvent::Retried { .. } => "retried",
                     JobEvent::Exhausted { .. } => "exhausted",
@@ -847,4 +851,186 @@ async fn test_snooze_only_emits_started_event() {
         rx.try_recv().is_err(),
         "Snooze should not produce a lifecycle outcome event"
     );
+}
+
+// ── Callback lifecycle events ───────────────────────────────────────────
+
+#[derive(Debug)]
+enum CbEvent {
+    Waiting(awa::JobRow),
+    Completed(awa::JobRow, Duration),
+    Exhausted(awa::JobRow, String),
+}
+
+/// Worker that parks on an external callback. Uses a `Worker` impl rather than
+/// a closure because awaiting `ctx.register_callback()` borrows the context,
+/// which the `'static` closure-handler bound disallows.
+struct ParkingWorker;
+
+#[async_trait::async_trait]
+impl Worker for ParkingWorker {
+    fn kind(&self) -> &'static str {
+        HookJob::kind()
+    }
+
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<JobResult, JobError> {
+        let callback = ctx
+            .register_callback(Duration::from_secs(3600))
+            .await
+            .map_err(JobError::retryable)?;
+        Ok(JobResult::WaitForCallback(callback))
+    }
+}
+
+/// Build a client whose `HookJob` worker parks on an external callback and
+/// whose hook forwards Waiting/Completed/Exhausted events onto `tx`.
+fn parking_client(pool: &sqlx::PgPool, queue: &str, tx: mpsc::UnboundedSender<CbEvent>) -> Client {
+    Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(ParkingWorker)
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                match event {
+                    JobEvent::WaitingForCallback { job, .. } => {
+                        let _ = tx.send(CbEvent::Waiting(job));
+                    }
+                    JobEvent::Completed { job, duration, .. } => {
+                        let _ = tx.send(CbEvent::Completed(job, duration));
+                    }
+                    JobEvent::Exhausted { job, error, .. } => {
+                        let _ = tx.send(CbEvent::Exhausted(job, error));
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .build()
+        .unwrap()
+}
+
+async fn insert_hook_job(pool: &sqlx::PgPool, queue: &str, value: &str) -> awa::JobRow {
+    awa::insert_with(
+        pool,
+        &HookJob {
+            action: "wait".into(),
+            value: value.into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_waiting_for_callback_event_fires_on_park() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_waiting";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, tx);
+    let inserted = insert_hook_job(&pool, queue, "park").await;
+
+    client.start().await.unwrap();
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Waiting(job) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::WaitingExternal);
+            assert!(job.callback_id.is_some(), "callback_id should be set");
+        }
+        other => panic!("expected WaitingForCallback, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_complete_external_dispatches_completed_event() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_complete";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, tx);
+    let inserted = insert_hook_job(&pool, queue, "complete").await;
+
+    client.start().await.unwrap();
+
+    // Park first.
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    // Resolve through the worker Client → Completed hook should fire.
+    let completed = client
+        .complete_external(callback_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(completed.id, inserted.id);
+
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Completed(job, duration) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::Completed);
+            assert_eq!(
+                duration,
+                Duration::ZERO,
+                "callback completion has no handler duration"
+            );
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_fail_external_dispatches_exhausted_event() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_fail";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, tx);
+    let inserted = insert_hook_job(&pool, queue, "fail").await;
+
+    client.start().await.unwrap();
+
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    client
+        .fail_external(callback_id, "payment declined", None)
+        .await
+        .unwrap();
+
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Exhausted(job, error) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(error, "payment declined");
+        }
+        other => panic!("expected Exhausted, got {other:?}"),
+    }
 }

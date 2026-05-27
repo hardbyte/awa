@@ -847,6 +847,19 @@ struct RuntimeReporterState {
     metrics: crate::metrics::AwaMetrics,
 }
 
+/// Best-effort extraction of the most recent error message from a job's
+/// `errors` history, for populating callback-driven `Exhausted`/`Retried`
+/// events. Returns an empty string when no structured error is present.
+fn latest_error_message(job: &awa_model::JobRow) -> String {
+    job.errors
+        .as_ref()
+        .and_then(|errors| errors.last())
+        .and_then(|entry| entry.get("error"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_default()
+}
+
 impl Client {
     /// Create a new builder.
     pub fn builder(pool: PgPool) -> ClientBuilder {
@@ -1378,6 +1391,98 @@ impl Client {
     /// Get the pool reference.
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// Resolve a pending external callback, then dispatch the matching
+    /// lifecycle event to this client's registered hooks.
+    ///
+    /// Prefer this over [`awa_model::admin::resolve_callback`] when you want
+    /// `Completed`/`Exhausted` hooks to fire for callback-driven outcomes.
+    /// Hooks fire only in this process; resolving through the bare `admin`
+    /// function transitions the job correctly but emits no event. A `resume`
+    /// or `ignore` outcome emits nothing — the job either re-enters execution
+    /// (and the executor emits the usual events) or nothing changed.
+    pub async fn resolve_callback(
+        &self,
+        callback_id: Uuid,
+        payload: Option<serde_json::Value>,
+        default_action: awa_model::DefaultAction,
+        run_lease: Option<i64>,
+    ) -> Result<awa_model::ResolveOutcome, awa_model::AwaError> {
+        let outcome =
+            admin::resolve_callback(&self.pool, callback_id, payload, default_action, run_lease)
+                .await?;
+        let event = match &outcome {
+            awa_model::ResolveOutcome::Completed { job, .. } => Some(UntypedJobEvent::Completed {
+                job: job.clone(),
+                duration: Duration::ZERO,
+            }),
+            awa_model::ResolveOutcome::Failed { job } => Some(UntypedJobEvent::Exhausted {
+                job: job.clone(),
+                error: latest_error_message(job),
+                attempt: job.attempt,
+            }),
+            awa_model::ResolveOutcome::Ignored { .. } => None,
+        };
+        if let Some(event) = event {
+            self.dispatch_callback_event(event).await;
+        }
+        Ok(outcome)
+    }
+
+    /// Complete a waiting job via its callback and dispatch a `Completed` hook.
+    pub async fn complete_external(
+        &self,
+        callback_id: Uuid,
+        payload: Option<serde_json::Value>,
+        run_lease: Option<i64>,
+    ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let job = admin::complete_external(&self.pool, callback_id, payload, run_lease).await?;
+        self.dispatch_callback_event(UntypedJobEvent::Completed {
+            job: job.clone(),
+            duration: Duration::ZERO,
+        })
+        .await;
+        Ok(job)
+    }
+
+    /// Fail a waiting job via its callback and dispatch an `Exhausted` hook.
+    pub async fn fail_external(
+        &self,
+        callback_id: Uuid,
+        error: &str,
+        run_lease: Option<i64>,
+    ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let job = admin::fail_external(&self.pool, callback_id, error, run_lease).await?;
+        self.dispatch_callback_event(UntypedJobEvent::Exhausted {
+            job: job.clone(),
+            error: error.to_string(),
+            attempt: job.attempt,
+        })
+        .await;
+        Ok(job)
+    }
+
+    /// Requeue a waiting job via its callback and dispatch a `Retried` hook.
+    pub async fn retry_external(
+        &self,
+        callback_id: Uuid,
+        run_lease: Option<i64>,
+    ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let job = admin::retry_external(&self.pool, callback_id, run_lease).await?;
+        self.dispatch_callback_event(UntypedJobEvent::Retried {
+            job: job.clone(),
+            error: latest_error_message(&job),
+            attempt: job.attempt,
+            next_run_at: job.run_at,
+        })
+        .await;
+        Ok(job)
+    }
+
+    async fn dispatch_callback_event(&self, event: UntypedJobEvent) {
+        let kind = event.job().kind.clone();
+        crate::executor::dispatch_lifecycle_event(&self.lifecycle_handlers, &kind, event).await;
     }
 
     /// Health check.
