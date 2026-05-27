@@ -1,7 +1,8 @@
-use awa::{JobArgs, JobResult, QueueConfig};
-use awa_seaorm::{client_builder, insert, insert_raw, migrate, SeaOrmAwaExt};
+use awa::{AwaError, InsertOpts, JobArgs, JobResult, QueueConfig, UniqueOpts};
+use awa_seaorm::{client_builder, insert, insert_raw, insert_with, migrate, SeaOrmAwaExt};
 use sea_orm::{ConnectionTrait, DatabaseConnection, TransactionTrait};
 use serde::{Deserialize, Serialize};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Serialize, Deserialize, JobArgs)]
 struct SendEmail {
@@ -12,6 +13,17 @@ struct SendEmail {
 fn test_database_url() -> String {
     std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgres://postgres:test@localhost:15432/awa_test".to_string())
+}
+
+/// Unique identifier for per-test tables and queues so a failed run that
+/// skips cleanup can't collide with the next one.
+fn unique_suffix(prefix: &str) -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    format!(
+        "{prefix}_{}_{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 async fn setup_database() -> (sqlx::PgPool, DatabaseConnection) {
@@ -91,8 +103,8 @@ async fn seaorm_pool_helper_matches_database_connection() {
 #[tokio::test]
 async fn enqueue_commits_atomically_with_app_writes() {
     let (pool, db) = setup_database().await;
-    let table_name = "seaorm_commit_rows";
-    create_app_table(&pool, table_name).await;
+    let table_name = unique_suffix("seaorm_commit_rows");
+    create_app_table(&pool, &table_name).await;
 
     let txn = db.begin().await.expect("begin transaction");
     txn.execute_unprepared(&format!(
@@ -128,14 +140,14 @@ async fn enqueue_commits_atomically_with_app_writes() {
         .expect("count committed job");
     assert_eq!(job_count, 1);
 
-    drop_app_table(&pool, table_name).await;
+    drop_app_table(&pool, &table_name).await;
 }
 
 #[tokio::test]
 async fn enqueue_rolls_back_with_app_writes() {
     let (pool, db) = setup_database().await;
-    let table_name = "seaorm_rollback_rows";
-    create_app_table(&pool, table_name).await;
+    let table_name = unique_suffix("seaorm_rollback_rows");
+    create_app_table(&pool, &table_name).await;
 
     let txn = db.begin().await.expect("begin transaction");
     txn.execute_unprepared(&format!(
@@ -173,5 +185,47 @@ async fn enqueue_rolls_back_with_app_writes() {
         .expect("count rolled-back job");
     assert_eq!(job_count, 0);
 
-    drop_app_table(&pool, table_name).await;
+    drop_app_table(&pool, &table_name).await;
+}
+
+#[tokio::test]
+async fn duplicate_unique_job_maps_to_unique_conflict() {
+    let (_pool, db) = setup_database().await;
+    let queue = unique_suffix("seaorm_unique_q");
+    let opts = || InsertOpts {
+        queue: queue.clone(),
+        unique: Some(UniqueOpts {
+            by_queue: true,
+            ..UniqueOpts::default()
+        }),
+        ..Default::default()
+    };
+
+    let first = insert_with(
+        &db,
+        &SendEmail {
+            to: "unique@example.com".into(),
+            subject: "first".into(),
+        },
+        opts(),
+    )
+    .await
+    .expect("first insert should succeed");
+    assert!(first.unique_key.is_some());
+
+    // A second insert with the same uniqueness key must surface as a typed
+    // UniqueConflict, identical to the native awa::insert path.
+    let result = insert_with(
+        &db,
+        &SendEmail {
+            to: "unique@example.com".into(),
+            subject: "first".into(),
+        },
+        opts(),
+    )
+    .await;
+    assert!(
+        matches!(result, Err(AwaError::UniqueConflict { .. })),
+        "expected UniqueConflict, got {result:?}"
+    );
 }

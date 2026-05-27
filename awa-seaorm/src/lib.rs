@@ -19,10 +19,11 @@
 //! API on the pool from [`pool`].
 
 use awa::adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
-use awa::{AwaError, Client, ClientBuilder, InsertOpts, JobArgs, JobRow};
-use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, SqlErr, Statement};
+use awa::{map_sqlx_error, AwaError, Client, ClientBuilder, InsertOpts, JobArgs, JobRow};
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, Statement};
 use sqlx::FromRow;
 use sqlx::PgPool;
+use std::sync::Arc;
 
 /// Convenience methods for using a SeaORM connection with Awa.
 pub trait SeaOrmAwaExt {
@@ -153,37 +154,21 @@ where
     JobRow::from_row(row).map_err(AwaError::from)
 }
 
-/// Translate a SeaORM error into Awa's error type, preserving unique-conflict
-/// detection (so callers see [`AwaError::UniqueConflict`]) and the underlying
-/// sqlx error where SeaORM exposes it.
+/// Translate a SeaORM error into Awa's error type.
+///
+/// Where SeaORM carries the underlying sqlx error, route it through Awa's
+/// canonical [`map_sqlx_error`] so the result — including unique-conflict
+/// detection — is identical to the native `awa::insert` path. SeaORM mints a
+/// fresh `Arc` per error, so the unwrap normally succeeds; the rare shared
+/// case falls back to a database error.
 fn map_db_err(err: DbErr) -> AwaError {
-    if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
-        return AwaError::UniqueConflict {
-            constraint: unique_constraint_name(&err),
-        };
-    }
-
     match err {
         DbErr::Exec(sea_orm::RuntimeErr::SqlxError(err))
         | DbErr::Query(sea_orm::RuntimeErr::SqlxError(err))
-        | DbErr::Conn(sea_orm::RuntimeErr::SqlxError(err)) => {
-            match std::sync::Arc::try_unwrap(err) {
-                Ok(err) => AwaError::from(err),
-                Err(err) => AwaError::Database(sqlx::Error::Protocol(err.to_string())),
-            }
-        }
+        | DbErr::Conn(sea_orm::RuntimeErr::SqlxError(err)) => match Arc::try_unwrap(err) {
+            Ok(err) => map_sqlx_error(err),
+            Err(err) => AwaError::Database(sqlx::Error::Protocol(err.to_string())),
+        },
         other => AwaError::Database(sqlx::Error::Protocol(other.to_string())),
-    }
-}
-
-fn unique_constraint_name(err: &DbErr) -> Option<String> {
-    let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
-    | DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
-    else {
-        return None;
-    };
-    match std::ops::Deref::deref(sqlx_err) {
-        sqlx::Error::Database(db_err) => db_err.constraint().map(|c| c.to_string()),
-        _ => None,
     }
 }
