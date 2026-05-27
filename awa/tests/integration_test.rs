@@ -1024,23 +1024,66 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     let kind_a = "integ_admin_meta_available_kind";
     let kind_b = "integ_admin_meta_scheduled_kind";
     let kind_c = "integ_admin_meta_waiting_kind";
+    let our_queues: &[&str] = &[queue_a, queue_b];
+    let our_kinds: &[&str] = &[kind_a, kind_b, kind_c];
 
-    clean_queue(client.pool(), queue_a).await;
-    clean_queue(client.pool(), queue_b).await;
-    sqlx::query("DELETE FROM awa.jobs WHERE kind = ANY($1)")
-        .bind(vec![kind_a, kind_b, kind_c])
-        .execute(client.pool())
+    // Run the entire test on a single pooled connection inside one
+    // transaction that holds the admin-metadata advisory lock (1098018130).
+    // Why: that lock is what `refresh_admin_metadata()` and
+    // `recompute_dirty_admin_metadata()` acquire before touching the
+    // cache tables. While we hold it, no maintenance leader running in a
+    // parallel test binary can take a snapshot of `jobs_hot` before our
+    // INSERTs commit and then overwrite `queue_state_counts` with stale
+    // counts between our recompute and our read. Doing both the mutation
+    // and the cache read in the same transaction also means the recompute
+    // call sees our pending dirty markers and our reads see the upsert it
+    // just performed — no cross-connection visibility races.
+    let mut tx = client.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(1098018130)")
+        .execute(&mut *tx)
         .await
         .unwrap();
 
-    // Snapshot baseline immediately before insert. Other test binaries may
-    // concurrently create/modify jobs in the shared database, so we can only
-    // assert that global counts increased by *at least* the expected delta.
-    admin::flush_dirty_admin_metadata(client.pool())
+    // Wipe any leftovers from previous runs of this test (jobs, pause
+    // flags, cache rows, dirty markers) for our unique queue/kind names.
+    sqlx::query("DELETE FROM awa.jobs WHERE queue = ANY($1) OR kind = ANY($2)")
+        .bind(our_queues)
+        .bind(our_kinds)
+        .execute(&mut *tx)
         .await
         .unwrap();
-    let baseline = admin::state_counts(client.pool()).await.unwrap();
+    sqlx::query("DELETE FROM awa.queue_meta WHERE queue = ANY($1)")
+        .bind(our_queues)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.queue_state_counts WHERE queue = ANY($1)")
+        .bind(our_queues)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.job_kind_catalog WHERE kind = ANY($1)")
+        .bind(our_kinds)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.job_queue_catalog WHERE queue = ANY($1)")
+        .bind(our_queues)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.admin_dirty_queues WHERE queue = ANY($1)")
+        .bind(our_queues)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM awa.admin_dirty_kinds WHERE kind = ANY($1)")
+        .bind(our_kinds)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
 
+    // ── Phase 1: insert 3 jobs across two queues, drain, verify caches ──
     sqlx::query(
         r#"
         INSERT INTO awa.jobs (kind, queue, args, state, run_at)
@@ -1055,87 +1098,155 @@ async fn test_admin_metadata_caches_track_state_and_catalog_changes() {
     .bind(kind_b)
     .bind(kind_c)
     .bind(queue_b)
-    .execute(client.pool())
+    .execute(&mut *tx)
     .await
     .unwrap();
 
-    admin::flush_dirty_admin_metadata(client.pool())
-        .await
-        .unwrap();
-    let counts = admin::state_counts(client.pool()).await.unwrap();
-    assert!(
-        counts.get(&JobState::Available).copied().unwrap_or(0)
-            > baseline.get(&JobState::Available).copied().unwrap_or(0),
-        "expected at least 1 more available job"
-    );
-    assert!(
-        counts.get(&JobState::Scheduled).copied().unwrap_or(0)
-            > baseline.get(&JobState::Scheduled).copied().unwrap_or(0),
-        "expected at least 1 more scheduled job"
-    );
-    assert!(
-        counts.get(&JobState::WaitingExternal).copied().unwrap_or(0)
-            > baseline
-                .get(&JobState::WaitingExternal)
-                .copied()
-                .unwrap_or(0),
-        "expected at least 1 more waiting_external job"
-    );
+    drain_dirty_for(&mut tx, our_queues, our_kinds).await;
 
-    let queues = admin::queue_overviews(client.pool()).await.unwrap();
-    let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
-    assert_eq!(queue_a_stats.total_queued, 2);
-    assert_eq!(queue_a_stats.available, 1);
-    assert_eq!(queue_a_stats.scheduled, 1);
-    let queue_b_stats = queues.iter().find(|stat| stat.queue == queue_b).unwrap();
-    assert_eq!(queue_b_stats.total_queued, 1);
-    assert_eq!(queue_b_stats.waiting_external, 1);
+    let (a_total, a_avail, a_sched) = sqlx::query_as::<_, (i64, i64, i64)>(
+        "SELECT scheduled + available + running + retryable + waiting_external,
+                available,
+                scheduled
+         FROM awa.queue_state_counts WHERE queue = $1",
+    )
+    .bind(queue_a)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(a_total, 2);
+    assert_eq!(a_avail, 1);
+    assert_eq!(a_sched, 1);
 
-    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
-    assert!(kinds.contains(&kind_a.to_string()));
-    assert!(kinds.contains(&kind_b.to_string()));
-    assert!(kinds.contains(&kind_c.to_string()));
+    let (b_total, b_waiting) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT scheduled + available + running + retryable + waiting_external,
+                waiting_external
+         FROM awa.queue_state_counts WHERE queue = $1",
+    )
+    .bind(queue_b)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(b_total, 1);
+    assert_eq!(b_waiting, 1);
 
-    let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
-    assert!(distinct_queues.contains(&queue_a.to_string()));
-    assert!(distinct_queues.contains(&queue_b.to_string()));
+    let kinds_present: Vec<String> = sqlx::query_scalar(
+        "SELECT kind FROM awa.job_kind_catalog WHERE kind = ANY($1) AND ref_count > 0",
+    )
+    .bind(our_kinds)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(kinds_present.contains(&kind_a.to_string()));
+    assert!(kinds_present.contains(&kind_b.to_string()));
+    assert!(kinds_present.contains(&kind_c.to_string()));
 
+    let queues_present: Vec<String> = sqlx::query_scalar(
+        "SELECT queue FROM awa.job_queue_catalog WHERE queue = ANY($1) AND ref_count > 0",
+    )
+    .bind(our_queues)
+    .fetch_all(&mut *tx)
+    .await
+    .unwrap();
+    assert!(queues_present.contains(&queue_a.to_string()));
+    assert!(queues_present.contains(&queue_b.to_string()));
+
+    // ── Phase 2: promote kind_b from scheduled to available ─────────────
     sqlx::query("UPDATE awa.jobs SET state = 'available', run_at = now() WHERE kind = $1")
         .bind(kind_b)
-        .execute(client.pool())
+        .execute(&mut *tx)
         .await
         .unwrap();
+    drain_dirty_for(&mut tx, our_queues, our_kinds).await;
+    let (a_avail_after, a_sched_after) = sqlx::query_as::<_, (i64, i64)>(
+        "SELECT available, scheduled FROM awa.queue_state_counts WHERE queue = $1",
+    )
+    .bind(queue_a)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    assert_eq!(a_avail_after, 2, "kind_b should now be available");
+    assert_eq!(a_sched_after, 0, "no scheduled jobs should remain");
 
-    // Verify the promotion via queue-specific stats (immune to concurrent
-    // test interference) rather than global count deltas.
-    admin::flush_dirty_admin_metadata(client.pool())
-        .await
-        .unwrap();
-    let queues = admin::queue_overviews(client.pool()).await.unwrap();
-    let queue_a_stats = queues.iter().find(|stat| stat.queue == queue_a).unwrap();
-    assert_eq!(queue_a_stats.available, 2, "kind_b should now be available");
-    assert_eq!(
-        queue_a_stats.scheduled, 0,
-        "no scheduled jobs should remain"
-    );
-
+    // ── Phase 3: delete kind_c (only job in queue_b); cache should purge ─
     sqlx::query("DELETE FROM awa.jobs WHERE kind = $1")
         .bind(kind_c)
-        .execute(client.pool())
+        .execute(&mut *tx)
         .await
         .unwrap();
+    drain_dirty_for(&mut tx, our_queues, our_kinds).await;
 
-    admin::flush_dirty_admin_metadata(client.pool())
+    let queue_b_row: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM awa.queue_state_counts WHERE queue = $1")
+            .bind(queue_b)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        queue_b_row.is_none(),
+        "queue_b should be purged from queue_state_counts"
+    );
+
+    let kind_c_row: Option<i32> =
+        sqlx::query_scalar("SELECT 1 FROM awa.job_kind_catalog WHERE kind = $1 AND ref_count > 0")
+            .bind(kind_c)
+            .fetch_optional(&mut *tx)
+            .await
+            .unwrap();
+    assert!(
+        kind_c_row.is_none(),
+        "kind_c should be purged from job_kind_catalog"
+    );
+
+    let queue_b_catalog_row: Option<i32> = sqlx::query_scalar(
+        "SELECT 1 FROM awa.job_queue_catalog WHERE queue = $1 AND ref_count > 0",
+    )
+    .bind(queue_b)
+    .fetch_optional(&mut *tx)
+    .await
+    .unwrap();
+    assert!(
+        queue_b_catalog_row.is_none(),
+        "queue_b should be purged from job_queue_catalog"
+    );
+
+    tx.commit().await.unwrap();
+}
+
+/// Drive the production `recompute_dirty_admin_metadata()` SQL function
+/// until our test's queues and kinds have no remaining dirty markers, so
+/// the cache tables reflect every mutation we just made.
+///
+/// Concurrent test binaries hitting the shared database can keep adding
+/// dirty markers for *their* queues/kinds while we loop, but
+/// `recompute_dirty_admin_metadata` orders by `touched_at` and processes
+/// 1000 entries per call, so each iteration makes forward progress and a
+/// bounded number of iterations is enough in practice. We cap the loop so
+/// a wedged drain reports a clear failure instead of hanging the test.
+async fn drain_dirty_for(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    queues: &[&str],
+    kinds: &[&str],
+) {
+    for _ in 0..100 {
+        sqlx::query("SELECT awa.recompute_dirty_admin_metadata(1000)")
+            .execute(&mut **tx)
+            .await
+            .unwrap();
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM awa.admin_dirty_queues WHERE queue = ANY($1))
+                  + (SELECT count(*) FROM awa.admin_dirty_kinds WHERE kind = ANY($2))",
+        )
+        .bind(queues)
+        .bind(kinds)
+        .fetch_one(&mut **tx)
         .await
         .unwrap();
-    let queues = admin::queue_overviews(client.pool()).await.unwrap();
-    assert!(!queues.iter().any(|stat| stat.queue == queue_b));
-
-    let kinds = admin::distinct_kinds(client.pool()).await.unwrap();
-    assert!(!kinds.contains(&kind_c.to_string()));
-
-    let distinct_queues = admin::distinct_queues(client.pool()).await.unwrap();
-    assert!(!distinct_queues.contains(&queue_b.to_string()));
+        if remaining == 0 {
+            return;
+        }
+    }
+    panic!("admin dirty markers for test queues/kinds were not drained after 100 iterations");
 }
 
 #[tokio::test]
