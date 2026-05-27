@@ -10,6 +10,7 @@ readme = "README.md"
 [dependencies]
 awa.workspace = true
 sea-orm.workspace = true
+serde_json.workspace = true
 sqlx.workspace = true
 
 [dev-dependencies]

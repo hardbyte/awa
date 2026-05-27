@@ -1,14 +1,27 @@
 //! SeaORM integration helpers for Awa.
 //!
-//! This crate stays deliberately thin: it exposes the underlying
-//! `sqlx::PgPool` from a SeaORM `DatabaseConnection`, then reuses Awa's
-//! existing migration and insertion helpers on that pool.
+//! This crate stays deliberately thin. Awa's core is SQLx/Postgres-native,
+//! and a SeaORM `DatabaseConnection` already wraps a `sqlx::PgPool` — so for
+//! building a client, running migrations, or reading job state you can reach
+//! the pool directly (see [`pool`]) and use Awa's existing APIs unchanged.
 //!
-//! It does not add a new storage engine, and it does not replace the
-//! existing `awa` sqlx API.
+//! The one thing the pool *can't* give you is enqueueing a job on the same
+//! connection as an in-flight SeaORM transaction: `get_postgres_connection_pool()`
+//! hands back a separate pooled connection, so a job inserted through it would
+//! commit independently of your ORM writes. The [`insert`], [`insert_with`],
+//! and [`insert_raw`] functions here run Awa's canonical insert SQL through
+//! SeaORM's [`ConnectionTrait`], so they bind to whatever you pass —
+//! a `DatabaseConnection` *or* a `DatabaseTransaction` — letting you enqueue a
+//! job atomically with the rest of a transaction. The returned row is decoded
+//! with Awa's own `FromRow`, so it is identical to a job from `awa::insert`.
+//!
+//! Job administration and reads are not duplicated here: use the `awa::admin`
+//! API on the pool from [`pool`].
 
+use awa::adapter::postgres::{prepare_job_insert, prepare_raw_job_insert, PreparedJobInsert};
 use awa::{AwaError, Client, ClientBuilder, InsertOpts, JobArgs, JobRow};
-use sea_orm::DatabaseConnection;
+use sea_orm::{ConnectionTrait, DatabaseConnection, DbErr, SqlErr, Statement};
+use sqlx::FromRow;
 use sqlx::PgPool;
 
 /// Convenience methods for using a SeaORM connection with Awa.
@@ -45,19 +58,132 @@ pub async fn migrate(connection: &DatabaseConnection) -> Result<(), AwaError> {
     awa::migrations::run(connection.awa_pool()).await
 }
 
-/// Insert a job using Awa's existing sqlx path via the SeaORM connection pool.
-pub async fn insert(
-    connection: &DatabaseConnection,
-    args: &impl JobArgs,
-) -> Result<JobRow, AwaError> {
-    awa::insert(connection.awa_pool(), args).await
+/// Enqueue a job using the type-provided job kind and serialized arguments.
+///
+/// Runs on the supplied SeaORM connection or transaction, so passing a
+/// `&DatabaseTransaction` commits the job atomically with the rest of that
+/// transaction.
+pub async fn insert<C>(connection: &C, args: &impl JobArgs) -> Result<JobRow, AwaError>
+where
+    C: ConnectionTrait,
+{
+    insert_with(connection, args, InsertOpts::default()).await
 }
 
-/// Insert a job with custom options using the SeaORM connection pool.
-pub async fn insert_with(
-    connection: &DatabaseConnection,
+/// Enqueue a job with explicit enqueue options.
+///
+/// Like [`insert`], this binds to the supplied connection or transaction.
+pub async fn insert_with<C>(
+    connection: &C,
     args: &impl JobArgs,
     opts: InsertOpts,
-) -> Result<JobRow, AwaError> {
-    awa::insert_with(connection.awa_pool(), args, opts).await
+) -> Result<JobRow, AwaError>
+where
+    C: ConnectionTrait,
+{
+    let prepared = prepare_job_insert(args, opts)?;
+    insert_prepared(connection, &prepared).await
+}
+
+/// Enqueue a job from a raw kind name and JSON-compatible arguments.
+///
+/// Like [`insert`], this binds to the supplied connection or transaction.
+pub async fn insert_raw<C>(
+    connection: &C,
+    kind: impl Into<String>,
+    args: impl Into<serde_json::Value>,
+    opts: InsertOpts,
+) -> Result<JobRow, AwaError>
+where
+    C: ConnectionTrait,
+{
+    let prepared = prepare_raw_job_insert(kind, args, opts)?;
+    insert_prepared(connection, &prepared).await
+}
+
+async fn insert_prepared<C>(
+    connection: &C,
+    prepared: &PreparedJobInsert,
+) -> Result<JobRow, AwaError>
+where
+    C: ConnectionTrait,
+{
+    let unique_key = prepared.unique_key().map(<[u8]>::to_vec);
+    let unique_states = prepared.unique_states_bit_string().map(ToOwned::to_owned);
+    let ordering_key = prepared.ordering_key().map(<[u8]>::to_vec);
+
+    let statement = Statement::from_sql_and_values(
+        connection.get_database_backend(),
+        awa::adapter::postgres::INSERT_JOB_SQL,
+        vec![
+            prepared.kind().into(),
+            prepared.queue().into(),
+            prepared.args().clone().into(),
+            prepared.state_db_str().into(),
+            prepared.priority().into(),
+            prepared.max_attempts().into(),
+            prepared.run_at().into(),
+            prepared.metadata().clone().into(),
+            prepared.tags().to_vec().into(),
+            unique_key.into(),
+            unique_states.into(),
+            ordering_key.into(),
+        ],
+    );
+
+    let result = connection
+        .query_one_raw(statement)
+        .await
+        .map_err(map_db_err)?
+        .ok_or_else(|| {
+            AwaError::Database(sqlx::Error::Protocol(
+                "insert_job_compat returned no row".to_string(),
+            ))
+        })?;
+
+    // SeaORM ran the query but `JobRow` already knows how to decode an
+    // `awa.jobs` row, so reach the underlying sqlx row and reuse it rather
+    // than maintaining a parallel column-by-column decoder.
+    let row = result.try_as_pg_row().ok_or_else(|| {
+        AwaError::Database(sqlx::Error::Protocol(
+            "expected a PostgreSQL row from the insert".to_string(),
+        ))
+    })?;
+
+    JobRow::from_row(row).map_err(AwaError::from)
+}
+
+/// Translate a SeaORM error into Awa's error type, preserving unique-conflict
+/// detection (so callers see [`AwaError::UniqueConflict`]) and the underlying
+/// sqlx error where SeaORM exposes it.
+fn map_db_err(err: DbErr) -> AwaError {
+    if matches!(err.sql_err(), Some(SqlErr::UniqueConstraintViolation(_))) {
+        return AwaError::UniqueConflict {
+            constraint: unique_constraint_name(&err),
+        };
+    }
+
+    match err {
+        DbErr::Exec(sea_orm::RuntimeErr::SqlxError(err))
+        | DbErr::Query(sea_orm::RuntimeErr::SqlxError(err))
+        | DbErr::Conn(sea_orm::RuntimeErr::SqlxError(err)) => {
+            match std::sync::Arc::try_unwrap(err) {
+                Ok(err) => AwaError::from(err),
+                Err(err) => AwaError::Database(sqlx::Error::Protocol(err.to_string())),
+            }
+        }
+        other => AwaError::Database(sqlx::Error::Protocol(other.to_string())),
+    }
+}
+
+fn unique_constraint_name(err: &DbErr) -> Option<String> {
+    let (DbErr::Exec(sea_orm::RuntimeErr::SqlxError(sqlx_err))
+    | DbErr::Query(sea_orm::RuntimeErr::SqlxError(sqlx_err))) = err
+    else {
+        return None;
+    };
+    match std::ops::Deref::deref(sqlx_err) {
+        sqlx::Error::Database(db_err) => db_err.constraint().map(|c| c.to_string()),
+        _ => None,
+    }
 }
