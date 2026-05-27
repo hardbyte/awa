@@ -94,12 +94,19 @@ mechanism:
   `Started` may already have fired for that attempt).
 - They do not block executor progress or queue capacity, and `shutdown()` does
   not wait for them. They can be lost on process crash or shutdown.
+- **Dispatch is not atomic with the state transition.** The hook runs *after*
+  the job's transition commits, as a separate in-process step — it is not a
+  transactional outbox. If the process dies between the commit and the
+  dispatch, the job state is durable but the event is lost. The same applies to
+  callback resolution: `complete_external` / `resolve_callback` commit the
+  outcome first, then dispatch.
 - `Started` is dispatched detached, so a very fast job may finish before its
   `Started` hook completes — do not rely on strict started-before-outcome
   ordering for short jobs.
 - A panicking hook is logged; later hooks for the same kind still run.
 
-If a side effect must be durable or retried, enqueue another job from the hook
-instead of relying on the hook itself.
+If a side effect must fire exactly once or survive a crash, do not rely on a
+hook — enqueue another Awa job from the resolving transaction (a real outbox),
+or have the hook enqueue follow-up work whose own delivery Awa guarantees.
 
 See [ADR-015](adr/015-post-commit-lifecycle-hooks.md) for the design rationale.
