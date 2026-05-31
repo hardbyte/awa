@@ -348,14 +348,27 @@ impl ClientBuilder {
     /// [`Self::on_completed_enqueue_with`] to override queue, priority, or
     /// other insert options.
     ///
-    /// The follow-up is `INSERT`ed in the *same database transaction* as the
-    /// completion's state change, so the trigger and the follow-up commit or
-    /// roll back together — see ADR-029. This is the durable counterpart to
-    /// [`Self::on_event`]: hooks are best-effort, in-process; this enqueue is
-    /// at-least-once and rides Awa's existing retry/DLQ machinery.
+    /// # Atomicity
+    ///
+    /// When the trigger completes from the worker handler (`Ok(Completed)`),
+    /// the follow-up `INSERT`s in the *same database transaction* as the
+    /// completion's state change, so the trigger and the follow-up commit
+    /// or roll back together (ADR-029, ADR-013 run-lease guard).
+    ///
+    /// When the trigger completes via callback resolution
+    /// ([`Client::complete_external`], [`Client::resolve_callback`] with a
+    /// `Complete` action), the follow-up dispatch runs in a *separate*
+    /// transaction *after* the resolution commits — a spec INSERT failure
+    /// leaves the job resolved without a follow-up (logged at error
+    /// level). Don't predicate a workflow on a callback-driven follow-up
+    /// landing.
+    ///
+    /// This is the durable counterpart to [`Self::on_event`]: hooks are
+    /// best-effort, in-process; this enqueue is at-least-once and rides
+    /// Awa's existing retry/DLQ machinery.
     ///
     /// Multiple registrations for the same kind stack and all run in the
-    /// finalization transaction.
+    /// same dispatch.
     pub fn on_completed_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -399,7 +412,10 @@ impl ClientBuilder {
     /// `make` receives the trigger's args, its post-retry `JobRow`, the error
     /// string, the previous attempt number, and the next-run-at timestamp.
     ///
-    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    /// Atomicity matches [`Self::on_completed_enqueue`]: worker-driven
+    /// retries dispatch in the transition's transaction; a retry driven by
+    /// [`Client::retry_external`] or [`Client::resolve_callback`] dispatches
+    /// in a separate transaction (best-effort) after the resolution commits.
     pub fn on_retried_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -451,7 +467,11 @@ impl ClientBuilder {
     /// `make` receives the trigger's args, its post-failure `JobRow`, the
     /// error string, and the attempt number.
     ///
-    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    /// Atomicity matches [`Self::on_completed_enqueue`]: worker-driven
+    /// exhaustion dispatches in the transition's transaction; an
+    /// exhaustion driven by [`Client::fail_external`] or
+    /// [`Client::resolve_callback`] with a `Fail` action dispatches in a
+    /// separate transaction (best-effort) after the resolution commits.
     pub fn on_exhausted_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -581,7 +601,14 @@ impl ClientBuilder {
     /// deadline exceeded). `make` receives the trigger's args, its post-rescue
     /// `JobRow`, and the [`RescueReason`](crate::events::RescueReason).
     ///
-    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    /// **Atomicity: best-effort, separate transaction.** Maintenance rescues
+    /// commit the rescue UPDATE before this dispatcher runs; the follow-up
+    /// dispatch opens its own transaction afterwards. If the spec INSERT
+    /// fails the rescue stands and the failure is logged. Don't predicate
+    /// a workflow on a rescue-driven follow-up landing — for compensation
+    /// after a stuck attempt, build the follow-up handler to be safely
+    /// re-runnable. The atomic variant is tracked as an open extension in
+    /// ADR-029.
     pub fn on_rescued_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,

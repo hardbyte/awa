@@ -59,12 +59,17 @@ Keep ADR-015's in-process hooks unchanged for observation. Add a first-class
 ### Principle
 
 A side effect that must survive process crash, deployment, or a split
-deployment topology (per ADR-027) is delivered as an Awa job that is
-**enqueued in the same database transaction** as the triggering state
-transition. The follow-up job inherits Awa's existing durability properties:
+deployment topology (per ADR-027) is delivered as an Awa job. For
+worker-driven outcomes that follow-up `INSERT`s **in the same database
+transaction** as the triggering state transition — both commit together
+or both roll back. Callback resolution and maintenance rescue dispatch
+their follow-ups in a separate transaction (best-effort, see
+[Atomicity matrix](#atomicity-matrix)) because the resolution / rescue
+transition has already committed by the time the dispatcher sees it.
+Either way the follow-up inherits Awa's existing durability properties:
 at-least-once delivery, retries, dead-letter (ADR-020), DLQ replay,
-observability through the admin UI, and crash recovery via run-lease guarded
-finalization (ADR-013).
+observability through the admin UI, and crash recovery via run-lease
+guarded finalization (ADR-013).
 
 ### Builder API
 

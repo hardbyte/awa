@@ -115,10 +115,15 @@ section for the durable mechanism.
 
 For side effects that **must survive a process crash** — sending a welcome
 email after signup, kicking off downstream work, persisting an audit row —
-use the transactional follow-up API instead of an `on_event` hook. A
-follow-up enqueue commits in the **same database transaction** as the
+use the transactional follow-up API instead of an `on_event` hook. For
+worker-driven outcomes (the trigger handler returned `Ok`/`Err`) the
+follow-up `INSERT`s in the **same database transaction** as the
 triggering state transition, so the follow-up either lands or the
-transition rolls back; there is no in-between.
+transition rolls back; there is no in-between. Callback resolution
+(`Client::*_external`) and maintenance rescue dispatch follow-ups in a
+**separate transaction** (best-effort) — see the [atomicity table
+below](#atomicity-guarantees) before designing a workflow that depends
+on rescue-driven or callback-driven follow-ups landing.
 
 ```rust
 use awa::{Client, EnqueueRequest, QueueConfig};

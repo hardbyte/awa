@@ -888,21 +888,23 @@ impl MaintenanceService {
         }
     }
 
-    /// Emit a Rescued lifecycle event (in-process hook) and dispatch any
-    /// registered Rescued follow-up specs. See
-    /// [`Self::dispatch_rescued_followups`] for the atomicity caveat on
-    /// the spec side.
+    /// Emit a Rescued notification: dispatch the durable follow-up specs
+    /// (best-effort, separate tx — see [`Self::dispatch_rescued_followups`])
+    /// then fire the in-process hook detached so a slow observer does not
+    /// gate the side-effect path or any work the caller does after this
+    /// (e.g. the callback-rescue DLQ move in
+    /// [`Self::rescue_expired_callbacks`]).
     async fn emit_rescued(&self, job: &JobRow, reason: crate::events::RescueReason) {
-        crate::executor::dispatch_lifecycle_event(
-            &self.lifecycle_handlers,
-            &job.kind,
-            crate::events::UntypedJobEvent::Rescued {
-                job: job.clone(),
-                reason,
-            },
-        )
-        .await;
         self.dispatch_rescued_followups(job, reason).await;
+        let handlers = self.lifecycle_handlers.clone();
+        let kind = job.kind.clone();
+        let event = crate::events::UntypedJobEvent::Rescued {
+            job: job.clone(),
+            reason,
+        };
+        tokio::spawn(async move {
+            crate::executor::dispatch_lifecycle_event(&handlers, &kind, event).await;
+        });
     }
 
     /// ADR-029 best-effort dispatch of `Rescued` follow-up specs.

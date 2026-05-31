@@ -2225,7 +2225,11 @@ async fn fail_queue_storage_with_followups(
     specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
-    let updated_job = if dlq_enabled {
+    // Track whether the row routed to DLQ so the metric records after a
+    // successful commit only — a spec-INSERT failure rolls the whole tx
+    // back, and a phantom DLQ count would lie about a transition that
+    // didn't actually happen.
+    let (updated_job, routed_to_dlq) = if dlq_enabled {
         let moved = runtime
             .store
             .fail_to_dlq_in_tx(
@@ -2237,15 +2241,14 @@ async fn fail_queue_storage_with_followups(
                 progress_snapshot,
             )
             .await?;
-        if moved.is_some() {
-            metrics.record_dlq_moved(&job.kind, &job.queue, dlq_reason);
-        }
-        moved
+        let routed = moved.is_some();
+        (moved, routed)
     } else {
-        runtime
+        let moved = runtime
             .store
             .fail_terminal_in_tx(&mut tx, job.id, job.run_lease, error_msg, progress_snapshot)
-            .await?
+            .await?;
+        (moved, false)
     };
     let Some(updated_job) = updated_job else {
         tx.rollback().await?;
@@ -2258,6 +2261,9 @@ async fn fail_queue_storage_with_followups(
     crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, Some(&outcome_ctx))
         .await?;
     tx.commit().await?;
+    if routed_to_dlq {
+        metrics.record_dlq_moved(&job.kind, &job.queue, dlq_reason);
+    }
     Ok(Some(updated_job))
 }
 
