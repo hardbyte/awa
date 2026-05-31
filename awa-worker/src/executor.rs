@@ -490,15 +490,6 @@ async fn complete_job(
             .await
         }
         RuntimeStorage::QueueStorage(runtime) => {
-            // ADR-029 follow-up enqueue is currently wired only on the
-            // canonical path. The queue-storage completion path's
-            // receipt-plane fast-complete (ADR-023) doesn't pass through a
-            // single transaction we can join from here; a dedicated
-            // tx-aware variant of `complete_runtime_batch_slow` is a
-            // follow-up. `Client::start` returns an error if specs are
-            // registered under queue storage, so we never reach this branch
-            // with a non-empty registry today.
-            let _ = enqueue_specs;
             complete_job_queue_storage(
                 runtime,
                 pool,
@@ -510,6 +501,7 @@ async fn complete_job(
                 progress_snapshot,
                 duration,
                 needs_event,
+                enqueue_specs,
                 dlq_enabled,
                 metrics,
             )
@@ -1041,6 +1033,7 @@ async fn complete_job_queue_storage(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
+    enqueue_specs: &Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
 ) -> Result<CompletionOutcome, AwaError> {
@@ -1048,6 +1041,50 @@ async fn complete_job_queue_storage(
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");
             info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
+
+            // ADR-029: when this kind has follow-up specs registered, drive
+            // completion through a dedicated transaction so the
+            // receipt-plane / lease cleanup + done_entries append +
+            // follow-up `INSERT`s commit atomically. The receipt-plane
+            // fast-complete (ADR-023) can't carry per-job follow-ups, so we
+            // bypass it for spec'd jobs and use the slow path's tx-aware
+            // variant.
+            let kind_specs = enqueue_specs.get(&job.kind).cloned();
+            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                let outcome = complete_queue_storage_with_followups(
+                    runtime,
+                    pool,
+                    job,
+                    queue_storage_claim,
+                    queue_storage_unique_states,
+                    &specs,
+                )
+                .await?;
+                return match outcome {
+                    None => {
+                        warn!(
+                            job_id = job.id,
+                            "Job already rescued/cancelled, completion ignored"
+                        );
+                        Ok(CompletionOutcome::IgnoredStale)
+                    }
+                    Some(updated_job) => {
+                        let event = if needs_event {
+                            Some(UntypedJobEvent::Completed {
+                                job: updated_job,
+                                duration,
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(CompletionOutcome::Applied {
+                            event,
+                            terminal: false,
+                        })
+                    }
+                };
+            }
+
             let updated = match match queue_storage_claim {
                 Some(claim) => {
                     completion_batcher
@@ -1485,6 +1522,82 @@ async fn complete_job_queue_storage(
             }
         }
     }
+}
+
+/// Complete a queue-storage job and run its registered follow-up enqueue
+/// specs atomically with the completion (ADR-029).
+///
+/// Bypasses the receipt-plane fast-complete path and goes straight to the
+/// tx-aware slow path so the lease/receipt cleanup, `done_entries` append,
+/// and follow-up `INSERT`s all commit together. `complete_runtime_batch_slow`
+/// already handles both receipt-claimed and materialised leases, so the
+/// trade-off is purely losing receipt-plane fast-complete throughput for
+/// spec'd jobs — acceptable since spec'd jobs do extra DB work anyway.
+///
+/// Returns:
+/// - `Ok(None)` if the completion was stale — the lease was already rescued
+///   or cancelled. The transaction is rolled back; no follow-ups emitted.
+/// - `Ok(Some(updated_job))` if the completion committed; follow-ups have
+///   been INSERTed in the same transaction. The returned row is the
+///   post-completion snapshot, mirroring the fallback constructed elsewhere
+///   in this file when `runtime.store.load_job` doesn't return one.
+#[allow(clippy::explicit_auto_deref)]
+async fn complete_queue_storage_with_followups(
+    runtime: &QueueStorageRuntime,
+    pool: &PgPool,
+    job: &JobRow,
+    queue_storage_claim: Option<&ClaimedEntry>,
+    queue_storage_unique_states: Option<&str>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let Some(claim) = queue_storage_claim else {
+        // The slow path is keyed on `ClaimedEntry` (it needs `lease_slot`,
+        // `lane_seq`, `claim_slot`, etc. to clean up receipt-plane and
+        // materialised lease rows). The executor always passes a claim when
+        // it dispatches a queue-storage job, so this branch is normally
+        // unreachable; report as stale rather than silently dropping the
+        // outcome.
+        warn!(
+            job_id = job.id,
+            "queue-storage completion with follow-up specs but no claim — \
+             treating as stale"
+        );
+        return Ok(None);
+    };
+
+    let runtime_job = ClaimedRuntimeJob {
+        claim: claim.clone(),
+        job: job.clone(),
+        unique_states: queue_storage_unique_states.map(std::string::ToString::to_string),
+    };
+
+    let mut tx = pool.begin().await?;
+
+    let updated = runtime
+        .store
+        .complete_runtime_batch_slow_in_tx(&mut tx, std::slice::from_ref(&runtime_job))
+        .await?;
+
+    if updated.is_empty() {
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    // Synthesise the post-completion snapshot — the store has just moved the
+    // lease into `done_entries` so a live SELECT would race with rotation.
+    // The happy-path fields are exactly those `complete_job_queue_storage`
+    // reconstructs when `load_job` returns None.
+    let mut updated_job = job.clone();
+    updated_job.state = JobState::Completed;
+    updated_job.finalized_at = Some(chrono::Utc::now());
+    updated_job.progress = None;
+
+    for spec in specs {
+        spec.run(&mut *tx, &updated_job).await?;
+    }
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
 }
 
 async fn direct_complete_job_queue_storage(

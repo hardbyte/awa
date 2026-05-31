@@ -6309,12 +6309,29 @@ impl QueueStorage {
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
     ) -> Result<Vec<(i64, i64)>, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .complete_runtime_batch_slow_in_tx(&mut tx, claimed)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Same as [`Self::complete_runtime_batch_slow`] but runs on the caller's
+    /// transaction so additional writes — for example ADR-029 follow-up job
+    /// inserts — can join the same commit. The caller is responsible for
+    /// `commit()` / `rollback()`. Handles both receipt-claimed and
+    /// materialised leases.
+    pub async fn complete_runtime_batch_slow_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
         if claimed.is_empty() {
             return Ok(Vec::new());
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         let claimed_map: BTreeMap<(i64, i64), ClaimedRuntimeJob> = claimed
             .iter()
@@ -6393,7 +6410,7 @@ impl QueueStorage {
                         }
                     }
 
-                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
                         .await?;
                     updated_all.extend(updated);
                 }
@@ -6519,12 +6536,11 @@ impl QueueStorage {
                         }
                     }
 
-                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
                         .await?;
                 }
             }
 
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(updated_all);
         }
 
@@ -6617,7 +6633,6 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
@@ -6634,10 +6649,8 @@ impl QueueStorage {
             }
         }
 
-        self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+        self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
             .await?;
-
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(updated)
     }
 

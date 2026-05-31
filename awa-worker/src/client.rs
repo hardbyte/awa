@@ -1169,27 +1169,6 @@ impl Client {
             *guard = effective_storage.clone();
         }
 
-        // ADR-029: on_*_enqueue specs are wired through the canonical executor
-        // path only at this stage. The queue-storage completion path uses a
-        // receipt-plane fast-complete (ADR-023) we can't currently join from
-        // a tx held by the executor; making it tx-aware is a separate
-        // follow-up. Fail fast here so callers can't ship code that silently
-        // never enqueues follow-ups under queue storage (the default runtime).
-        if !self.enqueue_specs.is_empty()
-            && matches!(
-                effective_storage,
-                crate::storage::RuntimeStorage::QueueStorage(_)
-            )
-        {
-            let kinds: Vec<&str> = self.enqueue_specs.keys().map(String::as_str).collect();
-            return Err(awa_model::AwaError::Validation(format!(
-                "follow-up enqueue specs ({kinds:?}) are registered, but this runtime is using \
-                 queue storage. ADR-029 queue-storage wiring is a separate follow-up; for now \
-                 use ClientBuilder::canonical_storage() on the process that performs the \
-                 triggering state transition."
-            )));
-        }
-
         self.log_transition_startup_status(&effective_storage)
             .await?;
 

@@ -186,43 +186,59 @@ async fn on_completed_enqueue_routes_follow_up_to_custom_queue() {
     assert_eq!(follow_up.priority, 1);
 }
 
-#[tokio::test]
-async fn on_completed_enqueue_under_queue_storage_fails_fast() {
+async fn setup_pool_queue_storage() -> sqlx::PgPool {
     use awa::model::queue_storage::{QueueStorage, QueueStorageConfig};
-
-    let _permit = test_gate().acquire_owned().await.unwrap();
     let pool = setup_pool_canonical().await;
     QueueStorage::new(QueueStorageConfig::default())
         .expect("build queue storage")
         .install(&pool)
         .await
         .expect("install queue storage");
+    pool
+}
+
+#[tokio::test]
+async fn on_completed_enqueue_inserts_follow_up_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_trigger";
 
     let client = Client::builder(pool.clone())
         .queue(
-            "enqueue_spec_queue_storage",
+            queue,
             QueueConfig {
                 poll_interval: Duration::from_millis(25),
                 ..Default::default()
             },
         )
         .register::<EnqueueTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
-        .on_completed_enqueue::<EnqueueTrigger, EnqueueFollowUp, _>(|args, _job| EnqueueFollowUp {
+        .on_completed_enqueue::<EnqueueTrigger, EnqueueFollowUp, _>(|args, job| EnqueueFollowUp {
             user_id: args.user_id,
-            triggered_by_job_id: 0,
+            triggered_by_job_id: job.id,
         })
         .build()
         .unwrap();
 
-    // ADR-029 queue-storage wiring is a deferred follow-up — it needs a
-    // tx-aware variant of `complete_runtime_batch_slow` so the receipt-plane
-    // (ADR-023) lease completion can join the follow-up's transaction.
-    // Until that lands, start() refuses loud so callers can't ship code
-    // that silently never enqueues follow-ups.
-    let err = client.start().await.expect_err("start should fail fast");
-    let msg = err.to_string();
-    assert!(
-        msg.contains("queue storage") && msg.contains("canonical_storage"),
-        "unexpected error message: {msg}"
-    );
+    let trigger_job = awa::insert_with(
+        &pool,
+        &EnqueueTrigger { user_id: 99 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    wait_for_state(&pool, trigger_job.id, JobState::Completed).await;
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("follow-up should be enqueued under queue storage");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp =
+        serde_json::from_value(follow_up.args.clone()).expect("decode follow-up args");
+    assert_eq!(follow_args.user_id, 99);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
 }
