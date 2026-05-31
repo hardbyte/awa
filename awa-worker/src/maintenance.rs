@@ -49,6 +49,18 @@ pub struct MaintenanceService {
     leader: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     periodic_jobs: Arc<Vec<PeriodicJob>>,
+    /// ADR-029 follow-up specs registry — used to dispatch `Rescued`
+    /// follow-ups (best-effort, separate tx) when this service rescues
+    /// jobs from stale heartbeat / expired callback / exceeded deadline.
+    enqueue_specs: Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
+    /// In-process `Rescued` lifecycle hooks (ADR-015), shared with the
+    /// executor. Best-effort fire-and-forget per rescued job.
+    lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
     /// In-flight job cancellation flags — used to signal deadline/heartbeat rescue
     /// to running handlers on this worker instance.
     in_flight: InFlightMap,
@@ -98,6 +110,13 @@ impl MaintenanceService {
         periodic_jobs: Arc<Vec<PeriodicJob>>,
         in_flight: InFlightMap,
         storage: RuntimeStorage,
+        enqueue_specs: Arc<
+            HashMap<
+                crate::enqueue_specs::Outcome,
+                HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+            >,
+        >,
+        lifecycle_handlers: Arc<HashMap<String, Vec<crate::events::BoxedUntypedEventHandler>>>,
     ) -> Self {
         Self {
             pool,
@@ -108,6 +127,8 @@ impl MaintenanceService {
             periodic_jobs,
             in_flight,
             storage,
+            enqueue_specs,
+            lifecycle_handlers,
             heartbeat_rescue_interval: Duration::from_secs(30),
             deadline_rescue_interval: Duration::from_secs(30),
             callback_rescue_interval: Duration::from_secs(30),
@@ -637,6 +658,10 @@ impl MaintenanceService {
                 warn!(count = rescued.len(), "Rescued stale heartbeat jobs");
                 // Signal cancellation to any rescued jobs still running on this instance
                 self.signal_cancellation(&rescued).await;
+                for job in &rescued {
+                    self.emit_rescued(job, crate::events::RescueReason::StaleHeartbeat)
+                        .await;
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue stale heartbeat jobs");
@@ -694,6 +719,10 @@ impl MaintenanceService {
                 warn!(count = rescued.len(), "Rescued deadline-expired jobs");
                 // Signal cancellation so handlers see ctx.is_cancelled() == true
                 self.signal_cancellation(&rescued).await;
+                for job in &rescued {
+                    self.emit_rescued(job, crate::events::RescueReason::DeadlineExceeded)
+                        .await;
+                }
             }
             Err(err) => {
                 error!(error = %err, "Failed to rescue deadline-expired jobs");
@@ -752,6 +781,10 @@ impl MaintenanceService {
                     )],
                 );
                 warn!(count = rescued.len(), "Rescued callback-timed-out jobs");
+                for job in &rescued {
+                    self.emit_rescued(job, crate::events::RescueReason::ExpiredCallback)
+                        .await;
+                }
                 if let RuntimeStorage::QueueStorage(runtime) = &self.storage {
                     for job in &rescued {
                         if job.state != JobState::Failed || !self.dlq_policy.enabled_for(&job.queue)
@@ -851,6 +884,84 @@ impl MaintenanceService {
             if let Some(flag) = self.in_flight.get_cancel((job.id, job.run_lease)) {
                 flag.store(true, Ordering::SeqCst);
                 debug!(job_id = job.id, "Signalled cancellation for rescued job");
+            }
+        }
+    }
+
+    /// Emit a Rescued lifecycle event (in-process hook) and dispatch any
+    /// registered Rescued follow-up specs. See
+    /// [`Self::dispatch_rescued_followups`] for the atomicity caveat on
+    /// the spec side.
+    async fn emit_rescued(&self, job: &JobRow, reason: crate::events::RescueReason) {
+        crate::executor::dispatch_lifecycle_event(
+            &self.lifecycle_handlers,
+            &job.kind,
+            crate::events::UntypedJobEvent::Rescued {
+                job: job.clone(),
+                reason,
+            },
+        )
+        .await;
+        self.dispatch_rescued_followups(job, reason).await;
+    }
+
+    /// ADR-029 best-effort dispatch of `Rescued` follow-up specs.
+    ///
+    /// Like callback-resolution follow-ups, this runs in a *separate*
+    /// transaction from the rescue UPDATE — the rescue UPDATE has already
+    /// committed by the time we're here, so we can't be atomic without
+    /// teaching every rescue path to take a `&mut tx`. If a spec INSERT
+    /// fails it's logged; the rescue itself remains valid.
+    async fn dispatch_rescued_followups(&self, job: &JobRow, reason: crate::events::RescueReason) {
+        let Some(specs) = self
+            .enqueue_specs
+            .get(&crate::enqueue_specs::Outcome::Rescued)
+            .and_then(|by_kind| by_kind.get(&job.kind))
+            .cloned()
+        else {
+            return;
+        };
+        if specs.is_empty() {
+            return;
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(err) => {
+                error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    rescue_reason = reason.as_str(),
+                    error = %err,
+                    "Rescued follow-up dispatch: failed to begin transaction"
+                );
+                return;
+            }
+        };
+        let outcome_ctx = crate::enqueue_specs::OutcomeContext::Rescued { reason };
+        let result =
+            crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, job, &specs, Some(&outcome_ctx))
+                .await;
+        match result {
+            Ok(()) => {
+                if let Err(err) = tx.commit().await {
+                    error!(
+                        job_id = job.id,
+                        kind = %job.kind,
+                        rescue_reason = reason.as_str(),
+                        error = %err,
+                        "Rescued follow-up dispatch: commit failed"
+                    );
+                }
+            }
+            Err(err) => {
+                error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    rescue_reason = reason.as_str(),
+                    error = %err,
+                    "Rescued follow-up dispatch: spec INSERT failed; rolling back"
+                );
+                let _ = tx.rollback().await;
             }
         }
     }

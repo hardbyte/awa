@@ -24,7 +24,7 @@ pub use awa_worker::{
     self as worker, context::ProgressState, BuildError, CallbackGuard, CallbackToken, Client,
     ClientBuilder, CronMissedFirePolicy, EnqueueRequest, HealthCheck, JobContext, JobError,
     JobEvent, JobResult, PeriodicJob, PeriodicJobBuilder, QueueCapacity, QueueConfig, QueueHealth,
-    RateLimit, RetentionPolicy, UntypedJobEvent, Worker,
+    RateLimit, RescueReason, RetentionPolicy, UntypedJobEvent, Worker,
 };
 
 #[cfg(feature = "http-worker")]

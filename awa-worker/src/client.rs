@@ -576,6 +576,53 @@ impl ClientBuilder {
         self
     }
 
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is rescued by maintenance (expired callback, stale heartbeat, or
+    /// deadline exceeded). `make` receives the trigger's args, its post-rescue
+    /// `JobRow`, and the [`RescueReason`](crate::events::RescueReason).
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_rescued_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, crate::events::RescueReason) -> F + Send + Sync + 'static,
+    {
+        self.on_rescued_enqueue_with::<T, F, _>(move |args, job, reason| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+        })
+    }
+
+    /// Like [`Self::on_rescued_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_rescued_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(
+                T,
+                &awa_model::JobRow,
+                crate::events::RescueReason,
+            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::RescuedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Rescued)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
     /// Register a raw worker implementation.
     pub fn register_worker(mut self, worker: impl Worker + 'static) -> Self {
         let kind = worker.kind().to_string();
@@ -1446,6 +1493,8 @@ impl Client {
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
             effective_storage.clone(),
+            self.enqueue_specs.clone(),
+            self.lifecycle_handlers.clone(),
         )
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {

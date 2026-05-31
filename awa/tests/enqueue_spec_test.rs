@@ -740,12 +740,12 @@ async fn fail_external_dispatches_exhausted_followup() {
             },
         )
         .register_worker(WaitWorker)
-        .on_exhausted_enqueue::<WaitTrigger, EnqueueFollowUp, _>(
-            |args, job, _error, _attempt| EnqueueFollowUp {
+        .on_exhausted_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job, _error, _attempt| {
+            EnqueueFollowUp {
                 user_id: args.user_id,
                 triggered_by_job_id: job.id,
-            },
-        )
+            }
+        })
         .build()
         .unwrap();
 
@@ -831,5 +831,75 @@ async fn retry_external_dispatches_retried_followup() {
 
     let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
     assert_eq!(follow_args.user_id, 503);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JobArgs)]
+struct ExpiringTrigger {
+    user_id: i64,
+}
+
+struct ShortCallbackWorker;
+
+#[async_trait::async_trait]
+impl awa::Worker for ShortCallbackWorker {
+    fn kind(&self) -> &'static str {
+        ExpiringTrigger::kind()
+    }
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<awa::JobResult, awa::JobError> {
+        // Very short callback timeout so maintenance rescues it quickly.
+        let guard = ctx
+            .register_callback(Duration::from_millis(100))
+            .await
+            .map_err(awa::JobError::retryable)?;
+        Ok(JobResult::WaitForCallback(guard))
+    }
+}
+
+#[tokio::test]
+async fn on_rescued_enqueue_dispatches_followup_on_expired_callback() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "enqueue_spec_rescued_trigger";
+
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .callback_rescue_interval(Duration::from_millis(100))
+        .register_worker(ShortCallbackWorker)
+        .on_rescued_enqueue::<ExpiringTrigger, EnqueueFollowUp, _>(|args, job, _reason| {
+            EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            }
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &ExpiringTrigger { user_id: 601 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("rescued follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 601);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
 }

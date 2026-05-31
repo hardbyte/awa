@@ -89,6 +89,9 @@ pub enum Outcome {
     Exhausted,
     Cancelled,
     WaitingForCallback,
+    /// Maintenance rescued the job (expired callback, stale heartbeat, or
+    /// exceeded deadline). See [`crate::events::RescueReason`].
+    Rescued,
 }
 
 /// Per-outcome runtime context handed to non-`Completed` follow-up closures
@@ -110,6 +113,9 @@ pub enum OutcomeContext {
         reason: String,
     },
     WaitingForCallback,
+    Rescued {
+        reason: crate::events::RescueReason,
+    },
 }
 
 /// Type-erased follow-up-enqueue spec for one (outcome, kind) pair.
@@ -292,6 +298,40 @@ where
         Box::pin(async move {
             let args: T = decode_trigger_args(job)?;
             let request = (self.make)(args, job);
+            insert_with(&mut *conn, &request.args, request.opts).await?;
+            Ok(())
+        })
+    }
+}
+
+/// Spec for the `Rescued` outcome. `make` receives the trigger's args,
+/// post-rescue `JobRow`, and the [`RescueReason`](crate::events::RescueReason).
+pub(crate) struct RescuedFollowUp<T, F, MakeFn> {
+    pub(crate) make: MakeFn,
+    pub(crate) _phantom: PhantomData<fn() -> (T, F)>,
+}
+
+impl<T, F, MakeFn> EnqueueFollowUp for RescuedFollowUp<T, F, MakeFn>
+where
+    T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+    F: JobArgs + Send + Sync + 'static,
+    MakeFn:
+        Fn(T, &JobRow, crate::events::RescueReason) -> EnqueueRequest<F> + Send + Sync + 'static,
+{
+    fn run<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        job: &'a JobRow,
+        outcome_context: Option<&'a OutcomeContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(OutcomeContext::Rescued { reason }) = outcome_context else {
+                return Err(AwaError::Validation(
+                    "RescuedFollowUp dispatched without a Rescued OutcomeContext".into(),
+                ));
+            };
+            let args: T = decode_trigger_args(job)?;
+            let request = (self.make)(args, job, *reason);
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
