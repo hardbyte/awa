@@ -39,6 +39,8 @@ in-place as historical context.
 | 024 | Deferred `done_entries` materialisation | Rejected | Investigated as a rotation guard; reverted in `053fec1` once a simpler integration test gave equivalent coverage | Historical |
 | 025 | [Sharded enqueue heads](025-sharded-enqueue-heads.md) | Accepted | Per-queue `enqueue_shards` (default 1) spreads `queue_enqueue_heads` row-lock contention across N rows; FIFO becomes per-shard at S>1 | Refines ADR-019 enqueue path |
 | 026 | [Narrow terminal history](026-narrow-terminal-history.md) | Accepted | Ready-backed terminal rows store only terminal facts and hydrate immutable body fields from retained `ready_entries` until queue prune | Refines ADR-019 terminal path |
+| 027 | [Callback ingress as a deployable surface](027-callback-ingress-surface.md) | Proposed | Separate signed callback ingress from the admin UI/API and expose callback-only embedding/CLI paths | Refines ADR-018 and ADR-021; uses ADR-029 for durable callback-driven side effects |
+| 028 | [Maintenance-only runtime role](028-maintenance-only-runtime-role.md) | Proposed | Run promotion, rescue, pruning, and metadata maintenance without claiming or executing user jobs | Complements ADR-027 and ADR-018; uses ADR-029 for durable rescue-driven side effects |
 
 ## Validation artifacts
 
