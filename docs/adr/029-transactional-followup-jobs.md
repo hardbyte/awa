@@ -95,8 +95,12 @@ the follow-up is durably visible.
 
 Counterparts cover the same outcomes as the typed `JobEvent` variants:
 `on_started_enqueue`, `on_completed_enqueue`, `on_retried_enqueue`,
-`on_exhausted_enqueue`, `on_cancelled_enqueue`,
-`on_waiting_for_callback_enqueue`. `Snooze` continues to emit nothing.
+`on_exhausted_enqueue`, `on_cancelled_enqueue`, and
+`on_waiting_for_callback_enqueue`. The `WaitingForCallback` variant is the
+park-time event introduced by the amendment to ADR-015 (PR #276); on `main`
+prior to that PR, the hook surface omits both `WaitingForCallback` and any
+parked-transition follow-up. `Snooze` continues to emit nothing on either
+surface.
 
 ### Where the enqueue runs
 
@@ -159,13 +163,14 @@ The two APIs are deliberately separate and orthogonal:
 
 - A user may register `on_event` and `on_*_enqueue` for the same trigger.
   Both fire; the hook is observation, the enqueue is delivery.
-- An `on_event_enqueue` registration on a process that does *not* perform
-  the relevant state transition is dormant; the engine has nothing to insert
-  for that process. This is consistent with the registry being per-process.
-- Cancellation, snooze, and rescue produce no hooks today; only the enqueue
-  path covers them. This is intentional — rescues happen in the maintenance
-  process, which has no user handler registry, but can still insert a
-  follow-up job from its transaction.
+- An `on_*_enqueue` registration on a process that does *not* perform the
+  relevant state transition is dormant; the engine has nothing to insert for
+  that process. This is consistent with the registry being per-process.
+- Snooze and rescue produce no hooks today; only the enqueue path covers
+  them. This is intentional — rescues happen in the maintenance process,
+  which has no user handler registry, but can still insert a follow-up job
+  from its transaction. Cancellation has both: `Cancelled` is a hook event in
+  ADR-015 and gains an `on_cancelled_enqueue` counterpart here.
 
 `docs/lifecycle-hooks.md` describes the hook path. The follow-up enqueue
 path gets its own section that names the trade-off explicitly: pick the API
