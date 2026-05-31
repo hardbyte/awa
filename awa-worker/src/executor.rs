@@ -208,6 +208,7 @@ pub struct JobExecutor {
     pool: PgPool,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
+    enqueue_specs: Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
@@ -223,6 +224,7 @@ impl JobExecutor {
         pool: PgPool,
         workers: Arc<HashMap<String, BoxedWorker>>,
         lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
+        enqueue_specs: Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
         in_flight: InFlightMap,
         queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
@@ -235,6 +237,7 @@ impl JobExecutor {
             pool,
             workers,
             lifecycle_handlers,
+            enqueue_specs,
             in_flight,
             queue_in_flight,
             state,
@@ -259,6 +262,7 @@ impl JobExecutor {
         let pool = self.pool.clone();
         let workers = self.workers.clone();
         let lifecycle_handlers = self.lifecycle_handlers.clone();
+        let enqueue_specs = self.enqueue_specs.clone();
         let in_flight = self.in_flight.clone();
         let queue_in_flight = self.queue_in_flight.clone();
         let state = self.state.clone();
@@ -365,6 +369,7 @@ impl JobExecutor {
                     progress_snapshot,
                     duration,
                     has_lifecycle_handlers,
+                    &enqueue_specs,
                     &storage,
                     dlq_enabled,
                     &metrics,
@@ -463,6 +468,7 @@ async fn complete_job(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
+    enqueue_specs: &Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
     storage: &RuntimeStorage,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
@@ -477,12 +483,19 @@ async fn complete_job(
                 progress_snapshot,
                 duration,
                 needs_event,
+                enqueue_specs,
                 dlq_enabled,
                 metrics,
             )
             .await
         }
         RuntimeStorage::QueueStorage(runtime) => {
+            // ADR-029 follow-up enqueue is currently wired only on the
+            // canonical path; queue-storage wiring is deferred to a follow-up
+            // PR. Specs for jobs running under queue storage are silently
+            // ignored for now — they will simply not produce follow-ups
+            // until the queue-storage finalization path is updated to honour
+            // them in the same transaction as its terminal append.
             complete_job_queue_storage(
                 runtime,
                 pool,
@@ -511,6 +524,7 @@ async fn complete_job_canonical(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
+    enqueue_specs: &Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
     _dlq_enabled: bool,
     _metrics: &crate::metrics::AwaMetrics,
 ) -> Result<CompletionOutcome, AwaError> {
@@ -518,6 +532,39 @@ async fn complete_job_canonical(
         Ok(JobResult::Completed) => {
             tracing::Span::current().record("otel.status_code", "OK");
             info!(job_id = job.id, kind = %job.kind, attempt = job.attempt, "Job completed");
+
+            // ADR-029: when this kind has follow-up specs registered, drive
+            // completion through a dedicated transaction so the UPDATE and
+            // the follow-up INSERTs commit atomically. The batched path
+            // can't carry per-job follow-ups, so we bypass it here.
+            let kind_specs = enqueue_specs.get(&job.kind).cloned();
+            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                let outcome = complete_canonical_with_followups(pool, job, &specs).await?;
+                return match outcome {
+                    None => {
+                        warn!(
+                            job_id = job.id,
+                            "Job already rescued/cancelled, completion ignored"
+                        );
+                        Ok(CompletionOutcome::IgnoredStale)
+                    }
+                    Some(updated_job) => {
+                        let event = if needs_event {
+                            Some(UntypedJobEvent::Completed {
+                                job: updated_job,
+                                duration,
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(CompletionOutcome::Applied {
+                            event,
+                            terminal: false,
+                        })
+                    }
+                };
+            }
+
             let result = match completion_batcher.complete(job.id, job.run_lease).await {
                 Ok(updated) => updated,
                 Err(err) => {
@@ -1508,4 +1555,61 @@ async fn direct_complete_job(pool: &PgPool, job: &JobRow) -> Result<bool, AwaErr
     .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+/// Complete a canonical-storage job and run its registered follow-up enqueue
+/// specs atomically with the completion UPDATE (ADR-029).
+///
+/// Returns:
+/// - `Ok(None)` if the completion was stale (`rows_affected == 0`) — the job
+///   has already been rescued or cancelled, no follow-ups are emitted, no
+///   event should fire.
+/// - `Ok(Some(updated_job))` if the completion committed; follow-ups have
+///   been INSERTed in the same transaction. The returned row is the
+///   post-completion snapshot (state = `completed`, `finalized_at` set).
+// The follow-up loop reborrows `&mut *tx` per spec invocation so the same
+// transaction handle can be reused; clippy reads the `*tx` as a redundant
+// deref but `fetch_one`'s Executor bound requires the inner connection.
+#[allow(clippy::explicit_auto_deref)]
+async fn complete_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'completed',
+            finalized_at = now(),
+            progress = NULL
+        WHERE id = $1 AND state = 'running' AND run_lease = $2
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.run_lease)
+    .execute(&mut *tx)
+    .await?;
+
+    if result.rows_affected() == 0 {
+        // Stale: another writer already finalised this attempt. Drop the
+        // transaction without emitting follow-ups.
+        tx.rollback().await?;
+        return Ok(None);
+    }
+
+    // Refresh the row through the awa.jobs view so the follow-up closures see
+    // the post-completion snapshot (state = completed, finalized_at set).
+    let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+        .bind(job.id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+    for spec in specs {
+        spec.run(&mut *tx, &updated_job).await?;
+    }
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
 }

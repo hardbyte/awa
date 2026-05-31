@@ -125,6 +125,7 @@ pub struct ClientBuilder {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
+    enqueue_specs: HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -175,6 +176,7 @@ impl ClientBuilder {
             job_kind_descriptors: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
+            enqueue_specs: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
@@ -331,6 +333,37 @@ impl ClientBuilder {
             .entry(kind)
             .or_default()
             .push(erased);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// completes successfully.
+    ///
+    /// `make` receives the trigger's deserialised args plus its post-completion
+    /// [`awa_model::JobRow`] and returns the follow-up job's `JobArgs`. The
+    /// follow-up is `INSERT`ed in the *same database transaction* as the
+    /// completion's state change, so the trigger and the follow-up commit or
+    /// roll back together — see ADR-029. This is the durable counterpart to
+    /// [`Self::on_event`]: hooks are best-effort, in-process; this enqueue is
+    /// at-least-once and rides Awa's existing retry/DLQ machinery.
+    ///
+    /// Multiple registrations for the same kind stack and all run in the
+    /// finalization transaction.
+    pub fn on_completed_enqueue<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::CompletedFollowUp::<T, F, _> {
+                make: move |args: T, job: &awa_model::JobRow| {
+                    (make(args, job), awa_model::InsertOpts::default())
+                },
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs.entry(kind).or_default().push(spec);
         self
     }
 
@@ -680,6 +713,7 @@ impl ClientBuilder {
             job_kind_descriptors: self.job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
+            enqueue_specs: Arc::new(self.enqueue_specs),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
             promote_interval: self.promote_interval,
@@ -767,6 +801,7 @@ pub struct Client {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
+    enqueue_specs: Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -1145,6 +1180,7 @@ impl Client {
             self.pool.clone(),
             self.workers.clone(),
             self.lifecycle_handlers.clone(),
+            self.enqueue_specs.clone(),
             self.in_flight.clone(),
             self.queue_in_flight.clone(),
             self.state.clone(),

@@ -3,6 +3,7 @@ pub mod client;
 mod completion;
 pub mod context;
 pub mod dispatcher;
+mod enqueue_specs;
 pub mod events;
 pub mod executor;
 pub mod heartbeat;
