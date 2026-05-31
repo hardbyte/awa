@@ -859,7 +859,7 @@ async fn test_snooze_only_emits_started_event() {
 enum CbEvent {
     Waiting(awa::JobRow),
     Completed(awa::JobRow, Duration),
-    Retried(awa::JobRow),
+    Retried { job: awa::JobRow, attempt: i16 },
     Exhausted(awa::JobRow, String),
 }
 
@@ -931,8 +931,8 @@ fn parking_client(
                     JobEvent::Completed { job, duration, .. } => {
                         let _ = tx.send(CbEvent::Completed(job, duration));
                     }
-                    JobEvent::Retried { job, .. } => {
-                        let _ = tx.send(CbEvent::Retried(job));
+                    JobEvent::Retried { job, attempt, .. } => {
+                        let _ = tx.send(CbEvent::Retried { job, attempt });
                     }
                     JobEvent::Exhausted { job, error, .. } => {
                         let _ = tx.send(CbEvent::Exhausted(job, error));
@@ -1123,12 +1123,19 @@ async fn test_client_retry_external_dispatches_retried_event() {
     client.retry_external(callback_id, None).await.unwrap();
 
     // The worker will re-claim the now-retryable job and park it again, so we
-    // may observe a fresh Waiting after the Retried; assert we see Retried.
+    // may observe a fresh Waiting after the Retried; assert we see Retried,
+    // and that the event's attempt is the parked attempt (>= 1), not the
+    // post-transition value (admin::retry_external resets attempt to 0 as
+    // part of requeuing).
     let mut saw_retried = false;
     for _ in 0..3 {
         match recv_event(&mut rx).await {
-            CbEvent::Retried(job) => {
+            CbEvent::Retried { job, attempt } => {
                 assert_eq!(job.id, inserted.id);
+                assert!(
+                    attempt >= 1,
+                    "Retried event must report the parked (failed) attempt, not the post-reset 0; got {attempt}"
+                );
                 saw_retried = true;
                 break;
             }

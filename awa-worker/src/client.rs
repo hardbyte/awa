@@ -1464,16 +1464,33 @@ impl Client {
     }
 
     /// Requeue a waiting job via its callback and dispatch a `Retried` hook.
+    ///
+    /// `admin::retry_external` resets `attempt` to 0 as part of requeuing the
+    /// job from scratch, so the returned `JobRow` no longer reflects the
+    /// attempt that was being retried. Capture the parked attempt first so
+    /// the `Retried` event reports the failed-attempt number — matching the
+    /// inline `Retried` semantics, where `attempt` is "the attempt that was
+    /// retried", not the post-transition value.
     pub async fn retry_external(
         &self,
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let parked_attempt: Option<i16> = sqlx::query_scalar(
+            "SELECT attempt FROM awa.jobs \
+             WHERE callback_id = $1 AND state = 'waiting_external' \
+               AND ($2::bigint IS NULL OR run_lease = $2)",
+        )
+        .bind(callback_id)
+        .bind(run_lease)
+        .fetch_optional(&self.pool)
+        .await?;
+
         let job = admin::retry_external(&self.pool, callback_id, run_lease).await?;
         self.dispatch_callback_event(UntypedJobEvent::Retried {
             job: job.clone(),
             error: latest_error_message(&job),
-            attempt: job.attempt,
+            attempt: parked_attempt.unwrap_or(job.attempt),
             next_run_at: job.run_at,
         })
         .await;
