@@ -2,9 +2,10 @@
 
 ## Status
 
-Accepted — core implementation landed (worker-driven outcomes atomic;
-callback-resolution and maintenance-rescue follow-ups dispatched on a
-best-effort separate transaction; see *Implementation status* below).
+Accepted. Worker-driven outcomes commit follow-ups atomically with the
+state transition; callback-resolution and maintenance-rescue paths
+dispatch follow-ups best-effort in a separate transaction (see
+[Atomicity matrix](#atomicity-matrix)).
 
 ## Context
 
@@ -313,17 +314,16 @@ positioning (ADR-001). Out of scope.
   (Postgres adapter / Python transaction bridge). The same transactional
   insert primitive is reused; nothing new is added to the bridge contract.
 
-## Implementation status
-
-As shipped:
+## Implementation
 
 - **Outcome surface.** `Outcome::{Completed, Retried, Exhausted,
   Cancelled, WaitingForCallback, Rescued}`. `Started` is intentionally
   excluded — claim-time enqueue would join the dispatcher's hot path,
   and the durable-side-effect use case for "job started" is uncommon.
-  Observation belongs to `on_event`. A future `on_started_enqueue` is
-  not blocked by anything in this design but is not part of v1.
-- **Builder API.** Each outcome gets a pair of builders:
+  Observation belongs to `on_event`. `on_started_enqueue` is not
+  blocked by anything in this design; whether to add it is left as an
+  open question rather than a v1 commitment.
+- **Builder API.** Each outcome has a pair of builders:
   `on_<outcome>_enqueue` (closure returns `JobArgs`) and
   `on_<outcome>_enqueue_with` (closure returns
   [`EnqueueRequest<F>`](#enqueuerequest) for `InsertOpts` overrides —
@@ -335,9 +335,9 @@ As shipped:
   Retried: `(args, &job_row, &error, attempt, next_run_at)`;
   Exhausted: `(args, &job_row, &error, attempt)`;
   Rescued: `(args, &job_row, RescueReason)`.
-- **Rescued event variant.** Maintenance rescues fire a new
-  `JobEvent::Rescued { args, job, reason: RescueReason }` (alongside the
-  follow-up spec dispatch), keeping rescue context distinct from
+- **Rescued event variant.** Maintenance rescues fire
+  `JobEvent::Rescued { args, job, reason: RescueReason }` alongside the
+  follow-up spec dispatch, keeping rescue context distinct from
   Retried/Exhausted rather than overloading either.
 
 ### Atomicity matrix
@@ -352,35 +352,37 @@ As shipped:
 The asymmetry is deliberate: worker-driven outcomes are the dominant
 path and inherit ADR-013's run-lease guard (zero rows matched → tx
 rollback → no follow-up), giving exact-once delivery on the happy path.
-Adding tx-aware variants to every `admin::*` and rescue path is mechanically
+Tx-aware variants on every `admin::*` and rescue path are mechanically
 straightforward but invasive, and the best-effort path is correct enough
-for v1: the trigger has already committed, so the worst case is a missing
-follow-up — not a phantom follow-up.
+for the supported guarantee: the trigger has already committed, so the
+worst case is a missing follow-up — not a phantom follow-up.
 
-### Future work / follow-up issues
+### Open extensions
 
-- **Python parity (deferred).** The Rust surface (`on_*_enqueue`,
-  `JobEvent::Rescued`, `RescueReason`) does not yet have a Python
-  binding. The implementation path is the same shape as `register_worker`
-  in `awa-python/src/worker.rs`: a `PythonFollowUp` type that wraps a
-  Python callable, takes the GIL inside `dispatch_specs_in_tx`,
-  serialises `JobRow + OutcomeContext` to Python, invokes the callable,
-  and decodes the returned dict to (`JobArgs`, `InsertOpts`) before the
-  underlying `insert_with` fires. ADR-015's hook surface (`@on_event`)
-  needs the same scaffold first. Tracking issue: TODO.
-- Fully atomic callback-resolution + follow-up enqueue: extract
+- **Python parity.** The Python binding does not yet expose
+  `on_*_enqueue` or `on_event`. The implementation path mirrors
+  `register_worker` in `awa-python/src/worker.rs`: a `PythonFollowUp`
+  type that wraps a Python callable, takes the GIL inside
+  `dispatch_specs_in_tx`, serialises `JobRow + OutcomeContext` to
+  Python, invokes the callable, and decodes the returned dict to
+  (`JobArgs`, `InsertOpts`) before the underlying `insert_with` fires.
+  ADR-015's hook surface (`@on_event`) needs the same scaffold first.
+- **Atomic callback-resolution + follow-up enqueue.** Requires
   `admin::{complete,fail,retry,resume}_external_in_tx` and matching
   queue-storage store methods so `Client::*_external` can drive the
   resolution and the spec dispatch in a single tx.
-- Fully atomic rescue + follow-up enqueue: thread `&mut tx` through
+- **Atomic rescue + follow-up enqueue.** Threads `&mut tx` through
   `maintenance::rescue_*` so the rescue UPDATE and the Rescued spec
   dispatch commit together.
-- `on_started_enqueue`: not blocked by the design; explicitly out of
-  scope for v1 to keep the hot path unaffected.
-- Conditional spec dispatch (skip enqueue based on a predicate over the
-  triggering row) is not in v1 — apply conditioning inside the follow-up
-  handler instead.
-- In-DB spec registry — deferred; the in-process registry is acceptable
-  while specs are declared in one place per deployment.
-- NOTIFY-as-wakeup-hint integration with follow-up queue poll cadence
-  — implementation-level, not architectural.
+- **`on_started_enqueue`.** Not blocked by the design; deliberately
+  out of scope to keep the claim/dispatch hot path uncontended. The
+  observation use case is already covered by `on_event`.
+- **Conditional spec dispatch.** Skipping enqueue based on a predicate
+  over the triggering row is not part of the API; conditioning belongs
+  inside the follow-up handler instead.
+- **In-DB spec registry.** Not part of the design; the in-process
+  registry is sufficient while specs are declared in one place per
+  deployment.
+- **NOTIFY-as-wakeup-hint for follow-up queue poll cadence.** An
+  implementation-level tuning lever rather than an architectural
+  concern.

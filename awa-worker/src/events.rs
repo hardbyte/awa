@@ -46,8 +46,8 @@ pub enum JobEvent<T> {
     /// Job was rescued by maintenance — either its callback wait expired,
     /// its heartbeat went stale (presumed crashed worker), or its deadline
     /// was exceeded. `reason` identifies the rescue path. The post-rescue
-    /// `job.state` is `retryable` or `failed` (when retries are exhausted)
-    /// or `dlq` (when DLQ routing was enabled).
+    /// `job.state` is `retryable` when retries remain or `failed` when the
+    /// attempt that was rescued exhausted its retry budget.
     Rescued {
         args: T,
         job: JobRow,
