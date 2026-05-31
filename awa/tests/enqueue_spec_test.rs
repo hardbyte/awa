@@ -214,9 +214,11 @@ async fn on_completed_enqueue_under_queue_storage_fails_fast() {
         .build()
         .unwrap();
 
-    // ADR-029 queue-storage wiring is a deferred follow-up. Until it lands,
-    // start() must refuse loud so callers can't ship code that silently
-    // never enqueues follow-ups.
+    // ADR-029 queue-storage wiring is a deferred follow-up — it needs a
+    // tx-aware variant of `complete_runtime_batch_slow` so the receipt-plane
+    // (ADR-023) lease completion can join the follow-up's transaction.
+    // Until that lands, start() refuses loud so callers can't ship code
+    // that silently never enqueues follow-ups.
     let err = client.start().await.expect_err("start should fail fast");
     let msg = err.to_string();
     assert!(

@@ -491,11 +491,14 @@ async fn complete_job(
         }
         RuntimeStorage::QueueStorage(runtime) => {
             // ADR-029 follow-up enqueue is currently wired only on the
-            // canonical path; queue-storage wiring is deferred to a follow-up
-            // PR. Specs for jobs running under queue storage are silently
-            // ignored for now — they will simply not produce follow-ups
-            // until the queue-storage finalization path is updated to honour
-            // them in the same transaction as its terminal append.
+            // canonical path. The queue-storage completion path's
+            // receipt-plane fast-complete (ADR-023) doesn't pass through a
+            // single transaction we can join from here; a dedicated
+            // tx-aware variant of `complete_runtime_batch_slow` is a
+            // follow-up. `Client::start` returns an error if specs are
+            // registered under queue storage, so we never reach this branch
+            // with a non-empty registry today.
+            let _ = enqueue_specs;
             complete_job_queue_storage(
                 runtime,
                 pool,

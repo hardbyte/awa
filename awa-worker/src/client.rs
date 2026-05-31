@@ -1169,11 +1169,12 @@ impl Client {
             *guard = effective_storage.clone();
         }
 
-        // ADR-029: on_*_enqueue specs are wired through the canonical
-        // executor path only at this stage. Fail fast when specs would
-        // otherwise be silently ignored under queue storage, so callers
-        // discover the limitation at startup rather than wondering why
-        // follow-ups never appear.
+        // ADR-029: on_*_enqueue specs are wired through the canonical executor
+        // path only at this stage. The queue-storage completion path uses a
+        // receipt-plane fast-complete (ADR-023) we can't currently join from
+        // a tx held by the executor; making it tx-aware is a separate
+        // follow-up. Fail fast here so callers can't ship code that silently
+        // never enqueues follow-ups under queue storage (the default runtime).
         if !self.enqueue_specs.is_empty()
             && matches!(
                 effective_storage,

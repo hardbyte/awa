@@ -6653,9 +6653,28 @@ impl QueueStorage {
         if completions.is_empty() {
             return Ok(Vec::new());
         }
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .complete_job_batch_by_id_in_tx(&mut tx, completions)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Same as [`Self::complete_job_batch_by_id`] but runs on the caller's
+    /// transaction so additional writes — for example ADR-029 follow-up job
+    /// inserts — can join the same commit. The caller is responsible for
+    /// `commit()` / `rollback()`.
+    pub async fn complete_job_batch_by_id_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        completions: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if completions.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         let job_ids: Vec<i64> = completions.iter().map(|(job_id, _)| *job_id).collect();
         let run_leases: Vec<i64> = completions
@@ -6698,11 +6717,10 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
 
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
@@ -6719,9 +6737,8 @@ impl QueueStorage {
             ));
         }
 
-        self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+        self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(moved
             .into_iter()
             .map(|entry| (entry.job_id, entry.run_lease))
