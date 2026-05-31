@@ -135,6 +135,65 @@ async fn on_completed_enqueue_inserts_follow_up_atomically() {
     assert_eq!(follow_up.state, JobState::Available);
 }
 
+/// A panicking `on_*_enqueue` closure must not unwind the executor or
+/// leave the trigger committed when the spec dispatch ran in the
+/// finalization transaction. The dispatch catches the panic, converts
+/// it to an AwaError, rolls back the tx (so the trigger stays in
+/// `running` and the heartbeat-rescue will pick it up), and the worker
+/// keeps draining other jobs.
+#[tokio::test]
+async fn panicking_on_completed_enqueue_closure_is_caught_and_rolls_back() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "enqueue_spec_panic_trigger";
+
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<EnqueueTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_completed_enqueue::<EnqueueTrigger, EnqueueFollowUp, _>(|_args, _job| {
+            panic!("user closure exploded");
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &EnqueueTrigger { user_id: 999 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    // Give the executor enough time to claim, perform, and attempt
+    // completion (which rolls back due to the panic).
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let trigger_after = admin::get_job(&pool, trigger_job.id).await.unwrap();
+    // Trigger must not be `completed` — the completion tx rolled back.
+    assert_ne!(
+        trigger_after.state,
+        JobState::Completed,
+        "panic in on_completed_enqueue closure leaked through and committed the trigger"
+    );
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind()).await;
+    assert!(
+        follow_up.is_none(),
+        "panicking closure must not have inserted a follow-up"
+    );
+}
+
 #[tokio::test]
 async fn on_completed_enqueue_routes_follow_up_to_custom_queue() {
     let _permit = test_gate().acquire_owned().await.unwrap();

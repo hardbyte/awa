@@ -148,6 +148,36 @@ fn decode_trigger_args<T: DeserializeOwned>(job: &JobRow) -> Result<T, AwaError>
     })
 }
 
+/// Invoke a user-supplied `make` closure, converting any panic into an
+/// `AwaError` so the spec dispatcher can roll back its transaction and
+/// log the failure the same way it would for a returned error. Without
+/// this, a panic in user code would unwind:
+/// - on worker-driven outcomes, the executor's completion task (the
+///   transition tx would still roll back via Drop, but the worker would
+///   log a JoinError rather than the typed spec failure);
+/// - on callback-resolution paths, the resolver task (after the
+///   resolution itself has already committed) — observers and in-process
+///   hooks downstream of the panic point never run;
+/// - on rescue paths, the maintenance task — likewise dropping the
+///   detached hook spawn for that rescue.
+fn catch_make_panic<R>(
+    kind: &str,
+    f: impl FnOnce() -> R + std::panic::UnwindSafe,
+) -> Result<R, AwaError> {
+    std::panic::catch_unwind(f).map_err(|panic| {
+        let detail = if let Some(msg) = panic.downcast_ref::<&'static str>() {
+            (*msg).to_string()
+        } else if let Some(msg) = panic.downcast_ref::<String>() {
+            msg.clone()
+        } else {
+            "panic payload not a string".to_string()
+        };
+        AwaError::Validation(format!(
+            "follow-up enqueue closure for kind {kind} panicked: {detail}"
+        ))
+    })
+}
+
 /// Spec for the `Completed` outcome. Captures a typed closure that maps the
 /// trigger's deserialised args plus its post-completion `JobRow` to an
 /// [`EnqueueRequest<F>`] describing the follow-up.
@@ -170,7 +200,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
         Box::pin(async move {
             let args: T = decode_trigger_args(job)?;
-            let request = (self.make)(args, job);
+            let request = catch_make_panic(
+                &job.kind,
+                std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
+            )?;
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
@@ -210,7 +243,12 @@ where
                 ));
             };
             let args: T = decode_trigger_args(job)?;
-            let request = (self.make)(args, job, error, *attempt, *next_run_at);
+            let request = catch_make_panic(
+                &job.kind,
+                std::panic::AssertUnwindSafe(|| {
+                    (self.make)(args, job, error, *attempt, *next_run_at)
+                }),
+            )?;
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
@@ -242,7 +280,10 @@ where
                 ));
             };
             let args: T = decode_trigger_args(job)?;
-            let request = (self.make)(args, job, error, *attempt);
+            let request = catch_make_panic(
+                &job.kind,
+                std::panic::AssertUnwindSafe(|| (self.make)(args, job, error, *attempt)),
+            )?;
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
@@ -274,7 +315,10 @@ where
                 ));
             };
             let args: T = decode_trigger_args(job)?;
-            let request = (self.make)(args, job, reason);
+            let request = catch_make_panic(
+                &job.kind,
+                std::panic::AssertUnwindSafe(|| (self.make)(args, job, reason)),
+            )?;
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
@@ -301,7 +345,10 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
         Box::pin(async move {
             let args: T = decode_trigger_args(job)?;
-            let request = (self.make)(args, job);
+            let request = catch_make_panic(
+                &job.kind,
+                std::panic::AssertUnwindSafe(|| (self.make)(args, job)),
+            )?;
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
@@ -335,7 +382,10 @@ where
                 ));
             };
             let args: T = decode_trigger_args(job)?;
-            let request = (self.make)(args, job, *reason);
+            let request = catch_make_panic(
+                &job.kind,
+                std::panic::AssertUnwindSafe(|| (self.make)(args, job, *reason)),
+            )?;
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
