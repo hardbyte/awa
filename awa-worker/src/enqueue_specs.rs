@@ -58,9 +58,9 @@ impl<F: JobArgs> EnqueueRequest<F> {
         self
     }
 
-    /// Replace the follow-up's [`InsertOpts`] wholesale (for callers who need
-    /// fields the builder methods above do not yet cover — `metadata`, `tags`,
-    /// `unique`, `run_at`, `deadline_duration`, `ordering_key`).
+    /// Replace the follow-up's [`InsertOpts`] wholesale — useful for fields
+    /// without dedicated builder methods (`metadata`, `tags`, `unique`,
+    /// `run_at`, `deadline_duration`, `ordering_key`).
     pub fn with_opts(mut self, opts: InsertOpts) -> Self {
         self.opts = opts;
         self
