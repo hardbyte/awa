@@ -409,6 +409,7 @@ Rust and Python workers coexist on the same queues. See
 | [0.5 → 0.6 upgrade](docs/upgrade-0.5-to-0.6.md) | Step-by-step operator checklist for the staged storage transition |
 | [Configuration reference](docs/configuration.md) | `QueueConfig`, `ClientBuilder`, Python `start()`, env vars |
 | [HTTP workers and callbacks](docs/http-callbacks.md) | Serverless dispatch, callback receiver endpoints, signature verification |
+| [Lifecycle hooks](docs/lifecycle-hooks.md) | React to job start/finish/retry/callback events for metrics, alerting, cleanup |
 | [Security & Postgres roles](docs/security.md) | Minimum-privilege roles, callback auth, operational guidance |
 | [Troubleshooting](docs/troubleshooting.md) | Stuck `running` jobs, leader delays, heartbeat timeouts |
 | [Architecture overview](docs/architecture.md) | System design, data flow, state machine, crash recovery |

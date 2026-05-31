@@ -7,9 +7,13 @@ EXTENDS FiniteSets, Naturals
 
   Verifies the three-way race between:
     1. External system calling complete_external / fail_external /
-       resolve_callback / resume_external
+       resolve_callback / resume_external / retry_external
     2. Maintenance leader running rescue_expired_callbacks (timeout)
     3. Heartbeat rescue clearing stale callback after worker crash
+
+  retry_external is a plain UPDATE like complete/fail, but its WHERE matches
+  only state='waiting_external' (not 'running'), so if it locks the row while
+  the job is still running it matches 0 rows and simply releases.
 
   Sequential callbacks: after resume_external transitions the job from
   waiting_external back to running, the handler can register a NEW
@@ -40,7 +44,7 @@ MaxCallbackGen == 2   \* Allow up to 2 callback lifecycles per job run
 
 JobStates == {"available", "running", "waiting_external", "completed", "retryable", "failed"}
 TerminalStates == {"completed", "retryable", "failed"}
-BlockingOps == {"complete", "fail", "resolve", "resume"}
+BlockingOps == {"complete", "fail", "resolve", "resume", "retry"}
 
 \* Row lock states. NoLock means the row is unlocked.
 \* Other values identify which operation holds the lock.
@@ -280,6 +284,30 @@ ResolveIgnoreRelease ==
     /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
                    taskLease, leader, resolved, callbackGen, blockedOps>>
 
+\* retry_external: plain UPDATE, WHERE state='waiting_external'. Requeues the
+\* job to available (attempt reset) and clears the callback.
+RetryExecute ==
+    /\ rowLock = "retry"
+    /\ jobState = "waiting_external"
+    /\ callbackId = CbId
+    /\ jobState' = "available"
+    /\ callbackId' = NoCb
+    /\ callbackTimedOut' = FALSE
+    /\ heartbeatFresh' = FALSE
+    /\ owner' = NoInstance
+    /\ resolved' = resolved + 1
+    /\ rowLock' = NoLock
+    /\ UNCHANGED <<lease, taskLease, leader, callbackGen, blockedOps>>
+
+\* retry_external matches only waiting_external. If it locked the row while the
+\* job was still running, the UPDATE matches 0 rows and just releases the lock.
+RetryNoOpRelease ==
+    /\ rowLock = "retry"
+    /\ jobState = "running"
+    /\ rowLock' = NoLock
+    /\ UNCHANGED <<jobState, callbackId, callbackTimedOut, heartbeatFresh, owner, lease,
+                   taskLease, leader, resolved, callbackGen, blockedOps>>
+
 \* ─── rescue_expired_callbacks: SKIP LOCKED UPDATE ─────────
 \*
 \* Uses FOR UPDATE SKIP LOCKED in the inner SELECT.
@@ -361,6 +389,8 @@ Next ==
     \/ ResolveCompleteExecute
     \/ ResolveFailExecute
     \/ ResolveIgnoreRelease
+    \/ RetryExecute
+    \/ RetryNoOpRelease
     \/ TimeoutExpires
     \/ \E i \in Instances : TimeoutTryLock(i)
     \/ TimeoutRetryExecute
@@ -385,6 +415,8 @@ StableNext ==
     \/ ResolveCompleteExecute
     \/ ResolveFailExecute
     \/ ResolveIgnoreRelease
+    \/ RetryExecute
+    \/ RetryNoOpRelease
     \/ TimeoutExpires
     \/ \E i \in Instances : TimeoutTryLock(i)
     \/ TimeoutRetryExecute
@@ -447,6 +479,8 @@ LockHolderConsistent ==
         (jobState \in {"waiting_external", "running"} /\ callbackId = CbId)
     /\ rowLock = "resume" =>
         (jobState \in {"waiting_external", "running"} /\ callbackId = CbId)
+    /\ rowLock = "retry" =>
+        (jobState \in {"waiting_external", "running"} /\ callbackId = CbId)
     /\ rowLock = "timeout_rescue" =>
         (jobState = "waiting_external" /\ callbackId = CbId /\ callbackTimedOut)
     /\ rowLock = "heartbeat_rescue" =>
@@ -480,6 +514,8 @@ FairnessAssumptions ==
     /\ WF_vars(ResolveCompleteExecute)
     /\ WF_vars(ResolveFailExecute)
     /\ WF_vars(ResolveIgnoreRelease)
+    /\ WF_vars(RetryExecute)
+    /\ WF_vars(RetryNoOpRelease)
     /\ WF_vars(HeartbeatExecute)
     /\ \A op \in BlockingOps : WF_vars(BlockingReEvaluate(op))
 

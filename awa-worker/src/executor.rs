@@ -782,8 +782,17 @@ async fn complete_job_canonical(
                     }
                 }
             }
+            let event = if needs_event {
+                let parked_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
+                    .bind(job.id)
+                    .fetch_one(pool)
+                    .await?;
+                Some(UntypedJobEvent::WaitingForCallback { job: parked_job })
+            } else {
+                None
+            };
             Ok(CompletionOutcome::Applied {
-                event: None,
+                event,
                 terminal: false,
             })
         }
@@ -1246,8 +1255,22 @@ async fn complete_job_queue_storage(
                     }
                 }
             }
+            let event = if needs_event {
+                let parked_job = runtime
+                    .store
+                    .load_job(pool, job.id)
+                    .await?
+                    .unwrap_or_else(|| {
+                        let mut parked = job.clone();
+                        parked.state = JobState::WaitingExternal;
+                        parked
+                    });
+                Some(UntypedJobEvent::WaitingForCallback { job: parked_job })
+            } else {
+                None
+            };
             Ok(CompletionOutcome::Applied {
-                event: None,
+                event,
                 terminal: false,
             })
         }
@@ -1445,7 +1468,7 @@ async fn direct_complete_job_queue_storage(
 /// Handlers are called sequentially. Panics are caught and logged — a
 /// misbehaving handler cannot crash the dispatch loop or lose events
 /// for subsequent handlers.
-async fn dispatch_lifecycle_event(
+pub(crate) async fn dispatch_lifecycle_event(
     handlers: &HashMap<String, Vec<BoxedUntypedEventHandler>>,
     kind: &str,
     event: UntypedJobEvent,

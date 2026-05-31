@@ -10,7 +10,13 @@ use std::time::Duration;
 pub enum JobEvent<T> {
     /// Job execution started after the claim committed.
     Started { args: T, job: JobRow },
+    /// Job parked waiting for an external callback. `job.callback_id` and
+    /// `job.callback_timeout_at` identify the pending callback.
+    WaitingForCallback { args: T, job: JobRow },
     /// Job completed successfully.
+    ///
+    /// For a callback-driven completion `duration` is [`Duration::ZERO`], since
+    /// no handler ran during the parked phase.
     Completed {
         args: T,
         job: JobRow,
@@ -44,6 +50,7 @@ impl<T> JobEvent<T> {
     pub fn job(&self) -> &JobRow {
         match self {
             JobEvent::Started { job, .. }
+            | JobEvent::WaitingForCallback { job, .. }
             | JobEvent::Completed { job, .. }
             | JobEvent::Retried { job, .. }
             | JobEvent::Exhausted { job, .. }
@@ -57,6 +64,8 @@ impl<T> JobEvent<T> {
 pub enum UntypedJobEvent {
     /// Job execution started after the claim committed.
     Started { job: JobRow },
+    /// Job parked waiting for an external callback.
+    WaitingForCallback { job: JobRow },
     /// Job completed successfully.
     Completed { job: JobRow, duration: Duration },
     /// Job failed but will be retried later.
@@ -81,6 +90,7 @@ impl UntypedJobEvent {
     pub fn job(&self) -> &JobRow {
         match self {
             UntypedJobEvent::Started { job, .. }
+            | UntypedJobEvent::WaitingForCallback { job, .. }
             | UntypedJobEvent::Completed { job, .. }
             | UntypedJobEvent::Retried { job, .. }
             | UntypedJobEvent::Exhausted { job, .. }
@@ -91,6 +101,9 @@ impl UntypedJobEvent {
     pub(crate) fn into_typed<T>(self, args: T) -> JobEvent<T> {
         match self {
             UntypedJobEvent::Started { job } => JobEvent::Started { args, job },
+            UntypedJobEvent::WaitingForCallback { job } => {
+                JobEvent::WaitingForCallback { args, job }
+            }
             UntypedJobEvent::Completed { job, duration } => JobEvent::Completed {
                 args,
                 job,

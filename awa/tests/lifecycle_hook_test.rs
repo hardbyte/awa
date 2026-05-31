@@ -673,6 +673,9 @@ async fn test_stale_completion_does_not_fire_event() {
                     JobEvent::Cancelled { args, .. } => {
                         tx.send(format!("cancelled:{}", args.value)).unwrap()
                     }
+                    JobEvent::WaitingForCallback { args, .. } => {
+                        tx.send(format!("waiting:{}", args.value)).unwrap()
+                    }
                 }
             }
         })
@@ -809,6 +812,7 @@ async fn test_snooze_only_emits_started_event() {
             async move {
                 let label = match &event {
                     JobEvent::Started { .. } => "started",
+                    JobEvent::WaitingForCallback { .. } => "waiting",
                     JobEvent::Completed { .. } => "completed",
                     JobEvent::Retried { .. } => "retried",
                     JobEvent::Exhausted { .. } => "exhausted",
@@ -846,5 +850,357 @@ async fn test_snooze_only_emits_started_event() {
     assert!(
         rx.try_recv().is_err(),
         "Snooze should not produce a lifecycle outcome event"
+    );
+}
+
+// ── Callback lifecycle events ───────────────────────────────────────────
+
+#[derive(Debug)]
+enum CbEvent {
+    Waiting(awa::JobRow),
+    Completed(awa::JobRow, Duration),
+    Retried { job: awa::JobRow, attempt: i16 },
+    Exhausted(awa::JobRow, String),
+}
+
+/// Like [`setup_pool`] but leaves the runtime on canonical storage (queue
+/// storage is never installed), so tests can exercise the canonical executor
+/// path.
+async fn setup_pool_canonical() -> sqlx::PgPool {
+    let pool = PgPoolOptions::new()
+        .max_connections(5)
+        .acquire_timeout(Duration::from_secs(10))
+        .connect(&database_url())
+        .await
+        .expect("Failed to connect to database — is Postgres running?");
+    sqlx::query("DROP SCHEMA IF EXISTS awa CASCADE")
+        .execute(&pool)
+        .await
+        .expect("Failed to drop awa schema");
+    migrations::run(&pool)
+        .await
+        .expect("Failed to run migrations");
+    pool
+}
+
+/// Worker that parks on an external callback. Uses a `Worker` impl rather than
+/// a closure because awaiting `ctx.register_callback()` borrows the context,
+/// which the `'static` closure-handler bound disallows.
+struct ParkingWorker;
+
+#[async_trait::async_trait]
+impl Worker for ParkingWorker {
+    fn kind(&self) -> &'static str {
+        HookJob::kind()
+    }
+
+    async fn perform(&self, ctx: &awa::JobContext) -> Result<JobResult, JobError> {
+        let callback = ctx
+            .register_callback(Duration::from_secs(3600))
+            .await
+            .map_err(JobError::retryable)?;
+        Ok(JobResult::WaitForCallback(callback))
+    }
+}
+
+/// Build a client whose `HookJob` worker parks on an external callback and
+/// whose hook forwards callback lifecycle events onto `tx`. With `canonical`
+/// set, the runtime uses canonical storage instead of queue storage.
+fn parking_client(
+    pool: &sqlx::PgPool,
+    queue: &str,
+    canonical: bool,
+    tx: mpsc::UnboundedSender<CbEvent>,
+) -> Client {
+    let mut builder = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(ParkingWorker)
+        .on_event::<HookJob, _, _>(move |event| {
+            let tx = tx.clone();
+            async move {
+                match event {
+                    JobEvent::WaitingForCallback { job, .. } => {
+                        let _ = tx.send(CbEvent::Waiting(job));
+                    }
+                    JobEvent::Completed { job, duration, .. } => {
+                        let _ = tx.send(CbEvent::Completed(job, duration));
+                    }
+                    JobEvent::Retried { job, attempt, .. } => {
+                        let _ = tx.send(CbEvent::Retried { job, attempt });
+                    }
+                    JobEvent::Exhausted { job, error, .. } => {
+                        let _ = tx.send(CbEvent::Exhausted(job, error));
+                    }
+                    _ => {}
+                }
+            }
+        });
+    if canonical {
+        builder = builder.canonical_storage();
+    }
+    builder.build().unwrap()
+}
+
+async fn insert_hook_job(pool: &sqlx::PgPool, queue: &str, value: &str) -> awa::JobRow {
+    awa::insert_with(
+        pool,
+        &HookJob {
+            action: "wait".into(),
+            value: value.into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+async fn test_waiting_for_callback_event_fires_on_park() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_waiting";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, false, tx);
+    let inserted = insert_hook_job(&pool, queue, "park").await;
+
+    client.start().await.unwrap();
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Waiting(job) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::WaitingExternal);
+            assert!(job.callback_id.is_some(), "callback_id should be set");
+        }
+        other => panic!("expected WaitingForCallback, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_complete_external_dispatches_completed_event() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_complete";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, false, tx);
+    let inserted = insert_hook_job(&pool, queue, "complete").await;
+
+    client.start().await.unwrap();
+
+    // Park first.
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    // Resolve through the worker Client → Completed hook should fire.
+    let completed = client
+        .complete_external(callback_id, None, None)
+        .await
+        .unwrap();
+    assert_eq!(completed.id, inserted.id);
+
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Completed(job, duration) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::Completed);
+            assert_eq!(
+                duration,
+                Duration::ZERO,
+                "callback completion has no handler duration"
+            );
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_fail_external_dispatches_exhausted_event() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_fail";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, false, tx);
+    let inserted = insert_hook_job(&pool, queue, "fail").await;
+
+    client.start().await.unwrap();
+
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    client
+        .fail_external(callback_id, "payment declined", None)
+        .await
+        .unwrap();
+
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Exhausted(job, error) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::Failed);
+            assert_eq!(error, "payment declined");
+        }
+        other => panic!("expected Exhausted, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_resolve_callback_dispatches_completed_event() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_resolve";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, false, tx);
+    let inserted = insert_hook_job(&pool, queue, "resolve").await;
+
+    client.start().await.unwrap();
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    let outcome = client
+        .resolve_callback(callback_id, None, awa::DefaultAction::Complete, None)
+        .await
+        .unwrap();
+    assert!(outcome.is_completed());
+
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Completed(job, duration) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::Completed);
+            assert_eq!(duration, Duration::ZERO);
+        }
+        other => panic!("expected Completed, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_client_retry_external_dispatches_retried_event() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_retry";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, false, tx);
+    let inserted = insert_hook_job(&pool, queue, "retry").await;
+
+    client.start().await.unwrap();
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    client.retry_external(callback_id, None).await.unwrap();
+
+    // The worker will re-claim the now-retryable job and park it again, so we
+    // may observe a fresh Waiting after the Retried; assert we see Retried,
+    // and that the event's attempt is the parked attempt (>= 1), not the
+    // post-transition value (admin::retry_external resets attempt to 0 as
+    // part of requeuing).
+    let mut saw_retried = false;
+    for _ in 0..3 {
+        match recv_event(&mut rx).await {
+            CbEvent::Retried { job, attempt } => {
+                assert_eq!(job.id, inserted.id);
+                assert!(
+                    attempt >= 1,
+                    "Retried event must report the parked (failed) attempt, not the post-reset 0; got {attempt}"
+                );
+                saw_retried = true;
+                break;
+            }
+            CbEvent::Waiting(_) => continue,
+            other => panic!("expected Retried/Waiting, got {other:?}"),
+        }
+    }
+    client.shutdown(Duration::from_secs(2)).await;
+    assert!(saw_retried, "expected a Retried event after retry_external");
+}
+
+#[tokio::test]
+async fn test_waiting_for_callback_event_fires_on_canonical_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "lifecycle_waiting_canonical";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, true, tx);
+    let inserted = insert_hook_job(&pool, queue, "park").await;
+
+    client.start().await.unwrap();
+    let event = recv_event(&mut rx).await;
+    client.shutdown(Duration::from_secs(2)).await;
+
+    match event {
+        CbEvent::Waiting(job) => {
+            assert_eq!(job.id, inserted.id);
+            assert_eq!(job.state, JobState::WaitingExternal);
+            assert!(job.callback_id.is_some());
+        }
+        other => panic!("expected WaitingForCallback on canonical storage, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_bare_admin_resolution_fires_no_hook() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool().await;
+    let queue = "lifecycle_cb_bare_admin";
+    clean_queue(&pool, queue).await;
+
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let client = parking_client(&pool, queue, false, tx);
+    let inserted = insert_hook_job(&pool, queue, "bare").await;
+
+    client.start().await.unwrap();
+    let callback_id = match recv_event(&mut rx).await {
+        CbEvent::Waiting(job) => job.callback_id.expect("callback_id set"),
+        other => panic!("expected Waiting, got {other:?}"),
+    };
+
+    // Resolve through the bare admin function (the boundary): the job
+    // transitions but no lifecycle hook should fire.
+    admin::complete_external(&pool, callback_id, None, None)
+        .await
+        .unwrap();
+    let completed = wait_for_job_state(&pool, inserted.id, JobState::Completed).await;
+    assert_eq!(completed.state, JobState::Completed);
+
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    client.shutdown(Duration::from_secs(2)).await;
+    assert!(
+        rx.try_recv().is_err(),
+        "bare admin resolution must not dispatch a lifecycle hook"
     );
 }
