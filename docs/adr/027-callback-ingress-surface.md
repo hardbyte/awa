@@ -156,12 +156,15 @@ Callback ingress resolves callback state. It must not assume a co-located
 `Client` runtime or local in-process lifecycle hook registry.
 
 Durable side effects triggered by callback resolution are delivered through
-the transactional follow-up enqueue mechanism in ADR-029: the callback
-receiver inserts the follow-up Awa job in the same transaction that commits
-the callback resolution, and an ordinary worker (anywhere) picks it up. The
-callback receiver does not invoke process-local hooks directly; observation-
-only hooks (ADR-015) continue to fire only in processes that perform the
-resolution themselves via the worker `Client`.
+the transactional follow-up enqueue mechanism in ADR-029. The callback
+receiver dispatches the follow-up `INSERT` best-effort in a separate
+transaction after the resolution commits — a `INSERT` failure leaves the
+job resolved without the follow-up (logged); fully atomic
+resolution-plus-enqueue is tracked as an open extension in ADR-029.
+Once the follow-up commits an ordinary worker (anywhere) picks it up.
+The callback receiver does not invoke process-local hooks directly;
+observation-only hooks (ADR-015) continue to fire only in processes
+that perform the resolution themselves via the worker `Client`.
 
 ## Consequences
 
