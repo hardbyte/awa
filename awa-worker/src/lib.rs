@@ -22,6 +22,7 @@ pub use client::{
 };
 pub use context::{CallbackGuard, CallbackToken, JobContext};
 pub use dispatcher::{QueueConfig, RateLimit};
+pub use enqueue_specs::EnqueueRequest;
 pub use events::{JobEvent, UntypedJobEvent};
 pub use executor::{JobError, JobResult, Worker};
 pub use maintenance::RetentionPolicy;

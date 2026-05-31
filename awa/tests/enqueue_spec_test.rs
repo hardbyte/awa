@@ -4,7 +4,7 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{admin, migrations};
-use awa::{Client, JobArgs, JobResult, JobState, QueueConfig};
+use awa::{Client, EnqueueRequest, JobArgs, JobResult, JobState, QueueConfig};
 use serde::{Deserialize, Serialize};
 use sqlx::postgres::PgPoolOptions;
 use std::sync::{Arc, OnceLock};
@@ -133,6 +133,57 @@ async fn on_completed_enqueue_inserts_follow_up_atomically() {
     assert_eq!(follow_args.user_id, 42);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
     assert_eq!(follow_up.state, JobState::Available);
+}
+
+#[tokio::test]
+async fn on_completed_enqueue_routes_follow_up_to_custom_queue() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let trigger_queue = "enqueue_spec_custom_trigger";
+    let follow_queue = "enqueue_spec_custom_follow";
+
+    let follow_queue_for_closure = follow_queue.to_string();
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            trigger_queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<EnqueueTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_completed_enqueue_with::<EnqueueTrigger, EnqueueFollowUp, _>(move |args, job| {
+            EnqueueRequest::new(EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            })
+            .queue(follow_queue_for_closure.clone())
+            .priority(1)
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &EnqueueTrigger { user_id: 7 },
+        awa::InsertOpts {
+            queue: trigger_queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    wait_for_state(&pool, trigger_job.id, JobState::Completed).await;
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("follow-up job should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    assert_eq!(follow_up.queue, follow_queue);
+    assert_eq!(follow_up.priority, 1);
 }
 
 #[tokio::test]

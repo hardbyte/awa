@@ -340,8 +340,12 @@ impl ClientBuilder {
     /// completes successfully.
     ///
     /// `make` receives the trigger's deserialised args plus its post-completion
-    /// [`awa_model::JobRow`] and returns the follow-up job's `JobArgs`. The
-    /// follow-up is `INSERT`ed in the *same database transaction* as the
+    /// [`awa_model::JobRow`] and returns the follow-up's `JobArgs` value. The
+    /// follow-up is enqueued with default [`awa_model::InsertOpts`] — use
+    /// [`Self::on_completed_enqueue_with`] to override queue, priority, or
+    /// other insert options.
+    ///
+    /// The follow-up is `INSERT`ed in the *same database transaction* as the
     /// completion's state change, so the trigger and the follow-up commit or
     /// roll back together — see ADR-029. This is the durable counterpart to
     /// [`Self::on_event`]: hooks are best-effort, in-process; this enqueue is
@@ -349,18 +353,33 @@ impl ClientBuilder {
     ///
     /// Multiple registrations for the same kind stack and all run in the
     /// finalization transaction.
-    pub fn on_completed_enqueue<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    pub fn on_completed_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
         F: JobArgs + Send + Sync + 'static,
         MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
     {
+        self.on_completed_enqueue_with::<T, F, _>(move |args, job| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+        })
+    }
+
+    /// Like [`Self::on_completed_enqueue`] but lets the closure return an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with explicit queue,
+    /// priority, or other [`awa_model::InsertOpts`] overrides.
+    pub fn on_completed_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
         let kind = T::kind().to_string();
         let spec: crate::enqueue_specs::BoxedEnqueueSpec =
             Arc::new(crate::enqueue_specs::CompletedFollowUp::<T, F, _> {
-                make: move |args: T, job: &awa_model::JobRow| {
-                    (make(args, job), awa_model::InsertOpts::default())
-                },
+                make,
                 _phantom: std::marker::PhantomData,
             });
         self.enqueue_specs.entry(kind).or_default().push(spec);
