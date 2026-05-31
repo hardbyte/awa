@@ -134,3 +134,42 @@ async fn on_completed_enqueue_inserts_follow_up_atomically() {
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
     assert_eq!(follow_up.state, JobState::Available);
 }
+
+#[tokio::test]
+async fn on_completed_enqueue_under_queue_storage_fails_fast() {
+    use awa::model::queue_storage::{QueueStorage, QueueStorageConfig};
+
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    QueueStorage::new(QueueStorageConfig::default())
+        .expect("build queue storage")
+        .install(&pool)
+        .await
+        .expect("install queue storage");
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            "enqueue_spec_queue_storage",
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<EnqueueTrigger, _, _>(|_args, _ctx| async move { Ok(JobResult::Completed) })
+        .on_completed_enqueue::<EnqueueTrigger, EnqueueFollowUp, _>(|args, _job| EnqueueFollowUp {
+            user_id: args.user_id,
+            triggered_by_job_id: 0,
+        })
+        .build()
+        .unwrap();
+
+    // ADR-029 queue-storage wiring is a deferred follow-up. Until it lands,
+    // start() must refuse loud so callers can't ship code that silently
+    // never enqueues follow-ups.
+    let err = client.start().await.expect_err("start should fail fast");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("queue storage") && msg.contains("canonical_storage"),
+        "unexpected error message: {msg}"
+    );
+}

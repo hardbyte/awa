@@ -1578,33 +1578,33 @@ async fn complete_canonical_with_followups(
 ) -> Result<Option<JobRow>, AwaError> {
     let mut tx = pool.begin().await?;
 
-    let result = sqlx::query(
+    // `UPDATE ... RETURNING` against `awa.jobs_hot` directly (not the
+    // `awa.jobs` compatibility view): in canonical-drain mode the view is
+    // backed by the active queue-storage schema and would return RowNotFound
+    // for a canonical row, rolling back the just-applied completion and
+    // wedging the job. The hot table is the source of truth for canonical
+    // attempts regardless of routing mode.
+    let updated_job: Option<JobRow> = sqlx::query_as(
         r#"
         UPDATE awa.jobs_hot
         SET state = 'completed',
             finalized_at = now(),
             progress = NULL
         WHERE id = $1 AND state = 'running' AND run_lease = $2
+        RETURNING *
         "#,
     )
     .bind(job.id)
     .bind(job.run_lease)
-    .execute(&mut *tx)
+    .fetch_optional(&mut *tx)
     .await?;
 
-    if result.rows_affected() == 0 {
+    let Some(updated_job) = updated_job else {
         // Stale: another writer already finalised this attempt. Drop the
         // transaction without emitting follow-ups.
         tx.rollback().await?;
         return Ok(None);
-    }
-
-    // Refresh the row through the awa.jobs view so the follow-up closures see
-    // the post-completion snapshot (state = completed, finalized_at set).
-    let updated_job: JobRow = sqlx::query_as("SELECT * FROM awa.jobs WHERE id = $1")
-        .bind(job.id)
-        .fetch_one(&mut *tx)
-        .await?;
+    };
 
     for spec in specs {
         spec.run(&mut *tx, &updated_job).await?;
