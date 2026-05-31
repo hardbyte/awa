@@ -1470,11 +1470,19 @@ async fn test_flush_dirty_admin_metadata_drains_full_backlog() {
         .await
         .unwrap();
 
-    let dirty_after: i64 = sqlx::query_scalar("SELECT count(*) FROM awa.admin_dirty_queues")
-        .fetch_one(client.pool())
-        .await
-        .unwrap();
-    assert_eq!(dirty_after, 0, "all dirty queues should be drained");
+    // Scope the post-flush check to this test's queues. Parallel test
+    // binaries share the database and can write fresh dirty markers between
+    // our flush and this assertion, so a global count(*) is racy.
+    let dirty_after: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.admin_dirty_queues WHERE queue LIKE 'integ_flush_backlog_%'",
+    )
+    .fetch_one(client.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        dirty_after, 0,
+        "all dirty queues for this test should be drained"
+    );
 
     // Verify the cache is accurate for a sample queue
     let stats = admin::queue_overviews(client.pool()).await.unwrap();
