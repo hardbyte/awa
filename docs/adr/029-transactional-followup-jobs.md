@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed
+Accepted — core implementation landed (worker-driven outcomes atomic;
+callback-resolution and maintenance-rescue follow-ups dispatched on a
+best-effort separate transaction; see *Implementation status* below).
 
 ## Context
 
@@ -311,20 +313,65 @@ positioning (ADR-001). Out of scope.
   (Postgres adapter / Python transaction bridge). The same transactional
   insert primitive is reused; nothing new is added to the bridge contract.
 
-## Open questions for follow-up issues
+## Implementation status
 
-These are deferred and intentionally not decided here:
+As shipped:
 
-- Exact `ClientBuilder` method names and the closure return type
-  (`Args`, `Option<Args>`, or `InsertParams` for finer control of queue /
-  scheduling / unique opts on the follow-up).
-- Whether follow-up specs may be conditional on the trigger's args / row
-  state in v1, or whether all conditioning must live in the follow-up
-  handler.
-- Python parity: how the same surface is expressed in the Python API
-  (likely via a decorator mirroring `@on_event` with an `enqueue=` form).
-- Whether the in-DB spec registry (deferred above) should be sketched in
-  a separate ADR before any production deployment is split across
-  versions.
-- The exact NOTIFY-as-wakeup-hint integration with the follow-up's queue
-  poll cadence — implementation-level, not architectural.
+- **Outcome surface.** `Outcome::{Completed, Retried, Exhausted,
+  Cancelled, WaitingForCallback, Rescued}`. `Started` is intentionally
+  excluded — claim-time enqueue would join the dispatcher's hot path,
+  and the durable-side-effect use case for "job started" is uncommon.
+  Observation belongs to `on_event`. A future `on_started_enqueue` is
+  not blocked by anything in this design but is not part of v1.
+- **Builder API.** Each outcome gets a pair of builders:
+  `on_<outcome>_enqueue` (closure returns `JobArgs`) and
+  `on_<outcome>_enqueue_with` (closure returns
+  [`EnqueueRequest<F>`](#enqueuerequest) for `InsertOpts` overrides —
+  queue, priority, max_attempts, metadata, tags, unique, run_at,
+  deadline_duration, ordering_key).
+- **Closure signatures** carry the per-outcome context:
+  Completed/WaitingForCallback: `(args, &job_row)`;
+  Cancelled: `(args, &job_row, &reason)`;
+  Retried: `(args, &job_row, &error, attempt, next_run_at)`;
+  Exhausted: `(args, &job_row, &error, attempt)`;
+  Rescued: `(args, &job_row, RescueReason)`.
+- **Rescued event variant.** Maintenance rescues fire a new
+  `JobEvent::Rescued { args, job, reason: RescueReason }` (alongside the
+  follow-up spec dispatch), keeping rescue context distinct from
+  Retried/Exhausted rather than overloading either.
+
+### Atomicity matrix
+
+| Emission site | Atomic with state commit? |
+|---|---|
+| Worker-driven outcomes on canonical storage | yes — `*_canonical_with_followups` helpers open one tx, run the state UPDATE (UPDATE...RETURNING on `awa.jobs_hot`; for `retryable` the DELETE+INSERT move into `awa.scheduled_jobs` is in a CTE), dispatch specs, commit |
+| Worker-driven outcomes on queue storage | yes — `*_queue_storage_with_followups` helpers run inside `complete_runtime_batch_slow_in_tx` / `cancel_running_in_tx` / `fail_*_in_tx` / `retry_*_in_tx` / `enter_callback_wait_in_tx` |
+| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) | **no — best-effort.** Spec dispatch runs in a separate tx after the resolution commits. If the spec INSERT fails the job remains resolved and the error is logged. Fully-atomic variant is tracked as follow-up (requires `_in_tx` versions of `admin::*_external` and the matching `store::*_external` paths). |
+| Maintenance rescue (stale heartbeat, deadline exceeded, expired callback) | **no — best-effort**, same shape and caveat as callback resolution |
+
+The asymmetry is deliberate: worker-driven outcomes are the dominant
+path and inherit ADR-013's run-lease guard (zero rows matched → tx
+rollback → no follow-up), giving exact-once delivery on the happy path.
+Adding tx-aware variants to every `admin::*` and rescue path is mechanically
+straightforward but invasive, and the best-effort path is correct enough
+for v1: the trigger has already committed, so the worst case is a missing
+follow-up — not a phantom follow-up.
+
+### Future work / follow-up issues
+
+- Fully atomic callback-resolution + follow-up enqueue: extract
+  `admin::{complete,fail,retry,resume}_external_in_tx` and matching
+  queue-storage store methods so `Client::*_external` can drive the
+  resolution and the spec dispatch in a single tx.
+- Fully atomic rescue + follow-up enqueue: thread `&mut tx` through
+  `maintenance::rescue_*` so the rescue UPDATE and the Rescued spec
+  dispatch commit together.
+- `on_started_enqueue`: not blocked by the design; explicitly out of
+  scope for v1 to keep the hot path unaffected.
+- Conditional spec dispatch (skip enqueue based on a predicate over the
+  triggering row) is not in v1 — apply conditioning inside the follow-up
+  handler instead.
+- In-DB spec registry — deferred; the in-process registry is acceptable
+  while specs are declared in one place per deployment.
+- NOTIFY-as-wakeup-hint integration with follow-up queue poll cadence
+  — implementation-level, not architectural.
