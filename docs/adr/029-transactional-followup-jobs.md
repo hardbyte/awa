@@ -359,6 +359,15 @@ follow-up — not a phantom follow-up.
 
 ### Future work / follow-up issues
 
+- **Python parity (deferred).** The Rust surface (`on_*_enqueue`,
+  `JobEvent::Rescued`, `RescueReason`) does not yet have a Python
+  binding. The implementation path is the same shape as `register_worker`
+  in `awa-python/src/worker.rs`: a `PythonFollowUp` type that wraps a
+  Python callable, takes the GIL inside `dispatch_specs_in_tx`,
+  serialises `JobRow + OutcomeContext` to Python, invokes the callable,
+  and decodes the returned dict to (`JobArgs`, `InsertOpts`) before the
+  underlying `insert_with` fires. ADR-015's hook surface (`@on_event`)
+  needs the same scaffold first. Tracking issue: TODO.
 - Fully atomic callback-resolution + follow-up enqueue: extract
   `admin::{complete,fail,retry,resume}_external_in_tx` and matching
   queue-storage store methods so `Client::*_external` can drive the
