@@ -1674,6 +1674,33 @@ impl Client {
             }),
             awa_model::ResolveOutcome::Ignored { .. } => None,
         };
+        // ADR-029 best-effort: dispatch follow-up specs in a separate tx
+        // *after* the resolution commits. See `dispatch_callback_followups`
+        // for the atomicity caveat. Resolution is the source of truth; if a
+        // spec INSERT fails we still consider the resolution successful.
+        match &outcome {
+            awa_model::ResolveOutcome::Completed { job, .. } => {
+                self.dispatch_callback_followups(
+                    job,
+                    crate::enqueue_specs::Outcome::Completed,
+                    None,
+                )
+                .await;
+            }
+            awa_model::ResolveOutcome::Failed { job } => {
+                let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
+                    error: latest_error_message(job),
+                    attempt: job.attempt,
+                };
+                self.dispatch_callback_followups(
+                    job,
+                    crate::enqueue_specs::Outcome::Exhausted,
+                    Some(outcome_ctx),
+                )
+                .await;
+            }
+            awa_model::ResolveOutcome::Ignored { .. } => {}
+        }
         if let Some(event) = event {
             self.dispatch_callback_event(event).await;
         }
@@ -1688,6 +1715,8 @@ impl Client {
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
         let job = admin::complete_external(&self.pool, callback_id, payload, run_lease).await?;
+        self.dispatch_callback_followups(&job, crate::enqueue_specs::Outcome::Completed, None)
+            .await;
         self.dispatch_callback_event(UntypedJobEvent::Completed {
             job: job.clone(),
             duration: Duration::ZERO,
@@ -1704,6 +1733,16 @@ impl Client {
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
         let job = admin::fail_external(&self.pool, callback_id, error, run_lease).await?;
+        let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
+            error: error.to_string(),
+            attempt: job.attempt,
+        };
+        self.dispatch_callback_followups(
+            &job,
+            crate::enqueue_specs::Outcome::Exhausted,
+            Some(outcome_ctx),
+        )
+        .await;
         self.dispatch_callback_event(UntypedJobEvent::Exhausted {
             job: job.clone(),
             error: error.to_string(),
@@ -1737,10 +1776,23 @@ impl Client {
         .await?;
 
         let job = admin::retry_external(&self.pool, callback_id, run_lease).await?;
+        let attempt = parked_attempt.unwrap_or(job.attempt);
+        let error_msg = latest_error_message(&job);
+        let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
+            error: error_msg.clone(),
+            attempt,
+            next_run_at: job.run_at,
+        };
+        self.dispatch_callback_followups(
+            &job,
+            crate::enqueue_specs::Outcome::Retried,
+            Some(outcome_ctx),
+        )
+        .await;
         self.dispatch_callback_event(UntypedJobEvent::Retried {
             job: job.clone(),
-            error: latest_error_message(&job),
-            attempt: parked_attempt.unwrap_or(job.attempt),
+            error: error_msg,
+            attempt,
             next_run_at: job.run_at,
         })
         .await;
@@ -1750,6 +1802,78 @@ impl Client {
     async fn dispatch_callback_event(&self, event: UntypedJobEvent) {
         let kind = event.job().kind.clone();
         crate::executor::dispatch_lifecycle_event(&self.lifecycle_handlers, &kind, event).await;
+    }
+
+    /// ADR-029 callback-resolution follow-up dispatch.
+    ///
+    /// **Atomicity caveat:** unlike worker-driven outcomes which dispatch
+    /// specs in the same transaction as the state transition, callback
+    /// resolution dispatches follow-ups in a *separate* transaction after
+    /// the resolution has already committed. If a spec INSERT fails (DB
+    /// disconnect, constraint violation, deserialisation error), the job
+    /// is still resolved but the follow-up is *not* enqueued — the error
+    /// is logged and the caller's `Result` remains `Ok`.
+    ///
+    /// Fully atomic callback resolution + follow-up enqueue requires
+    /// tx-aware admin variants (`complete_external_in_tx`, etc.) on both
+    /// canonical and queue-storage paths; tracked as a follow-up.
+    async fn dispatch_callback_followups(
+        &self,
+        job: &awa_model::JobRow,
+        outcome: crate::enqueue_specs::Outcome,
+        outcome_context: Option<crate::enqueue_specs::OutcomeContext>,
+    ) {
+        let Some(specs) = self
+            .enqueue_specs
+            .get(&outcome)
+            .and_then(|by_kind| by_kind.get(&job.kind))
+            .cloned()
+        else {
+            return;
+        };
+        if specs.is_empty() {
+            return;
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    error = %err,
+                    "callback follow-up dispatch: failed to begin transaction"
+                );
+                return;
+            }
+        };
+        let dispatch_result = crate::enqueue_specs::dispatch_specs_in_tx(
+            &mut tx,
+            job,
+            &specs,
+            outcome_context.as_ref(),
+        )
+        .await;
+        match dispatch_result {
+            Ok(()) => {
+                if let Err(err) = tx.commit().await {
+                    tracing::error!(
+                        job_id = job.id,
+                        kind = %job.kind,
+                        error = %err,
+                        "callback follow-up dispatch: commit failed"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    error = %err,
+                    "callback follow-up dispatch: spec INSERT failed; rolling back"
+                );
+                let _ = tx.rollback().await;
+            }
+        }
     }
 
     /// Health check.

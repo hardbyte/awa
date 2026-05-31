@@ -670,3 +670,166 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage()
     assert_eq!(follow_args.user_id, 444);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
 }
+
+#[tokio::test]
+async fn complete_external_dispatches_completed_followup() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "enqueue_spec_cb_complete";
+
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_completed_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job| EnqueueFollowUp {
+            user_id: args.user_id,
+            triggered_by_job_id: job.id,
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 501 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id set on parked job");
+
+    let _completed = client
+        .complete_external(callback_id, None, None)
+        .await
+        .expect("complete_external");
+
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("callback Completed follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 501);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn fail_external_dispatches_exhausted_followup() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "enqueue_spec_cb_fail";
+
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_exhausted_enqueue::<WaitTrigger, EnqueueFollowUp, _>(
+            |args, job, _error, _attempt| EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            },
+        )
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 502 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let _failed = client
+        .fail_external(callback_id, "external rejected", None)
+        .await
+        .expect("fail_external");
+
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("callback Exhausted follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 502);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn retry_external_dispatches_retried_followup() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "enqueue_spec_cb_retry";
+
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_retried_enqueue::<WaitTrigger, EnqueueFollowUp, _>(
+            |args, job, _error, _attempt, _next_run_at| EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            },
+        )
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 503 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let _retried = client
+        .retry_external(callback_id, None)
+        .await
+        .expect("retry_external");
+
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("callback Retried follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 503);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
