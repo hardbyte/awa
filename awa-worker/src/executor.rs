@@ -208,7 +208,12 @@ pub struct JobExecutor {
     pool: PgPool,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
-    enqueue_specs: Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
+    enqueue_specs: Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
     in_flight: InFlightMap,
     queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
     state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
@@ -224,7 +229,12 @@ impl JobExecutor {
         pool: PgPool,
         workers: Arc<HashMap<String, BoxedWorker>>,
         lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
-        enqueue_specs: Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
+        enqueue_specs: Arc<
+            HashMap<
+                crate::enqueue_specs::Outcome,
+                HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+            >,
+        >,
         in_flight: InFlightMap,
         queue_in_flight: Arc<HashMap<String, Arc<AtomicU32>>>,
         state: Arc<HashMap<std::any::TypeId, Box<dyn Any + Send + Sync>>>,
@@ -468,7 +478,12 @@ async fn complete_job(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
-    enqueue_specs: &Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
+    enqueue_specs: &Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
     storage: &RuntimeStorage,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
@@ -519,7 +534,12 @@ async fn complete_job_canonical(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
-    enqueue_specs: &Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
+    enqueue_specs: &Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
     _dlq_enabled: bool,
     _metrics: &crate::metrics::AwaMetrics,
 ) -> Result<CompletionOutcome, AwaError> {
@@ -532,7 +552,10 @@ async fn complete_job_canonical(
             // completion through a dedicated transaction so the UPDATE and
             // the follow-up INSERTs commit atomically. The batched path
             // can't carry per-job follow-ups, so we bypass it here.
-            let kind_specs = enqueue_specs.get(&job.kind).cloned();
+            let kind_specs = enqueue_specs
+                .get(&crate::enqueue_specs::Outcome::Completed)
+                .and_then(|by_kind| by_kind.get(&job.kind))
+                .cloned();
             if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
                 let outcome = complete_canonical_with_followups(pool, job, &specs).await?;
                 return match outcome {
@@ -606,6 +629,51 @@ async fn complete_job_canonical(
                 retry_after_secs = seconds,
                 "Job requested retry after duration"
             );
+
+            // ADR-029: caller-requested retry. The Retried OutcomeContext
+            // carries an empty error string (parity with the event emitted
+            // below) and the attempt / next_run_at read from the post-UPDATE
+            // row.
+            let kind_specs = enqueue_specs
+                .get(&crate::enqueue_specs::Outcome::Retried)
+                .and_then(|by_kind| by_kind.get(&job.kind))
+                .cloned();
+            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                let result = retry_after_canonical_with_followups(
+                    pool,
+                    job,
+                    seconds,
+                    progress_snapshot.as_ref(),
+                    &specs,
+                )
+                .await?;
+                return match result {
+                    None => {
+                        warn!(
+                            job_id = job.id,
+                            "Job already rescued/cancelled, retry ignored"
+                        );
+                        Ok(CompletionOutcome::IgnoredStale)
+                    }
+                    Some(updated_job) => {
+                        let event = if needs_event {
+                            Some(UntypedJobEvent::Retried {
+                                job: updated_job.clone(),
+                                error: String::new(),
+                                attempt: updated_job.attempt,
+                                next_run_at: updated_job.run_at,
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(CompletionOutcome::Applied {
+                            event,
+                            terminal: false,
+                        })
+                    }
+                };
+            }
+
             let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
@@ -691,12 +759,59 @@ async fn complete_job_canonical(
         }
 
         Ok(JobResult::Cancel(reason)) => {
+            tracing::Span::current().record("otel.status_code", "OK");
             info!(
                 job_id = job.id,
                 kind = %job.kind,
                 reason = %reason,
                 "Job cancelled by handler"
             );
+
+            // ADR-029: when this kind has Cancelled specs registered, drive
+            // the cancellation through a transaction so the UPDATE and the
+            // follow-up `INSERT`s commit atomically.
+            let kind_specs = enqueue_specs
+                .get(&crate::enqueue_specs::Outcome::Cancelled)
+                .and_then(|by_kind| by_kind.get(&job.kind))
+                .cloned();
+            let outcome_ctx = crate::enqueue_specs::OutcomeContext::Cancelled {
+                reason: reason.clone(),
+            };
+            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                let result = cancel_canonical_with_followups(
+                    pool,
+                    job,
+                    reason,
+                    progress_snapshot.as_ref(),
+                    &specs,
+                    &outcome_ctx,
+                )
+                .await?;
+                return match result {
+                    None => {
+                        warn!(
+                            job_id = job.id,
+                            "Job already rescued/cancelled, cancel ignored"
+                        );
+                        Ok(CompletionOutcome::IgnoredStale)
+                    }
+                    Some(updated_job) => {
+                        let event = if needs_event {
+                            Some(UntypedJobEvent::Cancelled {
+                                job: updated_job,
+                                reason: reason.clone(),
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(CompletionOutcome::Applied {
+                            event,
+                            terminal: false,
+                        })
+                    }
+                };
+            }
+
             let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
@@ -750,6 +865,33 @@ async fn complete_job_canonical(
                 kind = %job.kind,
                 "Job waiting for external callback"
             );
+
+            // ADR-029: WaitingForCallback follow-up enqueue. The triggering
+            // UPDATE and the follow-up INSERTs commit in the same transaction.
+            // Race / missing-callback paths below are unchanged and dispatch
+            // no follow-ups because the row didn't actually park.
+            let kind_specs = enqueue_specs
+                .get(&crate::enqueue_specs::Outcome::WaitingForCallback)
+                .and_then(|by_kind| by_kind.get(&job.kind))
+                .cloned();
+            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                let parked =
+                    park_canonical_with_followups(pool, job, progress_snapshot.as_ref(), &specs)
+                        .await?;
+                if let Some(parked_job) = parked {
+                    let event = if needs_event {
+                        Some(UntypedJobEvent::WaitingForCallback { job: parked_job })
+                    } else {
+                        None
+                    };
+                    return Ok(CompletionOutcome::Applied {
+                        event,
+                        terminal: false,
+                    });
+                }
+                // Fall through to the existing rows_affected == 0 handling.
+            }
+
             let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
@@ -847,6 +989,48 @@ async fn complete_job_canonical(
                 error = %msg,
                 "Job failed terminally"
             );
+
+            // ADR-029: terminal error counts as Exhausted (the error is
+            // fatal; no further attempts will run).
+            let kind_specs = enqueue_specs
+                .get(&crate::enqueue_specs::Outcome::Exhausted)
+                .and_then(|by_kind| by_kind.get(&job.kind))
+                .cloned();
+            if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                let result = terminal_canonical_with_followups(
+                    pool,
+                    job,
+                    msg,
+                    progress_snapshot.as_ref(),
+                    &specs,
+                )
+                .await?;
+                return match result {
+                    None => {
+                        warn!(
+                            job_id = job.id,
+                            "Job already rescued/cancelled, terminal failure ignored"
+                        );
+                        Ok(CompletionOutcome::IgnoredStale)
+                    }
+                    Some(updated_job) => {
+                        let event = if needs_event {
+                            Some(UntypedJobEvent::Exhausted {
+                                job: updated_job,
+                                error: msg.clone(),
+                                attempt: job.attempt,
+                            })
+                        } else {
+                            None
+                        };
+                        Ok(CompletionOutcome::Applied {
+                            event,
+                            terminal: true,
+                        })
+                    }
+                };
+            }
+
             let result = sqlx::query(
                 r#"
                 UPDATE awa.jobs
@@ -908,6 +1092,47 @@ async fn complete_job_canonical(
                     error = %error_msg,
                     "Job failed (max attempts exhausted)"
                 );
+
+                // ADR-029: retries exhausted -> Exhausted outcome.
+                let kind_specs = enqueue_specs
+                    .get(&crate::enqueue_specs::Outcome::Exhausted)
+                    .and_then(|by_kind| by_kind.get(&job.kind))
+                    .cloned();
+                if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                    let result = exhaust_canonical_with_followups(
+                        pool,
+                        job,
+                        &error_msg,
+                        progress_snapshot.as_ref(),
+                        &specs,
+                    )
+                    .await?;
+                    return match result {
+                        None => {
+                            warn!(
+                                job_id = job.id,
+                                "Job already rescued/cancelled, failure ignored"
+                            );
+                            Ok(CompletionOutcome::IgnoredStale)
+                        }
+                        Some(updated_job) => {
+                            let event = if needs_event {
+                                Some(UntypedJobEvent::Exhausted {
+                                    job: updated_job,
+                                    error: error_msg,
+                                    attempt: job.attempt,
+                                })
+                            } else {
+                                None
+                            };
+                            Ok(CompletionOutcome::Applied {
+                                event,
+                                terminal: true,
+                            })
+                        }
+                    };
+                }
+
                 let result = sqlx::query(
                     r#"
                     UPDATE awa.jobs
@@ -963,6 +1188,48 @@ async fn complete_job_canonical(
                     error = %error_msg,
                     "Job failed (will retry)"
                 );
+
+                // ADR-029: retryable error with backoff -> Retried outcome.
+                let kind_specs = enqueue_specs
+                    .get(&crate::enqueue_specs::Outcome::Retried)
+                    .and_then(|by_kind| by_kind.get(&job.kind))
+                    .cloned();
+                if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
+                    let result = retry_backoff_canonical_with_followups(
+                        pool,
+                        job,
+                        &error_msg,
+                        progress_snapshot.as_ref(),
+                        &specs,
+                    )
+                    .await?;
+                    return match result {
+                        None => {
+                            warn!(
+                                job_id = job.id,
+                                "Job already rescued/cancelled, retry ignored"
+                            );
+                            Ok(CompletionOutcome::IgnoredStale)
+                        }
+                        Some(updated_job) => {
+                            let event = if needs_event {
+                                Some(UntypedJobEvent::Retried {
+                                    job: updated_job.clone(),
+                                    error: error_msg,
+                                    attempt: job.attempt,
+                                    next_run_at: updated_job.run_at,
+                                })
+                            } else {
+                                None
+                            };
+                            Ok(CompletionOutcome::Applied {
+                                event,
+                                terminal: false,
+                            })
+                        }
+                    };
+                }
+
                 let result = sqlx::query(
                     r#"
                     UPDATE awa.jobs
@@ -1033,7 +1300,12 @@ async fn complete_job_queue_storage(
     progress_snapshot: Option<serde_json::Value>,
     duration: Duration,
     needs_event: bool,
-    enqueue_specs: &Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
+    enqueue_specs: &Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
     dlq_enabled: bool,
     metrics: &crate::metrics::AwaMetrics,
 ) -> Result<CompletionOutcome, AwaError> {
@@ -1049,7 +1321,10 @@ async fn complete_job_queue_storage(
             // fast-complete (ADR-023) can't carry per-job follow-ups, so we
             // bypass it for spec'd jobs and use the slow path's tx-aware
             // variant.
-            let kind_specs = enqueue_specs.get(&job.kind).cloned();
+            let kind_specs = enqueue_specs
+                .get(&crate::enqueue_specs::Outcome::Completed)
+                .and_then(|by_kind| by_kind.get(&job.kind))
+                .cloned();
             if let Some(specs) = kind_specs.filter(|s| !s.is_empty()) {
                 let outcome = complete_queue_storage_with_followups(
                     runtime,
@@ -1592,9 +1867,7 @@ async fn complete_queue_storage_with_followups(
     updated_job.finalized_at = Some(chrono::Utc::now());
     updated_job.progress = None;
 
-    for spec in specs {
-        spec.run(&mut *tx, &updated_job).await?;
-    }
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
 
     tx.commit().await?;
     Ok(Some(updated_job))
@@ -1722,9 +1995,347 @@ async fn complete_canonical_with_followups(
         return Ok(None);
     };
 
-    for spec in specs {
-        spec.run(&mut *tx, &updated_job).await?;
-    }
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, None).await?;
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
+}
+
+/// Cancelled-outcome equivalent: cancel the running canonical row and
+/// dispatch any registered `Cancelled` follow-ups inside the same
+/// transaction. Returns the post-update [`JobRow`] for event emission, or
+/// `None` when the row was already finalised by another writer.
+async fn cancel_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    reason: &str,
+    progress_snapshot: Option<&serde_json::Value>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+    outcome_ctx: &crate::enqueue_specs::OutcomeContext,
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let updated_job: Option<JobRow> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'cancelled',
+            finalized_at = now(),
+            errors = errors || $2::jsonb,
+            progress = $4
+        WHERE id = $1 AND state = 'running' AND run_lease = $3
+        RETURNING *
+        "#,
+    )
+    .bind(job.id)
+    .bind(serde_json::json!({
+        "error": format!("cancelled: {}", reason),
+        "attempt": job.attempt,
+        "at": chrono::Utc::now().to_rfc3339()
+    }))
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(updated_job) = updated_job else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, Some(outcome_ctx))
+        .await?;
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
+}
+
+/// Park the running canonical row into `waiting_external` and dispatch any
+/// registered `WaitingForCallback` follow-ups inside the same transaction.
+/// Returns the parked [`JobRow`] for event emission, or `None` when the
+/// guarded UPDATE matched zero rows (caller falls back to the existing race
+/// / missing-callback handling).
+async fn park_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    progress_snapshot: Option<&serde_json::Value>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let parked_job: Option<JobRow> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'waiting_external',
+            heartbeat_at = NULL,
+            deadline_at = NULL,
+            progress = $3
+        WHERE id = $1 AND state = 'running' AND run_lease = $2 AND callback_id IS NOT NULL
+        RETURNING *
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(parked_job) = parked_job else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    crate::enqueue_specs::dispatch_specs_in_tx(
+        &mut tx,
+        &parked_job,
+        specs,
+        Some(&crate::enqueue_specs::OutcomeContext::WaitingForCallback),
+    )
+    .await?;
+
+    tx.commit().await?;
+    Ok(Some(parked_job))
+}
+
+/// Caller-requested retry (RetryAfter) + Retried follow-ups.
+///
+/// `retryable` is forbidden in `awa.jobs_hot` (CHECK constraint); the row
+/// must move to `awa.scheduled_jobs`. We do the DELETE+INSERT explicitly
+/// in a CTE so the move plus the follow-up enqueue commit atomically. This
+/// mirrors what the `INSTEAD OF UPDATE` trigger on `awa.jobs` would do —
+/// avoiding the view keeps us correct under canonical-drain mode, where the
+/// view's trigger rejects UPDATEs while queue-storage is the active
+/// engine.
+async fn retry_after_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    seconds: f64,
+    progress_snapshot: Option<&serde_json::Value>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let updated_job: Option<JobRow> = sqlx::query_as(
+        r#"
+        WITH deleted AS (
+            DELETE FROM awa.jobs_hot
+            WHERE id = $1 AND state = 'running' AND run_lease = $3
+            RETURNING *
+        )
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args,
+            'retryable'::awa.job_state,
+            priority, attempt, max_attempts,
+            now() + make_interval(secs => $2),
+            heartbeat_at, deadline_at, attempted_at,
+            now(),
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, $4
+        FROM deleted
+        RETURNING *
+        "#,
+    )
+    .bind(job.id)
+    .bind(seconds)
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(updated_job) = updated_job else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
+        error: String::new(),
+        attempt: updated_job.attempt,
+        next_run_at: updated_job.run_at,
+    };
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, Some(&outcome_ctx))
+        .await?;
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
+}
+
+/// Terminal error -> failed + Exhausted follow-ups.
+async fn terminal_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    msg: &str,
+    progress_snapshot: Option<&serde_json::Value>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let updated_job: Option<JobRow> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            errors = errors || $2::jsonb,
+            progress = $4
+        WHERE id = $1 AND state = 'running' AND run_lease = $3
+        RETURNING *
+        "#,
+    )
+    .bind(job.id)
+    .bind(serde_json::json!({
+        "error": msg,
+        "attempt": job.attempt,
+        "at": chrono::Utc::now().to_rfc3339(),
+        "terminal": true
+    }))
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(updated_job) = updated_job else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
+        error: msg.to_string(),
+        attempt: job.attempt,
+    };
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, Some(&outcome_ctx))
+        .await?;
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
+}
+
+/// Retries exhausted (attempt >= max_attempts) -> failed + Exhausted
+/// follow-ups. Differs from terminal in the error envelope (no `terminal`
+/// marker since exhaustion is not a fatal-by-handler-assertion).
+async fn exhaust_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    error_msg: &str,
+    progress_snapshot: Option<&serde_json::Value>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let updated_job: Option<JobRow> = sqlx::query_as(
+        r#"
+        UPDATE awa.jobs_hot
+        SET state = 'failed',
+            finalized_at = now(),
+            errors = errors || $2::jsonb,
+            progress = $4
+        WHERE id = $1 AND state = 'running' AND run_lease = $3
+        RETURNING *
+        "#,
+    )
+    .bind(job.id)
+    .bind(serde_json::json!({
+        "error": error_msg,
+        "attempt": job.attempt,
+        "at": chrono::Utc::now().to_rfc3339()
+    }))
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(updated_job) = updated_job else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
+        error: error_msg.to_string(),
+        attempt: job.attempt,
+    };
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, Some(&outcome_ctx))
+        .await?;
+
+    tx.commit().await?;
+    Ok(Some(updated_job))
+}
+
+/// Retryable error within budget -> retryable + Retried follow-ups, using
+/// the configured backoff function for run_at.
+async fn retry_backoff_canonical_with_followups(
+    pool: &PgPool,
+    job: &JobRow,
+    error_msg: &str,
+    progress_snapshot: Option<&serde_json::Value>,
+    specs: &[crate::enqueue_specs::BoxedEnqueueSpec],
+) -> Result<Option<JobRow>, AwaError> {
+    let mut tx = pool.begin().await?;
+
+    let updated_job: Option<JobRow> = sqlx::query_as(
+        r#"
+        WITH deleted AS (
+            DELETE FROM awa.jobs_hot
+            WHERE id = $1 AND state = 'running' AND run_lease = $5
+            RETURNING *
+        )
+        INSERT INTO awa.scheduled_jobs (
+            id, kind, queue, args, state, priority, attempt, max_attempts,
+            run_at, heartbeat_at, deadline_at, attempted_at, finalized_at,
+            created_at, errors, metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, progress
+        )
+        SELECT
+            id, kind, queue, args,
+            'retryable'::awa.job_state,
+            priority, attempt, max_attempts,
+            now() + awa.backoff_duration($2, $3),
+            NULL, NULL,
+            attempted_at,
+            now(),
+            created_at,
+            errors || $4::jsonb,
+            metadata, tags, unique_key, unique_states,
+            callback_id, callback_timeout_at, callback_filter,
+            callback_on_complete, callback_on_fail, callback_transform,
+            run_lease, $6
+        FROM deleted
+        RETURNING *
+        "#,
+    )
+    .bind(job.id)
+    .bind(job.attempt)
+    .bind(job.max_attempts)
+    .bind(serde_json::json!({
+        "error": error_msg,
+        "attempt": job.attempt,
+        "at": chrono::Utc::now().to_rfc3339()
+    }))
+    .bind(job.run_lease)
+    .bind(progress_snapshot)
+    .fetch_optional(&mut *tx)
+    .await?;
+
+    let Some(updated_job) = updated_job else {
+        tx.rollback().await?;
+        return Ok(None);
+    };
+
+    let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
+        error: error_msg.to_string(),
+        attempt: job.attempt,
+        next_run_at: updated_job.run_at,
+    };
+    crate::enqueue_specs::dispatch_specs_in_tx(&mut tx, &updated_job, specs, Some(&outcome_ctx))
+        .await?;
 
     tx.commit().await?;
     Ok(Some(updated_job))

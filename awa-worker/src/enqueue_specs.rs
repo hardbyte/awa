@@ -1,7 +1,7 @@
 //! Transactional follow-up enqueue specs (ADR-029).
 //!
-//! A spec is a per-kind registration that, when its triggering state
-//! transition commits, inserts a follow-up Awa job in the same database
+//! A spec is a per-(outcome, kind) registration that, when its triggering
+//! state transition commits, inserts a follow-up Awa job in the same database
 //! transaction. The follow-up rides Awa's existing durability (at-least-once,
 //! retries, DLQ, admin visibility), so the side effect cannot be lost between
 //! the state commit and the hook dispatch the way an in-process hook can.
@@ -9,7 +9,8 @@
 //! Specs are type-erased here so the executor can dispatch them without
 //! knowing the trigger or follow-up types statically. The user-facing
 //! `ClientBuilder::on_*_enqueue` methods wrap their typed closures into
-//! impls of [`EnqueueFollowUp`] and accumulate them in a per-kind map.
+//! impls of [`EnqueueFollowUp`] and accumulate them in a two-level
+//! `outcome -> kind -> specs` registry.
 
 use awa_model::{insert_with, AwaError, InsertOpts, JobArgs, JobRow};
 use serde::de::DeserializeOwned;
@@ -72,21 +73,70 @@ impl<F: JobArgs> From<F> for EnqueueRequest<F> {
     }
 }
 
-/// Type-erased follow-up-enqueue spec for one (trigger kind, outcome) pair.
+/// The outcome whose state-commit triggers a registered spec.
 ///
-/// Implementors deserialise the trigger's args from the committed `JobRow`,
-/// apply the user's closure to produce the follow-up's `JobArgs` and
-/// [`InsertOpts`], then insert through the supplied executor — which the
-/// caller scopes to the same transaction as the triggering state commit.
+/// One spec is tied to exactly one outcome; the registry is keyed on this so
+/// the executor can look up specs for the specific branch it just took
+/// without filtering.
+///
+/// `Started` is intentionally excluded (see ADR-029): claim-time follow-up
+/// enqueue would join the dispatcher's hot path and the durable-side-effect
+/// use case for "job started" is uncommon. Observation belongs to hooks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Outcome {
+    Completed,
+    Retried,
+    Exhausted,
+    Cancelled,
+    WaitingForCallback,
+}
+
+/// Per-outcome runtime context handed to non-`Completed` follow-up closures
+/// so they can specialise on outcome-specific fields (error / attempt /
+/// reason / next_run_at). Variants mirror the corresponding
+/// `UntypedJobEvent` variants in shape.
+#[derive(Debug, Clone)]
+pub enum OutcomeContext {
+    Retried {
+        error: String,
+        attempt: i16,
+        next_run_at: chrono::DateTime<chrono::Utc>,
+    },
+    Exhausted {
+        error: String,
+        attempt: i16,
+    },
+    Cancelled {
+        reason: String,
+    },
+    WaitingForCallback,
+}
+
+/// Type-erased follow-up-enqueue spec for one (outcome, kind) pair.
+///
+/// `Completed` specs receive `outcome_context: None` (no extra context beyond
+/// the JobRow). Non-Completed specs receive `Some(ctx)` with the matching
+/// variant — the registry guarantees the variant matches because the spec is
+/// registered under its outcome key.
 pub(crate) trait EnqueueFollowUp: Send + Sync {
     fn run<'a>(
         &'a self,
         conn: &'a mut PgConnection,
         job: &'a JobRow,
+        outcome_context: Option<&'a OutcomeContext>,
     ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>>;
 }
 
 pub(crate) type BoxedEnqueueSpec = Arc<dyn EnqueueFollowUp + 'static>;
+
+fn decode_trigger_args<T: DeserializeOwned>(job: &JobRow) -> Result<T, AwaError> {
+    serde_json::from_value(job.args.clone()).map_err(|err| {
+        AwaError::Validation(format!(
+            "follow-up enqueue: failed to decode trigger args for kind {}: {err}",
+            job.kind
+        ))
+    })
+}
 
 /// Spec for the `Completed` outcome. Captures a typed closure that maps the
 /// trigger's deserialised args plus its post-completion `JobRow` to an
@@ -106,21 +156,158 @@ where
         &'a self,
         conn: &'a mut PgConnection,
         job: &'a JobRow,
+        _outcome_context: Option<&'a OutcomeContext>,
     ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
         Box::pin(async move {
-            // Deserialise the trigger args from the committed snapshot. If
-            // they don't decode, treat it as a configuration error in the
-            // hook rather than a job failure — the trigger has already
-            // committed by the time this runs.
-            let args: T = serde_json::from_value(job.args.clone()).map_err(|err| {
-                AwaError::Validation(format!(
-                    "follow-up enqueue: failed to decode trigger args for kind {}: {err}",
-                    job.kind
-                ))
-            })?;
+            let args: T = decode_trigger_args(job)?;
             let request = (self.make)(args, job);
             insert_with(&mut *conn, &request.args, request.opts).await?;
             Ok(())
         })
     }
+}
+
+/// Spec for the `Retried` outcome.
+pub(crate) struct RetriedFollowUp<T, F, MakeFn> {
+    pub(crate) make: MakeFn,
+    pub(crate) _phantom: PhantomData<fn() -> (T, F)>,
+}
+
+impl<T, F, MakeFn> EnqueueFollowUp for RetriedFollowUp<T, F, MakeFn>
+where
+    T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+    F: JobArgs + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow, &str, i16, chrono::DateTime<chrono::Utc>) -> EnqueueRequest<F>
+        + Send
+        + Sync
+        + 'static,
+{
+    fn run<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        job: &'a JobRow,
+        outcome_context: Option<&'a OutcomeContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(OutcomeContext::Retried {
+                error,
+                attempt,
+                next_run_at,
+            }) = outcome_context
+            else {
+                return Err(AwaError::Validation(
+                    "RetriedFollowUp dispatched without a Retried OutcomeContext".into(),
+                ));
+            };
+            let args: T = decode_trigger_args(job)?;
+            let request = (self.make)(args, job, error, *attempt, *next_run_at);
+            insert_with(&mut *conn, &request.args, request.opts).await?;
+            Ok(())
+        })
+    }
+}
+
+/// Spec for the `Exhausted` outcome (retries-exhausted or terminal-error).
+pub(crate) struct ExhaustedFollowUp<T, F, MakeFn> {
+    pub(crate) make: MakeFn,
+    pub(crate) _phantom: PhantomData<fn() -> (T, F)>,
+}
+
+impl<T, F, MakeFn> EnqueueFollowUp for ExhaustedFollowUp<T, F, MakeFn>
+where
+    T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+    F: JobArgs + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow, &str, i16) -> EnqueueRequest<F> + Send + Sync + 'static,
+{
+    fn run<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        job: &'a JobRow,
+        outcome_context: Option<&'a OutcomeContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(OutcomeContext::Exhausted { error, attempt }) = outcome_context else {
+                return Err(AwaError::Validation(
+                    "ExhaustedFollowUp dispatched without an Exhausted OutcomeContext".into(),
+                ));
+            };
+            let args: T = decode_trigger_args(job)?;
+            let request = (self.make)(args, job, error, *attempt);
+            insert_with(&mut *conn, &request.args, request.opts).await?;
+            Ok(())
+        })
+    }
+}
+
+/// Spec for the `Cancelled` outcome.
+pub(crate) struct CancelledFollowUp<T, F, MakeFn> {
+    pub(crate) make: MakeFn,
+    pub(crate) _phantom: PhantomData<fn() -> (T, F)>,
+}
+
+impl<T, F, MakeFn> EnqueueFollowUp for CancelledFollowUp<T, F, MakeFn>
+where
+    T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+    F: JobArgs + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow, &str) -> EnqueueRequest<F> + Send + Sync + 'static,
+{
+    fn run<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        job: &'a JobRow,
+        outcome_context: Option<&'a OutcomeContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
+        Box::pin(async move {
+            let Some(OutcomeContext::Cancelled { reason }) = outcome_context else {
+                return Err(AwaError::Validation(
+                    "CancelledFollowUp dispatched without a Cancelled OutcomeContext".into(),
+                ));
+            };
+            let args: T = decode_trigger_args(job)?;
+            let request = (self.make)(args, job, reason);
+            insert_with(&mut *conn, &request.args, request.opts).await?;
+            Ok(())
+        })
+    }
+}
+
+/// Spec for the `WaitingForCallback` outcome.
+pub(crate) struct WaitingForCallbackFollowUp<T, F, MakeFn> {
+    pub(crate) make: MakeFn,
+    pub(crate) _phantom: PhantomData<fn() -> (T, F)>,
+}
+
+impl<T, F, MakeFn> EnqueueFollowUp for WaitingForCallbackFollowUp<T, F, MakeFn>
+where
+    T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+    F: JobArgs + Send + Sync + 'static,
+    MakeFn: Fn(T, &JobRow) -> EnqueueRequest<F> + Send + Sync + 'static,
+{
+    fn run<'a>(
+        &'a self,
+        conn: &'a mut PgConnection,
+        job: &'a JobRow,
+        _outcome_context: Option<&'a OutcomeContext>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), AwaError>> + Send + 'a>> {
+        Box::pin(async move {
+            let args: T = decode_trigger_args(job)?;
+            let request = (self.make)(args, job);
+            insert_with(&mut *conn, &request.args, request.opts).await?;
+            Ok(())
+        })
+    }
+}
+
+/// Helper used by the executor (and other emission sites) to drive a list of
+/// specs against a connection inside an already-open transaction.
+pub(crate) async fn dispatch_specs_in_tx(
+    conn: &mut PgConnection,
+    job: &JobRow,
+    specs: &[BoxedEnqueueSpec],
+    outcome_context: Option<&OutcomeContext>,
+) -> Result<(), AwaError> {
+    for spec in specs {
+        spec.run(conn, job, outcome_context).await?;
+    }
+    Ok(())
 }

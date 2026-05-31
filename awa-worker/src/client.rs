@@ -125,7 +125,10 @@ pub struct ClientBuilder {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
-    enqueue_specs: HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+    enqueue_specs: HashMap<
+        crate::enqueue_specs::Outcome,
+        HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+    >,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -382,7 +385,194 @@ impl ClientBuilder {
                 make,
                 _phantom: std::marker::PhantomData,
             });
-        self.enqueue_specs.entry(kind).or_default().push(spec);
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Completed)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is retried (whether via `Ok(RetryAfter)` or a retryable `Err`).
+    /// `make` receives the trigger's args, its post-retry `JobRow`, the error
+    /// string, the previous attempt number, and the next-run-at timestamp.
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_retried_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16, chrono::DateTime<chrono::Utc>) -> F
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.on_retried_enqueue_with::<T, F, _>(move |args, job, error, attempt, next_run_at| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt, next_run_at))
+        })
+    }
+
+    /// Like [`Self::on_retried_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_retried_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(
+                T,
+                &awa_model::JobRow,
+                &str,
+                i16,
+                chrono::DateTime<chrono::Utc>,
+            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::RetriedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Retried)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is exhausted (retries used up *or* `Err(JobError::Terminal)`).
+    /// `make` receives the trigger's args, its post-failure `JobRow`, the
+    /// error string, and the attempt number.
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_exhausted_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> F + Send + Sync + 'static,
+    {
+        self.on_exhausted_enqueue_with::<T, F, _>(move |args, job, error, attempt| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt))
+        })
+    }
+
+    /// Like [`Self::on_exhausted_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_exhausted_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::ExhaustedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Exhausted)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is cancelled via `Ok(JobResult::Cancel(reason))`. `make` receives the
+    /// trigger's args, its post-cancellation `JobRow`, and the reason string.
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_cancelled_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str) -> F + Send + Sync + 'static,
+    {
+        self.on_cancelled_enqueue_with::<T, F, _>(move |args, job, reason| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+        })
+    }
+
+    /// Like [`Self::on_cancelled_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_cancelled_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::CancelledFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Cancelled)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// parks on an external callback (`Ok(JobResult::WaitForCallback)`).
+    /// `make` receives the trigger's args plus the parked `JobRow`
+    /// (`job.callback_id` and `job.callback_timeout_at` identify the
+    /// pending callback).
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_waiting_for_callback_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
+    {
+        self.on_waiting_for_callback_enqueue_with::<T, F, _>(move |args, job| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+        })
+    }
+
+    /// Like [`Self::on_waiting_for_callback_enqueue`] but the closure returns
+    /// an [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_waiting_for_callback_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec = Arc::new(
+            crate::enqueue_specs::WaitingForCallbackFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            },
+        );
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::WaitingForCallback)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
         self
     }
 
@@ -820,7 +1010,12 @@ pub struct Client {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
-    enqueue_specs: Arc<HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>>,
+    enqueue_specs: Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
