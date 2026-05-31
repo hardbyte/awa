@@ -476,3 +476,197 @@ async fn on_completed_enqueue_inserts_follow_up_under_queue_storage() {
     assert_eq!(follow_args.user_id, 99);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
 }
+
+#[tokio::test]
+async fn on_cancelled_enqueue_inserts_follow_up_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_cancel_trigger";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<EnqueueTrigger, _, _>(|_args, _ctx| async move {
+            Ok(JobResult::Cancel("user requested".to_string()))
+        })
+        .on_cancelled_enqueue::<EnqueueTrigger, EnqueueFollowUp, _>(|args, job, _reason| {
+            EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            }
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &EnqueueTrigger { user_id: 111 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    wait_for_state(&pool, trigger_job.id, JobState::Cancelled).await;
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage cancelled follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 111);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn on_exhausted_enqueue_inserts_follow_up_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_exhaust_trigger";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<ExhaustTrigger, _, _>(|_args, _ctx| async move {
+            Err(awa::JobError::Terminal("permanent failure".to_string()))
+        })
+        .on_exhausted_enqueue::<ExhaustTrigger, EnqueueFollowUp, _>(
+            |args, job, _error, _attempt| EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            },
+        )
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &ExhaustTrigger { user_id: 222 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    wait_for_state(&pool, trigger_job.id, JobState::Failed).await;
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage exhausted follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 222);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn on_retried_enqueue_inserts_follow_up_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_retry_trigger";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register::<RetryTrigger, _, _>(|_args, _ctx| async move {
+            Err(awa::JobError::Retryable("flaky".into()))
+        })
+        .on_retried_enqueue::<RetryTrigger, EnqueueFollowUp, _>(
+            |args, job, _error, _attempt, _next_run_at| EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            },
+        )
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &RetryTrigger { user_id: 333 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            max_attempts: 5,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage retried follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 333);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_wait_trigger";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_waiting_for_callback_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job| {
+            EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            }
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 444 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage waiting-for-callback follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 444);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
