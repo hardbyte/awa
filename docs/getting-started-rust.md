@@ -68,6 +68,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .connect(&database_url)
         .await?;
 
+    // This is your application's sqlx pool. Awa uses it for queue storage,
+    // but it does not become your general database abstraction.
     migrations::run(&pool).await?;
 
     let client = Client::builder(pool.clone())
@@ -150,6 +152,34 @@ The UI starts on `http://127.0.0.1:3000` by default.
 - `Client::start()` spawns background tasks and returns immediately. Your service should usually stay alive until it receives a shutdown signal.
 - `Client::shutdown(Duration)` is the graceful drain path. Set your container or process shutdown timeout slightly above that duration.
 - If you only need to enqueue jobs from Rust, depend on `awa-model` instead of `awa`.
+
+When enqueueing from a request or service method that already writes app
+data, use your existing `sqlx` transaction and pass it to Awa:
+
+```rust
+let mut tx = pool.begin().await?;
+
+sqlx::query("INSERT INTO orders (id, email) VALUES ($1, $2)")
+    .bind(order_id)
+    .bind(email)
+    .execute(&mut *tx)
+    .await?;
+
+let job = awa::insert_with(
+    &mut *tx,
+    &SendEmail {
+        to: email.to_string(),
+        subject: "Order confirmed".into(),
+    },
+    InsertOpts {
+        queue: "email".into(),
+        ..Default::default()
+    },
+)
+.await?;
+
+tx.commit().await?;
+```
 
 ## Routing related jobs to the same shard
 

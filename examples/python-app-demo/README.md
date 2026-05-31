@@ -3,7 +3,7 @@
 Tiny FastAPI example showing how Awa fits into a real application:
 
 - `demo_app/app.py` exposes a checkout endpoint
-- `demo_app/shared.py` contains the transactional enqueue logic
+- `demo_app/shared.py` keeps app SQL in SQLAlchemy and enqueues through the Awa bridge inside the same transaction
 - `demo_app/workers.py` runs the workers
 - `seed_demo.py` populates the admin UI with realistic domain data
 
@@ -55,6 +55,7 @@ curl -X POST http://127.0.0.1:8000/orders/checkout \
 
 - This project uses local `tool.uv.sources` overrides so it works directly inside the Awa repo.
 - If you copy this example into another repo, replace the local sources with published `awa-pg` and `awa-cli` dependencies.
+- The FastAPI app uses SQLAlchemy sessions for order data; Awa only handles queue migration, enqueue, worker, and admin/UI concerns.
 - Reusing the same `checkout_id` is idempotent and won't enqueue another order-confirmation email.
 - The seed script deliberately adds extra operational scenarios like waiting payment callbacks and failed inventory syncs so the UI has something worth inspecting.
 - If `awa serve` shows "Frontend not built", rebuild `awa-ui/frontend` and then rerun `uv sync` here so `awa-cli` picks up the embedded assets.
