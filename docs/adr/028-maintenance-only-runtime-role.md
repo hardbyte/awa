@@ -211,3 +211,8 @@ bounded `tick()`, not a replacement for the runtime role.
 - ADR-019 owns queue-storage maintenance concerns such as rotation and
   pruning. Maintenance-only runs those existing storage tasks; it does not
   redefine the storage engine.
+- ADR-029 defines transactional follow-up jobs. Maintenance-only uses that
+  mechanism to emit durable lifecycle effects for rescues (expired callback,
+  stale heartbeat, exceeded deadline) — enqueuing follow-up Awa jobs in the
+  same transaction as the rescue UPDATE, closing the rescue/timeout event
+  gap without requiring a handler registry in the maintenance process.

@@ -155,11 +155,13 @@ layers to expose framework-native routes without reverse-proxy rewriting.
 Callback ingress resolves callback state. It must not assume a co-located
 `Client` runtime or local in-process lifecycle hook registry.
 
-If callback completion should produce lifecycle notifications beyond the
-storage transition itself, that mechanism needs to be durable or otherwise
-runtime-independent. The callback receiver should call a shared resolution
-service and inherit whatever durable side effects the model layer guarantees,
-rather than invoking process-local hooks directly.
+Durable side effects triggered by callback resolution are delivered through
+the transactional follow-up enqueue mechanism in ADR-029: the callback
+receiver inserts the follow-up Awa job in the same transaction that commits
+the callback resolution, and an ordinary worker (anywhere) picks it up. The
+callback receiver does not invoke process-local hooks directly; observation-
+only hooks (ADR-015) continue to fire only in processes that perform the
+resolution themselves via the worker `Client`.
 
 ## Consequences
 
@@ -222,6 +224,9 @@ smaller upstream to protect.
   narrows into its own deployable surface.
 - ADR-021 defines callback completion, sequential waits, and heartbeats. This
   ADR changes HTTP exposure, not callback semantics.
-- ADR-015 defines builder-side lifecycle hooks. Callback ingress should not
-  depend on process-local hook registries unless a future ADR makes those
-  effects durable or runtime-independent.
+- ADR-015 defines builder-side lifecycle hooks. Callback ingress does not
+  depend on process-local hook registries; observation hooks stay in the
+  worker process.
+- ADR-029 defines transactional follow-up jobs, the runtime-independent
+  mechanism callback ingress uses for durable side effects triggered by a
+  resolution.
