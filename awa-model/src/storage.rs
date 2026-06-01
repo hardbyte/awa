@@ -30,6 +30,23 @@ pub struct StorageStatusReport {
     pub enter_mixed_transition_blockers: Vec<String>,
     pub can_finalize: bool,
     pub finalize_blockers: Vec<String>,
+    /// Historical samples of `canonical_live_backlog` anchored to the
+    /// current `transition_epoch`. Only populated when the caller passes
+    /// `?history=true` on `/api/storage`. The 0.6 server returns an empty
+    /// slice because samples are accumulated client-side (no audit table
+    /// — see issue #180); this field is kept additive so future versions
+    /// that introduce server-side accumulation stay wire-compatible.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history: Option<Vec<BacklogSample>>,
+}
+
+/// One sample of `canonical_live_backlog`, timestamped server-side. The UI
+/// uses these to render an epoch-anchored sparkline showing the full
+/// timeline of the current cutover (rather than a sliding window).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct BacklogSample {
+    pub at: DateTime<Utc>,
+    pub canonical_live_backlog: i64,
 }
 
 pub async fn status<'e, E>(executor: E) -> Result<StorageStatus, AwaError>
@@ -252,5 +269,6 @@ pub async fn status_report(pool: &PgPool) -> Result<StorageStatusReport, AwaErro
         enter_mixed_transition_blockers,
         can_finalize: finalize_blockers.is_empty(),
         finalize_blockers,
+        history: None,
     })
 }

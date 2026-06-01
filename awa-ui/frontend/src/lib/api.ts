@@ -193,6 +193,12 @@ export interface Capabilities {
   poll_interval_ms: number;
 }
 
+export interface StorageBacklogSample {
+  /** ISO-8601 server timestamp when the sample was recorded. */
+  at: string;
+  canonical_live_backlog: number;
+}
+
 export interface StorageStatusReport {
   current_engine: string;
   active_engine: string;
@@ -211,6 +217,11 @@ export interface StorageStatusReport {
   enter_mixed_transition_blockers: string[];
   can_finalize: boolean;
   finalize_blockers: string[];
+  /** Optional: present only when fetchStorage was called with
+   *  `?history=true`. The 0.6 server always returns an empty array
+   *  because no audit table exists (issue #180); clients accumulate
+   *  samples themselves keyed by `transition_epoch`. */
+  history?: StorageBacklogSample[];
 }
 
 export interface ListJobsParams {
@@ -415,8 +426,11 @@ export function fetchRuntime(): Promise<RuntimeOverview> {
 }
 
 // Returns null if the backend is older than 0.5.5-alpha and lacks /storage.
-export async function fetchStorage(): Promise<StorageStatusReport | null> {
-  const res = await fetch("/api/storage", {
+export async function fetchStorage(
+  options: { history?: boolean } = {}
+): Promise<StorageStatusReport | null> {
+  const qs = options.history ? "?history=true" : "";
+  const res = await fetch(`/api/storage${qs}`, {
     headers: { "Content-Type": "application/json" },
   });
   if (res.status === 404) return null;
