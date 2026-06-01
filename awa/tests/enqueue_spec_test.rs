@@ -1055,6 +1055,67 @@ async fn complete_external_rolls_back_callback_on_followup_panic() {
     client.shutdown(Duration::from_secs(2)).await;
 }
 
+/// Queue-storage counterpart of
+/// `complete_external_rolls_back_callback_on_followup_panic`. A panic in
+/// `on_completed_enqueue` must roll back the queue-storage callback
+/// completion (deletion from leases, insert into done_entries) together
+/// with the failed follow-up so the callback row remains addressable
+/// and the external sender can retry.
+#[tokio::test]
+async fn complete_external_rolls_back_callback_on_followup_panic_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_cb_complete_panic";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_completed_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|_args, _job| {
+            panic!("queue-storage callback follow-up exploded");
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 801 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let result = client.complete_external(callback_id, None, None).await;
+    assert!(
+        result.is_err(),
+        "queue-storage complete_external must surface the panicking-spec \
+         error so the external sender can retry the callback"
+    );
+
+    let after = admin::get_job(&pool, trigger_job.id).await.unwrap();
+    assert_eq!(after.state, JobState::WaitingExternal);
+    assert_eq!(after.callback_id, Some(callback_id));
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind()).await;
+    assert!(
+        follow_up.is_none(),
+        "no follow-up row should be visible after a rolled-back queue-storage \
+         callback completion"
+    );
+    client.shutdown(Duration::from_secs(2)).await;
+}
+
 #[tokio::test]
 async fn complete_external_dispatches_completed_followup_under_queue_storage() {
     let _permit = test_gate().acquire_owned().await.unwrap();

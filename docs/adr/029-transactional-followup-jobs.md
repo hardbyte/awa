@@ -368,21 +368,24 @@ positioning (ADR-001). Out of scope.
 |---|---|
 | Worker-driven outcomes on canonical storage | yes — `*_canonical_with_followups` helpers open one tx, run the state UPDATE (UPDATE...RETURNING on `awa.jobs_hot`; for `retryable` the DELETE+INSERT move into `awa.scheduled_jobs` is in a CTE), dispatch specs, commit |
 | Worker-driven outcomes on queue storage | yes — `*_queue_storage_with_followups` helpers run inside `complete_runtime_batch_slow_in_tx` / `cancel_running_in_tx` / `fail_*_in_tx` / `retry_*_in_tx` / `enter_callback_wait_in_tx` |
-| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) | **no — best-effort.** Spec dispatch runs in a separate tx after the resolution commits. If the spec INSERT fails the job remains resolved and the error is logged. Fully-atomic variant is tracked as follow-up (requires `_in_tx` versions of `admin::*_external` and the matching `store::*_external` paths). |
-| Maintenance rescue (stale heartbeat, deadline exceeded, expired callback) | **no — best-effort**, same shape and caveat as callback resolution |
+| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) on either storage engine | yes — `Client::*_external` opens one tx, drives the transition via `admin::*_external_in_tx` / `store::*_external_in_tx`, dispatches specs via `dispatch_specs_in_tx`, commits. A spec failure rolls the resolution back so the external sender can retry. |
+| Maintenance rescue (stale heartbeat, deadline exceeded, expired callback) | **no — best-effort.** Spec dispatch runs in a separate tx after the rescue commits. A spec failure leaves the rescue applied and is logged. Kept best-effort by design (see [Open extensions](#open-extensions)). |
 
-The asymmetry is deliberate: worker-driven outcomes are the dominant
-path and inherit ADR-013's run-lease guard (zero rows matched → tx
-rollback → no follow-up). The trigger transition and the follow-up
-`INSERT` either both commit or neither does, so each committed
-worker-driven outcome enqueues each registered follow-up exactly
-once. *Delivery* of the follow-up itself is at-least-once — once
-enqueued the row rides Awa's normal claim/retry semantics, and the
-follow-up handler must remain safe under re-execution. Tx-aware
-variants on every `admin::*` and rescue path are mechanically
-straightforward but invasive, and the best-effort path is correct
-enough for the supported guarantee: the trigger has already committed,
-so the worst case is a missing follow-up — not a phantom follow-up.
+Worker-driven outcomes inherit ADR-013's run-lease guard (zero rows
+matched → tx rollback → no follow-up); callback resolution inherits a
+matching guard from the `SELECT ... FOR UPDATE` lookup on `awa.jobs_hot`
+or `FOR UPDATE OF lease` on the queue-storage leases table. The
+trigger transition and the follow-up `INSERT` either both commit or
+neither does, so each committed worker-driven outcome or callback
+resolution enqueues each registered follow-up exactly once. *Delivery*
+of the follow-up itself is at-least-once — once enqueued the row rides
+Awa's normal claim/retry semantics, and the follow-up handler must
+remain safe under re-execution. The maintenance rescue path remains
+best-effort because coupling rescue liveness to the correctness of user
+follow-up code (a panic in `on_rescued_enqueue`) would be a worse
+trade than a missed Rescued follow-up; the rescue UPDATE has already
+committed when the dispatch runs, so the worst case is a missing
+follow-up — not a phantom follow-up.
 
 ### Open extensions
 

@@ -117,10 +117,11 @@ For side effects that **must survive a process crash** — sending a welcome
 email after signup, kicking off downstream work, persisting an audit row —
 use the transactional follow-up API instead of an `on_event` hook. For
 worker-driven outcomes (the trigger handler returned `Ok`/`Err`) and
-for callback resolution via the worker `Client::*_external` APIs, the
-follow-up `INSERT`s in the **same database transaction** as the
-triggering state transition: either both commit or both roll back, with
-no in-between. Maintenance rescue dispatches follow-ups in a **separate
+for callback resolution via the worker `Client` —
+`complete_external`, `fail_external`, `retry_external`, and
+`resolve_callback` — the follow-up `INSERT`s in the **same database
+transaction** as the triggering state transition: either both commit
+or both roll back, with no in-between. Maintenance rescue dispatches follow-ups in a **separate
 transaction** (best-effort) — see the [atomicity table
 below](#atomicity-guarantees) before designing a workflow that depends
 on rescue-driven follow-ups landing.
