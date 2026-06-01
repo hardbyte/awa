@@ -4622,6 +4622,86 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
     assert_eq!(counts_after.available, 0);
 }
 
+/// `queue_counts_fast` is an index-only depth probe intended for
+/// high-cadence pollers (admin dashboards, depth-target producers,
+/// soak observability). It returns the same shape as `queue_counts`
+/// but skips two expensive scans:
+///
+/// - `count(*) FROM done_entries WHERE queue=$1` — replaced by a sum
+///   over `queue_terminal_rollups.pruned_completed_count`, which only
+///   reflects rows that have already been rolled up.
+/// - `count(*) FROM lease_claims WHERE queue=$1 AND NOT EXISTS (...)`
+///   — replaced by `count(*) FROM leases WHERE queue=$1 AND state IN
+///   ('running','waiting_external')`, which omits receipt-plane claims
+///   that have not materialised a lease row.
+///
+/// Under steady state (empty leases table + nothing live in
+/// done_entries) the fast variant agrees with the exact variant on
+/// `available` and `running`. The exact variant's `completed` is the
+/// authority; the fast variant under-counts by the live (un-rolled-up)
+/// done_entries segment, which is documented and acceptable for the
+/// observability use case.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_counts_fast_steady";
+    let schema = "awa_qs_counts_fast_steady";
+    let store = create_store(&pool, schema).await;
+
+    // Empty queue: both variants must agree on every field.
+    let empty_fast = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("queue_counts_fast on empty queue");
+    let empty_exact = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts on empty queue");
+    assert_eq!(empty_fast.available, 0);
+    assert_eq!(empty_fast.running, 0);
+    assert_eq!(empty_fast.completed, 0);
+    assert_eq!(empty_fast.available, empty_exact.available);
+    assert_eq!(empty_fast.running, empty_exact.running);
+    assert_eq!(empty_fast.completed, empty_exact.completed);
+
+    // Available rows present: both variants agree.
+    store
+        .enqueue_batch(&pool, queue, 1, 5)
+        .await
+        .expect("Failed to enqueue jobs");
+    let with_available_fast = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("queue_counts_fast with rows available");
+    let with_available_exact = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts with rows available");
+    assert_eq!(with_available_fast.available, 5);
+    assert_eq!(with_available_fast.available, with_available_exact.available);
+    assert_eq!(with_available_fast.running, with_available_exact.running);
+
+    // Claim the rows (lease-materialisation path; no receipt-plane
+    // divergence with `lease_claim_receipts: false` from create_store).
+    let claimed = store
+        .claim_batch(&pool, queue, 5)
+        .await
+        .expect("Failed to claim");
+    assert_eq!(claimed.len(), 5);
+    let running_fast = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("queue_counts_fast with rows running");
+    let running_exact = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts with rows running");
+    assert_eq!(running_fast.running, 5);
+    assert_eq!(running_fast.running, running_exact.running);
+    assert_eq!(running_fast.available, running_exact.available);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
