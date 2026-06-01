@@ -3,37 +3,17 @@
 //! These endpoints are thin wrappers around the admin callback functions,
 //! enabling serverless functions to resolve callbacks via HTTP.
 
+use awa_model::callback_contract::{
+    self, CompletePayload, FailPayload, HeartbeatPayload, SIGNATURE_HEADER,
+};
 use axum::extract::{Path, State};
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
-use serde::Deserialize;
 
 use crate::error::ApiError;
 use crate::state::AppState;
-
-#[derive(Deserialize, Default)]
-pub struct CompletePayload {
-    #[serde(default)]
-    pub payload: Option<serde_json::Value>,
-}
-
-#[derive(Deserialize)]
-pub struct FailPayload {
-    pub error: String,
-}
-
-#[derive(Deserialize, Default)]
-pub struct HeartbeatPayload {
-    /// Timeout in seconds. Defaults to 3600 (1 hour).
-    #[serde(default = "default_heartbeat_timeout")]
-    pub timeout_seconds: f64,
-}
-
-fn default_heartbeat_timeout() -> f64 {
-    3600.0
-}
 
 fn verify_signature(
     headers: &HeaderMap,
@@ -45,17 +25,15 @@ fn verify_signature(
     };
 
     let provided = headers
-        .get("X-Awa-Signature")
-        .ok_or_else(|| ApiError::unauthorized("missing X-Awa-Signature header"))?
+        .get(SIGNATURE_HEADER)
+        .ok_or_else(|| ApiError::unauthorized(format!("missing {SIGNATURE_HEADER} header")))?
         .to_str()
-        .map_err(|_| ApiError::unauthorized("invalid X-Awa-Signature header"))?;
+        .map_err(|_| ApiError::unauthorized(format!("invalid {SIGNATURE_HEADER} header")))?;
 
-    let expected = blake3::keyed_hash(&secret, callback_id.as_bytes());
-    // Parse the provided hex into a Hash so the comparison uses blake3's
-    // constant-time PartialEq implementation.
-    match blake3::Hash::from_hex(provided) {
-        Ok(provided_hash) if expected == provided_hash => Ok(()),
-        _ => Err(ApiError::unauthorized("invalid callback signature")),
+    if callback_contract::verify(&secret, callback_id, provided) {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized("invalid callback signature"))
     }
 }
 

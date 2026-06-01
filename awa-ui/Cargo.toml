@@ -23,7 +23,6 @@ include = [
 awa-model.workspace = true
 awa-metrics.workspace = true
 axum.workspace = true
-blake3.workspace = true
 tower-http.workspace = true
 rust-embed.workspace = true
 sqlx.workspace = true
