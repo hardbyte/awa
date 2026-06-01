@@ -1,7 +1,12 @@
 pub mod cache;
+pub mod callback_router;
 pub mod error;
 pub mod handlers;
 pub mod state;
+
+pub use callback_router::{
+    callback_router, CallbackAuth, CallbackReceiverConfig, CallbackRouterBuildError,
+};
 
 use std::time::Duration;
 
