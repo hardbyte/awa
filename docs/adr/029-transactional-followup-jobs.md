@@ -370,11 +370,16 @@ positioning (ADR-001). Out of scope.
 
 The asymmetry is deliberate: worker-driven outcomes are the dominant
 path and inherit ADR-013's run-lease guard (zero rows matched → tx
-rollback → no follow-up), giving exact-once delivery on the happy path.
-Tx-aware variants on every `admin::*` and rescue path are mechanically
-straightforward but invasive, and the best-effort path is correct enough
-for the supported guarantee: the trigger has already committed, so the
-worst case is a missing follow-up — not a phantom follow-up.
+rollback → no follow-up). The trigger transition and the follow-up
+`INSERT` either both commit or neither does, so each committed
+worker-driven outcome enqueues each registered follow-up exactly
+once. *Delivery* of the follow-up itself is at-least-once — once
+enqueued the row rides Awa's normal claim/retry semantics, and the
+follow-up handler must remain safe under re-execution. Tx-aware
+variants on every `admin::*` and rescue path are mechanically
+straightforward but invasive, and the best-effort path is correct
+enough for the supported guarantee: the trigger has already committed,
+so the worst case is a missing follow-up — not a phantom follow-up.
 
 ### Open extensions
 

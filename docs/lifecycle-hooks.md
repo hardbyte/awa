@@ -173,9 +173,13 @@ deadline_duration, ordering_key):
 | Maintenance rescue (stale heartbeat / deadline / expired callback) | **no — best-effort**, same shape and caveat |
 
 The asymmetry is deliberate: the worker-driven path inherits ADR-013's
-run-lease guard (stale outcome → tx rolls back → no follow-up), giving
-exact-once semantics on the happy path. The callback-resolution and
-maintenance paths are tracked for a future tx-aware variant.
+run-lease guard (stale outcome → tx rolls back → no follow-up). The
+trigger transition and the follow-up `INSERT` either both commit or
+neither does — exactly-once *enqueue* per committed worker outcome.
+The follow-up itself, once enqueued, is delivered with Awa's usual
+at-least-once semantics, so the follow-up handler still needs to be
+safe under re-execution. The callback-resolution and maintenance paths
+are tracked for a future tx-aware variant.
 
 ### When to choose which API
 
