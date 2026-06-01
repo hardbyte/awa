@@ -107,6 +107,60 @@ enum Commands {
         #[arg(long, env = "AWA_READ_ONLY")]
         read_only: bool,
     },
+    /// Callback receiver subcommands
+    Callbacks {
+        #[command(subcommand)]
+        command: CallbackCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum CallbackCommands {
+    /// Start a callback-only receiver (no admin UI, no admin API).
+    ///
+    /// Use this when callbacks must be externally reachable but the admin
+    /// surface must remain private. See ADR-027 and docs/http-callbacks.md.
+    Serve {
+        /// Host to bind to
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
+        /// Port to listen on
+        #[arg(long, default_value = "4000")]
+        port: u16,
+        /// Maximum number of database connections
+        #[arg(long, default_value = "10", env = "AWA_POOL_MAX")]
+        pool_max: u32,
+        /// Minimum idle connections kept open
+        #[arg(long, default_value = "2", env = "AWA_POOL_MIN")]
+        pool_min: u32,
+        /// Seconds before an idle connection is closed
+        #[arg(long, default_value = "300", env = "AWA_POOL_IDLE_TIMEOUT")]
+        pool_idle_timeout: u64,
+        /// Maximum lifetime of a connection in seconds
+        #[arg(long, default_value = "1800", env = "AWA_POOL_MAX_LIFETIME")]
+        pool_max_lifetime: u64,
+        /// Seconds to wait when acquiring a connection
+        #[arg(long, default_value = "10", env = "AWA_POOL_ACQUIRE_TIMEOUT")]
+        pool_acquire_timeout: u64,
+        /// Hex-encoded 32-byte key used to verify callback signatures.
+        /// Required unless `--allow-unsigned` is set.
+        #[arg(long, env = "AWA_CALLBACK_HMAC_SECRET")]
+        callback_hmac_secret: Option<String>,
+        /// Path prefix the callback routes are mounted under. Defaults to
+        /// `/api/callbacks`, matching the built-in `awa serve` layout.
+        #[arg(
+            long,
+            default_value = "/api/callbacks",
+            env = "AWA_CALLBACK_PATH_PREFIX"
+        )]
+        path_prefix: String,
+        /// Accept inbound requests without `X-Awa-Signature` verification.
+        /// Only safe when the receiver is reachable from a trusted network
+        /// (mTLS at the load balancer, IP allow-list, private VPC, etc.).
+        /// Mutually exclusive with `--callback-hmac-secret`.
+        #[arg(long, env = "AWA_CALLBACK_ALLOW_UNSIGNED")]
+        allow_unsigned: bool,
+    },
 }
 
 fn parse_callback_hmac_secret(secret: &str) -> Result<[u8; 32], String> {
@@ -410,6 +464,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             axum::serve(listener, app).await?;
         }
 
+        // Callback-only receiver. See ADR-027 and docs/http-callbacks.md.
+        Commands::Callbacks {
+            command:
+                CallbackCommands::Serve {
+                    host,
+                    port,
+                    pool_max,
+                    pool_min,
+                    pool_idle_timeout,
+                    pool_max_lifetime,
+                    pool_acquire_timeout,
+                    callback_hmac_secret,
+                    path_prefix,
+                    allow_unsigned,
+                },
+        } => {
+            let auth = match (callback_hmac_secret.as_deref(), allow_unsigned) {
+                (Some(_), true) => {
+                    return Err(
+                        "--callback-hmac-secret and --allow-unsigned are mutually exclusive".into(),
+                    );
+                }
+                (Some(hex), false) => {
+                    let secret = parse_callback_hmac_secret(hex)
+                        .map_err(|err| format!("invalid callback secret: {err}"))?;
+                    awa_ui::callback_router::CallbackAuth::Signed(secret)
+                }
+                (None, true) => awa_ui::callback_router::CallbackAuth::Unsigned,
+                (None, false) => {
+                    return Err(
+                        "a callback signing secret is required by default; pass --callback-hmac-secret <hex32> or, for a trusted-network deployment, --allow-unsigned"
+                            .into(),
+                    );
+                }
+            };
+
+            let db_url = require_pool(&cli.database_url)?;
+            let pool = PgPoolOptions::new()
+                .max_connections(pool_max)
+                .min_connections(pool_min)
+                .idle_timeout(Duration::from_secs(pool_idle_timeout))
+                .max_lifetime(Duration::from_secs(pool_max_lifetime))
+                .acquire_timeout(Duration::from_secs(pool_acquire_timeout))
+                .connect(&db_url)
+                .await?;
+
+            let config = awa_ui::callback_router::CallbackReceiverConfig { auth, path_prefix };
+            let app = awa_ui::callback_router(pool, config).await?;
+            let addr = format!("{host}:{port}");
+            let listener = tokio::net::TcpListener::bind(&addr).await?;
+            if allow_unsigned {
+                tracing::warn!(
+                    "AWA callback receiver listening on http://{addr} (UNSIGNED — only safe on a trusted network)"
+                );
+            } else {
+                tracing::info!("AWA callback receiver listening on http://{addr}");
+            }
+            axum::serve(listener, app).await?;
+        }
+
         // Most remaining CLI commands are single-shot (one query, then exit)
         // so a small pool is sufficient. `storage prepare-queue-storage-schema`
         // is the exception: it acquires an advisory-lock connection and then
@@ -424,7 +538,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .await?;
 
             match command {
-                Commands::Migrate { .. } | Commands::Serve { .. } => unreachable!(),
+                Commands::Migrate { .. } | Commands::Serve { .. } | Commands::Callbacks { .. } => {
+                    unreachable!()
+                }
 
                 Commands::Job { command } => match command {
                     JobCommands::Dump { id } => {
