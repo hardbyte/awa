@@ -39,9 +39,16 @@ pub struct HttpWorkerConfig {
     /// signature as `X-Awa-Signature`.
     pub hmac_secret: Option<[u8; 32]>,
     /// Base URL for the callback endpoint. The full callback URL is
-    /// `{callback_base_url}/api/callbacks/{callback_id}/complete`.
+    /// `{callback_base_url}{callback_path_prefix}/{callback_id}/complete`.
     /// Required for async mode.
     pub callback_base_url: Option<String>,
+    /// Path prefix appended to `callback_base_url` when building the URL.
+    /// `None` uses [`awa_model::callback_contract::DEFAULT_CALLBACK_PATH_PREFIX`]
+    /// (`/api/callbacks`), matching the built-in `awa serve` route layout.
+    /// Set this to a custom value when the callback receiver is mounted at a
+    /// non-default path (e.g. a callback-only deployment or a user-owned API
+    /// layer — see ADR-027, #279, #281).
+    pub callback_path_prefix: Option<String>,
     /// HTTP request timeout for the initial POST to the function.
     /// Defaults to 30 seconds.
     pub request_timeout: Duration,
@@ -56,6 +63,7 @@ impl Default for HttpWorkerConfig {
             headers: HashMap::new(),
             hmac_secret: None,
             callback_base_url: None,
+            callback_path_prefix: None,
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -166,11 +174,12 @@ impl HttpWorker {
 
         // Build callback URL
         let callback_url = self.config.callback_base_url.as_ref().map(|base| {
-            format!(
-                "{}/api/callbacks/{}/complete",
-                base.trim_end_matches('/'),
-                callback_id_str
-            )
+            let prefix = self
+                .config
+                .callback_path_prefix
+                .as_deref()
+                .unwrap_or(callback_contract::DEFAULT_CALLBACK_PATH_PREFIX);
+            callback_contract::callback_url(base, prefix, &callback_id_str, "complete")
         });
 
         let body = HttpWorkerRequest {

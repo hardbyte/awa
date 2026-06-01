@@ -88,8 +88,35 @@ let client = Client::builder(pool)
 The runtime builds callback URLs as:
 
 ```text
-{callback_base_url}/api/callbacks/{callback_id}/complete
+{callback_base_url}{callback_path_prefix}/{callback_id}/complete
 ```
+
+`callback_path_prefix` defaults to `/api/callbacks`, which matches the
+built-in `awa serve` route layout. Override it when the callback receiver
+is mounted somewhere else — for example, a callback-only deployment behind
+a reverse proxy, or a user-owned API layer that hosts the routes inside
+a FastAPI / axum application (see [ADR-027](./adr/027-callback-ingress.md)):
+
+```rust
+let client = Client::builder(pool)
+    .http_worker("generate_pdf", HttpWorkerConfig {
+        url: "https://pdf-service.example.com/generate".into(),
+        mode: HttpWorkerMode::Async,
+        callback_base_url: Some("https://api.example.com".into()),
+        callback_path_prefix: Some("/awa-cb".into()),
+        ..Default::default()
+    })
+    /* ... */
+    .build()?;
+```
+
+That config produces URLs like
+`https://api.example.com/awa-cb/{callback_id}/complete`. Empty / missing
+leading slashes are normalized; trailing slashes are stripped.
+
+User-owned receivers should reuse [`awa::callback_contract::callback_url`]
+to build URLs and [`awa::callback_contract::verify`] to authenticate
+inbound requests so the wire contract cannot drift.
 
 ## Function request contract
 

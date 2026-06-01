@@ -34,6 +34,55 @@ pub const SIGNATURE_HEADER: &str = "X-Awa-Signature";
 /// heartbeat request omits `timeout_seconds`.
 pub const DEFAULT_HEARTBEAT_TIMEOUT_SECS: f64 = 3600.0;
 
+/// Path prefix used by `awa serve` and the built-in callback handler. The
+/// full URL of a callback action is
+/// `{callback_base_url}{prefix}/{callback_id}/{action}`.
+pub const DEFAULT_CALLBACK_PATH_PREFIX: &str = "/api/callbacks";
+
+/// Build the URL for a given callback action.
+///
+/// `base` is the externally-reachable URL of the receiver (e.g.
+/// `https://awa.example.com`). `prefix` is mounted under that base; an empty
+/// or whitespace-only prefix is permitted for receivers that expose the
+/// callback routes at the root. The output is normalized so callers cannot
+/// produce double slashes or accidentally drop the leading `/`:
+///
+/// - `base` has any trailing `/` stripped.
+/// - `prefix` is trimmed of surrounding whitespace and trailing `/`s; if it
+///   is non-empty and does not already start with `/`, one is prepended.
+/// - `action` is appended verbatim — pass `"complete"`, `"fail"`, or
+///   `"heartbeat"`.
+///
+/// ```
+/// # use awa_model::callback_contract::{callback_url, DEFAULT_CALLBACK_PATH_PREFIX};
+/// let url = callback_url(
+///     "https://awa.example.com",
+///     DEFAULT_CALLBACK_PATH_PREFIX,
+///     "550e8400-e29b-41d4-a716-446655440000",
+///     "complete",
+/// );
+/// assert_eq!(
+///     url,
+///     "https://awa.example.com/api/callbacks/550e8400-e29b-41d4-a716-446655440000/complete",
+/// );
+/// ```
+pub fn callback_url(base: &str, prefix: &str, callback_id: &str, action: &str) -> String {
+    let base = base.trim_end_matches('/');
+    let prefix = normalize_prefix(prefix);
+    format!("{base}{prefix}/{callback_id}/{action}")
+}
+
+fn normalize_prefix(prefix: &str) -> String {
+    let trimmed = prefix.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        String::new()
+    } else if trimmed.starts_with('/') {
+        trimmed.to_string()
+    } else {
+        format!("/{trimmed}")
+    }
+}
+
 /// Sign a callback id with the shared secret. Returns lowercase hex.
 pub fn sign(secret: &[u8; 32], callback_id: &str) -> String {
     blake3::keyed_hash(secret, callback_id.as_bytes())
@@ -131,5 +180,56 @@ mod tests {
         let payload: HeartbeatPayload =
             serde_json::from_str("{}").expect("empty object should deserialize");
         assert_eq!(payload.timeout_seconds, DEFAULT_HEARTBEAT_TIMEOUT_SECS);
+    }
+
+    #[test]
+    fn callback_url_default_path() {
+        let url = callback_url(
+            "https://awa.example.com",
+            DEFAULT_CALLBACK_PATH_PREFIX,
+            "abc",
+            "complete",
+        );
+        assert_eq!(url, "https://awa.example.com/api/callbacks/abc/complete");
+    }
+
+    #[test]
+    fn callback_url_custom_prefix() {
+        let url = callback_url("https://api.example.com", "/awa-cb", "abc", "fail");
+        assert_eq!(url, "https://api.example.com/awa-cb/abc/fail");
+    }
+
+    #[test]
+    fn callback_url_strips_trailing_slashes() {
+        let url = callback_url("https://api.example.com/", "/awa-cb/", "abc", "heartbeat");
+        assert_eq!(url, "https://api.example.com/awa-cb/abc/heartbeat");
+    }
+
+    #[test]
+    fn callback_url_normalizes_missing_leading_slash() {
+        let url = callback_url("https://api.example.com", "awa-cb", "abc", "complete");
+        assert_eq!(url, "https://api.example.com/awa-cb/abc/complete");
+    }
+
+    #[test]
+    fn callback_url_handles_empty_prefix() {
+        let url = callback_url("https://api.example.com", "", "abc", "complete");
+        assert_eq!(url, "https://api.example.com/abc/complete");
+        let url = callback_url("https://api.example.com", "   ", "abc", "complete");
+        assert_eq!(url, "https://api.example.com/abc/complete");
+    }
+
+    #[test]
+    fn callback_url_nested_prefix() {
+        let url = callback_url(
+            "https://api.example.com",
+            "/jobs/v1/callbacks",
+            "abc",
+            "complete",
+        );
+        assert_eq!(
+            url,
+            "https://api.example.com/jobs/v1/callbacks/abc/complete"
+        );
     }
 }
