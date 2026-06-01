@@ -6883,6 +6883,97 @@ impl QueueStorage {
         self.queue_counts_exact(pool, queue).await
     }
 
+    /// Index-only queue depth probe — for observability / depth-target
+    /// throttling. Returns the same shape as [`Self::queue_counts`] but
+    /// skips the table scans that [`Self::queue_counts_exact`] needs for
+    /// exact terminal accounting:
+    ///
+    /// - **available** is the same as the dispatcher's claim signal:
+    ///   `sum(GREATEST(enqueue_seq - claim_seq, 0))` over the shard
+    ///   head tables. No scan of `ready_entries`. This is an upper
+    ///   bound — the dispatcher closes the gap on its next claim
+    ///   attempt, but an admin DELETE of an unclaimed row leaves the
+    ///   head sequence ahead of the actual ready row count until that
+    ///   recovery branch runs. Acceptable for depth-target throttling
+    ///   and dashboards; not suitable for exact billing-style counts.
+    /// - **running** matches [`Self::queue_counts`]'s strict definition:
+    ///   `leases.state = 'running'` only. Receipt-plane claims that
+    ///   have not yet materialised a lease row are omitted (the
+    ///   exact path catches them via the `lease_claims` anti-join, but
+    ///   that anti-join is what this fast variant exists to avoid).
+    ///   `waiting_external` is *not* included — it's reported as part
+    ///   of admin's parked-callback view, not running.
+    /// - **completed** is read from the persisted
+    ///   `queue_terminal_rollups.pruned_completed_count` denormaliser.
+    ///   Rows currently in `done_entries` that have not yet rolled up
+    ///   are not included. Strictly a lower bound; converges to the
+    ///   exact count when rotation prunes the live `done_entries`
+    ///   segment.
+    ///
+    /// All three counters are O(num shards) lookups against small head
+    /// tables and `leases` index probes. Use this for high-cadence
+    /// pollers (admin dashboards, depth-target producers, soak
+    /// observability); use [`Self::queue_counts`] for admin tooling
+    /// that needs the exact terminal count.
+    #[tracing::instrument(skip(self, pool), fields(queue = %queue), name = "queue_storage.queue_counts_fast")]
+    pub async fn queue_counts_fast(
+        &self,
+        pool: &PgPool,
+        queue: &str,
+    ) -> Result<QueueCounts, AwaError> {
+        let schema = self.schema();
+        let queues = self.physical_queues_for_logical(queue);
+        // available: dispatcher signal — already an index-only sum over
+        // the (queue, priority, enqueue_shard) head tables.
+        let available = self.queue_claimer_signal(pool, queue).await?.available;
+        // running: leases.state = 'running' only, matching
+        // queue_counts_exact's strict definition. Receipt-plane claims
+        // that haven't materialised a lease row yet are documented as
+        // omitted in the method-level doc.
+        let running: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT COALESCE(count(*)::bigint, 0)
+            FROM {schema}.leases
+            WHERE queue = ANY($1)
+              AND state = 'running'
+            "#
+        ))
+        .bind(&queues)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        // completed: denormalised rollup only. Live (un-rolled-up)
+        // done_entries rows are excluded — see method-level docs.
+        let completed: i64 = sqlx::query_scalar(&format!(
+            r#"
+            SELECT COALESCE(sum(GREATEST(
+                COALESCE(lanes.pruned_completed_count, 0),
+                COALESCE(rollups.pruned_completed_count, 0)
+            )), 0)::bigint
+            FROM (
+                SELECT queue, priority, pruned_completed_count
+                FROM {schema}.queue_lanes
+                WHERE queue = ANY($1)
+            ) AS lanes
+            FULL OUTER JOIN (
+                SELECT queue, priority, pruned_completed_count
+                FROM {schema}.queue_terminal_rollups
+                WHERE queue = ANY($1)
+            ) AS rollups
+            USING (queue, priority)
+            "#
+        ))
+        .bind(&queues)
+        .fetch_one(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(QueueCounts {
+            available,
+            running,
+            completed,
+        })
+    }
+
     async fn retry_job_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
