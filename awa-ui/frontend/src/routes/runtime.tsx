@@ -79,8 +79,12 @@ export function RuntimePage() {
   // Once we've seen a null response the endpoint is known-absent for this
   // session — stop polling so we don't hammer it with 404s every interval.
   const storageQuery = useQuery<StorageStatusReport | null>({
-    queryKey: ["storage"],
-    queryFn: fetchStorage,
+    queryKey: ["storage", "with-history"],
+    // The card accumulates per-epoch backlog history client-side (Option
+    // A from issue #297). The `?history=true` query param is still set
+    // so the server-side contract is engaged — it makes future server
+    // ring-buffer rollouts a no-op for clients that already opted in.
+    queryFn: () => fetchStorage({ history: true }),
     refetchInterval: (query) =>
       query.state.data === null ? false : poll.interval,
     staleTime: poll.staleTime,

@@ -673,3 +673,88 @@ async fn test_storage_endpoint_returns_canonical_baseline_report() {
         "canonical baseline should list at least one finalize blocker"
     );
 }
+
+#[tokio::test]
+async fn test_storage_endpoint_omits_history_field_by_default() {
+    let _guard = runtime_api_test_guard().await;
+    let pool = setup_pool().await;
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/storage")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("storage request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+
+    // The optional `history` field is skipped when serialized so legacy
+    // clients (that don't pass ?history=true) see byte-for-byte the same
+    // wire shape they did before this change landed.
+    let payload: Value = serde_json::from_slice(&body).expect("payload should deserialize");
+    assert!(
+        payload.get("history").is_none(),
+        "history field must be absent when ?history=true is not requested: {payload:?}"
+    );
+
+    // And the existing typed shape still deserializes unchanged.
+    let report: StorageStatusReport =
+        serde_json::from_slice(&body).expect("storage report should deserialize");
+    assert!(report.history.is_none());
+}
+
+#[tokio::test]
+async fn test_storage_endpoint_returns_history_field_when_requested() {
+    let _guard = runtime_api_test_guard().await;
+    let pool = setup_pool().await;
+    let app = awa_ui::router(pool.clone(), std::time::Duration::ZERO)
+        .await
+        .expect("router should initialize");
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/storage?history=true")
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("storage request should succeed");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("response body should read");
+
+    // history is present and an array. In the 0.6 server this is always
+    // empty (samples are accumulated client-side, no audit table per
+    // #180). The field exists so a future server-side ring buffer can
+    // populate it without changing the wire contract.
+    let payload: Value = serde_json::from_slice(&body).expect("payload should deserialize");
+    let history = payload
+        .get("history")
+        .expect("history field should be present when ?history=true");
+    let samples = history
+        .as_array()
+        .expect("history should be an array of samples");
+    assert!(
+        samples.is_empty(),
+        "0.6 server should not accumulate samples server-side: {samples:?}"
+    );
+
+    // The rest of the payload should still match the schema clients
+    // already speak — additive-only contract.
+    let report: StorageStatusReport =
+        serde_json::from_slice(&body).expect("storage report should deserialize");
+    assert!(report.history.is_some());
+    assert!(report.history.as_ref().unwrap().is_empty());
+}

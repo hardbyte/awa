@@ -1,5 +1,6 @@
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::Json;
+use serde::Deserialize;
 
 use awa_model::admin;
 use awa_model::storage;
@@ -7,6 +8,20 @@ use awa_model::storage;
 use crate::cache::CacheError;
 use crate::error::ApiError;
 use crate::state::AppState;
+
+/// Query parameters accepted by `GET /api/storage`.
+///
+/// `history=true` opts in to the epoch-anchored backlog history field on
+/// the response. The 0.6 server has no persistent store for these samples
+/// (see #180), so the field is currently an empty slice — clients
+/// accumulate samples themselves, keyed by `transition_epoch`. The query
+/// param exists so the contract is stable for future versions that may
+/// add a server-side ring buffer without changing the API shape.
+#[derive(Debug, Default, Deserialize)]
+pub struct StorageQuery {
+    #[serde(default)]
+    pub history: bool,
+}
 
 pub async fn get_runtime(
     State(state): State<AppState>,
@@ -42,9 +57,10 @@ pub async fn list_queue_runtime(
 
 pub async fn get_storage(
     State(state): State<AppState>,
+    Query(query): Query<StorageQuery>,
 ) -> Result<Json<storage::StorageStatusReport>, ApiError> {
     let pool = state.pool.clone();
-    let report = state
+    let mut report = state
         .cache
         .storage
         .try_get_with((), async {
@@ -53,5 +69,12 @@ pub async fn get_storage(
                 .map_err(CacheError::from)
         })
         .await?;
+    if query.history {
+        // Per #180 (rejected new audit table) the 0.6 server doesn't
+        // accumulate samples. We still return the field — as an empty
+        // vector — so clients can rely on its presence to detect the
+        // contract and start their own client-side accumulation.
+        report.history = Some(Vec::new());
+    }
     Ok(Json(report))
 }
