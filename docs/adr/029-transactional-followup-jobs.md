@@ -345,7 +345,7 @@ positioning (ADR-001). Out of scope.
 - **Builder API.** Each outcome has a pair of builders:
   `on_<outcome>_enqueue` (closure returns `JobArgs`) and
   `on_<outcome>_enqueue_with` (closure returns
-  [`EnqueueRequest<F>`](#enqueuerequest) for `InsertOpts` overrides —
+  `EnqueueRequest<F>` for `InsertOpts` overrides —
   queue, priority, max_attempts, metadata, tags, unique, run_at,
   deadline_duration, ordering_key).
 - **Closure signatures** carry the per-outcome context:
