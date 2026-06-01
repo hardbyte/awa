@@ -350,18 +350,16 @@ impl ClientBuilder {
     ///
     /// # Atomicity
     ///
-    /// When the trigger completes from the worker handler (`Ok(Completed)`),
-    /// the follow-up `INSERT`s in the *same database transaction* as the
-    /// completion's state change, so the trigger and the follow-up commit
-    /// or roll back together (ADR-029, ADR-013 run-lease guard).
-    ///
-    /// When the trigger completes via callback resolution
-    /// ([`Client::complete_external`], [`Client::resolve_callback`] with a
-    /// `Complete` action), the follow-up dispatch runs in a *separate*
-    /// transaction *after* the resolution commits — a spec INSERT failure
-    /// leaves the job resolved without a follow-up (logged at error
-    /// level). Don't predicate a workflow on a callback-driven follow-up
-    /// landing.
+    /// Whether the trigger completes from the worker handler
+    /// (`Ok(Completed)`) or via callback resolution
+    /// ([`Client::complete_external`], [`Client::resolve_callback`] with
+    /// a `Complete` action), the follow-up `INSERT`s in the *same
+    /// database transaction* as the completion's state change. The
+    /// trigger and the follow-up commit or roll back together (ADR-029,
+    /// ADR-013 run-lease guard). A spec INSERT failure or a panic in
+    /// this closure rolls the completion back as well, so a failed
+    /// callback can be redelivered by the external sender rather than
+    /// leaving the job half-applied.
     ///
     /// This is the durable counterpart to [`Self::on_event`]: hooks are
     /// best-effort, in-process; this enqueue is at-least-once and rides
@@ -413,9 +411,10 @@ impl ClientBuilder {
     /// string, the previous attempt number, and the next-run-at timestamp.
     ///
     /// Atomicity matches [`Self::on_completed_enqueue`]: worker-driven
-    /// retries dispatch in the transition's transaction; a retry driven by
-    /// [`Client::retry_external`] or [`Client::resolve_callback`] dispatches
-    /// in a separate transaction (best-effort) after the resolution commits.
+    /// retries dispatch in the transition's transaction, and a retry
+    /// driven by [`Client::retry_external`] dispatches in the same
+    /// transaction as the resolution. A spec failure rolls the retry
+    /// transition back so the external sender can redeliver.
     pub fn on_retried_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -468,10 +467,11 @@ impl ClientBuilder {
     /// error string, and the attempt number.
     ///
     /// Atomicity matches [`Self::on_completed_enqueue`]: worker-driven
-    /// exhaustion dispatches in the transition's transaction; an
+    /// exhaustion dispatches in the transition's transaction, and an
     /// exhaustion driven by [`Client::fail_external`] or
-    /// [`Client::resolve_callback`] with a `Fail` action dispatches in a
-    /// separate transaction (best-effort) after the resolution commits.
+    /// [`Client::resolve_callback`] with a `Fail` action dispatches in
+    /// the same transaction as the resolution. A spec failure rolls the
+    /// failure transition back so the external sender can redeliver.
     pub fn on_exhausted_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
     where
         T: JobArgs + DeserializeOwned + Send + Sync + 'static,
@@ -1719,15 +1719,23 @@ impl Client {
         &self.pool
     }
 
-    /// Resolve a pending external callback, then dispatch the matching
-    /// lifecycle event to this client's registered hooks.
+    /// Resolve a pending external callback and dispatch the matching
+    /// lifecycle event + ADR-029 follow-up specs.
     ///
-    /// Prefer this over [`awa_model::admin::resolve_callback`] when you want
-    /// `Completed`/`Exhausted` hooks to fire for callback-driven outcomes.
-    /// Hooks fire only in this process; resolving through the bare `admin`
-    /// function transitions the job correctly but emits no event. A `resume`
-    /// or `ignore` outcome emits nothing — the job either re-enters execution
-    /// (and the executor emits the usual events) or nothing changed.
+    /// The callback transition (Complete / Fail) and any registered
+    /// `on_completed_enqueue` / `on_exhausted_enqueue` follow-up `INSERT`s
+    /// commit in a single transaction. A follow-up `INSERT` failure (or a
+    /// panic in the user-supplied closure) rolls the callback transition
+    /// back; the caller sees an `Err` and can surface a retryable failure
+    /// to the external sender so the callback can be redelivered. `Ignored`
+    /// produces no transition; `Resumed` does not currently fire a
+    /// follow-up spec because resume re-enters execution and the executor
+    /// emits the eventual outcome event itself.
+    ///
+    /// Prefer this over [`awa_model::admin::resolve_callback`] when you
+    /// want `Completed`/`Exhausted` hooks or follow-up enqueues to fire
+    /// for callback-driven outcomes. Hooks fire only in this process and
+    /// only after the transaction commits.
     pub async fn resolve_callback(
         &self,
         callback_id: Uuid,
@@ -1735,64 +1743,76 @@ impl Client {
         default_action: awa_model::DefaultAction,
         run_lease: Option<i64>,
     ) -> Result<awa_model::ResolveOutcome, awa_model::AwaError> {
+        let mut tx = self.pool.begin().await?;
         let outcome =
-            admin::resolve_callback(&self.pool, callback_id, payload, default_action, run_lease)
+            admin::resolve_callback_in_tx(&mut tx, callback_id, payload, default_action, run_lease)
                 .await?;
+        // ADR-029: dispatch follow-up specs in the same transaction. A
+        // spec failure rolls the transition back together with the
+        // follow-up, so callers can retry the external callback rather
+        // than discovering a half-applied result.
         let event = match &outcome {
-            awa_model::ResolveOutcome::Completed { job, .. } => Some(UntypedJobEvent::Completed {
-                job: job.clone(),
-                duration: Duration::ZERO,
-            }),
-            awa_model::ResolveOutcome::Failed { job } => Some(UntypedJobEvent::Exhausted {
-                job: job.clone(),
-                error: latest_error_message(job),
-                attempt: job.attempt,
-            }),
-            awa_model::ResolveOutcome::Ignored { .. } => None,
-        };
-        // ADR-029 best-effort: dispatch follow-up specs in a separate tx
-        // *after* the resolution commits. See `dispatch_callback_followups`
-        // for the atomicity caveat. Resolution is the source of truth; if a
-        // spec INSERT fails we still consider the resolution successful.
-        match &outcome {
             awa_model::ResolveOutcome::Completed { job, .. } => {
-                self.dispatch_callback_followups(
+                self.dispatch_callback_followups_in_tx(
+                    &mut tx,
                     job,
                     crate::enqueue_specs::Outcome::Completed,
                     None,
                 )
-                .await;
+                .await?;
+                Some(UntypedJobEvent::Completed {
+                    job: job.clone(),
+                    duration: Duration::ZERO,
+                })
             }
             awa_model::ResolveOutcome::Failed { job } => {
                 let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
                     error: latest_error_message(job),
                     attempt: job.attempt,
                 };
-                self.dispatch_callback_followups(
+                self.dispatch_callback_followups_in_tx(
+                    &mut tx,
                     job,
                     crate::enqueue_specs::Outcome::Exhausted,
                     Some(outcome_ctx),
                 )
-                .await;
+                .await?;
+                Some(UntypedJobEvent::Exhausted {
+                    job: job.clone(),
+                    error: latest_error_message(job),
+                    attempt: job.attempt,
+                })
             }
-            awa_model::ResolveOutcome::Ignored { .. } => {}
-        }
+            awa_model::ResolveOutcome::Ignored { .. } => None,
+        };
+        tx.commit().await?;
         if let Some(event) = event {
             self.dispatch_callback_event(event).await;
         }
         Ok(outcome)
     }
 
-    /// Complete a waiting job via its callback and dispatch a `Completed` hook.
+    /// Complete a waiting job via its callback. The callback completion
+    /// and any registered `on_completed_enqueue` follow-up `INSERT`s
+    /// commit atomically. A spec INSERT failure rolls the completion
+    /// back and returns `Err` so the external sender can retry. The
+    /// in-process `Completed` hook fires after the transaction commits.
     pub async fn complete_external(
         &self,
         callback_id: Uuid,
         payload: Option<serde_json::Value>,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let job = admin::complete_external(&self.pool, callback_id, payload, run_lease).await?;
-        self.dispatch_callback_followups(&job, crate::enqueue_specs::Outcome::Completed, None)
-            .await;
+        let mut tx = self.pool.begin().await?;
+        let job = admin::complete_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
+        self.dispatch_callback_followups_in_tx(
+            &mut tx,
+            &job,
+            crate::enqueue_specs::Outcome::Completed,
+            None,
+        )
+        .await?;
+        tx.commit().await?;
         self.dispatch_callback_event(UntypedJobEvent::Completed {
             job: job.clone(),
             duration: Duration::ZERO,
@@ -1801,24 +1821,31 @@ impl Client {
         Ok(job)
     }
 
-    /// Fail a waiting job via its callback and dispatch an `Exhausted` hook.
+    /// Fail a waiting job via its callback. The callback failure and any
+    /// registered `on_exhausted_enqueue` follow-up `INSERT`s commit
+    /// atomically. A spec INSERT failure rolls the failure back and
+    /// returns `Err` so the external sender can retry. The in-process
+    /// `Exhausted` hook fires after the transaction commits.
     pub async fn fail_external(
         &self,
         callback_id: Uuid,
         error: &str,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
-        let job = admin::fail_external(&self.pool, callback_id, error, run_lease).await?;
+        let mut tx = self.pool.begin().await?;
+        let job = admin::fail_external_in_tx(&mut tx, callback_id, error, run_lease).await?;
         let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
             error: error.to_string(),
             attempt: job.attempt,
         };
-        self.dispatch_callback_followups(
+        self.dispatch_callback_followups_in_tx(
+            &mut tx,
             &job,
             crate::enqueue_specs::Outcome::Exhausted,
             Some(outcome_ctx),
         )
-        .await;
+        .await?;
+        tx.commit().await?;
         self.dispatch_callback_event(UntypedJobEvent::Exhausted {
             job: job.clone(),
             error: error.to_string(),
@@ -1828,19 +1855,26 @@ impl Client {
         Ok(job)
     }
 
-    /// Requeue a waiting job via its callback and dispatch a `Retried` hook.
+    /// Requeue a waiting job via its callback. The callback retry and
+    /// any registered `on_retried_enqueue` follow-up `INSERT`s commit
+    /// atomically. A spec INSERT failure rolls the retry back and
+    /// returns `Err` so the external sender can retry. The in-process
+    /// `Retried` hook fires after the transaction commits.
     ///
-    /// `admin::retry_external` resets `attempt` to 0 as part of requeuing the
-    /// job from scratch, so the returned `JobRow` no longer reflects the
-    /// attempt that was being retried. Capture the parked attempt first so
-    /// the `Retried` event reports the failed-attempt number — matching the
-    /// inline `Retried` semantics, where `attempt` is "the attempt that was
-    /// retried", not the post-transition value.
+    /// `admin::retry_external_in_tx` resets `attempt` to 0 as part of
+    /// requeuing the job from scratch, so the returned `JobRow` no
+    /// longer reflects the attempt that was being retried. The pre-retry
+    /// attempt number is captured under the same row lock before the
+    /// transition runs so the `Retried` event and spec context report
+    /// the failed-attempt number — matching the inline `Retried`
+    /// semantics where `attempt` is "the attempt that was retried", not
+    /// the post-transition value.
     pub async fn retry_external(
         &self,
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
+        let mut tx = self.pool.begin().await?;
         let parked_attempt: Option<i16> = sqlx::query_scalar(
             "SELECT attempt FROM awa.jobs \
              WHERE callback_id = $1 AND state = 'waiting_external' \
@@ -1848,10 +1882,10 @@ impl Client {
         )
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
 
-        let job = admin::retry_external(&self.pool, callback_id, run_lease).await?;
+        let job = admin::retry_external_in_tx(&mut tx, callback_id, run_lease).await?;
         let attempt = parked_attempt.unwrap_or(job.attempt);
         let error_msg = latest_error_message(&job);
         let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
@@ -1859,12 +1893,14 @@ impl Client {
             attempt,
             next_run_at: job.run_at,
         };
-        self.dispatch_callback_followups(
+        self.dispatch_callback_followups_in_tx(
+            &mut tx,
             &job,
             crate::enqueue_specs::Outcome::Retried,
             Some(outcome_ctx),
         )
-        .await;
+        .await?;
+        tx.commit().await?;
         self.dispatch_callback_event(UntypedJobEvent::Retried {
             job: job.clone(),
             error: error_msg,
@@ -1880,76 +1916,31 @@ impl Client {
         crate::executor::dispatch_lifecycle_event(&self.lifecycle_handlers, &kind, event).await;
     }
 
-    /// ADR-029 callback-resolution follow-up dispatch.
-    ///
-    /// **Atomicity caveat:** unlike worker-driven outcomes which dispatch
-    /// specs in the same transaction as the state transition, callback
-    /// resolution dispatches follow-ups in a *separate* transaction after
-    /// the resolution has already committed. If a spec INSERT fails (DB
-    /// disconnect, constraint violation, deserialisation error), the job
-    /// is still resolved but the follow-up is *not* enqueued — the error
-    /// is logged and the caller's `Result` remains `Ok`.
-    ///
-    /// Fully atomic callback resolution + follow-up enqueue requires
-    /// tx-aware admin variants (`complete_external_in_tx`, etc.) on both
-    /// canonical and queue-storage paths; tracked as a follow-up.
-    async fn dispatch_callback_followups(
+    /// ADR-029 callback-resolution follow-up dispatch inside the
+    /// caller-owned transaction. Errors (including caught panics from
+    /// user-supplied `make` closures) propagate out so the caller can
+    /// roll the callback transition back together with the failed
+    /// follow-up; the external sender then sees a retryable failure
+    /// rather than a half-applied result.
+    async fn dispatch_callback_followups_in_tx(
         &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         job: &awa_model::JobRow,
         outcome: crate::enqueue_specs::Outcome,
         outcome_context: Option<crate::enqueue_specs::OutcomeContext>,
-    ) {
+    ) -> Result<(), awa_model::AwaError> {
         let Some(specs) = self
             .enqueue_specs
             .get(&outcome)
             .and_then(|by_kind| by_kind.get(&job.kind))
             .cloned()
         else {
-            return;
+            return Ok(());
         };
         if specs.is_empty() {
-            return;
+            return Ok(());
         }
-        let mut tx = match self.pool.begin().await {
-            Ok(tx) => tx,
-            Err(err) => {
-                tracing::error!(
-                    job_id = job.id,
-                    kind = %job.kind,
-                    error = %err,
-                    "callback follow-up dispatch: failed to begin transaction"
-                );
-                return;
-            }
-        };
-        let dispatch_result = crate::enqueue_specs::dispatch_specs_in_tx(
-            &mut tx,
-            job,
-            &specs,
-            outcome_context.as_ref(),
-        )
-        .await;
-        match dispatch_result {
-            Ok(()) => {
-                if let Err(err) = tx.commit().await {
-                    tracing::error!(
-                        job_id = job.id,
-                        kind = %job.kind,
-                        error = %err,
-                        "callback follow-up dispatch: commit failed"
-                    );
-                }
-            }
-            Err(err) => {
-                tracing::error!(
-                    job_id = job.id,
-                    kind = %job.kind,
-                    error = %err,
-                    "callback follow-up dispatch: spec INSERT failed; rolling back"
-                );
-                let _ = tx.rollback().await;
-            }
-        }
+        crate::enqueue_specs::dispatch_specs_in_tx(tx, job, &specs, outcome_context.as_ref()).await
     }
 
     /// Health check.

@@ -1,14 +1,16 @@
 //! Transactional follow-up enqueue specs (ADR-029).
 //!
 //! A spec is a per-(outcome, kind) registration that fires when its
-//! triggering state transition commits. Worker-driven outcomes dispatch
-//! the follow-up `INSERT` in the same transaction as the state UPDATE
-//! (atomic with the trigger). Callback-resolution and maintenance-rescue
-//! outcomes dispatch in a separate transaction after the trigger
-//! transaction commits (best-effort — a failed `INSERT` is logged and
-//! the trigger stands). Either way, once the follow-up `INSERT` commits
-//! the row is a regular Awa job: at-least-once, retried, DLQ-aware,
-//! visible to admin tooling.
+//! triggering state transition commits. Worker-driven outcomes and
+//! callback resolution via the worker `Client::*_external` APIs
+//! dispatch the follow-up `INSERT` in the same transaction as the
+//! state UPDATE (atomic with the trigger — a spec failure rolls the
+//! trigger back so the caller / external sender can retry). Maintenance
+//! rescue dispatches in a separate transaction after the rescue
+//! commits (best-effort — a failed `INSERT` is logged and the rescue
+//! stands). Either way, once the follow-up `INSERT` commits the row is
+//! a regular Awa job: at-least-once, retried, DLQ-aware, visible to
+//! admin tooling.
 //!
 //! Specs are type-erased here so the executor can dispatch them without
 //! knowing the trigger or follow-up types statically. The user-facing

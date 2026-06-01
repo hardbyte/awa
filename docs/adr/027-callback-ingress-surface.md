@@ -155,16 +155,24 @@ layers to expose framework-native routes without reverse-proxy rewriting.
 Callback ingress resolves callback state. It must not assume a co-located
 `Client` runtime or local in-process lifecycle hook registry.
 
-Durable side effects triggered by callback resolution are delivered through
-the transactional follow-up enqueue mechanism in ADR-029. The callback
-receiver dispatches the follow-up `INSERT` best-effort in a separate
-transaction after the resolution commits — a `INSERT` failure leaves the
-job resolved without the follow-up (logged); fully atomic
-resolution-plus-enqueue is tracked as an open extension in ADR-029.
-Once the follow-up commits an ordinary worker (anywhere) picks it up.
-The callback receiver does not invoke process-local hooks directly;
-observation-only hooks (ADR-015) continue to fire only in processes
-that perform the resolution themselves via the worker `Client`.
+Durable side effects triggered by callback resolution are delivered
+through the transactional follow-up enqueue mechanism in ADR-029. A
+worker `Client` performing the resolution (the in-process worker
+case) commits the callback transition and the follow-up `INSERT` in a
+single transaction via the `admin::*_external_in_tx` /
+`store::*_external_in_tx` helpers — an INSERT failure rolls the
+transition back, so the external sender can retry. Once the follow-up
+commits an ordinary worker (anywhere) picks it up.
+
+A callback-only ingress process (this ADR) does not yet own a worker
+registry, so it cannot dispatch user follow-up specs itself. When the
+callback-only surface lands, reusing the same `_in_tx` admin helpers
+plus a router-side registry hookup will give it the same atomic
+contract; until then, callback-only ingress runs the transition
+without follow-up dispatch. The callback receiver does not invoke
+process-local hooks directly; observation-only hooks (ADR-015)
+continue to fire only in processes that perform the resolution
+themselves via the worker `Client`.
 
 ## Consequences
 

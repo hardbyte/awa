@@ -2,10 +2,10 @@
 
 ## Status
 
-Accepted. Worker-driven outcomes commit follow-ups atomically with the
-state transition; callback-resolution and maintenance-rescue paths
-dispatch follow-ups best-effort in a separate transaction (see
-[Atomicity matrix](#atomicity-matrix)).
+Accepted. Worker-driven outcomes and callback resolution via the worker
+`Client` commit follow-ups atomically with the state transition;
+maintenance rescue dispatches follow-ups best-effort in a separate
+transaction (see [Atomicity matrix](#atomicity-matrix)).
 
 ## Context
 
@@ -95,15 +95,16 @@ Client::builder(pool)
 ```
 
 The closure returns a follow-up `JobArgs` value (default `InsertOpts`) or
-an `EnqueueRequest<F>` with `InsertOpts` overrides. When the trigger is a
-worker-driven outcome the engine `INSERT`s the follow-up in the same
-transaction as the state `UPDATE`; the follow-up commits with the
-trigger or rolls back with it. For callback resolution and maintenance
-rescue the engine `INSERT`s the follow-up in a separate transaction
-opened *after* the trigger transaction commits (see
-[Atomicity matrix](#atomicity-matrix)). In either case, once the
-follow-up `INSERT` commits the row is durably visible and rides Awa's
-existing retry / DLQ machinery.
+an `EnqueueRequest<F>` with `InsertOpts` overrides. For worker-driven
+outcomes and callback resolution via the worker `Client`, the engine
+`INSERT`s the follow-up in the same transaction as the triggering state
+change; the follow-up commits with the trigger or rolls back with it
+(a spec INSERT failure or a panic in the user-supplied closure rolls the
+trigger transition back as well). For maintenance rescue the engine
+`INSERT`s the follow-up in a separate transaction opened *after* the
+rescue commits (see [Atomicity matrix](#atomicity-matrix)). In either
+case, once the follow-up `INSERT` commits the row is durably visible and
+rides Awa's existing retry / DLQ machinery.
 
 Counterparts cover the outcomes that benefit most from durable delivery:
 `on_completed_enqueue`, `on_retried_enqueue`, `on_exhausted_enqueue`,
@@ -121,16 +122,18 @@ transition:
 | Transition | Performed by | Follow-up enqueued by | Atomic? |
 |---|---|---|---|
 | Inline outcomes (Completed, Retried, Exhausted, Cancelled, WaitingForCallback) | Worker executor | Worker executor, in the finalization transaction | yes |
-| Callback resolution via worker `Client` | The resolving process | That process, in a separate transaction after the resolution commits | no — best-effort |
-| Callback resolution via callback-only ingress (ADR-027) | Callback receiver | Same as worker `Client` resolution: best-effort separate transaction | no — best-effort |
+| Callback resolution via worker `Client` | The resolving process | That process, in the resolution transaction (via `admin::*_external_in_tx` / `store::*_external_in_tx`) | yes |
+| Callback resolution via callback-only ingress (ADR-027) | Callback receiver | Pending: callback-only ingress does not yet own a worker registry. When that surface lands it can reuse the same `_in_tx` admin / store helpers used by the worker `Client`. | pending |
 | Expired-callback / stale-heartbeat / deadline rescue (ADR-028) | Maintenance runtime | Maintenance runtime, in a separate transaction after the rescue commits | no — best-effort |
 
-The atomicity asymmetry is deliberate: worker-driven outcomes inherit
-ADR-013's run-lease guard (zero rows matched → tx rollback → no
-follow-up). Tx-aware variants on every `admin::*` and rescue path are
-mechanically straightforward but invasive, so the best-effort path is
-accepted: the trigger has already committed, so the worst case is a
-missing follow-up — not a phantom follow-up. See
+Why rescue stays best-effort: a panic in a user-supplied
+`on_rescued_enqueue` closure would otherwise roll the rescue UPDATE
+back, coupling rescue liveness (the maintenance loop's job recovery
+guarantee) to the correctness of user follow-up code. A zero-loss
+rescue-notification story is better served by an outbox/sweeper than
+by inlining user code into the rescue tx. The current best-effort
+behaviour means the trigger has already committed, so the worst case
+is a missing follow-up — not a phantom follow-up. See
 [Atomicity matrix](#atomicity-matrix) for the call sites involved.
 
 ### Registry lives in process — for now
@@ -391,13 +394,21 @@ so the worst case is a missing follow-up — not a phantom follow-up.
   Python, invokes the callable, and decodes the returned dict to
   (`JobArgs`, `InsertOpts`) before the underlying `insert_with` fires.
   ADR-015's hook surface (`@on_event`) needs the same scaffold first.
-- **Atomic callback-resolution + follow-up enqueue.** Requires
-  `admin::{complete,fail,retry,resume}_external_in_tx` and matching
-  queue-storage store methods so `Client::*_external` can drive the
-  resolution and the spec dispatch in a single tx.
-- **Atomic rescue + follow-up enqueue.** Threads `&mut tx` through
-  `maintenance::rescue_*` so the rescue UPDATE and the Rescued spec
-  dispatch commit together.
+- **Atomic callback-resolution for callback-only ingress (ADR-027).**
+  The worker `Client::*_external` paths now drive the resolution and
+  spec dispatch in a single tx via `admin::*_external_in_tx` and the
+  matching `store::*_external_in_tx` helpers. The callback-only
+  ingress process landed by ADR-027 will need its own registry hookup
+  to reuse the same `_in_tx` admin path; until then, callback ingress
+  outside the worker `Client` remains a separate transition with no
+  follow-up dispatch.
+- **Atomic rescue + follow-up enqueue: deliberately not pursued.**
+  Threading `&mut tx` through `maintenance::rescue_*` would couple
+  rescue liveness to the correctness of user follow-up code — a panic
+  in `on_rescued_enqueue` could roll back a rescue UPDATE and prevent
+  maintenance from recovering stale jobs. A future zero-loss
+  rescue-notification design should use an outbox/sweeper rather than
+  inlining user code into the rescue tx.
 - **`on_started_enqueue`.** Not blocked by the design; deliberately
   out of scope to keep the claim/dispatch hot path uncontended. The
   observation use case is already covered by `on_event`.

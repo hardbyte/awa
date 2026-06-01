@@ -116,14 +116,14 @@ section for the durable mechanism.
 For side effects that **must survive a process crash** — sending a welcome
 email after signup, kicking off downstream work, persisting an audit row —
 use the transactional follow-up API instead of an `on_event` hook. For
-worker-driven outcomes (the trigger handler returned `Ok`/`Err`) the
+worker-driven outcomes (the trigger handler returned `Ok`/`Err`) and
+for callback resolution via the worker `Client::*_external` APIs, the
 follow-up `INSERT`s in the **same database transaction** as the
-triggering state transition, so the follow-up either lands or the
-transition rolls back; there is no in-between. Callback resolution
-(`Client::*_external`) and maintenance rescue dispatch follow-ups in a
-**separate transaction** (best-effort) — see the [atomicity table
+triggering state transition: either both commit or both roll back, with
+no in-between. Maintenance rescue dispatches follow-ups in a **separate
+transaction** (best-effort) — see the [atomicity table
 below](#atomicity-guarantees) before designing a workflow that depends
-on rescue-driven or callback-driven follow-ups landing.
+on rescue-driven follow-ups landing.
 
 ```rust
 use awa::{Client, EnqueueRequest, QueueConfig};
@@ -169,17 +169,20 @@ deadline_duration, ordering_key):
 | Emission site | Atomic with state commit? |
 |---|---|
 | Worker-driven outcomes (handler returns `Ok`/`Err`) on either storage engine | **yes** — one transaction, one commit |
-| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) | **no — best-effort.** The resolution commits first, then specs dispatch in a separate tx. If the spec INSERT fails the job remains resolved and the error is logged. |
-| Maintenance rescue (stale heartbeat / deadline / expired callback) | **no — best-effort**, same shape and caveat |
+| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) on either storage engine | **yes** — one transaction, one commit. A spec INSERT failure (or a panic in the user-supplied closure) rolls the callback transition back together with the follow-up; `Client::*_external` returns `Err` and the external sender can retry. |
+| Maintenance rescue (stale heartbeat / deadline / expired callback) | **no — best-effort.** The rescue commits first, then specs dispatch in a separate tx. A spec failure leaves the rescue applied and is logged. |
 
-The asymmetry is deliberate: the worker-driven path inherits ADR-013's
-run-lease guard (stale outcome → tx rolls back → no follow-up). The
-trigger transition and the follow-up `INSERT` either both commit or
-neither does — exactly-once *enqueue* per committed worker outcome.
-The follow-up itself, once enqueued, is delivered with Awa's usual
-at-least-once semantics, so the follow-up handler still needs to be
-safe under re-execution. The callback-resolution and maintenance paths
-are tracked for a future tx-aware variant.
+The trigger transition and the follow-up `INSERT` either both commit
+or neither does — exactly-once *enqueue* per committed worker outcome
+or callback resolution. The follow-up itself, once enqueued, is
+delivered with Awa's usual at-least-once semantics, so the follow-up
+handler still needs to be safe under re-execution.
+
+Rescue stays best-effort by design: making it atomic would couple
+rescue liveness to the correctness of user follow-up code (a panic in
+`on_rescued_enqueue` would roll back a stale-heartbeat rescue and
+leave the job stuck in `running`). Zero-loss rescue notifications
+belong in an outbox/sweeper, not inlined into the rescue tx.
 
 ### When to choose which API
 
