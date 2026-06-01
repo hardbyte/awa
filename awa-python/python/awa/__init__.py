@@ -43,6 +43,7 @@ from awa._awa import (
 )
 
 from awa.client import AsyncClient, Client
+from awa import callback_contract
 
 __all__ = [
     # Clients
@@ -86,4 +87,6 @@ __all__ = [
     "TerminalError",
     "DatabaseError",
     "CallbackNotFound",
+    # Callback receiver contract (for user-owned API layers)
+    "callback_contract",
 ]
