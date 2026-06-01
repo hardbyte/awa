@@ -4,6 +4,8 @@ use chrono::{DateTime, Utc};
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
 
+mod storage_wait;
+
 #[derive(Parser)]
 #[command(
     name = "awa",
@@ -258,7 +260,19 @@ enum StorageCommands {
     /// Enter mixed transition and begin routing new writes to the prepared engine
     EnterMixedTransition,
     /// Finalize the storage transition once drain and capability gates pass
-    Finalize,
+    Finalize {
+        /// Dry-run: print the readiness report and exit. Exits 0 when
+        /// ready to finalize, exits 2 when one or more blockers remain.
+        /// No SQL state change.
+        #[arg(long, conflicts_with = "wait")]
+        check: bool,
+        /// Poll the readiness gates until they stay clear for a few
+        /// consecutive checks, then invoke finalize. Optional duration
+        /// cap (e.g. `10m`, `2h30m`, `90s`). Without a value, waits
+        /// indefinitely. Polls every 5s by default.
+        #[arg(long, value_name = "DURATION", num_args = 0..=1, default_missing_value = "")]
+        wait: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -755,10 +769,60 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let report = awa_model::storage::status_report(&pool).await?;
                         println!("{}", serde_json::to_string_pretty(&report)?);
                     }
-                    StorageCommands::Finalize => {
-                        awa_model::storage::finalize(&pool).await?;
-                        let report = awa_model::storage::status_report(&pool).await?;
-                        println!("{}", serde_json::to_string_pretty(&report)?);
+                    StorageCommands::Finalize { check, wait } => {
+                        if check {
+                            // Dry-run: print the same readiness report as
+                            // `awa storage status` plus a concise blocker
+                            // summary, and exit non-zero (2) if blocked.
+                            let report = awa_model::storage::status_report(&pool).await?;
+                            println!("{}", serde_json::to_string_pretty(&report)?);
+                            if report.can_finalize {
+                                eprintln!("storage finalize: ready");
+                            } else {
+                                eprintln!(
+                                    "storage finalize: blocked ({} blocker{})",
+                                    report.finalize_blockers.len(),
+                                    if report.finalize_blockers.len() == 1 {
+                                        ""
+                                    } else {
+                                        "s"
+                                    }
+                                );
+                                for blocker in &report.finalize_blockers {
+                                    eprintln!("  - {blocker}");
+                                }
+                                std::process::exit(2);
+                            }
+                        } else if let Some(wait_arg) = wait {
+                            let cap = if wait_arg.is_empty() {
+                                None
+                            } else {
+                                Some(storage_wait::parse_duration(&wait_arg).map_err(|e| {
+                                    format!("--wait: invalid duration {wait_arg:?}: {e}")
+                                })?)
+                            };
+                            match storage_wait::wait_for_finalize(&pool, cap).await? {
+                                storage_wait::WaitOutcome::Finalized(report) => {
+                                    println!("{}", serde_json::to_string_pretty(&report)?);
+                                }
+                                storage_wait::WaitOutcome::TimedOut(report) => {
+                                    println!("{}", serde_json::to_string_pretty(&report)?);
+                                    eprintln!(
+                                        "storage finalize --wait: timed out after {:?} with {} blocker(s)",
+                                        cap.unwrap_or_default(),
+                                        report.finalize_blockers.len()
+                                    );
+                                    for blocker in &report.finalize_blockers {
+                                        eprintln!("  - {blocker}");
+                                    }
+                                    std::process::exit(2);
+                                }
+                            }
+                        } else {
+                            awa_model::storage::finalize(&pool).await?;
+                            let report = awa_model::storage::status_report(&pool).await?;
+                            println!("{}", serde_json::to_string_pretty(&report)?);
+                        }
                     }
                 },
 
