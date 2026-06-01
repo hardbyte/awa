@@ -9120,6 +9120,74 @@ impl QueueStorage {
         Ok(true)
     }
 
+    /// Load the currently-active lease row for `job_id` (running or
+    /// waiting_external) inside a caller-owned transaction. Used by ADR-029
+    /// helpers that need the post-park snapshot — including the
+    /// `callback_id` and `callback_timeout_at` written by
+    /// `register_callback()` — without leaving the transaction that just
+    /// performed the parking UPDATE.
+    pub async fn load_active_lease_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let schema = self.schema();
+        let row: Option<LeaseJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                lease.ready_slot,
+                lease.ready_generation,
+                lease.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                lease.state,
+                lease.priority,
+                lease.attempt,
+                lease.run_lease,
+                lease.max_attempts,
+                lease.lane_seq,
+                ready.run_at,
+                lease.heartbeat_at,
+                lease.deadline_at,
+                lease.attempted_at,
+                NULL::timestamptz AS finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                lease.callback_id,
+                lease.callback_timeout_at,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
+                attempt.progress,
+                attempt.callback_result
+            FROM {schema}.leases AS lease
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = lease.ready_slot
+             AND ready.ready_generation = lease.ready_generation
+             AND ready.queue = lease.queue
+             AND ready.priority = lease.priority
+             AND ready.enqueue_shard = lease.enqueue_shard
+             AND ready.lane_seq = lease.lane_seq
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = lease.job_id
+             AND attempt.run_lease = lease.run_lease
+            WHERE lease.job_id = $1
+              AND lease.run_lease = $2
+            "#,
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        row.map(LeaseJobRow::into_job_row).transpose()
+    }
+
     pub async fn enter_callback_wait(
         &self,
         pool: &PgPool,

@@ -448,6 +448,10 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_atomically() {
     let pool = setup_pool_canonical().await;
     let queue = "enqueue_spec_wait_trigger";
 
+    let seen_callback_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let seen_callback_id_for_closure = seen_callback_id.clone();
+
     let client = Client::builder(pool.clone())
         .canonical_storage()
         .queue(
@@ -458,7 +462,8 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_atomically() {
             },
         )
         .register_worker(WaitWorker)
-        .on_waiting_for_callback_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job| {
+        .on_waiting_for_callback_enqueue::<WaitTrigger, EnqueueFollowUp, _>(move |args, job| {
+            *seen_callback_id_for_closure.lock().unwrap() = job.callback_id;
             EnqueueFollowUp {
                 user_id: args.user_id,
                 triggered_by_job_id: job.id,
@@ -488,6 +493,12 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_atomically() {
     let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
     assert_eq!(follow_args.user_id, 44);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+    let captured = seen_callback_id
+        .lock()
+        .unwrap()
+        .expect("closure should have observed a callback_id on the parked JobRow");
+    let parked = admin::get_job(&pool, trigger_job.id).await.unwrap();
+    assert_eq!(Some(captured), parked.callback_id);
 }
 
 #[tokio::test]
@@ -689,6 +700,15 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage()
     let pool = setup_pool_queue_storage().await;
     let queue = "enqueue_spec_qs_wait_trigger";
 
+    // Capture the parked JobRow the closure sees so we can assert that
+    // `register_callback()`'s writes (callback_id, callback_timeout_at)
+    // are visible — the dispatcher must reload the row from the leases
+    // table after `enter_callback_wait_in_tx`, not reuse the pre-park
+    // snapshot the executor claimed.
+    let seen_callback_id: Arc<std::sync::Mutex<Option<uuid::Uuid>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let seen_callback_id_for_closure = seen_callback_id.clone();
+
     let client = Client::builder(pool.clone())
         .queue(
             queue,
@@ -698,7 +718,8 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage()
             },
         )
         .register_worker(WaitWorker)
-        .on_waiting_for_callback_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job| {
+        .on_waiting_for_callback_enqueue::<WaitTrigger, EnqueueFollowUp, _>(move |args, job| {
+            *seen_callback_id_for_closure.lock().unwrap() = job.callback_id;
             EnqueueFollowUp {
                 user_id: args.user_id,
                 triggered_by_job_id: job.id,
@@ -728,6 +749,16 @@ async fn on_waiting_for_callback_enqueue_inserts_follow_up_under_queue_storage()
     let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
     assert_eq!(follow_args.user_id, 444);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+    let captured = seen_callback_id
+        .lock()
+        .unwrap()
+        .expect("closure should have observed a callback_id on the parked JobRow");
+    let parked = admin::get_job(&pool, trigger_job.id).await.unwrap();
+    assert_eq!(
+        Some(captured),
+        parked.callback_id,
+        "closure-visible callback_id must match the one written by register_callback()"
+    );
 }
 
 #[tokio::test]

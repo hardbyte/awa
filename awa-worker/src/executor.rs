@@ -2289,13 +2289,29 @@ async fn park_queue_storage_with_followups(
         tx.rollback().await?;
         return Ok(None);
     }
-    // The parked row lives in the leases table; constructing the post-park
-    // snapshot from `job` matches the fallback `complete_job_queue_storage`
-    // already uses when `load_job` doesn't return a row.
-    let mut parked_job = job.clone();
-    parked_job.state = JobState::WaitingExternal;
-    parked_job.heartbeat_at = None;
-    parked_job.deadline_at = None;
+    // Re-read the parked row inside the same transaction. The input
+    // `job` is the snapshot the executor claimed earlier — it does not
+    // carry `callback_id` / `callback_timeout_at` written by
+    // `register_callback()` during the handler, and the parked-state
+    // fields (state, heartbeat_at, deadline_at) only land after the
+    // enter_callback_wait_in_tx UPDATE above. Fall back to a synthesised
+    // snapshot only if the SELECT misses (shouldn't happen because the
+    // UPDATE just matched, but defensive).
+    let parked_job = match runtime
+        .store
+        .load_active_lease_in_tx(&mut tx, job.id, job.run_lease)
+        .await?
+    {
+        Some(row) => row,
+        None => {
+            let mut parked = job.clone();
+            parked.state = JobState::WaitingExternal;
+            parked.heartbeat_at = None;
+            parked.deadline_at = None;
+            parked.callback_id = Some(callback_id);
+            parked
+        }
+    };
     crate::enqueue_specs::dispatch_specs_in_tx(
         &mut tx,
         &parked_job,
