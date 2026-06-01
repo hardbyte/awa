@@ -43,6 +43,7 @@ registered for the same kind; they stack and run sequentially.
 | `Retried` | the attempt failed (or `RetryAfter`) and the job will run again |
 | `Exhausted` | the job exhausted its retries, or failed terminally, and moved to `failed` |
 | `Cancelled` | the job was cancelled |
+| `Rescued` | maintenance rescued the job (expired callback, stale heartbeat, or exceeded deadline) — `reason: RescueReason` carries which |
 
 How `JobResult` / outcomes map to events:
 
@@ -107,10 +108,91 @@ mechanism:
 
 If a side effect must fire exactly once or survive a crash, do not drive it
 from a hook at all — the dispatch may never run, and enqueueing the follow-up
-work *from* the hook just inherits that same unreliability. Drive it from
-something durable instead: enqueue the follow-up as an Awa job inside a
-transaction you control — for a callback, the very transaction that resolves it
-(a transactional outbox) — or make the job handler perform the side effect
-idempotently so re-execution is safe.
+work *from* the hook just inherits that same unreliability. See the next
+section for the durable mechanism.
 
-See [ADR-015](adr/015-post-commit-lifecycle-hooks.md) for the design rationale.
+## Durable follow-up jobs (`on_*_enqueue`)
+
+For side effects that **must survive a process crash** — sending a welcome
+email after signup, kicking off downstream work, persisting an audit row —
+use the transactional follow-up API instead of an `on_event` hook. For
+worker-driven outcomes (the trigger handler returned `Ok`/`Err`) the
+follow-up `INSERT`s in the **same database transaction** as the
+triggering state transition, so the follow-up either lands or the
+transition rolls back; there is no in-between. Callback resolution
+(`Client::*_external`) and maintenance rescue dispatch follow-ups in a
+**separate transaction** (best-effort) — see the [atomicity table
+below](#atomicity-guarantees) before designing a workflow that depends
+on rescue-driven or callback-driven follow-ups landing.
+
+```rust
+use awa::{Client, EnqueueRequest, QueueConfig};
+
+let client = Client::builder(pool)
+    .queue("signup", QueueConfig::default())
+    .register::<Signup, _, _>(|_, _| async move { Ok(awa::JobResult::Completed) })
+    // When a Signup completes, enqueue a WelcomeEmail in the *same* tx.
+    // Closure receives the trigger args and the post-completion JobRow.
+    .on_completed_enqueue::<Signup, WelcomeEmail, _>(|args, job| WelcomeEmail {
+        user_id: args.user_id,
+        signup_job_id: job.id,
+    })
+    .build()?;
+```
+
+There is one builder per outcome, plus a `_with` variant whose closure
+returns `EnqueueRequest<F>` so you can override `InsertOpts` on the
+follow-up (queue, priority, max_attempts, metadata, tags, unique, run_at,
+deadline_duration, ordering_key):
+
+| Builder | Fires when | Closure signature |
+|---|---|---|
+| `on_completed_enqueue` | `JobResult::Completed` | `(args, &job)` |
+| `on_cancelled_enqueue` | `JobResult::Cancel(reason)` | `(args, &job, &reason)` |
+| `on_retried_enqueue` | retryable err (retries left) or `RetryAfter` | `(args, &job, &error, attempt, next_run_at)` |
+| `on_exhausted_enqueue` | retries exhausted, or `Err(Terminal)` | `(args, &job, &error, attempt)` |
+| `on_waiting_for_callback_enqueue` | `JobResult::WaitForCallback` | `(args, &job)` |
+| `on_rescued_enqueue` | maintenance rescue (expired callback / stale heartbeat / deadline) | `(args, &job, RescueReason)` |
+
+`on_*_enqueue_with` returns `EnqueueRequest<F>`:
+
+```rust
+.on_completed_enqueue_with::<Signup, WelcomeEmail, _>(|args, job| {
+    EnqueueRequest::new(WelcomeEmail { user_id: args.user_id })
+        .queue("email")
+        .priority(1)
+})
+```
+
+### Atomicity guarantees
+
+| Emission site | Atomic with state commit? |
+|---|---|
+| Worker-driven outcomes (handler returns `Ok`/`Err`) on either storage engine | **yes** — one transaction, one commit |
+| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) | **no — best-effort.** The resolution commits first, then specs dispatch in a separate tx. If the spec INSERT fails the job remains resolved and the error is logged. |
+| Maintenance rescue (stale heartbeat / deadline / expired callback) | **no — best-effort**, same shape and caveat |
+
+The asymmetry is deliberate: the worker-driven path inherits ADR-013's
+run-lease guard (stale outcome → tx rolls back → no follow-up). The
+trigger transition and the follow-up `INSERT` either both commit or
+neither does — exactly-once *enqueue* per committed worker outcome.
+The follow-up itself, once enqueued, is delivered with Awa's usual
+at-least-once semantics, so the follow-up handler still needs to be
+safe under re-execution. The callback-resolution and maintenance paths
+are tracked for a future tx-aware variant.
+
+### When to choose which API
+
+- **Observation** (metrics, traces, alerts) → `on_event` — cheap, in-process,
+  acceptable to drop a sample on a crash.
+- **Side effect that must survive a crash** (send email, persist record,
+  kick off downstream work) → `on_*_enqueue` — slightly more expensive
+  (it's an Awa job) but durable, retried, DLQ'd, and visible in admin.
+
+If you can't tell which you want, use `on_*_enqueue`. The cost of an
+unnecessary follow-up is bounded; the cost of a lost reliable side effect
+is not.
+
+See [ADR-015](adr/015-post-commit-lifecycle-hooks.md) for hook rationale,
+and [ADR-029](adr/029-transactional-followup-jobs.md) for the follow-up
+enqueue design and atomicity matrix.

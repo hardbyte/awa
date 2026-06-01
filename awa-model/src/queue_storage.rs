@@ -6309,12 +6309,29 @@ impl QueueStorage {
         pool: &PgPool,
         claimed: &[ClaimedRuntimeJob],
     ) -> Result<Vec<(i64, i64)>, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .complete_runtime_batch_slow_in_tx(&mut tx, claimed)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Same as [`Self::complete_runtime_batch_slow`] but runs on the caller's
+    /// transaction so additional writes — for example ADR-029 follow-up job
+    /// inserts — can join the same commit. The caller is responsible for
+    /// `commit()` / `rollback()`. Handles both receipt-claimed and
+    /// materialised leases.
+    pub async fn complete_runtime_batch_slow_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        claimed: &[ClaimedRuntimeJob],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
         if claimed.is_empty() {
             return Ok(Vec::new());
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         let claimed_map: BTreeMap<(i64, i64), ClaimedRuntimeJob> = claimed
             .iter()
@@ -6393,7 +6410,7 @@ impl QueueStorage {
                         }
                     }
 
-                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
                         .await?;
                     updated_all.extend(updated);
                 }
@@ -6519,12 +6536,11 @@ impl QueueStorage {
                         }
                     }
 
-                    self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+                    self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
                         .await?;
                 }
             }
 
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(updated_all);
         }
 
@@ -6617,7 +6633,6 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
@@ -6634,10 +6649,8 @@ impl QueueStorage {
             }
         }
 
-        self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+        self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
             .await?;
-
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(updated)
     }
 
@@ -6653,9 +6666,28 @@ impl QueueStorage {
         if completions.is_empty() {
             return Ok(Vec::new());
         }
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .complete_job_batch_by_id_in_tx(&mut tx, completions)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Same as [`Self::complete_job_batch_by_id`] but runs on the caller's
+    /// transaction so additional writes — for example ADR-029 follow-up job
+    /// inserts — can join the same commit. The caller is responsible for
+    /// `commit()` / `rollback()`.
+    pub async fn complete_job_batch_by_id_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        completions: &[(i64, i64)],
+    ) -> Result<Vec<(i64, i64)>, AwaError> {
+        if completions.is_empty() {
+            return Ok(Vec::new());
+        }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
 
         let job_ids: Vec<i64> = completions.iter().map(|(job_id, _)| *job_id).collect();
         let run_leases: Vec<i64> = completions
@@ -6698,11 +6730,10 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Vec::new());
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
 
         let finalized_at = Utc::now();
         let mut done_rows = Vec::with_capacity(moved.len());
@@ -6719,9 +6750,8 @@ impl QueueStorage {
             ));
         }
 
-        self.insert_done_rows_tx(&mut tx, &done_rows, Some(JobState::Running))
+        self.insert_done_rows_tx(tx, &done_rows, Some(JobState::Running))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(moved
             .into_iter()
             .map(|entry| (entry.job_id, entry.run_lease))
@@ -9090,9 +9120,94 @@ impl QueueStorage {
         Ok(true)
     }
 
+    /// Load the currently-active lease row for `job_id` (running or
+    /// waiting_external) inside a caller-owned transaction. Used by ADR-029
+    /// helpers that need the post-park snapshot — including the
+    /// `callback_id` and `callback_timeout_at` written by
+    /// `register_callback()` — without leaving the transaction that just
+    /// performed the parking UPDATE.
+    pub async fn load_active_lease_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let schema = self.schema();
+        let row: Option<LeaseJobRow> = sqlx::query_as(&format!(
+            r#"
+            SELECT
+                lease.ready_slot,
+                lease.ready_generation,
+                lease.job_id,
+                ready.kind,
+                ready.queue,
+                ready.args,
+                lease.state,
+                lease.priority,
+                lease.attempt,
+                lease.run_lease,
+                lease.max_attempts,
+                lease.lane_seq,
+                ready.run_at,
+                lease.heartbeat_at,
+                lease.deadline_at,
+                lease.attempted_at,
+                NULL::timestamptz AS finalized_at,
+                ready.created_at,
+                ready.unique_key,
+                ready.unique_states,
+                lease.callback_id,
+                lease.callback_timeout_at,
+                attempt.callback_filter,
+                attempt.callback_on_complete,
+                attempt.callback_on_fail,
+                attempt.callback_transform,
+                COALESCE(ready.payload, '{{}}'::jsonb) AS payload,
+                attempt.progress,
+                attempt.callback_result
+            FROM {schema}.leases AS lease
+            JOIN {schema}.ready_entries AS ready
+              ON ready.ready_slot = lease.ready_slot
+             AND ready.ready_generation = lease.ready_generation
+             AND ready.queue = lease.queue
+             AND ready.priority = lease.priority
+             AND ready.enqueue_shard = lease.enqueue_shard
+             AND ready.lane_seq = lease.lane_seq
+            LEFT JOIN {schema}.attempt_state AS attempt
+              ON attempt.job_id = lease.job_id
+             AND attempt.run_lease = lease.run_lease
+            WHERE lease.job_id = $1
+              AND lease.run_lease = $2
+            "#,
+        ))
+        .bind(job_id)
+        .bind(run_lease)
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        row.map(LeaseJobRow::into_job_row).transpose()
+    }
+
     pub async fn enter_callback_wait(
         &self,
         pool: &PgPool,
+        job_id: i64,
+        run_lease: i64,
+        callback_id: Uuid,
+    ) -> Result<bool, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let entered = self
+            .enter_callback_wait_in_tx(&mut tx, job_id, run_lease, callback_id)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(entered)
+    }
+
+    /// Transaction-aware variant of [`Self::enter_callback_wait`] (ADR-029).
+    /// Returns whether the row transitioned to `waiting_external`.
+    pub async fn enter_callback_wait_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
         job_id: i64,
         run_lease: i64,
         callback_id: Uuid,
@@ -9113,7 +9228,7 @@ impl QueueStorage {
         .bind(job_id)
         .bind(run_lease)
         .bind(callback_id)
-        .execute(pool)
+        .execute(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
         Ok(result.rows_affected() > 0)
@@ -9751,14 +9866,31 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .retry_after_in_tx(&mut tx, job_id, run_lease, retry_after, progress)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::retry_after`]. Caller owns the
+    /// transaction lifecycle so the move can commit atomically alongside
+    /// follow-up `INSERT`s (ADR-029).
+    pub async fn retry_after_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        retry_after: Duration,
+        progress: Option<serde_json::Value>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(&mut tx, job_id, run_lease, "retryable")
+            .take_running_attempt_tx(tx, job_id, run_lease, "retryable")
             .await?
         else {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
-        let now = self.current_timestamp_tx(&mut tx).await?;
+        let now = self.current_timestamp_tx(tx).await?;
 
         let payload =
             Self::with_progress(moved.payload.clone(), progress.or(moved.progress.clone()))?;
@@ -9770,9 +9902,8 @@ impl QueueStorage {
             Some(now),
             payload,
         );
-        self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
+        self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(deferred.into_job_row()?))
     }
 
@@ -9819,11 +9950,26 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .cancel_running_in_tx(&mut tx, job_id, run_lease, reason, progress)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::cancel_running`] (ADR-029).
+    pub async fn cancel_running_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        reason: &str,
+        progress: Option<serde_json::Value>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(&mut tx, job_id, run_lease, "cancelled")
+            .take_running_attempt_tx(tx, job_id, run_lease, "cancelled")
             .await?
         else {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
 
@@ -9840,9 +9986,8 @@ impl QueueStorage {
             moved
                 .clone()
                 .into_done_row(JobState::Cancelled, Utc::now(), payload.into_json());
-        self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(done.into_job_row()?))
     }
 
@@ -9855,11 +10000,26 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .fail_terminal_in_tx(&mut tx, job_id, run_lease, error, progress)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::fail_terminal`] (ADR-029).
+    pub async fn fail_terminal_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        error: &str,
+        progress: Option<serde_json::Value>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(&mut tx, job_id, run_lease, "failed")
+            .take_running_attempt_tx(tx, job_id, run_lease, "failed")
             .await?
         else {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
 
@@ -9871,9 +10031,8 @@ impl QueueStorage {
         let done = moved
             .clone()
             .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
-        self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(done.into_job_row()?))
     }
 
@@ -9887,11 +10046,27 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .fail_to_dlq_in_tx(&mut tx, job_id, run_lease, dlq_reason, error, progress)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::fail_to_dlq`] (ADR-029).
+    pub async fn fail_to_dlq_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        dlq_reason: &str,
+        error: &str,
+        progress: Option<serde_json::Value>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(&mut tx, job_id, run_lease, "dlq")
+            .take_running_attempt_tx(tx, job_id, run_lease, "dlq")
             .await?
         else {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
 
@@ -9908,9 +10083,8 @@ impl QueueStorage {
             dlq_reason.to_string(),
             dlq_at,
         );
-        self.insert_dlq_rows_tx(&mut tx, std::slice::from_ref(&dlq_row), Some(moved.state))
+        self.insert_dlq_rows_tx(tx, std::slice::from_ref(&dlq_row), Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(dlq_row.into_job_row()?))
     }
 
@@ -10286,11 +10460,26 @@ impl QueueStorage {
         progress: Option<serde_json::Value>,
     ) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .fail_retryable_in_tx(&mut tx, job_id, run_lease, error, progress)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::fail_retryable`] (ADR-029).
+    pub async fn fail_retryable_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        job_id: i64,
+        run_lease: i64,
+        error: &str,
+        progress: Option<serde_json::Value>,
+    ) -> Result<Option<JobRow>, AwaError> {
         let Some(moved) = self
-            .take_running_attempt_tx(&mut tx, job_id, run_lease, "retryable")
+            .take_running_attempt_tx(tx, job_id, run_lease, "retryable")
             .await?
         else {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(None);
         };
 
@@ -10306,22 +10495,20 @@ impl QueueStorage {
                 moved
                     .clone()
                     .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
-            self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done), Some(moved.state))
+            self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(moved.state))
                 .await?;
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Ok(Some(done.into_job_row()?));
         }
 
         let deferred = moved.clone().into_deferred_row(
             JobState::Retryable,
-            self.backoff_at_tx(&mut tx, moved.attempt, moved.max_attempts)
+            self.backoff_at_tx(tx, moved.attempt, moved.max_attempts)
                 .await?,
             Some(Utc::now()),
             payload.into_json(),
         );
-        self.insert_deferred_rows_tx(&mut tx, vec![deferred.clone()], Some(moved.state))
+        self.insert_deferred_rows_tx(tx, vec![deferred.clone()], Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         Ok(Some(deferred.into_job_row()?))
     }
 

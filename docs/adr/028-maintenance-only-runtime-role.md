@@ -212,7 +212,10 @@ bounded `tick()`, not a replacement for the runtime role.
   pruning. Maintenance-only runs those existing storage tasks; it does not
   redefine the storage engine.
 - ADR-029 defines transactional follow-up jobs. Maintenance-only uses that
-  mechanism to emit durable lifecycle effects for rescues (expired callback,
-  stale heartbeat, exceeded deadline) — enqueuing follow-up Awa jobs in the
-  same transaction as the rescue UPDATE, closing the rescue/timeout event
-  gap without requiring a handler registry in the maintenance process.
+  mechanism to dispatch durable lifecycle effects for rescues (expired
+  callback, stale heartbeat, exceeded deadline). The dispatch is
+  best-effort (in a separate transaction after the rescue UPDATE
+  commits — see ADR-029's atomicity matrix); once the follow-up
+  `INSERT` lands, the row is a regular Awa job. This closes the
+  rescue/timeout event gap without requiring a handler registry in the
+  maintenance process.

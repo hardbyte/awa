@@ -676,6 +676,9 @@ async fn test_stale_completion_does_not_fire_event() {
                     JobEvent::WaitingForCallback { args, .. } => {
                         tx.send(format!("waiting:{}", args.value)).unwrap()
                     }
+                    JobEvent::Rescued { args, reason, .. } => tx
+                        .send(format!("rescued:{}:{}", args.value, reason.as_str()))
+                        .unwrap(),
                 }
             }
         })
@@ -817,6 +820,7 @@ async fn test_snooze_only_emits_started_event() {
                     JobEvent::Retried { .. } => "retried",
                     JobEvent::Exhausted { .. } => "exhausted",
                     JobEvent::Cancelled { .. } => "cancelled",
+                    JobEvent::Rescued { .. } => "rescued",
                 };
                 let _ = tx.send(label.to_string());
             }

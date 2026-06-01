@@ -125,6 +125,10 @@ pub struct ClientBuilder {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: HashMap<String, BoxedWorker>,
     lifecycle_handlers: HashMap<String, Vec<BoxedUntypedEventHandler>>,
+    enqueue_specs: HashMap<
+        crate::enqueue_specs::Outcome,
+        HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+    >,
     state: HashMap<TypeId, Box<dyn Any + Send + Sync>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -175,6 +179,7 @@ impl ClientBuilder {
             job_kind_descriptors: HashMap::new(),
             workers: HashMap::new(),
             lifecycle_handlers: HashMap::new(),
+            enqueue_specs: HashMap::new(),
             state: HashMap::new(),
             heartbeat_interval: Duration::from_secs(30),
             promote_interval: Duration::from_millis(250),
@@ -331,6 +336,317 @@ impl ClientBuilder {
             .entry(kind)
             .or_default()
             .push(erased);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// completes successfully.
+    ///
+    /// `make` receives the trigger's deserialised args plus its post-completion
+    /// [`awa_model::JobRow`] and returns the follow-up's `JobArgs` value. The
+    /// follow-up is enqueued with default [`awa_model::InsertOpts`] — use
+    /// [`Self::on_completed_enqueue_with`] to override queue, priority, or
+    /// other insert options.
+    ///
+    /// # Atomicity
+    ///
+    /// When the trigger completes from the worker handler (`Ok(Completed)`),
+    /// the follow-up `INSERT`s in the *same database transaction* as the
+    /// completion's state change, so the trigger and the follow-up commit
+    /// or roll back together (ADR-029, ADR-013 run-lease guard).
+    ///
+    /// When the trigger completes via callback resolution
+    /// ([`Client::complete_external`], [`Client::resolve_callback`] with a
+    /// `Complete` action), the follow-up dispatch runs in a *separate*
+    /// transaction *after* the resolution commits — a spec INSERT failure
+    /// leaves the job resolved without a follow-up (logged at error
+    /// level). Don't predicate a workflow on a callback-driven follow-up
+    /// landing.
+    ///
+    /// This is the durable counterpart to [`Self::on_event`]: hooks are
+    /// best-effort, in-process; this enqueue is at-least-once and rides
+    /// Awa's existing retry/DLQ machinery.
+    ///
+    /// Multiple registrations for the same kind stack and all run in the
+    /// same dispatch.
+    pub fn on_completed_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
+    {
+        self.on_completed_enqueue_with::<T, F, _>(move |args, job| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+        })
+    }
+
+    /// Like [`Self::on_completed_enqueue`] but lets the closure return an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with explicit queue,
+    /// priority, or other [`awa_model::InsertOpts`] overrides.
+    pub fn on_completed_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::CompletedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Completed)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is retried (whether via `Ok(RetryAfter)` or a retryable `Err`).
+    /// `make` receives the trigger's args, its post-retry `JobRow`, the error
+    /// string, the previous attempt number, and the next-run-at timestamp.
+    ///
+    /// Atomicity matches [`Self::on_completed_enqueue`]: worker-driven
+    /// retries dispatch in the transition's transaction; a retry driven by
+    /// [`Client::retry_external`] or [`Client::resolve_callback`] dispatches
+    /// in a separate transaction (best-effort) after the resolution commits.
+    pub fn on_retried_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16, chrono::DateTime<chrono::Utc>) -> F
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.on_retried_enqueue_with::<T, F, _>(move |args, job, error, attempt, next_run_at| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt, next_run_at))
+        })
+    }
+
+    /// Like [`Self::on_retried_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_retried_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(
+                T,
+                &awa_model::JobRow,
+                &str,
+                i16,
+                chrono::DateTime<chrono::Utc>,
+            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::RetriedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Retried)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is exhausted (retries used up *or* `Err(JobError::Terminal)`).
+    /// `make` receives the trigger's args, its post-failure `JobRow`, the
+    /// error string, and the attempt number.
+    ///
+    /// Atomicity matches [`Self::on_completed_enqueue`]: worker-driven
+    /// exhaustion dispatches in the transition's transaction; an
+    /// exhaustion driven by [`Client::fail_external`] or
+    /// [`Client::resolve_callback`] with a `Fail` action dispatches in a
+    /// separate transaction (best-effort) after the resolution commits.
+    pub fn on_exhausted_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> F + Send + Sync + 'static,
+    {
+        self.on_exhausted_enqueue_with::<T, F, _>(move |args, job, error, attempt| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, error, attempt))
+        })
+    }
+
+    /// Like [`Self::on_exhausted_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_exhausted_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str, i16) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::ExhaustedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Exhausted)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is cancelled via `Ok(JobResult::Cancel(reason))`. `make` receives the
+    /// trigger's args, its post-cancellation `JobRow`, and the reason string.
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_cancelled_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str) -> F + Send + Sync + 'static,
+    {
+        self.on_cancelled_enqueue_with::<T, F, _>(move |args, job, reason| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+        })
+    }
+
+    /// Like [`Self::on_cancelled_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_cancelled_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, &str) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::CancelledFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Cancelled)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// parks on an external callback (`Ok(JobResult::WaitForCallback)`).
+    /// `make` receives the trigger's args plus the parked `JobRow`
+    /// (`job.callback_id` and `job.callback_timeout_at` identify the
+    /// pending callback).
+    ///
+    /// See [`Self::on_completed_enqueue`] for the same-transaction semantics.
+    pub fn on_waiting_for_callback_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> F + Send + Sync + 'static,
+    {
+        self.on_waiting_for_callback_enqueue_with::<T, F, _>(move |args, job| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job))
+        })
+    }
+
+    /// Like [`Self::on_waiting_for_callback_enqueue`] but the closure returns
+    /// an [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_waiting_for_callback_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec = Arc::new(
+            crate::enqueue_specs::WaitingForCallbackFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            },
+        );
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::WaitingForCallback)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
+        self
+    }
+
+    /// Register a durable follow-up Awa job to enqueue when a job of type `T`
+    /// is rescued by maintenance (expired callback, stale heartbeat, or
+    /// deadline exceeded). `make` receives the trigger's args, its post-rescue
+    /// `JobRow`, and the [`RescueReason`](crate::events::RescueReason).
+    ///
+    /// **Atomicity: best-effort, separate transaction.** Maintenance rescues
+    /// commit the rescue UPDATE before this dispatcher runs; the follow-up
+    /// dispatch opens its own transaction afterwards. If the spec INSERT
+    /// fails the rescue stands and the failure is logged. Don't predicate
+    /// a workflow on a rescue-driven follow-up landing — for compensation
+    /// after a stuck attempt, build the follow-up handler to be safely
+    /// re-runnable. The atomic variant is tracked as an open extension in
+    /// ADR-029.
+    pub fn on_rescued_enqueue<T, F, MakeFn>(self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(T, &awa_model::JobRow, crate::events::RescueReason) -> F + Send + Sync + 'static,
+    {
+        self.on_rescued_enqueue_with::<T, F, _>(move |args, job, reason| {
+            crate::enqueue_specs::EnqueueRequest::new(make(args, job, reason))
+        })
+    }
+
+    /// Like [`Self::on_rescued_enqueue`] but the closure returns an
+    /// [`EnqueueRequest`](crate::EnqueueRequest) with `InsertOpts` overrides.
+    pub fn on_rescued_enqueue_with<T, F, MakeFn>(mut self, make: MakeFn) -> Self
+    where
+        T: JobArgs + DeserializeOwned + Send + Sync + 'static,
+        F: JobArgs + Send + Sync + 'static,
+        MakeFn: Fn(
+                T,
+                &awa_model::JobRow,
+                crate::events::RescueReason,
+            ) -> crate::enqueue_specs::EnqueueRequest<F>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let kind = T::kind().to_string();
+        let spec: crate::enqueue_specs::BoxedEnqueueSpec =
+            Arc::new(crate::enqueue_specs::RescuedFollowUp::<T, F, _> {
+                make,
+                _phantom: std::marker::PhantomData,
+            });
+        self.enqueue_specs
+            .entry(crate::enqueue_specs::Outcome::Rescued)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(spec);
         self
     }
 
@@ -680,6 +996,7 @@ impl ClientBuilder {
             job_kind_descriptors: self.job_kind_descriptors,
             workers: Arc::new(self.workers),
             lifecycle_handlers: Arc::new(self.lifecycle_handlers),
+            enqueue_specs: Arc::new(self.enqueue_specs),
             state: Arc::new(self.state),
             heartbeat_interval: self.heartbeat_interval,
             promote_interval: self.promote_interval,
@@ -767,6 +1084,12 @@ pub struct Client {
     job_kind_descriptors: HashMap<String, JobKindDescriptor>,
     workers: Arc<HashMap<String, BoxedWorker>>,
     lifecycle_handlers: Arc<HashMap<String, Vec<BoxedUntypedEventHandler>>>,
+    enqueue_specs: Arc<
+        HashMap<
+            crate::enqueue_specs::Outcome,
+            HashMap<String, Vec<crate::enqueue_specs::BoxedEnqueueSpec>>,
+        >,
+    >,
     state: Arc<HashMap<TypeId, Box<dyn Any + Send + Sync>>>,
     heartbeat_interval: Duration,
     promote_interval: Duration,
@@ -1145,6 +1468,7 @@ impl Client {
             self.pool.clone(),
             self.workers.clone(),
             self.lifecycle_handlers.clone(),
+            self.enqueue_specs.clone(),
             self.in_flight.clone(),
             self.queue_in_flight.clone(),
             self.state.clone(),
@@ -1196,6 +1520,8 @@ impl Client {
             self.periodic_jobs.clone(),
             self.in_flight.clone(),
             effective_storage.clone(),
+            self.enqueue_specs.clone(),
+            self.lifecycle_handlers.clone(),
         )
         .promote_interval(self.promote_interval);
         if let Some(interval) = self.heartbeat_rescue_interval {
@@ -1424,6 +1750,33 @@ impl Client {
             }),
             awa_model::ResolveOutcome::Ignored { .. } => None,
         };
+        // ADR-029 best-effort: dispatch follow-up specs in a separate tx
+        // *after* the resolution commits. See `dispatch_callback_followups`
+        // for the atomicity caveat. Resolution is the source of truth; if a
+        // spec INSERT fails we still consider the resolution successful.
+        match &outcome {
+            awa_model::ResolveOutcome::Completed { job, .. } => {
+                self.dispatch_callback_followups(
+                    job,
+                    crate::enqueue_specs::Outcome::Completed,
+                    None,
+                )
+                .await;
+            }
+            awa_model::ResolveOutcome::Failed { job } => {
+                let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
+                    error: latest_error_message(job),
+                    attempt: job.attempt,
+                };
+                self.dispatch_callback_followups(
+                    job,
+                    crate::enqueue_specs::Outcome::Exhausted,
+                    Some(outcome_ctx),
+                )
+                .await;
+            }
+            awa_model::ResolveOutcome::Ignored { .. } => {}
+        }
         if let Some(event) = event {
             self.dispatch_callback_event(event).await;
         }
@@ -1438,6 +1791,8 @@ impl Client {
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
         let job = admin::complete_external(&self.pool, callback_id, payload, run_lease).await?;
+        self.dispatch_callback_followups(&job, crate::enqueue_specs::Outcome::Completed, None)
+            .await;
         self.dispatch_callback_event(UntypedJobEvent::Completed {
             job: job.clone(),
             duration: Duration::ZERO,
@@ -1454,6 +1809,16 @@ impl Client {
         run_lease: Option<i64>,
     ) -> Result<awa_model::JobRow, awa_model::AwaError> {
         let job = admin::fail_external(&self.pool, callback_id, error, run_lease).await?;
+        let outcome_ctx = crate::enqueue_specs::OutcomeContext::Exhausted {
+            error: error.to_string(),
+            attempt: job.attempt,
+        };
+        self.dispatch_callback_followups(
+            &job,
+            crate::enqueue_specs::Outcome::Exhausted,
+            Some(outcome_ctx),
+        )
+        .await;
         self.dispatch_callback_event(UntypedJobEvent::Exhausted {
             job: job.clone(),
             error: error.to_string(),
@@ -1487,10 +1852,23 @@ impl Client {
         .await?;
 
         let job = admin::retry_external(&self.pool, callback_id, run_lease).await?;
+        let attempt = parked_attempt.unwrap_or(job.attempt);
+        let error_msg = latest_error_message(&job);
+        let outcome_ctx = crate::enqueue_specs::OutcomeContext::Retried {
+            error: error_msg.clone(),
+            attempt,
+            next_run_at: job.run_at,
+        };
+        self.dispatch_callback_followups(
+            &job,
+            crate::enqueue_specs::Outcome::Retried,
+            Some(outcome_ctx),
+        )
+        .await;
         self.dispatch_callback_event(UntypedJobEvent::Retried {
             job: job.clone(),
-            error: latest_error_message(&job),
-            attempt: parked_attempt.unwrap_or(job.attempt),
+            error: error_msg,
+            attempt,
             next_run_at: job.run_at,
         })
         .await;
@@ -1500,6 +1878,78 @@ impl Client {
     async fn dispatch_callback_event(&self, event: UntypedJobEvent) {
         let kind = event.job().kind.clone();
         crate::executor::dispatch_lifecycle_event(&self.lifecycle_handlers, &kind, event).await;
+    }
+
+    /// ADR-029 callback-resolution follow-up dispatch.
+    ///
+    /// **Atomicity caveat:** unlike worker-driven outcomes which dispatch
+    /// specs in the same transaction as the state transition, callback
+    /// resolution dispatches follow-ups in a *separate* transaction after
+    /// the resolution has already committed. If a spec INSERT fails (DB
+    /// disconnect, constraint violation, deserialisation error), the job
+    /// is still resolved but the follow-up is *not* enqueued — the error
+    /// is logged and the caller's `Result` remains `Ok`.
+    ///
+    /// Fully atomic callback resolution + follow-up enqueue requires
+    /// tx-aware admin variants (`complete_external_in_tx`, etc.) on both
+    /// canonical and queue-storage paths; tracked as a follow-up.
+    async fn dispatch_callback_followups(
+        &self,
+        job: &awa_model::JobRow,
+        outcome: crate::enqueue_specs::Outcome,
+        outcome_context: Option<crate::enqueue_specs::OutcomeContext>,
+    ) {
+        let Some(specs) = self
+            .enqueue_specs
+            .get(&outcome)
+            .and_then(|by_kind| by_kind.get(&job.kind))
+            .cloned()
+        else {
+            return;
+        };
+        if specs.is_empty() {
+            return;
+        }
+        let mut tx = match self.pool.begin().await {
+            Ok(tx) => tx,
+            Err(err) => {
+                tracing::error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    error = %err,
+                    "callback follow-up dispatch: failed to begin transaction"
+                );
+                return;
+            }
+        };
+        let dispatch_result = crate::enqueue_specs::dispatch_specs_in_tx(
+            &mut tx,
+            job,
+            &specs,
+            outcome_context.as_ref(),
+        )
+        .await;
+        match dispatch_result {
+            Ok(()) => {
+                if let Err(err) = tx.commit().await {
+                    tracing::error!(
+                        job_id = job.id,
+                        kind = %job.kind,
+                        error = %err,
+                        "callback follow-up dispatch: commit failed"
+                    );
+                }
+            }
+            Err(err) => {
+                tracing::error!(
+                    job_id = job.id,
+                    kind = %job.kind,
+                    error = %err,
+                    "callback follow-up dispatch: spec INSERT failed; rolling back"
+                );
+                let _ = tx.rollback().await;
+            }
+        }
     }
 
     /// Health check.

@@ -43,6 +43,38 @@ pub enum JobEvent<T> {
         job: JobRow,
         reason: String,
     },
+    /// Job was rescued by maintenance — either its callback wait expired,
+    /// its heartbeat went stale (presumed crashed worker), or its deadline
+    /// was exceeded. `reason` identifies the rescue path. The post-rescue
+    /// `job.state` is `retryable` when retries remain or `failed` when the
+    /// attempt that was rescued exhausted its retry budget.
+    Rescued {
+        args: T,
+        job: JobRow,
+        reason: RescueReason,
+    },
+}
+
+/// Why maintenance rescued the job.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RescueReason {
+    /// The external callback's `callback_timeout_at` elapsed without resolution.
+    ExpiredCallback,
+    /// The job's heartbeat went stale (worker presumed crashed or stuck).
+    StaleHeartbeat,
+    /// The job's `deadline_at` elapsed.
+    DeadlineExceeded,
+}
+
+impl RescueReason {
+    /// Stable identifier suitable for logs / spec dispatch context.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RescueReason::ExpiredCallback => "expired_callback",
+            RescueReason::StaleHeartbeat => "stale_heartbeat",
+            RescueReason::DeadlineExceeded => "deadline_exceeded",
+        }
+    }
 }
 
 impl<T> JobEvent<T> {
@@ -54,7 +86,8 @@ impl<T> JobEvent<T> {
             | JobEvent::Completed { job, .. }
             | JobEvent::Retried { job, .. }
             | JobEvent::Exhausted { job, .. }
-            | JobEvent::Cancelled { job, .. } => job,
+            | JobEvent::Cancelled { job, .. }
+            | JobEvent::Rescued { job, .. } => job,
         }
     }
 }
@@ -83,6 +116,8 @@ pub enum UntypedJobEvent {
     },
     /// Job was cancelled by the handler.
     Cancelled { job: JobRow, reason: String },
+    /// Job was rescued by maintenance. See [`JobEvent::Rescued`].
+    Rescued { job: JobRow, reason: RescueReason },
 }
 
 impl UntypedJobEvent {
@@ -94,7 +129,8 @@ impl UntypedJobEvent {
             | UntypedJobEvent::Completed { job, .. }
             | UntypedJobEvent::Retried { job, .. }
             | UntypedJobEvent::Exhausted { job, .. }
-            | UntypedJobEvent::Cancelled { job, .. } => job,
+            | UntypedJobEvent::Cancelled { job, .. }
+            | UntypedJobEvent::Rescued { job, .. } => job,
         }
     }
 
@@ -132,6 +168,7 @@ impl UntypedJobEvent {
                 attempt,
             },
             UntypedJobEvent::Cancelled { job, reason } => JobEvent::Cancelled { args, job, reason },
+            UntypedJobEvent::Rescued { job, reason } => JobEvent::Rescued { args, job, reason },
         }
     }
 }

@@ -41,7 +41,7 @@ in-place as historical context.
 | 026 | [Narrow terminal history](026-narrow-terminal-history.md) | Accepted | Ready-backed terminal rows store only terminal facts and hydrate immutable body fields from retained `ready_entries` until queue prune | Refines ADR-019 terminal path |
 | 027 | [Callback ingress as a deployable surface](027-callback-ingress-surface.md) | Proposed | Separate signed callback ingress from the admin UI/API and expose callback-only embedding/CLI paths | Refines ADR-018 and ADR-021; uses ADR-029 for durable callback-driven side effects |
 | 028 | [Maintenance-only runtime role](028-maintenance-only-runtime-role.md) | Proposed | Run promotion, rescue, pruning, and metadata maintenance without claiming or executing user jobs | Complements ADR-027 and ADR-018; uses ADR-029 for durable rescue-driven side effects |
-| 029 | [Transactional follow-up jobs](029-transactional-followup-jobs.md) | Proposed | Durable lifecycle side effects are delivered by enqueuing follow-up Awa jobs in the same transaction as the triggering state commit; hooks remain for observation | Codifies ADR-015's "enqueue another job" guidance; resolves the durable-event punt in proposed ADRs 027/028 |
+| 029 | [Transactional follow-up jobs](029-transactional-followup-jobs.md) | Accepted | Durable lifecycle side effects are delivered by enqueuing follow-up Awa jobs — atomically with the triggering state UPDATE for worker-driven outcomes, best-effort in a separate transaction for callback resolution and maintenance rescue; hooks remain for observation | Codifies ADR-015's "enqueue another job" guidance; addresses the durable-event punt in ADRs 027/028 |
 
 ## Validation artifacts
 

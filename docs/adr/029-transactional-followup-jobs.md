@@ -2,7 +2,10 @@
 
 ## Status
 
-Proposed
+Accepted. Worker-driven outcomes commit follow-ups atomically with the
+state transition; callback-resolution and maintenance-rescue paths
+dispatch follow-ups best-effort in a separate transaction (see
+[Atomicity matrix](#atomicity-matrix)).
 
 ## Context
 
@@ -56,12 +59,17 @@ Keep ADR-015's in-process hooks unchanged for observation. Add a first-class
 ### Principle
 
 A side effect that must survive process crash, deployment, or a split
-deployment topology (per ADR-027) is delivered as an Awa job that is
-**enqueued in the same database transaction** as the triggering state
-transition. The follow-up job inherits Awa's existing durability properties:
+deployment topology (per ADR-027) is delivered as an Awa job. For
+worker-driven outcomes that follow-up `INSERT`s **in the same database
+transaction** as the triggering state transition — both commit together
+or both roll back. Callback resolution and maintenance rescue dispatch
+their follow-ups in a separate transaction (best-effort, see
+[Atomicity matrix](#atomicity-matrix)) because the resolution / rescue
+transition has already committed by the time the dispatcher sees it.
+Either way the follow-up inherits Awa's existing durability properties:
 at-least-once delivery, retries, dead-letter (ADR-020), DLQ replay,
-observability through the admin UI, and crash recovery via run-lease guarded
-finalization (ADR-013).
+observability through the admin UI, and crash recovery via run-lease
+guarded finalization (ADR-013).
 
 ### Builder API
 
@@ -86,36 +94,44 @@ Client::builder(pool)
     });
 ```
 
-The closure returns a follow-up `JobArgs` value (or an `Option<...>` /
-`InsertParams` for conditional / option-bearing follow-ups; final shape is an
-implementation detail of the follow-up issue). The engine inserts the
-follow-up job in the transaction that commits the trigger's state change. If
-the transaction rolls back, the follow-up is not enqueued; if it commits,
-the follow-up is durably visible.
+The closure returns a follow-up `JobArgs` value (default `InsertOpts`) or
+an `EnqueueRequest<F>` with `InsertOpts` overrides. When the trigger is a
+worker-driven outcome the engine `INSERT`s the follow-up in the same
+transaction as the state `UPDATE`; the follow-up commits with the
+trigger or rolls back with it. For callback resolution and maintenance
+rescue the engine `INSERT`s the follow-up in a separate transaction
+opened *after* the trigger transaction commits (see
+[Atomicity matrix](#atomicity-matrix)). In either case, once the
+follow-up `INSERT` commits the row is durably visible and rides Awa's
+existing retry / DLQ machinery.
 
-Counterparts cover the same outcomes as the typed `JobEvent` variants:
-`on_started_enqueue`, `on_completed_enqueue`, `on_retried_enqueue`,
-`on_exhausted_enqueue`, `on_cancelled_enqueue`, and
-`on_waiting_for_callback_enqueue`. The `WaitingForCallback` variant is the
-park-time event introduced by the amendment to ADR-015 (PR #276); on `main`
-prior to that PR, the hook surface omits both `WaitingForCallback` and any
-parked-transition follow-up. `Snooze` continues to emit nothing on either
-surface.
+Counterparts cover the outcomes that benefit most from durable delivery:
+`on_completed_enqueue`, `on_retried_enqueue`, `on_exhausted_enqueue`,
+`on_cancelled_enqueue`, `on_waiting_for_callback_enqueue`, and
+`on_rescued_enqueue`. `Started` is intentionally excluded — claim-time
+enqueue would join the dispatcher's hot path and the use case for
+"job started" is observation, which `on_event` already covers.
+`Snooze` continues to emit nothing on either surface.
 
 ### Where the enqueue runs
 
-The enqueue is performed by whatever process performs the state transition:
+The enqueue is performed by whatever process performs the state
+transition:
 
-| Transition | Performed by | Follow-up enqueued by |
-|---|---|---|
-| Claim / inline outcomes (Started, Completed, Retried, Exhausted, Cancelled) | Worker executor | Worker executor, in the finalization transaction |
-| Callback resolution via worker `Client` | The resolving process | That process, in the resolution transaction |
-| Callback resolution via callback-only ingress (ADR-027) | Callback receiver | Callback receiver, in the resolution transaction |
-| Expired-callback / stale-heartbeat / deadline rescue (ADR-028) | Maintenance runtime | Maintenance runtime, in the rescue transaction |
+| Transition | Performed by | Follow-up enqueued by | Atomic? |
+|---|---|---|---|
+| Inline outcomes (Completed, Retried, Exhausted, Cancelled, WaitingForCallback) | Worker executor | Worker executor, in the finalization transaction | yes |
+| Callback resolution via worker `Client` | The resolving process | That process, in a separate transaction after the resolution commits | no — best-effort |
+| Callback resolution via callback-only ingress (ADR-027) | Callback receiver | Same as worker `Client` resolution: best-effort separate transaction | no — best-effort |
+| Expired-callback / stale-heartbeat / deadline rescue (ADR-028) | Maintenance runtime | Maintenance runtime, in a separate transaction after the rescue commits | no — best-effort |
 
-Every emitter shares one rule: the follow-up `INSERT` is in the same
-transaction as the state `UPDATE`. The follow-up is then claimed by an
-ordinary worker; the original transition does not need to wait for it.
+The atomicity asymmetry is deliberate: worker-driven outcomes inherit
+ADR-013's run-lease guard (zero rows matched → tx rollback → no
+follow-up). Tx-aware variants on every `admin::*` and rescue path are
+mechanically straightforward but invasive, so the best-effort path is
+accepted: the trigger has already committed, so the worst case is a
+missing follow-up — not a phantom follow-up. See
+[Atomicity matrix](#atomicity-matrix) for the call sites involved.
 
 ### Registry lives in process — for now
 
@@ -196,9 +212,12 @@ whose guarantees match the side effect.
   across every deployment role ADR-027 and ADR-028 introduce: inline
   outcomes, callback resolution (worker-`Client` or callback-only), rescue,
   and any future transition.
-- The rescue / timeout event gap closes naturally: a rescue transaction can
-  enqueue `job_failed_rescue` (or any user-defined follow-up) atomically
-  with the rescue UPDATE.
+- The rescue / timeout event gap closes: a rescue can dispatch
+  `job_failed_rescue` (or any user-defined follow-up) — best-effort,
+  in a separate transaction after the rescue commits, but the
+  follow-up itself is then a durable Awa job with full retry / DLQ
+  semantics. Closing this gap fully atomically is tracked as an open
+  extension.
 - The "what should be in a hook?" mistake disappears at the API level —
   observation and delivery have different names and obviously different
   guarantees.
@@ -289,42 +308,105 @@ positioning (ADR-001). Out of scope.
   ("enqueue another job") into a first-class API. ADR-015's hooks remain
   the correct mechanism for observation; this ADR adds the mechanism for
   delivery.
-- **ADR-027** (callback ingress, proposed). Resolves the open question
+- **ADR-027** (callback ingress, proposed). Addresses the open question
   ADR-027 punts on: durable callback notifications. A callback-only
-  ingress process enqueues follow-ups in the resolution transaction; no
-  in-process handler registry is required for delivery.
-- **ADR-028** (maintenance-only runtime, proposed). Gives rescue paths a
-  way to participate in lifecycle delivery without owning a handler
-  registry, closing the rescue / timeout event gap.
-- **ADR-013** (run-lease, guarded finalization). The follow-up enqueue
-  joins the same transaction as the guarded-finalization UPDATE; if the
-  UPDATE matches zero rows (stale outcome), the transaction rolls back and
-  the follow-up is not enqueued, preserving the at-most-once finalization
-  contract.
+  ingress process dispatches follow-ups best-effort after the
+  resolution commits; no in-process handler registry is required for
+  delivery.
+- **ADR-028** (maintenance-only runtime, proposed). Gives rescue paths
+  a way to dispatch durable lifecycle work without owning a handler
+  registry. The dispatch is best-effort (separate transaction); the
+  follow-up itself is a regular Awa job once enqueued.
+- **ADR-013** (run-lease, guarded finalization). For worker-driven
+  outcomes the follow-up enqueue joins the same transaction as the
+  guarded-finalization UPDATE; if the UPDATE matches zero rows (stale
+  outcome), the transaction rolls back and the follow-up is not
+  enqueued, preserving the at-most-once finalization contract.
 - **ADR-020** (DLQ). Follow-up jobs participate in the DLQ family
   unchanged; a side effect that exhausts retries lands in the DLQ with
   full args and history.
-- **ADR-021** (sequential callbacks, callback heartbeats). The callback
-  resolution surface remains as defined; this ADR adds a follow-up insert
-  to its resolving transaction.
+- **ADR-021** (sequential callbacks, callback heartbeats). The
+  callback resolution surface is unchanged; this ADR adds a follow-up
+  dispatch that runs in a separate transaction after the resolution
+  commits.
 - **ADR-006** (insert-only transaction bridge) and **ADR-016/017**
   (Postgres adapter / Python transaction bridge). The same transactional
   insert primitive is reused; nothing new is added to the bridge contract.
 
-## Open questions for follow-up issues
+## Implementation
 
-These are deferred and intentionally not decided here:
+- **Outcome surface.** `Outcome::{Completed, Retried, Exhausted,
+  Cancelled, WaitingForCallback, Rescued}`. `Started` is intentionally
+  excluded — claim-time enqueue would join the dispatcher's hot path,
+  and the durable-side-effect use case for "job started" is uncommon.
+  Observation belongs to `on_event`. `on_started_enqueue` is not
+  blocked by anything in this design; whether to add it is left as an
+  open question rather than a v1 commitment.
+- **Builder API.** Each outcome has a pair of builders:
+  `on_<outcome>_enqueue` (closure returns `JobArgs`) and
+  `on_<outcome>_enqueue_with` (closure returns
+  `EnqueueRequest<F>` for `InsertOpts` overrides —
+  queue, priority, max_attempts, metadata, tags, unique, run_at,
+  deadline_duration, ordering_key).
+- **Closure signatures** carry the per-outcome context:
+  Completed/WaitingForCallback: `(args, &job_row)`;
+  Cancelled: `(args, &job_row, &reason)`;
+  Retried: `(args, &job_row, &error, attempt, next_run_at)`;
+  Exhausted: `(args, &job_row, &error, attempt)`;
+  Rescued: `(args, &job_row, RescueReason)`.
+- **Rescued event variant.** Maintenance rescues fire
+  `JobEvent::Rescued { args, job, reason: RescueReason }` alongside the
+  follow-up spec dispatch, keeping rescue context distinct from
+  Retried/Exhausted rather than overloading either.
 
-- Exact `ClientBuilder` method names and the closure return type
-  (`Args`, `Option<Args>`, or `InsertParams` for finer control of queue /
-  scheduling / unique opts on the follow-up).
-- Whether follow-up specs may be conditional on the trigger's args / row
-  state in v1, or whether all conditioning must live in the follow-up
-  handler.
-- Python parity: how the same surface is expressed in the Python API
-  (likely via a decorator mirroring `@on_event` with an `enqueue=` form).
-- Whether the in-DB spec registry (deferred above) should be sketched in
-  a separate ADR before any production deployment is split across
-  versions.
-- The exact NOTIFY-as-wakeup-hint integration with the follow-up's queue
-  poll cadence — implementation-level, not architectural.
+### Atomicity matrix
+
+| Emission site | Atomic with state commit? |
+|---|---|
+| Worker-driven outcomes on canonical storage | yes — `*_canonical_with_followups` helpers open one tx, run the state UPDATE (UPDATE...RETURNING on `awa.jobs_hot`; for `retryable` the DELETE+INSERT move into `awa.scheduled_jobs` is in a CTE), dispatch specs, commit |
+| Worker-driven outcomes on queue storage | yes — `*_queue_storage_with_followups` helpers run inside `complete_runtime_batch_slow_in_tx` / `cancel_running_in_tx` / `fail_*_in_tx` / `retry_*_in_tx` / `enter_callback_wait_in_tx` |
+| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) | **no — best-effort.** Spec dispatch runs in a separate tx after the resolution commits. If the spec INSERT fails the job remains resolved and the error is logged. Fully-atomic variant is tracked as follow-up (requires `_in_tx` versions of `admin::*_external` and the matching `store::*_external` paths). |
+| Maintenance rescue (stale heartbeat, deadline exceeded, expired callback) | **no — best-effort**, same shape and caveat as callback resolution |
+
+The asymmetry is deliberate: worker-driven outcomes are the dominant
+path and inherit ADR-013's run-lease guard (zero rows matched → tx
+rollback → no follow-up). The trigger transition and the follow-up
+`INSERT` either both commit or neither does, so each committed
+worker-driven outcome enqueues each registered follow-up exactly
+once. *Delivery* of the follow-up itself is at-least-once — once
+enqueued the row rides Awa's normal claim/retry semantics, and the
+follow-up handler must remain safe under re-execution. Tx-aware
+variants on every `admin::*` and rescue path are mechanically
+straightforward but invasive, and the best-effort path is correct
+enough for the supported guarantee: the trigger has already committed,
+so the worst case is a missing follow-up — not a phantom follow-up.
+
+### Open extensions
+
+- **Python parity.** The Python binding does not yet expose
+  `on_*_enqueue` or `on_event`. The implementation path mirrors
+  `register_worker` in `awa-python/src/worker.rs`: a `PythonFollowUp`
+  type that wraps a Python callable, takes the GIL inside
+  `dispatch_specs_in_tx`, serialises `JobRow + OutcomeContext` to
+  Python, invokes the callable, and decodes the returned dict to
+  (`JobArgs`, `InsertOpts`) before the underlying `insert_with` fires.
+  ADR-015's hook surface (`@on_event`) needs the same scaffold first.
+- **Atomic callback-resolution + follow-up enqueue.** Requires
+  `admin::{complete,fail,retry,resume}_external_in_tx` and matching
+  queue-storage store methods so `Client::*_external` can drive the
+  resolution and the spec dispatch in a single tx.
+- **Atomic rescue + follow-up enqueue.** Threads `&mut tx` through
+  `maintenance::rescue_*` so the rescue UPDATE and the Rescued spec
+  dispatch commit together.
+- **`on_started_enqueue`.** Not blocked by the design; deliberately
+  out of scope to keep the claim/dispatch hot path uncontended. The
+  observation use case is already covered by `on_event`.
+- **Conditional spec dispatch.** Skipping enqueue based on a predicate
+  over the triggering row is not part of the API; conditioning belongs
+  inside the follow-up handler instead.
+- **In-DB spec registry.** Not part of the design; the in-process
+  registry is sufficient while specs are declared in one place per
+  deployment.
+- **NOTIFY-as-wakeup-hint for follow-up queue poll cadence.** An
+  implementation-level tuning lever rather than an architectural
+  concern.
