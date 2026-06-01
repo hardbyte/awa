@@ -2,10 +2,10 @@
 
 ## Status
 
-Accepted. Worker-driven outcomes commit follow-ups atomically with the
-state transition; callback-resolution and maintenance-rescue paths
-dispatch follow-ups best-effort in a separate transaction (see
-[Atomicity matrix](#atomicity-matrix)).
+Accepted. Worker-driven outcomes and callback resolution via the worker
+`Client` commit follow-ups atomically with the state transition;
+maintenance rescue dispatches follow-ups best-effort in a separate
+transaction (see [Atomicity matrix](#atomicity-matrix)).
 
 ## Context
 
@@ -95,15 +95,16 @@ Client::builder(pool)
 ```
 
 The closure returns a follow-up `JobArgs` value (default `InsertOpts`) or
-an `EnqueueRequest<F>` with `InsertOpts` overrides. When the trigger is a
-worker-driven outcome the engine `INSERT`s the follow-up in the same
-transaction as the state `UPDATE`; the follow-up commits with the
-trigger or rolls back with it. For callback resolution and maintenance
-rescue the engine `INSERT`s the follow-up in a separate transaction
-opened *after* the trigger transaction commits (see
-[Atomicity matrix](#atomicity-matrix)). In either case, once the
-follow-up `INSERT` commits the row is durably visible and rides Awa's
-existing retry / DLQ machinery.
+an `EnqueueRequest<F>` with `InsertOpts` overrides. For worker-driven
+outcomes and callback resolution via the worker `Client`, the engine
+`INSERT`s the follow-up in the same transaction as the triggering state
+change; the follow-up commits with the trigger or rolls back with it
+(a spec INSERT failure or a panic in the user-supplied closure rolls the
+trigger transition back as well). For maintenance rescue the engine
+`INSERT`s the follow-up in a separate transaction opened *after* the
+rescue commits (see [Atomicity matrix](#atomicity-matrix)). In either
+case, once the follow-up `INSERT` commits the row is durably visible and
+rides Awa's existing retry / DLQ machinery.
 
 Counterparts cover the outcomes that benefit most from durable delivery:
 `on_completed_enqueue`, `on_retried_enqueue`, `on_exhausted_enqueue`,
@@ -121,16 +122,18 @@ transition:
 | Transition | Performed by | Follow-up enqueued by | Atomic? |
 |---|---|---|---|
 | Inline outcomes (Completed, Retried, Exhausted, Cancelled, WaitingForCallback) | Worker executor | Worker executor, in the finalization transaction | yes |
-| Callback resolution via worker `Client` | The resolving process | That process, in a separate transaction after the resolution commits | no — best-effort |
-| Callback resolution via callback-only ingress (ADR-027) | Callback receiver | Same as worker `Client` resolution: best-effort separate transaction | no — best-effort |
+| Callback resolution via worker `Client` | The resolving process | That process, in the resolution transaction (via `admin::*_external_in_tx` / `store::*_external_in_tx`) | yes |
+| Callback resolution via callback-only ingress (ADR-027) | Callback receiver | Pending: callback-only ingress does not yet own a worker registry. When that surface lands it can reuse the same `_in_tx` admin / store helpers used by the worker `Client`. | pending |
 | Expired-callback / stale-heartbeat / deadline rescue (ADR-028) | Maintenance runtime | Maintenance runtime, in a separate transaction after the rescue commits | no — best-effort |
 
-The atomicity asymmetry is deliberate: worker-driven outcomes inherit
-ADR-013's run-lease guard (zero rows matched → tx rollback → no
-follow-up). Tx-aware variants on every `admin::*` and rescue path are
-mechanically straightforward but invasive, so the best-effort path is
-accepted: the trigger has already committed, so the worst case is a
-missing follow-up — not a phantom follow-up. See
+Why rescue stays best-effort: a panic in a user-supplied
+`on_rescued_enqueue` closure would otherwise roll the rescue UPDATE
+back, coupling rescue liveness (the maintenance loop's job recovery
+guarantee) to the correctness of user follow-up code. A zero-loss
+rescue-notification story is better served by an outbox/sweeper than
+by inlining user code into the rescue tx. The current best-effort
+behaviour means the trigger has already committed, so the worst case
+is a missing follow-up — not a phantom follow-up. See
 [Atomicity matrix](#atomicity-matrix) for the call sites involved.
 
 ### Registry lives in process — for now
@@ -365,21 +368,24 @@ positioning (ADR-001). Out of scope.
 |---|---|
 | Worker-driven outcomes on canonical storage | yes — `*_canonical_with_followups` helpers open one tx, run the state UPDATE (UPDATE...RETURNING on `awa.jobs_hot`; for `retryable` the DELETE+INSERT move into `awa.scheduled_jobs` is in a CTE), dispatch specs, commit |
 | Worker-driven outcomes on queue storage | yes — `*_queue_storage_with_followups` helpers run inside `complete_runtime_batch_slow_in_tx` / `cancel_running_in_tx` / `fail_*_in_tx` / `retry_*_in_tx` / `enter_callback_wait_in_tx` |
-| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) | **no — best-effort.** Spec dispatch runs in a separate tx after the resolution commits. If the spec INSERT fails the job remains resolved and the error is logged. Fully-atomic variant is tracked as follow-up (requires `_in_tx` versions of `admin::*_external` and the matching `store::*_external` paths). |
-| Maintenance rescue (stale heartbeat, deadline exceeded, expired callback) | **no — best-effort**, same shape and caveat as callback resolution |
+| Callback resolution on `Client` (`complete_external`, `fail_external`, `retry_external`, `resolve_callback`) on either storage engine | yes — `Client::*_external` opens one tx, drives the transition via `admin::*_external_in_tx` / `store::*_external_in_tx`, dispatches specs via `dispatch_specs_in_tx`, commits. A spec failure rolls the resolution back so the external sender can retry. |
+| Maintenance rescue (stale heartbeat, deadline exceeded, expired callback) | **no — best-effort.** Spec dispatch runs in a separate tx after the rescue commits. A spec failure leaves the rescue applied and is logged. Kept best-effort by design (see [Open extensions](#open-extensions)). |
 
-The asymmetry is deliberate: worker-driven outcomes are the dominant
-path and inherit ADR-013's run-lease guard (zero rows matched → tx
-rollback → no follow-up). The trigger transition and the follow-up
-`INSERT` either both commit or neither does, so each committed
-worker-driven outcome enqueues each registered follow-up exactly
-once. *Delivery* of the follow-up itself is at-least-once — once
-enqueued the row rides Awa's normal claim/retry semantics, and the
-follow-up handler must remain safe under re-execution. Tx-aware
-variants on every `admin::*` and rescue path are mechanically
-straightforward but invasive, and the best-effort path is correct
-enough for the supported guarantee: the trigger has already committed,
-so the worst case is a missing follow-up — not a phantom follow-up.
+Worker-driven outcomes inherit ADR-013's run-lease guard (zero rows
+matched → tx rollback → no follow-up); callback resolution inherits a
+matching guard from the `SELECT ... FOR UPDATE` lookup on `awa.jobs_hot`
+or `FOR UPDATE OF lease` on the queue-storage leases table. The
+trigger transition and the follow-up `INSERT` either both commit or
+neither does, so each committed worker-driven outcome or callback
+resolution enqueues each registered follow-up exactly once. *Delivery*
+of the follow-up itself is at-least-once — once enqueued the row rides
+Awa's normal claim/retry semantics, and the follow-up handler must
+remain safe under re-execution. The maintenance rescue path remains
+best-effort because coupling rescue liveness to the correctness of user
+follow-up code (a panic in `on_rescued_enqueue`) would be a worse
+trade than a missed Rescued follow-up; the rescue UPDATE has already
+committed when the dispatch runs, so the worst case is a missing
+follow-up — not a phantom follow-up.
 
 ### Open extensions
 
@@ -391,13 +397,21 @@ so the worst case is a missing follow-up — not a phantom follow-up.
   Python, invokes the callable, and decodes the returned dict to
   (`JobArgs`, `InsertOpts`) before the underlying `insert_with` fires.
   ADR-015's hook surface (`@on_event`) needs the same scaffold first.
-- **Atomic callback-resolution + follow-up enqueue.** Requires
-  `admin::{complete,fail,retry,resume}_external_in_tx` and matching
-  queue-storage store methods so `Client::*_external` can drive the
-  resolution and the spec dispatch in a single tx.
-- **Atomic rescue + follow-up enqueue.** Threads `&mut tx` through
-  `maintenance::rescue_*` so the rescue UPDATE and the Rescued spec
-  dispatch commit together.
+- **Atomic callback-resolution for callback-only ingress (ADR-027).**
+  The worker `Client::*_external` paths now drive the resolution and
+  spec dispatch in a single tx via `admin::*_external_in_tx` and the
+  matching `store::*_external_in_tx` helpers. The callback-only
+  ingress process landed by ADR-027 will need its own registry hookup
+  to reuse the same `_in_tx` admin path; until then, callback ingress
+  outside the worker `Client` remains a separate transition with no
+  follow-up dispatch.
+- **Atomic rescue + follow-up enqueue: deliberately not pursued.**
+  Threading `&mut tx` through `maintenance::rescue_*` would couple
+  rescue liveness to the correctness of user follow-up code — a panic
+  in `on_rescued_enqueue` could roll back a rescue UPDATE and prevent
+  maintenance from recovering stale jobs. A future zero-loss
+  rescue-notification design should use an outbox/sweeper rather than
+  inlining user code into the rescue tx.
 - **`on_started_enqueue`.** Not blocked by the design; deliberately
   out of scope to keep the claim/dispatch hot path uncontended. The
   observation use case is already covered by `on_event`.

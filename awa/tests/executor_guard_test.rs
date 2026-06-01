@@ -125,6 +125,7 @@ async fn test_shutdown_waits_for_inflight_jobs() {
     }
 
     let client = Client::builder(pool.clone())
+        .canonical_storage()
         .queue(
             queue,
             QueueConfig {
@@ -219,6 +220,7 @@ async fn test_heartbeat_alive_during_drain() {
     }
 
     let client = Client::builder(pool.clone())
+        .canonical_storage()
         .queue(
             queue,
             QueueConfig {
@@ -297,6 +299,7 @@ async fn test_deadline_rescue_signals_cancellation() {
     }
 
     let client = Client::builder(pool.clone())
+        .canonical_storage()
         .queue(
             queue,
             QueueConfig {

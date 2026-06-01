@@ -253,6 +253,21 @@ async fn active_queue_storage(pool: &PgPool) -> Result<Option<QueueStorage>, Awa
         .transpose()
 }
 
+/// Transaction-aware variant of [`active_queue_storage`] — read the active
+/// queue-storage schema inside the caller's transaction so the engine
+/// selection and the resulting state UPDATE commit (or roll back)
+/// together. Required by the ADR-029 atomic callback resolution path so a
+/// race between this read and a routing flip can never split the chosen
+/// engine and the transition that follows.
+async fn active_queue_storage_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+) -> Result<Option<QueueStorage>, AwaError> {
+    QueueStorage::active_schema_in_tx(tx)
+        .await?
+        .map(QueueStorage::from_existing_schema)
+        .transpose()
+}
+
 fn queue_storage_current_jobs_cte(schema: &str) -> String {
     format!(
         r#"
@@ -2808,7 +2823,24 @@ pub async fn complete_external(
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    complete_external_inner(pool, callback_id, payload, run_lease, false).await
+    let mut tx = pool.begin().await?;
+    let row = complete_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Transaction-aware variant of [`complete_external`] (ADR-029). Callers
+/// that want to dispatch follow-up specs in the same transaction as the
+/// callback completion should drive this directly and own the
+/// `tx.commit()`. See [`crate::admin::resolve_callback_in_tx`] for the
+/// policy-evaluating counterpart.
+pub async fn complete_external_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    payload: Option<serde_json::Value>,
+    run_lease: Option<i64>,
+) -> Result<JobRow, AwaError> {
+    complete_external_in_tx_inner(tx, callback_id, payload, run_lease, false).await
 }
 
 /// Complete a waiting job and resume the handler with the callback payload.
@@ -2822,19 +2854,38 @@ pub async fn resume_external(
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    complete_external_inner(pool, callback_id, payload, run_lease, true).await
+    let mut tx = pool.begin().await?;
+    let row = resume_external_in_tx(&mut tx, callback_id, payload, run_lease).await?;
+    tx.commit().await?;
+    Ok(row)
 }
 
-async fn complete_external_inner(
-    pool: &PgPool,
+/// Transaction-aware variant of [`resume_external`] (ADR-029). Resume is
+/// not currently an ADR-029 outcome — the handler keeps running and will
+/// emit its own completion event later — so callers that just need
+/// payload delivery generally use [`resume_external`]. This `_in_tx`
+/// shape exists for symmetry with the other callback transitions and so
+/// applications can compose the resume `UPDATE` with their own
+/// transaction-local writes.
+pub async fn resume_external_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    payload: Option<serde_json::Value>,
+    run_lease: Option<i64>,
+) -> Result<JobRow, AwaError> {
+    complete_external_in_tx_inner(tx, callback_id, payload, run_lease, true).await
+}
+
+async fn complete_external_in_tx_inner(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     callback_id: Uuid,
     payload: Option<serde_json::Value>,
     run_lease: Option<i64>,
     resume: bool,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    if let Some(store) = active_queue_storage_in_tx(tx).await? {
         return store
-            .complete_external(pool, callback_id, payload, run_lease, resume)
+            .complete_external_in_tx(tx, callback_id, payload, run_lease, resume)
             .await;
     }
 
@@ -2862,7 +2913,7 @@ async fn complete_external_inner(
         .bind(callback_id)
         .bind(run_lease)
         .bind(&payload_json)
-        .fetch_optional(pool)
+        .fetch_optional(tx.as_mut())
         .await?
     } else {
         // Complete: terminal state, clear everything.
@@ -2887,7 +2938,7 @@ async fn complete_external_inner(
         )
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(pool)
+        .fetch_optional(tx.as_mut())
         .await?
     };
 
@@ -2905,9 +2956,27 @@ pub async fn fail_external(
     error: &str,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    let row = fail_external_in_tx(&mut tx, callback_id, error, run_lease).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Transaction-aware variant of [`fail_external`] (ADR-029).
+pub async fn fail_external_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    error: &str,
+    run_lease: Option<i64>,
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage_in_tx(tx).await? {
         return store
-            .fail_external(pool, callback_id, error, run_lease)
+            .fail_external_with_error_entry_in_tx(
+                tx,
+                callback_id,
+                serde_json::json!({ "error": error }),
+                run_lease,
+            )
             .await;
     }
 
@@ -2937,7 +3006,7 @@ pub async fn fail_external(
     .bind(callback_id)
     .bind(error)
     .bind(run_lease)
-    .fetch_optional(pool)
+    .fetch_optional(tx.as_mut())
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -2959,8 +3028,20 @@ pub async fn retry_external(
     callback_id: Uuid,
     run_lease: Option<i64>,
 ) -> Result<JobRow, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
-        return store.retry_external(pool, callback_id, run_lease).await;
+    let mut tx = pool.begin().await?;
+    let row = retry_external_in_tx(&mut tx, callback_id, run_lease).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// Transaction-aware variant of [`retry_external`] (ADR-029).
+pub async fn retry_external_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    run_lease: Option<i64>,
+) -> Result<JobRow, AwaError> {
+    if let Some(store) = active_queue_storage_in_tx(tx).await? {
+        return store.retry_external_in_tx(tx, callback_id, run_lease).await;
     }
 
     let row = sqlx::query_as::<_, JobRow>(
@@ -2985,7 +3066,7 @@ pub async fn retry_external(
     )
     .bind(callback_id)
     .bind(run_lease)
-    .fetch_optional(pool)
+    .fetch_optional(tx.as_mut())
     .await?;
 
     row.ok_or(AwaError::CallbackNotFound {
@@ -3362,9 +3443,36 @@ pub async fn resolve_callback(
     default_action: DefaultAction,
     run_lease: Option<i64>,
 ) -> Result<ResolveOutcome, AwaError> {
-    if let Some(store) = active_queue_storage(pool).await? {
+    let mut tx = pool.begin().await?;
+    let outcome =
+        resolve_callback_in_tx(&mut tx, callback_id, payload, default_action, run_lease).await?;
+    tx.commit().await?;
+    Ok(outcome)
+}
+
+/// Transaction-aware variant of [`resolve_callback`] (ADR-029).
+///
+/// Performs callback lookup, CEL evaluation, and the chosen state
+/// transition (Complete / Fail / Ignore) inside the caller-owned
+/// transaction. The lookup takes a row lock — `SELECT ... FOR UPDATE` on
+/// `awa.jobs_hot` for canonical storage; `FOR UPDATE OF lease` against
+/// the active queue-storage `leases` table — so concurrent resolves are
+/// serialised on the same `callback_id`.
+///
+/// Callers that want to dispatch ADR-029 follow-up specs in the same
+/// transaction (e.g. `Client::resolve_callback`) drive this directly,
+/// then dispatch specs against the returned [`ResolveOutcome`] before
+/// committing.
+pub async fn resolve_callback_in_tx(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    callback_id: Uuid,
+    payload: Option<serde_json::Value>,
+    default_action: DefaultAction,
+    run_lease: Option<i64>,
+) -> Result<ResolveOutcome, AwaError> {
+    if let Some(store) = active_queue_storage_in_tx(tx).await? {
         let job = store
-            .callback_job(pool, callback_id, run_lease)
+            .callback_job_in_tx(tx, callback_id, run_lease, true)
             .await?
             .ok_or(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
@@ -3375,7 +3483,7 @@ pub async fn resolve_callback(
         return match action {
             ResolveAction::Complete(transformed_payload) => {
                 let completed_job = store
-                    .complete_external(pool, callback_id, None, run_lease, false)
+                    .complete_external_in_tx(tx, callback_id, None, run_lease, false)
                     .await?;
                 Ok(ResolveOutcome::Completed {
                     payload: transformed_payload,
@@ -3393,15 +3501,13 @@ pub async fn resolve_callback(
                 }
 
                 let failed_job = store
-                    .fail_external_with_error_entry(pool, callback_id, error_json, run_lease)
+                    .fail_external_with_error_entry_in_tx(tx, callback_id, error_json, run_lease)
                     .await?;
                 Ok(ResolveOutcome::Failed { job: failed_job })
             }
             ResolveAction::Ignore(reason) => Ok(ResolveOutcome::Ignored { reason }),
         };
     }
-
-    let mut tx = pool.begin().await?;
 
     // Query jobs_hot directly (not the awa.jobs UNION ALL view) because
     // FOR UPDATE is not reliably supported on UNION views. Waiting_external
@@ -3419,7 +3525,7 @@ pub async fn resolve_callback(
     )
     .bind(callback_id)
     .bind(run_lease)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(tx.as_mut())
     .await?
     .ok_or(AwaError::CallbackNotFound {
         callback_id: callback_id.to_string(),
@@ -3448,10 +3554,9 @@ pub async fn resolve_callback(
                 "#,
             )
             .bind(job.id)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.as_mut())
             .await?;
 
-            tx.commit().await?;
             Ok(ResolveOutcome::Completed {
                 payload: transformed_payload,
                 job: completed_job,
@@ -3487,14 +3592,14 @@ pub async fn resolve_callback(
             )
             .bind(job.id)
             .bind(error_json)
-            .fetch_one(&mut *tx)
+            .fetch_one(tx.as_mut())
             .await?;
 
-            tx.commit().await?;
             Ok(ResolveOutcome::Failed { job: failed_job })
         }
         ResolveAction::Ignore(reason) => {
-            // No state change — dropping tx releases FOR UPDATE lock
+            // No state change — caller's tx will commit cleanly without
+            // changing the FOR UPDATE row, releasing the lock.
             Ok(ResolveOutcome::Ignored { reason })
         }
     }

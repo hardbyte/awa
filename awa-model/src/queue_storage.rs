@@ -1829,6 +1829,20 @@ impl QueueStorage {
         .map_err(map_sqlx_error)
     }
 
+    /// Transaction-aware variant of [`Self::active_schema`] — read the
+    /// active queue-storage schema name inside the caller's transaction
+    /// rather than acquiring a separate pool connection.
+    pub async fn active_schema_in_tx(
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    ) -> Result<Option<String>, AwaError> {
+        sqlx::query_scalar(
+            "SELECT schema_name FROM awa.runtime_storage_backends WHERE backend = 'queue_storage'",
+        )
+        .fetch_optional(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)
+    }
+
     fn materialize_runtime_payload(
         payload: serde_json::Value,
         progress: Option<serde_json::Value>,
@@ -9304,6 +9318,31 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<Option<JobRow>, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .callback_job_in_tx(&mut tx, callback_id, run_lease, false)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::callback_job`] (ADR-029).
+    /// When `for_update` is `true` the join's lease row is locked with
+    /// `FOR UPDATE OF lease`, mirroring the canonical `resolve_callback`
+    /// lookup that takes a row lock on `awa.jobs_hot` before evaluating
+    /// the callback policy and committing the resulting transition.
+    pub async fn callback_job_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        callback_id: Uuid,
+        run_lease: Option<i64>,
+        for_update: bool,
+    ) -> Result<Option<JobRow>, AwaError> {
+        let lock_clause = if for_update {
+            "FOR UPDATE OF lease"
+        } else {
+            ""
+        };
         let row: Option<LeaseJobRow> = sqlx::query_as(&format!(
             r#"
             SELECT
@@ -9352,13 +9391,14 @@ impl QueueStorage {
               AND ($2::bigint IS NULL OR lease.run_lease = $2)
             ORDER BY lease.run_lease DESC
             LIMIT 1
+            {lock_clause}
             "#,
             self.leases_table(),
-            schema = self.schema()
+            schema = self.schema(),
         ))
         .bind(callback_id)
         .bind(run_lease)
-        .fetch_optional(pool)
+        .fetch_optional(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
 
@@ -9374,8 +9414,29 @@ impl QueueStorage {
         run_lease: Option<i64>,
         resume: bool,
     ) -> Result<JobRow, AwaError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .complete_external_in_tx(&mut tx, callback_id, payload, run_lease, resume)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::complete_external`] (ADR-029).
+    /// The non-resume path returns the post-completion `JobRow` directly
+    /// from the `done_row` insert. The resume path returns the parked-row
+    /// snapshot reloaded inside the same transaction via
+    /// [`Self::load_active_lease_in_tx`] — i.e. it does not leave the
+    /// caller's transaction to refresh state.
+    pub async fn complete_external_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        callback_id: Uuid,
+        payload: Option<serde_json::Value>,
+        run_lease: Option<i64>,
+        resume: bool,
+    ) -> Result<JobRow, AwaError> {
         if resume {
-            let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
             let resumed: Option<(i64, i64)> = sqlx::query_as(&format!(
                 r#"
                 UPDATE {}
@@ -9396,8 +9457,7 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            let Some((job_id, run_lease)) = resumed else {
-                tx.commit().await.map_err(map_sqlx_error)?;
+            let Some((job_id, resumed_run_lease)) = resumed else {
                 return Err(AwaError::CallbackNotFound {
                     callback_id: callback_id.to_string(),
                 });
@@ -9428,16 +9488,14 @@ impl QueueStorage {
                 self.attempt_state_table()
             ))
             .bind(job_id)
-            .bind(run_lease)
+            .bind(resumed_run_lease)
             .bind(payload.unwrap_or(serde_json::Value::Null))
             .execute(tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
-            tx.commit().await.map_err(map_sqlx_error)?;
-
             return self
-                .load_job(pool, job_id)
+                .load_active_lease_in_tx(tx, job_id, resumed_run_lease)
                 .await?
                 .ok_or(AwaError::CallbackNotFound {
                     callback_id: callback_id.to_string(),
@@ -9445,7 +9503,6 @@ impl QueueStorage {
         }
 
         let schema = self.schema();
-        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -9478,13 +9535,12 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Err(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             });
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -9496,9 +9552,8 @@ impl QueueStorage {
             moved
                 .clone()
                 .into_done_row(JobState::Completed, Utc::now(), payload.into_json());
-        self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done_row), Some(moved.state))
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done_row), Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         done_row.into_job_row()
     }
 
@@ -9525,8 +9580,24 @@ impl QueueStorage {
         error_entry: serde_json::Value,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .fail_external_with_error_entry_in_tx(&mut tx, callback_id, error_entry, run_lease)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::fail_external_with_error_entry`]
+    /// (ADR-029).
+    pub async fn fail_external_with_error_entry_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        callback_id: Uuid,
+        error_entry: serde_json::Value,
+        run_lease: Option<i64>,
+    ) -> Result<JobRow, AwaError> {
+        let schema = self.schema();
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -9559,13 +9630,12 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Err(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             });
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let mut payload = RuntimePayload::from_json(Self::payload_with_attempt_state(
@@ -9593,9 +9663,8 @@ impl QueueStorage {
             moved
                 .clone()
                 .into_done_row(JobState::Failed, Utc::now(), payload.into_json());
-        self.insert_done_rows_tx(&mut tx, std::slice::from_ref(&done_row), Some(moved.state))
+        self.insert_done_rows_tx(tx, std::slice::from_ref(&done_row), Some(moved.state))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         done_row.into_job_row()
     }
 
@@ -9605,8 +9674,22 @@ impl QueueStorage {
         callback_id: Uuid,
         run_lease: Option<i64>,
     ) -> Result<JobRow, AwaError> {
-        let schema = self.schema();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        let result = self
+            .retry_external_in_tx(&mut tx, callback_id, run_lease)
+            .await?;
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(result)
+    }
+
+    /// Transaction-aware variant of [`Self::retry_external`] (ADR-029).
+    pub async fn retry_external_in_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+        callback_id: Uuid,
+        run_lease: Option<i64>,
+    ) -> Result<JobRow, AwaError> {
+        let schema = self.schema();
         let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
             r#"
             DELETE FROM {schema}.leases
@@ -9639,13 +9722,12 @@ impl QueueStorage {
         .map_err(map_sqlx_error)?;
 
         if deleted.is_empty() {
-            tx.commit().await.map_err(map_sqlx_error)?;
             return Err(AwaError::CallbackNotFound {
                 callback_id: callback_id.to_string(),
             });
         }
 
-        let moved = self.hydrate_deleted_leases_tx(&mut tx, deleted).await?;
+        let moved = self.hydrate_deleted_leases_tx(tx, deleted).await?;
         let moved = moved.into_iter().next().expect("deleted callback lease");
 
         let ready_payload =
@@ -9656,11 +9738,10 @@ impl QueueStorage {
             run_at: Utc::now(),
             ..moved.clone().into_ready_row(Utc::now(), ready_payload)
         };
-        self.insert_existing_ready_rows_tx(&mut tx, vec![ready_row.clone()], Some(moved.state))
+        self.insert_existing_ready_rows_tx(tx, vec![ready_row.clone()], Some(moved.state))
             .await?;
-        self.notify_queues_tx(&mut tx, std::iter::once(moved.queue.clone()))
+        self.notify_queues_tx(tx, std::iter::once(moved.queue.clone()))
             .await?;
-        tx.commit().await.map_err(map_sqlx_error)?;
         ReadyJobRow {
             job_id: ready_row.job_id,
             kind: ready_row.kind,

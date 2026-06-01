@@ -993,3 +993,285 @@ async fn on_rescued_enqueue_dispatches_followup_on_expired_callback() {
     assert_eq!(follow_args.user_id, 601);
     assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
 }
+
+/// Atomicity contract for `Client::complete_external`: if the registered
+/// `on_completed_enqueue` closure panics, the callback completion must
+/// roll back together with the failed follow-up so the external sender
+/// sees a retryable failure and the next delivery can succeed.
+#[tokio::test]
+async fn complete_external_rolls_back_callback_on_followup_panic() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_canonical().await;
+    let queue = "enqueue_spec_cb_complete_panic";
+
+    let client = Client::builder(pool.clone())
+        .canonical_storage()
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_completed_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|_args, _job| {
+            panic!("callback follow-up exploded");
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 701 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let result = client.complete_external(callback_id, None, None).await;
+    assert!(
+        result.is_err(),
+        "complete_external must surface the panicking-spec error so the external \
+         sender can retry the callback"
+    );
+
+    // The callback row must still be addressable by its callback_id, i.e.
+    // the completion UPDATE rolled back along with the failed spec INSERT.
+    let after = admin::get_job(&pool, trigger_job.id).await.unwrap();
+    assert_eq!(after.state, JobState::WaitingExternal);
+    assert_eq!(after.callback_id, Some(callback_id));
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind()).await;
+    assert!(
+        follow_up.is_none(),
+        "no follow-up row should be visible after a rolled-back callback completion"
+    );
+    client.shutdown(Duration::from_secs(2)).await;
+}
+
+/// Queue-storage counterpart of
+/// `complete_external_rolls_back_callback_on_followup_panic`. A panic in
+/// `on_completed_enqueue` must roll back the queue-storage callback
+/// completion (deletion from leases, insert into done_entries) together
+/// with the failed follow-up so the callback row remains addressable
+/// and the external sender can retry.
+#[tokio::test]
+async fn complete_external_rolls_back_callback_on_followup_panic_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_cb_complete_panic";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_completed_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|_args, _job| {
+            panic!("queue-storage callback follow-up exploded");
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 801 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let result = client.complete_external(callback_id, None, None).await;
+    assert!(
+        result.is_err(),
+        "queue-storage complete_external must surface the panicking-spec \
+         error so the external sender can retry the callback"
+    );
+
+    let after = admin::get_job(&pool, trigger_job.id).await.unwrap();
+    assert_eq!(after.state, JobState::WaitingExternal);
+    assert_eq!(after.callback_id, Some(callback_id));
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind()).await;
+    assert!(
+        follow_up.is_none(),
+        "no follow-up row should be visible after a rolled-back queue-storage \
+         callback completion"
+    );
+    client.shutdown(Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn complete_external_dispatches_completed_followup_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_cb_complete";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_completed_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job| EnqueueFollowUp {
+            user_id: args.user_id,
+            triggered_by_job_id: job.id,
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 711 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let _completed = client
+        .complete_external(callback_id, None, None)
+        .await
+        .expect("queue-storage complete_external");
+
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage callback Completed follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 711);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn fail_external_dispatches_exhausted_followup_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_cb_fail";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_exhausted_enqueue::<WaitTrigger, EnqueueFollowUp, _>(|args, job, _error, _attempt| {
+            EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            }
+        })
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 712 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let _failed = client
+        .fail_external(callback_id, "external rejected", None)
+        .await
+        .expect("queue-storage fail_external");
+
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage callback Exhausted follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 712);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
+
+#[tokio::test]
+async fn retry_external_dispatches_retried_followup_under_queue_storage() {
+    let _permit = test_gate().acquire_owned().await.unwrap();
+    let pool = setup_pool_queue_storage().await;
+    let queue = "enqueue_spec_qs_cb_retry";
+
+    let client = Client::builder(pool.clone())
+        .queue(
+            queue,
+            QueueConfig {
+                poll_interval: Duration::from_millis(25),
+                ..Default::default()
+            },
+        )
+        .register_worker(WaitWorker)
+        .on_retried_enqueue::<WaitTrigger, EnqueueFollowUp, _>(
+            |args, job, _error, _attempt, _next_run_at| EnqueueFollowUp {
+                user_id: args.user_id,
+                triggered_by_job_id: job.id,
+            },
+        )
+        .build()
+        .unwrap();
+
+    let trigger_job = awa::insert_with(
+        &pool,
+        &WaitTrigger { user_id: 713 },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client.start().await.unwrap();
+    let parked = wait_for_state(&pool, trigger_job.id, JobState::WaitingExternal).await;
+    let callback_id = parked.callback_id.expect("callback id");
+
+    let _retried = client
+        .retry_external(callback_id, None)
+        .await
+        .expect("queue-storage retry_external");
+
+    let follow_up = first_follow_up(&pool, EnqueueFollowUp::kind())
+        .await
+        .expect("queue-storage callback Retried follow-up should be enqueued");
+    client.shutdown(Duration::from_secs(2)).await;
+
+    let follow_args: EnqueueFollowUp = serde_json::from_value(follow_up.args.clone()).unwrap();
+    assert_eq!(follow_args.user_id, 713);
+    assert_eq!(follow_args.triggered_by_job_id, trigger_job.id);
+}
