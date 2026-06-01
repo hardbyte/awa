@@ -118,20 +118,27 @@ psql "$DATABASE_URL" -c "
 # 7. Flip routing. New writes and cron enqueues go to queue storage.
 awa --database-url "$DATABASE_URL" storage enter-mixed-transition
 
-# 8. Watch canonical drain. `canonical_live_backlog()` sums non-terminal
-#    `jobs_hot` rows plus everything still in `scheduled_jobs` — the
-#    same number the gate uses internally.
-watch -n 5 'psql "$DATABASE_URL" -c "SELECT awa.canonical_live_backlog() AS canonical_backlog;"'
-#    → wait for canonical_backlog to reach 0
+# 8. Wait for canonical drain and finalize. `awa storage finalize --wait`
+#    polls every 5s and only invokes the SQL finalize once every
+#    readiness gate (`canonical_live_backlog`, no canonical or
+#    drain-only runtimes still heartbeating, etc.) has stayed clear
+#    for two consecutive observations. Default wait is unbounded;
+#    pass e.g. `--wait=2h` to cap. Polling progress is emitted via
+#    structured `tracing` logs (set `RUST_LOG=info` to see it).
+awa --database-url "$DATABASE_URL" storage finalize --wait
+#    → exits 0 once state=active; exits 2 if the wait cap expires
+#       while blockers remain.
 
-# 9. Finalize once canonical backlog is empty.
-awa --database-url "$DATABASE_URL" storage finalize
+# 8a. (Optional) Dry-run the readiness gates first without changing
+#     state. `--check` prints the same JSON `awa storage status`
+#     would, plus a one-line summary, and exits 2 if blocked.
+awa --database-url "$DATABASE_URL" storage finalize --check
 
-# 10. Verify active state.
+# 9. Verify active state.
 awa --database-url "$DATABASE_URL" storage status
 #    → current=queue_storage, active=queue_storage, prepared=NULL, state=active
 
-# 11. Once state=active, the queue-storage-target runtime is no longer
+# 10. Once state=active, the queue-storage-target runtime is no longer
 #     special — auto-role runtimes started from now on resolve to queue
 #     storage at startup. Either keep the explicit target running or
 #     redeploy it without --transition-role; behavior is identical
