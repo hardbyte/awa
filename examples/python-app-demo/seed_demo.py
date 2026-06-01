@@ -4,6 +4,8 @@ import argparse
 import asyncio
 
 import awa
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker
 
 from demo_app.shared import (
     CACHE_QUEUE,
@@ -16,6 +18,7 @@ from demo_app.shared import (
     SEED_SCALE_PRESETS,
     WarmProductCache,
     clear_demo_data,
+    create_app_engine,
     create_checkout,
     create_client,
     ensure_app_schema,
@@ -62,15 +65,17 @@ async def wait_for_many(
         )
 
 
-async def wait_for_cron_sync(client: awa.AsyncClient, name: str, *, timeout_seconds: float = 10.0) -> None:
+async def wait_for_cron_sync(
+    db: AsyncEngine, name: str, *, timeout_seconds: float = 10.0
+) -> None:
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
-        tx = await client.transaction()
-        row = await tx.fetch_optional(
-            "SELECT 1 FROM awa.cron_jobs WHERE name = $1",
-            name,
-        )
-        await tx.commit()
+        async with db.connect() as conn:
+            result = await conn.execute(
+                text("SELECT 1 FROM awa.cron_jobs WHERE name = :name"),
+                {"name": name},
+            )
+            row = result.first()
         if row is not None:
             return
         if asyncio.get_running_loop().time() >= deadline:
@@ -95,20 +100,23 @@ async def main() -> None:
 
     client = create_client()
     await client.migrate()
-    await ensure_app_schema(client)
-    await clear_demo_data(client)
+    db = create_app_engine()
+    sessions = async_sessionmaker(db, expire_on_commit=False)
+    await ensure_app_schema(db)
+    await clear_demo_data(db)
 
     callback_ids: list[str] = []
     register_workers(client, callback_ids)
 
     receipt_job_ids: list[int] = []
     for i in range(preset["completed_orders"]):
-        checkout = await create_checkout(
-            client,
-            customer_email=f"customer{i + 1}@example.com",
-            total_cents=1499 + (i * 200),
-            order_id=f"ord_demo_{i + 1:03d}",
-        )
+        async with sessions() as session:
+            checkout = await create_checkout(
+                session,
+                customer_email=f"customer{i + 1}@example.com",
+                total_cents=1499 + (i * 200),
+                order_id=f"ord_demo_{i + 1:03d}",
+            )
         receipt_job_ids.append(int(checkout["confirmation_job_id"]))
 
     failed_ids = await seed_failed_syncs(client, preset["failed_syncs"])
@@ -140,8 +148,10 @@ async def main() -> None:
     await wait_for_many(client, receipt_job_ids, awa.JobState.Completed)
     await wait_for_many(client, failed_ids, awa.JobState.Failed)
     await wait_for_many(client, waiting_ids, awa.JobState.WaitingExternal)
-    await wait_for_cron_sync(client, CRON_NAME)
+    await wait_for_cron_sync(db, CRON_NAME)
     await client.shutdown()
+    await client.close()
+    await db.dispose()
 
     print("\nDemo app data ready")
     print("===================")

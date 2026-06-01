@@ -47,10 +47,14 @@ asyncio.run(main())
 A synchronous worker model is also available via `awa.Client` for
 codebases that aren't async-first.
 
+For application tables, keep using your existing database library. The
+`awa.bridge` helpers insert jobs through asyncpg, psycopg3, SQLAlchemy, or
+Django connections so app rows and jobs can commit in the same transaction.
+
 ## What you get
 
 - **Transactional enqueue** — enqueue inside the same Postgres transaction
-  as your application's writes.
+  as your application's writes, using your existing connection/session.
 - **Vacuum-aware storage** — append-only ready entries plus a partitioned
   receipt ring keep dead-tuple pressure bounded under sustained load.
   See [ADR-019](https://github.com/hardbyte/awa/blob/main/docs/adr/019-queue-storage-redesign.md)

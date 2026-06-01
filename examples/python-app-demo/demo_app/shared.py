@@ -6,6 +6,9 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
 import awa
+from awa.bridge import insert_job
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 
 DATABASE_URL = os.environ.get(
     "DATABASE_URL", "postgres://postgres:test@localhost:15432/awa_test"
@@ -78,28 +81,46 @@ def create_client() -> awa.AsyncClient:
     return awa.AsyncClient(DATABASE_URL)
 
 
-async def ensure_app_schema(client: awa.AsyncClient) -> None:
-    tx = await client.transaction()
-    await tx.execute(
-        f"""
-        CREATE TABLE IF NOT EXISTS {ORDERS_TABLE} (
-            order_id TEXT PRIMARY KEY,
-            customer_email TEXT NOT NULL,
-            total_cents INTEGER NOT NULL,
-            status TEXT NOT NULL DEFAULT 'queued',
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+def sqlalchemy_database_url(database_url: str = DATABASE_URL) -> str:
+    if database_url.startswith("postgres://"):
+        return "postgresql+asyncpg://" + database_url.removeprefix("postgres://")
+    if database_url.startswith("postgresql://"):
+        return "postgresql+asyncpg://" + database_url.removeprefix("postgresql://")
+    return database_url
+
+
+def create_app_engine() -> AsyncEngine:
+    return create_async_engine(sqlalchemy_database_url(), pool_pre_ping=True)
+
+
+async def ensure_app_schema(db: AsyncEngine) -> None:
+    async with db.begin() as conn:
+        await conn.execute(
+            text(
+                f"""
+                CREATE TABLE IF NOT EXISTS {ORDERS_TABLE} (
+                    order_id TEXT PRIMARY KEY,
+                    customer_email TEXT NOT NULL,
+                    total_cents INTEGER NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+                """
+            )
         )
-        """
-    )
-    await tx.commit()
 
 
-async def clear_demo_data(client: awa.AsyncClient) -> None:
-    tx = await client.transaction()
-    await tx.execute(f"DELETE FROM {ORDERS_TABLE}")
-    await tx.execute("DELETE FROM awa.jobs WHERE queue LIKE 'store_%'")
-    await tx.execute("DELETE FROM awa.cron_jobs WHERE name = $1", CRON_NAME)
-    await tx.commit()
+async def clear_demo_data(db: AsyncEngine) -> None:
+    async with db.begin() as conn:
+        await conn.execute(text(f"DELETE FROM {ORDERS_TABLE}"))
+        await conn.execute(
+            text("DELETE FROM awa.jobs WHERE queue LIKE :queue_pattern"),
+            {"queue_pattern": "store_%"},
+        )
+        await conn.execute(
+            text("DELETE FROM awa.cron_jobs WHERE name = :name"),
+            {"name": CRON_NAME},
+        )
 
 
 def register_workers(client: awa.AsyncClient, callback_ids: list[str] | None = None) -> None:
@@ -204,32 +225,37 @@ def register_workers(client: awa.AsyncClient, callback_ids: list[str] | None = N
 
 
 async def create_checkout(
-    client: awa.AsyncClient,
+    session: AsyncSession,
     *,
     customer_email: str,
     total_cents: int,
     order_id: str | None = None,
 ) -> dict[str, object]:
     resolved_order_id = order_id or f"ord_{uuid4().hex[:10]}"
-    async with await client.transaction() as tx:
-        inserted = await tx.fetch_optional(
-            f"""
-            INSERT INTO {ORDERS_TABLE} (order_id, customer_email, total_cents, status)
-            VALUES ($1, $2, $3, 'submitted')
-            ON CONFLICT (order_id) DO NOTHING
-            RETURNING order_id
-            """,
-            resolved_order_id,
-            customer_email,
-            total_cents,
+    async with session.begin():
+        inserted = await session.execute(
+            text(
+                f"""
+                INSERT INTO {ORDERS_TABLE} (order_id, customer_email, total_cents, status)
+                VALUES (:order_id, :customer_email, :total_cents, 'submitted')
+                ON CONFLICT (order_id) DO NOTHING
+                RETURNING order_id
+                """
+            ),
+            {
+                "order_id": resolved_order_id,
+                "customer_email": customer_email,
+                "total_cents": total_cents,
+            },
         )
-        if inserted is None:
+        if inserted.first() is None:
             return {
                 "order_id": resolved_order_id,
                 "confirmation_job_id": None,
                 "duplicate": True,
             }
-        confirmation_job = await tx.insert(
+        confirmation_job = await insert_job(
+            session,
             SendOrderConfirmationEmail(
                 order_id=resolved_order_id,
                 customer_email=customer_email,
@@ -240,24 +266,26 @@ async def create_checkout(
         )
     return {
         "order_id": resolved_order_id,
-        "confirmation_job_id": confirmation_job.id,
+        "confirmation_job_id": confirmation_job["id"],
         "duplicate": False,
     }
 
 
-async def list_recent_orders(client: awa.AsyncClient, limit: int = 20) -> list[dict[str, object]]:
-    tx = await client.transaction()
-    rows = await tx.fetch_all(
-        f"""
-        SELECT order_id, customer_email, total_cents, status, created_at
-        FROM {ORDERS_TABLE}
-        ORDER BY created_at DESC
-        LIMIT $1
-        """,
-        limit,
+async def list_recent_orders(
+    session: AsyncSession, limit: int = 20
+) -> list[dict[str, object]]:
+    result = await session.execute(
+        text(
+            f"""
+            SELECT order_id, customer_email, total_cents, status, created_at
+            FROM {ORDERS_TABLE}
+            ORDER BY created_at DESC
+            LIMIT :limit
+            """
+        ),
+        {"limit": limit},
     )
-    await tx.commit()
-    return rows
+    return [dict(row) for row in result.mappings().all()]
 
 
 async def seed_pending_payments(client: awa.AsyncClient, count: int) -> list[int]:

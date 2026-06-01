@@ -131,7 +131,10 @@ async def main():
         tags=["etl", "daily"],
     )
 
-    # ── Enqueue jobs transactionally ────────────────────────────
+    # ── Enqueue a queue-only batch transactionally ──────────────
+    #
+    # If this producer also wrote application tables, use your app's
+    # database connection/session and awa.bridge.insert_job(...) instead.
 
     async with await client.transaction() as tx:
         for table in ["users", "orders", "events"]:
