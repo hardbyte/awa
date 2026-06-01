@@ -4631,9 +4631,9 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
 ///   over `queue_terminal_rollups.pruned_completed_count`, which only
 ///   reflects rows that have already been rolled up.
 /// - `count(*) FROM lease_claims WHERE queue=$1 AND NOT EXISTS (...)`
-///   — replaced by `count(*) FROM leases WHERE queue=$1 AND state IN
-///   ('running','waiting_external')`, which omits receipt-plane claims
-///   that have not materialised a lease row.
+///   — replaced by `count(*) FROM leases WHERE queue=$1 AND state =
+///   'running'`, which omits receipt-plane claims that have not
+///   materialised a lease row.
 ///
 /// Under steady state (empty leases table + nothing live in
 /// done_entries) the fast variant agrees with the exact variant on
