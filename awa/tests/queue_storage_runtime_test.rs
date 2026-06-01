@@ -4679,7 +4679,10 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
         .await
         .expect("queue_counts with rows available");
     assert_eq!(with_available_fast.available, 5);
-    assert_eq!(with_available_fast.available, with_available_exact.available);
+    assert_eq!(
+        with_available_fast.available,
+        with_available_exact.available
+    );
     assert_eq!(with_available_fast.running, with_available_exact.running);
 
     // Claim the rows (lease-materialisation path; no receipt-plane
@@ -4700,6 +4703,56 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
     assert_eq!(running_fast.running, 5);
     assert_eq!(running_fast.running, running_exact.running);
     assert_eq!(running_fast.available, running_exact.available);
+
+    // Complete the rows so they land in done_entries. At this point
+    // queue_counts (exact) sees them via the live_terminal CTE; the
+    // fast variant under-counts because rollups haven't absorbed the
+    // segment yet. That divergence is documented and intentional.
+    let completed_count = store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("Failed to complete");
+    assert_eq!(completed_count, 5);
+    let pre_prune_fast = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("queue_counts_fast pre-prune");
+    let pre_prune_exact = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts pre-prune");
+    assert_eq!(pre_prune_exact.completed, 5);
+    assert_eq!(
+        pre_prune_fast.completed, 0,
+        "fast under-counts pre-prune because live done_entries aren't \
+         in the rollup yet (documented behaviour)"
+    );
+
+    // Rotate + prune the now-completed slot. After prune,
+    // queue_terminal_rollups.pruned_completed_count absorbs the
+    // live segment and the fast and exact variants should agree.
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    match store.prune_oldest(&pool).await.expect("prune_oldest") {
+        awa_model::queue_storage::PruneOutcome::Pruned { .. } => {}
+        other => panic!("expected Pruned, got {other:?}"),
+    }
+    let post_prune_fast = store
+        .queue_counts_fast(&pool, queue)
+        .await
+        .expect("queue_counts_fast post-prune");
+    let post_prune_exact = store
+        .queue_counts(&pool, queue)
+        .await
+        .expect("queue_counts post-prune");
+    assert_eq!(post_prune_exact.completed, 5);
+    assert_eq!(
+        post_prune_fast.completed, 5,
+        "fast must match exact once the segment has rolled up"
+    );
+    assert_eq!(post_prune_fast.completed, post_prune_exact.completed);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -6890,11 +6890,19 @@ impl QueueStorage {
     ///
     /// - **available** is the same as the dispatcher's claim signal:
     ///   `sum(GREATEST(enqueue_seq - claim_seq, 0))` over the shard
-    ///   head tables. No scan of `ready_entries`.
-    /// - **running** counts `leases` rows in the active states (one
-    ///   filtered count per logical queue shard). Does *not* anti-join
-    ///   `lease_claims` against `lease_claim_closures` — receipt-plane
-    ///   claims that have not yet materialised a lease row are omitted.
+    ///   head tables. No scan of `ready_entries`. This is an upper
+    ///   bound — the dispatcher closes the gap on its next claim
+    ///   attempt, but an admin DELETE of an unclaimed row leaves the
+    ///   head sequence ahead of the actual ready row count until that
+    ///   recovery branch runs. Acceptable for depth-target throttling
+    ///   and dashboards; not suitable for exact billing-style counts.
+    /// - **running** matches [`Self::queue_counts`]'s strict definition:
+    ///   `leases.state = 'running'` only. Receipt-plane claims that
+    ///   have not yet materialised a lease row are omitted (the
+    ///   exact path catches them via the `lease_claims` anti-join, but
+    ///   that anti-join is what this fast variant exists to avoid).
+    ///   `waiting_external` is *not* included — it's reported as part
+    ///   of admin's parked-callback view, not running.
     /// - **completed** is read from the persisted
     ///   `queue_terminal_rollups.pruned_completed_count` denormaliser.
     ///   Rows currently in `done_entries` that have not yet rolled up
@@ -6918,14 +6926,16 @@ impl QueueStorage {
         // available: dispatcher signal — already an index-only sum over
         // the (queue, priority, enqueue_shard) head tables.
         let available = self.queue_claimer_signal(pool, queue).await?.available;
-        // running: live leases only; receipt-plane claims that haven't
-        // materialised a lease row yet are omitted (documented above).
+        // running: leases.state = 'running' only, matching
+        // queue_counts_exact's strict definition. Receipt-plane claims
+        // that haven't materialised a lease row yet are documented as
+        // omitted in the method-level doc.
         let running: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT COALESCE(count(*)::bigint, 0)
             FROM {schema}.leases
             WHERE queue = ANY($1)
-              AND state IN ('running', 'waiting_external')
+              AND state = 'running'
             "#
         ))
         .bind(&queues)
