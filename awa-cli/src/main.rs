@@ -861,6 +861,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         lease_slot_count,
                         reset,
                     } => {
+                        // The default `awa` schema also holds the canonical
+                        // migration tables (schema_version, runtime_instances,
+                        // storage_transition_state, ...). `DROP SCHEMA awa
+                        // CASCADE` would take them with it and leave the
+                        // database unrecoverable. See
+                        // docs/queue-storage-substrate.md.
+                        if reset && schema == "awa" {
+                            return Err(
+                                "Refusing to DROP SCHEMA awa CASCADE — schema 'awa' is the \
+                                 default migration-owned queue-storage substrate and also \
+                                 contains the canonical migration tables (schema_version, \
+                                 runtime_instances, storage_transition_state, etc.). \
+                                 Use --schema <other> for a throwaway substrate, or \
+                                 'awa storage abort' to rewind an in-flight transition."
+                                    .into(),
+                            );
+                        }
                         let store = awa_model::QueueStorage::new(awa_model::QueueStorageConfig {
                             schema: schema.clone(),
                             queue_slot_count: queue_slot_count as usize,

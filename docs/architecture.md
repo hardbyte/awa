@@ -96,6 +96,14 @@ receipt plane, and ADR-026 refines terminal history:
 - [ADR-023: Receipt Plane Ring Partitioning](adr/023-receipt-plane-ring-partitioning.md)
 - [ADR-026: Narrow Terminal History](adr/026-narrow-terminal-history.md)
 
+For how the per-schema substrate is installed and who owns which
+objects, see [Queue-storage substrate](queue-storage-substrate.md).
+The default `awa.*` substrate is materialised by `awa migrate`; custom
+queue-storage schemas are installed via the
+`awa.install_queue_storage_substrate()` SQL helper that
+`prepare_schema()` and `awa storage prepare-queue-storage-schema`
+both call into.
+
 ## Job Lifecycle
 
 Core transitions:

@@ -156,7 +156,15 @@ does not need this temporary-table grant.
 
 The queue-storage backend defaults to keeping its tables in the same
 `awa` schema, so the grants above cover both control-plane and
-queue-storage tables. If you override the schema name (Rust:
+queue-storage tables. See
+[Queue-storage substrate](queue-storage-substrate.md) for the full
+ownership contract — what `awa migrate` installs by default, how
+custom schemas are materialised via
+`awa.install_queue_storage_substrate()`, and why
+`awa storage prepare-queue-storage-schema --schema awa --reset` is
+rejected.
+
+If you override the schema name (Rust:
 `QueueStorageConfig.schema`; Python: `queue_storage_schema=...`; CLI:
 `awa storage prepare-queue-storage-schema --schema <name>`), repeat
 the grant block against that schema:

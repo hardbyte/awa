@@ -15,11 +15,20 @@ Current guarantees from the migration layer:
 
 Most migrations are additive, but storage-engine migrations can be
 non-additive when they are protected by rollout gates. For example,
-queue-storage migrations reshape internal keys, drop obsolete columns, and
-`prepare_schema()` performs operational DDL for partitions, indexes,
-sequences, and helper functions. Rolling upgrades stay practical because those
-changes are forward-only, idempotent where possible, and gated by the storage
+queue-storage migrations reshape internal keys and drop obsolete
+columns. Rolling upgrades stay practical because those changes are
+forward-only, idempotent where possible, and gated by the storage
 transition state rather than by assuming every DDL step is additive.
+
+The default queue-storage substrate at `awa.*` is owned by
+`awa migrate` via the `v023_install_queue_storage_substrate`
+migration, which calls the `awa.install_queue_storage_substrate(schema, ...)`
+SQL helper. `prepare_schema()` (Rust) and
+`awa storage prepare-queue-storage-schema` (CLI) call the same helper
+for custom queue-storage schemas. See
+[Queue-storage substrate](queue-storage-substrate.md) for the full
+ownership contract, the rejection of `--reset --schema awa`, and how
+to install a custom-shaped substrate.
 
 ## Fresh Install
 

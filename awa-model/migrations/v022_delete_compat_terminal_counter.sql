@@ -160,15 +160,21 @@ BEGIN
     GET DIAGNOSTICS v_rows = ROW_COUNT;
 
     IF v_rows > 0 THEN
-        -- The counter table is created lazily by
-        -- QueueStorage::prepare_schema() on first runtime boot, which
-        -- can happen AFTER migrations have run (migrations don't
-        -- prepare the per-schema queue-storage tables). Guard the
-        -- decrement with `to_regclass` so a DELETE FROM awa.jobs that
-        -- arrives during the boot window degrades to "drift, then
-        -- rebuild" rather than "relation does not exist". Operators
-        -- recover with `awa storage rebuild-terminal-counters` once the
-        -- counter table catches up.
+        -- Guard the counter decrement with `to_regclass`. The default
+        -- `awa.queue_terminal_live_counts` is materialised by `awa
+        -- migrate` (see v023), so this guard is a no-op on the default
+        -- install. It still matters for:
+        --   - Custom queue-storage schemas, where the counter table is
+        --     created by `awa storage prepare-queue-storage-schema`
+        --     (which can run after migrate). A DELETE FROM awa.jobs
+        --     routed to a custom backend before its substrate is
+        --     prepared degrades to "drift, then rebuild" rather than
+        --     "relation does not exist".
+        --   - Partially-prepared schemas during repair.
+        --   - External migration tooling that applies SQL out of order
+        --     or stops mid-flight.
+        -- Operators recover with `awa storage rebuild-terminal-counters`
+        -- once the counter table catches up.
         IF to_regclass(format('%I.queue_terminal_live_counts', v_schema)) IS NOT NULL THEN
             EXECUTE format(
                 'UPDATE %I.queue_terminal_live_counts AS counts
