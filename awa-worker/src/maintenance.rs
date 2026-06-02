@@ -12,7 +12,7 @@ use sqlx::{PgPool, Postgres};
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -35,6 +35,139 @@ impl Default for RetentionPolicy {
             failed: Duration::from_secs(259200),   // 72h
             dlq: None,
         }
+    }
+}
+
+/// Per-branch observability state for the maintenance leader's main
+/// `tokio::select!` loop. Tracks the most recent body duration so the
+/// next fire of the same branch can decide whether it was already
+/// overdue, and an `is_delayed` flag so we only log/count one event per
+/// "overrun episode" rather than once per tick.
+///
+/// Wired through `AwaMetrics` — see [`crate::metrics::AwaMetrics`] for the
+/// instrument definitions. Issue #242.
+#[derive(Debug, Default)]
+struct MaintenanceBranchState {
+    /// Body duration of the previous run of this branch. `None` until the
+    /// branch has run at least once.
+    last_duration: Option<Duration>,
+    /// True when the previous body exceeded its tick interval and we've
+    /// already emitted the on-time -> delayed warning/counter. Cleared on
+    /// the recovery transition.
+    is_delayed: bool,
+}
+
+/// Records the start of one branch body and emits observability when the
+/// body returns. Constructed by [`MaintenanceBranchTracker::begin`], which
+/// also applies the previous-run overrun check before the body starts so
+/// the warning/counter line up with the fire moment described in #242.
+struct BranchTimer<'a> {
+    tracker: &'a MaintenanceBranchTracker,
+    branch: &'static str,
+    metrics: &'a crate::metrics::AwaMetrics,
+    started_at: Instant,
+}
+
+impl<'a> BranchTimer<'a> {
+    /// Stop the timer, record the duration into both the per-branch
+    /// histogram and the tracker's state. Must be called once after the
+    /// body returns — there is no `Drop` impl so a panic-mid-body would
+    /// leave the histogram un-recorded, which is fine: a panicking
+    /// maintenance branch is a bigger story than the missing sample.
+    fn finish(self) {
+        let duration = self.started_at.elapsed();
+        self.metrics
+            .record_maintenance_branch_duration(self.branch, duration);
+        self.tracker.record_finish(self.branch, duration);
+    }
+}
+
+/// Owns the per-branch overrun state for the maintenance leader loop.
+/// All access is logically single-threaded — the maintenance loop is the
+/// only caller — but the loop runs inside a `tokio::spawn`-ed task that
+/// requires `Send`, so we use `std::sync::Mutex` rather than `RefCell`.
+/// The mutex is uncontended in practice (one acquirer); cost is one
+/// uncontended lock per branch tick.
+#[derive(Default)]
+struct MaintenanceBranchTracker {
+    branches: std::sync::Mutex<HashMap<&'static str, MaintenanceBranchState>>,
+}
+
+impl MaintenanceBranchTracker {
+    fn new() -> Self {
+        Self {
+            branches: std::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Call at the moment a branch arm fires, before running its body.
+    /// Applies the previous-run overrun check (warn + counter on
+    /// on-time -> delayed; warn on delayed -> on-time), then returns a
+    /// [`BranchTimer`] whose `.finish()` records the body duration.
+    fn begin<'a>(
+        &'a self,
+        branch: &'static str,
+        tick_interval: Duration,
+        metrics: &'a crate::metrics::AwaMetrics,
+    ) -> BranchTimer<'a> {
+        let mut branches = self
+            .branches
+            .lock()
+            .expect("maintenance branch tracker mutex");
+        let state = branches.entry(branch).or_default();
+        if let Some(last_duration) = state.last_duration {
+            let overdue = last_duration > tick_interval;
+            if overdue && !state.is_delayed {
+                state.is_delayed = true;
+                warn!(
+                    branch,
+                    last_duration_ms = last_duration.as_millis() as u64,
+                    tick_interval_ms = tick_interval.as_millis() as u64,
+                    "maintenance branch overran its tick interval",
+                );
+                metrics.record_maintenance_branch_overrun(branch);
+            } else if !overdue && state.is_delayed {
+                state.is_delayed = false;
+                warn!(
+                    branch,
+                    last_duration_ms = last_duration.as_millis() as u64,
+                    tick_interval_ms = tick_interval.as_millis() as u64,
+                    "maintenance branch recovered to on-time",
+                );
+            }
+        }
+        drop(branches);
+        BranchTimer {
+            tracker: self,
+            branch,
+            metrics,
+            started_at: Instant::now(),
+        }
+    }
+
+    /// Internal — called by [`BranchTimer::finish`] to stash the body's
+    /// wall-clock duration so the next fire of the same branch can apply
+    /// the overrun check.
+    fn record_finish(&self, branch: &'static str, duration: Duration) {
+        let mut branches = self
+            .branches
+            .lock()
+            .expect("maintenance branch tracker mutex");
+        let state = branches.entry(branch).or_default();
+        state.last_duration = Some(duration);
+    }
+
+    /// Test helper — read the current state for one branch. Not used in
+    /// production code paths.
+    #[cfg(test)]
+    fn snapshot(&self, branch: &'static str) -> Option<(Option<Duration>, bool)> {
+        let branches = self
+            .branches
+            .lock()
+            .expect("maintenance branch tracker mutex");
+        branches
+            .get(branch)
+            .map(|state| (state.last_duration, state.is_delayed))
     }
 }
 
@@ -346,6 +479,26 @@ impl MaintenanceService {
                 .storage
                 .queue_storage()
                 .map(|runtime| tokio::time::interval(runtime.claim_rotate_interval));
+            // Cache rotate intervals alongside the timers so the per-branch
+            // observability calls can recover the configured period. Both
+            // derive from the same `queue_storage()` source so they are
+            // Some/None in lockstep with their corresponding timers.
+            let vacuum_queue_interval = self
+                .storage
+                .queue_storage()
+                .map(|runtime| runtime.queue_rotate_interval);
+            let vacuum_lease_interval = self
+                .storage
+                .queue_storage()
+                .map(|runtime| runtime.lease_rotate_interval);
+            let vacuum_claim_interval = self
+                .storage
+                .queue_storage()
+                .map(|runtime| runtime.claim_rotate_interval);
+            // Per-branch overrun tracker. Issue #242 — observability only;
+            // the architectural split of this `tokio::select!` is deferred
+            // to v0.7 conditional on the overrun counter showing fleet hits.
+            let branch_tracker = MaintenanceBranchTracker::new();
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -390,37 +543,57 @@ impl MaintenanceService {
                         return;
                     }
                     _ = heartbeat_rescue_timer.tick() => {
+                        let timer = branch_tracker.begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics);
                         self.rescue_stale_heartbeats().await;
+                        timer.finish();
                     }
                     _ = deadline_rescue_timer.tick() => {
+                        let timer = branch_tracker.begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics);
                         self.rescue_expired_deadlines().await;
+                        timer.finish();
                     }
                     _ = callback_rescue_timer.tick() => {
+                        let timer = branch_tracker.begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics);
                         self.rescue_expired_callbacks().await;
+                        timer.finish();
                     }
                     _ = promote_timer.tick() => {
+                        let timer = branch_tracker.begin("promote_scheduled", self.promote_interval, &self.metrics);
                         self.promote_scheduled().await;
+                        timer.finish();
                     }
                     _ = cleanup_timer.tick() => {
+                        let timer = branch_tracker.begin("cleanup", self.cleanup_interval, &self.metrics);
                         self.cleanup_completed().await;
                         self.cleanup_dlq_rows().await;
                         self.cleanup_stale_runtime_snapshots().await;
                         self.cleanup_stale_descriptors().await;
+                        timer.finish();
                     }
                     _ = cron_sync_timer.tick() => {
+                        let timer = branch_tracker.begin("cron_sync", self.cron_sync_interval, &self.metrics);
                         self.sync_periodic_jobs_to_db().await;
+                        timer.finish();
                     }
                     _ = queue_stats_timer.tick() => {
+                        let timer = branch_tracker.begin("queue_stats", self.queue_stats_interval, &self.metrics);
                         self.publish_queue_health_metrics().await;
+                        timer.finish();
                     }
                     _ = dirty_key_timer.tick() => {
+                        let timer = branch_tracker.begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics);
                         self.recompute_dirty_admin_metadata().await;
+                        timer.finish();
                     }
                     _ = metadata_reconciliation_timer.tick() => {
+                        let timer = branch_tracker.begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics);
                         self.refresh_admin_metadata().await;
+                        timer.finish();
                     }
                     _ = priority_aging_timer.tick() => {
+                        let timer = branch_tracker.begin("priority_aging", self.priority_aging_interval, &self.metrics);
                         self.age_waiting_priorities().await;
+                        timer.finish();
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_queue_timer {
@@ -429,7 +602,11 @@ impl MaintenanceService {
                             std::future::pending::<()>().await;
                         }
                     }, if vacuum_queue_timer.is_some() => {
+                        let interval = vacuum_queue_interval
+                            .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
+                        let timer = branch_tracker.begin("rotate_queue", interval, &self.metrics);
                         self.rotate_queue_storage_queue().await;
+                        timer.finish();
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_lease_timer {
@@ -438,7 +615,11 @@ impl MaintenanceService {
                             std::future::pending::<()>().await;
                         }
                     }, if vacuum_lease_timer.is_some() => {
+                        let interval = vacuum_lease_interval
+                            .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
+                        let timer = branch_tracker.begin("rotate_lease", interval, &self.metrics);
                         self.rotate_queue_storage_leases().await;
+                        timer.finish();
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_claim_timer {
@@ -447,7 +628,11 @@ impl MaintenanceService {
                             std::future::pending::<()>().await;
                         }
                     }, if vacuum_claim_timer.is_some() => {
+                        let interval = vacuum_claim_interval
+                            .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
+                        let timer = branch_tracker.begin("rotate_claim", interval, &self.metrics);
                         self.rotate_queue_storage_claims().await;
+                        timer.finish();
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -2051,6 +2236,126 @@ mod tests {
                 Utc.with_ymd_and_hms(2026, 5, 7, 12, 0, 10).unwrap(),
             ]
         );
+    }
+
+    // ── MaintenanceBranchTracker (#242) ──────────────────────────────
+
+    fn metrics_for_test() -> crate::metrics::AwaMetrics {
+        crate::metrics::AwaMetrics::from_global()
+    }
+
+    #[test]
+    fn branch_tracker_initial_state_has_no_history() {
+        let tracker = MaintenanceBranchTracker::new();
+        assert_eq!(tracker.snapshot("promote_scheduled"), None);
+    }
+
+    #[test]
+    fn branch_tracker_finish_records_last_duration() {
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        let timer = tracker.begin("promote_scheduled", Duration::from_secs(1), &metrics);
+        // Body would run here in production; for the test we just finish.
+        timer.finish();
+        let (last_duration, is_delayed) = tracker
+            .snapshot("promote_scheduled")
+            .expect("snapshot should exist after one finish");
+        assert!(last_duration.is_some());
+        // First tick has no prior duration to compare against, so we
+        // cannot be in the delayed state yet.
+        assert!(!is_delayed);
+    }
+
+    #[test]
+    fn branch_tracker_flags_overrun_on_next_begin() {
+        // Simulate: tick interval = 100ms, body duration = 250ms. The
+        // first finish records 250ms. The second begin sees 250 > 100
+        // and transitions the branch to "delayed".
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        tracker.branches.lock().unwrap().insert(
+            "cleanup",
+            MaintenanceBranchState {
+                last_duration: Some(Duration::from_millis(250)),
+                is_delayed: false,
+            },
+        );
+        let _timer = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
+        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
+        assert!(
+            is_delayed,
+            "branch should flip to delayed when last_duration exceeds tick interval"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_does_not_re_flag_while_already_delayed() {
+        // While already delayed, a further overrun must NOT re-emit the
+        // warning/counter. This is the "one event per overrun episode"
+        // requirement from the #242 acceptance bar.
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        tracker.branches.lock().unwrap().insert(
+            "cleanup",
+            MaintenanceBranchState {
+                last_duration: Some(Duration::from_millis(300)),
+                is_delayed: true,
+            },
+        );
+        let _timer = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
+        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
+        // Stays delayed. (The "one event per episode" contract is at the
+        // emission layer; this assertion confirms the state doesn't
+        // toggle off and on between consecutive overruns, which would
+        // otherwise produce duplicate events.)
+        assert!(is_delayed);
+    }
+
+    #[test]
+    fn branch_tracker_recovers_to_on_time() {
+        // Branch was delayed, last_duration drops back under the tick
+        // interval — the next begin should clear is_delayed.
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        tracker.branches.lock().unwrap().insert(
+            "cleanup",
+            MaintenanceBranchState {
+                last_duration: Some(Duration::from_millis(50)),
+                is_delayed: true,
+            },
+        );
+        let _timer = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
+        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
+        assert!(
+            !is_delayed,
+            "branch should recover to on-time when last_duration is back under the interval"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_per_branch_state_is_independent() {
+        // Two branches advance independently — overrun on one does not
+        // bleed into the other.
+        let tracker = MaintenanceBranchTracker::new();
+        let metrics = metrics_for_test();
+        tracker.branches.lock().unwrap().insert(
+            "cleanup",
+            MaintenanceBranchState {
+                last_duration: Some(Duration::from_millis(500)),
+                is_delayed: false,
+            },
+        );
+        tracker.branches.lock().unwrap().insert(
+            "promote_scheduled",
+            MaintenanceBranchState {
+                last_duration: Some(Duration::from_millis(10)),
+                is_delayed: false,
+            },
+        );
+        let _t1 = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
+        let _t2 = tracker.begin("promote_scheduled", Duration::from_millis(250), &metrics);
+        assert!(tracker.snapshot("cleanup").unwrap().1);
+        assert!(!tracker.snapshot("promote_scheduled").unwrap().1);
     }
 
     #[test]
