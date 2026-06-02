@@ -4755,6 +4755,488 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
     assert_eq!(post_prune_fast.completed, post_prune_exact.completed);
 }
 
+/// #290 PR A1 invariant: every terminal-row insert path increments
+/// `queue_terminal_live_counts` so that `SUM(live_terminal_count)` for a
+/// queue equals `count(*) FROM done_entries WHERE queue = ANY(...)`.
+///
+/// PR A1 only wires the increment side. The decrement side (DLQ moves,
+/// discards, retry-from-terminal, SQL-compat deletes) lands in PR A2 and
+/// the read switch lands in PR B; this test deliberately avoids any
+/// terminal-delete path so the invariant holds on the increment side alone.
+///
+/// The test exercises both insert paths:
+/// - `insert_done_rows_tx` via `complete_batch` on the lease-materialisation
+///   path (default `create_store` builds the store without the receipt
+///   fast-complete candidate set).
+/// - the fused receipt fast path is exercised in
+///   `test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path`
+///   below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_helper";
+    let schema = "awa_qs_terminal_live_counts_helper";
+    let store = create_store(&pool, schema).await;
+
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        done_entries_count(&pool, schema, queue).await,
+        "invariant holds on empty queue"
+    );
+
+    store
+        .enqueue_batch(&pool, queue, 1, 7)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 7).await.expect("claim");
+    assert_eq!(claimed.len(), 7);
+    let completed = store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    assert_eq!(completed, 7);
+
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 7);
+    assert_eq!(
+        live_sum, done_count,
+        "live counter sum must equal done_entries cardinality after complete_batch"
+    );
+
+    // A second completion batch on the same queue must accumulate, not
+    // replace — guards against the UPSERT using = instead of += on
+    // conflict.
+    store
+        .enqueue_batch(&pool, queue, 1, 3)
+        .await
+        .expect("enqueue 2");
+    let claimed2 = store.claim_batch(&pool, queue, 3).await.expect("claim 2");
+    store
+        .complete_batch(&pool, &claimed2)
+        .await
+        .expect("complete 2");
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 10);
+    assert_eq!(live_sum, done_count, "counter accumulates across batches");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_fast";
+    let schema = "awa_qs_terminal_live_counts_fast";
+    // lease_claim_receipts: true makes the receipt fast-complete path
+    // available (assuming the claimed jobs are otherwise eligible —
+    // see Self::receipt_fast_complete_candidate).
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 5)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 5, std::time::Duration::from_secs(30))
+        .await
+        .expect("claim");
+
+    // Guard the test against silent fast-path elision: if anything in
+    // `receipt_fast_complete_candidate`'s eligibility ever changes (or
+    // if `enqueue_batch` starts producing jobs with metadata/tags/
+    // unique_keys that disqualify the fast path), this assertion fails
+    // loudly so the counter wiring stays under test. Without it, a
+    // future regression could silently fall through to
+    // `complete_claimed_batch` (which routes via `insert_done_rows_tx`)
+    // and the fused-CTE counter_upsert stage would go untested.
+    for entry in &claimed {
+        assert!(
+            entry.claim.lease_claim_receipt,
+            "test setup must drive the receipt fast path: \
+             entry has lease_claim_receipt={}",
+            entry.claim.lease_claim_receipt
+        );
+        assert!(
+            entry.job.unique_key.is_none()
+                && entry.job.tags.is_empty()
+                && entry.job.errors.as_ref().is_none_or(Vec::is_empty),
+            "test setup must satisfy receipt_fast_complete_candidate: \
+             unique_key.is_none={}, tags.empty={}, errors.empty={}",
+            entry.job.unique_key.is_none(),
+            entry.job.tags.is_empty(),
+            entry.job.errors.as_ref().is_none_or(Vec::is_empty),
+        );
+    }
+
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    assert_eq!(completed.len(), 5);
+
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 5);
+    assert_eq!(
+        live_sum, done_count,
+        "fused receipt fast path must also increment the counter"
+    );
+}
+
+/// #290: every terminal-delete path keeps the counter invariant tight.
+/// Exercises retry-from-terminal (`retry_job_tx`), single DLQ move
+/// (`move_failed_to_dlq`), bulk DLQ move (`bulk_move_failed_to_dlq`),
+/// and discard (`discard_failed_by_kind`). The invariant
+/// `SUM(live_terminal_count) == count(*) FROM done_entries` must hold
+/// after each operation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_delete";
+    let schema = "awa_qs_terminal_live_counts_delete";
+    let store = create_store(&pool, schema).await;
+
+    // Seed a known terminal population: 3 completed, 3 failed, 3 cancelled,
+    // direct SQL into done_entries with matching counter rows. Going through
+    // claim/complete would also work but adds noise; the writer paths are
+    // already tested above. Here we want to focus the test on delete-path
+    // decrements.
+    seed_terminal_rows(&pool, schema, queue, "completed", 3).await;
+    seed_terminal_rows(&pool, schema, queue, "failed", 3).await;
+    seed_terminal_rows(&pool, schema, queue, "cancelled", 3).await;
+
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 9);
+    assert_eq!(live_sum, done_count, "invariant after seeding terminals");
+
+    // 1. Single DLQ move: pick one failed job and move it.
+    let failed_job_id = first_failed_job_id(&pool, schema, queue).await;
+    store
+        .move_failed_to_dlq(&pool, failed_job_id, "manual-test")
+        .await
+        .expect("move_failed_to_dlq");
+    assert_invariant_holds(&pool, schema, queue, "after move_failed_to_dlq").await;
+
+    // 2. Bulk DLQ move: drain all remaining failed rows. Seeded 3
+    //    `failed` rows; the single move in step 1 removed one, so 2
+    //    remain. Exact assertion catches a silent no-op on the
+    //    single-move path (which would make bulk pick up all 3 and
+    //    still leave the invariant balanced).
+    let moved = store
+        .bulk_move_failed_to_dlq(&pool, None, Some(queue), "bulk-test")
+        .await
+        .expect("bulk_move_failed_to_dlq");
+    assert_eq!(
+        moved, 2,
+        "expected exactly 2 failed rows to remain after step 1"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after bulk_move_failed_to_dlq").await;
+
+    // 3. Discard: seed fresh failed rows of a unique kind, then
+    //    `discard_failed_by_kind`. We use a unique kind for this seeding
+    //    to scope the discard precisely.
+    seed_terminal_rows_with_kind(&pool, schema, queue, "failed", "discard_kind", 4).await;
+    assert_invariant_holds(&pool, schema, queue, "after reseed before discard").await;
+    let discarded = store
+        .discard_failed_by_kind(&pool, "discard_kind")
+        .await
+        .expect("discard_failed_by_kind");
+    assert_eq!(discarded, 4, "discard should remove the 4 seeded rows");
+    assert_invariant_holds(&pool, schema, queue, "after discard_failed_by_kind").await;
+
+    // 4. Retry-from-terminal: pick a seeded cancelled row and retry it.
+    //    retry_job_tx deletes the terminal row and inserts a fresh ready
+    //    row.
+    let cancelled_job_id = first_cancelled_job_id(&pool, schema, queue).await;
+    let retried = store
+        .retry_job(&pool, cancelled_job_id)
+        .await
+        .expect("retry_job");
+    assert!(retried.is_some(), "retry_job should succeed for cancelled");
+    assert_invariant_holds(&pool, schema, queue, "after retry_job from terminal").await;
+}
+
+/// #290: prune folds counter rows into queue_terminal_rollups and
+/// clears the slot's live counter, keeping the invariant intact across
+/// rotate + prune.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_prune_folds_into_rollups() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_prune";
+    let schema = "awa_qs_terminal_live_counts_prune";
+    let store = create_store(&pool, schema).await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 5)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 5).await.expect("claim");
+    store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+
+    match store.rotate(&pool).await.expect("rotate") {
+        awa_model::queue_storage::RotateOutcome::Rotated { .. } => {}
+        other => panic!("expected Rotated, got {other:?}"),
+    }
+    match store.prune_oldest(&pool).await.expect("prune_oldest") {
+        awa_model::queue_storage::PruneOutcome::Pruned { .. } => {}
+        other => panic!("expected Pruned, got {other:?}"),
+    }
+
+    // After prune:
+    // - done_entries for this queue is empty (partition truncated)
+    // - queue_terminal_live_counts has no rows for this slot
+    // - queue_terminal_rollups.pruned_completed_count absorbed the 5
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 0);
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        0,
+        "live counter for the pruned slot must be cleared"
+    );
+    let rollup: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COALESCE(SUM(pruned_completed_count), 0)::bigint \
+         FROM {schema}.queue_terminal_rollups WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("rollup sum");
+    assert_eq!(rollup, 5, "rollup absorbed the pruned slot's counter");
+}
+
+/// Direct-SQL seed for terminal-state test rows. Inserts into
+/// `done_entries` AND `queue_terminal_live_counts` so the invariant
+/// holds at seed time; the test then exercises delete paths to verify
+/// they decrement the counter correctly.
+async fn seed_terminal_rows(pool: &sqlx::PgPool, schema: &str, queue: &str, state: &str, n: i64) {
+    seed_terminal_rows_with_kind(pool, schema, queue, state, "chaos_job", n).await;
+}
+
+async fn seed_terminal_rows_with_kind(
+    pool: &sqlx::PgPool,
+    schema: &str,
+    queue: &str,
+    state: &str,
+    kind: &str,
+    n: i64,
+) {
+    // Insert N done_entries rows at (ready_slot=0, priority=2,
+    // enqueue_shard=0). lane_seq stays unique per call by reading the
+    // current max and adding rownums.
+    let next_lane_seq: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COALESCE(max(lane_seq), 0)::bigint + 1 \
+         FROM {schema}.done_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("max lane_seq");
+    let next_job_id: i64 = sqlx::query_scalar::<_, i64>(
+        "SELECT COALESCE(max(id), 1000000)::bigint + 1 FROM awa.jobs_hot",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap_or(1_000_000);
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        )
+        SELECT
+            0,
+            1,
+            $1::bigint + g - 1,
+            $2,
+            $3,
+            $4::awa.job_state,
+            2::smallint,
+            1::smallint,
+            1::bigint,
+            $5::bigint + g - 1,
+            0::smallint,
+            now(),
+            now(),
+            '{{}}'::jsonb
+        FROM generate_series(1, $6::int) AS g
+        "#
+    ))
+    .bind(next_job_id)
+    .bind(kind)
+    .bind(queue)
+    .bind(state)
+    .bind(next_lane_seq)
+    .bind(n as i32)
+    .execute(pool)
+    .await
+    .expect("seed done_entries");
+
+    sqlx::query(&format!(
+        r#"
+        INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+            ready_slot, queue, priority, enqueue_shard, live_terminal_count
+        )
+        VALUES (0, $1, 2::smallint, 0::smallint, $2::bigint)
+        ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+        SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
+        "#
+    ))
+    .bind(queue)
+    .bind(n)
+    .execute(pool)
+    .await
+    .expect("seed live counter");
+}
+
+async fn first_failed_job_id(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT job_id FROM {schema}.done_entries \
+         WHERE queue = $1 AND state = 'failed' LIMIT 1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("first failed job id")
+}
+
+async fn first_cancelled_job_id(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT job_id FROM {schema}.done_entries \
+         WHERE queue = $1 AND state = 'cancelled' LIMIT 1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("first cancelled job id")
+}
+
+async fn assert_invariant_holds(pool: &sqlx::PgPool, schema: &str, queue: &str, label: &str) {
+    let live = live_count_sum(pool, schema, queue).await;
+    let done = done_entries_count(pool, schema, queue).await;
+    assert_eq!(
+        live, done,
+        "#290 invariant ({label}): SUM(live_terminal_count) ({live}) \
+         must equal count(*) FROM done_entries ({done})"
+    );
+}
+
+/// #290 — SQL compat `DELETE FROM awa.jobs WHERE id = $1` routes to
+/// `awa.delete_job_compat()`. The v022 migration teaches the done_entries
+/// branch of that function to decrement `queue_terminal_live_counts`.
+/// Without it, deleting a terminal row via the SQL compat path drifts
+/// the counter from the underlying table — and once #305's read switch
+/// lands, the drift becomes operator-visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_sql_compat";
+    let schema = "awa_qs_terminal_live_counts_sql_compat";
+    // create_store activates this schema via the storage transition
+    // dance (prepare → enter_mixed_transition → finalize), so
+    // `awa.active_queue_storage_schema()` returns `schema` and
+    // `awa.delete_job_compat()` routes to it.
+    let _store = create_store(&pool, schema).await;
+
+    seed_terminal_rows(&pool, schema, queue, "completed", 5).await;
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+
+    let target_id: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT job_id FROM {schema}.done_entries WHERE queue = $1 LIMIT 1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("first done job id");
+
+    let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .expect("delete_job_compat call");
+    assert!(
+        deleted,
+        "delete_job_compat should return true for an existing terminal row"
+    );
+
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 4);
+    assert_invariant_holds(&pool, schema, queue, "after SQL compat delete").await;
+}
+
+/// #290 — `rebuild_terminal_counters` truncates and re-aggregates from
+/// `done_entries`, restoring the invariant after any drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_rebuild";
+    let schema = "awa_qs_terminal_live_counts_rebuild";
+    let store = create_store(&pool, schema).await;
+
+    // Seed 7 terminal rows with matching counter entries, then manually
+    // poison the counter to simulate rollover drift.
+    seed_terminal_rows(&pool, schema, queue, "completed", 7).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_terminal_live_counts SET live_terminal_count = 999 WHERE queue = $1"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("poison counter");
+
+    // Sanity-check the drift is present.
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 999);
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 7);
+
+    let rebuilt = store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild");
+    assert!(rebuilt >= 1, "rebuild should re-populate counter rows");
+    assert_invariant_holds(&pool, schema, queue, "after rebuild").await;
+}
+
+async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COALESCE(SUM(live_terminal_count), 0)::bigint \
+         FROM {schema}.queue_terminal_live_counts WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("sum live_terminal_count")
+}
+
+async fn done_entries_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count done_entries")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;

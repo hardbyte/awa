@@ -95,7 +95,7 @@ The runtime builds callback URLs as:
 built-in `awa serve` route layout. Override it when the callback receiver
 is mounted somewhere else — for example, a callback-only deployment behind
 a reverse proxy, or a user-owned API layer that hosts the routes inside
-a FastAPI / axum application (see [ADR-027](./adr/027-callback-ingress.md)):
+a FastAPI / axum application (see [ADR-027](./adr/027-callback-ingress-surface.md)):
 
 ```rust
 let client = Client::builder(pool)
@@ -205,7 +205,7 @@ convenient for development but undesirable when callbacks must be
 externally reachable while the admin surface must stay private.
 
 For that case Awa ships a callback-only receiver as a deployable role
-(see [ADR-027](./adr/027-callback-ingress.md)):
+(see [ADR-027](./adr/027-callback-ingress-surface.md)):
 
 ```text
 awa callbacks serve \

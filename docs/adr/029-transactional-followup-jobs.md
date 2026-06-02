@@ -312,10 +312,14 @@ positioning (ADR-001). Out of scope.
   the correct mechanism for observation; this ADR adds the mechanism for
   delivery.
 - **ADR-027** (callback ingress, proposed). Addresses the open question
-  ADR-027 punts on: durable callback notifications. A callback-only
-  ingress process dispatches follow-ups best-effort after the
-  resolution commits; no in-process handler registry is required for
-  delivery.
+  ADR-027 punts on: durable callback notifications. The worker `Client`
+  drives resolution + follow-up dispatch in a single transaction via
+  `admin::*_external_in_tx`. A callback-only ingress process built per
+  ADR-027 will need its own registry hookup to reuse the same
+  `_in_tx` admin path; until that hookup lands, callback ingress
+  outside the worker `Client` is a separate transition with no
+  follow-up dispatch. See the "Open extensions" section below for the
+  current implementation boundary.
 - **ADR-028** (maintenance-only runtime, proposed). Gives rescue paths
   a way to dispatch durable lifecycle work without owning a handler
   registry. The dispatch is best-effort (separate transaction); the

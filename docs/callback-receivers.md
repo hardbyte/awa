@@ -31,7 +31,7 @@ The callback receiver routes mutate job state. Specifically, `complete`
 and `fail` are terminal — once they succeed, the job leaves
 `waiting_external`. A receiver that does not verify `X-Awa-Signature`
 must be protected another way (mTLS at the load balancer, IP allow-list,
-private VPC). See [ADR-027](./adr/027-callback-ingress.md) for the
+private VPC). See [ADR-027](./adr/027-callback-ingress-surface.md) for the
 deployable-role model.
 
 ## Custom axum receiver (Rust)

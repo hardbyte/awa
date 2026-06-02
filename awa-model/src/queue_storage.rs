@@ -3368,6 +3368,85 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
+            // queue_terminal_live_counts: per-(ready_slot, queue, priority,
+            // enqueue_shard) live count of rows currently in done_entries.
+            // Replaces the `count(*) FROM done_entries WHERE queue = ANY(...)`
+            // scan in queue_counts_exact (#290). Shard-aligned to inherit the
+            // ADR-025 row-lock spread; one counter row per group means a
+            // skewed batch of 512 terminal inserts costs one UPSERT. Prune
+            // folds a slot's rows into queue_terminal_rollups in the same
+            // transaction as the partition truncate (lands in PR B of this
+            // series; A1 here only wires the increment side).
+            //
+            // fillfactor=50 + tuned autovacuum: the upsert path is a HOT
+            // candidate (no secondary index touched). Without explicit
+            // fillfactor, the upserts spill to fresh pages under sustained
+            // completion load.
+            //
+            // Created here, after the `done_entries` partition loop above,
+            // because the backfill below SELECTs FROM `done_entries`.
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_terminal_live_counts (
+                ready_slot          INT NOT NULL,
+                queue               TEXT NOT NULL,
+                priority            SMALLINT NOT NULL,
+                enqueue_shard       SMALLINT NOT NULL,
+                live_terminal_count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (ready_slot, queue, priority, enqueue_shard)
+            )
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.queue_terminal_live_counts SET (
+                fillfactor = 50,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Backfill from existing done_entries in the same transaction as
+            // the table creation. On a fresh install this is a no-op
+            // (done_entries is empty). On an existing 0.6 cluster, this
+            // builds the live counts from the current done_entries
+            // population before any new code path tries to read them.
+            // ON CONFLICT DO NOTHING because the loop is idempotent and a
+            // re-running prepare_schema must not double-count.
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                ready_slot,
+                queue,
+                priority,
+                enqueue_shard,
+                live_terminal_count
+            )
+            SELECT
+                ready_slot,
+                queue,
+                priority,
+                enqueue_shard,
+                count(*)::bigint
+            FROM {schema}.done_entries
+            GROUP BY ready_slot, queue, priority, enqueue_shard
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO NOTHING
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             for slot in 0..self.lease_slot_count() {
                 sqlx::query(&format!(
                     r#"
@@ -3902,6 +3981,7 @@ impl QueueStorage {
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
+                {schema}.queue_terminal_live_counts,
                 {schema}.queue_claimer_leases,
                 {schema}.queue_claimer_state,
                 {schema}.queue_ring_slots,
@@ -4913,7 +4993,168 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
         }
 
+        // #290: maintain queue_terminal_live_counts as a denormalised
+        // count of live done_entries rows, keyed by
+        // (ready_slot, queue, priority, enqueue_shard) to match the
+        // ring + shard identity. Aggregate this batch into one row per
+        // group so a skewed full batch of N terminal inserts costs at
+        // most one UPSERT per (slot, queue, priority, shard) tuple
+        // touched. The read side (queue_counts_exact, switched in a
+        // follow-up PR) then sums these counters instead of scanning
+        // done_entries.
+        self.increment_live_terminal_counters_tx(tx, rows).await?;
+
         Ok(rows.len())
+    }
+
+    /// Aggregate `rows` by `(ready_slot, queue, priority, enqueue_shard)`
+    /// and UPSERT the per-group delta into `queue_terminal_live_counts`.
+    /// Called from every terminal-insert path so the counter stays in
+    /// lockstep with `done_entries` cardinality. The invariant tested in
+    /// `queue_storage_runtime_test::test_queue_terminal_live_counts_*`
+    /// is that `SUM(live_terminal_count)` for a queue equals
+    /// `count(*) FROM done_entries WHERE queue = ANY(...)`.
+    async fn increment_live_terminal_counters_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DoneJobRow],
+    ) -> Result<(), AwaError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // BTreeMap, not HashMap: two concurrent transactions upserting the
+        // same set of counter keys must take row locks in the same order,
+        // or they can deadlock on the ON CONFLICT DO UPDATE. Sorted key
+        // iteration removes that race entirely. See also the matching
+        // ORDER BY in the fused CTE upsert.
+        let mut by_group: BTreeMap<(i32, String, i16, i16), i64> = BTreeMap::new();
+        for row in rows {
+            let key = (
+                row.ready_slot,
+                row.queue.clone(),
+                row.priority,
+                row.enqueue_shard,
+            );
+            *by_group.entry(key).or_insert(0) += 1;
+        }
+        let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
+        let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
+        let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
+        for ((slot, queue, prio, shard), delta) in by_group {
+            ready_slots.push(slot);
+            queues.push(queue);
+            priorities.push(prio);
+            enqueue_shards.push(shard);
+            deltas.push(delta);
+        }
+        let schema = self.schema();
+        // ORDER BY pins the lock-acquisition order PG sees inside the
+        // INSERT ... ON CONFLICT, matching the sorted Rust iteration above.
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                ready_slot, queue, priority, enqueue_shard, live_terminal_count
+            )
+            SELECT ready_slot, queue, priority, enqueue_shard, delta
+            FROM unnest(
+                $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[]
+            ) AS d(ready_slot, queue, priority, enqueue_shard, delta)
+            ORDER BY ready_slot, queue, priority, enqueue_shard
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+            SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
+            "#
+        ))
+        .bind(&ready_slots)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&enqueue_shards)
+        .bind(&deltas)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Decrement `queue_terminal_live_counts` by the per-group magnitudes
+    /// implied by `rows`. Called from every terminal-delete path
+    /// (retry-from-terminal, DLQ move, discard). Rows whose group has no
+    /// counter row are tolerated (`GREATEST(0, ...)` floor) so the
+    /// operation is idempotent across re-runs.
+    async fn decrement_live_terminal_counters_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[(i32, String, i16, i16)],
+    ) -> Result<(), AwaError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // BTreeMap + ORDER BY: same deadlock-avoidance discipline as the
+        // increment helper. The UPDATE locks rows in the order PG sees
+        // its driving subquery; sorting the unnest input gives a stable
+        // (slot, queue, priority, shard) lock-acquisition order across
+        // concurrent transactions.
+        let mut by_group: BTreeMap<(i32, String, i16, i16), i64> = BTreeMap::new();
+        for key in rows {
+            *by_group.entry(key.clone()).or_insert(0) += 1;
+        }
+        let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
+        let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
+        let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
+        for ((slot, queue, prio, shard), delta) in by_group {
+            ready_slots.push(slot);
+            queues.push(queue);
+            priorities.push(prio);
+            enqueue_shards.push(shard);
+            deltas.push(delta);
+        }
+        let schema = self.schema();
+        sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.queue_terminal_live_counts AS counts
+            SET live_terminal_count = GREATEST(0, counts.live_terminal_count - sorted.delta)
+            FROM (
+                SELECT ready_slot, queue, priority, enqueue_shard, delta
+                FROM unnest(
+                    $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[]
+                ) AS d(ready_slot, queue, priority, enqueue_shard, delta)
+                ORDER BY ready_slot, queue, priority, enqueue_shard
+            ) AS sorted
+            WHERE counts.ready_slot     = sorted.ready_slot
+              AND counts.queue          = sorted.queue
+              AND counts.priority       = sorted.priority
+              AND counts.enqueue_shard  = sorted.enqueue_shard
+            "#
+        ))
+        .bind(&ready_slots)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&enqueue_shards)
+        .bind(&deltas)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Build the row-key vector for `decrement_live_terminal_counters_tx`
+    /// from a slice of `DoneJobRow` (used by retry-from-terminal,
+    /// DLQ move, and discard, all of which DELETE FROM done_entries
+    /// with `RETURNING *` materialised into `DoneJobRow`).
+    fn done_rows_to_counter_keys(rows: &[DoneJobRow]) -> Vec<(i32, String, i16, i16)> {
+        rows.iter()
+            .map(|row| {
+                (
+                    row.ready_slot,
+                    row.queue.clone(),
+                    row.priority,
+                    row.enqueue_shard,
+                )
+            })
+            .collect()
     }
 
     async fn delete_ready_backing_rows_tx<'a>(
@@ -6256,7 +6497,40 @@ impl QueueStorage {
                 JOIN closed
                   ON closed.job_id = completed.job_id
                  AND closed.run_lease = completed.run_lease
-                RETURNING job_id, run_lease
+                RETURNING ready_slot, queue, priority, enqueue_shard, job_id, run_lease
+            ),
+            -- #290: increment live terminal counters in lockstep with
+            -- the `terminal` INSERT above. Aggregate by group so a
+            -- skewed batch costs one UPSERT per touched
+            -- (slot, queue, priority, shard). Postgres executes
+            -- data-modifying CTEs unconditionally, so the outer SELECT
+            -- doesn't need to reference this stage.
+            --
+            -- ORDER BY pins the lock-acquisition order on the
+            -- ON CONFLICT DO UPDATE. Two concurrent receipt-fast batches
+            -- touching overlapping (slot, queue, priority, shard) tuples
+            -- would otherwise deadlock if their group iteration order
+            -- differed.
+            counter_upsert AS (
+                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                    ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                )
+                SELECT
+                    ready_slot, queue, priority, enqueue_shard, delta
+                FROM (
+                    SELECT
+                        terminal.ready_slot,
+                        terminal.queue,
+                        terminal.priority,
+                        terminal.enqueue_shard,
+                        count(*)::bigint AS delta
+                    FROM terminal
+                    GROUP BY terminal.ready_slot, terminal.queue, terminal.priority, terminal.enqueue_shard
+                ) AS grouped
+                ORDER BY ready_slot, queue, priority, enqueue_shard
+                ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+                SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
+                RETURNING 1
             )
             SELECT job_id, run_lease
             FROM terminal
@@ -7081,6 +7355,13 @@ impl QueueStorage {
         if let Some(terminal) = terminal {
             self.delete_ready_backing_rows_tx(tx, std::slice::from_ref(&terminal))
                 .await?;
+            // #290: the DELETE FROM done_entries above removes one terminal
+            // row; the counter must decrement in lockstep.
+            self.decrement_live_terminal_counters_tx(
+                tx,
+                &Self::done_rows_to_counter_keys(std::slice::from_ref(&terminal)),
+            )
+            .await?;
             let ready_row = ExistingReadyRow {
                 job_id: terminal.job_id,
                 kind: terminal.kind,
@@ -10302,6 +10583,12 @@ impl QueueStorage {
 
         self.delete_ready_backing_rows_tx(&mut tx, std::slice::from_ref(&moved))
             .await?;
+        // #290: DLQ move deletes from done_entries — decrement counter.
+        self.decrement_live_terminal_counters_tx(
+            &mut tx,
+            &Self::done_rows_to_counter_keys(std::slice::from_ref(&moved)),
+        )
+        .await?;
         let dlq_row = moved
             .clone()
             .into_dlq_row(dlq_reason.to_string(), Utc::now());
@@ -10353,6 +10640,10 @@ impl QueueStorage {
         }
 
         self.delete_ready_backing_rows_tx(&mut tx, &moved).await?;
+        // #290: bulk DLQ move deletes from done_entries — decrement counter
+        // by the per-group magnitudes of the moved rows.
+        self.decrement_live_terminal_counters_tx(&mut tx, &Self::done_rows_to_counter_keys(&moved))
+            .await?;
         let dlq_at = Utc::now();
         let rows: Vec<DlqJobRow> = moved
             .into_iter()
@@ -10594,6 +10885,15 @@ impl QueueStorage {
 
         self.delete_ready_backing_rows_tx(&mut tx, &deleted_done)
             .await?;
+        // #290: discard removes terminal `failed` rows from done_entries
+        // (and `failed` DLQ rows from dlq_entries — counter is keyed on
+        // done_entries only). Decrement the counter by the per-group
+        // magnitudes of `deleted_done`.
+        self.decrement_live_terminal_counters_tx(
+            &mut tx,
+            &Self::done_rows_to_counter_keys(&deleted_done),
+        )
+        .await?;
 
         for row in &deleted_done {
             self.sync_unique_claim(
@@ -11219,6 +11519,73 @@ impl QueueStorage {
         })
     }
 
+    /// Rebuild the `queue_terminal_live_counts` table from scratch by
+    /// truncating it and re-aggregating `done_entries` (per #290). Run
+    /// this when:
+    ///
+    /// - upgrading from a pre-#290 fleet, where in-flight binaries wrote
+    ///   `done_entries` without maintaining the counter,
+    /// - after any incident that may have left the counter inconsistent
+    ///   with `done_entries`, or
+    /// - as a routine drift-recovery step before relying on counter-fed
+    ///   reads for billing-grade accuracy.
+    ///
+    /// The rebuild is wrapped in an advisory lock so concurrent writers
+    /// don't interleave new inserts mid-rebuild. The lock key is scoped
+    /// to the queue-storage schema, so other schemas / other operations
+    /// are unaffected. Writers that hit the lock will block briefly
+    /// rather than fail.
+    ///
+    /// **Operator note:** this is best run on a quiesced fleet (workers
+    /// paused or fully drained). Concurrent inserts during the rebuild
+    /// will block on the lock; long-held locks can stall the fleet. The
+    /// rebuild itself is O(rows in `done_entries`).
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rebuild_terminal_counters")]
+    pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
+        let schema = self.schema();
+        let rebuild_lock_name = format!("awa.queue_storage.rebuild_terminal_counters:{schema}");
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&rebuild_lock_name)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            "TRUNCATE TABLE {schema}.queue_terminal_live_counts"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let inserted: i64 = sqlx::query_scalar(&format!(
+            r#"
+            WITH inserted AS (
+                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                    ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                )
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    count(*)::bigint
+                FROM {schema}.done_entries
+                GROUP BY ready_slot, queue, priority, enqueue_shard
+                RETURNING 1
+            )
+            SELECT COALESCE(count(*), 0)::bigint FROM inserted
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(inserted)
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest")]
     pub async fn prune_oldest(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
@@ -11325,6 +11692,19 @@ impl QueueStorage {
             });
         }
 
+        // #290: scan the about-to-be-truncated partition for the rollup
+        // fold. The rollup column is *permanent* state, so we MUST fold
+        // from ground truth (the `{done_child}` partition itself), not
+        // from `queue_terminal_live_counts` — the counter can drift
+        // briefly during a rolling upgrade from a pre-counter binary
+        // and folding drift into the rollup would bake it in forever.
+        // The counter rows for this slot are still cleaned up after the
+        // truncate; reads from the counter (queue_counts_exact in #305)
+        // may transiently disagree with the rollup until the operator
+        // runs `awa storage rebuild-terminal-counters`, but the rollup
+        // itself stays authoritative. See PR #304 reviewer finding
+        // "High: A1 can persist stale counter state before the
+        // read-switch PR" for the trade-off.
         let pruned_terminal_counts: Vec<(String, i16, i64)> = sqlx::query_as(&format!(
             r#"
             SELECT queue, priority, count(*)::bigint AS pruned_count
@@ -11346,6 +11726,20 @@ impl QueueStorage {
                     self.adjust_terminal_rollups_batch(&mut tx, pruned_terminal_counts.into_iter())
                         .await?;
                 }
+                // #290: the live counter rows for this slot are about to
+                // be orphans (their underlying done_entries rows just got
+                // truncated). Delete them in the same transaction. The
+                // rollup fold above already captured ground-truth from
+                // the partition scan; this just cleans up the counter
+                // index entries so a future insert into a re-rotated
+                // slot starts from zero.
+                sqlx::query(&format!(
+                    "DELETE FROM {schema}.queue_terminal_live_counts WHERE ready_slot = $1"
+                ))
+                .bind(slot)
+                .execute(tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
                 tx.commit().await.map_err(map_sqlx_error)?;
                 Ok(PruneOutcome::Pruned { slot })
             }
