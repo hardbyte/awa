@@ -29,10 +29,13 @@ async def lifespan(app: FastAPI):
     finally:
         await client.close()
     db = create_app_engine()
-    await ensure_app_schema(db)
-    app.state.db = db
-    app.state.sessions = async_sessionmaker(db, expire_on_commit=False)
     try:
+        # Any failure between engine creation and `yield` must still
+        # dispose() the pool — including ensure_app_schema(), which
+        # acquires a connection and runs DDL.
+        await ensure_app_schema(db)
+        app.state.db = db
+        app.state.sessions = async_sessionmaker(db, expire_on_commit=False)
         yield
     finally:
         await db.dispose()
