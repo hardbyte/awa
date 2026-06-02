@@ -11519,6 +11519,73 @@ impl QueueStorage {
         })
     }
 
+    /// Rebuild the `queue_terminal_live_counts` table from scratch by
+    /// truncating it and re-aggregating `done_entries` (per #290). Run
+    /// this when:
+    ///
+    /// - upgrading from a pre-#290 fleet, where in-flight binaries wrote
+    ///   `done_entries` without maintaining the counter,
+    /// - after any incident that may have left the counter inconsistent
+    ///   with `done_entries`, or
+    /// - as a routine drift-recovery step before relying on counter-fed
+    ///   reads for billing-grade accuracy.
+    ///
+    /// The rebuild is wrapped in an advisory lock so concurrent writers
+    /// don't interleave new inserts mid-rebuild. The lock key is scoped
+    /// to the queue-storage schema, so other schemas / other operations
+    /// are unaffected. Writers that hit the lock will block briefly
+    /// rather than fail.
+    ///
+    /// **Operator note:** this is best run on a quiesced fleet (workers
+    /// paused or fully drained). Concurrent inserts during the rebuild
+    /// will block on the lock; long-held locks can stall the fleet. The
+    /// rebuild itself is O(rows in `done_entries`).
+    #[tracing::instrument(skip(self, pool), name = "queue_storage.rebuild_terminal_counters")]
+    pub async fn rebuild_terminal_counters(&self, pool: &PgPool) -> Result<i64, AwaError> {
+        let schema = self.schema();
+        let rebuild_lock_name = format!("awa.queue_storage.rebuild_terminal_counters:{schema}");
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&rebuild_lock_name)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            "TRUNCATE TABLE {schema}.queue_terminal_live_counts"
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        let inserted: i64 = sqlx::query_scalar(&format!(
+            r#"
+            WITH inserted AS (
+                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                    ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                )
+                SELECT
+                    ready_slot,
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    count(*)::bigint
+                FROM {schema}.done_entries
+                GROUP BY ready_slot, queue, priority, enqueue_shard
+                RETURNING 1
+            )
+            SELECT COALESCE(count(*), 0)::bigint FROM inserted
+            "#
+        ))
+        .fetch_one(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(inserted)
+    }
+
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest")]
     pub async fn prune_oldest(&self, pool: &PgPool) -> Result<PruneOutcome, AwaError> {
         let schema = self.schema();
@@ -11625,22 +11692,26 @@ impl QueueStorage {
             });
         }
 
-        // #290: fold the live counter rows for this slot into
-        // queue_terminal_rollups. Source-of-truth is the live counter
-        // (which has been kept in lockstep with done_entries by the
-        // increment/decrement sites). Reading from the counter rather
-        // than scanning `{done_child}` removes one O(rows-in-slot) scan
-        // from the prune path; the partition truncate below removes the
-        // underlying rows.
+        // #290: scan the about-to-be-truncated partition for the rollup
+        // fold. The rollup column is *permanent* state, so we MUST fold
+        // from ground truth (the `{done_child}` partition itself), not
+        // from `queue_terminal_live_counts` — the counter can drift
+        // briefly during a rolling upgrade from a pre-counter binary
+        // and folding drift into the rollup would bake it in forever.
+        // The counter rows for this slot are still cleaned up after the
+        // truncate; reads from the counter (queue_counts_exact in #305)
+        // may transiently disagree with the rollup until the operator
+        // runs `awa storage rebuild-terminal-counters`, but the rollup
+        // itself stays authoritative. See PR #304 reviewer finding
+        // "High: A1 can persist stale counter state before the
+        // read-switch PR" for the trade-off.
         let pruned_terminal_counts: Vec<(String, i16, i64)> = sqlx::query_as(&format!(
             r#"
-            SELECT queue, priority, SUM(live_terminal_count)::bigint AS pruned_count
-            FROM {schema}.queue_terminal_live_counts
-            WHERE ready_slot = $1
+            SELECT queue, priority, count(*)::bigint AS pruned_count
+            FROM {done_child}
             GROUP BY queue, priority
             "#
         ))
-        .bind(slot)
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)?;
@@ -11658,7 +11729,10 @@ impl QueueStorage {
                 // #290: the live counter rows for this slot are about to
                 // be orphans (their underlying done_entries rows just got
                 // truncated). Delete them in the same transaction. The
-                // rollup fold above has already captured their values.
+                // rollup fold above already captured ground-truth from
+                // the partition scan; this just cleans up the counter
+                // index entries so a future insert into a re-rotated
+                // slot starts from zero.
                 sqlx::query(&format!(
                     "DELETE FROM {schema}.queue_terminal_live_counts WHERE ready_slot = $1"
                 ))

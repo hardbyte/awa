@@ -5132,6 +5132,124 @@ async fn assert_invariant_holds(pool: &sqlx::PgPool, schema: &str, queue: &str, 
     );
 }
 
+/// #290 — SQL compat `DELETE FROM awa.jobs WHERE id = $1` routes to
+/// `awa.delete_job_compat()`. The v022 migration teaches the done_entries
+/// branch of that function to decrement `queue_terminal_live_counts`.
+/// Without it, deleting a terminal row via the SQL compat path drifts
+/// the counter from the underlying table — and once #305's read switch
+/// lands, the drift becomes operator-visible.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_sql_compat";
+    let schema = "awa_qs_terminal_live_counts_sql_compat";
+    let _store = create_store(&pool, schema).await;
+    // Test infra already has queue_storage active under the default
+    // schema; delete_job_compat resolves the schema via
+    // `awa.active_queue_storage_schema()` which reads from
+    // `storage_transition_state`. We need that to point at our test
+    // schema for the call below. The simplest path: skip the transition
+    // dance and route the call by hand to the test schema's function
+    // copy. (active_queue_storage_schema() returns the cluster-wide
+    // active schema, not a per-test override.)
+    //
+    // Since v022's function lives on the schema-resolved-at-call-time
+    // path, the most direct check is to call the function with the
+    // already-active schema set to our test schema. We achieve that by
+    // pointing `awa.storage_transition_state` at our test schema for
+    // the duration of the call, then restoring it. The
+    // QUEUE_STORAGE_RUNTIME_LOCK guards us against interleaving with
+    // other tests.
+    let prior_state: (String, serde_json::Value, String) =
+        sqlx::query_as("SELECT current_engine, details, state FROM awa.storage_transition_state")
+            .fetch_one(&pool)
+            .await
+            .expect("read prior storage_transition_state");
+    sqlx::query(
+        "UPDATE awa.storage_transition_state \
+         SET current_engine = 'queue_storage', \
+             details = $1::jsonb, \
+             state = 'active', \
+             prepared_engine = NULL",
+    )
+    .bind(serde_json::json!({ "schema": schema }))
+    .execute(&pool)
+    .await
+    .expect("point active schema at test schema");
+
+    seed_terminal_rows(&pool, schema, queue, "completed", 5).await;
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 5);
+
+    let target_id: i64 = sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT job_id FROM {schema}.done_entries WHERE queue = $1 LIMIT 1"
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("first done job id");
+
+    let deleted: bool = sqlx::query_scalar("SELECT awa.delete_job_compat($1)")
+        .bind(target_id)
+        .fetch_one(&pool)
+        .await
+        .expect("delete_job_compat call");
+    assert!(
+        deleted,
+        "delete_job_compat should return true for an existing terminal row"
+    );
+
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 4);
+    assert_invariant_holds(&pool, schema, queue, "after SQL compat delete").await;
+
+    // Restore prior storage_transition_state so other tests aren't
+    // affected by our schema override.
+    sqlx::query(
+        "UPDATE awa.storage_transition_state \
+         SET current_engine = $1, details = $2::jsonb, state = $3",
+    )
+    .bind(prior_state.0)
+    .bind(prior_state.1)
+    .bind(prior_state.2)
+    .execute(&pool)
+    .await
+    .expect("restore storage_transition_state");
+}
+
+/// #290 — `rebuild_terminal_counters` truncates and re-aggregates from
+/// `done_entries`, restoring the invariant after any drift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_rebuild";
+    let schema = "awa_qs_terminal_live_counts_rebuild";
+    let store = create_store(&pool, schema).await;
+
+    // Seed 7 terminal rows with matching counter entries, then manually
+    // poison the counter to simulate rollover drift.
+    seed_terminal_rows(&pool, schema, queue, "completed", 7).await;
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_terminal_live_counts SET live_terminal_count = 999 WHERE queue = $1"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("poison counter");
+
+    // Sanity-check the drift is present.
+    assert_eq!(live_count_sum(&pool, schema, queue).await, 999);
+    assert_eq!(done_entries_count(&pool, schema, queue).await, 7);
+
+    let rebuilt = store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild");
+    assert!(rebuilt >= 1, "rebuild should re-populate counter rows");
+    assert_invariant_holds(&pool, schema, queue, "after rebuild").await;
+}
+
 async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COALESCE(SUM(live_terminal_count), 0)::bigint \

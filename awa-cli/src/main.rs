@@ -327,6 +327,14 @@ enum StorageCommands {
         #[arg(long, value_name = "DURATION", num_args = 0..=1, default_missing_value = "")]
         wait: Option<String>,
     },
+    /// Rebuild `queue_terminal_live_counts` from `done_entries`.
+    ///
+    /// Use this after upgrading from a pre-#290 fleet, after any incident
+    /// that may have left the counter inconsistent with `done_entries`,
+    /// or as a routine drift-recovery step before relying on
+    /// counter-fed reads for billing-grade accuracy. Wraps the rebuild
+    /// in an advisory lock; best run on a quiesced fleet.
+    RebuildTerminalCounters,
 }
 
 #[derive(Subcommand)]
@@ -939,6 +947,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let report = awa_model::storage::status_report(&pool).await?;
                             println!("{}", serde_json::to_string_pretty(&report)?);
                         }
+                    }
+                    StorageCommands::RebuildTerminalCounters => {
+                        // Resolve the live queue-storage schema from the
+                        // transition state; no point letting the operator
+                        // pass it as a flag and risk targeting an inactive
+                        // engine.
+                        let schema = awa_model::QueueStorage::active_schema(&pool)
+                            .await?
+                            .ok_or_else(|| {
+                                "no active queue-storage schema; nothing to rebuild".to_string()
+                            })?;
+                        let store = awa_model::QueueStorage::from_existing_schema(&schema)?;
+                        let inserted = store.rebuild_terminal_counters(&pool).await?;
+                        eprintln!(
+                            "rebuilt queue_terminal_live_counts in schema '{schema}': \
+                             {inserted} counter row(s) populated from done_entries"
+                        );
                     }
                 },
 
