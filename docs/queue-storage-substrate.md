@@ -66,7 +66,7 @@ state.
 
 The CLI rejects this combination:
 
-```
+```text
 Error: "Refusing to DROP SCHEMA awa CASCADE — schema 'awa' is the
 default migration-owned queue-storage substrate and also contains the
 canonical migration tables (schema_version, runtime_instances,
