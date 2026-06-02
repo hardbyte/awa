@@ -77,7 +77,7 @@ New operator surfaces:
 ```bash
 awa --database-url "$DATABASE_URL" storage status
 awa --database-url "$DATABASE_URL" storage prepare --engine queue_storage
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa
+awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema <custom_schema>
 awa --database-url "$DATABASE_URL" storage abort
 ```
 
@@ -98,9 +98,12 @@ These functions are one-shot operational commands. They are not schema-migration
 DDL and should be run deliberately by an operator or rollout tool, not embedded
 into the extracted migration SQL itself.
 
-`storage prepare-queue-storage-schema` is also an operational command, but it
-only materializes the queue-storage schema. It does **not** change
-`awa.storage_transition_state` and it does **not** activate routing.
+`awa migrate` materializes the default queue-storage substrate in the `awa`
+schema with the default slot counts. `storage prepare-queue-storage-schema` is
+still the operational command for custom queue-storage schemas, custom slot
+counts, or idempotent preflight checks. It only materializes the queue-storage
+schema: it does **not** change `awa.storage_transition_state` and it does
+**not** activate routing.
 
 Queue-storage schema preparation may also relax the physical `done_entries`
 body columns (`args`, `max_attempts`, `run_at`, `created_at`) to allow narrow
@@ -124,8 +127,9 @@ Current behavior:
   and blocker lists for `enter-mixed-transition` / `finalize`
 - `storage prepare` records a future engine and optional metadata, but keeps
   enqueue routing and worker execution on canonical storage
-- `storage prepare-queue-storage-schema` creates the target queue-storage
-  schema ahead of time without changing routing
+- `awa migrate` creates the default `awa` queue-storage substrate; `storage
+  prepare-queue-storage-schema` creates custom queue-storage schemas ahead of
+  time without changing routing
 - `storage abort` returns routing to canonical and clears a prepared or mixed-transition
   rollout before final activation
 - `storage enter-mixed-transition` requires prepared queue-storage metadata,

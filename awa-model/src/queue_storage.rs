@@ -323,7 +323,7 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
 fn validate_ident(ident: &str) -> Result<(), AwaError> {
     let mut chars = ident.chars();
     match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        Some(first) if first.is_ascii_lowercase() || first == '_' => {}
         _ => {
             return Err(AwaError::Validation(format!(
                 "invalid SQL identifier: {ident}"
@@ -331,7 +331,7 @@ fn validate_ident(ident: &str) -> Result<(), AwaError> {
         }
     }
 
-    if chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
         Ok(())
     } else {
         Err(AwaError::Validation(format!(
@@ -423,6 +423,64 @@ fn oldest_initialized_ring_slot(
     }
 
     Some((oldest_slot, oldest_generation))
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::{validate_ident, QueueStorage, QueueStorageConfig};
+
+    #[test]
+    fn queue_storage_schema_identifiers_are_lowercase_unquoted_names() {
+        for ident in ["awa", "awa_queue_storage", "_awa123"] {
+            validate_ident(ident).expect("identifier should be accepted");
+        }
+
+        for ident in ["Awa", "awa-queue", "123awa", "awa.queue"] {
+            assert!(
+                validate_ident(ident).is_err(),
+                "identifier should be rejected: {ident}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_queue_storage_schema_requires_default_physical_shape() {
+        for config in [
+            QueueStorageConfig {
+                queue_slot_count: 32,
+                ..Default::default()
+            },
+            QueueStorageConfig {
+                lease_slot_count: 4,
+                ..Default::default()
+            },
+            QueueStorageConfig {
+                claim_slot_count: 4,
+                ..Default::default()
+            },
+            QueueStorageConfig {
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+        ] {
+            let err = QueueStorage::new(config).expect_err("default awa schema shape must reject");
+            assert!(
+                err.to_string()
+                    .contains("default `awa` queue-storage schema"),
+                "unexpected error: {err}"
+            );
+        }
+
+        QueueStorage::new(QueueStorageConfig {
+            schema: "awa_custom".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        })
+        .expect("custom schema should allow custom physical shape");
+    }
 }
 
 #[cfg(test)]
@@ -1684,6 +1742,18 @@ impl QueueStorage {
                 "queue storage requires at least 1 queue stripe".into(),
             ));
         }
+        if config.schema == DEFAULT_SCHEMA
+            && (config.queue_slot_count != DEFAULT_QUEUE_SLOT_COUNT
+                || config.lease_slot_count != DEFAULT_LEASE_SLOT_COUNT
+                || config.claim_slot_count != DEFAULT_CLAIM_SLOT_COUNT
+                || !config.lease_claim_receipts)
+        {
+            return Err(AwaError::Validation(
+                "the default `awa` queue-storage schema must use the default slot counts and \
+                 lease_claim_receipts=true"
+                    .into(),
+            ));
+        }
         validate_ident(&config.schema)?;
         Ok(Self {
             config,
@@ -2225,35 +2295,6 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            if lease_claims_legacy_exists {
-                sqlx::query(&format!(
-                    r#"
-                INSERT INTO {schema}.lease_claims (
-                    claim_slot, job_id, run_lease, ready_slot, ready_generation,
-                    queue, priority, attempt, max_attempts, lane_seq,
-                    claimed_at, materialized_at
-                )
-                SELECT
-                    (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton),
-                    job_id, run_lease, ready_slot, ready_generation,
-                    queue, priority, attempt, max_attempts, lane_seq,
-                    claimed_at, materialized_at
-                FROM {schema}.lease_claims_legacy
-                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                "#
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    "DROP TABLE {schema}.lease_claims_legacy"
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
-
             let closures_legacy_exists: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (
@@ -2268,6 +2309,63 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            let legacy_claim_slot: Option<i32> =
+                if lease_claims_legacy_exists || closures_legacy_exists {
+                    Some(
+                        sqlx::query_scalar(&format!(
+                            "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+                        ))
+                        .fetch_one(install_tx.as_mut())
+                        .await
+                        .map_err(map_sqlx_error)?,
+                    )
+                } else {
+                    None
+                };
+
+            if lease_claims_legacy_exists {
+                sqlx::query(&format!(
+                    "ALTER TABLE {schema}.lease_claims_legacy ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0"
+                ))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                sqlx::query(&format!(
+                    "ALTER TABLE {schema}.lease_claims_legacy ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ"
+                ))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    r#"
+                INSERT INTO {schema}.lease_claims (
+                    claim_slot, job_id, run_lease, ready_slot, ready_generation,
+                    queue, priority, attempt, max_attempts, lane_seq,
+                    enqueue_shard, claimed_at, materialized_at, deadline_at
+                )
+                SELECT
+                    $1,
+                    job_id, run_lease, ready_slot, ready_generation,
+                    queue, priority, attempt, max_attempts, lane_seq,
+                    enqueue_shard, claimed_at, materialized_at, deadline_at
+                FROM {schema}.lease_claims_legacy
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                "#
+                ))
+                .bind(legacy_claim_slot.expect("legacy claim slot should be present"))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    "DROP TABLE {schema}.lease_claims_legacy"
+                ))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+
             if closures_legacy_exists {
                 sqlx::query(&format!(
                     r#"
@@ -2275,12 +2373,13 @@ impl QueueStorage {
                     claim_slot, job_id, run_lease, outcome, closed_at
                 )
                 SELECT
-                    (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton),
+                    $1,
                     job_id, run_lease, outcome, closed_at
                 FROM {schema}.lease_claim_closures_legacy
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 "#
                 ))
+                .bind(legacy_claim_slot.expect("legacy claim slot should be present"))
                 .execute(install_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;

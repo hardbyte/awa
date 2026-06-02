@@ -18,8 +18,8 @@
 -- schema; the helper rejects non-default configs against `p_schema='awa'`
 -- with errcode 22023.
 --
--- The helper is SECURITY INVOKER and does not GRANT to public — runtime
--- roles MUST NOT gain DDL through it. The helper takes a per-schema
+-- The helper is SECURITY INVOKER and explicitly revokes EXECUTE from
+-- PUBLIC — runtime roles MUST NOT gain DDL through it. The helper takes a per-schema
 -- advisory xact lock named `awa.queue_storage.install:{p_schema}` to
 -- serialize concurrent installs (matches the lock pattern previously
 -- held in Rust).
@@ -32,7 +32,8 @@
 --   lease_claims / lease_claim_closures rename-and-rebuild from a
 --   non-partitioned shape, queue_count_snapshots drop) — these are
 --   one-shot upgrade fixups that don't belong in a forward-only DDL
---   function. They remain in `prepare_schema()`.
+--   function. They remain in `prepare_schema()` for custom schemas; the
+--   default `awa` migration path runs the `awa`-specific copy below.
 
 CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
     p_schema               TEXT,
@@ -51,6 +52,31 @@ DECLARE
     v_initial_gen    BIGINT;
     v_claimed_cte    TEXT;
 BEGIN
+    IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
+        RAISE EXCEPTION 'install_queue_storage_substrate: schema name must match ^[a-z_][a-z0-9_]*$; got %',
+            p_schema
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_queue_slot_count IS NULL OR p_queue_slot_count < 4 THEN
+        RAISE EXCEPTION 'install_queue_storage_substrate: queue_slot_count must be >= 4; got %',
+            p_queue_slot_count
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_lease_slot_count IS NULL OR p_lease_slot_count < 2 THEN
+        RAISE EXCEPTION 'install_queue_storage_substrate: lease_slot_count must be >= 2; got %',
+            p_lease_slot_count
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_claim_slot_count IS NULL OR p_claim_slot_count < 2 THEN
+        RAISE EXCEPTION 'install_queue_storage_substrate: claim_slot_count must be >= 2; got %',
+            p_claim_slot_count
+            USING ERRCODE = '22023';
+    END IF;
+    IF p_lease_claim_receipts IS NULL THEN
+        RAISE EXCEPTION 'install_queue_storage_substrate: lease_claim_receipts must not be NULL'
+            USING ERRCODE = '22023';
+    END IF;
+
     -- Serialize concurrent installs for the same schema. The lock name
     -- matches the Rust `prepare_schema()` lock, so a CLI install racing
     -- with a Rust worker boot serializes on the same key.
@@ -995,7 +1021,7 @@ BEGIN
                     selected.lane_seq,
                     v_lane_shard,
                     v_claimed_at,
-                    COALESCE(v_deadline_at, v_claimed_at + make_interval(secs => $6)),
+                    v_deadline_at,
                     v_claimed_at
                 FROM selected
                 CROSS JOIN lease_ring
@@ -1294,8 +1320,109 @@ $install$;
 COMMENT ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) IS
     'Installs the queue-storage substrate (sequences, ring-state singletons, partitioned ready/done/lease tables, lane indexes, claim_ready_runtime()) into the named schema. The default ''awa'' substrate is migration-owned and default-shaped: lease_claim_receipts=TRUE and (queue=16, lease=8, claim=8). Operators wanting non-default slot counts or lease_claim_receipts=FALSE must use a custom queue-storage schema. SECURITY INVOKER, takes a per-schema advisory xact lock. See #308.';
 
--- Install the default `awa` substrate as part of migrate.
-SELECT awa.install_queue_storage_substrate('awa');
+REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM PUBLIC;
+
+-- Install the default `awa` substrate as part of migrate. Unlike the
+-- reusable helper, this default-schema path also performs the one-shot
+-- legacy fixups that let `awa migrate` upgrade a database where the
+-- default `awa` queue-storage substrate was previously prepared by Rust.
+-- Keep the whole cleanup -> helper -> copy-back path inside one statement
+-- so the per-schema advisory xact lock serializes it with prepare_schema().
+DO $$
+DECLARE
+    v_open_receipt_claims_count BIGINT;
+    v_lease_claims_relkind TEXT;
+    v_closures_relkind TEXT;
+    v_legacy_claim_slot INT;
+BEGIN
+    PERFORM pg_advisory_xact_lock(
+        hashtextextended('awa.queue_storage.install:awa', 0)
+    );
+
+    IF to_regclass('awa.open_receipt_claims') IS NOT NULL THEN
+        SELECT count(*)::bigint
+        INTO v_open_receipt_claims_count
+        FROM awa.open_receipt_claims;
+
+        IF v_open_receipt_claims_count > 0 THEN
+            RAISE EXCEPTION 'awa.open_receipt_claims has % rows but the runtime no longer reads or writes this table',
+                v_open_receipt_claims_count
+                USING ERRCODE = '22023',
+                      HINT = 'Run the ADR-023 reverse migration (recreate from lease_claims minus lease_claim_closures) to drain it, then re-run awa migrate.';
+        END IF;
+
+        DROP TABLE IF EXISTS awa.open_receipt_claims CASCADE;
+    END IF;
+
+    SELECT c.relkind::text
+    INTO v_lease_claims_relkind
+    FROM pg_class AS c
+    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'awa'
+      AND c.relname = 'lease_claims';
+
+    SELECT c.relkind::text
+    INTO v_closures_relkind
+    FROM pg_class AS c
+    JOIN pg_namespace AS n ON n.oid = c.relnamespace
+    WHERE n.nspname = 'awa'
+      AND c.relname = 'lease_claim_closures';
+
+    IF v_lease_claims_relkind = 'r' THEN
+        ALTER TABLE awa.lease_claims RENAME TO lease_claims_legacy;
+    END IF;
+    IF v_closures_relkind = 'r' THEN
+        ALTER TABLE awa.lease_claim_closures RENAME TO lease_claim_closures_legacy;
+    END IF;
+
+    DROP TABLE IF EXISTS awa.queue_count_snapshots;
+
+    PERFORM awa.install_queue_storage_substrate('awa');
+
+    IF to_regclass('awa.lease_claims_legacy') IS NOT NULL
+       OR to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
+        SELECT current_slot
+        INTO v_legacy_claim_slot
+        FROM awa.claim_ring_state
+        WHERE singleton;
+    END IF;
+
+    IF to_regclass('awa.lease_claims_legacy') IS NOT NULL THEN
+        ALTER TABLE awa.lease_claims_legacy
+            ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0;
+        ALTER TABLE awa.lease_claims_legacy
+            ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ;
+
+        INSERT INTO awa.lease_claims (
+            claim_slot, job_id, run_lease, ready_slot, ready_generation,
+            queue, priority, attempt, max_attempts, lane_seq,
+            enqueue_shard, claimed_at, materialized_at, deadline_at
+        )
+        SELECT
+            v_legacy_claim_slot,
+            job_id, run_lease, ready_slot, ready_generation,
+            queue, priority, attempt, max_attempts, lane_seq,
+            enqueue_shard, claimed_at, materialized_at, deadline_at
+        FROM awa.lease_claims_legacy
+        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING;
+
+        DROP TABLE awa.lease_claims_legacy;
+    END IF;
+
+    IF to_regclass('awa.lease_claim_closures_legacy') IS NOT NULL THEN
+        INSERT INTO awa.lease_claim_closures (
+            claim_slot, job_id, run_lease, outcome, closed_at
+        )
+        SELECT
+            v_legacy_claim_slot,
+            job_id, run_lease, outcome, closed_at
+        FROM awa.lease_claim_closures_legacy
+        ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING;
+
+        DROP TABLE awa.lease_claim_closures_legacy;
+    END IF;
+END
+$$;
 
 INSERT INTO awa.schema_version (version, description)
 VALUES (23, 'Install default awa queue-storage substrate via awa.install_queue_storage_substrate() helper (#308)')

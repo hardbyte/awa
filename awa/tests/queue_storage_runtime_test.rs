@@ -2142,6 +2142,54 @@ async fn test_legacy_zero_deadline_claim_conversion_error_rolls_back() {
     assert_eq!(claimed[0].job.id, job_id);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_legacy_zero_deadline_claim_without_receipts_succeeds() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(4).await;
+    let schema = "awa_qs_legacy_zero_deadline_claim";
+    let queue = "qs_legacy_zero_deadline_claim";
+    let store = create_store(&pool, schema).await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &CompleteJob { id: 311 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("zero-deadline legacy claim should not reference a missing parameter");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].job.id, job_id);
+    assert!(
+        !claimed[0].claim.lease_claim_receipt,
+        "legacy non-receipts claim should materialize into leases"
+    );
+
+    let deadline_at: Option<DateTime<Utc>> = sqlx::query_scalar(&format!(
+        "SELECT deadline_at FROM {schema}.leases WHERE job_id = $1"
+    ))
+    .bind(job_id)
+    .fetch_one(&pool)
+    .await
+    .expect("claimed lease should exist");
+    assert!(
+        deadline_at.is_none(),
+        "zero-deadline legacy claim should leave leases.deadline_at NULL"
+    );
+    assert_eq!(
+        lease_claim_count(&pool, &store).await,
+        0,
+        "legacy non-receipts claim must not write receipt rows"
+    );
+}
+
 /// Receipt-plane partition-migration test (see ADR-023). Start from
 /// a schema that still has the legacy regular (non-partitioned)
 /// `lease_claims` + `lease_claim_closures`, seed some rows in them,
@@ -2178,8 +2226,10 @@ async fn test_lease_claim_migration_preserves_rows() {
             attempt SMALLINT NOT NULL,
             max_attempts SMALLINT NOT NULL,
             lane_seq BIGINT NOT NULL,
+            enqueue_shard SMALLINT NOT NULL DEFAULT 0,
             claimed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
             materialized_at TIMESTAMPTZ,
+            deadline_at TIMESTAMPTZ,
             PRIMARY KEY (job_id, run_lease)
         )
         "#
@@ -2208,8 +2258,10 @@ async fn test_lease_claim_migration_preserves_rows() {
             r#"
             INSERT INTO {schema}.lease_claims
                 (job_id, run_lease, ready_slot, ready_generation, queue,
-                 priority, attempt, max_attempts, lane_seq, claimed_at, materialized_at)
-            VALUES ($1, 1, 0, 0, 'legacy', 2, 1, 25, $1, now(), NULL)
+                 priority, attempt, max_attempts, lane_seq, enqueue_shard,
+                 claimed_at, materialized_at, deadline_at)
+            VALUES ($1, 1, 0, 0, 'legacy', 2, 1, 25, $1, ($1 % 2)::smallint,
+                    now(), NULL, TIMESTAMPTZ '2030-01-01 00:00:00+00')
             "#
         ))
         .bind(job_id)
@@ -2307,6 +2359,20 @@ async fn test_lease_claim_migration_preserves_rows() {
         claims_count, 5,
         "all 5 legacy claim rows must migrate into current_slot"
     );
+
+    let preserved_claim_shape: (i16, bool) = sqlx::query_as(&format!(
+        r#"
+        SELECT enqueue_shard,
+               deadline_at = TIMESTAMPTZ '2030-01-01 00:00:00+00'
+        FROM {schema}.lease_claims
+        WHERE job_id = 3
+          AND run_lease = 1
+        "#
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("read migrated claim metadata");
+    assert_eq!(preserved_claim_shape, (1, true));
 
     let closures_count: i64 = sqlx::query_scalar(&format!(
         "SELECT count(*) FROM {schema}.lease_claim_closures WHERE claim_slot = $1"
