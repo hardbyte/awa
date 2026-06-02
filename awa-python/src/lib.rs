@@ -1,4 +1,5 @@
 mod args;
+mod callback_contract;
 mod client;
 mod dlq;
 mod errors;
@@ -103,6 +104,21 @@ fn _awa(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(current_migration_version, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::init_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(telemetry::shutdown_telemetry, m)?)?;
+    m.add_function(wrap_pyfunction!(callback_contract::sign_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(callback_contract::verify_callback, m)?)?;
+    m.add_function(wrap_pyfunction!(callback_contract::build_callback_url, m)?)?;
+    m.add(
+        "CALLBACK_SIGNATURE_HEADER",
+        awa_model::callback_contract::SIGNATURE_HEADER,
+    )?;
+    m.add(
+        "CALLBACK_DEFAULT_HEARTBEAT_TIMEOUT_SECS",
+        awa_model::callback_contract::DEFAULT_HEARTBEAT_TIMEOUT_SECS,
+    )?;
+    m.add(
+        "CALLBACK_DEFAULT_PATH_PREFIX",
+        awa_model::callback_contract::DEFAULT_CALLBACK_PATH_PREFIX,
+    )?;
 
     // Exceptions
     m.add("AwaError", m.py().get_type::<AwaError>())?;

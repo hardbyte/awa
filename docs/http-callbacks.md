@@ -197,6 +197,55 @@ The `complete` endpoint completes the job. It does not resume an in-process
 handler for sequential callback workflows; use the Rust/Python admin API
 `resume_external` path for that pattern.
 
+## Deploying callback ingress separately
+
+`awa serve` bundles the admin UI, admin REST API, static fallback, and the
+callback receiver behind a single router with permissive CORS. That is
+convenient for development but undesirable when callbacks must be
+externally reachable while the admin surface must stay private.
+
+For that case Awa ships a callback-only receiver as a deployable role
+(see [ADR-027](./adr/027-callback-ingress.md)):
+
+```text
+awa callbacks serve \
+  --host 0.0.0.0 --port 4000 \
+  --callback-hmac-secret "$AWA_CALLBACK_HMAC_SECRET" \
+  --path-prefix /api/callbacks
+```
+
+The router:
+
+- Mounts only `POST {prefix}/{callback_id}/{complete,fail,heartbeat}`.
+- Does not serve static UI assets or admin REST routes.
+- Does not apply permissive CORS.
+- Refuses to build against a read-only database (all three routes mutate
+  job state).
+- Requires a callback signing secret by default. Pass `--allow-unsigned`
+  only when the receiver lives on a trusted network (mTLS at the load
+  balancer, IP allow-list, private VPC, etc.).
+
+The same router is available as a Rust library for embedding:
+
+```rust
+use awa_ui::{callback_router, CallbackAuth, CallbackReceiverConfig};
+
+let router = callback_router(
+    pool,
+    CallbackReceiverConfig::new(CallbackAuth::Signed(secret)),
+)
+.await?;
+```
+
+Use [`HttpWorkerConfig::callback_path_prefix`](#configuration) on the
+worker side to match a non-default `--path-prefix` so the URLs the worker
+hands to your function point at the receiver.
+
+If you want callbacks to land inside your own application (FastAPI,
+axum, etc.) rather than running Awa's receiver at all, see
+[`docs/callback-receivers.md`](./callback-receivers.md) for the
+user-owned API integration pattern.
+
 ## Function-side verification
 
 The signature primarily protects the Awa callback receiver from unauthorized

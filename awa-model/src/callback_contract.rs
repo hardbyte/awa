@@ -219,6 +219,20 @@ mod tests {
         assert_eq!(url, "https://api.example.com/abc/complete");
     }
 
+    /// Pin a known signing output so silent algorithm changes break this
+    /// test. Same vector is asserted from Python in
+    /// `awa-python/tests/test_callback_contract.py::test_known_test_vector`
+    /// so the two language bindings cannot drift.
+    #[test]
+    fn sign_pinned_test_vector() {
+        let secret = [7u8; 32];
+        let signature = sign(&secret, "abc");
+        assert_eq!(
+            signature,
+            "b1495225f01fa8cd09e410d288d09b68c1cc9fb2414686c0d3ac13fc905497d9",
+        );
+    }
+
     #[test]
     fn callback_url_nested_prefix() {
         let url = callback_url(
