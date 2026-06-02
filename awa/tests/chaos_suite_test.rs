@@ -1252,12 +1252,18 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     .await
     .expect("Failed to insert sentinel simple chaos job");
 
-    python_worker
-        .wait_for_line(
-            "START mode=worker_simple_chaos_job",
-            Duration::from_secs(10),
-        )
-        .await;
+    // Synchronize on the durable DB state instead of helper stdout: the sentinel
+    // job reaching `running` proves the Python worker has claimed it. Avoids
+    // pipe-buffered stderr scheduling flake from the helper.
+    wait_for_kind_state_count(
+        &pool,
+        &queue,
+        "simple_chaos_job",
+        "running",
+        1,
+        Duration::from_secs(10),
+    )
+    .await;
 
     async fn insert_wave(pool: &sqlx::PgPool, queue: &str, seq: &mut i64) {
         for _ in 0..2 {
@@ -1304,16 +1310,9 @@ async fn test_sustained_mixed_workload_survives_repeated_node_failures() {
     insert_wave(&pool, &queue, &mut seq).await;
     insert_wave(&pool, &queue, &mut seq).await;
 
-    // Confirm Python is mid-execution on at least one simple job. The stdout
-    // line proves the helper entered the handler; the database predicate is
-    // the durable synchronization point that makes the later rescue assertion
-    // independent of stdout scheduling.
-    python_worker
-        .wait_for_line(
-            "START mode=worker_simple_chaos_job",
-            Duration::from_secs(10),
-        )
-        .await;
+    // Confirm Python is mid-execution on at least one simple job. The DB
+    // predicate (`running` count) is the durable synchronization point that
+    // makes the later rescue assertion independent of helper stdout scheduling.
     let running_before_kill = wait_for_kind_state_count(
         &pool,
         &queue,
