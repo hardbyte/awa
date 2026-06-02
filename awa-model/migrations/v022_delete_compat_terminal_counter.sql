@@ -160,16 +160,27 @@ BEGIN
     GET DIAGNOSTICS v_rows = ROW_COUNT;
 
     IF v_rows > 0 THEN
-        EXECUTE format(
-            'UPDATE %I.queue_terminal_live_counts AS counts
-             SET live_terminal_count = GREATEST(0, counts.live_terminal_count - 1)
-             WHERE counts.ready_slot     = $1
-               AND counts.queue          = $2
-               AND counts.priority       = $3
-               AND counts.enqueue_shard  = $4',
-            v_schema
-        )
-        USING v_ready_slot, v_queue, v_priority, v_enqueue_shard;
+        -- The counter table is created lazily by
+        -- QueueStorage::prepare_schema() on first runtime boot, which
+        -- can happen AFTER migrations have run (migrations don't
+        -- prepare the per-schema queue-storage tables). Guard the
+        -- decrement with `to_regclass` so a DELETE FROM awa.jobs that
+        -- arrives during the boot window degrades to "drift, then
+        -- rebuild" rather than "relation does not exist". Operators
+        -- recover with `awa storage rebuild-terminal-counters` once the
+        -- counter table catches up.
+        IF to_regclass(format('%I.queue_terminal_live_counts', v_schema)) IS NOT NULL THEN
+            EXECUTE format(
+                'UPDATE %I.queue_terminal_live_counts AS counts
+                 SET live_terminal_count = GREATEST(0, counts.live_terminal_count - 1)
+                 WHERE counts.ready_slot     = $1
+                   AND counts.queue          = $2
+                   AND counts.priority       = $3
+                   AND counts.enqueue_shard  = $4',
+                v_schema
+            )
+            USING v_ready_slot, v_queue, v_priority, v_enqueue_shard;
+        END IF;
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,
             v_unique_key,

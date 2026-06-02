@@ -4929,12 +4929,19 @@ async fn test_queue_terminal_live_counts_decrement_on_terminal_delete_paths() {
         .expect("move_failed_to_dlq");
     assert_invariant_holds(&pool, schema, queue, "after move_failed_to_dlq").await;
 
-    // 2. Bulk DLQ move: drain all remaining failed rows.
+    // 2. Bulk DLQ move: drain all remaining failed rows. Seeded 3
+    //    `failed` rows; the single move in step 1 removed one, so 2
+    //    remain. Exact assertion catches a silent no-op on the
+    //    single-move path (which would make bulk pick up all 3 and
+    //    still leave the invariant balanced).
     let moved = store
         .bulk_move_failed_to_dlq(&pool, None, Some(queue), "bulk-test")
         .await
         .expect("bulk_move_failed_to_dlq");
-    assert!(moved >= 2, "expected at least 2 failed rows still to move");
+    assert_eq!(
+        moved, 2,
+        "expected exactly 2 failed rows to remain after step 1"
+    );
     assert_invariant_holds(&pool, schema, queue, "after bulk_move_failed_to_dlq").await;
 
     // 3. Discard: seed fresh failed rows of a unique kind, then
@@ -5144,39 +5151,11 @@ async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
     let pool = setup_pool(10).await;
     let queue = "qs_terminal_live_counts_sql_compat";
     let schema = "awa_qs_terminal_live_counts_sql_compat";
+    // create_store activates this schema via the storage transition
+    // dance (prepare → enter_mixed_transition → finalize), so
+    // `awa.active_queue_storage_schema()` returns `schema` and
+    // `awa.delete_job_compat()` routes to it.
     let _store = create_store(&pool, schema).await;
-    // Test infra already has queue_storage active under the default
-    // schema; delete_job_compat resolves the schema via
-    // `awa.active_queue_storage_schema()` which reads from
-    // `storage_transition_state`. We need that to point at our test
-    // schema for the call below. The simplest path: skip the transition
-    // dance and route the call by hand to the test schema's function
-    // copy. (active_queue_storage_schema() returns the cluster-wide
-    // active schema, not a per-test override.)
-    //
-    // Since v022's function lives on the schema-resolved-at-call-time
-    // path, the most direct check is to call the function with the
-    // already-active schema set to our test schema. We achieve that by
-    // pointing `awa.storage_transition_state` at our test schema for
-    // the duration of the call, then restoring it. The
-    // QUEUE_STORAGE_RUNTIME_LOCK guards us against interleaving with
-    // other tests.
-    let prior_state: (String, serde_json::Value, String) =
-        sqlx::query_as("SELECT current_engine, details, state FROM awa.storage_transition_state")
-            .fetch_one(&pool)
-            .await
-            .expect("read prior storage_transition_state");
-    sqlx::query(
-        "UPDATE awa.storage_transition_state \
-         SET current_engine = 'queue_storage', \
-             details = $1::jsonb, \
-             state = 'active', \
-             prepared_engine = NULL",
-    )
-    .bind(serde_json::json!({ "schema": schema }))
-    .execute(&pool)
-    .await
-    .expect("point active schema at test schema");
 
     seed_terminal_rows(&pool, schema, queue, "completed", 5).await;
     assert_eq!(done_entries_count(&pool, schema, queue).await, 5);
@@ -5202,19 +5181,6 @@ async fn test_queue_terminal_live_counts_decrement_on_sql_compat_delete() {
 
     assert_eq!(done_entries_count(&pool, schema, queue).await, 4);
     assert_invariant_holds(&pool, schema, queue, "after SQL compat delete").await;
-
-    // Restore prior storage_transition_state so other tests aren't
-    // affected by our schema override.
-    sqlx::query(
-        "UPDATE awa.storage_transition_state \
-         SET current_engine = $1, details = $2::jsonb, state = $3",
-    )
-    .bind(prior_state.0)
-    .bind(prior_state.1)
-    .bind(prior_state.2)
-    .execute(&pool)
-    .await
-    .expect("restore storage_transition_state");
 }
 
 /// #290 — `rebuild_terminal_counters` truncates and re-aggregates from
