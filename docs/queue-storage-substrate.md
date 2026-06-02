@@ -83,6 +83,64 @@ To rebuild a queue-storage substrate from scratch:
 
 `DROP SCHEMA awa CASCADE` is not a supported operator action.
 
+## Driving installs and upgrades from external migration tooling
+
+Teams that already run their schema changes through a tool like
+Sqitch, Liquibase, or a hand-rolled migration runner do not need to
+invoke `awa migrate` or any other Rust binary. The migration set
+extracted with `awa migrate --sql` (or `--extract-to`) is complete:
+it includes the substrate DDL via the v023 helper, and the staged
+transition is driven by SQL functions.
+
+### Fresh install (no canonical data yet)
+
+After applying the migration files, the first runtime that boots
+calls `awa.storage_auto_finalize_if_fresh('awa')` which atomically
+advances `canonical → active` when `awa.jobs` is empty and no live
+runtimes have heartbeated. External tooling can call the same
+function as a post-migrate step to land in `active` before the first
+worker even starts:
+
+```sql
+SELECT awa.storage_auto_finalize_if_fresh('awa');
+```
+
+`storage_auto_finalize_if_fresh` carries a `GRANT EXECUTE ... TO
+PUBLIC`, so it is callable from any role.
+
+### Upgrade from an existing canonical-only deployment
+
+`storage_auto_finalize_if_fresh` refuses to short-circuit when
+canonical work or live runtimes exist. The operator drives the
+staged transition with three SQL function calls, each of which
+mirrors the equivalent `awa storage` CLI subcommand:
+
+```sql
+-- (1) Mark queue-storage as the prepared target.
+SELECT awa.storage_prepare('queue_storage', '{"schema":"awa"}'::jsonb);
+
+-- (2) Bring up at least one worker with
+--     transition_role=queue_storage_target. Stop any canonical-only
+--     workers. Then flip routing into mixed mode:
+SELECT awa.storage_enter_mixed_transition();
+
+-- (3) Wait for workers to drain the canonical backlog onto
+--     queue-storage. When `awa.queue_counts_exact` shows no
+--     canonical-live work remaining, finalize:
+SELECT awa.storage_finalize();
+```
+
+`storage_enter_mixed_transition` will reject the call until at least
+one live `queue_storage_target` runtime is heartbeating, and
+`storage_finalize` will reject the call until the canonical backlog
+is drained. Both gates are deliberate — they prevent operators from
+flipping routing onto a substrate that has no executor or onto a
+non-empty canonical backlog.
+
+The orchestration (start new-mode workers, stop old-mode workers,
+wait for drain) is unchanged from the CLI flow — only the invocation
+surface is different.
+
 ## Design rationale
 
 The split between migration-owned default substrate and helper-installed
