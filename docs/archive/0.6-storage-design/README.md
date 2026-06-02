@@ -12,3 +12,8 @@ For the shipping 0.6 shape, prefer:
 - [0.5.x to 0.6 upgrade checklist](../../upgrade-0.5-to-0.6.md)
 - [ADR-019: Queue Storage Engine](../../adr/019-queue-storage-redesign.md)
 - [ADR-023: Receipt Plane Ring Partitioning](../../adr/023-receipt-plane-ring-partitioning.md)
+
+Included archived notes:
+
+- [Issue 169 storage redesign spike](issue-169-storage-spike.md) — early
+  segment/claim-ledger exploration kept for issue-thread continuity.

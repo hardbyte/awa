@@ -1,8 +1,12 @@
-# Issue 169: Storage Redesign Spike
+# Issue 169 Storage Redesign Spike
 
-This spike document captures the earlier exploratory work. The current concrete
-design proposal and prototype results now live in
-[ADR-019](/Users/brian/dev/awa/docs/adr/019-vacuum-aware-storage-redesign.md#L1).
+This is an archived design spike from the 0.6 storage investigation, kept for
+context because public issue threads refer to it. It is not the current 0.6
+implementation guide.
+
+For the queue-storage design that shipped in the 0.6 line, see
+[ADR-019](../../adr/019-queue-storage-redesign.md). Follow-up work on a
+future segment/cursor storage engine is tracked in the public issue tracker.
 
 ## Question
 
