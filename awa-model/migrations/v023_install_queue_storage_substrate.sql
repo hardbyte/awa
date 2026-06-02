@@ -24,10 +24,10 @@
 -- serialize concurrent installs (matches the lock pattern previously
 -- held in Rust).
 --
--- Out of scope for this PR:
--- - The `awa.runtime_storage_backends` cross-schema table and its seed —
---   that still lives in `prepare_schema()` and will move to v024 in
---   issue #308 PR 2.
+-- Deliberately not owned by this helper:
+-- - The `awa.runtime_storage_backends` cross-schema table is owned by the
+--   v012 migration. Activation/finalization paths seed or update the
+--   `queue_storage` row.
 -- - The non-additive legacy upgrade edge cases (open_receipt_claims drop,
 --   lease_claims / lease_claim_closures rename-and-rebuild from a
 --   non-partitioned shape, queue_count_snapshots drop) — these are
