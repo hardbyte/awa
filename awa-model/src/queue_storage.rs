@@ -3368,6 +3368,85 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
+            // queue_terminal_live_counts: per-(ready_slot, queue, priority,
+            // enqueue_shard) live count of rows currently in done_entries.
+            // Replaces the `count(*) FROM done_entries WHERE queue = ANY(...)`
+            // scan in queue_counts_exact (#290). Shard-aligned to inherit the
+            // ADR-025 row-lock spread; one counter row per group means a
+            // skewed batch of 512 terminal inserts costs one UPSERT. Prune
+            // folds a slot's rows into queue_terminal_rollups in the same
+            // transaction as the partition truncate (lands in PR B of this
+            // series; A1 here only wires the increment side).
+            //
+            // fillfactor=50 + tuned autovacuum: the upsert path is a HOT
+            // candidate (no secondary index touched). Without explicit
+            // fillfactor, the upserts spill to fresh pages under sustained
+            // completion load.
+            //
+            // Created here, after the `done_entries` partition loop above,
+            // because the backfill below SELECTs FROM `done_entries`.
+            sqlx::query(&format!(
+                r#"
+            CREATE TABLE IF NOT EXISTS {schema}.queue_terminal_live_counts (
+                ready_slot          INT NOT NULL,
+                queue               TEXT NOT NULL,
+                priority            SMALLINT NOT NULL,
+                enqueue_shard       SMALLINT NOT NULL,
+                live_terminal_count BIGINT NOT NULL DEFAULT 0,
+                PRIMARY KEY (ready_slot, queue, priority, enqueue_shard)
+            )
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            sqlx::query(&format!(
+                r#"
+            ALTER TABLE {schema}.queue_terminal_live_counts SET (
+                fillfactor = 50,
+                autovacuum_vacuum_scale_factor = 0.0,
+                autovacuum_vacuum_threshold = 200,
+                autovacuum_vacuum_cost_limit = 2000,
+                autovacuum_vacuum_cost_delay = 2
+            )
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // Backfill from existing done_entries in the same transaction as
+            // the table creation. On a fresh install this is a no-op
+            // (done_entries is empty). On an existing 0.6 cluster, this
+            // builds the live counts from the current done_entries
+            // population before any new code path tries to read them.
+            // ON CONFLICT DO NOTHING because the loop is idempotent and a
+            // re-running prepare_schema must not double-count.
+            sqlx::query(&format!(
+                r#"
+            INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                ready_slot,
+                queue,
+                priority,
+                enqueue_shard,
+                live_terminal_count
+            )
+            SELECT
+                ready_slot,
+                queue,
+                priority,
+                enqueue_shard,
+                count(*)::bigint
+            FROM {schema}.done_entries
+            GROUP BY ready_slot, queue, priority, enqueue_shard
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO NOTHING
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             for slot in 0..self.lease_slot_count() {
                 sqlx::query(&format!(
                     r#"
@@ -3902,6 +3981,7 @@ impl QueueStorage {
                 {schema}.deferred_jobs,
                 {schema}.queue_lanes,
                 {schema}.queue_terminal_rollups,
+                {schema}.queue_terminal_live_counts,
                 {schema}.queue_claimer_leases,
                 {schema}.queue_claimer_state,
                 {schema}.queue_ring_slots,
@@ -4913,7 +4993,139 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
         }
 
+        // #290: maintain queue_terminal_live_counts as a denormalised
+        // count of live done_entries rows, keyed by
+        // (ready_slot, queue, priority, enqueue_shard) to match the
+        // ring + shard identity. Aggregate this batch into one row per
+        // group so a skewed full batch of N terminal inserts costs at
+        // most one UPSERT per (slot, queue, priority, shard) tuple
+        // touched. The read side (queue_counts_exact, switched in a
+        // follow-up PR) then sums these counters instead of scanning
+        // done_entries.
+        self.increment_live_terminal_counters_tx(tx, rows).await?;
+
         Ok(rows.len())
+    }
+
+    /// Aggregate `rows` by `(ready_slot, queue, priority, enqueue_shard)`
+    /// and UPSERT the per-group delta into `queue_terminal_live_counts`.
+    /// Called from every terminal-insert path so the counter stays in
+    /// lockstep with `done_entries` cardinality. The invariant tested in
+    /// `queue_storage_runtime_test::test_queue_terminal_live_counts_*`
+    /// is that `SUM(live_terminal_count)` for a queue equals
+    /// `count(*) FROM done_entries WHERE queue = ANY(...)`.
+    async fn increment_live_terminal_counters_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[DoneJobRow],
+    ) -> Result<(), AwaError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut by_group: HashMap<(i32, String, i16, i16), i64> = HashMap::new();
+        for row in rows {
+            let key = (
+                row.ready_slot,
+                row.queue.clone(),
+                row.priority,
+                row.enqueue_shard,
+            );
+            *by_group.entry(key).or_insert(0) += 1;
+        }
+        let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
+        let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
+        let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
+        for ((slot, queue, prio, shard), delta) in by_group {
+            ready_slots.push(slot);
+            queues.push(queue);
+            priorities.push(prio);
+            enqueue_shards.push(shard);
+            deltas.push(delta);
+        }
+        let schema = self.schema();
+        sqlx::query(&format!(
+            r#"
+            INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                ready_slot, queue, priority, enqueue_shard, live_terminal_count
+            )
+            SELECT * FROM unnest(
+                $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[]
+            )
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+            SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
+            "#
+        ))
+        .bind(&ready_slots)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&enqueue_shards)
+        .bind(&deltas)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
+    }
+
+    /// Decrement `queue_terminal_live_counts` by the per-group magnitudes
+    /// implied by `rows`. Called from every terminal-delete path
+    /// (retry-from-terminal, DLQ move, discard, SQL compat deletes).
+    /// Pins the invariant in lockstep with the increment counterpart.
+    /// Rows whose group has no counter row are tolerated (`GREATEST(0, ...)`
+    /// floor) so the operation is idempotent across re-runs.
+    ///
+    /// PR A1 ships only the increment side. The delete-site wiring lands
+    /// in PR A2 of the #290 series; the helper is in place now so PR A2
+    /// is a pure wiring change.
+    #[allow(dead_code)]
+    async fn decrement_live_terminal_counters_tx<'a>(
+        &self,
+        tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
+        rows: &[(i32, String, i16, i16)],
+    ) -> Result<(), AwaError> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut by_group: HashMap<(i32, String, i16, i16), i64> = HashMap::new();
+        for key in rows {
+            *by_group.entry(key.clone()).or_insert(0) += 1;
+        }
+        let mut ready_slots: Vec<i32> = Vec::with_capacity(by_group.len());
+        let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
+        let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
+        for ((slot, queue, prio, shard), delta) in by_group {
+            ready_slots.push(slot);
+            queues.push(queue);
+            priorities.push(prio);
+            enqueue_shards.push(shard);
+            deltas.push(delta);
+        }
+        let schema = self.schema();
+        sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.queue_terminal_live_counts AS counts
+            SET live_terminal_count = GREATEST(0, counts.live_terminal_count - delta.delta)
+            FROM unnest(
+                $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[]
+            ) AS delta(ready_slot, queue, priority, enqueue_shard, delta)
+            WHERE counts.ready_slot     = delta.ready_slot
+              AND counts.queue          = delta.queue
+              AND counts.priority       = delta.priority
+              AND counts.enqueue_shard  = delta.enqueue_shard
+            "#
+        ))
+        .bind(&ready_slots)
+        .bind(&queues)
+        .bind(&priorities)
+        .bind(&enqueue_shards)
+        .bind(&deltas)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+        Ok(())
     }
 
     async fn delete_ready_backing_rows_tx<'a>(
@@ -6256,7 +6468,29 @@ impl QueueStorage {
                 JOIN closed
                   ON closed.job_id = completed.job_id
                  AND closed.run_lease = completed.run_lease
-                RETURNING job_id, run_lease
+                RETURNING ready_slot, queue, priority, enqueue_shard, job_id, run_lease
+            ),
+            -- #290: increment live terminal counters in lockstep with
+            -- the `terminal` INSERT above. Aggregate by group so a
+            -- skewed batch costs one UPSERT per touched
+            -- (slot, queue, priority, shard). Postgres executes
+            -- data-modifying CTEs unconditionally, so the outer SELECT
+            -- doesn't need to reference this stage.
+            counter_upsert AS (
+                INSERT INTO {schema}.queue_terminal_live_counts AS counts (
+                    ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                )
+                SELECT
+                    terminal.ready_slot,
+                    terminal.queue,
+                    terminal.priority,
+                    terminal.enqueue_shard,
+                    count(*)::bigint
+                FROM terminal
+                GROUP BY terminal.ready_slot, terminal.queue, terminal.priority, terminal.enqueue_shard
+                ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+                SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
+                RETURNING 1
             )
             SELECT job_id, run_lease
             FROM terminal

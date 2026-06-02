@@ -4755,6 +4755,137 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
     assert_eq!(post_prune_fast.completed, post_prune_exact.completed);
 }
 
+/// #290 PR A1 invariant: every terminal-row insert path increments
+/// `queue_terminal_live_counts` so that `SUM(live_terminal_count)` for a
+/// queue equals `count(*) FROM done_entries WHERE queue = ANY(...)`.
+///
+/// PR A1 only wires the increment side. The decrement side (DLQ moves,
+/// discards, retry-from-terminal, SQL-compat deletes) lands in PR A2 and
+/// the read switch lands in PR B; this test deliberately avoids any
+/// terminal-delete path so the invariant holds on the increment side alone.
+///
+/// The test exercises both insert paths:
+/// - `insert_done_rows_tx` via `complete_batch` on the lease-materialisation
+///   path (default `create_store` builds the store without the receipt
+///   fast-complete candidate set).
+/// - the fused receipt fast path is exercised in
+///   `test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path`
+///   below.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_matches_done_entries_via_insert_helper() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_helper";
+    let schema = "awa_qs_terminal_live_counts_helper";
+    let store = create_store(&pool, schema).await;
+
+    assert_eq!(
+        live_count_sum(&pool, schema, queue).await,
+        done_entries_count(&pool, schema, queue).await,
+        "invariant holds on empty queue"
+    );
+
+    store
+        .enqueue_batch(&pool, queue, 1, 7)
+        .await
+        .expect("enqueue");
+    let claimed = store.claim_batch(&pool, queue, 7).await.expect("claim");
+    assert_eq!(claimed.len(), 7);
+    let completed = store
+        .complete_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    assert_eq!(completed, 7);
+
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 7);
+    assert_eq!(
+        live_sum, done_count,
+        "live counter sum must equal done_entries cardinality after complete_batch"
+    );
+
+    // A second completion batch on the same queue must accumulate, not
+    // replace — guards against the UPSERT using = instead of += on
+    // conflict.
+    store
+        .enqueue_batch(&pool, queue, 1, 3)
+        .await
+        .expect("enqueue 2");
+    let claimed2 = store.claim_batch(&pool, queue, 3).await.expect("claim 2");
+    store
+        .complete_batch(&pool, &claimed2)
+        .await
+        .expect("complete 2");
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 10);
+    assert_eq!(live_sum, done_count, "counter accumulates across batches");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_live_counts_matches_done_entries_via_receipt_fast_path() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_live_counts_fast";
+    let schema = "awa_qs_terminal_live_counts_fast";
+    // lease_claim_receipts: true makes the receipt fast-complete path
+    // available (assuming the claimed jobs are otherwise eligible —
+    // see Self::receipt_fast_complete_candidate).
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            lease_claim_receipts: true,
+            ..Default::default()
+        },
+    )
+    .await;
+
+    store
+        .enqueue_batch(&pool, queue, 1, 5)
+        .await
+        .expect("enqueue");
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 5, std::time::Duration::from_secs(30))
+        .await
+        .expect("claim");
+    let completed = store
+        .complete_runtime_batch(&pool, &claimed)
+        .await
+        .expect("complete");
+    assert_eq!(completed.len(), 5);
+
+    let live_sum = live_count_sum(&pool, schema, queue).await;
+    let done_count = done_entries_count(&pool, schema, queue).await;
+    assert_eq!(done_count, 5);
+    assert_eq!(
+        live_sum, done_count,
+        "fused receipt fast path must also increment the counter"
+    );
+}
+
+async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT COALESCE(SUM(live_terminal_count), 0)::bigint \
+         FROM {schema}.queue_terminal_live_counts WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("sum live_terminal_count")
+}
+
+async fn done_entries_count(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
+    sqlx::query_scalar::<_, i64>(&format!(
+        "SELECT count(*)::bigint FROM {schema}.done_entries WHERE queue = $1"
+    ))
+    .bind(queue)
+    .fetch_one(pool)
+    .await
+    .expect("count done_entries")
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_striped_claims_probe_stripes_round_robin() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
