@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 22;
+pub const CURRENT_VERSION: i32 = 23;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -98,6 +98,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "delete_job_compat decrements queue_terminal_live_counts for done_entries deletes",
         &[V22_UP],
     ),
+    (
+        23,
+        "Install default awa queue-storage substrate via SQL helper",
+        &[V23_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -121,6 +126,7 @@ const V19_UP: &str = include_str!("../migrations/v019_queue_storage_jobs_compat_
 const V20_UP: &str = include_str!("../migrations/v020_active_queue_storage_schema_fallback.sql");
 const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.sql");
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
+const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
