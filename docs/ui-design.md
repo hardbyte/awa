@@ -6,17 +6,27 @@ The `awa-ui` crate provides a built-in web dashboard for monitoring and managing
 awa --database-url $DATABASE_URL serve --host 127.0.0.1 --port 3000
 ```
 
+The admin UI is **one of several HTTP surfaces** Awa exposes. The other two are the standalone callback receiver (`awa callbacks serve` — see [HTTP callbacks](http-callbacks.md)) and user-owned callback APIs ([callback receivers](callback-receivers.md)). The deployable-role split is covered end-to-end in [Security](security.md#deployable-roles).
+
 ## Architecture
 
 `awa-ui` exposes an `axum::Router` that can be run standalone via `awa-cli serve` or embedded into an existing axum application:
 
 ```rust
-// Standalone
-let app = awa_ui::router(pool.clone());
+// Standalone — admin UI + admin API + callback receiver in one router
+let app = awa_ui::router(pool.clone(), Duration::from_secs(5)).await?;
 axum::serve(listener, app).await?;
 
 // Embedded in your app
-let app = my_app_router.nest("/awa", awa_ui::router(pool.clone()));
+let app = my_app_router.nest("/awa", awa_ui::router(pool.clone(), Duration::from_secs(5)).await?);
+
+// Callback-only — no admin UI, no admin API, no static fallback
+// Use this when callbacks are externally reachable but admin must stay private.
+let app = awa_ui::callback_router(
+    pool.clone(),
+    awa_ui::CallbackReceiverConfig::new(awa_ui::CallbackAuth::Signed(secret)),
+)
+.await?;
 ```
 
 The frontend is a React 19 SPA built with Vite and embedded into the binary via `rust-embed`. The axum handler serves `index.html` for all non-API routes (SPA fallback), and JSON REST endpoints under `/api/`.

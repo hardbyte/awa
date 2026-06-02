@@ -291,25 +291,58 @@ queue-storage schema plus the shared control tables (`queue_meta`,
 current model is secure for the separation it provides (runtime can't modify
 schema).
 
+## Deployable roles
+
+Awa is one process binary, but for production it splits into several
+*deployable roles*. Each role has a different exposure profile, and
+mixing them onto the same listener is the most common source of
+operational risk. See [ADR-027](adr/027-callback-ingress-surface.md) for
+the design rationale and [`docs/http-callbacks.md`](http-callbacks.md)
+for the per-role deployment shape.
+
+| Role | Purpose | Exposure | Mutates job state? |
+|---|---|---|---|
+| **Admin UI / API** (`awa serve`) | operator inspection and mutation — jobs, queues, runtime, DLQ, stats | private operator network | yes |
+| **Callback receiver** (`awa callbacks serve` or user-owned router) | `complete` / `fail` / `heartbeat` for `HttpWorker` async mode and external systems | public or partner-facing, signed | yes |
+| **Workers / dispatchers** (`awa::Client` with registered workers) | claim jobs, execute handlers, dispatch via `HttpWorker` | internal | yes |
+| **Maintenance runtime** (background tasks on any worker process; future: dedicated role per ADR-028) | promotion, rescue, pruning, metadata refresh | internal | yes |
+| **Database** | storage and coordination | private | yes |
+
+A single development setup can collapse these onto one process: `awa serve` runs admin + callback receiver, an embedded `awa::Client` runs workers, and Postgres is reachable on localhost. Production deployments **should** split at least the admin UI from the callback receiver — the admin surface stays on the operator network, the receiver lives wherever it needs to be reachable from the function (often public).
+
+### Common deployment shapes
+
+- **All-in-one dev:** `awa serve` + an embedded `awa::Client`. Admin UI and callback receiver share the same listener with permissive CORS. Fine for local development; never run this on a public listener.
+- **Private admin + public callback receiver:** `awa serve` on a private VPC subnet, `awa callbacks serve --callback-hmac-secret …` on an external load balancer. The receiver router omits static UI assets, the admin REST routes, and permissive CORS.
+- **User-owned callback API:** mount the three callback ingress routes inside your existing FastAPI / axum / Flask app, using `awa_model::callback_contract::verify` (Rust) or `awa.callback_contract.verify` (Python) so the signature contract cannot drift. See [`docs/callback-receivers.md`](callback-receivers.md).
+- **Receiver + maintenance-only runtime:** the receiver handles ingress while a dedicated runtime instance runs promotion / rescue / pruning. Workers stay on their own deployment. Maintenance-only runtime is tracked in [ADR-028](adr/028-maintenance-only-runtime-role.md).
+- **HTTP-worker deployments:** the worker process still runs an `awa::Client` — it claims jobs, calls the function, and registers the callback. The receiver is a separate listener. A function endpoint without a corresponding dispatcher process will *never* see jobs.
+
 ## Admin Surface
 
-`awa serve` exposes a read/write admin API and UI. Treat it as an operator surface, not a public endpoint.
+`awa serve` is an **operator surface**: it bundles the admin REST API, the React dashboard, the static fallback, permissive CORS, and (today) the callback receiver routes behind a single router. Treat it like a database admin console:
 
 - Put it behind your normal authentication and authorization layer.
 - Restrict network access with ingress policy, firewall rules, or private networking.
 - Prefer binding to localhost or an internal service address unless you explicitly need external access.
 
+When callbacks must be externally reachable but the admin surface must stay private, run them on separate listeners using `awa callbacks serve` or a user-owned receiver — the admin endpoints simply do not exist on those routers.
+
 ## Callback Endpoints
 
-When using `HttpWorker` async mode, `awa-ui` exposes these callback receiver endpoints:
+The callback receiver exposes three **mutating ingress** endpoints, regardless of which deployable role hosts them:
 
-- `POST /api/callbacks/:callback_id/complete`
-- `POST /api/callbacks/:callback_id/fail`
-- `POST /api/callbacks/:callback_id/heartbeat`
+- `POST {prefix}/:callback_id/complete`
+- `POST {prefix}/:callback_id/fail`
+- `POST {prefix}/:callback_id/heartbeat`
 
-These endpoints mutate job state and should not be exposed without protection.
-The full HTTP worker flow, callback payloads, and signature contract are
-documented in [HTTP workers and callback signatures](http-callbacks.md).
+`{prefix}` defaults to `/api/callbacks`, matching the historical `awa serve` shape so existing deployments keep working unchanged. It is configurable on both sides:
+
+- Worker side: `HttpWorkerConfig::callback_path_prefix`
+- `awa callbacks serve` side: `--path-prefix` / `AWA_CALLBACK_PATH_PREFIX`
+- Custom-receiver side: mount your routes at whatever prefix you want and pass that prefix back to the worker config
+
+These endpoints mutate job state and must not be exposed without protection. The full HTTP worker flow, callback payloads, and signature contract are documented in [HTTP workers and callback signatures](http-callbacks.md).
 
 ## Callback Signature Verification
 
@@ -335,7 +368,9 @@ uses BLAKE3 keyed hashing over the callback ID string, not RFC HMAC.
 
 ## Custom Callback Receivers
 
-If you do not use `awa-ui` and instead mount your own callback handlers around `admin::complete_external`, `admin::fail_external`, or `admin::heartbeat_callback`, you must provide equivalent request authentication yourself.
+When you host the callback ingress routes inside your own application (FastAPI, axum, Flask, etc.), reuse the shared helpers in `awa::callback_contract` (Rust) or `awa.callback_contract` (Python) rather than re-implementing the signature algorithm. The Python wrappers are thin PyO3 bindings around the same Rust functions, with a pinned BLAKE3 test vector asserted from both sides so the bindings cannot drift.
+
+See [callback receivers](callback-receivers.md) for end-to-end custom-axum and FastAPI examples.
 
 ## Operational Guidance
 
