@@ -323,7 +323,7 @@ fn map_sqlx_error(err: sqlx::Error) -> AwaError {
 fn validate_ident(ident: &str) -> Result<(), AwaError> {
     let mut chars = ident.chars();
     match chars.next() {
-        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        Some(first) if first.is_ascii_lowercase() || first == '_' => {}
         _ => {
             return Err(AwaError::Validation(format!(
                 "invalid SQL identifier: {ident}"
@@ -331,7 +331,7 @@ fn validate_ident(ident: &str) -> Result<(), AwaError> {
         }
     }
 
-    if chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+    if chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
         Ok(())
     } else {
         Err(AwaError::Validation(format!(
@@ -423,6 +423,64 @@ fn oldest_initialized_ring_slot(
     }
 
     Some((oldest_slot, oldest_generation))
+}
+
+#[cfg(test)]
+mod identifier_tests {
+    use super::{validate_ident, QueueStorage, QueueStorageConfig};
+
+    #[test]
+    fn queue_storage_schema_identifiers_are_lowercase_unquoted_names() {
+        for ident in ["awa", "awa_queue_storage", "_awa123"] {
+            validate_ident(ident).expect("identifier should be accepted");
+        }
+
+        for ident in ["Awa", "awa-queue", "123awa", "awa.queue"] {
+            assert!(
+                validate_ident(ident).is_err(),
+                "identifier should be rejected: {ident}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_queue_storage_schema_requires_default_physical_shape() {
+        for config in [
+            QueueStorageConfig {
+                queue_slot_count: 32,
+                ..Default::default()
+            },
+            QueueStorageConfig {
+                lease_slot_count: 4,
+                ..Default::default()
+            },
+            QueueStorageConfig {
+                claim_slot_count: 4,
+                ..Default::default()
+            },
+            QueueStorageConfig {
+                lease_claim_receipts: false,
+                ..Default::default()
+            },
+        ] {
+            let err = QueueStorage::new(config).expect_err("default awa schema shape must reject");
+            assert!(
+                err.to_string()
+                    .contains("default `awa` queue-storage schema"),
+                "unexpected error: {err}"
+            );
+        }
+
+        QueueStorage::new(QueueStorageConfig {
+            schema: "awa_custom".to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            claim_slot_count: 2,
+            lease_claim_receipts: false,
+            ..Default::default()
+        })
+        .expect("custom schema should allow custom physical shape");
+    }
 }
 
 #[cfg(test)]
@@ -1684,6 +1742,18 @@ impl QueueStorage {
                 "queue storage requires at least 1 queue stripe".into(),
             ));
         }
+        if config.schema == DEFAULT_SCHEMA
+            && (config.queue_slot_count != DEFAULT_QUEUE_SLOT_COUNT
+                || config.lease_slot_count != DEFAULT_LEASE_SLOT_COUNT
+                || config.claim_slot_count != DEFAULT_CLAIM_SLOT_COUNT
+                || !config.lease_claim_receipts)
+        {
+            return Err(AwaError::Validation(
+                "the default `awa` queue-storage schema must use the default slot counts and \
+                 lease_claim_receipts=true"
+                    .into(),
+            ));
+        }
         validate_ident(&config.schema)?;
         Ok(Self {
             config,
@@ -2055,20 +2125,39 @@ impl QueueStorage {
             .map_err(map_sqlx_error)?;
 
         let install_result = async {
+            // Helper-owned DDL. The helper takes the same per-schema advisory
+            // xact lock we just acquired (re-entrant on the same session) and
+            // performs the entire forward-only substrate install: sequences,
+            // ring-state singletons, partitioned ready/done/lease tables,
+            // lane indexes, claim_ready_runtime() function, and seed rows.
+            // Validation inside the helper rejects non-default configuration
+            // against the default `awa` schema (see migration v023 and #308).
+            //
+            // What stays here (constraint 7 of #308 PR 1):
+            //   * `open_receipt_claims` non-empty rejection + drop (ADR-023).
+            //   * Legacy rename of `lease_claims` / `lease_claim_closures`
+            //     before the helper creates the partitioned parents, plus the
+            //     post-helper copy + drop of the renamed-aside rows.
+            //   * `queue_count_snapshots` legacy drop.
+            //   * `awa.runtime_storage_backends` cross-schema CREATE (the
+            //     seed is in `activate_backend`; this CREATE moves to a
+            //     dedicated migration in #308 PR 2).
+            //
+            // The helper does NOT touch `awa.runtime_storage_backends` and
+            // does NOT change storage-transition state, so a call to
+            // `prepare_schema` remains activation-neutral.
+
             sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
                 .execute(install_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
 
             // The hot path reads "currently open" by anti-joining the
-            // partitioned `lease_claims` / `lease_claim_closures`
-            // pair, so `open_receipt_claims` is unused (see ADR-023).
-            // Drop it on every install. Refuse to drop a non-empty
-            // table — non-empty here means an operator rolled forward
-            // from an older build that still wrote rows we don't want
-            // to silently delete. Treat that as an error the operator
-            // must resolve (typically by running the reverse-
-            // migration recipe in ADR-023 and re-trying).
+            // partitioned `lease_claims` / `lease_claim_closures` pair, so
+            // `open_receipt_claims` is unused (see ADR-023). Drop it on every
+            // install. Refuse to drop a non-empty table — non-empty here
+            // means an operator rolled forward from an older build that
+            // still wrote rows we don't want to silently delete.
             let open_receipt_claims_exists: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (
@@ -2105,706 +2194,13 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
-            let claimed_cte = if self.lease_claim_receipts() {
-                format!(
-                    r#"
-                    claim_ring AS (
-                        SELECT current_slot AS claim_slot
-                        FROM {schema}.claim_ring_state
-                        WHERE singleton = TRUE
-                    ),
-                    claimed AS (
-                        INSERT INTO {schema}.lease_claims AS claim_rows (
-                            claim_slot,
-                            job_id,
-                            run_lease,
-                            ready_slot,
-                            ready_generation,
-                            queue,
-                            priority,
-                            attempt,
-                            max_attempts,
-                            lane_seq,
-                            enqueue_shard,
-                            deadline_at
-                        )
-                        SELECT
-                            claim_ring.claim_slot,
-                            selected.job_id,
-                            selected.run_lease + 1,
-                            selected.ready_slot,
-                            selected.ready_generation,
-                            selected.queue,
-                            selected.effective_priority,
-                            selected.attempt + 1,
-                            selected.max_attempts,
-                            selected.lane_seq,
-                            v_lane_shard,
-                            v_deadline_at
-                        FROM selected
-                        CROSS JOIN claim_ring
-                        RETURNING
-                            claim_rows.claim_slot,
-                            claim_rows.ready_slot,
-                            claim_rows.ready_generation,
-                            claim_rows.job_id,
-                            claim_rows.queue,
-                            claim_rows.priority,
-                            claim_rows.lane_seq,
-                            claim_rows.attempt,
-                            claim_rows.run_lease,
-                            claim_rows.max_attempts
-                    )
-                    -- The partitioned lease_claims row above is the
-                    -- authoritative record of "currently open"; every
-                    -- other receipt-plane query reads it anti-joined
-                    -- with lease_claim_closures. `deadline_at` is the
-                    -- per-claim deadline when the queue has a non-zero
-                    -- `deadline_duration`; the deadline-rescue path
-                    -- scans expired rows (anti-joined with closures
-                    -- and leases — same disambiguation as the
-                    -- heartbeat-rescue path) and force-closes them.
-                    "#
-                )
-            } else {
-                // Non-receipts path doesn't write to lease_claims, so
-                // claim_slot is meaningless here. We still emit a
-                // placeholder value so the outer SELECT can reference
-                // `claimed.claim_slot` unconditionally.
-                format!(
-                    r#"
-                    claimed AS (
-                        INSERT INTO {schema}.leases AS lease_rows (
-                            lease_slot,
-                            lease_generation,
-                            ready_slot,
-                            ready_generation,
-                            job_id,
-                            queue,
-                            state,
-                            priority,
-                            attempt,
-                            run_lease,
-                            max_attempts,
-                            lane_seq,
-                            enqueue_shard,
-                            heartbeat_at,
-                            deadline_at,
-                            attempted_at
-                        )
-                        SELECT
-                            lease_ring.lease_slot,
-                            lease_ring.lease_generation,
-                            selected.ready_slot,
-                            selected.ready_generation,
-                            selected.job_id,
-                            selected.queue,
-                            'running'::awa.job_state,
-                            selected.effective_priority,
-                            selected.attempt + 1,
-                            selected.run_lease + 1,
-                            selected.max_attempts,
-                            selected.lane_seq,
-                            v_lane_shard,
-                            v_claimed_at,
-                            COALESCE(v_deadline_at, v_claimed_at + make_interval(secs => $6)),
-                            v_claimed_at
-                        FROM selected
-                        CROSS JOIN lease_ring
-                        RETURNING
-                            0::int AS claim_slot,
-                            lease_rows.ready_slot,
-                            lease_rows.ready_generation,
-                            lease_rows.lease_slot,
-                            lease_rows.lease_generation,
-                            lease_rows.queue,
-                            lease_rows.priority,
-                            lease_rows.lane_seq,
-                            lease_rows.attempt,
-                            lease_rows.run_lease,
-                            lease_rows.max_attempts,
-                            lease_rows.heartbeat_at,
-                            lease_rows.deadline_at,
-                            lease_rows.attempted_at
-                    )
-                    "#
-                )
-            };
-
-            sqlx::query(&format!(
-                r#"
-                CREATE SEQUENCE IF NOT EXISTS {schema}.job_id_seq
-                "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_ring_state (
-                singleton      BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-                current_slot   INT NOT NULL,
-                generation     BIGINT NOT NULL,
-                slot_count     INT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // #290: live-terminal-counter trust marker. NULL = the
-            // counter has not yet been rebuilt under counter-aware code
-            // (set by `rebuild_terminal_counters` after a successful
-            // rebuild, or auto-marked at install time for fresh installs
-            // where done_entries is empty). `queue_counts_exact` reads
-            // this and falls back to scanning done_entries when NULL,
-            // so the "exact" naming stays honest during a rolling
-            // upgrade from a pre-#290 fleet. The trust marker lives on
-            // queue_ring_state — the natural per-schema singleton — so
-            // we don't add a new table for what is effectively one
-            // boolean. The column is updated only on schema install and
-            // on operator-driven rebuild, so it doesn't affect the
-            // existing HOT-update story for rotation writes to
-            // (current_slot, generation).
-            sqlx::query(&format!(
-                "ALTER TABLE {schema}.queue_ring_state \
-                 ADD COLUMN IF NOT EXISTS terminal_counter_trusted_at TIMESTAMPTZ"
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Singleton row is rewritten on every queue rotation. Columns being
-            // updated (current_slot, generation) are not indexed, so a low
-            // fillfactor keeps the update in-page as a HOT update and the
-            // aggressive vacuum threshold reclaims the non-HOT line pointer
-            // churn quickly.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.queue_ring_state SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.queue_ring_state (singleton, current_slot, generation, slot_count)
-            VALUES (TRUE, 0, 0, $1)
-            ON CONFLICT (singleton) DO NOTHING
-            "#
-            ))
-            .bind(self.queue_slot_count() as i32)
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_ring_slots (
-                slot        INT PRIMARY KEY,
-                generation  BIGINT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.queue_ring_slots SET (
-                fillfactor = 70,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.lease_ring_state (
-                singleton      BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-                current_slot   INT NOT NULL,
-                generation     BIGINT NOT NULL,
-                slot_count     INT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.lease_ring_state SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.lease_ring_state (singleton, current_slot, generation, slot_count)
-            VALUES (TRUE, 0, 0, $1)
-            ON CONFLICT (singleton) DO NOTHING
-            "#
-            ))
-            .bind(self.lease_slot_count() as i32)
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.lease_ring_slots (
-                slot        INT PRIMARY KEY,
-                generation  BIGINT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.lease_ring_slots SET (
-                fillfactor = 70,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // ADR-023 claim-ring control plane. Mirrors lease_ring_state /
-            // lease_ring_slots above. The current_slot is the partition that
-            // new `lease_claims` receipts and `lease_claim_closures`
-            // tombstones append into; rotate_claims advances it with a
-            // compare-and-swap on (current_slot, generation); prune_oldest_claims
-            // reclaims older partitions via TRUNCATE.
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.claim_ring_state (
-                singleton      BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
-                current_slot   INT NOT NULL,
-                generation     BIGINT NOT NULL,
-                slot_count     INT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.claim_ring_state SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.claim_ring_state (singleton, current_slot, generation, slot_count)
-            VALUES (TRUE, 0, 0, $1)
-            ON CONFLICT (singleton) DO NOTHING
-            "#
-            ))
-            .bind(self.claim_slot_count() as i32)
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.claim_ring_slots (
-                slot        INT PRIMARY KEY,
-                generation  BIGINT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.claim_ring_slots SET (
-                fillfactor = 70,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 50,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_lanes (
-                queue           TEXT NOT NULL,
-                priority        SMALLINT NOT NULL,
-                next_seq        BIGINT NOT NULL DEFAULT 1,
-                claim_seq       BIGINT NOT NULL DEFAULT 1,
-                pruned_completed_count BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (queue, priority)
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_enqueue_heads (
-                queue           TEXT NOT NULL,
-                priority        SMALLINT NOT NULL,
-                enqueue_shard   SMALLINT NOT NULL DEFAULT 0,
-                next_seq        BIGINT NOT NULL DEFAULT 1,
-                PRIMARY KEY (queue, priority, enqueue_shard)
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Updated once per enqueue batch to advance next_seq. The primary
-            // key is the only index, and next_seq is not part of it, so the
-            // updates are 99.9% HOT. fillfactor=50 (matching the ring-state
-            // singletons) reserves enough per-page slack that HOT updates
-            // stay in-page during autovacuum-blocked windows; fillfactor=70
-            // bloated the heap to ~90 pages for a single live row in a
-            // 30-min run with idle-in-tx pressure.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.queue_enqueue_heads SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_claim_heads (
-                queue           TEXT NOT NULL,
-                priority        SMALLINT NOT NULL,
-                enqueue_shard   SMALLINT NOT NULL DEFAULT 0,
-                claim_seq       BIGINT NOT NULL DEFAULT 1,
-                PRIMARY KEY (queue, priority, enqueue_shard)
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.queue_claim_heads SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_terminal_rollups (
-                queue                  TEXT NOT NULL,
-                priority               SMALLINT NOT NULL,
-                pruned_completed_count BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (queue, priority)
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // queue_count_snapshots was a staleness-cached counterpart
-            // of queue_counts_exact, used when the dispatcher's claim
-            // hot path still polled exact counts. The dispatcher now
-            // derives the available count directly from the head tables
-            // (`next_seq - claim_seq`, O(few rows)) and nothing else
-            // needs the snapshot. Drop it on every prepare_schema so
-            // an upgrade from an older install reclaims the storage.
-            sqlx::query(&format!(
-                "DROP TABLE IF EXISTS {schema}.queue_count_snapshots"
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_claimer_leases (
-                queue             TEXT NOT NULL,
-                claimer_slot      SMALLINT NOT NULL,
-                owner_instance_id UUID NOT NULL,
-                lease_epoch       BIGINT NOT NULL DEFAULT 0,
-                leased_at         TIMESTAMPTZ NOT NULL,
-                last_claimed_at   TIMESTAMPTZ NOT NULL,
-                expires_at        TIMESTAMPTZ NOT NULL,
-                PRIMARY KEY (queue, claimer_slot)
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // mark_queue_claimer_active refreshes last_claimed_at + expires_at
-            // when a claimer lease is nearing the idle-steal threshold. HOT
-            // updates require free space on the same page as the old tuple,
-            // which default fillfactor=100% denies. Without explicit
-            // fillfactor, high-replica repros spilled frequent lease refreshes
-            // to fresh pages. Match the pattern of the other
-            // 1-row-per-(queue, slot) hot Warm tables.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.queue_claimer_leases SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_claimer_state (
-                queue            TEXT PRIMARY KEY,
-                target_claimers  SMALLINT NOT NULL,
-                updated_at       TIMESTAMPTZ NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // expires_at is updated by mark_queue_claimer_active when a
-            // claimer lease needs refresh. Any column referenced by an index —
-            // INCLUDE columns count for HOT-blocking purposes on PG 17 —
-            // disqualifies the update from HOT. Empirically observed 0% HOT
-            // ratio at 4×8 with both `(queue, owner_instance_id, expires_at)`
-            // and `(queue, owner_instance_id) INCLUDE (expires_at)` index
-            // shapes.
-            //
-            // Drop expires_at from the index entirely. The SELECT at
-            // acquire_queue_claimer that filters `expires_at > $now` falls
-            // back to a heap recheck per matching row, but the candidate
-            // set per (queue, owner_instance_id) is bounded by
-            // claimer_slots-per-queue (single digits in practice), so the
-            // recheck is cheap. fillfactor=50 (set on the table above)
-            // pairs with this to give HOT updates room to land in-page.
-            sqlx::query(&format!(
-                r#"
-            DROP INDEX IF EXISTS {schema}.idx_{schema}_queue_claimer_leases_owner
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_queue_claimer_leases_owner
-                ON {schema}.queue_claimer_leases (queue, owner_instance_id)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.queue_enqueue_heads AS heads (
-                queue,
-                priority,
-                enqueue_shard,
-                next_seq
-            )
-            SELECT
-                queue,
-                priority,
-                0::smallint,
-                next_seq
-            FROM {schema}.queue_lanes
-            ON CONFLICT (queue, priority, enqueue_shard) DO UPDATE
-            SET next_seq = GREATEST(heads.next_seq, EXCLUDED.next_seq)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.queue_claim_heads AS heads (
-                queue,
-                priority,
-                enqueue_shard,
-                claim_seq
-            )
-            SELECT
-                queue,
-                priority,
-                0::smallint,
-                claim_seq
-            FROM {schema}.queue_lanes
-            ON CONFLICT (queue, priority, enqueue_shard) DO UPDATE
-            SET claim_seq = GREATEST(heads.claim_seq, EXCLUDED.claim_seq)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.queue_terminal_rollups AS rollups (
-                queue,
-                priority,
-                pruned_completed_count
-            )
-            SELECT
-                queue,
-                priority,
-                pruned_completed_count
-            FROM {schema}.queue_lanes
-            WHERE pruned_completed_count > 0
-            ON CONFLICT (queue, priority) DO UPDATE
-            SET pruned_completed_count = GREATEST(
-                rollups.pruned_completed_count,
-                EXCLUDED.pruned_completed_count
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            UPDATE {schema}.queue_lanes
-            SET pruned_completed_count = 0
-            WHERE pruned_completed_count > 0
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(
-                r#"
-            CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
-                backend     TEXT PRIMARY KEY,
-                schema_name TEXT NOT NULL,
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            "#,
-            )
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.leases (
-                lease_slot        INT NOT NULL,
-                lease_generation  BIGINT NOT NULL,
-                ready_slot        INT NOT NULL,
-                ready_generation  BIGINT NOT NULL,
-                job_id            BIGINT NOT NULL,
-                queue             TEXT NOT NULL,
-                state             awa.job_state NOT NULL DEFAULT 'running',
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL DEFAULT 1,
-                run_lease         BIGINT NOT NULL DEFAULT 1,
-                max_attempts      SMALLINT NOT NULL DEFAULT 25,
-                lane_seq          BIGINT NOT NULL,
-                enqueue_shard     SMALLINT NOT NULL DEFAULT 0,
-                heartbeat_at      TIMESTAMPTZ,
-                deadline_at       TIMESTAMPTZ,
-                attempted_at      TIMESTAMPTZ,
-                callback_id       UUID,
-                callback_timeout_at TIMESTAMPTZ,
-                PRIMARY KEY (lease_slot, queue, priority, enqueue_shard, lane_seq)
-            ) PARTITION BY LIST (lease_slot)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // `lease_claims` and `lease_claim_closures` are partitioned by
-            // `claim_slot` (see ADR-023). Fresh installs create the
-            // partitioned parents directly; existing installs with regular
-            // tables take the in-place migration path (rename → create
-            // partitioned → copy → drop legacy). Idempotent: re-running on
-            // an already-partitioned table is a no-op.
-            let claim_slot_count = self.claim_slot_count();
-
             // Detect the current shape of lease_claims / lease_claim_closures.
+            // The partitioned parents have relkind 'p'; regular tables have
+            // 'r' and need to be renamed aside so the helper can create the
+            // partitioned parents under the canonical name. Copying the data
+            // back happens after the helper returns, all inside this single
+            // transaction so a crash leaves the schema in one of exactly two
+            // states (pre-migration or post-migration).
             let lease_claims_relkind: Option<String> = sqlx::query_scalar(
                 r#"
                 SELECT c.relkind::text
@@ -2831,8 +2227,6 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
-            // Regular tables → rename aside before creating the partitioned
-            // parent. Partitioned or absent → do nothing.
             if lease_claims_relkind.as_deref() == Some("r") {
                 sqlx::query(&format!(
                     "ALTER TABLE {schema}.lease_claims RENAME TO lease_claims_legacy"
@@ -2850,101 +2244,43 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
+            // queue_count_snapshots was a staleness-cached counterpart of
+            // queue_counts_exact. The dispatcher now derives the available
+            // count directly from the head tables and nothing else needs the
+            // snapshot. Drop it on every prepare_schema so an upgrade from an
+            // older install reclaims the storage. Done before the helper
+            // runs because the helper does not touch this legacy table.
             sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.lease_claims (
-                claim_slot        INT NOT NULL,
-                job_id            BIGINT NOT NULL,
-                run_lease         BIGINT NOT NULL,
-                ready_slot        INT NOT NULL,
-                ready_generation  BIGINT NOT NULL,
-                queue             TEXT NOT NULL,
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL,
-                max_attempts      SMALLINT NOT NULL,
-                lane_seq          BIGINT NOT NULL,
-                enqueue_shard     SMALLINT NOT NULL DEFAULT 0,
-                claimed_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                materialized_at   TIMESTAMPTZ,
-                deadline_at       TIMESTAMPTZ,
-                PRIMARY KEY (claim_slot, job_id, run_lease)
-            ) PARTITION BY LIST (claim_slot)
-            "#
+                "DROP TABLE IF EXISTS {schema}.queue_count_snapshots"
             ))
             .execute(install_tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
-            // Upgrade path for clusters that prepared the schema before
-            // deadline_at was introduced. ADD COLUMN IF NOT EXISTS on a
-            // partitioned parent propagates to every child partition.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.lease_claims
-                ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            for slot in 0..claim_slot_count {
-                sqlx::query(&format!(
-                    r#"
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.lease_claims
-                FOR VALUES IN ({slot})
-                "#,
-                    claim_child_name(schema, slot)
-                ))
+            // The single forward-only DDL call. See the migration file
+            // `awa-model/migrations/v023_install_queue_storage_substrate.sql`
+            // for the function body. Default values match the constants in
+            // this file (DEFAULT_QUEUE_SLOT_COUNT etc); the helper validates
+            // that the default `awa` schema only ever gets default-shaped
+            // installs.
+            sqlx::query("SELECT awa.install_queue_storage_substrate($1, $2, $3, $4, $5)")
+                .bind(schema)
+                .bind(self.queue_slot_count() as i32)
+                .bind(self.lease_slot_count() as i32)
+                .bind(self.claim_slot_count() as i32)
+                .bind(self.lease_claim_receipts())
                 .execute(install_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-            }
 
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_stale
-                ON {schema}.lease_claims (materialized_at, claimed_at, job_id)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Low-write index for the deadline-rescue scan. Claim deadlines
-            // are append-heavy and roughly time-ordered, so BRIN avoids a
-            // btree insert on every short-path claim while still letting
-            // rescue skip ranges whose deadlines are all in the future.
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_deadline_brin
-                ON {schema}.lease_claims USING BRIN (deadline_at)
-                WITH (pages_per_range = 16)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Secondary index on (job_id, run_lease) for completion /
-            // materialize / rescue paths that don't carry claim_slot in
-            // hand. Propagates to every child partition.
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claims_job_run
-                ON {schema}.lease_claims (job_id, run_lease)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // In-place migration: move existing rows into the
-            // partitioned parent. Every legacy row lands in the
-            // current claim_slot — the ring rotates naturally and
-            // existing receipts will close (or be force-rescued) on
-            // their normal lifecycle. Guarded by EXISTS so fresh
-            // installs skip it.
+            // Post-helper legacy fixups: copy any renamed-aside rows into the
+            // newly partitioned parents created by the helper, then drop the
+            // legacy table. ON CONFLICT DO NOTHING so a re-run after a
+            // partial copy is idempotent. The outer transaction keeps the
+            // copy + drop atomic so a crash between them leaves the schema
+            // in one of exactly two states (pre or post migration); without
+            // that the next `prepare_schema`'s ON CONFLICT would silently
+            // mask the inconsistency.
             let lease_claims_legacy_exists: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (
@@ -2956,87 +2292,6 @@ impl QueueStorage {
             )
             .bind(schema)
             .fetch_one(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            if lease_claims_legacy_exists {
-                // The outer prepare_schema transaction keeps the copy + drop atomic so a
-                // crash between the two leaves the schema in one of
-                // exactly two states: pre-migration (legacy still
-                // there, partitioned parent empty) or post-migration
-                // (legacy gone, partitioned parent populated).
-                // Otherwise a crash window can leave both populated,
-                // and the next prepare_schema's
-                // `ON CONFLICT DO NOTHING` masks the inconsistency
-                // without surfacing it.
-                sqlx::query(&format!(
-                    r#"
-                INSERT INTO {schema}.lease_claims (
-                    claim_slot, job_id, run_lease, ready_slot, ready_generation,
-                    queue, priority, attempt, max_attempts, lane_seq,
-                    claimed_at, materialized_at
-                )
-                SELECT
-                    (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton),
-                    job_id, run_lease, ready_slot, ready_generation,
-                    queue, priority, attempt, max_attempts, lane_seq,
-                    claimed_at, materialized_at
-                FROM {schema}.lease_claims_legacy
-                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
-                "#
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    "DROP TABLE {schema}.lease_claims_legacy"
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-            }
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.lease_claim_closures (
-                claim_slot        INT NOT NULL,
-                job_id            BIGINT NOT NULL,
-                run_lease         BIGINT NOT NULL,
-                outcome           TEXT NOT NULL,
-                closed_at         TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                PRIMARY KEY (claim_slot, job_id, run_lease)
-            ) PARTITION BY LIST (claim_slot)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            for slot in 0..claim_slot_count {
-                sqlx::query(&format!(
-                    r#"
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.lease_claim_closures
-                FOR VALUES IN ({slot})
-                "#,
-                    closure_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
-
-            // Secondary index on (job_id, run_lease) mirroring the one on
-            // lease_claims — completion / rescue sites that don't have
-            // claim_slot in hand still find closures via this index.
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_lease_claim_closures_job_run
-                ON {schema}.lease_claim_closures (job_id, run_lease)
-            "#
-            ))
-            .execute(install_tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
 
@@ -3054,23 +2309,77 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            let legacy_claim_slot: Option<i32> =
+                if lease_claims_legacy_exists || closures_legacy_exists {
+                    Some(
+                        sqlx::query_scalar(&format!(
+                            "SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton"
+                        ))
+                        .fetch_one(install_tx.as_mut())
+                        .await
+                        .map_err(map_sqlx_error)?,
+                    )
+                } else {
+                    None
+                };
+
+            if lease_claims_legacy_exists {
+                sqlx::query(&format!(
+                    "ALTER TABLE {schema}.lease_claims_legacy ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0"
+                ))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+                sqlx::query(&format!(
+                    "ALTER TABLE {schema}.lease_claims_legacy ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ"
+                ))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    r#"
+                INSERT INTO {schema}.lease_claims (
+                    claim_slot, job_id, run_lease, ready_slot, ready_generation,
+                    queue, priority, attempt, max_attempts, lane_seq,
+                    enqueue_shard, claimed_at, materialized_at, deadline_at
+                )
+                SELECT
+                    $1,
+                    job_id, run_lease, ready_slot, ready_generation,
+                    queue, priority, attempt, max_attempts, lane_seq,
+                    enqueue_shard, claimed_at, materialized_at, deadline_at
+                FROM {schema}.lease_claims_legacy
+                ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
+                "#
+                ))
+                .bind(legacy_claim_slot.expect("legacy claim slot should be present"))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
+                sqlx::query(&format!(
+                    "DROP TABLE {schema}.lease_claims_legacy"
+                ))
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+            }
+
             if closures_legacy_exists {
-                // See the matching `lease_claims_legacy` migration
-                // above for the rationale: copy + drop must be atomic
-                // so a crash leaves the schema either fully migrated
-                // or fully not.
                 sqlx::query(&format!(
                     r#"
                 INSERT INTO {schema}.lease_claim_closures (
                     claim_slot, job_id, run_lease, outcome, closed_at
                 )
                 SELECT
-                    (SELECT current_slot FROM {schema}.claim_ring_state WHERE singleton),
+                    $1,
                     job_id, run_lease, outcome, closed_at
                 FROM {schema}.lease_claim_closures_legacy
                 ON CONFLICT (claim_slot, job_id, run_lease) DO NOTHING
                 "#
                 ))
+                .bind(legacy_claim_slot.expect("legacy claim slot should be present"))
                 .execute(install_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
@@ -3081,839 +2390,25 @@ impl QueueStorage {
                 .execute(install_tx.as_mut())
                 .await
                 .map_err(map_sqlx_error)?;
-
             }
 
-            sqlx::query(&format!(
+            // awa.runtime_storage_backends is a cross-schema table that
+            // tracks which queue-storage schema each storage backend is
+            // currently bound to. Still created here for #308 PR 1; PR 2
+            // moves the CREATE into a dedicated migration so `awa migrate`
+            // owns the row entirely.
+            sqlx::query(
                 r#"
-            CREATE TABLE IF NOT EXISTS {schema}.attempt_state (
-                job_id              BIGINT NOT NULL,
-                run_lease           BIGINT NOT NULL,
-                heartbeat_at        TIMESTAMPTZ,
-                progress            JSONB,
-                callback_filter     TEXT,
-                callback_on_complete TEXT,
-                callback_on_fail    TEXT,
-                callback_transform  TEXT,
-                callback_result     JSONB,
-                updated_at          TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                PRIMARY KEY (job_id, run_lease)
+            CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
+                backend     TEXT PRIMARY KEY,
+                schema_name TEXT NOT NULL,
+                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
             )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.attempt_state
-                ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Upserted on every heartbeat, deleted on every completion. The PK
-            // is the only index, and all mutable columns (heartbeat_at,
-            // updated_at, progress, callback_*) are outside it, so a reduced
-            // fillfactor keeps heartbeat UPDATEs HOT.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.attempt_state SET (
-                fillfactor = 80,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.ready_entries (
-                ready_slot        INT NOT NULL,
-                ready_generation  BIGINT NOT NULL,
-                job_id            BIGINT NOT NULL,
-                kind              TEXT NOT NULL,
-                queue             TEXT NOT NULL,
-                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL DEFAULT 0,
-                run_lease         BIGINT NOT NULL DEFAULT 0,
-                max_attempts      SMALLINT NOT NULL DEFAULT 25,
-                lane_seq          BIGINT NOT NULL,
-                enqueue_shard     SMALLINT NOT NULL DEFAULT 0,
-                run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                attempted_at      TIMESTAMPTZ,
-                created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                unique_key        BYTEA,
-                unique_states     TEXT,
-                payload           JSONB,
-                PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
-            ) PARTITION BY LIST (ready_slot)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.done_entries (
-                ready_slot        INT NOT NULL,
-                ready_generation  BIGINT NOT NULL,
-                job_id            BIGINT NOT NULL,
-                kind              TEXT NOT NULL,
-                queue             TEXT NOT NULL,
-                args              JSONB,
-                state             awa.job_state NOT NULL DEFAULT 'completed',
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL DEFAULT 1,
-                run_lease         BIGINT NOT NULL DEFAULT 1,
-                max_attempts      SMALLINT,
-                lane_seq          BIGINT NOT NULL,
-                enqueue_shard     SMALLINT NOT NULL DEFAULT 0,
-                run_at            TIMESTAMPTZ,
-                attempted_at      TIMESTAMPTZ,
-                finalized_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                created_at        TIMESTAMPTZ,
-                unique_key        BYTEA,
-                unique_states     TEXT,
-                payload           JSONB,
-                PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, lane_seq)
-            ) PARTITION BY LIST (ready_slot)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Narrow terminal history: ready-backed terminal rows keep the
-            // durable terminal fact plus payload delta, and hydrate immutable
-            // job-body fields from ready_entries while the shared queue-ring
-            // slot is retained. Existing installs created these columns as
-            // NOT NULL with defaults; relaxing them is backwards-compatible
-            // with older wide writers and lets new writers avoid duplicated
-            // row/WAL budget.
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.done_entries
-                ALTER COLUMN args DROP NOT NULL,
-                ALTER COLUMN args DROP DEFAULT,
-                ALTER COLUMN max_attempts DROP NOT NULL,
-                ALTER COLUMN max_attempts DROP DEFAULT,
-                ALTER COLUMN run_at DROP NOT NULL,
-                ALTER COLUMN run_at DROP DEFAULT,
-                ALTER COLUMN created_at DROP NOT NULL,
-                ALTER COLUMN created_at DROP DEFAULT
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            let done_projection = done_row_projection("done", "ready");
-            let ready_join = done_ready_join(schema, "done", "ready");
-            sqlx::query(&format!(
-                r#"
-            CREATE OR REPLACE VIEW {schema}.terminal_jobs AS
-            SELECT
-                {done_projection}
-            FROM {schema}.done_entries AS done
-            {ready_join}
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.deferred_jobs (
-                job_id            BIGINT PRIMARY KEY,
-                kind              TEXT NOT NULL,
-                queue             TEXT NOT NULL,
-                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                state             awa.job_state NOT NULL,
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL DEFAULT 0,
-                run_lease         BIGINT NOT NULL DEFAULT 0,
-                max_attempts      SMALLINT NOT NULL DEFAULT 25,
-                run_at            TIMESTAMPTZ NOT NULL,
-                attempted_at      TIMESTAMPTZ,
-                finalized_at      TIMESTAMPTZ,
-                created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                unique_key        BYTEA,
-                unique_states     TEXT,
-                payload           JSONB,
-                CONSTRAINT deferred_jobs_state_check
-                    CHECK (state IN ('scheduled', 'retryable'))
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_deferred_due
-                ON {schema}.deferred_jobs (state, run_at, queue, priority, job_id)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_deferred_job_unique
-                ON {schema}.deferred_jobs (unique_key)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.dlq_entries (
-                job_id            BIGINT PRIMARY KEY,
-                kind              TEXT NOT NULL,
-                queue             TEXT NOT NULL,
-                args              JSONB NOT NULL DEFAULT '{{}}'::jsonb,
-                state             awa.job_state NOT NULL DEFAULT 'failed',
-                priority          SMALLINT NOT NULL,
-                attempt           SMALLINT NOT NULL DEFAULT 1,
-                run_lease         BIGINT NOT NULL DEFAULT 1,
-                max_attempts      SMALLINT NOT NULL DEFAULT 25,
-                run_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                attempted_at      TIMESTAMPTZ,
-                finalized_at      TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                created_at        TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                unique_key        BYTEA,
-                unique_states     TEXT,
-                payload           JSONB,
-                dlq_reason        TEXT NOT NULL,
-                dlq_at            TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
-                original_run_lease BIGINT NOT NULL
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            CREATE INDEX IF NOT EXISTS idx_{schema}_dlq_queue_time
-                ON {schema}.dlq_entries (queue, dlq_at DESC)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            for slot in 0..self.queue_slot_count() {
-                sqlx::query(&format!(
-                    r#"
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.ready_entries
-                FOR VALUES IN ({slot})
-                "#,
-                    ready_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                // Includes enqueue_shard so `claim_ready_runtime`'s WHERE
-                // (queue, priority, enqueue_shard, lane_seq >= claim_seq)
-                // hits the index directly under enqueue_shards > 1. The
-                // narrow (queue, priority, lane_seq) shape that predated
-                // v017 caused the planner to post-filter shard and discard
-                // (shards-1)/shards of rows per partition per claim probe
-                // (see v021 migration for measurements).
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_ready_{slot}_lane_shard
-                    ON {} (queue, priority, enqueue_shard, lane_seq)
-                "#,
-                    ready_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_ready_{slot}_job
-                    ON {} (job_id)
-                "#,
-                    ready_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.done_entries
-                FOR VALUES IN ({slot})
-                "#,
-                    done_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                // Mirror of the ready_entries shard-aware lane index;
-                // see the comment there for the rationale.
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_done_{slot}_lane_shard
-                    ON {} (queue, priority, enqueue_shard, lane_seq)
-                "#,
-                    done_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_done_{slot}_job
-                    ON {} (job_id)
-                "#,
-                    done_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
-
-            // queue_terminal_live_counts: per-(ready_slot, queue, priority,
-            // enqueue_shard) live count of rows currently in done_entries.
-            // Replaces the `count(*) FROM done_entries WHERE queue = ANY(...)`
-            // scan in queue_counts_exact (#290). Shard-aligned to inherit the
-            // ADR-025 row-lock spread; one counter row per group means a
-            // skewed batch of 512 terminal inserts costs one UPSERT. Prune
-            // folds a slot's rows into queue_terminal_rollups in the same
-            // transaction as the partition truncate (lands in PR B of this
-            // series; A1 here only wires the increment side).
-            //
-            // fillfactor=50 + tuned autovacuum: the upsert path is a HOT
-            // candidate (no secondary index touched). Without explicit
-            // fillfactor, the upserts spill to fresh pages under sustained
-            // completion load.
-            //
-            // Created here, after the `done_entries` partition loop above,
-            // because the backfill below SELECTs FROM `done_entries`.
-            sqlx::query(&format!(
-                r#"
-            CREATE TABLE IF NOT EXISTS {schema}.queue_terminal_live_counts (
-                ready_slot          INT NOT NULL,
-                queue               TEXT NOT NULL,
-                priority            SMALLINT NOT NULL,
-                enqueue_shard       SMALLINT NOT NULL,
-                live_terminal_count BIGINT NOT NULL DEFAULT 0,
-                PRIMARY KEY (ready_slot, queue, priority, enqueue_shard)
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // #290: queue-leading index so `queue_counts_exact`'s
-            // `WHERE queue = ANY($1)` scan is an index range probe over
-            // the requested queue's rows instead of a full-table scan
-            // across every queue's counters. The PK leads with
-            // `ready_slot`, which is the right shape for the row-level
-            // UPSERT path (one row per group) but the wrong shape for
-            // the read aggregation. Including `priority` as the second
-            // column keeps the index narrow while supporting any future
-            // per-priority drill-down. Notably we do NOT INCLUDE
-            // `live_terminal_count` here — that would block HOT updates
-            // on the very column the increment/decrement path mutates,
-            // re-introducing the v016 bloat shape #290 is trying to
-            // avoid.
-            sqlx::query(&format!(
-                "CREATE INDEX IF NOT EXISTS \
-                 idx_{schema}_queue_terminal_live_counts_queue \
-                 ON {schema}.queue_terminal_live_counts (queue, priority)"
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            sqlx::query(&format!(
-                r#"
-            ALTER TABLE {schema}.queue_terminal_live_counts SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // Backfill from existing done_entries in the same transaction as
-            // the table creation. On a fresh install this is a no-op
-            // (done_entries is empty). On an existing 0.6 cluster, this
-            // builds the live counts from the current done_entries
-            // population before any new code path tries to read them.
-            // ON CONFLICT DO NOTHING because the loop is idempotent and a
-            // re-running prepare_schema must not double-count.
-            sqlx::query(&format!(
-                r#"
-            INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                ready_slot,
-                queue,
-                priority,
-                enqueue_shard,
-                live_terminal_count
-            )
-            SELECT
-                ready_slot,
-                queue,
-                priority,
-                enqueue_shard,
-                count(*)::bigint
-            FROM {schema}.done_entries
-            GROUP BY ready_slot, queue, priority, enqueue_shard
-            ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO NOTHING
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            // #290: auto-mark trusted for fresh installs. If
-            // `done_entries` is empty at this point AND the trust
-            // marker is still NULL, the counter is vacuously correct
-            // (nothing to drift) and the operator shouldn't have to
-            // run the rebuild CLI just to enable the perf path. On an
-            // existing install upgrading from a pre-#290 fleet, old
-            // binaries that wrote to done_entries before the new
-            // runtime booted would have left non-zero rows here, so
-            // we leave trusted_at NULL and the operator must
-            // explicitly rebuild after the rolling upgrade completes.
-            //
-            // The advisory lock held by prepare_schema gives us a
-            // tight window — concurrent writes from other schema
-            // preps are serialised on the lock, and any in-flight
-            // Rust writers are already counter-maintaining by
-            // definition (they built against this codebase).
-            sqlx::query(&format!(
-                r#"
-            UPDATE {schema}.queue_ring_state
-            SET terminal_counter_trusted_at = now()
-            WHERE singleton = TRUE
-              AND terminal_counter_trusted_at IS NULL
-              AND NOT EXISTS (SELECT 1 FROM {schema}.done_entries LIMIT 1)
-            "#
-            ))
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
-            for slot in 0..self.lease_slot_count() {
-                sqlx::query(&format!(
-                    r#"
-                CREATE TABLE IF NOT EXISTS {} PARTITION OF {schema}.leases
-                FOR VALUES IN ({slot})
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                // Mirror of the ready_entries shard-aware lane index;
-                // see the comment there for the rationale.
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_lane_shard
-                    ON {} (queue, priority, enqueue_shard, lane_seq)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_ready_ref
-                    ON {} (ready_slot, ready_generation)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_job
-                    ON {} (job_id, run_lease)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_callback
-                    ON {} (callback_id)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_state_hb
-                    ON {} (state, heartbeat_at)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_state_deadline
-                    ON {} (state, deadline_at)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-
-                sqlx::query(&format!(
-                    r#"
-                CREATE INDEX IF NOT EXISTS idx_{schema}_leases_{slot}_state_callback_timeout
-                    ON {} (state, callback_timeout_at)
-                "#,
-                    lease_child_name(schema, slot)
-                ))
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
-
-            sqlx::query(&format!(
-                r#"
-            CREATE OR REPLACE FUNCTION {schema}.claim_ready_runtime(
-                p_queue TEXT,
-                p_max_batch BIGINT,
-                p_deadline_secs DOUBLE PRECISION,
-                p_aging_secs DOUBLE PRECISION
-            )
-            RETURNS TABLE(
-                ready_slot INT,
-                ready_generation BIGINT,
-                lane_seq BIGINT,
-                enqueue_shard SMALLINT,
-                lease_slot INT,
-                lease_generation BIGINT,
-                claim_slot INT,
-                job_id BIGINT,
-                kind TEXT,
-                queue TEXT,
-                args JSONB,
-                lane_priority SMALLINT,
-                priority SMALLINT,
-                attempt SMALLINT,
-                run_lease BIGINT,
-                max_attempts SMALLINT,
-                run_at TIMESTAMPTZ,
-                heartbeat_at TIMESTAMPTZ,
-                deadline_at TIMESTAMPTZ,
-                attempted_at TIMESTAMPTZ,
-                created_at TIMESTAMPTZ,
-                unique_key BYTEA,
-                unique_states TEXT,
-                payload JSONB
-            )
-            LANGUAGE plpgsql
-            SET search_path = pg_catalog, awa, public
-            AS $func$
-            DECLARE
-                v_lane_priority SMALLINT;
-                v_lane_shard SMALLINT;
-                v_lane_claim_seq BIGINT;
-                v_lane_next_seq BIGINT;
-                v_claim_limit BIGINT;
-                v_claimed_count BIGINT;
-                v_target_slot INT;
-                v_target_generation BIGINT;
-                v_claimed_at TIMESTAMPTZ;
-                v_deadline_at TIMESTAMPTZ;
-            BEGIN
-                SELECT
-                    claims.priority,
-                    claims.enqueue_shard,
-                    claims.claim_seq,
-                    enqueues.next_seq
-                INTO v_lane_priority, v_lane_shard, v_lane_claim_seq, v_lane_next_seq
-                FROM {schema}.queue_claim_heads AS claims
-                JOIN {schema}.queue_enqueue_heads AS enqueues
-                  ON enqueues.queue = claims.queue
-                 AND enqueues.priority = claims.priority
-                 AND enqueues.enqueue_shard = claims.enqueue_shard
-                JOIN LATERAL (
-                    SELECT
-                        ready.ready_slot,
-                        ready.ready_generation,
-                        ready.run_at,
-                        CASE
-                            WHEN p_aging_secs > 0 THEN GREATEST(
-                                1,
-                                claims.priority - FLOOR(
-                                    EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
-                                )::smallint
-                            )::smallint
-                            ELSE claims.priority
-                        END AS effective_priority
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.queue = p_queue
-                      AND ready.priority = claims.priority
-                      AND ready.enqueue_shard = claims.enqueue_shard
-                      AND ready.lane_seq >= claims.claim_seq
-                    ORDER BY ready.lane_seq ASC
-                    LIMIT 1
-                ) AS candidate ON TRUE
-                WHERE claims.queue = p_queue
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM awa.queue_meta AS meta
-                      WHERE meta.queue = p_queue
-                        AND meta.paused = TRUE
-                  )
-                  AND claims.claim_seq < enqueues.next_seq
-                ORDER BY candidate.effective_priority ASC, candidate.run_at ASC, claims.priority ASC
-                LIMIT 1
-                FOR UPDATE OF claims SKIP LOCKED;
-
-                IF NOT FOUND THEN
-                    RETURN;
-                END IF;
-
-                SELECT ready.ready_slot, ready.ready_generation
-                INTO v_target_slot, v_target_generation
-                FROM {schema}.ready_entries AS ready
-                WHERE ready.queue = p_queue
-                  AND ready.priority = v_lane_priority
-                  AND ready.enqueue_shard = v_lane_shard
-                  AND ready.lane_seq >= v_lane_claim_seq
-                ORDER BY ready.lane_seq ASC
-                LIMIT 1;
-
-                IF NOT FOUND THEN
-                    UPDATE {schema}.queue_claim_heads AS claims
-                    SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
-                    WHERE claims.queue = p_queue
-                      AND claims.priority = v_lane_priority
-                      AND claims.enqueue_shard = v_lane_shard;
-                    RETURN;
-                END IF;
-
-                v_claim_limit := LEAST(GREATEST(v_lane_next_seq - v_lane_claim_seq, 0), p_max_batch);
-                IF v_claim_limit <= 0 THEN
-                    RETURN;
-                END IF;
-
-                v_claimed_at := clock_timestamp();
-                IF p_deadline_secs > 0 THEN
-                    v_deadline_at := v_claimed_at + make_interval(secs => p_deadline_secs);
-                ELSE
-                    v_deadline_at := NULL::timestamptz;
-                END IF;
-
-                RETURN QUERY
-                WITH lease_ring AS (
-                    SELECT current_slot AS lease_slot, generation AS lease_generation
-                    FROM {schema}.lease_ring_state
-                    WHERE singleton = TRUE
-                ),
-                selected AS (
-                    SELECT
-                        ready.ready_slot,
-                        ready.ready_generation,
-                        ready.job_id,
-                        ready.kind,
-                        ready.queue,
-                        ready.args,
-                        ready.priority AS lane_priority,
-                        CASE
-                            WHEN p_aging_secs > 0 THEN GREATEST(
-                                1,
-                                ready.priority - FLOOR(
-                                    EXTRACT(EPOCH FROM (clock_timestamp() - ready.run_at)) / p_aging_secs
-                                )::smallint
-                            )::smallint
-                            ELSE ready.priority
-                        END AS effective_priority,
-                        ready.attempt,
-                        ready.run_lease,
-                        ready.max_attempts,
-                        ready.lane_seq,
-                        ready.run_at,
-                        ready.created_at,
-                        ready.unique_key,
-                        ready.unique_states,
-                        COALESCE(ready.payload, '{{}}'::jsonb) AS payload
-                    FROM {schema}.ready_entries AS ready
-                    WHERE ready.queue = p_queue
-                      AND ready.priority = v_lane_priority
-                      AND ready.enqueue_shard = v_lane_shard
-                      AND ready.ready_slot = v_target_slot
-                      AND ready.ready_generation = v_target_generation
-                      AND ready.lane_seq >= v_lane_claim_seq
-                    ORDER BY ready.lane_seq ASC
-                    LIMIT v_claim_limit
-                ),
-                advanced AS (
-                    UPDATE {schema}.queue_claim_heads AS claims
-                    SET claim_seq = COALESCE(
-                            (SELECT max(selected.lane_seq) + 1 FROM selected),
-                            claims.claim_seq
-                        )
-                    WHERE claims.queue = p_queue
-                      AND claims.priority = v_lane_priority
-                      AND claims.enqueue_shard = v_lane_shard
-                    RETURNING claims.priority
-                ),
-                {claimed_cte}
-                SELECT
-                    claimed.ready_slot,
-                    claimed.ready_generation,
-                    claimed.lane_seq,
-                    v_lane_shard AS enqueue_shard,
-                    lease_ring.lease_slot,
-                    lease_ring.lease_generation,
-                    claimed.claim_slot,
-                    selected.job_id,
-                    selected.kind,
-                    selected.queue,
-                    selected.args,
-                    selected.lane_priority,
-                    selected.effective_priority,
-                    claimed.attempt,
-                    claimed.run_lease,
-                    claimed.max_attempts,
-                    selected.run_at,
-                    CASE
-                        WHEN p_deadline_secs > 0 THEN v_claimed_at
-                        ELSE NULL::timestamptz
-                    END AS heartbeat_at,
-                    v_deadline_at AS deadline_at,
-                    CASE
-                        WHEN p_deadline_secs > 0 THEN v_claimed_at
-                        ELSE NULL::timestamptz
-                    END AS attempted_at,
-                    selected.created_at,
-                    selected.unique_key,
-                    selected.unique_states,
-                    selected.payload
-                FROM claimed
-                CROSS JOIN lease_ring
-                JOIN selected
-                 ON selected.ready_slot = claimed.ready_slot
-                 AND selected.ready_generation = claimed.ready_generation
-                 AND selected.queue = claimed.queue
-                 AND selected.effective_priority = claimed.priority
-                 AND selected.lane_seq = claimed.lane_seq
-                ORDER BY selected.lane_seq ASC;
-
-                GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
-
-                -- The derived available count `next_seq - claim_seq`
-                -- decreases naturally as the `advanced` CTE above bumps
-                -- claim_seq past the claimed lane_seq. The only extra
-                -- branch is gap-recovery: if no rows were claimed but
-                -- the head says the queue is non-empty (next_seq >
-                -- claim_seq), admin deletes have left a gap between
-                -- claim_seq and next_seq. Advance claim_seq to catch
-                -- up so subsequent readers don't see a stale over-count.
-                IF v_claimed_count = 0 THEN
-                    UPDATE {schema}.queue_claim_heads AS claims
-                    SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
-                    WHERE claims.queue = p_queue
-                      AND claims.priority = v_lane_priority
-                      AND claims.enqueue_shard = v_lane_shard;
-                END IF;
-            END;
-            $func$
             "#,
-                claimed_cte = claimed_cte
-            ))
+            )
             .execute(install_tx.as_mut())
             .await
             .map_err(map_sqlx_error)?;
-
-            for slot in 0..self.queue_slot_count() {
-                sqlx::query(&format!(
-                    r#"
-                INSERT INTO {schema}.queue_ring_slots (slot, generation)
-                VALUES ($1, $2)
-                ON CONFLICT (slot) DO NOTHING
-                "#
-                ))
-                .bind(slot as i32)
-                .bind(if slot == 0 { 0_i64 } else { -1_i64 })
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
-
-            for slot in 0..self.lease_slot_count() {
-                sqlx::query(&format!(
-                    r#"
-                    INSERT INTO {schema}.lease_ring_slots (slot, generation)
-                    VALUES ($1, $2)
-                    ON CONFLICT (slot) DO NOTHING
-                    "#
-                ))
-                .bind(slot as i32)
-                .bind(if slot == 0 { 0_i64 } else { -1_i64 })
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
-
-            for slot in 0..self.claim_slot_count() {
-                sqlx::query(&format!(
-                    r#"
-                    INSERT INTO {schema}.claim_ring_slots (slot, generation)
-                    VALUES ($1, $2)
-                    ON CONFLICT (slot) DO NOTHING
-                    "#
-                ))
-                .bind(slot as i32)
-                .bind(if slot == 0 { 0_i64 } else { -1_i64 })
-                .execute(install_tx.as_mut())
-                .await
-                .map_err(map_sqlx_error)?;
-            }
 
             Ok(())
         }

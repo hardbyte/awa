@@ -59,13 +59,13 @@ much smaller instances than their peak insertion rate would suggest.
 
 ## IAM and Cloud SQL connectivity
 
-Migrations and queue-storage schema preparation need DDL-capable
+Migrations and custom queue-storage schema preparation need DDL-capable
 credentials. Ordinary workers can run with the runtime grants in
-[`security.md`](security.md) once `awa migrate` and
-`awa storage prepare-queue-storage-schema` have already materialized the
-schema. If you rely on fresh-install auto-prepare from the first worker
-startup instead, that worker connection also needs the DDL privileges required
-by `prepare_schema()`.
+[`security.md`](security.md) once `awa migrate` has materialized the default
+`awa` substrate, or once `awa storage prepare-queue-storage-schema` has
+materialized a custom queue-storage schema. If you rely on fresh-install
+auto-prepare from the first worker startup instead, that worker connection also
+needs the DDL privileges required by `prepare_schema()`.
 
 ### Cloud SQL with IAM authentication
 
@@ -189,10 +189,11 @@ hours the first time:
 - **Concurrent worker startup on a fresh DB used to expose
   `prepare_schema` races.** The #264 fix serializes schema preparation under a
   transaction-scoped advisory lock and keeps the install body on that same
-  connection. Still prefer running `awa migrate` and
-  `awa storage prepare-queue-storage-schema` as an explicit rollout step in
-  production: it gives you one clear DDL owner, avoids first-request startup
-  surprises, and lets workers use runtime-only grants.
+  connection. Still prefer running `awa migrate` as the explicit rollout step
+  for the default `awa` substrate, or `awa storage prepare-queue-storage-schema`
+  for custom queue-storage schemas, in production: it gives you one clear DDL
+  owner, avoids first-request startup surprises, and lets workers use
+  runtime-only grants.
 
 - **PG18-on-AlloyDB upgrade preserves the schema and v021 indexes
   across the cut-over.** No re-bootstrap needed; just verify the

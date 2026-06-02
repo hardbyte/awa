@@ -229,6 +229,7 @@ async fn grant_runtime_privileges(pool: &PgPool, role: &str, include_truncate: b
         GRANT USAGE, SELECT ON SEQUENCE awa.jobs_id_seq TO {role};
         GRANT {table_privileges} ON ALL TABLES IN SCHEMA awa TO {role};
         GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO {role};
+        REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN) FROM {role};
         "#
     ))
     .execute(pool)
@@ -394,6 +395,25 @@ async fn test_documented_runtime_grants_cover_admin_refresh_truncate() {
     drop_login_role(&pool, &runtime_with_truncate).await;
 }
 
+#[tokio::test]
+async fn test_install_queue_storage_substrate_is_not_public_executable() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+    migrations::run(&pool).await.unwrap();
+
+    let public_can_execute: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('public', 'awa.install_queue_storage_substrate(text,integer,integer,integer,boolean)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !public_can_execute,
+        "queue-storage substrate installer must not be executable by PUBLIC"
+    );
+}
+
 // ── Step-through upgrade with data survival ──────────────────────
 
 #[tokio::test]
@@ -549,6 +569,128 @@ async fn test_migration_sql_matches_run() {
     );
 
     migrations::run(&pool).await.unwrap();
+}
+
+#[tokio::test]
+async fn test_v023_migrates_legacy_default_queue_storage_tables() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    for (_version, _desc, sql) in migrations::migration_sql_range(0, 22) {
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+    }
+
+    sqlx::raw_sql(
+        r#"
+        CREATE TABLE awa.open_receipt_claims (job_id bigint);
+        CREATE TABLE awa.queue_count_snapshots (queue text);
+        CREATE TABLE awa.lease_claims (
+            job_id           BIGINT NOT NULL,
+            run_lease        BIGINT NOT NULL,
+            ready_slot       INT NOT NULL,
+            ready_generation BIGINT NOT NULL,
+            queue            TEXT NOT NULL,
+            priority         SMALLINT NOT NULL,
+            attempt          SMALLINT NOT NULL,
+            max_attempts     SMALLINT NOT NULL,
+            lane_seq         BIGINT NOT NULL,
+            enqueue_shard    SMALLINT NOT NULL DEFAULT 0,
+            claimed_at       TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            materialized_at  TIMESTAMPTZ,
+            deadline_at      TIMESTAMPTZ
+        );
+        CREATE TABLE awa.lease_claim_closures (
+            job_id    BIGINT NOT NULL,
+            run_lease BIGINT NOT NULL,
+            outcome   TEXT NOT NULL,
+            closed_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp()
+        );
+
+        INSERT INTO awa.lease_claims (
+            job_id, run_lease, ready_slot, ready_generation, queue, priority,
+            attempt, max_attempts, lane_seq, enqueue_shard, claimed_at,
+            materialized_at, deadline_at
+        )
+        SELECT
+            gs, 1, 0, 0, 'legacy_default', 2::smallint,
+            0::smallint, 25::smallint, gs, (gs % 2)::smallint,
+            clock_timestamp(), NULL::timestamptz,
+            TIMESTAMPTZ '2030-01-01 00:00:00+00'
+        FROM generate_series(1, 5) AS gs;
+
+        INSERT INTO awa.lease_claim_closures (job_id, run_lease, outcome, closed_at)
+        SELECT gs, 1, 'completed', clock_timestamp()
+        FROM generate_series(1, 2) AS gs;
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrations::run(&pool).await.unwrap();
+
+    let version = migrations::current_version(&pool).await.unwrap();
+    assert_eq!(version, migrations::CURRENT_VERSION);
+
+    let lease_claims_relkind: String = sqlx::query_scalar(
+        r#"
+        SELECT c.relkind::text
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE n.nspname = 'awa'
+          AND c.relname = 'lease_claims'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        lease_claims_relkind, "p",
+        "v023 should rebuild legacy lease_claims as a partitioned parent"
+    );
+
+    let migrated_claims: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM awa.lease_claims WHERE queue = 'legacy_default'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(migrated_claims, 5);
+
+    let preserved_claim_shape: (i16, bool) = sqlx::query_as(
+        r#"
+        SELECT enqueue_shard,
+               deadline_at = TIMESTAMPTZ '2030-01-01 00:00:00+00'
+        FROM awa.lease_claims
+        WHERE queue = 'legacy_default'
+          AND job_id = 3
+          AND run_lease = 1
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(preserved_claim_shape, (1, true));
+
+    let migrated_closures: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.lease_claim_closures WHERE outcome = 'completed'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(migrated_closures, 2);
+
+    for relname in [
+        "awa.lease_claims_legacy",
+        "awa.lease_claim_closures_legacy",
+        "awa.open_receipt_claims",
+        "awa.queue_count_snapshots",
+    ] {
+        assert!(
+            !relation_exists(&pool, relname).await,
+            "{relname} should be removed by the v023 default-schema cleanup"
+        );
+    }
 }
 
 // ── Legacy version upgrade (0.3.x → 0.4.x) ─────────────────────

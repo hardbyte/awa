@@ -106,12 +106,11 @@ they opened the page, not historical replay.
 #    coexist; while state is still canonical or prepared, all writes
 #    and execution stay canonical.
 
-# 2. Materialize the queue-storage schema before the routing flip.
-#    Skipping this means the first queue-storage write pays the
-#    schema-install cost. The default is the `awa` schema (shared
-#    with canonical metadata); if you want an isolated schema name
-#    for queue-storage tables, pass it here AND in step 3's --details.
-awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema awa
+# 2. Optional: materialize a custom queue-storage schema before the
+#    routing flip. The default `awa` schema is already materialized by
+#    `awa migrate`; run this only if you want an isolated schema name or
+#    non-default slot counts, and pass the same schema in step 3's --details.
+# awa --database-url "$DATABASE_URL" storage prepare-queue-storage-schema --schema <custom_schema>
 
 # 3. Record the prepared engine. Default schema is `awa`; pass
 #    --details '{"schema":"<name>"}' to record a different name.
@@ -194,8 +193,8 @@ awa --database-url "$DATABASE_URL" storage status
 
 | After step | Watch for |
 |------------|-----------|
-| migrate | `SELECT MAX(version) FROM awa.schema_version` advances |
-| prepare-queue-storage-schema | `\dt awa.ready_entries` (and other queue-storage tables) exist in the `awa` schema |
+| migrate | `SELECT MAX(version) FROM awa.schema_version` advances; `\dt awa.ready_entries` exists for the default schema |
+| prepare custom queue-storage schema | `\dt <custom_schema>.ready_entries` (and other queue-storage tables) exist when using a custom schema |
 | prepare | `awa storage status` reports `state=prepared` |
 | start queue-storage target | `awa.runtime_instances` shows `transition_role='queue_storage_target'` and `storage_capability='queue_storage'` for the new instance; `awa storage status` lists no `enter_mixed_transition_blockers` |
 | enter-mixed-transition | `awa_maintenance_rotate_attempts_total{awa_ring="queue", awa_ring_outcome="rotated"}` is non-zero in Grafana; queue ring `current_slot` advancing |

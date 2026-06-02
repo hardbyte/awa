@@ -118,6 +118,9 @@ GRANT SELECT, INSERT, UPDATE, DELETE, TRUNCATE ON ALL TABLES IN SCHEMA awa TO aw
 
 -- Functions (trigger functions execute with invoker privileges)
 GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA awa TO awa_runtime;
+-- Keep the queue-storage installer helper migrator/operator-only.
+REVOKE EXECUTE ON FUNCTION awa.install_queue_storage_substrate(TEXT, INT, INT, INT, BOOLEAN)
+  FROM awa_runtime;
 
 -- Default privileges for future migrations.
 ALTER DEFAULT PRIVILEGES FOR ROLE awa_owner IN SCHEMA awa
@@ -177,7 +180,12 @@ ALTER DEFAULT PRIVILEGES FOR ROLE awa_migrator IN SCHEMA my_qs_schema
   GRANT EXECUTE ON FUNCTIONS TO awa_runtime;
 ```
 
-The queue-storage schema is migrated by `awa storage prepare-queue-storage-schema`, which runs as the migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The runtime role needs read/write/execute privileges plus `TRUNCATE` for ring-partition rotation; it never needs DDL.
+The default `awa` queue-storage substrate is migrated by `awa migrate`. Custom
+queue-storage schemas are migrated by
+`awa storage prepare-queue-storage-schema`, which should also run as the
+migrator role and creates objects owned by `awa_migrator` / `awa_owner`. The
+runtime role needs read/write/execute privileges plus `TRUNCATE` for
+ring-partition rotation; it never needs DDL.
 
 ### 5. Configure your processes
 

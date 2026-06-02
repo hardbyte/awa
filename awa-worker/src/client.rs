@@ -1276,7 +1276,11 @@ impl Client {
                 // and the staged transition is unaffected.
                 if status.state == "canonical" && status.prepared_engine.is_none() {
                     let configured_schema = runtime.store.schema().to_string();
-                    runtime.store.prepare_schema(&self.pool).await?;
+                    if !transition::queue_storage_schema_ready(&self.pool, &configured_schema)
+                        .await?
+                    {
+                        runtime.store.prepare_schema(&self.pool).await?;
+                    }
                     let promoted: bool =
                         sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
                             .bind(&configured_schema)
@@ -2772,9 +2776,8 @@ mod tests {
         migrations::run(&pool)
             .await
             .expect("migrations should succeed");
-        // After folding queue-storage into the `awa` schema, migrations
-        // don't create queue-storage tables — those are added by
-        // `store.install()` below. No separate schema-drop step needed.
+        // The explicit install remains an idempotence check now that
+        // migrations materialize the default queue-storage substrate.
 
         let queue = "health_queue_storage";
         let client = Client::builder(pool.clone())
@@ -2806,6 +2809,69 @@ mod tests {
 
     #[derive(Clone, serde::Serialize, serde::Deserialize, awa_macros::JobArgs)]
     struct CutoverShortJob {}
+
+    #[tokio::test]
+    async fn fresh_auto_finalize_uses_migrated_default_substrate_without_prepare_schema() {
+        let _guard = test_mutex().lock().await;
+        let pool = setup_pool(4).await;
+        reset_schema(&pool).await;
+        migrations::run(&pool)
+            .await
+            .expect("fresh 0.6 schema install should succeed");
+
+        sqlx::raw_sql(
+            r#"
+            CREATE OR REPLACE FUNCTION awa.install_queue_storage_substrate(
+                p_schema TEXT,
+                p_queue_slot_count INT DEFAULT 16,
+                p_lease_slot_count INT DEFAULT 8,
+                p_claim_slot_count INT DEFAULT 8,
+                p_lease_claim_receipts BOOLEAN DEFAULT TRUE
+            )
+            RETURNS VOID
+            LANGUAGE plpgsql
+            AS $$
+            BEGIN
+                RAISE EXCEPTION 'prepare_schema should not run when default queue-storage substrate is already ready'
+                    USING ERRCODE = '55000';
+            END
+            $$;
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("failed to poison queue-storage helper");
+
+        let client = Client::builder(pool.clone())
+            .queue(
+                "fresh_auto_finalize",
+                QueueConfig {
+                    max_workers: 1,
+                    poll_interval: Duration::from_millis(25),
+                    deadline_duration: Duration::ZERO,
+                    ..QueueConfig::default()
+                },
+            )
+            .register::<CutoverShortJob, _, _>(move |_args, _ctx| async move {
+                Ok(JobResult::Completed)
+            })
+            .promote_interval(Duration::from_millis(25))
+            .leader_election_interval(Duration::from_millis(100))
+            .leader_check_interval(Duration::from_millis(50))
+            .runtime_snapshot_interval(Duration::from_millis(100))
+            .build()
+            .expect("Failed to build fresh auto-finalize client");
+
+        client
+            .start()
+            .await
+            .expect("fresh runtime should auto-finalize without prepare_schema");
+        assert_eq!(
+            active_queue_storage_schema(&pool).await.as_deref(),
+            Some("awa")
+        );
+        client.shutdown(Duration::from_secs(5)).await;
+    }
 
     #[tokio::test]
     async fn canonical_runtime_drains_in_flight_jobs_across_schema_upgrade_before_queue_storage_cutover(
