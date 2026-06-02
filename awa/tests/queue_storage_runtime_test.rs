@@ -5216,6 +5216,113 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
     assert_invariant_holds(&pool, schema, queue, "after rebuild").await;
 }
 
+/// #290 — `queue_counts_exact` honours the
+/// `queue_ring_state.terminal_counter_trusted_at` marker. When the marker
+/// is NULL (e.g. a rolling-upgrade window where a pre-#290 binary may
+/// have written `done_entries` rows without maintaining the counter), the
+/// read path falls back to scanning `done_entries`; otherwise it uses
+/// the counter directly. This keeps the "exact" naming honest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_terminal_counter_trust_marker_gates_read_path() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_terminal_counter_trust";
+    let schema = "awa_qs_terminal_counter_trust";
+    let store = create_store(&pool, schema).await;
+
+    // Fresh installs auto-mark trusted (empty done_entries at
+    // prepare_schema time).
+    assert!(
+        store
+            .terminal_counter_trusted(&pool)
+            .await
+            .expect("trust check"),
+        "fresh install should auto-mark the trust marker"
+    );
+
+    // Seed 5 terminal rows. The counter and done_entries agree.
+    seed_terminal_rows(&pool, schema, queue, "completed", 5).await;
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("counts")
+            .terminal,
+        5,
+        "trusted path returns counter sum"
+    );
+
+    // Simulate a pre-#290 binary's drift by:
+    //  1. Inserting an "orphan" done_entries row without a matching
+    //     counter increment.
+    //  2. Manually clearing the trust marker (operator hasn't yet run
+    //     `awa storage rebuild-terminal-counters`).
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) VALUES (0, 1, 7000000, 'chaos_job', $1, 'completed'::awa.job_state,
+                  2::smallint, 1::smallint, 1::bigint, 9999::bigint,
+                  0::smallint, now(), now(), '{{}}'::jsonb)"
+    ))
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed orphan done row");
+    sqlx::query(&format!(
+        "UPDATE {schema}.queue_ring_state \
+         SET terminal_counter_trusted_at = NULL WHERE singleton = TRUE"
+    ))
+    .execute(&pool)
+    .await
+    .expect("clear trust marker");
+
+    assert!(
+        !store
+            .terminal_counter_trusted(&pool)
+            .await
+            .expect("trust check"),
+        "trust marker cleared"
+    );
+
+    // Untrusted path scans done_entries → reports 6 (the seeded 5 +
+    // the orphan row). If the read still trusted the counter, it
+    // would return 5 and silently mask the drift.
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("counts")
+            .terminal,
+        6,
+        "untrusted path scans done_entries instead of the counter"
+    );
+
+    // Rebuild restores the invariant AND flips the trust marker back.
+    store
+        .rebuild_terminal_counters(&pool)
+        .await
+        .expect("rebuild");
+    assert!(
+        store
+            .terminal_counter_trusted(&pool)
+            .await
+            .expect("trust check"),
+        "rebuild should set the trust marker"
+    );
+    assert_eq!(
+        store
+            .queue_counts(&pool, queue)
+            .await
+            .expect("counts")
+            .terminal,
+        6,
+        "trusted path post-rebuild returns the rebuilt counter sum"
+    );
+    assert_invariant_holds(&pool, schema, queue, "after rebuild trust flip").await;
+}
+
 async fn live_count_sum(pool: &sqlx::PgPool, schema: &str, queue: &str) -> i64 {
     sqlx::query_scalar::<_, i64>(&format!(
         "SELECT COALESCE(SUM(live_terminal_count), 0)::bigint \
