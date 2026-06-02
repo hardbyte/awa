@@ -1,6 +1,7 @@
 pub mod adapter;
 pub mod admin;
 pub mod bridge;
+pub mod callback_contract;
 pub mod cron;
 pub mod dlq;
 pub mod error;

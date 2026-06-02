@@ -4,6 +4,7 @@
 
 use crate::context::JobContext;
 use crate::executor::{JobError, JobResult, Worker};
+use awa_model::callback_contract;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -38,9 +39,16 @@ pub struct HttpWorkerConfig {
     /// signature as `X-Awa-Signature`.
     pub hmac_secret: Option<[u8; 32]>,
     /// Base URL for the callback endpoint. The full callback URL is
-    /// `{callback_base_url}/api/callbacks/{callback_id}/complete`.
+    /// `{callback_base_url}{callback_path_prefix}/{callback_id}/complete`.
     /// Required for async mode.
     pub callback_base_url: Option<String>,
+    /// Path prefix appended to `callback_base_url` when building the URL.
+    /// `None` uses [`awa_model::callback_contract::DEFAULT_CALLBACK_PATH_PREFIX`]
+    /// (`/api/callbacks`), matching the built-in `awa serve` route layout.
+    /// Set this to a custom value when the callback receiver is mounted at a
+    /// non-default path (e.g. a callback-only deployment or a user-owned API
+    /// layer — see ADR-027, #279, #281).
+    pub callback_path_prefix: Option<String>,
     /// HTTP request timeout for the initial POST to the function.
     /// Defaults to 30 seconds.
     pub request_timeout: Duration,
@@ -55,6 +63,7 @@ impl Default for HttpWorkerConfig {
             headers: HashMap::new(),
             hmac_secret: None,
             callback_base_url: None,
+            callback_path_prefix: None,
             request_timeout: Duration::from_secs(30),
         }
     }
@@ -115,12 +124,12 @@ impl HttpWorker {
         }
     }
 
-    /// Compute the blake3 keyed-hash signature for a callback ID.
+    /// Compute the BLAKE3 keyed-hash signature for a callback ID.
     fn sign_callback_id(&self, callback_id: &str) -> Option<String> {
-        self.config.hmac_secret.map(|key| {
-            let hash = blake3::keyed_hash(&key, callback_id.as_bytes());
-            hash.to_hex().to_string()
-        })
+        self.config
+            .hmac_secret
+            .as_ref()
+            .map(|key| callback_contract::sign(key, callback_id))
     }
 }
 
@@ -165,11 +174,12 @@ impl HttpWorker {
 
         // Build callback URL
         let callback_url = self.config.callback_base_url.as_ref().map(|base| {
-            format!(
-                "{}/api/callbacks/{}/complete",
-                base.trim_end_matches('/'),
-                callback_id_str
-            )
+            let prefix = self
+                .config
+                .callback_path_prefix
+                .as_deref()
+                .unwrap_or(callback_contract::DEFAULT_CALLBACK_PATH_PREFIX);
+            callback_contract::callback_url(base, prefix, &callback_id_str, "complete")
         });
 
         let body = HttpWorkerRequest {
@@ -191,7 +201,7 @@ impl HttpWorker {
 
         // Add callback signature
         if let Some(signature) = self.sign_callback_id(&callback_id_str) {
-            request = request.header("X-Awa-Signature", &signature);
+            request = request.header(callback_contract::SIGNATURE_HEADER, &signature);
         }
 
         // POST to function — we expect 2xx to mean "accepted"
@@ -252,16 +262,17 @@ impl HttpWorker {
     }
 }
 
-/// Verify a blake3 keyed-hash signature for a callback ID.
+/// Verify a BLAKE3 keyed-hash signature for a callback id.
 ///
-/// Used by callback receiver endpoints to authenticate incoming requests.
+/// Re-exported from [`awa_model::callback_contract::verify`] so existing
+/// callers compiled against `awa_worker::http_worker::verify_callback_signature`
+/// keep working. New code SHOULD prefer the canonical
+/// `awa_model::callback_contract` path so user-owned callback receivers can
+/// share it without pulling in the worker crate.
 pub fn verify_callback_signature(
     hmac_secret: &[u8; 32],
     callback_id: &str,
     provided_signature: &str,
 ) -> bool {
-    let expected = blake3::keyed_hash(hmac_secret, callback_id.as_bytes());
-    // Parse the provided hex into a Hash so the comparison uses blake3's
-    // constant-time PartialEq implementation.
-    blake3::Hash::from_hex(provided_signature).is_ok_and(|h| expected == h)
+    callback_contract::verify(hmac_secret, callback_id, provided_signature)
 }

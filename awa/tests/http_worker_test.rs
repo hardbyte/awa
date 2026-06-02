@@ -613,3 +613,79 @@ async fn test_hw9_callback_url() {
         "URL should end with /complete: {url}"
     );
 }
+
+/// HW10: Custom callback_path_prefix is honored when building the URL.
+#[tokio::test]
+async fn test_hw10_callback_url_custom_prefix() {
+    let client = setup().await;
+    let queue = "hw_callback_url_custom_prefix";
+    clean_queue(client.pool(), queue).await;
+
+    let captured_url = Arc::new(tokio::sync::Mutex::new(None::<String>));
+    let url_ref = captured_url.clone();
+
+    let app = axum::Router::new().route(
+        "/function",
+        axum::routing::post(move |body: axum::Json<serde_json::Value>| {
+            let url_ref = url_ref.clone();
+            async move {
+                let url = body
+                    .get("callback_url")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                *url_ref.lock().await = url;
+                axum::http::StatusCode::ACCEPTED
+            }
+        }),
+    );
+
+    let (addr, _handle) = mock_function_server(app).await;
+
+    let worker = HttpWorker::new(
+        "http_task".to_string(),
+        HttpWorkerConfig {
+            url: format!("http://{addr}/function"),
+            mode: HttpWorkerMode::Async,
+            callback_timeout: Duration::from_secs(60),
+            callback_base_url: Some("https://api.example.com".into()),
+            callback_path_prefix: Some("/awa-cb".into()),
+            ..Default::default()
+        },
+    );
+
+    awa::insert_with(
+        client.pool(),
+        &HttpTask {
+            task_id: "url-custom-prefix".into(),
+        },
+        awa::InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    client
+        .work_one_in_queue(&worker, Some(queue))
+        .await
+        .unwrap();
+
+    let url = captured_url
+        .lock()
+        .await
+        .clone()
+        .expect("callback_url should be present");
+    assert!(
+        url.starts_with("https://api.example.com/awa-cb/"),
+        "URL should use the custom prefix: {url}"
+    );
+    assert!(
+        !url.contains("/api/callbacks/"),
+        "URL should not contain the default prefix when overridden: {url}"
+    );
+    assert!(
+        url.ends_with("/complete"),
+        "URL should end with /complete: {url}"
+    );
+}

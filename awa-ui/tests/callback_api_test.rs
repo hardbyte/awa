@@ -107,9 +107,7 @@ async fn callback_complete_requires_valid_signature_when_configured() {
         .expect("job lookup should succeed");
     assert_eq!(stale_state, "waiting_external");
 
-    let signature = blake3::keyed_hash(&secret, callback_id.to_string().as_bytes())
-        .to_hex()
-        .to_string();
+    let signature = awa_model::callback_contract::sign(&secret, &callback_id.to_string());
     let (status, body) = post_json(
         &app,
         &path,
