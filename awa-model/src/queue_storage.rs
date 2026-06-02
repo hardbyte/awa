@@ -3408,6 +3408,28 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // #290: queue-leading index so `queue_counts_exact`'s
+            // `WHERE queue = ANY($1)` scan is an index range probe over
+            // the requested queue's rows instead of a full-table scan
+            // across every queue's counters. The PK leads with
+            // `ready_slot`, which is the right shape for the row-level
+            // UPSERT path (one row per group) but the wrong shape for
+            // the read aggregation. Including `priority` as the second
+            // column keeps the index narrow while supporting any future
+            // per-priority drill-down. Notably we do NOT INCLUDE
+            // `live_terminal_count` here — that would block HOT updates
+            // on the very column the increment/decrement path mutates,
+            // re-introducing the v016 bloat shape #290 is trying to
+            // avoid.
+            sqlx::query(&format!(
+                "CREATE INDEX IF NOT EXISTS \
+                 idx_{schema}_queue_terminal_live_counts_queue \
+                 ON {schema}.queue_terminal_live_counts (queue, priority)"
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.queue_terminal_live_counts SET (
