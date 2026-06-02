@@ -339,6 +339,10 @@ async fn test_fresh_install_reaches_current_version() {
     migrations::run(&pool).await.unwrap();
     let version = migrations::current_version(&pool).await.unwrap();
     assert_eq!(version, migrations::CURRENT_VERSION);
+    assert!(
+        relation_exists(&pool, "awa.runtime_storage_backends").await,
+        "runtime_storage_backends should be migration-owned"
+    );
 }
 
 // ── Idempotency ──────────────────────────────────────────────────

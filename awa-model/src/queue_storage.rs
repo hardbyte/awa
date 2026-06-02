@@ -2139,13 +2139,11 @@ impl QueueStorage {
             //     before the helper creates the partitioned parents, plus the
             //     post-helper copy + drop of the renamed-aside rows.
             //   * `queue_count_snapshots` legacy drop.
-            //   * `awa.runtime_storage_backends` cross-schema CREATE (the
-            //     seed is in `activate_backend`; this CREATE moves to a
-            //     dedicated migration in #308 PR 2).
             //
-            // The helper does NOT touch `awa.runtime_storage_backends` and
-            // does NOT change storage-transition state, so a call to
-            // `prepare_schema` remains activation-neutral.
+            // `awa.runtime_storage_backends` is owned by migrations (v012);
+            // activation paths only seed/update its row. The helper does NOT
+            // touch it and does NOT change storage-transition state, so a call
+            // to `prepare_schema` remains activation-neutral.
 
             sqlx::query(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
                 .execute(install_tx.as_mut())
@@ -2392,24 +2390,6 @@ impl QueueStorage {
                 .map_err(map_sqlx_error)?;
             }
 
-            // awa.runtime_storage_backends is a cross-schema table that
-            // tracks which queue-storage schema each storage backend is
-            // currently bound to. Still created here for #308 PR 1; PR 2
-            // moves the CREATE into a dedicated migration so `awa migrate`
-            // owns the row entirely.
-            sqlx::query(
-                r#"
-            CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
-                backend     TEXT PRIMARY KEY,
-                schema_name TEXT NOT NULL,
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            "#,
-            )
-            .execute(install_tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-
             Ok(())
         }
         .await;
@@ -2425,19 +2405,6 @@ impl QueueStorage {
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.activate_backend")]
     pub async fn activate_backend(&self, pool: &PgPool) -> Result<(), AwaError> {
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS awa.runtime_storage_backends (
-                backend     TEXT PRIMARY KEY,
-                schema_name TEXT NOT NULL,
-                updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
-            )
-            "#,
-        )
-        .execute(pool)
-        .await
-        .map_err(map_sqlx_error)?;
-
         let schema = self.schema();
         let details = serde_json::json!({ "schema": schema });
 
@@ -2446,7 +2413,8 @@ impl QueueStorage {
         // Mark queue storage active only after the full schema, partitions,
         // indexes, and helper functions are in place. The explicit install
         // helper is used by tests and queue-storage-only setups, so it must
-        // flip both the routing registry and the storage transition state.
+        // flip both the migration-owned routing registry row and the storage
+        // transition state.
         sqlx::query(
             r#"
             INSERT INTO awa.runtime_storage_backends (backend, schema_name, updated_at)

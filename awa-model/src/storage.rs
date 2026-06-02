@@ -127,11 +127,11 @@ fn queue_storage_schema_from_status(status: &StorageStatus) -> Option<String> {
 /// `QueueStorage::prepare_schema`.
 ///
 /// The required objects (tables, the job-id sequence, the claim
-/// function and its exact signature) all originate from
-/// [`QueueStorage::prepare_schema`](crate::QueueStorage::prepare_schema).
-/// If you change a name or the `claim_ready_runtime` signature there,
-/// update this check at the same time — they are intentionally a
-/// single source of truth split across two files for readability.
+/// function and its exact signature) originate from the v023 SQL helper,
+/// called either by `awa migrate` for the default schema or by
+/// [`QueueStorage::prepare_schema`](crate::QueueStorage::prepare_schema)
+/// for custom schemas. If you change a name or the `claim_ready_runtime`
+/// signature there, update this check at the same time.
 pub async fn queue_storage_schema_ready(pool: &PgPool, schema: &str) -> Result<bool, AwaError> {
     sqlx::query_scalar::<_, bool>(
         r#"

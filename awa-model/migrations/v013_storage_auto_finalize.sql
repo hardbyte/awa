@@ -22,11 +22,11 @@
 -- liveness window, the function returns FALSE and the caller falls
 -- back to the manual prepare/enter-mixed-transition/finalize path.
 --
--- The schema-install side (prepare_schema in Rust) is the caller's
--- responsibility — auto-finalize assumes the queue-storage tables are
--- already present, mirroring the contract of storage_finalize().
--- Workers should call prepare_schema() before invoking this function;
--- prepare_schema is idempotent so concurrent workers are safe.
+-- The schema-install side is the caller's responsibility — auto-finalize
+-- assumes the queue-storage tables are already present, mirroring the
+-- contract of storage_finalize(). Fresh default `awa` installs get the
+-- substrate from `awa migrate`; custom schemas should be materialized with
+-- prepare_schema() before invoking this function.
 --
 -- The FOR UPDATE on the singleton row serialises with concurrent
 -- callers: first worker's call returns TRUE and flips state to
