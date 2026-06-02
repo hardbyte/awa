@@ -193,7 +193,14 @@ impl ClaimedRuntimeJob {
 pub struct QueueCounts {
     pub available: i64,
     pub running: i64,
-    pub completed: i64,
+    /// Count of rows in *any* terminal state (`completed`, `failed`, or
+    /// `cancelled`) for the queue. The name reflects what the field
+    /// actually counts: it is `count(*) FROM done_entries` semantics, not
+    /// `count(*) WHERE state = 'completed'`. The historical name
+    /// `completed` was a misnomer — `queue_counts_exact` has always
+    /// included failed and cancelled terminals; renamed in #290 along
+    /// with the counter-backed read path.
+    pub terminal: i64,
 }
 
 /// Cheap available-only signal used by the dispatcher's claimer-sizing
@@ -205,7 +212,7 @@ pub struct QueueCounts {
 /// This is intentionally a separate type from [`QueueCounts`]: the
 /// dispatcher claim hot path only consumes the available count, and
 /// returning a `QueueCounts` with two perpetually-zero fields would
-/// invite future code to read `.running` or `.completed` and silently
+/// invite future code to read `.running` or `.terminal` and silently
 /// get wrong answers. Code that legitimately needs the full counts
 /// should call [`QueueStorage::queue_counts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2247,6 +2254,28 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // #290: live-terminal-counter trust marker. NULL = the
+            // counter has not yet been rebuilt under counter-aware code
+            // (set by `rebuild_terminal_counters` after a successful
+            // rebuild, or auto-marked at install time for fresh installs
+            // where done_entries is empty). `queue_counts_exact` reads
+            // this and falls back to scanning done_entries when NULL,
+            // so the "exact" naming stays honest during a rolling
+            // upgrade from a pre-#290 fleet. The trust marker lives on
+            // queue_ring_state — the natural per-schema singleton — so
+            // we don't add a new table for what is effectively one
+            // boolean. The column is updated only on schema install and
+            // on operator-driven rebuild, so it doesn't affect the
+            // existing HOT-update story for rotation writes to
+            // (current_slot, generation).
+            sqlx::query(&format!(
+                "ALTER TABLE {schema}.queue_ring_state \
+                 ADD COLUMN IF NOT EXISTS terminal_counter_trusted_at TIMESTAMPTZ"
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             // Singleton row is rewritten on every queue rotation. Columns being
             // updated (current_slot, generation) are not indexed, so a low
             // fillfactor keeps the update in-page as a HOT update and the
@@ -3401,6 +3430,28 @@ impl QueueStorage {
             .await
             .map_err(map_sqlx_error)?;
 
+            // #290: queue-leading index so `queue_counts_exact`'s
+            // `WHERE queue = ANY($1)` scan is an index range probe over
+            // the requested queue's rows instead of a full-table scan
+            // across every queue's counters. The PK leads with
+            // `ready_slot`, which is the right shape for the row-level
+            // UPSERT path (one row per group) but the wrong shape for
+            // the read aggregation. Including `priority` as the second
+            // column keeps the index narrow while supporting any future
+            // per-priority drill-down. Notably we do NOT INCLUDE
+            // `live_terminal_count` here — that would block HOT updates
+            // on the very column the increment/decrement path mutates,
+            // re-introducing the v016 bloat shape #290 is trying to
+            // avoid.
+            sqlx::query(&format!(
+                "CREATE INDEX IF NOT EXISTS \
+                 idx_{schema}_queue_terminal_live_counts_queue \
+                 ON {schema}.queue_terminal_live_counts (queue, priority)"
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
             sqlx::query(&format!(
                 r#"
             ALTER TABLE {schema}.queue_terminal_live_counts SET (
@@ -3441,6 +3492,35 @@ impl QueueStorage {
             FROM {schema}.done_entries
             GROUP BY ready_slot, queue, priority, enqueue_shard
             ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO NOTHING
+            "#
+            ))
+            .execute(install_tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            // #290: auto-mark trusted for fresh installs. If
+            // `done_entries` is empty at this point AND the trust
+            // marker is still NULL, the counter is vacuously correct
+            // (nothing to drift) and the operator shouldn't have to
+            // run the rebuild CLI just to enable the perf path. On an
+            // existing install upgrading from a pre-#290 fleet, old
+            // binaries that wrote to done_entries before the new
+            // runtime booted would have left non-zero rows here, so
+            // we leave trusted_at NULL and the operator must
+            // explicitly rebuild after the rolling upgrade completes.
+            //
+            // The advisory lock held by prepare_schema gives us a
+            // tight window — concurrent writes from other schema
+            // preps are serialised on the lock, and any in-flight
+            // Rust writers are already counter-maintaining by
+            // definition (they built against this codebase).
+            sqlx::query(&format!(
+                r#"
+            UPDATE {schema}.queue_ring_state
+            SET terminal_counter_trusted_at = now()
+            WHERE singleton = TRUE
+              AND terminal_counter_trusted_at IS NULL
+              AND NOT EXISTS (SELECT 1 FROM {schema}.done_entries LIMIT 1)
             "#
             ))
             .execute(install_tx.as_mut())
@@ -7051,6 +7131,19 @@ impl QueueStorage {
     /// transient gap between admin DELETE of an unclaimed row and the
     /// dispatcher's next gap-recovery pass. Use [`Self::queue_claimer_signal`]
     /// for the dispatcher hot path.
+    ///
+    /// The live-terminal portion reads from `queue_terminal_live_counts`
+    /// (the #290 denormaliser) when [`Self::terminal_counter_trusted`]
+    /// returns true, and falls back to a `count(*) FROM done_entries`
+    /// scan when not. The fallback exists for the rolling-upgrade
+    /// window: a pre-#290 binary writing terminal rows would have
+    /// missed the counter, so reads against a fleet that hasn't yet
+    /// run `awa storage rebuild-terminal-counters` would otherwise
+    /// undercount. The trust marker is auto-set for fresh installs
+    /// (empty done_entries at prepare_schema time) and set explicitly
+    /// by the rebuild CLI; on an existing install before the operator
+    /// rebuilds, the trust marker stays NULL and the scan-based path
+    /// is used — "exact" stays honest.
     async fn queue_counts_exact(
         &self,
         pool: &PgPool,
@@ -7058,6 +7151,28 @@ impl QueueStorage {
     ) -> Result<QueueCounts, AwaError> {
         let schema = self.schema();
         let queues = self.physical_queues_for_logical(queue);
+        let counter_trusted = self.terminal_counter_trusted(pool).await?;
+        // The live-terminal CTE swaps between counter-fed and
+        // scan-fed depending on trust. Build it as a string so the
+        // outer query plan is otherwise identical between the two
+        // paths.
+        let live_terminal_cte = if counter_trusted {
+            format!(
+                "live_terminal AS (
+                    SELECT COALESCE(SUM(live_terminal_count), 0)::bigint AS terminal
+                    FROM {schema}.queue_terminal_live_counts
+                    WHERE queue = ANY($1)
+                )"
+            )
+        } else {
+            format!(
+                "live_terminal AS (
+                    SELECT count(*)::bigint AS terminal
+                    FROM {schema}.done_entries
+                    WHERE queue = ANY($1)
+                )"
+            )
+        };
         let row: (i64, i64, i64) = sqlx::query_as(&format!(
             r#"
             WITH lane_counts AS (
@@ -7124,15 +7239,11 @@ impl QueueStorage {
                     ), 0)
                 )::bigint AS running
             ),
-            live_terminal AS (
-                SELECT count(*)::bigint AS completed
-                FROM {schema}.done_entries
-                WHERE queue = ANY($1)
-            )
+            {live_terminal_cte}
             SELECT
                 lane_counts.available,
                 live_running.running,
-                pruned_terminal.completed + live_terminal.completed AS completed
+                pruned_terminal.completed + live_terminal.terminal AS terminal
             FROM lane_counts
             CROSS JOIN pruned_terminal
             CROSS JOIN live_running
@@ -7144,11 +7255,11 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let (available, running, completed) = row;
+        let (available, running, terminal) = row;
         Ok(QueueCounts {
             available,
             running,
-            completed,
+            terminal,
         })
     }
 
@@ -7177,12 +7288,15 @@ impl QueueStorage {
     ///   that anti-join is what this fast variant exists to avoid).
     ///   `waiting_external` is *not* included — it's reported as part
     ///   of admin's parked-callback view, not running.
-    /// - **completed** is read from the persisted
+    /// - **terminal** is read from the persisted
     ///   `queue_terminal_rollups.pruned_completed_count` denormaliser.
     ///   Rows currently in `done_entries` that have not yet rolled up
     ///   are not included. Strictly a lower bound; converges to the
     ///   exact count when rotation prunes the live `done_entries`
-    ///   segment.
+    ///   segment. (The name `terminal` is honest — this number counts
+    ///   `completed`, `failed`, and `cancelled` rows in done_entries,
+    ///   the same semantics as [`Self::queue_counts_exact`]; renamed
+    ///   from `completed` in #290.)
     ///
     /// All three counters are O(num shards) lookups against small head
     /// tables and `leases` index probes. Use this for high-cadence
@@ -7216,9 +7330,9 @@ impl QueueStorage {
         .fetch_one(pool)
         .await
         .map_err(map_sqlx_error)?;
-        // completed: denormalised rollup only. Live (un-rolled-up)
+        // terminal: denormalised rollup only. Live (un-rolled-up)
         // done_entries rows are excluded — see method-level docs.
-        let completed: i64 = sqlx::query_scalar(&format!(
+        let terminal: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT COALESCE(sum(GREATEST(
                 COALESCE(lanes.pruned_completed_count, 0),
@@ -7244,7 +7358,7 @@ impl QueueStorage {
         Ok(QueueCounts {
             available,
             running,
-            completed,
+            terminal,
         })
     }
 
@@ -11582,8 +11696,48 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
+        // Flip the trust marker. From this point the read path
+        // (queue_counts_exact) uses the counter directly; before this
+        // call, it falls back to scanning done_entries.
+        sqlx::query(&format!(
+            r#"
+            UPDATE {schema}.queue_ring_state
+            SET terminal_counter_trusted_at = now()
+            WHERE singleton = TRUE
+            "#
+        ))
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
         tx.commit().await.map_err(map_sqlx_error)?;
         Ok(inserted)
+    }
+
+    /// Check whether the live terminal counter has been marked trusted
+    /// for exact reads. Returns `true` for fresh installs (the trust
+    /// marker is auto-set by `prepare_schema` when `done_entries` is
+    /// empty) and after a successful
+    /// [`Self::rebuild_terminal_counters`]; returns `false` on an
+    /// existing install that has not yet been rebuilt under the new
+    /// counter-aware code path.
+    ///
+    /// `queue_counts_exact` consults this to decide between the
+    /// counter-fed fast path and the scan-based fallback. Single-row
+    /// PK fetch; negligible cost per call.
+    pub async fn terminal_counter_trusted(&self, pool: &PgPool) -> Result<bool, AwaError> {
+        let schema = self.schema();
+        let trusted: Option<bool> = sqlx::query_scalar(&format!(
+            "SELECT terminal_counter_trusted_at IS NOT NULL \
+             FROM {schema}.queue_ring_state WHERE singleton = TRUE"
+        ))
+        .fetch_optional(pool)
+        .await
+        .map_err(map_sqlx_error)?;
+        // Missing row = pre-#290 schema that hasn't run the new
+        // prepare_schema yet. Treat as untrusted; the scan path is
+        // still correct.
+        Ok(trusted.unwrap_or(false))
     }
 
     #[tracing::instrument(skip(self, pool), name = "queue_storage.prune_oldest")]
