@@ -63,6 +63,8 @@ pub mod names {
     pub const MAINTENANCE_PROMOTE_BATCHES: &str = "awa.maintenance.promote_batches";
     pub const MAINTENANCE_PROMOTE_BATCH_SIZE: &str = "awa.maintenance.promote_batch_size";
     pub const MAINTENANCE_PROMOTE_DURATION: &str = "awa.maintenance.promote_duration";
+    pub const MAINTENANCE_BRANCH_DURATION: &str = "awa.maintenance.branch.duration";
+    pub const MAINTENANCE_BRANCH_OVERRUN: &str = "awa.maintenance.branch.overrun";
     pub const MAINTENANCE_ROTATE_ATTEMPTS: &str = "awa.maintenance.rotate.attempts";
     pub const MAINTENANCE_ROTATE_SKIPPED_ROWS: &str = "awa.maintenance.rotate.skipped_rows";
     pub const MAINTENANCE_PRUNE_ATTEMPTS: &str = "awa.maintenance.prune.attempts";
@@ -198,6 +200,23 @@ pub struct AwaMetrics {
     pub maintenance_prune_attempts: Counter<u64>,
     /// Magnitude of the reason count when prune returns SkippedActive.
     pub maintenance_prune_skipped_rows: Histogram<u64>,
+    /// Per-branch wall-clock duration for the maintenance leader's main
+    /// `tokio::select!` loop, attributed by `awa.maintenance.branch`. Records
+    /// the time from the moment a select arm fires to the moment its body
+    /// returns — so each sample is the body's contribution to head-of-line
+    /// delay for every other branch on the same loop. Dashboards alert on
+    /// `histogram_quantile(0.99, ...)` per branch to see whether any one
+    /// branch is dominating select-loop time. Issue #242.
+    pub maintenance_branch_duration_seconds: Histogram<f64>,
+    /// Counter of "delayed tick" transitions per maintenance branch. One
+    /// increment is emitted when a branch fires after running longer than
+    /// its own tick interval in the previous iteration — i.e. the timer
+    /// was already overdue at the moment it fired. Emits on transition
+    /// (on-time -> delayed) only, not on every subsequent overrun tick,
+    /// so a sustained slow branch produces one event per "overrun episode"
+    /// rather than one per tick. Fleets alert on this rather than
+    /// scraping the matching `tracing::warn!` line. Issue #242.
+    pub maintenance_branch_overrun_total: Counter<u64>,
     /// Current ring `current_slot` per ring, sampled from each rotate call.
     /// The slot number itself isn't meaningful but the rate of advance is —
     /// dashboards plot `rate(slot_changes)` to see whether rotation is
@@ -456,6 +475,21 @@ impl AwaMetrics {
                 .u64_histogram(names::MAINTENANCE_PRUNE_SKIPPED_ROWS)
                 .with_description("Magnitude of the reason count on a SkippedActive prune")
                 .with_unit("{row}")
+                .build(),
+            maintenance_branch_duration_seconds: meter
+                .f64_histogram(names::MAINTENANCE_BRANCH_DURATION)
+                .with_description(
+                    "Per-branch wall-clock duration of the maintenance leader's tokio::select! arms",
+                )
+                .with_unit("s")
+                .with_boundaries(WAIT_DURATION_BUCKETS_SECONDS.to_vec())
+                .build(),
+            maintenance_branch_overrun_total: meter
+                .u64_counter(names::MAINTENANCE_BRANCH_OVERRUN)
+                .with_description(
+                    "Maintenance branch overrun episodes: a branch fired after its previous run exceeded its tick interval",
+                )
+                .with_unit("{episode}")
                 .build(),
             ring_current_slot: meter
                 .i64_gauge(names::RING_CURRENT_SLOT)
@@ -959,6 +993,31 @@ impl AwaMetrics {
                 }
             }
         }
+    }
+
+    /// Record the wall-clock duration of one maintenance `tokio::select!`
+    /// arm. `branch` is a static name (e.g. `"promote_scheduled"`,
+    /// `"rescue_stale_heartbeats"`) so the attribute set stays bounded.
+    /// Issue #242.
+    pub fn record_maintenance_branch_duration(&self, branch: &'static str, duration: Duration) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.maintenance.branch",
+            branch,
+        )];
+        self.maintenance_branch_duration_seconds
+            .record(duration.as_secs_f64(), &attrs);
+    }
+
+    /// Record one maintenance branch overrun episode — a transition from
+    /// "on-time" to "delayed" for `branch`. Increments
+    /// `awa.maintenance.branch.overrun` (Prometheus:
+    /// `awa_maintenance_branch_overrun_total{branch="<name>"}`). Issue #242.
+    pub fn record_maintenance_branch_overrun(&self, branch: &'static str) {
+        let attrs = [opentelemetry::KeyValue::new(
+            "awa.maintenance.branch",
+            branch,
+        )];
+        self.maintenance_branch_overrun_total.add(1, &attrs);
     }
 
     /// Record a ring prune outcome.
