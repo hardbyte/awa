@@ -211,18 +211,39 @@ async def handle_import(job):
 **Transactional enqueue** — atomic with your business logic:
 
 ```python
-async with await client.transaction() as tx:
-    await tx.execute("INSERT INTO orders (id) VALUES ($1)", order_id)
-    await tx.insert(SendEmail(to="alice@example.com", subject="Order confirmed"))
+from awa.bridge import insert_job
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+async def create_order(session: AsyncSession, order_id: str) -> int:
+    async with session.begin():
+        await session.execute(
+            text("INSERT INTO orders (id) VALUES (:order_id)"),
+            {"order_id": order_id},
+        )
+        job = await insert_job(
+            session,
+            SendEmail(to="alice@example.com", subject="Order confirmed"),
+            queue="email",
+        )
+    return job["id"]
 ```
 
-**Sync API** for Django/Flask — use `awa.Client` for sync frameworks; all methods are plain (no suffix):
+`AsyncClient` is the worker/admin/direct-producer handle. In web handlers,
+keep using SQLAlchemy, asyncpg, psycopg, Django, or your existing database
+stack, and call `awa.bridge.insert_job(...)` inside that transaction.
+
+**Sync API** for synchronous workers/admin code:
 
 ```python
 client = awa.Client("postgres://localhost/mydb")
 client.migrate()
 job = client.insert(SendEmail(to="bob@example.com", subject="Hello"))
 ```
+
+For Django/Flask request transactions, use `awa.bridge.insert_job_sync(...)`
+with the framework's existing connection/session instead of routing app SQL
+through Awa.
 
 **Sequential callbacks** — suspend a handler, wait for an external system, then resume:
 
@@ -293,10 +314,21 @@ let client = Client::builder(pool.clone())
     .build()?;
 client.start().await?;
 
-// Insert a job (with uniqueness)
-awa::insert_with(&pool, &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() },
-    awa::InsertOpts { unique: Some(awa::UniqueOpts { by_args: true, ..Default::default() }), ..Default::default() },
+// Use your application's sqlx transaction for app rows and Awa jobs.
+let mut tx = pool.begin().await?;
+sqlx::query("INSERT INTO orders (id) VALUES ($1)")
+    .bind(order_id)
+    .execute(&mut *tx)
+    .await?;
+awa::insert_with(
+    &mut *tx,
+    &SendEmail { to: "alice@example.com".into(), subject: "Welcome".into() },
+    awa::InsertOpts {
+        unique: Some(awa::UniqueOpts { by_args: true, ..Default::default() }),
+        ..Default::default()
+    },
 ).await?;
+tx.commit().await?;
 
 // Cancel by unique key (e.g., when the triggering condition is resolved)
 awa::admin::cancel_by_unique_key(&pool, "send_email", None, Some(&serde_json::json!({"to": "alice@example.com", "subject": "Welcome"})), None).await?;

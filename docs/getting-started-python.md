@@ -124,8 +124,54 @@ python -m awa --database-url "$DATABASE_URL" serve
 ## Useful Variants
 
 - `await client.migrate()` runs migrations from Python instead of the CLI.
-- `awa.Client` provides a synchronous API for Django or Flask — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`, `client.transaction()`).
+- `awa.Client` provides a synchronous API for worker/admin/direct-producer code — all methods are plain (e.g., `client.insert(...)`, `client.migrate()`).
 - `client.start()` accepts tuple queue configs for hard-reserved mode and dict configs for weighted mode. See [Configuration reference](configuration.md).
+
+## ORM Transaction Bridging
+
+Most applications should keep using their normal database stack for business
+tables. Use `AsyncClient`/`Client` for workers, admin calls, migrations, and
+queue-only producers; when a web request already has a transaction, enqueue
+through `awa.bridge` on that same connection/session.
+
+Install the app database libraries you already use, for example:
+
+```bash
+pip install 'sqlalchemy[asyncio]' asyncpg
+```
+
+Then enqueue in the same SQLAlchemy transaction as your application write:
+
+```python
+from dataclasses import dataclass
+
+from awa.bridge import insert_job
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import AsyncSession
+
+
+@dataclass
+class SendEmail:
+    to: str
+    subject: str
+
+
+async def create_order(session: AsyncSession, order_id: str, email: str) -> int:
+    async with session.begin():
+        await session.execute(
+            text("INSERT INTO orders (id, email) VALUES (:id, :email)"),
+            {"id": order_id, "email": email},
+        )
+        job = await insert_job(
+            session,
+            SendEmail(to=email, subject="Order confirmed"),
+            queue="email",
+        )
+    return job["id"]
+```
+
+The same bridge supports asyncpg, psycopg3, SQLAlchemy, and Django; see
+[Bridge Adapters](bridge-adapters.md) for driver-specific examples.
 
 ### Routing related jobs to the same shard
 

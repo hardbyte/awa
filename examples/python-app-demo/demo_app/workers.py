@@ -6,6 +6,7 @@ from .shared import (
     EMAIL_QUEUE,
     OPS_QUEUE,
     PAYMENTS_QUEUE,
+    create_app_engine,
     create_client,
     ensure_app_schema,
     register_workers,
@@ -15,7 +16,9 @@ from .shared import (
 async def main() -> None:
     client = create_client()
     await client.migrate()
-    await ensure_app_schema(client)
+    db = create_app_engine()
+    await ensure_app_schema(db)
+    await db.dispose()
     register_workers(client)
     await client.start(
         [(EMAIL_QUEUE, 2), (OPS_QUEUE, 1), (PAYMENTS_QUEUE, 1)],
@@ -27,6 +30,7 @@ async def main() -> None:
         await asyncio.Event().wait()
     finally:
         await client.shutdown(timeout_ms=5000)
+        await client.close()
 
 
 if __name__ == "__main__":
