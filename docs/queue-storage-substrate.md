@@ -105,8 +105,12 @@ worker even starts:
 SELECT awa.storage_auto_finalize_if_fresh('awa');
 ```
 
-`storage_auto_finalize_if_fresh` carries a `GRANT EXECUTE ... TO
-PUBLIC`, so it is callable from any role.
+`storage_auto_finalize_if_fresh` has `GRANT EXECUTE ... TO PUBLIC`,
+so the EXECUTE bit is open to any role. The function is
+`SECURITY INVOKER` and reads/writes
+`awa.storage_transition_state`, `awa.jobs`, `awa.runtime_instances`,
+and `awa.runtime_storage_backends`, so callers still need the normal
+runtime/migrator table privileges on those.
 
 ### Upgrade from an existing canonical-only deployment
 
@@ -125,17 +129,32 @@ SELECT awa.storage_prepare('queue_storage', '{"schema":"awa"}'::jsonb);
 SELECT awa.storage_enter_mixed_transition();
 
 -- (3) Wait for workers to drain the canonical backlog onto
---     queue-storage. When `awa.queue_counts_exact` shows no
---     canonical-live work remaining, finalize:
+--     queue-storage. The two SQL gates `storage_finalize` enforces
+--     are observable directly:
+--
+--       SELECT awa.canonical_live_backlog();
+--       -- must return 0 before finalize will advance.
+--
+--       SELECT count(*)
+--       FROM awa.runtime_instances
+--       WHERE storage_capability IN ('canonical', 'canonical_drain_only')
+--         AND last_seen_at + make_interval(
+--               secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+--             ) >= now();
+--       -- must also be 0 (no live canonical or drain-only runtimes).
+--
+--     When both are 0, finalize:
 SELECT awa.storage_finalize();
 ```
 
 `storage_enter_mixed_transition` will reject the call until at least
-one live `queue_storage_target` runtime is heartbeating, and
-`storage_finalize` will reject the call until the canonical backlog
-is drained. Both gates are deliberate — they prevent operators from
-flipping routing onto a substrate that has no executor or onto a
-non-empty canonical backlog.
+one live `queue_storage_target` runtime is heartbeating.
+`storage_finalize` will reject the call while
+`awa.canonical_live_backlog() > 0` or while any canonical /
+canonical-drain-only runtime is still inside its liveness window.
+Both gates are deliberate — they prevent operators from flipping
+routing onto a substrate that has no executor or while canonical
+work or canonical-mode workers are still active.
 
 The orchestration (start new-mode workers, stop old-mode workers,
 wait for drain) is unchanged from the CLI flow — only the invocation

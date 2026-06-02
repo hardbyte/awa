@@ -171,11 +171,22 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
     // `storage_finalize` refuses to advance while canonical live work
     // remains. In a real upgrade the operator waits in mixed_transition
     // for workers to drain; for the test we delete the marker to
-    // simulate that drain.
+    // simulate that drain, then call awa.canonical_live_backlog()
+    // directly to confirm the documented SQL gate is satisfied before
+    // finalize.
     sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = 'sql_only_upgrade'")
         .execute(&pool)
         .await
         .expect("simulate canonical drain");
+
+    let backlog: i64 = sqlx::query_scalar("SELECT awa.canonical_live_backlog()")
+        .fetch_one(&pool)
+        .await
+        .expect("canonical_live_backlog");
+    assert_eq!(
+        backlog, 0,
+        "documented SQL gate must report empty backlog before finalize"
+    );
 
     sqlx::query("SELECT awa.storage_finalize()")
         .execute(&pool)
