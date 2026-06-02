@@ -4113,7 +4113,7 @@ async fn test_queue_storage_prune_skips_live_ready_slot_until_completion() {
         .expect("Failed to sample queue counts after pruning completed slot");
     assert_eq!(counts_after_prune.available, 0);
     assert_eq!(counts_after_prune.running, 0);
-    assert_eq!(counts_after_prune.completed, 1);
+    assert_eq!(counts_after_prune.terminal, 1);
 
     client.shutdown(Duration::from_secs(5)).await;
 }
@@ -4218,7 +4218,7 @@ async fn test_queue_storage_prune_pending_ready_match_is_scoped_by_enqueue_shard
         .expect("Failed to sample queue counts");
     assert_eq!(counts.available, 1);
     assert_eq!(counts.running, 0);
-    assert_eq!(counts.completed, 1);
+    assert_eq!(counts.terminal, 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -4252,7 +4252,7 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
         .queue_counts(&pool, queue)
         .await
         .expect("Failed to read queue counts before backfill");
-    assert_eq!(counts_before_backfill.completed, 7);
+    assert_eq!(counts_before_backfill.terminal, 7);
 
     store
         .prepare_schema(&pool)
@@ -4281,7 +4281,7 @@ async fn test_queue_storage_queue_counts_reads_legacy_lane_rollups_and_backfills
         .queue_counts(&pool, queue)
         .await
         .expect("Failed to read queue counts after backfill");
-    assert_eq!(counts_after_backfill.completed, 7);
+    assert_eq!(counts_after_backfill.terminal, 7);
 }
 
 /// Pin that prepare_schema removes the legacy queue_count_snapshots
@@ -4601,7 +4601,7 @@ async fn test_queue_storage_queue_counts_and_claims_aggregate_across_stripes() {
         .expect("Failed to aggregate queue counts across stripes");
     assert_eq!(counts.available, 8);
     assert_eq!(counts.running, 0);
-    assert_eq!(counts.completed, 0);
+    assert_eq!(counts.terminal, 0);
 
     let claimed = store
         .claim_batch(&pool, queue, 8)
@@ -4660,10 +4660,10 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
         .expect("queue_counts on empty queue");
     assert_eq!(empty_fast.available, 0);
     assert_eq!(empty_fast.running, 0);
-    assert_eq!(empty_fast.completed, 0);
+    assert_eq!(empty_fast.terminal, 0);
     assert_eq!(empty_fast.available, empty_exact.available);
     assert_eq!(empty_fast.running, empty_exact.running);
-    assert_eq!(empty_fast.completed, empty_exact.completed);
+    assert_eq!(empty_fast.terminal, empty_exact.terminal);
 
     // Available rows present: both variants agree.
     store
@@ -4721,9 +4721,9 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
         .queue_counts(&pool, queue)
         .await
         .expect("queue_counts pre-prune");
-    assert_eq!(pre_prune_exact.completed, 5);
+    assert_eq!(pre_prune_exact.terminal, 5);
     assert_eq!(
-        pre_prune_fast.completed, 0,
+        pre_prune_fast.terminal, 0,
         "fast under-counts pre-prune because live done_entries aren't \
          in the rollup yet (documented behaviour)"
     );
@@ -4747,12 +4747,12 @@ async fn test_queue_storage_queue_counts_fast_matches_exact_on_steady_state() {
         .queue_counts(&pool, queue)
         .await
         .expect("queue_counts post-prune");
-    assert_eq!(post_prune_exact.completed, 5);
+    assert_eq!(post_prune_exact.terminal, 5);
     assert_eq!(
-        post_prune_fast.completed, 5,
+        post_prune_fast.terminal, 5,
         "fast must match exact once the segment has rolled up"
     );
-    assert_eq!(post_prune_fast.completed, post_prune_exact.completed);
+    assert_eq!(post_prune_fast.terminal, post_prune_exact.terminal);
 }
 
 /// #290 PR A1 invariant: every terminal-row insert path increments
@@ -6528,7 +6528,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
             .queue_counts(&pool, queue)
             .await
             .expect("Failed to sample queue counts")
-            .completed,
+            .terminal,
         1
     );
 
@@ -6542,7 +6542,7 @@ async fn test_queue_storage_admin_discard_failed_releases_unique_claims_from_don
             .queue_counts(&pool, queue)
             .await
             .expect("Failed to resample queue counts")
-            .completed,
+            .terminal,
         0
     );
 

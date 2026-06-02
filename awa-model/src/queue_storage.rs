@@ -193,7 +193,14 @@ impl ClaimedRuntimeJob {
 pub struct QueueCounts {
     pub available: i64,
     pub running: i64,
-    pub completed: i64,
+    /// Count of rows in *any* terminal state (`completed`, `failed`, or
+    /// `cancelled`) for the queue. The name reflects what the field
+    /// actually counts: it is `count(*) FROM done_entries` semantics, not
+    /// `count(*) WHERE state = 'completed'`. The historical name
+    /// `completed` was a misnomer — `queue_counts_exact` has always
+    /// included failed and cancelled terminals; renamed in #290 along
+    /// with the counter-backed read path.
+    pub terminal: i64,
 }
 
 /// Cheap available-only signal used by the dispatcher's claimer-sizing
@@ -205,7 +212,7 @@ pub struct QueueCounts {
 /// This is intentionally a separate type from [`QueueCounts`]: the
 /// dispatcher claim hot path only consumes the available count, and
 /// returning a `QueueCounts` with two perpetually-zero fields would
-/// invite future code to read `.running` or `.completed` and silently
+/// invite future code to read `.running` or `.terminal` and silently
 /// get wrong answers. Code that legitimately needs the full counts
 /// should call [`QueueStorage::queue_counts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7124,15 +7131,21 @@ impl QueueStorage {
                     ), 0)
                 )::bigint AS running
             ),
+            -- #290: read live terminal counts from the denormalised
+            -- counter instead of scanning `done_entries`. The counter is
+            -- maintained in lockstep with done_entries by the increment/
+            -- decrement sites and folded into queue_terminal_rollups at
+            -- prune time, so this sum + pruned_terminal is the exact
+            -- count of all terminal rows ever recorded for the queue.
             live_terminal AS (
-                SELECT count(*)::bigint AS completed
-                FROM {schema}.done_entries
+                SELECT COALESCE(SUM(live_terminal_count), 0)::bigint AS terminal
+                FROM {schema}.queue_terminal_live_counts
                 WHERE queue = ANY($1)
             )
             SELECT
                 lane_counts.available,
                 live_running.running,
-                pruned_terminal.completed + live_terminal.completed AS completed
+                pruned_terminal.completed + live_terminal.terminal AS terminal
             FROM lane_counts
             CROSS JOIN pruned_terminal
             CROSS JOIN live_running
@@ -7144,11 +7157,11 @@ impl QueueStorage {
         .await
         .map_err(map_sqlx_error)?;
 
-        let (available, running, completed) = row;
+        let (available, running, terminal) = row;
         Ok(QueueCounts {
             available,
             running,
-            completed,
+            terminal,
         })
     }
 
@@ -7177,12 +7190,15 @@ impl QueueStorage {
     ///   that anti-join is what this fast variant exists to avoid).
     ///   `waiting_external` is *not* included — it's reported as part
     ///   of admin's parked-callback view, not running.
-    /// - **completed** is read from the persisted
+    /// - **terminal** is read from the persisted
     ///   `queue_terminal_rollups.pruned_completed_count` denormaliser.
     ///   Rows currently in `done_entries` that have not yet rolled up
     ///   are not included. Strictly a lower bound; converges to the
     ///   exact count when rotation prunes the live `done_entries`
-    ///   segment.
+    ///   segment. (The name `terminal` is honest — this number counts
+    ///   `completed`, `failed`, and `cancelled` rows in done_entries,
+    ///   the same semantics as [`Self::queue_counts_exact`]; renamed
+    ///   from `completed` in #290.)
     ///
     /// All three counters are O(num shards) lookups against small head
     /// tables and `leases` index probes. Use this for high-cadence
@@ -7216,9 +7232,9 @@ impl QueueStorage {
         .fetch_one(pool)
         .await
         .map_err(map_sqlx_error)?;
-        // completed: denormalised rollup only. Live (un-rolled-up)
+        // terminal: denormalised rollup only. Live (un-rolled-up)
         // done_entries rows are excluded — see method-level docs.
-        let completed: i64 = sqlx::query_scalar(&format!(
+        let terminal: i64 = sqlx::query_scalar(&format!(
             r#"
             SELECT COALESCE(sum(GREATEST(
                 COALESCE(lanes.pruned_completed_count, 0),
@@ -7244,7 +7260,7 @@ impl QueueStorage {
         Ok(QueueCounts {
             available,
             running,
-            completed,
+            terminal,
         })
     }
 

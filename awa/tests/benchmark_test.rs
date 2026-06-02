@@ -805,7 +805,7 @@ async fn test_throughput_rust_workers_queue_storage() {
                 .expect("Failed to sample queue storage queue counts");
             panic!(
                 "Vacuum-aware timeout after 30s: completed={}/{} available={} running={}",
-                counts.completed, total_jobs, counts.available, counts.running
+                counts.terminal, total_jobs, counts.available, counts.running
             );
         }
 
@@ -815,7 +815,7 @@ async fn test_throughput_rust_workers_queue_storage() {
             .await
             .expect("Failed to sample queue storage queue counts");
 
-        if counts.completed == total_jobs {
+        if counts.terminal == total_jobs {
             let processing_elapsed = processing_start.elapsed();
             let throughput = total_jobs as f64 / processing_elapsed.as_secs_f64();
             let end_to_end_elapsed = benchmark_start.elapsed();
@@ -951,17 +951,17 @@ async fn test_throughput_rust_workers_queue_storage() {
             return;
         }
 
-        if counts.completed == last_completed {
+        if counts.terminal == last_completed {
             stall_checks += 1;
             if stall_checks > 50 {
                 panic!(
                     "Vacuum-aware processing stalled at {}/{} completed jobs",
-                    counts.completed, total_jobs
+                    counts.terminal, total_jobs
                 );
             }
         } else {
             stall_checks = 0;
-            last_completed = counts.completed;
+            last_completed = counts.terminal;
         }
     }
 }
@@ -1117,12 +1117,12 @@ async fn test_queue_storage_runtime_offered_rate() {
             .queue_counts(&pool, queue)
             .await
             .expect("Failed to sample queue storage offered-rate counts");
-        let completed_delta = counts.completed.saturating_sub(previous_completed);
-        previous_completed = counts.completed;
+        let completed_delta = counts.terminal.saturating_sub(previous_completed);
+        previous_completed = counts.terminal;
         println!(
             "[bench-va-offered] second={second:>2} seeded={} completed={} (+{}) available={} running={}",
             seeded.load(Ordering::Relaxed),
-            counts.completed,
+            counts.terminal,
             completed_delta,
             counts.available,
             counts.running,
@@ -1130,7 +1130,7 @@ async fn test_queue_storage_runtime_offered_rate() {
         samples.push(OfferedRateSample {
             second,
             seeded: seeded.load(Ordering::Relaxed),
-            completed: counts.completed,
+            completed: counts.terminal,
             completed_delta,
             available: counts.available,
             running: counts.running,
@@ -1149,7 +1149,7 @@ async fn test_queue_storage_runtime_offered_rate() {
             .queue_counts(&pool, queue)
             .await
             .expect("Failed to sample final offered-rate counts");
-        if counts.completed >= seeded_total
+        if counts.terminal >= seeded_total
             || drain_start.elapsed() >= Duration::from_secs(drain_timeout_secs)
         {
             break counts;
@@ -1170,13 +1170,13 @@ async fn test_queue_storage_runtime_offered_rate() {
         actual_enqueue_per_s,
         completed_per_s,
         seeded_total,
-        final_counts.completed,
+        final_counts.terminal,
         final_backlog,
         elapsed.as_secs_f64(),
     );
 
     let mut outcomes = HashMap::new();
-    outcomes.insert("completed".to_string(), final_counts.completed as u64);
+    outcomes.insert("completed".to_string(), final_counts.terminal as u64);
     outcomes.insert("available".to_string(), final_counts.available as u64);
     outcomes.insert("running".to_string(), final_counts.running as u64);
 
@@ -1203,7 +1203,7 @@ async fn test_queue_storage_runtime_offered_rate() {
     });
     if let Some(start) = db_profile_start.as_ref() {
         if let Some(db_profile) = capture_db_profile_delta(&pool, start).await {
-            let completed = final_counts.completed.max(1);
+            let completed = final_counts.terminal.max(1);
             if let Some(wal_bytes) = db_profile
                 .get("wal_bytes")
                 .and_then(serde_json::Value::as_i64)

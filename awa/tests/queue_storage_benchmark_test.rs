@@ -350,7 +350,7 @@ async fn sample_snapshot(
     QueueStorageSnapshot {
         available: counts.available,
         running: counts.running,
-        completed: counts.completed,
+        completed: counts.terminal,
         queue_lanes_dead_tup,
         ready_dead_tup,
         done_dead_tup,
@@ -759,7 +759,7 @@ async fn test_queue_storage_round_trip_smoke() {
         .expect("Failed to sample smoke counts");
     assert_eq!(counts.available, 6);
     assert_eq!(counts.running, 4);
-    assert_eq!(counts.completed, 0);
+    assert_eq!(counts.terminal, 0);
 
     let completed = store
         .complete_batch(&pool, &claimed)
@@ -809,7 +809,7 @@ async fn test_queue_storage_round_trip_smoke() {
         .expect("Failed to sample final smoke counts");
     assert_eq!(final_counts.available, 0);
     assert_eq!(final_counts.running, 0);
-    assert_eq!(final_counts.completed, 10);
+    assert_eq!(final_counts.terminal, 10);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 6)]
