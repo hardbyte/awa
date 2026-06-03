@@ -9611,26 +9611,45 @@ impl QueueStorage {
         let cutoff = Utc::now()
             - TimeDelta::from_std(staleness)
                 .map_err(|err| AwaError::Validation(format!("invalid staleness: {err}")))?;
-        // #169 B1: in receipts mode `leases.heartbeat_at` is never
-        // written (attempt_state owns heartbeat_at), so the leases-side
-        // `WHERE state='running' AND heartbeat_at < cutoff` scan would
-        // always be a no-op — but it would still walk the table /
-        // index. Skip it explicitly; the receipts-side rescue path
-        // below picks up stale claims via `attempt_state`.
-        let deleted: Vec<DeletedLeaseRow> = if self.lease_claim_receipts() {
-            Vec::new()
-        } else {
-            sqlx::query_as(&format!(
-                r#"
-            DELETE FROM {schema}.leases
-            WHERE job_id IN (
-                SELECT job_id
-                FROM {schema}.leases
-                WHERE state = 'running'
-                  AND heartbeat_at < $1
-                ORDER BY heartbeat_at ASC
+        // #169 B1: the staleness predicate prefers
+        // `attempt_state.heartbeat_at` (receipts-mode source of truth,
+        // where heartbeat_batch writes go) and falls back to
+        // `leases.heartbeat_at` (legacy non-receipts source). Two
+        // cases this covers:
+        //
+        //   * Receipts mode, claim materialized into `leases` via
+        //     callback registration / progress upsert / equivalent.
+        //     The leases row was written once at materialize time and
+        //     its `heartbeat_at` is stale by definition. The fresh
+        //     value lives on `attempt_state.heartbeat_at`. COALESCE
+        //     picks `attempt` so a healthy worker isn't falsely
+        //     rescued — and a dead worker IS rescued, which the
+        //     receipt-side path can't do (its anti-join below
+        //     excludes materialized leases to avoid double-closure).
+        //   * Legacy non-receipts mode: attempt_state.heartbeat_at is
+        //     never written; COALESCE falls back to
+        //     leases.heartbeat_at — same shape as pre-B1.
+        //
+        // The dropped `idx_state_hb` (v025) doesn't hurt this scan:
+        // the planner can satisfy the `state='running'` prefix via the
+        // surviving `(state, deadline_at)` or
+        // `(state, callback_timeout_at)` indexes, followed by a heap
+        // recheck of the COALESCE. Bounded by running-lease count and
+        // called at 30s cadence — cheap.
+        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
+            r#"
+            DELETE FROM {schema}.leases AS target
+            WHERE (target.job_id, target.run_lease) IN (
+                SELECT lease.job_id, lease.run_lease
+                FROM {schema}.leases AS lease
+                LEFT JOIN {schema}.attempt_state AS attempt
+                  ON attempt.job_id = lease.job_id
+                 AND attempt.run_lease = lease.run_lease
+                WHERE lease.state = 'running'
+                  AND COALESCE(attempt.heartbeat_at, lease.heartbeat_at) < $1
+                ORDER BY COALESCE(attempt.heartbeat_at, lease.heartbeat_at) ASC
                 LIMIT 500
-                FOR UPDATE SKIP LOCKED
+                FOR UPDATE OF lease SKIP LOCKED
             )
             RETURNING
                 ready_slot,
@@ -9650,12 +9669,11 @@ impl QueueStorage {
                 callback_id,
                 callback_timeout_at
             "#
-            ))
-            .bind(cutoff)
-            .fetch_all(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?
-        };
+        ))
+        .bind(cutoff)
+        .fetch_all(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
 
         let rescued_receipts = if self.lease_claim_receipts() {
             self.rescue_stale_receipt_claims_tx(&mut tx, cutoff).await?
