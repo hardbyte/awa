@@ -94,14 +94,20 @@ async fn lease_claims_partitions_carry_fillfactor_50() {
     }
 }
 
-/// Custom schemas register themselves in `awa.runtime_storage_backends`
-/// when activated. v024's DO block iterates that table and applies the
-/// fillfactor to every registered schema. This test stamps a fake
-/// registration row, calls `awa.apply_receipt_plane_fillfactor` (the
-/// v024 helper, which is also what operators run for ad-hoc custom
-/// schemas), and asserts the partitions land at fillfactor=50.
+/// Simulates the "upgraded DB, post-v024, operator prepares a new
+/// custom schema" scenario: the install function still cached in
+/// pg_proc may have the pre-v024 body that leaves partitions at the
+/// default fillfactor=100. v024 introduces
+/// `awa.apply_receipt_plane_fillfactor` precisely to close that gap.
+///
+/// To prove the helper is actually what restores the reloptions (and
+/// the test isn't passing vacuously because the install body in *this*
+/// checkout already sets them), we install the substrate, RESET all
+/// the partition reloptions back to the default to simulate the
+/// pre-v024 helper body, then call the helper and assert the settings
+/// come back.
 #[tokio::test]
-async fn apply_receipt_plane_fillfactor_helper_covers_custom_schemas() {
+async fn apply_receipt_plane_fillfactor_helper_restores_reset_partitions() {
     let pool = migrated_pool().await;
     let schema = format!("awa_fillfactor_test_{}", uuid::Uuid::new_v4().simple());
 
@@ -114,16 +120,74 @@ async fn apply_receipt_plane_fillfactor_helper_covers_custom_schemas() {
         .await
         .expect("create test schema");
 
-    // The install function in pg_proc on an existing DB still has the
-    // pre-v024 body (no in-loop fillfactor ALTER), so a fresh
-    // `install_queue_storage_substrate` call leaves partitions at the
-    // default fillfactor=100. v024's apply_... helper is what closes
-    // that gap.
     sqlx::query("SELECT awa.install_queue_storage_substrate($1)")
         .bind(&schema)
         .execute(&pool)
         .await
         .expect("install substrate via helper");
+
+    // Simulate the pre-v024 install body: strip every reloption the
+    // v024 helper is meant to restore. We discover the partitions via
+    // pg_inherits so the simulation works against any slot count.
+    let partition_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT (n.nspname || '.' || c.relname)::text
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_inherits AS inh ON inh.inhrelid = c.oid
+        WHERE n.nspname = $1
+          AND (inh.inhparent = ($1 || '.leases')::regclass
+            OR inh.inhparent = ($1 || '.lease_claims')::regclass)
+          AND c.relkind = 'r'
+        "#,
+    )
+    .bind(&schema)
+    .fetch_all(&pool)
+    .await
+    .expect("list custom-schema partitions");
+    assert!(
+        !partition_names.is_empty(),
+        "expected at least one partition under {schema}"
+    );
+    for name in &partition_names {
+        sqlx::query(&format!(
+            "ALTER TABLE {name} RESET ( \
+             fillfactor, \
+             autovacuum_vacuum_scale_factor, \
+             autovacuum_vacuum_threshold, \
+             autovacuum_vacuum_cost_limit, \
+             autovacuum_vacuum_cost_delay)"
+        ))
+        .execute(&pool)
+        .await
+        .expect("reset partition reloptions");
+    }
+
+    // Confirm the RESET actually stripped the reloptions — otherwise
+    // the subsequent helper call would pass vacuously.
+    let post_reset_with_fillfactor: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*) FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_inherits AS inh ON inh.inhrelid = c.oid
+        WHERE n.nspname = $1
+          AND (inh.inhparent = ($1 || '.leases')::regclass
+            OR inh.inhparent = ($1 || '.lease_claims')::regclass)
+          AND c.relkind = 'r'
+          AND c.reloptions IS NOT NULL
+          AND 'fillfactor=50' = ANY(c.reloptions)
+        "#,
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .expect("count partitions still carrying fillfactor=50");
+    assert_eq!(
+        post_reset_with_fillfactor, 0,
+        "RESET should have cleared fillfactor on all partitions before \
+         the helper call so the assertion below proves the helper works"
+    );
+
     sqlx::query("SELECT awa.apply_receipt_plane_fillfactor($1)")
         .bind(&schema)
         .execute(&pool)
@@ -156,7 +220,75 @@ async fn apply_receipt_plane_fillfactor_helper_covers_custom_schemas() {
         let opts = opts.clone().unwrap_or_default();
         assert!(
             has_option(&opts, "fillfactor", "50"),
-            "{schema}.{name} reloptions missing fillfactor=50: {opts:?}"
+            "{schema}.{name} reloptions missing fillfactor=50 after helper call: {opts:?}"
+        );
+    }
+
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("cleanup test schema");
+}
+
+/// `QueueStorage::prepare_schema` should call
+/// `apply_receipt_plane_fillfactor` automatically so a worker boot or
+/// CLI `prepare-queue-storage-schema` against a new custom schema gets
+/// the fillfactor set even when the install helper still cached in
+/// pg_proc has the pre-v024 body. Mirrors the same RESET-simulate-old-
+/// helper pattern as the test above, but exercises the Rust orchestrator
+/// instead of the SQL helper directly.
+#[tokio::test]
+async fn prepare_schema_applies_receipt_plane_fillfactor() {
+    use awa_model::{QueueStorage, QueueStorageConfig};
+
+    let pool = migrated_pool().await;
+    let schema = format!("awa_prepare_test_{}", uuid::Uuid::new_v4().simple());
+    let store = QueueStorage::new(QueueStorageConfig {
+        schema: schema.clone(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        ..Default::default()
+    })
+    .expect("construct QueueStorage");
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("clean any prior schema");
+
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("prepare_schema should succeed against fresh schema");
+
+    let partitions: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
+        r#"
+        SELECT c.relname, c.reloptions::text[]
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_inherits AS inh ON inh.inhrelid = c.oid
+        WHERE n.nspname = $1
+          AND (inh.inhparent = ($1 || '.leases')::regclass
+            OR inh.inhparent = ($1 || '.lease_claims')::regclass)
+          AND c.relkind = 'r'
+        ORDER BY c.relname
+        "#,
+    )
+    .bind(&schema)
+    .fetch_all(&pool)
+    .await
+    .expect("read partition reloptions");
+
+    assert!(
+        !partitions.is_empty(),
+        "expected leases and lease_claims partitions in {schema}"
+    );
+    for (name, opts) in &partitions {
+        let opts = opts.clone().unwrap_or_default();
+        assert!(
+            has_option(&opts, "fillfactor", "50"),
+            "{schema}.{name} reloptions missing fillfactor=50 after prepare_schema: {opts:?}"
         );
     }
 

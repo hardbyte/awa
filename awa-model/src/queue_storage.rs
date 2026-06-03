@@ -2271,6 +2271,19 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
+            // #169: apply receipt-plane fillfactor tunings. On databases
+            // upgraded across v024, the install helper still in pg_proc
+            // may have the pre-v024 body that doesn't set fillfactor on
+            // leases / lease_claims partitions; this delegated call
+            // closes the gap regardless. Tunings live in their own SQL
+            // function (see v024) so future perf knobs land additively
+            // without touching the bigger install helper.
+            sqlx::query("SELECT awa.apply_receipt_plane_fillfactor($1)")
+                .bind(schema)
+                .execute(install_tx.as_mut())
+                .await
+                .map_err(map_sqlx_error)?;
+
             // Post-helper legacy fixups: copy any renamed-aside rows into the
             // newly partitioned parents created by the helper, then drop the
             // legacy table. ON CONFLICT DO NOTHING so a re-run after a

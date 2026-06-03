@@ -32,12 +32,21 @@
 -- non-blocking and fast even on populated tables.
 --
 -- Covers the default `awa` schema and any custom queue-storage schemas
--- currently registered in `awa.runtime_storage_backends`. A custom
--- schema prepared *after* this migration runs on an existing
--- deployment will get fillfactor=100 from the install helper still
--- cached in pg_proc — the operator workaround is `SELECT
--- awa.apply_receipt_plane_fillfactor('<schema>')` after their
--- `awa storage prepare-queue-storage-schema` call.
+-- whose substrate physically exists in the database. The discovery
+-- query scans pg_class for any schema with both a partitioned `leases`
+-- and `lease_claims` parent — broader than the registration tables
+-- (`runtime_storage_backends` only lists the active backend;
+-- `storage_transition_state.details` only lists the prepared schema
+-- during an in-flight transition), so it picks up custom schemas that
+-- were materialized but never activated.
+--
+-- Rust `QueueStorage::prepare_schema()` also calls
+-- `apply_receipt_plane_fillfactor` after `install_queue_storage_substrate`,
+-- so any schema prepared after this migration (via the CLI or worker
+-- boot path) lands at fillfactor=50 even if the install helper still
+-- cached in pg_proc has the pre-v024 body. External tooling that
+-- bypasses prepare_schema and calls the install helper directly should
+-- also call `apply_receipt_plane_fillfactor` against the same schema.
 
 CREATE OR REPLACE FUNCTION awa.apply_receipt_plane_fillfactor(p_schema TEXT)
 RETURNS VOID
@@ -83,15 +92,28 @@ DO $$
 DECLARE
     v_schema TEXT;
 BEGIN
-    -- Default schema.
-    PERFORM awa.apply_receipt_plane_fillfactor('awa');
-
-    -- Any custom queue-storage schemas registered as active or prepared.
+    -- Discover every schema that has the queue-storage substrate by
+    -- scanning pg_class for a partitioned `leases` table. This is
+    -- broader than reading `awa.runtime_storage_backends` (which only
+    -- carries the active backend's schema) or
+    -- `awa.storage_transition_state.details->>'schema'` (which only
+    -- carries the prepared schema during an in-flight transition):
+    -- both miss custom schemas that were materialized via
+    -- prepare_schema but never activated. pg_class is the authoritative
+    -- source for "this substrate physically exists."
     FOR v_schema IN
-        SELECT DISTINCT schema_name
-        FROM awa.runtime_storage_backends
-        WHERE schema_name IS NOT NULL
-          AND schema_name <> 'awa'
+        SELECT n.nspname
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        WHERE c.relname = 'leases'
+          AND c.relkind = 'p'  -- partitioned table
+          AND EXISTS (
+              SELECT 1 FROM pg_class AS lc
+              JOIN pg_namespace AS ln ON ln.oid = lc.relnamespace
+              WHERE ln.nspname = n.nspname
+                AND lc.relname = 'lease_claims'
+                AND lc.relkind = 'p'
+          )
     LOOP
         PERFORM awa.apply_receipt_plane_fillfactor(v_schema);
     END LOOP;
