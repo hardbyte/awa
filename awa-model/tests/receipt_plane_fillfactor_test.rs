@@ -230,15 +230,28 @@ async fn apply_receipt_plane_fillfactor_helper_restores_reset_partitions() {
         .expect("cleanup test schema");
 }
 
-/// `QueueStorage::prepare_schema` should call
-/// `apply_receipt_plane_fillfactor` automatically so a worker boot or
-/// CLI `prepare-queue-storage-schema` against a new custom schema gets
-/// the fillfactor set even when the install helper still cached in
-/// pg_proc has the pre-v024 body. Mirrors the same RESET-simulate-old-
-/// helper pattern as the test above, but exercises the Rust orchestrator
-/// instead of the SQL helper directly.
+/// Prove that `QueueStorage::prepare_schema`'s call to
+/// `apply_receipt_plane_fillfactor` is what restores tunings on a
+/// re-prepare against an already-installed substrate. This is the
+/// scenario that matters on the upgrade path: the install helper
+/// cached in pg_proc may be the pre-v024 body that doesn't set
+/// fillfactor in its CREATE TABLE loops, but
+/// `install_queue_storage_substrate` is idempotent — on a re-prepare
+/// it skips the CREATE TABLE IF NOT EXISTS branch entirely. So even
+/// if the helper *did* carry the in-loop ALTERs (as on a fresh
+/// install in this checkout), they wouldn't re-fire on re-prepare.
+/// What does fire is the orchestrator's explicit
+/// `apply_receipt_plane_fillfactor` call after install.
+///
+/// Sequence:
+///   1. `prepare_schema` (creates substrate, leaves at fillfactor=50).
+///   2. RESET reloptions on every partition to simulate the
+///      pre-v024 state.
+///   3. `prepare_schema` again. If the orchestrator hook is removed,
+///      this becomes a no-op and the partitions stay reset.
+///   4. Assert fillfactor=50 is back.
 #[tokio::test]
-async fn prepare_schema_applies_receipt_plane_fillfactor() {
+async fn prepare_schema_reapplies_receipt_plane_fillfactor_on_reprepare() {
     use awa_model::{QueueStorage, QueueStorageConfig};
 
     let pool = migrated_pool().await;
@@ -260,7 +273,76 @@ async fn prepare_schema_applies_receipt_plane_fillfactor() {
     store
         .prepare_schema(&pool)
         .await
-        .expect("prepare_schema should succeed against fresh schema");
+        .expect("first prepare_schema should succeed");
+
+    // Simulate the pre-v024 state: strip every reloption the v024 hook
+    // is meant to restore. Discover partitions via pg_inherits so the
+    // simulation works regardless of slot count.
+    let partition_names: Vec<String> = sqlx::query_scalar(
+        r#"
+        SELECT (n.nspname || '.' || c.relname)::text
+        FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_inherits AS inh ON inh.inhrelid = c.oid
+        WHERE n.nspname = $1
+          AND (inh.inhparent = ($1 || '.leases')::regclass
+            OR inh.inhparent = ($1 || '.lease_claims')::regclass)
+          AND c.relkind = 'r'
+        "#,
+    )
+    .bind(&schema)
+    .fetch_all(&pool)
+    .await
+    .expect("list partitions");
+    assert!(!partition_names.is_empty(), "expected partitions");
+    for name in &partition_names {
+        sqlx::query(&format!(
+            "ALTER TABLE {name} RESET ( \
+             fillfactor, \
+             autovacuum_vacuum_scale_factor, \
+             autovacuum_vacuum_threshold, \
+             autovacuum_vacuum_cost_limit, \
+             autovacuum_vacuum_cost_delay)"
+        ))
+        .execute(&pool)
+        .await
+        .expect("reset partition reloptions");
+    }
+
+    // Sanity-check the reset took effect — without this the final
+    // assertion could pass vacuously if the RESET didn't actually clear
+    // anything.
+    let after_reset_with_fillfactor: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*) FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_inherits AS inh ON inh.inhrelid = c.oid
+        WHERE n.nspname = $1
+          AND (inh.inhparent = ($1 || '.leases')::regclass
+            OR inh.inhparent = ($1 || '.lease_claims')::regclass)
+          AND c.relkind = 'r'
+          AND c.reloptions IS NOT NULL
+          AND 'fillfactor=50' = ANY(c.reloptions)
+        "#,
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .expect("count partitions still carrying fillfactor=50");
+    assert_eq!(
+        after_reset_with_fillfactor, 0,
+        "RESET must have cleared fillfactor=50 on every partition; \
+         otherwise the orchestrator's contribution can't be observed"
+    );
+
+    // Re-prepare. install_queue_storage_substrate is idempotent and the
+    // CREATE TABLE IF NOT EXISTS branches don't re-fire on existing
+    // partitions, so only the orchestrator's explicit
+    // apply_receipt_plane_fillfactor call can restore the reloptions.
+    store
+        .prepare_schema(&pool)
+        .await
+        .expect("second prepare_schema should succeed");
 
     let partitions: Vec<(String, Option<Vec<String>>)> = sqlx::query_as(
         r#"
@@ -278,17 +360,13 @@ async fn prepare_schema_applies_receipt_plane_fillfactor() {
     .bind(&schema)
     .fetch_all(&pool)
     .await
-    .expect("read partition reloptions");
+    .expect("read partition reloptions after re-prepare");
 
-    assert!(
-        !partitions.is_empty(),
-        "expected leases and lease_claims partitions in {schema}"
-    );
     for (name, opts) in &partitions {
         let opts = opts.clone().unwrap_or_default();
         assert!(
             has_option(&opts, "fillfactor", "50"),
-            "{schema}.{name} reloptions missing fillfactor=50 after prepare_schema: {opts:?}"
+            "{schema}.{name} reloptions missing fillfactor=50 after re-prepare: {opts:?}"
         );
     }
 
@@ -296,6 +374,91 @@ async fn prepare_schema_applies_receipt_plane_fillfactor() {
         .execute(&pool)
         .await
         .expect("cleanup test schema");
+}
+
+/// Ownership boundary: `apply_receipt_plane_fillfactor` and the v024
+/// migration sweep must NOT alter unrelated app-owned schemas that
+/// happen to have a partitioned `leases` / `lease_claims` pair.
+/// Gating on the AWA-specific `claim_ready_runtime` function signature
+/// is what keeps the sweep inside AWA's namespace. This test creates
+/// a lookalike schema, calls the helper, and asserts the lookalike
+/// partitions stay at the default reloptions.
+#[tokio::test]
+async fn apply_receipt_plane_fillfactor_skips_non_awa_schemas() {
+    let pool = migrated_pool().await;
+    let schema = format!("app_owned_test_{}", uuid::Uuid::new_v4().simple());
+
+    sqlx::query(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("clean any prior schema");
+    sqlx::query(&format!("CREATE SCHEMA {schema}"))
+        .execute(&pool)
+        .await
+        .expect("create app-owned schema");
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.leases ( \
+         lease_slot INT NOT NULL, id BIGINT NOT NULL, \
+         PRIMARY KEY (lease_slot, id) \
+         ) PARTITION BY LIST (lease_slot)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create lookalike leases parent");
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.leases_0 PARTITION OF {schema}.leases FOR VALUES IN (0)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create lookalike leases partition");
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.lease_claims ( \
+         claim_slot INT NOT NULL, id BIGINT NOT NULL, \
+         PRIMARY KEY (claim_slot, id) \
+         ) PARTITION BY LIST (claim_slot)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create lookalike lease_claims parent");
+    sqlx::query(&format!(
+        "CREATE TABLE {schema}.lease_claims_0 PARTITION OF {schema}.lease_claims FOR VALUES IN (0)"
+    ))
+    .execute(&pool)
+    .await
+    .expect("create lookalike lease_claims partition");
+
+    // The helper sees no claim_ready_runtime function in this schema,
+    // so it should return without altering anything.
+    sqlx::query("SELECT awa.apply_receipt_plane_fillfactor($1)")
+        .bind(&schema)
+        .execute(&pool)
+        .await
+        .expect("apply_receipt_plane_fillfactor on unrelated schema");
+
+    let altered: i64 = sqlx::query_scalar(
+        r#"
+        SELECT count(*) FROM pg_class AS c
+        JOIN pg_namespace AS n ON n.oid = c.relnamespace
+        JOIN pg_inherits AS inh ON inh.inhrelid = c.oid
+        WHERE n.nspname = $1
+          AND c.relkind = 'r'
+          AND c.reloptions IS NOT NULL
+        "#,
+    )
+    .bind(&schema)
+    .fetch_one(&pool)
+    .await
+    .expect("count altered partitions in lookalike schema");
+    assert_eq!(
+        altered, 0,
+        "apply_receipt_plane_fillfactor must not touch partitions in a \
+         schema that lacks the AWA claim_ready_runtime sentinel"
+    );
+
+    sqlx::query(&format!("DROP SCHEMA {schema} CASCADE"))
+        .execute(&pool)
+        .await
+        .expect("cleanup lookalike schema");
 }
 
 /// `ready_entries`, `done_entries`, and `lease_claim_closures` are

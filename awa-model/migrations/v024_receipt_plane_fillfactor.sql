@@ -57,11 +57,30 @@ DECLARE
     v_partition_relid OID;
     v_leases_oid      OID;
     v_claims_oid      OID;
+    v_is_awa_substrate BOOLEAN;
 BEGIN
     v_leases_oid := to_regclass(format('%I.leases', p_schema));
     v_claims_oid := to_regclass(format('%I.lease_claims', p_schema));
 
     IF v_leases_oid IS NULL OR v_claims_oid IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- Ownership boundary: only touch AWA-owned substrates. Schemas
+    -- that happen to share the `leases` / `lease_claims` table names
+    -- but were not installed by `awa.install_queue_storage_substrate`
+    -- (e.g. unrelated application tables) must be left alone. The
+    -- gating sentinel is the AWA-specific `claim_ready_runtime`
+    -- function with its full signature — the same shape
+    -- `awa_model::storage::queue_storage_schema_ready` uses to
+    -- identify an AWA substrate. The install helper creates that
+    -- function in every substrate; no other code path does.
+    v_is_awa_substrate := to_regprocedure(format(
+        '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+        p_schema
+    )) IS NOT NULL;
+
+    IF NOT v_is_awa_substrate THEN
         RETURN;
     END IF;
 
@@ -92,29 +111,29 @@ DO $$
 DECLARE
     v_schema TEXT;
 BEGIN
-    -- Discover every schema that has the queue-storage substrate by
-    -- scanning pg_class for a partitioned `leases` table. This is
-    -- broader than reading `awa.runtime_storage_backends` (which only
-    -- carries the active backend's schema) or
-    -- `awa.storage_transition_state.details->>'schema'` (which only
-    -- carries the prepared schema during an in-flight transition):
-    -- both miss custom schemas that were materialized via
-    -- prepare_schema but never activated. pg_class is the authoritative
-    -- source for "this substrate physically exists."
+    -- Discover every schema that holds an AWA queue-storage substrate.
+    -- Matching just "has a partitioned `leases` table" would step on
+    -- unrelated app-owned schemas that happen to share the name, so
+    -- the gating sentinel is `awa.claim_ready_runtime` with the
+    -- AWA-specific signature — the same shape
+    -- `awa_model::storage::queue_storage_schema_ready` uses to identify
+    -- an AWA substrate. The install helper creates that function in
+    -- every substrate; no other code path does. This is broader than
+    -- reading `awa.runtime_storage_backends` (active backend only) or
+    -- `awa.storage_transition_state.details->>'schema'` (prepared
+    -- schema only during an in-flight transition), but stays inside
+    -- AWA's ownership boundary.
     FOR v_schema IN
         SELECT n.nspname
-        FROM pg_class AS c
-        JOIN pg_namespace AS n ON n.oid = c.relnamespace
-        WHERE c.relname = 'leases'
-          AND c.relkind = 'p'  -- partitioned table
-          AND EXISTS (
-              SELECT 1 FROM pg_class AS lc
-              JOIN pg_namespace AS ln ON ln.oid = lc.relnamespace
-              WHERE ln.nspname = n.nspname
-                AND lc.relname = 'lease_claims'
-                AND lc.relkind = 'p'
-          )
+        FROM pg_namespace AS n
+        WHERE to_regprocedure(format(
+            '%I.claim_ready_runtime(text,bigint,double precision,double precision)',
+            n.nspname
+        )) IS NOT NULL
     LOOP
+        -- The helper itself re-checks the sentinel and verifies the
+        -- partitioned `leases` / `lease_claims` exist before doing
+        -- anything, so this loop is safe to be liberal.
         PERFORM awa.apply_receipt_plane_fillfactor(v_schema);
     END LOOP;
 END
