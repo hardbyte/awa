@@ -2271,13 +2271,16 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
 
-            // #169: apply receipt-plane fillfactor tunings. On databases
-            // upgraded across v024, the install helper still in pg_proc
-            // may have the pre-v024 body that doesn't set fillfactor on
-            // leases / lease_claims partitions; this delegated call
-            // closes the gap regardless. Tunings live in their own SQL
-            // function (see v024) so future perf knobs land additively
-            // without touching the bigger install helper.
+            // #169: apply receipt-plane fillfactor tunings. The install
+            // helper above creates structure only; tunings live in
+            // their own SQL function (see v024) and the orchestrator
+            // here is the canonical place that composes them. This
+            // means future perf knobs land additively in
+            // `apply_receipt_plane_fillfactor` (or a sibling helper)
+            // without touching the bigger install helper, and every
+            // path that creates substrate — Rust prepare_schema, fresh
+            // `awa migrate` (via v024's sweep), explicit operator call
+            // against a custom schema — composes the same two pieces.
             sqlx::query("SELECT awa.apply_receipt_plane_fillfactor($1)")
                 .bind(schema)
                 .execute(install_tx.as_mut())

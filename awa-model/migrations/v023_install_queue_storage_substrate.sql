@@ -520,24 +520,6 @@ BEGIN
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.lease_claims FOR VALUES IN (%s)',
             p_schema, format('lease_claims_%s', v_slot), p_schema, v_slot
         );
-
-        -- #169: lease_claims gets `SET materialized_at = clock_timestamp()`
-        -- on every receipt materialize. The stale index keys on
-        -- materialized_at, so each UPDATE is non-HOT — leaving fillfactor
-        -- at the default 100 means every UPDATE spills to a fresh page.
-        -- Match the d21e5db / ab99a31 pattern on the other Warm tables.
-        EXECUTE format(
-            $alter$
-            ALTER TABLE %I.%I SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            $alter$,
-            p_schema, format('lease_claims_%s', v_slot)
-        );
     END LOOP;
 
     EXECUTE format(
@@ -905,29 +887,6 @@ BEGIN
         EXECUTE format(
             'CREATE TABLE IF NOT EXISTS %I.%I PARTITION OF %I.leases FOR VALUES IN (%s)',
             p_schema, format('leases_%s', v_slot), p_schema, v_slot
-        );
-
-        -- #169: leases takes heartbeat / state-transition / callback UPDATEs
-        -- (heartbeat_at, state, callback_id, callback_timeout_at,
-        -- deadline_at). Several of those columns are indexed below
-        -- (state_hb / state_deadline / state_callback_timeout / callback),
-        -- so the UPDATEs are non-HOT regardless of fillfactor. fillfactor=50
-        -- still matters: it reserves on-page space so the new tuple version
-        -- lands in the same page, keeping dead-tuple density bounded under
-        -- pinned-MVCC pressure. The companion B1 work-in-progress will
-        -- drop the heartbeat_at write/index entirely in receipts mode; this
-        -- fillfactor change is orthogonal hygiene that benefits both modes.
-        EXECUTE format(
-            $alter$
-            ALTER TABLE %I.%I SET (
-                fillfactor = 50,
-                autovacuum_vacuum_scale_factor = 0.0,
-                autovacuum_vacuum_threshold = 200,
-                autovacuum_vacuum_cost_limit = 2000,
-                autovacuum_vacuum_cost_delay = 2
-            )
-            $alter$,
-            p_schema, format('leases_%s', v_slot)
         );
 
         EXECUTE format(
