@@ -83,6 +83,83 @@ To rebuild a queue-storage substrate from scratch:
 
 `DROP SCHEMA awa CASCADE` is not a supported operator action.
 
+## Driving installs and upgrades from external migration tooling
+
+Teams that already run their schema changes through a tool like
+Sqitch, Liquibase, or a hand-rolled migration runner do not need to
+invoke `awa migrate` or any other Rust binary. The migration set
+extracted with `awa migrate --sql` (or `--extract-to`) is complete:
+it includes the substrate DDL via the v023 helper, and the staged
+transition is driven by SQL functions.
+
+### Fresh install (no canonical data yet)
+
+After applying the migration files, the first runtime that boots
+calls `awa.storage_auto_finalize_if_fresh('awa')` which atomically
+advances `canonical → active` when `awa.jobs` is empty and no live
+runtimes have heartbeated. External tooling can call the same
+function as a post-migrate step to land in `active` before the first
+worker even starts:
+
+```sql
+SELECT awa.storage_auto_finalize_if_fresh('awa');
+```
+
+`storage_auto_finalize_if_fresh` has `GRANT EXECUTE ... TO PUBLIC`,
+so the EXECUTE bit is open to any role. The function is
+`SECURITY INVOKER` and reads/writes
+`awa.storage_transition_state`, `awa.jobs`, `awa.runtime_instances`,
+and `awa.runtime_storage_backends`, so callers still need the normal
+runtime/migrator table privileges on those.
+
+### Upgrade from an existing canonical-only deployment
+
+`storage_auto_finalize_if_fresh` refuses to short-circuit when
+canonical work or live runtimes exist. The operator drives the
+staged transition with three SQL function calls, each of which
+mirrors the equivalent `awa storage` CLI subcommand:
+
+```sql
+-- (1) Mark queue-storage as the prepared target.
+SELECT awa.storage_prepare('queue_storage', '{"schema":"awa"}'::jsonb);
+
+-- (2) Bring up at least one worker with
+--     transition_role=queue_storage_target. Stop any canonical-only
+--     workers. Then flip routing into mixed mode:
+SELECT awa.storage_enter_mixed_transition();
+
+-- (3) Wait for workers to drain the canonical backlog onto
+--     queue-storage. The two SQL gates `storage_finalize` enforces
+--     are observable directly:
+--
+--       SELECT awa.canonical_live_backlog();
+--       -- must return 0 before finalize will advance.
+--
+--       SELECT count(*)
+--       FROM awa.runtime_instances
+--       WHERE storage_capability IN ('canonical', 'canonical_drain_only')
+--         AND last_seen_at + make_interval(
+--               secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30)
+--             ) >= now();
+--       -- must also be 0 (no live canonical or drain-only runtimes).
+--
+--     When both are 0, finalize:
+SELECT awa.storage_finalize();
+```
+
+`storage_enter_mixed_transition` will reject the call until at least
+one live `queue_storage_target` runtime is heartbeating.
+`storage_finalize` will reject the call while
+`awa.canonical_live_backlog() > 0` or while any canonical /
+canonical-drain-only runtime is still inside its liveness window.
+Both gates are deliberate — they prevent operators from flipping
+routing onto a substrate that has no executor or while canonical
+work or canonical-mode workers are still active.
+
+The orchestration (start new-mode workers, stop old-mode workers,
+wait for drain) is unchanged from the CLI flow — only the invocation
+surface is different.
+
 ## Design rationale
 
 The split between migration-owned default substrate and helper-installed
