@@ -909,10 +909,14 @@ BEGIN
             p_schema, v_slot, p_schema, format('leases_%s', v_slot)
         );
 
-        EXECUTE format(
-            'CREATE INDEX IF NOT EXISTS idx_%s_leases_%s_state_hb ON %I.%I (state, heartbeat_at)',
-            p_schema, v_slot, p_schema, format('leases_%s', v_slot)
-        );
+        -- #169 B1: idx_state_hb dropped. In receipts mode (the only
+        -- supported shape for the default `awa` schema)
+        -- `leases.heartbeat_at` is never written, so the index would
+        -- be empty; the rescue path reads `attempt_state.heartbeat_at`
+        -- instead. Legacy non-receipts custom schemas fall back to a
+        -- seq-scan of `WHERE state='running'` rows (bounded by live
+        -- worker count, called at 30s cadence) — acceptable. v025
+        -- drops the index from existing 0.6 deployments.
 
         EXECUTE format(
             'CREATE INDEX IF NOT EXISTS idx_%s_leases_%s_state_deadline ON %I.%I (state, deadline_at)',

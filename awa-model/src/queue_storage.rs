@@ -7618,7 +7618,7 @@ impl QueueStorage {
                 lease.max_attempts,
                 lease.lane_seq,
                 ready.run_at,
-                lease.heartbeat_at,
+                COALESCE(attempt.heartbeat_at, lease.heartbeat_at) AS heartbeat_at,
                 lease.deadline_at,
                 lease.attempted_at,
                 NULL::timestamptz AS finalized_at,
@@ -8128,7 +8128,7 @@ impl QueueStorage {
                 lease.max_attempts,
                 lease.lane_seq,
                 ready.run_at,
-                lease.heartbeat_at,
+                COALESCE(attempt.heartbeat_at, lease.heartbeat_at) AS heartbeat_at,
                 lease.deadline_at,
                 lease.attempted_at,
                 NULL::timestamptz AS finalized_at,
@@ -8324,7 +8324,7 @@ impl QueueStorage {
                 lease.max_attempts,
                 lease.lane_seq,
                 ready.run_at,
-                lease.heartbeat_at,
+                COALESCE(attempt.heartbeat_at, lease.heartbeat_at) AS heartbeat_at,
                 lease.deadline_at,
                 lease.attempted_at,
                 NULL::timestamptz AS finalized_at,
@@ -8810,39 +8810,50 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
-        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut updated = 0_usize;
         if self.lease_claim_receipts() {
+            // #169 B1: in receipts mode, attempt_state is the
+            // authoritative heartbeat home. Skip the `UPDATE leases SET
+            // heartbeat_at = ...` entirely — that write was the
+            // dominant per-heartbeat non-HOT update on the partitioned
+            // `leases` table (every state-indexed partial index pays 2
+            // dead entries per write under sustained churn). Compat
+            // reads in `LeaseJobRow` SELECTs and the `awa.jobs` view
+            // COALESCE attempt_state.heartbeat_at first.
             updated += self
                 .upsert_attempt_state_from_receipts_tx(&mut tx, jobs)
                 .await?;
+        } else {
+            // Legacy non-receipts mode (custom schemas with
+            // `lease_claim_receipts=FALSE`): the `leases.heartbeat_at`
+            // write is still the heartbeat home, since there is no
+            // upsert_attempt_state path firing.
+            let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _)| *job_id).collect();
+            let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease)| *run_lease).collect();
+            let result = sqlx::query(&format!(
+                r#"
+                WITH inflight AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[]) AS v(job_id, run_lease)
+                )
+                UPDATE {table}
+                SET heartbeat_at = clock_timestamp()
+                FROM inflight
+                WHERE {table}.job_id = inflight.job_id
+                  AND {table}.run_lease = inflight.run_lease
+                  AND {table}.state = 'running'
+                "#,
+                table = self.leases_table(),
+            ))
+            .bind(&job_ids)
+            .bind(&run_leases)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            updated += result.rows_affected() as usize;
         }
-        let result = sqlx::query(&format!(
-            r#"
-            WITH inflight AS (
-                SELECT * FROM unnest($1::bigint[], $2::bigint[]) AS v(job_id, run_lease)
-            )
-            UPDATE {}
-            SET heartbeat_at = clock_timestamp()
-            FROM inflight
-            WHERE {}.job_id = inflight.job_id
-              AND {}.run_lease = inflight.run_lease
-              AND {}.state = 'running'
-            "#,
-            self.leases_table(),
-            self.leases_table(),
-            self.leases_table(),
-            self.leases_table()
-        ))
-        .bind(&job_ids)
-        .bind(&run_leases)
-        .execute(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(updated + result.rows_affected() as usize)
+        Ok(updated)
     }
 
     pub async fn heartbeat_progress_batch(
@@ -8854,53 +8865,65 @@ impl QueueStorage {
             return Ok(0);
         }
 
-        let schema = self.schema();
-        let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _, _)| *job_id).collect();
-        let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
-        let progress: Vec<serde_json::Value> =
-            jobs.iter().map(|(_, _, value)| value.clone()).collect();
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let mut updated = 0_usize;
-        if self.lease_claim_receipts() {
-            updated += self
-                .upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
-                .await?;
-        }
-        let lease_updated: i64 = sqlx::query_scalar(&format!(
-            r#"
-            WITH inflight AS (
-                SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[]) AS v(job_id, run_lease, progress)
-            ),
-            updated AS (
-                UPDATE {} AS lease
-                SET heartbeat_at = clock_timestamp()
-                FROM inflight
-                WHERE lease.job_id = inflight.job_id
-                  AND lease.run_lease = inflight.run_lease
-                  AND lease.state = 'running'
-                RETURNING lease.job_id, lease.run_lease, inflight.progress
-            ),
-            upsert_attempt AS (
-                INSERT INTO {schema}.attempt_state (job_id, run_lease, progress, updated_at)
-                SELECT job_id, run_lease, progress, clock_timestamp()
-                FROM updated
-                ON CONFLICT (job_id, run_lease)
-                DO UPDATE SET
-                    progress = EXCLUDED.progress,
-                    updated_at = clock_timestamp()
-            )
-            SELECT count(*)::bigint FROM updated
-            "#,
-            self.leases_table()
-        ))
-        .bind(&job_ids)
-        .bind(&run_leases)
-        .bind(&progress)
-        .fetch_one(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+        let updated = if self.lease_claim_receipts() {
+            // #169 B1: receipts mode is the only supported shape for
+            // the default `awa` schema. attempt_state already carries
+            // heartbeat_at + progress, so the `UPDATE leases SET
+            // heartbeat_at` + nested `INSERT INTO attempt_state` CTE
+            // is collapsed into the single attempt_state upsert. The
+            // upsert sources open-claim identity from `lease_claims`
+            // anti-joined against `lease_claim_closures` so it picks
+            // up every claim regardless of whether
+            // `materialize_claims` has fanned it out to `leases` yet.
+            self.upsert_attempt_state_progress_from_receipts_tx(&mut tx, jobs)
+                .await?
+        } else {
+            // Legacy non-receipts mode keeps the old CTE shape that
+            // updates leases.heartbeat_at + leases.progress
+            // (via attempt_state upsert) in a single round-trip.
+            let schema = self.schema();
+            let job_ids: Vec<i64> = jobs.iter().map(|(job_id, _, _)| *job_id).collect();
+            let run_leases: Vec<i64> = jobs.iter().map(|(_, run_lease, _)| *run_lease).collect();
+            let progress: Vec<serde_json::Value> =
+                jobs.iter().map(|(_, _, value)| value.clone()).collect();
+            let lease_updated: i64 = sqlx::query_scalar(&format!(
+                r#"
+                WITH inflight AS (
+                    SELECT * FROM unnest($1::bigint[], $2::bigint[], $3::jsonb[]) AS v(job_id, run_lease, progress)
+                ),
+                updated AS (
+                    UPDATE {table} AS lease
+                    SET heartbeat_at = clock_timestamp()
+                    FROM inflight
+                    WHERE lease.job_id = inflight.job_id
+                      AND lease.run_lease = inflight.run_lease
+                      AND lease.state = 'running'
+                    RETURNING lease.job_id, lease.run_lease, inflight.progress
+                ),
+                upsert_attempt AS (
+                    INSERT INTO {schema}.attempt_state (job_id, run_lease, progress, updated_at)
+                    SELECT job_id, run_lease, progress, clock_timestamp()
+                    FROM updated
+                    ON CONFLICT (job_id, run_lease)
+                    DO UPDATE SET
+                        progress = EXCLUDED.progress,
+                        updated_at = clock_timestamp()
+                )
+                SELECT count(*)::bigint FROM updated
+                "#,
+                table = self.leases_table(),
+            ))
+            .bind(&job_ids)
+            .bind(&run_leases)
+            .bind(&progress)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+            lease_updated as usize
+        };
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(updated + lease_updated as usize)
+        Ok(updated)
     }
 
     pub async fn retry_after(
@@ -9588,8 +9611,17 @@ impl QueueStorage {
         let cutoff = Utc::now()
             - TimeDelta::from_std(staleness)
                 .map_err(|err| AwaError::Validation(format!("invalid staleness: {err}")))?;
-        let deleted: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
-            r#"
+        // #169 B1: in receipts mode `leases.heartbeat_at` is never
+        // written (attempt_state owns heartbeat_at), so the leases-side
+        // `WHERE state='running' AND heartbeat_at < cutoff` scan would
+        // always be a no-op — but it would still walk the table /
+        // index. Skip it explicitly; the receipts-side rescue path
+        // below picks up stale claims via `attempt_state`.
+        let deleted: Vec<DeletedLeaseRow> = if self.lease_claim_receipts() {
+            Vec::new()
+        } else {
+            sqlx::query_as(&format!(
+                r#"
             DELETE FROM {schema}.leases
             WHERE job_id IN (
                 SELECT job_id
@@ -9618,11 +9650,12 @@ impl QueueStorage {
                 callback_id,
                 callback_timeout_at
             "#
-        ))
-        .bind(cutoff)
-        .fetch_all(tx.as_mut())
-        .await
-        .map_err(map_sqlx_error)?;
+            ))
+            .bind(cutoff)
+            .fetch_all(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?
+        };
 
         let rescued_receipts = if self.lease_claim_receipts() {
             self.rescue_stale_receipt_claims_tx(&mut tx, cutoff).await?
