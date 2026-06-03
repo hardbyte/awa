@@ -37,6 +37,29 @@ async fn migrated_pool() -> PgPool {
     pool
 }
 
+/// Clear every canonical source the transition gates inspect:
+///
+/// - `awa.jobs_hot` and `awa.scheduled_jobs`, because `awa.jobs` is
+///   `jobs_hot UNION ALL scheduled_jobs` and
+///   `storage_auto_finalize_if_fresh` counts rows from the view.
+/// - `awa.scheduled_jobs` additionally, because
+///   `awa.canonical_live_backlog()` (the finalize gate) sums
+///   non-terminal `jobs_hot` rows + the full count of `scheduled_jobs`.
+///
+/// A leftover scheduled row from another test run can make the
+/// fresh-install test report `auto_finalize = false` or the upgrade
+/// test report a non-zero backlog after the simulated drain.
+async fn clear_canonical_work(pool: &PgPool) {
+    sqlx::query("DELETE FROM awa.jobs_hot")
+        .execute(pool)
+        .await
+        .expect("clear awa.jobs_hot");
+    sqlx::query("DELETE FROM awa.scheduled_jobs")
+        .execute(pool)
+        .await
+        .expect("clear awa.scheduled_jobs");
+}
+
 async fn reset_transition_state(pool: &PgPool) {
     let mut tx = pool.begin().await.expect("begin reset tx");
     sqlx::query(
@@ -133,6 +156,7 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
     let _guard = TRANSITION_LOCK.lock().await;
     let pool = migrated_pool().await;
     reset_transition_state(&pool).await;
+    clear_canonical_work(&pool).await;
 
     // Defeat auto-finalize: ensure there's at least one canonical row
     // so `storage_auto_finalize_if_fresh` would refuse to short-circuit.
@@ -170,14 +194,11 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
 
     // `storage_finalize` refuses to advance while canonical live work
     // remains. In a real upgrade the operator waits in mixed_transition
-    // for workers to drain; for the test we delete the marker to
-    // simulate that drain, then call awa.canonical_live_backlog()
-    // directly to confirm the documented SQL gate is satisfied before
-    // finalize.
-    sqlx::query("DELETE FROM awa.jobs_hot WHERE queue = 'sql_only_upgrade'")
-        .execute(&pool)
-        .await
-        .expect("simulate canonical drain");
+    // for workers to drain; the test clears all canonical sources
+    // (jobs_hot + scheduled_jobs, since `canonical_live_backlog()`
+    // sums both) to simulate that drain, then asserts the two
+    // documented SQL gates explicitly.
+    clear_canonical_work(&pool).await;
 
     let backlog: i64 = sqlx::query_scalar("SELECT awa.canonical_live_backlog()")
         .fetch_one(&pool)
@@ -186,6 +207,26 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
     assert_eq!(
         backlog, 0,
         "documented SQL gate must report empty backlog before finalize"
+    );
+
+    // Second documented gate: no live canonical / canonical_drain_only
+    // runtimes. The only stamped runtime is queue_storage_target, so
+    // this should already be zero; assert it so any future change to
+    // the test setup that introduces a canonical-mode runtime fails
+    // loudly here rather than inside the storage_finalize RAISE.
+    let live_canonical: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM awa.runtime_instances \
+         WHERE storage_capability IN ('canonical', 'canonical_drain_only') \
+           AND last_seen_at + make_interval( \
+                 secs => GREATEST(((GREATEST(snapshot_interval_ms, 1000) / 1000) * 3)::int, 30) \
+               ) >= now()",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("count live canonical runtimes");
+    assert_eq!(
+        live_canonical, 0,
+        "documented SQL gate must report no live canonical / drain-only runtimes before finalize"
     );
 
     sqlx::query("SELECT awa.storage_finalize()")
@@ -208,19 +249,19 @@ async fn external_tooling_can_upgrade_canonical_to_queue_storage_via_sql() {
 
 /// Fresh-install path: empty `awa.jobs` and no live runtimes means
 /// `storage_auto_finalize_if_fresh` is allowed to jump straight from
-/// canonical to active. The function is `GRANT EXECUTE ... TO PUBLIC`
-/// (v013) so any caller — including a migration tool running as a
-/// non-owner role — can invoke it. This test calls it via raw SQL with
-/// no Rust runtime involvement.
+/// canonical to active. The function carries `GRANT EXECUTE ... TO
+/// PUBLIC` (v013), so the EXECUTE bit is open to any role; the
+/// function is `SECURITY INVOKER` and still reads/writes
+/// `storage_transition_state`, `jobs`, `runtime_instances`, and
+/// `runtime_storage_backends`, so a non-owner caller also needs the
+/// normal table privileges. This test calls it via raw SQL with no
+/// Rust runtime involvement.
 #[tokio::test]
 async fn external_tooling_can_finalize_fresh_install_via_sql() {
     let _guard = TRANSITION_LOCK.lock().await;
     let pool = migrated_pool().await;
     reset_transition_state(&pool).await;
-    sqlx::query("DELETE FROM awa.jobs_hot")
-        .execute(&pool)
-        .await
-        .expect("clear canonical jobs for fresh-install scenario");
+    clear_canonical_work(&pool).await;
 
     let promoted: bool = sqlx::query_scalar("SELECT awa.storage_auto_finalize_if_fresh($1)")
         .bind("awa")
