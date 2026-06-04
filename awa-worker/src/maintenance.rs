@@ -57,25 +57,57 @@ struct MaintenanceBranchState {
     /// for the current overrun episode. Cleared on the recovery
     /// transition.
     is_delayed: bool,
-    /// Number of consecutive ticks where `last_duration > tick_interval`.
-    /// Used for hysteresis: a single bad tick around the threshold no
-    /// longer flips `is_delayed` and spams the log; we wait for
-    /// `OVERRUN_HYSTERESIS_K` in a row.
+    /// Number of consecutive overrun observations (last_duration above
+    /// the upper threshold). Samples inside the deadband neither
+    /// advance this counter nor reset it.
     consecutive_overrun: u32,
-    /// Mirror of `consecutive_overrun` for on-time ticks; used to gate
-    /// the delayed -> on-time recovery transition with the same K
-    /// hysteresis.
+    /// Mirror of `consecutive_overrun` for clearly-on-time samples
+    /// (last_duration below the lower threshold). Used to gate
+    /// delayed -> on-time recovery with the same K-consecutive
+    /// requirement.
     consecutive_ontime: u32,
+    /// Tick counter that suppresses the branch body while the branch
+    /// is unhealthy. Decremented every tick; while non-zero the
+    /// caller's body is skipped. Re-armed on every flip-to-delayed
+    /// AND every overrun observation while already delayed, so a
+    /// branch that keeps failing keeps quietly waiting instead of
+    /// hammering the database.
+    cooldown_ticks_remaining: u32,
 }
 
 /// How many consecutive observations the branch tracker requires before
-/// flipping `is_delayed` either direction. `K=3` means a single ~tick-
-/// boundary jitter no longer triggers the warning + counter; a real
-/// sustained overrun (or sustained recovery) still does, just one
-/// `tick_interval * (K-1)` later than the previous edge-triggered
-/// shape. The downside of this delay is exactly the upside of the
-/// hysteresis: we stop flapping at the boundary.
+/// flipping `is_delayed` either direction. Combined with the
+/// duration-margin thresholds below: a sample inside the deadband
+/// (between `LOWER_FACTOR_*` and `UPPER_FACTOR_*` of `tick_interval`)
+/// doesn't advance either counter, so the boundary flap from #316's
+/// post-mortem stops at the source. A sample outside the deadband
+/// still needs `OVERRUN_HYSTERESIS_K` peers on the same side before
+/// the state flips.
 const OVERRUN_HYSTERESIS_K: u32 = 3;
+
+/// Duration-margin thresholds. Crossing
+/// `last_duration > tick_interval * UPPER` counts as an overrun
+/// sample; `last_duration < tick_interval * LOWER` counts as an
+/// on-time sample. Everything in between is a deadband that leaves
+/// both counters untouched.
+///
+/// `UPPER = 3/2` and `LOWER = 7/10` give a generous deadband — the
+/// branch has to be at 70% of its tick or below to count as recovered,
+/// and 50% above its tick to count as overrunning. This prevents
+/// 51ms-vs-49ms jitter at the 50ms boundary from advancing either
+/// counter, which is what bench evidence on #316 showed was still
+/// happening with K-only hysteresis. Integer ratios avoid f64 in the
+/// hot path.
+const OVERRUN_UPPER_NUM: u32 = 3;
+const OVERRUN_UPPER_DEN: u32 = 2;
+const OVERRUN_LOWER_NUM: u32 = 7;
+const OVERRUN_LOWER_DEN: u32 = 10;
+
+/// Number of ticks to suppress a delayed branch's body. At the default
+/// `lease_rotate_interval = 250ms`, 120 ticks = 30s wall time of quiet
+/// before the branch tries again. Re-armed on every overrun
+/// observation while still delayed.
+const BRANCH_COOLDOWN_TICKS: u32 = 120;
 
 /// Records the start of one branch body and emits observability when the
 /// body returns. Constructed by [`MaintenanceBranchTracker::begin`], which
@@ -121,37 +153,77 @@ impl MaintenanceBranchTracker {
     }
 
     /// Call at the moment a branch arm fires, before running its body.
-    /// Applies the previous-run overrun check (warn + counter on
-    /// on-time -> delayed; warn on delayed -> on-time), then returns a
-    /// [`BranchTimer`] whose `.finish()` records the body duration.
-    fn begin<'a>(
+    /// Applies cooldown + duration-margin hysteresis, then either:
+    ///   * returns `Some(BranchTimer)` so the caller runs the body
+    ///     and calls `.finish()`, or
+    ///   * returns `None` to signal "skip this tick" — the body
+    ///     must not run, and no duration sample is recorded for this
+    ///     tick (so the K-on-time counter doesn't advance for skipped
+    ///     work).
+    ///
+    /// Two gating phases:
+    ///
+    /// 1. **Cooldown.** If `cooldown_ticks_remaining > 0`, decrement
+    ///    and return `None`. While cooldown is non-zero the branch is
+    ///    quiet; this is set on flip-to-delayed and re-armed on
+    ///    every subsequent overrun observation, so an unhealthy
+    ///    branch backs off instead of beating on the database every
+    ///    tick.
+    /// 2. **Duration-margin hysteresis.** Compare `last_duration` to
+    ///    `tick_interval * UPPER/LOWER`. Outside the deadband, advance
+    ///    the matching K-counter; inside, leave both alone. Crossing
+    ///    K-consecutive on either side flips `is_delayed` and may
+    ///    arm cooldown.
+    fn try_begin<'a>(
         &'a self,
         branch: &'static str,
         tick_interval: Duration,
         metrics: &'a crate::metrics::AwaMetrics,
-    ) -> BranchTimer<'a> {
+    ) -> Option<BranchTimer<'a>> {
         let mut branches = self
             .branches
             .lock()
             .expect("maintenance branch tracker mutex");
         let state = branches.entry(branch).or_default();
+
+        // Phase 1: cooldown gate. Counts down regardless of any
+        // other signal; the branch stays quiet while non-zero.
+        if state.cooldown_ticks_remaining > 0 {
+            state.cooldown_ticks_remaining -= 1;
+            return None;
+        }
+
+        // Phase 2: duration-margin + K-consecutive hysteresis.
         if let Some(last_duration) = state.last_duration {
-            let overdue = last_duration > tick_interval;
-            if overdue {
+            // Integer-ratio thresholds — avoid f64 in the hot path.
+            let upper_threshold = tick_interval * OVERRUN_UPPER_NUM / OVERRUN_UPPER_DEN;
+            let lower_threshold = tick_interval * OVERRUN_LOWER_NUM / OVERRUN_LOWER_DEN;
+
+            if last_duration > upper_threshold {
                 state.consecutive_overrun = state.consecutive_overrun.saturating_add(1);
                 state.consecutive_ontime = 0;
-                if state.consecutive_overrun >= OVERRUN_HYSTERESIS_K && !state.is_delayed {
+                let cross_threshold = state.consecutive_overrun >= OVERRUN_HYSTERESIS_K;
+                if cross_threshold && !state.is_delayed {
                     state.is_delayed = true;
+                    state.cooldown_ticks_remaining = BRANCH_COOLDOWN_TICKS;
                     warn!(
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
+                        upper_threshold_ms = upper_threshold.as_millis() as u64,
                         consecutive_overrun = state.consecutive_overrun,
-                        "maintenance branch overran its tick interval",
+                        cooldown_ticks = BRANCH_COOLDOWN_TICKS,
+                        "maintenance branch overran tick interval, entering cooldown",
                     );
                     metrics.record_maintenance_branch_overrun(branch);
+                    return None;
+                } else if cross_threshold && state.is_delayed {
+                    // Already delayed and another overrun arrived —
+                    // re-arm cooldown but stay quiet about it.
+                    state.cooldown_ticks_remaining = BRANCH_COOLDOWN_TICKS;
+                    return None;
                 }
-            } else {
+            } else if last_duration < lower_threshold {
                 state.consecutive_ontime = state.consecutive_ontime.saturating_add(1);
                 state.consecutive_overrun = 0;
                 if state.consecutive_ontime >= OVERRUN_HYSTERESIS_K && state.is_delayed {
@@ -160,19 +232,23 @@ impl MaintenanceBranchTracker {
                         branch,
                         last_duration_ms = last_duration.as_millis() as u64,
                         tick_interval_ms = tick_interval.as_millis() as u64,
+                        lower_threshold_ms = lower_threshold.as_millis() as u64,
                         consecutive_ontime = state.consecutive_ontime,
                         "maintenance branch recovered to on-time",
                     );
                 }
+            } else {
+                // Deadband — neither counter advances. This is the
+                // explicit no-op that kills the 49ms-vs-51ms flap.
             }
         }
         drop(branches);
-        BranchTimer {
+        Some(BranchTimer {
             tracker: self,
             branch,
             metrics,
             started_at: Instant::now(),
-        }
+        })
     }
 
     /// Internal — called by [`BranchTimer::finish`] to stash the body's
@@ -198,6 +274,23 @@ impl MaintenanceBranchTracker {
         branches
             .get(branch)
             .map(|state| (state.last_duration, state.is_delayed))
+    }
+
+    /// Test-only — read the per-branch cooldown counter and consecutive
+    /// counters so tests can assert on the full state machine.
+    #[cfg(test)]
+    fn cooldown_snapshot(&self, branch: &'static str) -> Option<(u32, u32, u32)> {
+        let branches = self
+            .branches
+            .lock()
+            .expect("maintenance branch tracker mutex");
+        branches.get(branch).map(|state| {
+            (
+                state.cooldown_ticks_remaining,
+                state.consecutive_overrun,
+                state.consecutive_ontime,
+            )
+        })
     }
 }
 
@@ -669,57 +762,67 @@ impl MaintenanceService {
                         return;
                     }
                     _ = heartbeat_rescue_timer.tick() => {
-                        let timer = branch_tracker.begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics);
-                        self.rescue_stale_heartbeats().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("rescue_stale_heartbeats", self.heartbeat_rescue_interval, &self.metrics) {
+                            self.rescue_stale_heartbeats().await;
+                            timer.finish();
+                        }
                     }
                     _ = deadline_rescue_timer.tick() => {
-                        let timer = branch_tracker.begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics);
-                        self.rescue_expired_deadlines().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("rescue_expired_deadlines", self.deadline_rescue_interval, &self.metrics) {
+                            self.rescue_expired_deadlines().await;
+                            timer.finish();
+                        }
                     }
                     _ = callback_rescue_timer.tick() => {
-                        let timer = branch_tracker.begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics);
-                        self.rescue_expired_callbacks().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("rescue_expired_callbacks", self.callback_rescue_interval, &self.metrics) {
+                            self.rescue_expired_callbacks().await;
+                            timer.finish();
+                        }
                     }
                     _ = promote_timer.tick() => {
-                        let timer = branch_tracker.begin("promote_scheduled", self.promote_interval, &self.metrics);
-                        self.promote_scheduled().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("promote_scheduled", self.promote_interval, &self.metrics) {
+                            self.promote_scheduled().await;
+                            timer.finish();
+                        }
                     }
                     _ = cleanup_timer.tick() => {
-                        let timer = branch_tracker.begin("cleanup", self.cleanup_interval, &self.metrics);
-                        self.cleanup_completed().await;
-                        self.cleanup_dlq_rows().await;
-                        self.cleanup_stale_runtime_snapshots().await;
-                        self.cleanup_stale_descriptors().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("cleanup", self.cleanup_interval, &self.metrics) {
+                            self.cleanup_completed().await;
+                            self.cleanup_dlq_rows().await;
+                            self.cleanup_stale_runtime_snapshots().await;
+                            self.cleanup_stale_descriptors().await;
+                            timer.finish();
+                        }
                     }
                     _ = cron_sync_timer.tick() => {
-                        let timer = branch_tracker.begin("cron_sync", self.cron_sync_interval, &self.metrics);
-                        self.sync_periodic_jobs_to_db().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("cron_sync", self.cron_sync_interval, &self.metrics) {
+                            self.sync_periodic_jobs_to_db().await;
+                            timer.finish();
+                        }
                     }
                     _ = queue_stats_timer.tick() => {
-                        let timer = branch_tracker.begin("queue_stats", self.queue_stats_interval, &self.metrics);
-                        self.publish_queue_health_metrics().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("queue_stats", self.queue_stats_interval, &self.metrics) {
+                            self.publish_queue_health_metrics().await;
+                            timer.finish();
+                        }
                     }
                     _ = dirty_key_timer.tick() => {
-                        let timer = branch_tracker.begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics);
-                        self.recompute_dirty_admin_metadata().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("recompute_dirty_admin_metadata", self.dirty_key_recompute_interval, &self.metrics) {
+                            self.recompute_dirty_admin_metadata().await;
+                            timer.finish();
+                        }
                     }
                     _ = metadata_reconciliation_timer.tick() => {
-                        let timer = branch_tracker.begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics);
-                        self.refresh_admin_metadata().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("refresh_admin_metadata", self.metadata_reconciliation_interval, &self.metrics) {
+                            self.refresh_admin_metadata().await;
+                            timer.finish();
+                        }
                     }
                     _ = priority_aging_timer.tick() => {
-                        let timer = branch_tracker.begin("priority_aging", self.priority_aging_interval, &self.metrics);
-                        self.age_waiting_priorities().await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("priority_aging", self.priority_aging_interval, &self.metrics) {
+                            self.age_waiting_priorities().await;
+                            timer.finish();
+                        }
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_queue_timer {
@@ -730,9 +833,10 @@ impl MaintenanceService {
                     }, if vacuum_queue_timer.is_some() => {
                         let interval = vacuum_queue_interval
                             .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
-                        let timer = branch_tracker.begin("rotate_queue", interval, &self.metrics);
-                        self.rotate_queue_storage_queue(&prune_tracker).await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("rotate_queue", interval, &self.metrics) {
+                            self.rotate_queue_storage_queue(&prune_tracker).await;
+                            timer.finish();
+                        }
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_lease_timer {
@@ -743,9 +847,10 @@ impl MaintenanceService {
                     }, if vacuum_lease_timer.is_some() => {
                         let interval = vacuum_lease_interval
                             .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
-                        let timer = branch_tracker.begin("rotate_lease", interval, &self.metrics);
-                        self.rotate_queue_storage_leases(&prune_tracker).await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("rotate_lease", interval, &self.metrics) {
+                            self.rotate_queue_storage_leases(&prune_tracker).await;
+                            timer.finish();
+                        }
                     }
                     _ = async {
                         if let Some(timer) = &mut vacuum_claim_timer {
@@ -756,9 +861,10 @@ impl MaintenanceService {
                     }, if vacuum_claim_timer.is_some() => {
                         let interval = vacuum_claim_interval
                             .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
-                        let timer = branch_tracker.begin("rotate_claim", interval, &self.metrics);
-                        self.rotate_queue_storage_claims(&prune_tracker).await;
-                        timer.finish();
+                        if let Some(timer) = branch_tracker.try_begin("rotate_claim", interval, &self.metrics) {
+                            self.rotate_queue_storage_claims(&prune_tracker).await;
+                            timer.finish();
+                        }
                     }
                     _ = leader_check_timer.tick() => {
                         // Verify leader connection is still alive.
@@ -2404,36 +2510,37 @@ mod tests {
     fn branch_tracker_finish_records_last_duration() {
         let tracker = MaintenanceBranchTracker::new();
         let metrics = metrics_for_test();
-        let timer = tracker.begin("promote_scheduled", Duration::from_secs(1), &metrics);
+        let timer = tracker
+            .try_begin("promote_scheduled", Duration::from_secs(1), &metrics)
+            .expect("first tick should not be skipped");
         // Body would run here in production; for the test we just finish.
         timer.finish();
         let (last_duration, is_delayed) = tracker
             .snapshot("promote_scheduled")
             .expect("snapshot should exist after one finish");
         assert!(last_duration.is_some());
-        // First tick has no prior duration to compare against, so we
-        // cannot be in the delayed state yet.
-        assert!(!is_delayed);
+        assert!(
+            !is_delayed,
+            "first tick has no prior duration → not delayed"
+        );
     }
 
-    /// Drive `tracker.begin` `n` times against a fixed `last_duration` /
-    /// `tick_interval` so the consecutive-overrun / consecutive-ontime
-    /// counters advance the way real ticks would. Reseting
-    /// `last_duration` after each begin matches the production shape
-    /// where each tick's body finish writes a new value.
+    /// Drive `tracker.try_begin` `n` times against a fixed
+    /// `last_duration` / `tick_interval`. Re-seeds `last_duration`
+    /// before each call so we model `n` consecutive ticks where the
+    /// previous body completed in `last_duration`. Returns the
+    /// observed `try_begin` outcomes (Some = body would have run,
+    /// None = body skipped by cooldown).
     fn replay_ticks(
         tracker: &MaintenanceBranchTracker,
         branch: &'static str,
         last_duration: Duration,
         tick_interval: Duration,
         n: u32,
-    ) {
+    ) -> Vec<bool> {
         let metrics = metrics_for_test();
+        let mut ran = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            // The check in `begin` reads `state.last_duration` set by
-            // the *previous* tick. Re-seed it to the same value on
-            // every iteration so we model `n` consecutive ticks at the
-            // same duration.
             tracker
                 .branches
                 .lock()
@@ -2441,33 +2548,78 @@ mod tests {
                 .entry(branch)
                 .or_default()
                 .last_duration = Some(last_duration);
-            let _timer = tracker.begin(branch, tick_interval, &metrics);
+            let timer_opt = tracker.try_begin(branch, tick_interval, &metrics);
+            ran.push(timer_opt.is_some());
         }
+        ran
     }
 
     #[test]
     fn branch_tracker_single_overrun_does_not_flip() {
-        // Hysteresis: one overrun observation isn't enough to flip
-        // `is_delayed`. A tick that goes 101ms against a 100ms
-        // interval shouldn't spam the log.
+        // A single overrun sample (clearly above the upper threshold)
+        // shouldn't flip is_delayed — K-consecutive is required.
+        let tracker = MaintenanceBranchTracker::new();
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(200), // upper threshold for 100ms tick is 150
+            Duration::from_millis(100),
+            1,
+        );
+        assert!(
+            !tracker.snapshot("cleanup").unwrap().1,
+            "single overrun must not flip is_delayed (K=3 required)"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_deadband_sample_does_not_advance_counters() {
+        // Samples between LOWER (70ms) and UPPER (150ms) of a 100ms
+        // tick — e.g., 101ms or 51ms — must NOT advance either
+        // counter. This is the fix the bench post-mortem prescribed:
+        // 49ms-vs-51ms flap at the boundary no longer accumulates
+        // toward a flip.
         let tracker = MaintenanceBranchTracker::new();
         replay_ticks(
             &tracker,
             "cleanup",
             Duration::from_millis(101),
             Duration::from_millis(100),
-            1,
+            5,
         );
-        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
-        assert!(
-            !is_delayed,
-            "single overrun must not flip is_delayed (hysteresis K=3)"
+        let (cooldown, overrun, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(cooldown, 0, "deadband samples should not arm cooldown");
+        assert_eq!(overrun, 0, "deadband sample 101ms must not advance overrun");
+        assert_eq!(ontime, 0, "deadband sample 101ms must not advance ontime");
+    }
+
+    #[test]
+    fn branch_tracker_k_consecutive_overruns_flips_and_arms_cooldown() {
+        // After K=3 consecutive samples clearly above UPPER, flip to
+        // delayed AND arm cooldown. The third try_begin returns None
+        // (cooldown gate fires the same tick we flip).
+        let tracker = MaintenanceBranchTracker::new();
+        let ran = replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
+        );
+        assert_eq!(ran, vec![true, true, false], "flip-tick skips body");
+        let (cooldown, overrun, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert!(tracker.snapshot("cleanup").unwrap().1, "flipped to delayed");
+        assert_eq!(overrun, OVERRUN_HYSTERESIS_K);
+        assert_eq!(
+            cooldown, BRANCH_COOLDOWN_TICKS,
+            "cooldown armed to BRANCH_COOLDOWN_TICKS at flip"
         );
     }
 
     #[test]
-    fn branch_tracker_k_consecutive_overruns_flips() {
-        // After `OVERRUN_HYSTERESIS_K` (3) consecutive overruns, flip.
+    fn branch_tracker_cooldown_skips_body() {
+        // Drive past the flip, then assert subsequent ticks return
+        // None until cooldown decrements to zero.
         let tracker = MaintenanceBranchTracker::new();
         replay_ticks(
             &tracker,
@@ -2476,52 +2628,29 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
-        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
-        assert!(is_delayed, "K consecutive overruns must flip to delayed");
-    }
-
-    #[test]
-    fn branch_tracker_intermittent_overrun_does_not_flip() {
-        // Pattern: overrun, on-time, overrun, on-time, overrun (5
-        // ticks, 3 of them overruns but not consecutive). Must stay
-        // on-time.
-        let tracker = MaintenanceBranchTracker::new();
-        for over in [true, false, true, false, true] {
-            let dur = if over {
-                Duration::from_millis(150)
-            } else {
-                Duration::from_millis(50)
-            };
-            replay_ticks(&tracker, "cleanup", dur, Duration::from_millis(100), 1);
-        }
-        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
-        assert!(
-            !is_delayed,
-            "intermittent overruns must not flip is_delayed without K consecutive"
-        );
-    }
-
-    #[test]
-    fn branch_tracker_does_not_re_flag_while_already_delayed() {
-        // While already delayed, further overruns must not re-emit
-        // (state stays delayed). #242's "one event per overrun episode."
-        let tracker = MaintenanceBranchTracker::new();
-        // Push past the K=3 threshold.
-        replay_ticks(
+        // Next BRANCH_COOLDOWN_TICKS ticks all skip. Replay with
+        // last_duration = 50ms (on-time) so the cooldown is the only
+        // gate that can return None.
+        let ran = replay_ticks(
             &tracker,
             "cleanup",
-            Duration::from_millis(250),
+            Duration::from_millis(50),
             Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K + 5,
+            BRANCH_COOLDOWN_TICKS,
         );
-        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
-        assert!(is_delayed, "stays delayed across further overrun ticks");
+        assert!(
+            ran.iter().all(|&r| !r),
+            "every tick during cooldown must skip body"
+        );
+        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(cooldown, 0, "cooldown decrements to zero");
     }
 
     #[test]
-    fn branch_tracker_recovers_only_after_k_ontime_ticks() {
-        // Hysteresis on the recovery side too: a single under-interval
-        // tick mid-overrun must not clear is_delayed.
+    fn branch_tracker_cooldown_expires_then_body_runs() {
+        // Same setup, plus one more on-time tick after cooldown
+        // expires. That tick's body should run; on-time counter
+        // advances.
         let tracker = MaintenanceBranchTracker::new();
         replay_ticks(
             &tracker,
@@ -2530,25 +2659,121 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
-        assert!(
-            tracker.snapshot("cleanup").unwrap().1,
-            "delayed after K overruns"
-        );
-
-        // One on-time tick — still delayed.
         replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            BRANCH_COOLDOWN_TICKS,
+        );
+        let ran = replay_ticks(
             &tracker,
             "cleanup",
             Duration::from_millis(50),
             Duration::from_millis(100),
             1,
         );
-        assert!(
-            tracker.snapshot("cleanup").unwrap().1,
-            "single on-time tick must not clear delayed (hysteresis K=3)"
+        assert_eq!(ran, vec![true], "post-cooldown tick runs body");
+        let (_, _, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(
+            ontime, 1,
+            "on-time counter advances on first post-cooldown tick"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_cooldown_rearms_on_continued_overrun() {
+        // After flip + cooldown expiry, if the next body is STILL
+        // slow (above UPPER), cooldown re-arms — without re-emitting
+        // the flip warning (still already delayed).
+        let tracker = MaintenanceBranchTracker::new();
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
+        );
+        // Drain cooldown.
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            BRANCH_COOLDOWN_TICKS,
         );
 
-        // Two more on-time ticks — total K consecutive — recovers.
+        // First post-cooldown body runs and goes slow again. Need
+        // K more overrun samples to "cross" again because we cleared
+        // consecutive_ontime on each ontime tick. Wait — the on-time
+        // ticks during cooldown were skipped (returned None), so the
+        // consecutive_ontime / consecutive_overrun counters were
+        // frozen during cooldown. After cooldown, consecutive_overrun
+        // is still at OVERRUN_HYSTERESIS_K from before — so the very
+        // first overrun observation post-cooldown re-arms cooldown.
+        let ran = replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            1,
+        );
+        assert_eq!(
+            ran,
+            vec![false],
+            "stay-delayed overrun re-arms cooldown without running body"
+        );
+        let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS);
+        assert!(
+            tracker.snapshot("cleanup").unwrap().1,
+            "still delayed across re-arm"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_intermittent_overrun_does_not_flip() {
+        // Pattern: 3 clearly-overrun samples interleaved with
+        // clearly-on-time samples. Non-consecutive overruns never
+        // accumulate K=3 because each on-time tick resets the counter.
+        let tracker = MaintenanceBranchTracker::new();
+        for over in [true, false, true, false, true] {
+            let dur = if over {
+                Duration::from_millis(200)
+            } else {
+                Duration::from_millis(50)
+            };
+            replay_ticks(&tracker, "cleanup", dur, Duration::from_millis(100), 1);
+        }
+        assert!(
+            !tracker.snapshot("cleanup").unwrap().1,
+            "intermittent overruns must not flip"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_recovers_only_after_k_ontime_ticks_post_cooldown() {
+        // After cooldown expires, K consecutive clearly-on-time ticks
+        // are needed before is_delayed clears.
+        let tracker = MaintenanceBranchTracker::new();
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
+        );
+        // Drain cooldown.
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            BRANCH_COOLDOWN_TICKS,
+        );
+        // K-1 on-time ticks — not yet recovered. (consecutive_overrun
+        // was OVERRUN_HYSTERESIS_K post-flip; the first on-time tick
+        // that actually runs resets it to 0 and bumps ontime to 1.)
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2557,8 +2782,20 @@ mod tests {
             OVERRUN_HYSTERESIS_K - 1,
         );
         assert!(
+            tracker.snapshot("cleanup").unwrap().1,
+            "still delayed before K-th on-time tick"
+        );
+        // K-th on-time tick — recovers.
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            1,
+        );
+        assert!(
             !tracker.snapshot("cleanup").unwrap().1,
-            "K consecutive on-time ticks recover from delayed"
+            "recovered after K consecutive on-time"
         );
     }
 
