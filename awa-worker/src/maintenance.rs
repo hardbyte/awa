@@ -4,6 +4,8 @@ use crate::storage::RuntimeStorage;
 use awa_model::cron::{
     atomic_enqueue, list_cron_jobs, upsert_cron_job, CronJobRow, CronMissedFirePolicy,
 };
+#[cfg(test)]
+use awa_model::SkipReason;
 use awa_model::{JobRow, JobState, PeriodicJob, PruneOutcome, RotateOutcome};
 use chrono::Utc;
 use croner::Cron;
@@ -51,11 +53,29 @@ struct MaintenanceBranchState {
     /// Body duration of the previous run of this branch. `None` until the
     /// branch has run at least once.
     last_duration: Option<Duration>,
-    /// True when the previous body exceeded its tick interval and we've
-    /// already emitted the on-time -> delayed warning/counter. Cleared on
-    /// the recovery transition.
+    /// True when we've emitted the on-time -> delayed warning/counter
+    /// for the current overrun episode. Cleared on the recovery
+    /// transition.
     is_delayed: bool,
+    /// Number of consecutive ticks where `last_duration > tick_interval`.
+    /// Used for hysteresis: a single bad tick around the threshold no
+    /// longer flips `is_delayed` and spams the log; we wait for
+    /// `OVERRUN_HYSTERESIS_K` in a row.
+    consecutive_overrun: u32,
+    /// Mirror of `consecutive_overrun` for on-time ticks; used to gate
+    /// the delayed -> on-time recovery transition with the same K
+    /// hysteresis.
+    consecutive_ontime: u32,
 }
+
+/// How many consecutive observations the branch tracker requires before
+/// flipping `is_delayed` either direction. `K=3` means a single ~tick-
+/// boundary jitter no longer triggers the warning + counter; a real
+/// sustained overrun (or sustained recovery) still does, just one
+/// `tick_interval * (K-1)` later than the previous edge-triggered
+/// shape. The downside of this delay is exactly the upside of the
+/// hysteresis: we stop flapping at the boundary.
+const OVERRUN_HYSTERESIS_K: u32 = 3;
 
 /// Records the start of one branch body and emits observability when the
 /// body returns. Constructed by [`MaintenanceBranchTracker::begin`], which
@@ -117,23 +137,33 @@ impl MaintenanceBranchTracker {
         let state = branches.entry(branch).or_default();
         if let Some(last_duration) = state.last_duration {
             let overdue = last_duration > tick_interval;
-            if overdue && !state.is_delayed {
-                state.is_delayed = true;
-                warn!(
-                    branch,
-                    last_duration_ms = last_duration.as_millis() as u64,
-                    tick_interval_ms = tick_interval.as_millis() as u64,
-                    "maintenance branch overran its tick interval",
-                );
-                metrics.record_maintenance_branch_overrun(branch);
-            } else if !overdue && state.is_delayed {
-                state.is_delayed = false;
-                warn!(
-                    branch,
-                    last_duration_ms = last_duration.as_millis() as u64,
-                    tick_interval_ms = tick_interval.as_millis() as u64,
-                    "maintenance branch recovered to on-time",
-                );
+            if overdue {
+                state.consecutive_overrun = state.consecutive_overrun.saturating_add(1);
+                state.consecutive_ontime = 0;
+                if state.consecutive_overrun >= OVERRUN_HYSTERESIS_K && !state.is_delayed {
+                    state.is_delayed = true;
+                    warn!(
+                        branch,
+                        last_duration_ms = last_duration.as_millis() as u64,
+                        tick_interval_ms = tick_interval.as_millis() as u64,
+                        consecutive_overrun = state.consecutive_overrun,
+                        "maintenance branch overran its tick interval",
+                    );
+                    metrics.record_maintenance_branch_overrun(branch);
+                }
+            } else {
+                state.consecutive_ontime = state.consecutive_ontime.saturating_add(1);
+                state.consecutive_overrun = 0;
+                if state.consecutive_ontime >= OVERRUN_HYSTERESIS_K && state.is_delayed {
+                    state.is_delayed = false;
+                    warn!(
+                        branch,
+                        last_duration_ms = last_duration.as_millis() as u64,
+                        tick_interval_ms = tick_interval.as_millis() as u64,
+                        consecutive_ontime = state.consecutive_ontime,
+                        "maintenance branch recovered to on-time",
+                    );
+                }
             }
         }
         drop(branches);
@@ -170,6 +200,96 @@ impl MaintenanceBranchTracker {
             .map(|state| (state.last_duration, state.is_delayed))
     }
 }
+
+/// Per-segment exponential backoff for the prune step of the queue /
+/// lease / claim ring-rotation branches. The rotate step is always
+/// cheap (cursor advance under an advisory lock); the prune step is
+/// what hurts under pinned MVCC: every tick attempts `LOCK TABLE
+/// <child> IN ACCESS EXCLUSIVE MODE` (with a 50ms timeout) followed by
+/// `SELECT count(*) FROM <child>`. Under a pinned snapshot the child
+/// can't be reclaimed, so the count walks dead tuples and the prune
+/// returns `SkippedActive` — every 50ms by default. This tracker skips
+/// the next 2^level ticks (capped at 32) after a `SkippedActive` or
+/// `Blocked` outcome, doubling on each repeat. A successful `Pruned`
+/// resets to no backoff. `Noop` (ring empty / nothing to consider)
+/// leaves state unchanged — backoff is for "I tried and couldn't",
+/// not "there's nothing to do."
+#[derive(Default)]
+struct PruneBackoffTracker {
+    branches: std::sync::Mutex<HashMap<&'static str, PruneBackoffState>>,
+}
+
+#[derive(Debug, Default)]
+struct PruneBackoffState {
+    /// Number of upcoming ticks to skip the prune call entirely.
+    /// Decremented on every `should_skip` poll; the tick where it
+    /// reaches 0 actually runs prune again.
+    skip_remaining: u32,
+    /// Last backoff exponent applied. Used to set `skip_remaining` to
+    /// `1 << level` on the next failure. Reset to 0 on `Pruned`.
+    backoff_level: u8,
+}
+
+/// Cap on the backoff exponent. `2^5 = 32` ticks; at the 50ms default
+/// `lease_rotate_interval` that is ~1.6s between prune attempts under
+/// sustained pin pressure. Long enough to cut the per-tick scan cost
+/// dramatically; short enough that prune resumes promptly once the
+/// snapshot is released.
+const MAX_PRUNE_BACKOFF_LEVEL: u8 = 5;
+
+impl PruneBackoffTracker {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns true when the caller should skip this tick's prune.
+    /// Side effect: decrements `skip_remaining` when non-zero.
+    fn should_skip(&self, branch: &'static str) -> bool {
+        let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let state = branches.entry(branch).or_default();
+        if state.skip_remaining > 0 {
+            state.skip_remaining -= 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Update backoff state for a completed prune call. `Pruned` resets;
+    /// `SkippedActive` / `Blocked` doubles; `Noop` is neutral.
+    fn record_outcome(&self, branch: &'static str, outcome: &PruneOutcome) {
+        let mut branches = self.branches.lock().expect("prune backoff tracker mutex");
+        let state = branches.entry(branch).or_default();
+        match outcome {
+            PruneOutcome::Pruned { .. } => {
+                state.skip_remaining = 0;
+                state.backoff_level = 0;
+            }
+            PruneOutcome::SkippedActive { .. } | PruneOutcome::Blocked { .. } => {
+                state.backoff_level = state
+                    .backoff_level
+                    .saturating_add(1)
+                    .min(MAX_PRUNE_BACKOFF_LEVEL);
+                state.skip_remaining = 1u32 << state.backoff_level;
+            }
+            PruneOutcome::Noop => {}
+        }
+    }
+
+    #[cfg(test)]
+    fn snapshot(&self, branch: &'static str) -> Option<(u32, u8)> {
+        let branches = self.branches.lock().expect("prune backoff tracker mutex");
+        branches
+            .get(branch)
+            .map(|state| (state.skip_remaining, state.backoff_level))
+    }
+}
+
+/// Branch keys used by the prune backoff tracker. Kept as `&'static
+/// str` so the tracker's HashMap doesn't have to allocate per call.
+const PRUNE_BRANCH_LEASE: &str = "lease";
+const PRUNE_BRANCH_CLAIM: &str = "claim";
+const PRUNE_BRANCH_QUEUE: &str = "queue";
 
 /// Maintenance service: runs leader-elected background tasks.
 ///
@@ -499,6 +619,12 @@ impl MaintenanceService {
             // the architectural split of this `tokio::select!` is deferred
             // to v0.7 conditional on the overrun counter showing fleet hits.
             let branch_tracker = MaintenanceBranchTracker::new();
+            // Per-segment prune backoff (#169). Gates the prune step of
+            // each rotate branch so a pinned MVCC snapshot doesn't make
+            // us repeat the ACCESS-EXCLUSIVE + count(*) attempt every
+            // tick. Local to the leader loop so a re-election resets
+            // backoff to zero.
+            let prune_tracker = PruneBackoffTracker::new();
 
             // Skip the first immediate tick
             heartbeat_rescue_timer.tick().await;
@@ -605,7 +731,7 @@ impl MaintenanceService {
                         let interval = vacuum_queue_interval
                             .expect("vacuum_queue_interval Some iff vacuum_queue_timer Some");
                         let timer = branch_tracker.begin("rotate_queue", interval, &self.metrics);
-                        self.rotate_queue_storage_queue().await;
+                        self.rotate_queue_storage_queue(&prune_tracker).await;
                         timer.finish();
                     }
                     _ = async {
@@ -618,7 +744,7 @@ impl MaintenanceService {
                         let interval = vacuum_lease_interval
                             .expect("vacuum_lease_interval Some iff vacuum_lease_timer Some");
                         let timer = branch_tracker.begin("rotate_lease", interval, &self.metrics);
-                        self.rotate_queue_storage_leases().await;
+                        self.rotate_queue_storage_leases(&prune_tracker).await;
                         timer.finish();
                     }
                     _ = async {
@@ -631,7 +757,7 @@ impl MaintenanceService {
                         let interval = vacuum_claim_interval
                             .expect("vacuum_claim_interval Some iff vacuum_claim_timer Some");
                         let timer = branch_tracker.begin("rotate_claim", interval, &self.metrics);
-                        self.rotate_queue_storage_claims().await;
+                        self.rotate_queue_storage_claims(&prune_tracker).await;
                         timer.finish();
                     }
                     _ = leader_check_timer.tick() => {
@@ -1333,7 +1459,7 @@ impl MaintenanceService {
         Ok((promoted, queues))
     }
 
-    async fn rotate_queue_storage_queue(&self) {
+    async fn rotate_queue_storage_queue(&self, prune_tracker: &PruneBackoffTracker) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
@@ -1361,9 +1487,15 @@ impl MaintenanceService {
             }
         }
 
+        if prune_tracker.should_skip(PRUNE_BRANCH_QUEUE) {
+            debug!(branch = PRUNE_BRANCH_QUEUE, "Prune backed off this tick");
+            return;
+        }
+
         match runtime.store.prune_oldest(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("queue", &outcome);
+                prune_tracker.record_outcome(PRUNE_BRANCH_QUEUE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
                     PruneOutcome::Pruned { slot } => {
@@ -1392,7 +1524,7 @@ impl MaintenanceService {
         }
     }
 
-    async fn rotate_queue_storage_leases(&self) {
+    async fn rotate_queue_storage_leases(&self, prune_tracker: &PruneBackoffTracker) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
@@ -1419,9 +1551,15 @@ impl MaintenanceService {
             }
         }
 
+        if prune_tracker.should_skip(PRUNE_BRANCH_LEASE) {
+            debug!(branch = PRUNE_BRANCH_LEASE, "Prune backed off this tick");
+            return;
+        }
+
         match runtime.store.prune_oldest_leases(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("lease", &outcome);
+                prune_tracker.record_outcome(PRUNE_BRANCH_LEASE, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
                     PruneOutcome::Pruned { slot } => {
@@ -1453,7 +1591,7 @@ impl MaintenanceService {
     /// Claim-ring maintenance tick (see ADR-023). Rotates the claim-ring
     /// cursor and prunes the oldest fully-closed partition, mirroring the
     /// lease-ring rotate/prune pair above.
-    async fn rotate_queue_storage_claims(&self) {
+    async fn rotate_queue_storage_claims(&self, prune_tracker: &PruneBackoffTracker) {
         let Some(runtime) = self.storage.queue_storage() else {
             return;
         };
@@ -1481,9 +1619,15 @@ impl MaintenanceService {
             }
         }
 
+        if prune_tracker.should_skip(PRUNE_BRANCH_CLAIM) {
+            debug!(branch = PRUNE_BRANCH_CLAIM, "Prune backed off this tick");
+            return;
+        }
+
         match runtime.store.prune_oldest_claims(&self.pool).await {
             Ok(outcome) => {
                 self.metrics.record_prune_outcome("claim", &outcome);
+                prune_tracker.record_outcome(PRUNE_BRANCH_CLAIM, &outcome);
                 match outcome {
                     PruneOutcome::Noop => {}
                     PruneOutcome::Pruned { slot } => {
@@ -2266,96 +2410,263 @@ mod tests {
         assert!(!is_delayed);
     }
 
-    #[test]
-    fn branch_tracker_flags_overrun_on_next_begin() {
-        // Simulate: tick interval = 100ms, body duration = 250ms. The
-        // first finish records 250ms. The second begin sees 250 > 100
-        // and transitions the branch to "delayed".
-        let tracker = MaintenanceBranchTracker::new();
+    /// Drive `tracker.begin` `n` times against a fixed `last_duration` /
+    /// `tick_interval` so the consecutive-overrun / consecutive-ontime
+    /// counters advance the way real ticks would. Reseting
+    /// `last_duration` after each begin matches the production shape
+    /// where each tick's body finish writes a new value.
+    fn replay_ticks(
+        tracker: &MaintenanceBranchTracker,
+        branch: &'static str,
+        last_duration: Duration,
+        tick_interval: Duration,
+        n: u32,
+    ) {
         let metrics = metrics_for_test();
-        tracker.branches.lock().unwrap().insert(
+        for _ in 0..n {
+            // The check in `begin` reads `state.last_duration` set by
+            // the *previous* tick. Re-seed it to the same value on
+            // every iteration so we model `n` consecutive ticks at the
+            // same duration.
+            tracker
+                .branches
+                .lock()
+                .unwrap()
+                .entry(branch)
+                .or_default()
+                .last_duration = Some(last_duration);
+            let _timer = tracker.begin(branch, tick_interval, &metrics);
+        }
+    }
+
+    #[test]
+    fn branch_tracker_single_overrun_does_not_flip() {
+        // Hysteresis: one overrun observation isn't enough to flip
+        // `is_delayed`. A tick that goes 101ms against a 100ms
+        // interval shouldn't spam the log.
+        let tracker = MaintenanceBranchTracker::new();
+        replay_ticks(
+            &tracker,
             "cleanup",
-            MaintenanceBranchState {
-                last_duration: Some(Duration::from_millis(250)),
-                is_delayed: false,
-            },
+            Duration::from_millis(101),
+            Duration::from_millis(100),
+            1,
         );
-        let _timer = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
         let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
         assert!(
-            is_delayed,
-            "branch should flip to delayed when last_duration exceeds tick interval"
+            !is_delayed,
+            "single overrun must not flip is_delayed (hysteresis K=3)"
+        );
+    }
+
+    #[test]
+    fn branch_tracker_k_consecutive_overruns_flips() {
+        // After `OVERRUN_HYSTERESIS_K` (3) consecutive overruns, flip.
+        let tracker = MaintenanceBranchTracker::new();
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
+        );
+        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
+        assert!(is_delayed, "K consecutive overruns must flip to delayed");
+    }
+
+    #[test]
+    fn branch_tracker_intermittent_overrun_does_not_flip() {
+        // Pattern: overrun, on-time, overrun, on-time, overrun (5
+        // ticks, 3 of them overruns but not consecutive). Must stay
+        // on-time.
+        let tracker = MaintenanceBranchTracker::new();
+        for over in [true, false, true, false, true] {
+            let dur = if over {
+                Duration::from_millis(150)
+            } else {
+                Duration::from_millis(50)
+            };
+            replay_ticks(&tracker, "cleanup", dur, Duration::from_millis(100), 1);
+        }
+        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
+        assert!(
+            !is_delayed,
+            "intermittent overruns must not flip is_delayed without K consecutive"
         );
     }
 
     #[test]
     fn branch_tracker_does_not_re_flag_while_already_delayed() {
-        // While already delayed, a further overrun must NOT re-emit the
-        // warning/counter. This is the "one event per overrun episode"
-        // requirement from the #242 acceptance bar.
+        // While already delayed, further overruns must not re-emit
+        // (state stays delayed). #242's "one event per overrun episode."
         let tracker = MaintenanceBranchTracker::new();
-        let metrics = metrics_for_test();
-        tracker.branches.lock().unwrap().insert(
+        // Push past the K=3 threshold.
+        replay_ticks(
+            &tracker,
             "cleanup",
-            MaintenanceBranchState {
-                last_duration: Some(Duration::from_millis(300)),
-                is_delayed: true,
-            },
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K + 5,
         );
-        let _timer = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
         let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
-        // Stays delayed. (The "one event per episode" contract is at the
-        // emission layer; this assertion confirms the state doesn't
-        // toggle off and on between consecutive overruns, which would
-        // otherwise produce duplicate events.)
-        assert!(is_delayed);
+        assert!(is_delayed, "stays delayed across further overrun ticks");
     }
 
     #[test]
-    fn branch_tracker_recovers_to_on_time() {
-        // Branch was delayed, last_duration drops back under the tick
-        // interval — the next begin should clear is_delayed.
+    fn branch_tracker_recovers_only_after_k_ontime_ticks() {
+        // Hysteresis on the recovery side too: a single under-interval
+        // tick mid-overrun must not clear is_delayed.
         let tracker = MaintenanceBranchTracker::new();
-        let metrics = metrics_for_test();
-        tracker.branches.lock().unwrap().insert(
+        replay_ticks(
+            &tracker,
             "cleanup",
-            MaintenanceBranchState {
-                last_duration: Some(Duration::from_millis(50)),
-                is_delayed: true,
-            },
+            Duration::from_millis(250),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
         );
-        let _timer = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
-        let (_, is_delayed) = tracker.snapshot("cleanup").expect("snapshot");
         assert!(
-            !is_delayed,
-            "branch should recover to on-time when last_duration is back under the interval"
+            tracker.snapshot("cleanup").unwrap().1,
+            "delayed after K overruns"
+        );
+
+        // One on-time tick — still delayed.
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            1,
+        );
+        assert!(
+            tracker.snapshot("cleanup").unwrap().1,
+            "single on-time tick must not clear delayed (hysteresis K=3)"
+        );
+
+        // Two more on-time ticks — total K consecutive — recovers.
+        replay_ticks(
+            &tracker,
+            "cleanup",
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K - 1,
+        );
+        assert!(
+            !tracker.snapshot("cleanup").unwrap().1,
+            "K consecutive on-time ticks recover from delayed"
         );
     }
 
     #[test]
     fn branch_tracker_per_branch_state_is_independent() {
-        // Two branches advance independently — overrun on one does not
-        // bleed into the other.
+        // Drive "cleanup" past the K=3 overrun threshold while
+        // "promote_scheduled" stays on-time the whole time. Branches
+        // must not share state.
         let tracker = MaintenanceBranchTracker::new();
-        let metrics = metrics_for_test();
-        tracker.branches.lock().unwrap().insert(
+        replay_ticks(
+            &tracker,
             "cleanup",
-            MaintenanceBranchState {
-                last_duration: Some(Duration::from_millis(500)),
-                is_delayed: false,
-            },
+            Duration::from_millis(500),
+            Duration::from_millis(100),
+            OVERRUN_HYSTERESIS_K,
         );
-        tracker.branches.lock().unwrap().insert(
+        replay_ticks(
+            &tracker,
             "promote_scheduled",
-            MaintenanceBranchState {
-                last_duration: Some(Duration::from_millis(10)),
-                is_delayed: false,
-            },
+            Duration::from_millis(10),
+            Duration::from_millis(250),
+            OVERRUN_HYSTERESIS_K,
         );
-        let _t1 = tracker.begin("cleanup", Duration::from_millis(100), &metrics);
-        let _t2 = tracker.begin("promote_scheduled", Duration::from_millis(250), &metrics);
         assert!(tracker.snapshot("cleanup").unwrap().1);
         assert!(!tracker.snapshot("promote_scheduled").unwrap().1);
+    }
+
+    // ── PruneBackoffTracker (#169) ────────────────────────────────────
+
+    fn skip_active(slot: i32) -> PruneOutcome {
+        PruneOutcome::SkippedActive {
+            slot,
+            reason: SkipReason::LeaseActive,
+            count: 1,
+        }
+    }
+
+    #[test]
+    fn prune_backoff_initial_state_does_not_skip() {
+        let tracker = PruneBackoffTracker::new();
+        assert!(!tracker.should_skip(PRUNE_BRANCH_LEASE));
+        assert_eq!(
+            tracker.snapshot(PRUNE_BRANCH_LEASE),
+            Some((0, 0)),
+            "polling once must not introduce backoff"
+        );
+    }
+
+    #[test]
+    fn prune_backoff_skipped_active_doubles_then_resets_on_pruned() {
+        let tracker = PruneBackoffTracker::new();
+
+        // First failure: backoff_level=1, skip the next 2 ticks.
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((2, 1)));
+        assert!(tracker.should_skip(PRUNE_BRANCH_LEASE));
+        assert!(tracker.should_skip(PRUNE_BRANCH_LEASE));
+        assert!(!tracker.should_skip(PRUNE_BRANCH_LEASE));
+
+        // Second failure: backoff_level=2, skip the next 4.
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((4, 2)));
+
+        // Recovery: Pruned clears everything.
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Pruned { slot: 0 });
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((0, 0)));
+        assert!(!tracker.should_skip(PRUNE_BRANCH_LEASE));
+    }
+
+    #[test]
+    fn prune_backoff_blocked_increases_level_same_as_skipped_active() {
+        let tracker = PruneBackoffTracker::new();
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Blocked { slot: 0 });
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((2, 1)));
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Blocked { slot: 0 });
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((4, 2)));
+    }
+
+    #[test]
+    fn prune_backoff_noop_is_neutral() {
+        let tracker = PruneBackoffTracker::new();
+        // Build up some backoff first so we have observable state.
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        let before = tracker.snapshot(PRUNE_BRANCH_LEASE);
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &PruneOutcome::Noop);
+        let after = tracker.snapshot(PRUNE_BRANCH_LEASE);
+        assert_eq!(
+            before, after,
+            "Noop must not change backoff state — there was nothing to do, not a failure"
+        );
+    }
+
+    #[test]
+    fn prune_backoff_caps_at_max_level() {
+        let tracker = PruneBackoffTracker::new();
+        // Drive past the cap to make sure backoff_level saturates.
+        for _ in 0..(MAX_PRUNE_BACKOFF_LEVEL as u32 + 5) {
+            tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        }
+        let (skip_remaining, backoff_level) =
+            tracker.snapshot(PRUNE_BRANCH_LEASE).expect("snapshot");
+        assert_eq!(backoff_level, MAX_PRUNE_BACKOFF_LEVEL);
+        assert_eq!(skip_remaining, 1u32 << MAX_PRUNE_BACKOFF_LEVEL);
+    }
+
+    #[test]
+    fn prune_backoff_per_branch_state_is_independent() {
+        let tracker = PruneBackoffTracker::new();
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        tracker.record_outcome(PRUNE_BRANCH_LEASE, &skip_active(0));
+        // Claim branch is untouched.
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_LEASE), Some((4, 2)));
+        assert_eq!(tracker.snapshot(PRUNE_BRANCH_CLAIM), None);
+        assert!(!tracker.should_skip(PRUNE_BRANCH_CLAIM));
     }
 
     #[test]
