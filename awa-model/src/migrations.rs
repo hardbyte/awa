@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 24;
+pub const CURRENT_VERSION: i32 = 25;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -108,6 +108,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Lower fillfactor to 50 on leases and lease_claims partitions",
         &[V24_UP],
     ),
+    (
+        25,
+        "Drop idx_<schema>_leases_<slot>_state_hb on all AWA substrates",
+        &[V25_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -133,6 +138,7 @@ const V21_UP: &str = include_str!("../migrations/v021_shard_aware_lane_indexes.s
 const V22_UP: &str = include_str!("../migrations/v022_delete_compat_terminal_counter.sql");
 const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_substrate.sql");
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
+const V25_UP: &str = include_str!("../migrations/v025_drop_leases_state_hb_index.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
