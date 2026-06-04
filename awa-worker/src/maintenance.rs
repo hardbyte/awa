@@ -110,7 +110,7 @@ const OVERRUN_LOWER_DEN: u32 = 10;
 const BRANCH_COOLDOWN_TICKS: u32 = 120;
 
 /// Records the start of one branch body and emits observability when the
-/// body returns. Constructed by [`MaintenanceBranchTracker::begin`], which
+/// body returns. Constructed by [`MaintenanceBranchTracker::try_begin`], which
 /// also applies the previous-run overrun check before the body starts so
 /// the warning/counter line up with the fire moment described in #242.
 struct BranchTimer<'a> {
@@ -309,7 +309,7 @@ impl MaintenanceBranchTracker {
 /// <child> IN ACCESS EXCLUSIVE MODE` (with a 50ms timeout) followed by
 /// `SELECT count(*) FROM <child>`. Under a pinned snapshot the child
 /// can't be reclaimed, so the count walks dead tuples and the prune
-/// returns `SkippedActive` — every 50ms by default. This tracker skips
+/// returns `SkippedActive` — every tick. This tracker skips
 /// the next 2^level ticks (capped at 32) after a `SkippedActive` or
 /// `Blocked` outcome, doubling on each repeat. A successful `Pruned`
 /// resets to no backoff. `Noop` (ring empty / nothing to consider)
@@ -331,8 +331,8 @@ struct PruneBackoffState {
     backoff_level: u8,
 }
 
-/// Cap on the backoff exponent. `2^5 = 32` ticks; at the 50ms default
-/// `lease_rotate_interval` that is ~1.6s between prune attempts under
+/// Cap on the backoff exponent. `2^5 = 32` ticks; at the 250ms default
+/// `lease_rotate_interval` that is ~8s between prune attempts under
 /// sustained pin pressure. Long enough to cut the per-tick scan cost
 /// dramatically; short enough that prune resumes promptly once the
 /// snapshot is released.
