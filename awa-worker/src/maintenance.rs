@@ -194,7 +194,15 @@ impl MaintenanceBranchTracker {
         }
 
         // Phase 2: duration-margin + K-consecutive hysteresis.
-        if let Some(last_duration) = state.last_duration {
+        // `take()` consumes the sample so we evaluate each body's
+        // duration exactly once. Without this, when cooldown returns
+        // None (no body runs → no new sample), the next post-cooldown
+        // `try_begin` would re-read the same pre-flip overrun sample,
+        // see `consecutive_overrun >= K` already, and re-arm cooldown
+        // forever. The branch would never run its body again until
+        // the worker restarts. Codex + CodeRabbit both flagged this
+        // on PR #318.
+        if let Some(last_duration) = state.last_duration.take() {
             // Integer-ratio thresholds — avoid f64 in the hot path.
             let upper_threshold = tick_interval * OVERRUN_UPPER_NUM / OVERRUN_UPPER_DEN;
             let lower_threshold = tick_interval * OVERRUN_LOWER_NUM / OVERRUN_LOWER_DEN;
@@ -2525,33 +2533,48 @@ mod tests {
         );
     }
 
-    /// Drive `tracker.try_begin` `n` times against a fixed
-    /// `last_duration` / `tick_interval`. Re-seeds `last_duration`
-    /// before each call so we model `n` consecutive ticks where the
-    /// previous body completed in `last_duration`. Returns the
-    /// observed `try_begin` outcomes (Some = body would have run,
-    /// None = body skipped by cooldown).
+    /// Drive `n` consecutive `try_begin` ticks. When the body would
+    /// have run (try_begin returns Some), call `record_finish` with
+    /// `body_duration` to simulate the body completing in that time.
+    /// When the body is skipped (cooldown returns None), `last_duration`
+    /// is intentionally NOT updated — matching production where a
+    /// skipped tick doesn't produce a new sample. Returns one bool per
+    /// tick: true if the body ran, false if it was skipped.
+    ///
+    /// This helper does NOT seed `last_duration` itself. Tests that need
+    /// an initial sample (e.g., to drive the very first overrun
+    /// observation) must call `seed_last_duration` first.
     fn replay_ticks(
         tracker: &MaintenanceBranchTracker,
         branch: &'static str,
-        last_duration: Duration,
+        body_duration: Duration,
         tick_interval: Duration,
         n: u32,
     ) -> Vec<bool> {
         let metrics = metrics_for_test();
         let mut ran = Vec::with_capacity(n as usize);
         for _ in 0..n {
-            tracker
-                .branches
-                .lock()
-                .unwrap()
-                .entry(branch)
-                .or_default()
-                .last_duration = Some(last_duration);
             let timer_opt = tracker.try_begin(branch, tick_interval, &metrics);
-            ran.push(timer_opt.is_some());
+            let did_run = timer_opt.is_some();
+            ran.push(did_run);
+            if did_run {
+                tracker.record_finish(branch, body_duration);
+            }
         }
         ran
+    }
+
+    /// Explicitly seed `last_duration` as if a prior body completed in
+    /// `dur`. Use to set up the initial state for tests that need
+    /// the first `try_begin` to see a sample.
+    fn seed_last_duration(tracker: &MaintenanceBranchTracker, branch: &'static str, dur: Duration) {
+        tracker
+            .branches
+            .lock()
+            .unwrap()
+            .entry(branch)
+            .or_default()
+            .last_duration = Some(dur);
     }
 
     #[test]
@@ -2559,6 +2582,7 @@ mod tests {
         // A single overrun sample (clearly above the upper threshold)
         // shouldn't flip is_delayed — K-consecutive is required.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(200));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2575,11 +2599,11 @@ mod tests {
     #[test]
     fn branch_tracker_deadband_sample_does_not_advance_counters() {
         // Samples between LOWER (70ms) and UPPER (150ms) of a 100ms
-        // tick — e.g., 101ms or 51ms — must NOT advance either
-        // counter. This is the fix the bench post-mortem prescribed:
-        // 49ms-vs-51ms flap at the boundary no longer accumulates
-        // toward a flip.
+        // tick — e.g., 101ms — must NOT advance either counter. This
+        // is the fix the bench post-mortem prescribed: 49ms-vs-51ms
+        // flap at the boundary no longer accumulates toward a flip.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(101));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2596,9 +2620,12 @@ mod tests {
     #[test]
     fn branch_tracker_k_consecutive_overruns_flips_and_arms_cooldown() {
         // After K=3 consecutive samples clearly above UPPER, flip to
-        // delayed AND arm cooldown. The third try_begin returns None
-        // (cooldown gate fires the same tick we flip).
+        // delayed AND arm cooldown. The third try_begin consumes the
+        // K-th sample, crosses the threshold, and returns None (the
+        // flip-tick skips the body so we don't immediately do more
+        // expensive work).
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         let ran = replay_ticks(
             &tracker,
             "cleanup",
@@ -2619,8 +2646,12 @@ mod tests {
     #[test]
     fn branch_tracker_cooldown_skips_body() {
         // Drive past the flip, then assert subsequent ticks return
-        // None until cooldown decrements to zero.
+        // None until cooldown decrements to zero. After the flip,
+        // `last_duration` was consumed by `take()`, so the cooldown
+        // gate is the only thing returning None here — exactly the
+        // production shape we want.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2628,9 +2659,9 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
-        // Next BRANCH_COOLDOWN_TICKS ticks all skip. Replay with
-        // last_duration = 50ms (on-time) so the cooldown is the only
-        // gate that can return None.
+        // Subsequent ticks return None until cooldown drains. We pass
+        // 50ms as the body_duration but it's unused — `record_finish`
+        // is only called when a body actually runs.
         let ran = replay_ticks(
             &tracker,
             "cleanup",
@@ -2648,10 +2679,14 @@ mod tests {
 
     #[test]
     fn branch_tracker_cooldown_expires_then_body_runs() {
-        // Same setup, plus one more on-time tick after cooldown
-        // expires. That tick's body should run; on-time counter
-        // advances.
+        // After cooldown drains, the first post-cooldown try_begin
+        // sees `last_duration = None` (consumed at the flip, no body
+        // ran during cooldown), so no hysteresis check fires; the
+        // body simply runs. The counters do NOT advance on this
+        // first post-cooldown tick — the sample this body produces
+        // is evaluated on the *next* try_begin.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2673,20 +2708,31 @@ mod tests {
             Duration::from_millis(100),
             1,
         );
-        assert_eq!(ran, vec![true], "post-cooldown tick runs body");
-        let (_, _, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
+        assert_eq!(ran, vec![true], "post-cooldown body runs");
+        let (cooldown, overrun, ontime) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
         assert_eq!(
-            ontime, 1,
-            "on-time counter advances on first post-cooldown tick"
+            cooldown, 0,
+            "cooldown stays at zero after a single fast body"
+        );
+        assert_eq!(
+            overrun, OVERRUN_HYSTERESIS_K,
+            "consecutive_overrun preserved across cooldown (no eval on this tick)"
+        );
+        assert_eq!(
+            ontime, 0,
+            "ontime advances on the next tick — this one had no sample to evaluate"
         );
     }
 
     #[test]
     fn branch_tracker_cooldown_rearms_on_continued_overrun() {
-        // After flip + cooldown expiry, if the next body is STILL
-        // slow (above UPPER), cooldown re-arms — without re-emitting
-        // the flip warning (still already delayed).
+        // After cooldown drains, the first post-cooldown body runs
+        // and is slow. That slow body's sample is evaluated on the
+        // *second* post-cooldown try_begin, where it re-arms cooldown
+        // because consecutive_overrun is already at K (preserved
+        // across the cooldown).
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2694,7 +2740,6 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
-        // Drain cooldown.
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2703,28 +2748,23 @@ mod tests {
             BRANCH_COOLDOWN_TICKS,
         );
 
-        // First post-cooldown body runs and goes slow again. Need
-        // K more overrun samples to "cross" again because we cleared
-        // consecutive_ontime on each ontime tick. Wait — the on-time
-        // ticks during cooldown were skipped (returned None), so the
-        // consecutive_ontime / consecutive_overrun counters were
-        // frozen during cooldown. After cooldown, consecutive_overrun
-        // is still at OVERRUN_HYSTERESIS_K from before — so the very
-        // first overrun observation post-cooldown re-arms cooldown.
+        // Tick 1 post-cooldown: take None, no eval, body runs slow.
+        // Tick 2: take Some(250), consecutive_overrun saturates past
+        // K, is_delayed && cross → re-arm cooldown.
         let ran = replay_ticks(
             &tracker,
             "cleanup",
             Duration::from_millis(250),
             Duration::from_millis(100),
-            1,
+            2,
         );
         assert_eq!(
             ran,
-            vec![false],
-            "stay-delayed overrun re-arms cooldown without running body"
+            vec![true, false],
+            "first tick runs body; second tick re-arms cooldown"
         );
         let (cooldown, _, _) = tracker.cooldown_snapshot("cleanup").expect("snapshot");
-        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS);
+        assert_eq!(cooldown, BRANCH_COOLDOWN_TICKS, "cooldown re-armed");
         assert!(
             tracker.snapshot("cleanup").unwrap().1,
             "still delayed across re-arm"
@@ -2737,6 +2777,7 @@ mod tests {
         // clearly-on-time samples. Non-consecutive overruns never
         // accumulate K=3 because each on-time tick resets the counter.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(200));
         for over in [true, false, true, false, true] {
             let dur = if over {
                 Duration::from_millis(200)
@@ -2753,9 +2794,13 @@ mod tests {
 
     #[test]
     fn branch_tracker_recovers_only_after_k_ontime_ticks_post_cooldown() {
-        // After cooldown expires, K consecutive clearly-on-time ticks
-        // are needed before is_delayed clears.
+        // After cooldown drains, K consecutive on-time samples must be
+        // *evaluated* before is_delayed clears. The very first
+        // post-cooldown body has no sample to evaluate (last_duration
+        // was consumed at the flip), so K evaluable samples require
+        // K+1 post-cooldown ticks: one to seed, K to advance ontime.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(250));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2763,7 +2808,6 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
-        // Drain cooldown.
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2771,21 +2815,22 @@ mod tests {
             Duration::from_millis(100),
             BRANCH_COOLDOWN_TICKS,
         );
-        // K-1 on-time ticks — not yet recovered. (consecutive_overrun
-        // was OVERRUN_HYSTERESIS_K post-flip; the first on-time tick
-        // that actually runs resets it to 0 and bumps ontime to 1.)
+
+        // K post-cooldown ticks: tick 1 seeds, ticks 2..K evaluate K-1
+        // on-time samples. Still delayed.
         replay_ticks(
             &tracker,
             "cleanup",
             Duration::from_millis(50),
             Duration::from_millis(100),
-            OVERRUN_HYSTERESIS_K - 1,
+            OVERRUN_HYSTERESIS_K,
         );
         assert!(
             tracker.snapshot("cleanup").unwrap().1,
-            "still delayed before K-th on-time tick"
+            "still delayed after only K-1 evaluations"
         );
-        // K-th on-time tick — recovers.
+
+        // (K+1)-th tick evaluates the K-th on-time sample → recovery.
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2795,7 +2840,7 @@ mod tests {
         );
         assert!(
             !tracker.snapshot("cleanup").unwrap().1,
-            "recovered after K consecutive on-time"
+            "recovered after K evaluable on-time samples"
         );
     }
 
@@ -2805,6 +2850,7 @@ mod tests {
         // "promote_scheduled" stays on-time the whole time. Branches
         // must not share state.
         let tracker = MaintenanceBranchTracker::new();
+        seed_last_duration(&tracker, "cleanup", Duration::from_millis(500));
         replay_ticks(
             &tracker,
             "cleanup",
@@ -2812,6 +2858,7 @@ mod tests {
             Duration::from_millis(100),
             OVERRUN_HYSTERESIS_K,
         );
+        seed_last_duration(&tracker, "promote_scheduled", Duration::from_millis(10));
         replay_ticks(
             &tracker,
             "promote_scheduled",
