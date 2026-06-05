@@ -260,13 +260,19 @@ PausedBlocksEnqueue ==
 
 \* ─── Liveness (under fairness) ────────────────────────────
 \*
-\* Liveness requires an external availability assumption: at least one
-\* instance stays alive and eventually becomes leader. In a finite model
-\* where TLC can crash the entire cluster, this cannot be checked without
-\* restricting the spec. We check liveness under a "stable cluster" Next
-\* that omits Crash/Recover (all instances stay alive). Pause and Resume
-\* remain in scope; weak fairness on Resume ensures that any pause is
-\* eventually undone, so liveness holds.
+\* Liveness requires external assumptions:
+\*   - at least one instance stays alive and eventually becomes leader, and
+\*   - the operator stops adversarially pausing: a paused schedule will
+\*     eventually be resumed, after which it stays active.
+\*
+\* In a finite model where TLC can crash the entire cluster or storm
+\* Pause / Resume, neither liveness claim can be checked without
+\* restricting the spec. StableNext omits Crash, Recover, and Pause but
+\* keeps Resume so an initially-paused schedule can become active. Weak
+\* fairness on Resume ensures that any pause eventually clears. Safety
+\* (Spec, PausedBlocksEnqueue) is still checked across the full Next
+\* that includes the omitted actions — the restriction only narrows
+\* what liveness means, not what safety must hold under.
 
 StableNext ==
     \/ AdvanceClock
@@ -275,7 +281,6 @@ StableNext ==
     \/ \E i \in Instances : ReadCronState(i)
     \/ \E i \in Instances : AtomicEnqueue(i)
     \/ \E i \in Instances : CASFail(i)
-    \/ Pause
     \/ Resume
 
 StableSpec == Init /\ [][StableNext]_vars
@@ -290,14 +295,12 @@ FairSpec ==
     /\ WF_vars(Resume)
 
 \* Coalesced schedules eventually enqueue the latest due fire.
-\* Checked under FairSpec (stable cluster with no crashes; Resume eventually
-\* fires if Pause is asserted).
+\* Checked under FairSpec (stable cluster, no adversarial pause/resume).
 CoalescedLatestFireEventuallyEnqueued ==
     (policy = "coalesce" /\ clock = MaxFire) ~> (jobCount[MaxFire] = 1)
 
 \* Catch-up schedules eventually enqueue every missed fire in order.
-\* Checked under FairSpec (stable cluster with no crashes; Resume eventually
-\* fires if Pause is asserted).
+\* Checked under FairSpec (stable cluster, no adversarial pause/resume).
 CatchUpFiresEventuallyEnqueued ==
     (policy = "catch_up" /\ clock = MaxFire) ~> (\A f \in FireTimes : jobCount[f] = 1)
 

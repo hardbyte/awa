@@ -81,7 +81,7 @@ Cron pause and queue pause are also independent. Queue pause is enforced at disp
 
 #### Model
 
-The pause guarantee is verified in TLA+. `AwaCron` includes `Pause` and `Resume` actions; the `PausedBlocksEnqueue` property asserts that no step taken from a paused state increments `jobCount`. Liveness is checked under weak fairness on `Resume`, so a paused schedule still satisfies the "due fires eventually enqueue" property once Resume is taken.
+The pause guarantee is verified in TLA+. `AwaCron` includes `Pause` and `Resume` actions; the `PausedBlocksEnqueue` property asserts that no step taken from a paused state increments `jobCount` and is checked across the full safety spec, including Pause / Resume storms. Liveness (`CoalescedLatestFireEventuallyEnqueued`, `CatchUpFiresEventuallyEnqueued`) is checked under a restricted "stable cluster, no adversarial pause" spec that includes `Resume` (with weak fairness) but omits `Pause` — TLC otherwise finds a Pause / Resume storm that starves `AtomicEnqueue` by toggling `paused` between the leader's read and CAS. This matches how the model already omits `Crash` / `Recover` from the liveness spec: progress claims hold only when the environment is not adversarial.
 
 ### Leader liveness verification
 
