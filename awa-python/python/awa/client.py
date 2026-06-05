@@ -671,7 +671,7 @@ class AsyncClient:
         queue_storage_claim_slot_count: int = DEFAULT_QUEUE_STORAGE_CLAIM_SLOT_COUNT,
         queue_storage_queue_stripe_count: int = DEFAULT_QUEUE_STORAGE_QUEUE_STRIPE_COUNT,
         queue_storage_queue_rotate_interval_ms: int = 1000,
-        queue_storage_lease_rotate_interval_ms: int = 50,
+        queue_storage_lease_rotate_interval_ms: int = 250,
         queue_storage_claim_rotate_interval_ms: int | None = None,
         storage_transition_role: Literal[
             "auto", "canonical_drain", "queue_storage_target"
