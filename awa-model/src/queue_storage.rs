@@ -1048,6 +1048,11 @@ struct ClaimCursorAdvance {
     only_if_current: Option<i64>,
 }
 
+type ClaimCursorLaneKey = (String, i16, i16);
+type ConditionalClaimCursorAdvances = BTreeMap<i64, i64>;
+type GroupedClaimCursorAdvances =
+    BTreeMap<ClaimCursorLaneKey, (Option<i64>, ConditionalClaimCursorAdvances)>;
+
 struct CancelJobTxResult {
     row: JobRow,
     claim_cursor_advance: Option<ClaimCursorAdvance>,
@@ -3064,7 +3069,7 @@ impl QueueStorage {
     }
 
     fn claim_cursor_advances(rows: &[ReadyJobLeaseRow]) -> Vec<ClaimCursorAdvance> {
-        let mut next_by_lane: BTreeMap<(String, i16, i16), i64> = BTreeMap::new();
+        let mut next_by_lane: BTreeMap<ClaimCursorLaneKey, i64> = BTreeMap::new();
         for row in rows {
             let key = (row.queue.clone(), row.lane_priority, row.enqueue_shard);
             let next = row.lane_seq + 1;
@@ -3089,8 +3094,7 @@ impl QueueStorage {
     }
 
     fn normalize_claim_cursor_advances(advances: &[ClaimCursorAdvance]) -> Vec<ClaimCursorAdvance> {
-        let mut grouped: BTreeMap<(String, i16, i16), (Option<i64>, BTreeMap<i64, i64>)> =
-            BTreeMap::new();
+        let mut grouped: GroupedClaimCursorAdvances = BTreeMap::new();
 
         for advance in advances {
             let key = (

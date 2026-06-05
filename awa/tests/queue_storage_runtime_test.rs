@@ -26,6 +26,18 @@ use uuid::Uuid;
 
 static QUEUE_STORAGE_RUNTIME_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
+#[derive(Debug, PartialEq, sqlx::FromRow)]
+struct RawReceiptClaimRow {
+    ready_slot: i32,
+    ready_generation: i64,
+    job_id: i64,
+    priority: i16,
+    attempt: i16,
+    run_lease: i64,
+    lane_seq: i64,
+    claim_slot: i32,
+}
+
 fn install_in_memory_metrics() -> (InMemoryMetricExporter, SdkMeterProvider) {
     let exporter = InMemoryMetricExporter::default();
     let meter_provider = SdkMeterProvider::builder()
@@ -3821,7 +3833,7 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .await
     .expect("claim sequence name");
 
-    let first: Vec<(i32, i64, i64, i16, i16, i64, i64, i32)> = sqlx::query_as(&format!(
+    let first: Vec<RawReceiptClaimRow> = sqlx::query_as(&format!(
         "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
          FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
     ))
@@ -3833,7 +3845,19 @@ async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advanc
     .await
     .expect("first raw receipt claim");
 
-    assert_eq!(first, vec![(0, 0, job_id, 2, 1, 1, 1, 0)]);
+    assert_eq!(
+        first,
+        vec![RawReceiptClaimRow {
+            ready_slot: 0,
+            ready_generation: 0,
+            job_id,
+            priority: 2,
+            attempt: 1,
+            run_lease: 1,
+            lane_seq: 1,
+            claim_slot: 0,
+        }]
+    );
     assert_eq!(
         claim_cursor().await,
         1,
