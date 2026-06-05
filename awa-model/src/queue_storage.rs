@@ -22,6 +22,7 @@ const DEFAULT_QUEUE_STRIPE_COUNT: usize = 1;
 const QUEUE_STRIPE_DELIMITER: &str = "#";
 const COPY_NULL_SENTINEL: &str = "__AWA_NULL__";
 const COPY_CHUNK_TARGET_BYTES: usize = 256 * 1024;
+const TERMINAL_COUNTER_BUCKETS: i16 = 256;
 
 /// Deterministically map an ordering key to a shard in `[0, shards)`.
 ///
@@ -44,6 +45,10 @@ pub fn shard_for_ordering_key(ordering_key: &[u8], shards: i16) -> i16 {
         hash = hash.wrapping_mul(PRIME).wrapping_add(*byte as u128) & MASK;
     }
     (hash % (shards as u128)) as i16
+}
+
+fn terminal_counter_bucket(job_id: i64) -> i16 {
+    job_id.rem_euclid(TERMINAL_COUNTER_BUCKETS as i64) as i16
 }
 
 #[derive(Debug, Clone)]
@@ -204,10 +209,9 @@ pub struct QueueCounts {
 }
 
 /// Cheap available-only signal used by the dispatcher's claimer-sizing
-/// control loop. Derives the count from
-/// `queue_enqueue_heads.next_seq − queue_claim_heads.claim_seq`
-/// summed over the queue's physical stripes — two PK reads per lane,
-/// O(few rows) regardless of backlog size.
+/// control loop. Derives the count from enqueue and claim sequence cursors
+/// summed over the queue's physical stripes — two PK reads per lane, O(few
+/// rows) regardless of backlog size.
 ///
 /// This is intentionally a separate type from [`QueueCounts`]: the
 /// dispatcher claim hot path only consumes the available count, and
@@ -990,6 +994,20 @@ struct ReadyTransitionRow {
     unique_key: Option<Vec<u8>>,
     unique_states: Option<String>,
     payload: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct ClaimCursorAdvance {
+    queue: String,
+    priority: i16,
+    enqueue_shard: i16,
+    next_seq: i64,
+    only_if_current: Option<i64>,
+}
+
+struct CancelJobTxResult {
+    row: JobRow,
+    claim_cursor_advance: Option<ClaimCursorAdvance>,
 }
 
 impl ReadyTransitionRow {
@@ -2668,7 +2686,7 @@ impl QueueStorage {
         // rows for this `(queue, priority, shard)` triple. The cache is
         // optimistic — if that earlier transaction rolled back, the head
         // row is missing even though the cache says it exists.
-        // `advance_enqueue_head` detects that case via the empty UPDATE
+        // `advance_enqueue_head` detects that case via the empty reserve
         // result, invalidates the cache entry, and re-runs
         // `ensure_lane_inserts` directly (bypassing this fast path).
         if self.lane_is_cached(queue, priority, enqueue_shard) {
@@ -2724,6 +2742,18 @@ impl QueueStorage {
             INSERT INTO {schema}.queue_claim_heads (queue, priority, enqueue_shard)
             VALUES ($1, $2, $3)
             ON CONFLICT (queue, priority, enqueue_shard) DO NOTHING
+            "#
+        ))
+        .bind(queue)
+        .bind(priority)
+        .bind(enqueue_shard)
+        .execute(tx.as_mut())
+        .await
+        .map_err(map_sqlx_error)?;
+
+        sqlx::query(&format!(
+            r#"
+            SELECT {schema}.ensure_lane_sequences($1, $2, $3)
             "#
         ))
         .bind(queue)
@@ -2835,13 +2865,13 @@ impl QueueStorage {
             .clear();
     }
 
-    // Advance `queue_enqueue_heads.next_seq` for a specific
+    // Reserve lane sequence numbers for a specific
     // `(queue, priority, shard)` triple and return the lane sequence at
     // which the caller's range starts. If the head row is missing —
     // typically because a previous ensure_lane ran inside a transaction
     // that ultimately rolled back, leaving a stale cache entry behind —
-    // the cache entry is invalidated, ensure_lane is re-run, and the
-    // UPDATE is retried exactly once. A second miss surfaces as
+    // the cache entry is invalidated, ensure_lane is re-run, and the reserve
+    // is retried exactly once. A second miss surfaces as
     // RowNotFound.
     async fn advance_enqueue_head<'a>(
         &self,
@@ -2854,10 +2884,9 @@ impl QueueStorage {
         let schema = self.schema();
         let sql = format!(
             r#"
-            UPDATE {schema}.queue_enqueue_heads
-            SET next_seq = next_seq + $4
+            SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)
+            FROM {schema}.queue_enqueue_heads
             WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3
-            RETURNING next_seq - $4
             "#
         );
 
@@ -2989,6 +3018,86 @@ impl QueueStorage {
         .fetch_all(tx.as_mut())
         .await
         .map_err(map_sqlx_error)
+    }
+
+    fn claim_cursor_advances(rows: &[ReadyJobLeaseRow]) -> Vec<ClaimCursorAdvance> {
+        let mut next_by_lane: BTreeMap<(String, i16, i16), i64> = BTreeMap::new();
+        for row in rows {
+            let key = (row.queue.clone(), row.lane_priority, row.enqueue_shard);
+            let next = row.lane_seq + 1;
+            next_by_lane
+                .entry(key)
+                .and_modify(|current| *current = (*current).max(next))
+                .or_insert(next);
+        }
+
+        next_by_lane
+            .into_iter()
+            .map(
+                |((queue, priority, enqueue_shard), next_seq)| ClaimCursorAdvance {
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    next_seq,
+                    only_if_current: None,
+                },
+            )
+            .collect()
+    }
+
+    async fn advance_claim_cursors(&self, pool: &PgPool, advances: &[ClaimCursorAdvance]) {
+        // PostgreSQL sequence state is not rolled back with the surrounding
+        // transaction. Keep claim cursors lagging rather than risking a cursor
+        // that gets ahead of ready rows whose claim/cancel transaction aborts.
+        if let Err(err) = self.advance_claim_cursors_strict(pool, advances).await {
+            tracing::warn!(
+                error = ?err,
+                lanes = advances.len(),
+                "failed to advance queue-storage claim cursors after committed state change"
+            );
+        }
+    }
+
+    async fn advance_claim_cursors_strict(
+        &self,
+        pool: &PgPool,
+        advances: &[ClaimCursorAdvance],
+    ) -> Result<(), AwaError> {
+        if advances.is_empty() {
+            return Ok(());
+        }
+
+        let schema = self.schema();
+        let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
+        for advance in advances {
+            sqlx::query(&format!(
+                r#"
+                WITH head AS MATERIALIZED (
+                    SELECT seq_name
+                    FROM {schema}.queue_claim_heads
+                    WHERE queue = $1
+                      AND priority = $2
+                      AND enqueue_shard = $3
+                    FOR UPDATE
+                )
+                SELECT {schema}.set_sequence_next(seq_name, $4)
+                FROM head
+                WHERE $5::bigint IS NULL
+                   OR {schema}.sequence_next_value(seq_name) = $5
+                "#
+            ))
+            .bind(&advance.queue)
+            .bind(advance.priority)
+            .bind(advance.enqueue_shard)
+            .bind(advance.next_seq)
+            .bind(advance.only_if_current)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx_error)?;
+        Ok(())
     }
 
     async fn execute_ready_inserts_tx<'a>(
@@ -3586,13 +3695,14 @@ impl QueueStorage {
         // or they can deadlock on the ON CONFLICT DO UPDATE. Sorted key
         // iteration removes that race entirely. See also the matching
         // ORDER BY in the fused CTE upsert.
-        let mut by_group: BTreeMap<(i32, String, i16, i16), i64> = BTreeMap::new();
+        let mut by_group: BTreeMap<(i32, String, i16, i16, i16), i64> = BTreeMap::new();
         for row in rows {
             let key = (
                 row.ready_slot,
                 row.queue.clone(),
                 row.priority,
                 row.enqueue_shard,
+                terminal_counter_bucket(row.job_id),
             );
             *by_group.entry(key).or_insert(0) += 1;
         }
@@ -3600,12 +3710,14 @@ impl QueueStorage {
         let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
         let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut counter_buckets: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
-        for ((slot, queue, prio, shard), delta) in by_group {
+        for ((slot, queue, prio, shard, bucket), delta) in by_group {
             ready_slots.push(slot);
             queues.push(queue);
             priorities.push(prio);
             enqueue_shards.push(shard);
+            counter_buckets.push(bucket);
             deltas.push(delta);
         }
         let schema = self.schema();
@@ -3614,14 +3726,14 @@ impl QueueStorage {
         sqlx::query(&format!(
             r#"
             INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
             )
-            SELECT ready_slot, queue, priority, enqueue_shard, delta
+            SELECT ready_slot, queue, priority, enqueue_shard, counter_bucket, delta
             FROM unnest(
-                $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[]
-            ) AS d(ready_slot, queue, priority, enqueue_shard, delta)
-            ORDER BY ready_slot, queue, priority, enqueue_shard
-            ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+                $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::smallint[], $6::bigint[]
+            ) AS d(ready_slot, queue, priority, enqueue_shard, counter_bucket, delta)
+            ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
             SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
             "#
         ))
@@ -3629,6 +3741,7 @@ impl QueueStorage {
         .bind(&queues)
         .bind(&priorities)
         .bind(&enqueue_shards)
+        .bind(&counter_buckets)
         .bind(&deltas)
         .execute(tx.as_mut())
         .await
@@ -3644,7 +3757,7 @@ impl QueueStorage {
     async fn decrement_live_terminal_counters_tx<'a>(
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
-        rows: &[(i32, String, i16, i16)],
+        rows: &[(i32, String, i16, i16, i16)],
     ) -> Result<(), AwaError> {
         if rows.is_empty() {
             return Ok(());
@@ -3654,7 +3767,7 @@ impl QueueStorage {
         // its driving subquery; sorting the unnest input gives a stable
         // (slot, queue, priority, shard) lock-acquisition order across
         // concurrent transactions.
-        let mut by_group: BTreeMap<(i32, String, i16, i16), i64> = BTreeMap::new();
+        let mut by_group: BTreeMap<(i32, String, i16, i16, i16), i64> = BTreeMap::new();
         for key in rows {
             *by_group.entry(key.clone()).or_insert(0) += 1;
         }
@@ -3662,12 +3775,14 @@ impl QueueStorage {
         let mut queues: Vec<String> = Vec::with_capacity(by_group.len());
         let mut priorities: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut enqueue_shards: Vec<i16> = Vec::with_capacity(by_group.len());
+        let mut counter_buckets: Vec<i16> = Vec::with_capacity(by_group.len());
         let mut deltas: Vec<i64> = Vec::with_capacity(by_group.len());
-        for ((slot, queue, prio, shard), delta) in by_group {
+        for ((slot, queue, prio, shard, bucket), delta) in by_group {
             ready_slots.push(slot);
             queues.push(queue);
             priorities.push(prio);
             enqueue_shards.push(shard);
+            counter_buckets.push(bucket);
             deltas.push(delta);
         }
         let schema = self.schema();
@@ -3676,22 +3791,24 @@ impl QueueStorage {
             UPDATE {schema}.queue_terminal_live_counts AS counts
             SET live_terminal_count = GREATEST(0, counts.live_terminal_count - sorted.delta)
             FROM (
-                SELECT ready_slot, queue, priority, enqueue_shard, delta
+                SELECT ready_slot, queue, priority, enqueue_shard, counter_bucket, delta
                 FROM unnest(
-                    $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::bigint[]
-                ) AS d(ready_slot, queue, priority, enqueue_shard, delta)
-                ORDER BY ready_slot, queue, priority, enqueue_shard
+                    $1::int[], $2::text[], $3::smallint[], $4::smallint[], $5::smallint[], $6::bigint[]
+                ) AS d(ready_slot, queue, priority, enqueue_shard, counter_bucket, delta)
+                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
             ) AS sorted
             WHERE counts.ready_slot     = sorted.ready_slot
               AND counts.queue          = sorted.queue
               AND counts.priority       = sorted.priority
               AND counts.enqueue_shard  = sorted.enqueue_shard
+              AND counts.counter_bucket = sorted.counter_bucket
             "#
         ))
         .bind(&ready_slots)
         .bind(&queues)
         .bind(&priorities)
         .bind(&enqueue_shards)
+        .bind(&counter_buckets)
         .bind(&deltas)
         .execute(tx.as_mut())
         .await
@@ -3703,7 +3820,7 @@ impl QueueStorage {
     /// from a slice of `DoneJobRow` (used by retry-from-terminal,
     /// DLQ move, and discard, all of which DELETE FROM done_entries
     /// with `RETURNING *` materialised into `DoneJobRow`).
-    fn done_rows_to_counter_keys(rows: &[DoneJobRow]) -> Vec<(i32, String, i16, i16)> {
+    fn done_rows_to_counter_keys(rows: &[DoneJobRow]) -> Vec<(i32, String, i16, i16, i16)> {
         rows.iter()
             .map(|row| {
                 (
@@ -3711,6 +3828,7 @@ impl QueueStorage {
                     row.queue.clone(),
                     row.priority,
                     row.enqueue_shard,
+                    terminal_counter_bucket(row.job_id),
                 )
             })
             .collect()
@@ -4265,12 +4383,15 @@ impl QueueStorage {
                 .await?,
             );
         }
+        let claim_cursor_advances = Self::claim_cursor_advances(&claimed_rows);
         let claimed = claimed_rows
             .into_iter()
             .map(|row| row.claim_ref(self.lease_claim_receipts()))
             .collect();
 
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.advance_claim_cursors(pool, &claim_cursor_advances)
+            .await;
         Ok(claimed)
     }
 
@@ -4389,17 +4510,25 @@ impl QueueStorage {
             // timestamp, so a post-commit conversion error would strand the
             // materialized lease indefinitely. Keep the old rollback semantics
             // for that path.
-            let claimed = claimed
-                .into_iter()
+            let converted = claimed
+                .iter()
+                .cloned()
                 .map(|row| row.into_claimed_runtime_job(use_lease_claim_receipts))
                 .collect::<Result<Vec<_>, _>>()?;
+            let claim_cursor_advances = Self::claim_cursor_advances(&claimed);
             tx.commit().await.map_err(map_sqlx_error)?;
-            return Ok(claimed);
+            self.advance_claim_cursors(pool, &claim_cursor_advances)
+                .await;
+            return Ok(converted);
         }
+
+        let claim_cursor_advances = Self::claim_cursor_advances(&claimed);
 
         // Release claim locks before doing Rust-side payload conversion; this
         // keeps the hot claim transaction focused on database state changes.
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.advance_claim_cursors(pool, &claim_cursor_advances)
+            .await;
 
         claimed
             .into_iter()
@@ -4593,10 +4722,10 @@ impl QueueStorage {
         signal: &AvailableSignal,
         max_claimers: i16,
     ) -> i16 {
-        // The signal source `queue_enqueue_heads.next_seq -
-        // queue_claim_heads.claim_seq` counts lane positions enqueued
-        // but not yet claimed, so we don't subtract a running count —
-        // already-claimed rows are excluded by the claim_seq advance.
+        // The signal source counts sequence positions reserved for enqueue
+        // but not yet claimed. It can over-count deleted or uncommitted
+        // positions, but already-claimed rows are excluded by the claim cursor
+        // advance.
         // `backlog` is retained as a separate name in the threshold
         // table to keep room for shape tweaks that diverge from
         // `available` later.
@@ -4712,14 +4841,14 @@ impl QueueStorage {
 
     /// Cheap, dispatcher-grade available-count signal.
     ///
-    /// Sums `next_seq - claim_seq` across the queue's (queue, priority)
-    /// lanes — one PK read into each of the two head tables per lane
+    /// Sums `enqueue_cursor - claim_cursor` across the queue's
+    /// (queue, priority) lanes — one PK read into each of the two head tables per lane
     /// (typically ≤ 4 lanes per logical queue). The difference is an
     /// upper bound on the count of unclaimed ready rows: admin DELETEs
-    /// of unclaimed jobs leave a gap between `claim_seq` and `next_seq`
-    /// until the next claim attempt's gap-recovery branch closes it.
-    /// The dispatcher tolerates this drift because the worst case is
-    /// one wasted claim attempt that finds no rows.
+    /// of unclaimed jobs and in-flight enqueue reservations can leave a
+    /// gap between `claim_cursor` and `enqueue_cursor`. The dispatcher
+    /// tolerates this drift because the worst case is a wasted claim
+    /// attempt that finds no committed rows.
     ///
     /// For an exact count, use [`Self::queue_counts_exact`], which
     /// scans `ready_entries`.
@@ -4732,7 +4861,14 @@ impl QueueStorage {
         let queues = self.physical_queues_for_logical(queue);
         let available: i64 = sqlx::query_scalar(&format!(
             r#"
-            SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint
+            SELECT COALESCE(
+                sum(GREATEST(
+                    {schema}.sequence_next_value(qe.seq_name)
+                        - {schema}.sequence_next_value(qc.seq_name),
+                    0
+                )),
+                0
+            )::bigint
             FROM {schema}.queue_enqueue_heads AS qe
             JOIN {schema}.queue_claim_heads AS qc
               ON qc.queue = qe.queue
@@ -5072,22 +5208,27 @@ impl QueueStorage {
             -- differed.
             counter_upsert AS (
                 INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                    ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                    ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
                 )
                 SELECT
-                    ready_slot, queue, priority, enqueue_shard, delta
+                    ready_slot, queue, priority, enqueue_shard, counter_bucket, delta
                 FROM (
                     SELECT
                         terminal.ready_slot,
                         terminal.queue,
                         terminal.priority,
                         terminal.enqueue_shard,
+                        mod(
+                            mod(terminal.job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
+                                + {TERMINAL_COUNTER_BUCKETS}::bigint,
+                            {TERMINAL_COUNTER_BUCKETS}::bigint
+                        )::smallint AS counter_bucket,
                         count(*)::bigint AS delta
                     FROM terminal
-                    GROUP BY terminal.ready_slot, terminal.queue, terminal.priority, terminal.enqueue_shard
+                    GROUP BY terminal.ready_slot, terminal.queue, terminal.priority, terminal.enqueue_shard, counter_bucket
                 ) AS grouped
-                ORDER BY ready_slot, queue, priority, enqueue_shard
-                ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+                ORDER BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+                ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
                 SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
                 RETURNING 1
             )
@@ -5607,9 +5748,9 @@ impl QueueStorage {
 
     /// Exact admin/UI-grade queue counts. Scans `ready_entries` rather
     /// than reading the head tables — slower, but unaffected by the
-    /// transient gap between admin DELETE of an unclaimed row and the
-    /// dispatcher's next gap-recovery pass. Use [`Self::queue_claimer_signal`]
-    /// for the dispatcher hot path.
+    /// transient gap between sequence reservations and committed,
+    /// still-claimable ready rows. Use [`Self::queue_claimer_signal`] for the
+    /// dispatcher hot path.
     ///
     /// The live-terminal portion reads from `queue_terminal_live_counts`
     /// (the #290 denormaliser) when [`Self::terminal_counter_trusted`]
@@ -5657,11 +5798,11 @@ impl QueueStorage {
             WITH lane_counts AS (
                 -- Exact count: a ready row is available iff its
                 -- lane_seq has not yet been passed by the lane's
-                -- claim_seq cursor. Each shard within a (queue,
+                -- claim sequence cursor. Each shard within a (queue,
                 -- priority) lane carries its own sequence, so the
                 -- join matches on shard too — otherwise a ready row
                 -- in shard A could be incorrectly compared against
-                -- shard B's claim_seq.
+                -- shard B's claim cursor.
                 SELECT COALESCE(count(*)::bigint, 0) AS available
                 FROM {schema}.ready_entries AS ready
                 JOIN {schema}.queue_claim_heads AS claims
@@ -5669,7 +5810,7 @@ impl QueueStorage {
                  AND claims.priority = ready.priority
                  AND claims.enqueue_shard = ready.enqueue_shard
                 WHERE ready.queue = ANY($1)
-                  AND ready.lane_seq >= claims.claim_seq
+                  AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
             ),
             pruned_terminal AS (
                 SELECT COALESCE(
@@ -5755,11 +5896,10 @@ impl QueueStorage {
     /// - **available** is the same as the dispatcher's claim signal:
     ///   `sum(GREATEST(enqueue_seq - claim_seq, 0))` over the shard
     ///   head tables. No scan of `ready_entries`. This is an upper
-    ///   bound — the dispatcher closes the gap on its next claim
-    ///   attempt, but an admin DELETE of an unclaimed row leaves the
-    ///   head sequence ahead of the actual ready row count until that
-    ///   recovery branch runs. Acceptable for depth-target throttling
-    ///   and dashboards; not suitable for exact billing-style counts.
+    ///   bound: admin DELETEs, committed gaps, and uncommitted enqueue
+    ///   reservations can leave the enqueue sequence ahead of the actual
+    ///   ready row count. Acceptable for depth-target throttling and
+    ///   dashboards; not suitable for exact billing-style counts.
     /// - **running** matches [`Self::queue_counts`]'s strict definition:
     ///   `leases.state = 'running'` only. Receipt-plane claims that
     ///   have not yet materialised a lease row are omitted (the
@@ -6095,7 +6235,7 @@ impl QueueStorage {
         &self,
         tx: &mut sqlx::Transaction<'a, sqlx::Postgres>,
         job_id: i64,
-    ) -> Result<Option<JobRow>, AwaError> {
+    ) -> Result<Option<CancelJobTxResult>, AwaError> {
         let schema = self.schema();
         let ready: Option<ReadyTransitionRow> = sqlx::query_as(&format!(
             r#"
@@ -6113,7 +6253,7 @@ impl QueueStorage {
                  AND claims.priority = ready.priority
                  AND claims.enqueue_shard = ready.enqueue_shard
                 WHERE ready.job_id = $1
-                  AND ready.lane_seq >= claims.claim_seq
+                  AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
                 ORDER BY ready.lane_seq DESC
                 LIMIT 1
                 FOR UPDATE SKIP LOCKED
@@ -6152,31 +6292,24 @@ impl QueueStorage {
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(JobState::Available))
                 .await?;
             // If the cancelled lane was *exactly* at the claim head,
-            // advance the head past it so the derived
-            // `next_seq - claim_seq` count drops by 1 immediately.
+            // advance the head past it so the derived cursor-difference count
+            // drops by 1 immediately.
             // When other unclaimed lanes still sit between claim_seq
             // and the cancelled lane_seq, leave claim_seq alone —
             // advancing would skip past those still-claimable rows.
-            // The dispatcher's gap-recovery branch absorbs the
-            // transient over-count when claim_seq later catches up.
-            sqlx::query(&format!(
-                r#"
-                UPDATE {schema}.queue_claim_heads
-                SET claim_seq = claim_seq + 1
-                WHERE queue = $1
-                  AND priority = $2
-                  AND enqueue_shard = $3
-                  AND claim_seq = $4
-                "#
-            ))
-            .bind(&ready.queue)
-            .bind(ready.priority)
-            .bind(ready.enqueue_shard)
-            .bind(ready.lane_seq)
-            .execute(tx.as_mut())
-            .await
-            .map_err(map_sqlx_error)?;
-            return Ok(Some(done.into_job_row()?));
+            // Non-head deletes can leave a bounded dispatcher over-count until
+            // later committed rows on the lane are claimed.
+            let claim_cursor_advance = ClaimCursorAdvance {
+                queue: ready.queue.clone(),
+                priority: ready.priority,
+                enqueue_shard: ready.enqueue_shard,
+                next_seq: ready.lane_seq + 1,
+                only_if_current: Some(ready.lane_seq),
+            };
+            return Ok(Some(CancelJobTxResult {
+                row: done.into_job_row()?,
+                claim_cursor_advance: Some(claim_cursor_advance),
+            }));
         }
 
         let deleted_lease: Vec<DeletedLeaseRow> = sqlx::query_as(&format!(
@@ -6230,7 +6363,10 @@ impl QueueStorage {
             // Wake any worker currently executing this attempt.
             self.notify_cancellation_tx(tx, lease.job_id, lease.run_lease)
                 .await?;
-            return Ok(Some(done.into_job_row()?));
+            return Ok(Some(CancelJobTxResult {
+                row: done.into_job_row()?,
+                claim_cursor_advance: None,
+            }));
         }
 
         // ADR-023 receipt-only cancel: the job may be running on a
@@ -6401,7 +6537,10 @@ impl QueueStorage {
                 .await
                 .map_err(map_sqlx_error)?;
                 self.notify_cancellation_tx(tx, job_id, run_lease).await?;
-                return Ok(Some(done.into_job_row()?));
+                return Ok(Some(CancelJobTxResult {
+                    row: done.into_job_row()?,
+                    claim_cursor_advance: None,
+                }));
             }
         }
 
@@ -6469,7 +6608,10 @@ impl QueueStorage {
             };
             self.insert_done_rows_tx(tx, std::slice::from_ref(&done), Some(deferred.state))
                 .await?;
-            return Ok(Some(done.into_job_row()?));
+            return Ok(Some(CancelJobTxResult {
+                row: done.into_job_row()?,
+                claim_cursor_advance: None,
+            }));
         }
 
         Ok(None)
@@ -6477,9 +6619,17 @@ impl QueueStorage {
 
     pub async fn cancel_job(&self, pool: &PgPool, job_id: i64) -> Result<Option<JobRow>, AwaError> {
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
-        let row = self.cancel_job_tx(&mut tx, job_id).await?;
+        let result = self.cancel_job_tx(&mut tx, job_id).await?;
         tx.commit().await.map_err(map_sqlx_error)?;
-        Ok(row)
+        if let Some(result) = result {
+            if let Some(advance) = result.claim_cursor_advance.as_ref() {
+                self.advance_claim_cursors(pool, std::slice::from_ref(advance))
+                    .await;
+            }
+            Ok(Some(result.row))
+        } else {
+            Ok(None)
+        }
     }
 
     pub async fn cancel_jobs_by_ids(
@@ -6493,12 +6643,18 @@ impl QueueStorage {
 
         let mut tx = pool.begin().await.map_err(map_sqlx_error)?;
         let mut rows = Vec::with_capacity(ids.len());
+        let mut claim_cursor_advances = Vec::new();
         for job_id in ids {
-            if let Some(row) = self.cancel_job_tx(&mut tx, *job_id).await? {
-                rows.push(row);
+            if let Some(result) = self.cancel_job_tx(&mut tx, *job_id).await? {
+                if let Some(advance) = result.claim_cursor_advance {
+                    claim_cursor_advances.push(advance);
+                }
+                rows.push(result.row);
             }
         }
         tx.commit().await.map_err(map_sqlx_error)?;
+        self.advance_claim_cursors(pool, &claim_cursor_advances)
+            .await;
         Ok(rows)
     }
 
@@ -6533,7 +6689,7 @@ impl QueueStorage {
                   ON claims.queue = ready.queue
                  AND claims.priority = ready.priority
                  AND claims.enqueue_shard = ready.enqueue_shard
-                WHERE ready.lane_seq >= claims.claim_seq
+                WHERE ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
                   AND ready.priority > 1
                   AND ready.run_at <= $1
                 ORDER BY ready.run_at ASC, ready.lane_seq ASC
@@ -6608,14 +6764,11 @@ impl QueueStorage {
             });
         }
 
-        // Aging deletes ready rows from the source lane without
-        // moving the source's claim_seq, then re-inserts on the
-        // target lane (which bumps target's next_seq). The source's
-        // derived `next_seq - claim_seq` over-counts by `moved` until
-        // the dispatcher's next claim attempt on that lane hits the
-        // gap-recovery branch in `claim_ready_runtime` and catches
-        // claim_seq up. The drift is bounded by aging rate × poll
-        // interval and self-corrects.
+        // Aging deletes ready rows from the source lane without moving the
+        // source's claim cursor, then re-inserts on the target lane. The
+        // source lane can temporarily over-count by `moved`; later successful
+        // claims on that lane advance the cursor again. The drift is bounded
+        // by aging rate × poll interval.
         self.insert_existing_ready_rows_tx(&mut tx, ready_rows, Some(JobState::Available))
             .await?;
         self.notify_queues_tx(&mut tx, queues).await?;
@@ -10207,16 +10360,21 @@ impl QueueStorage {
             r#"
             WITH inserted AS (
                 INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-                    ready_slot, queue, priority, enqueue_shard, live_terminal_count
+                    ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
                 )
                 SELECT
                     ready_slot,
                     queue,
                     priority,
                     enqueue_shard,
+                    mod(
+                        mod(job_id, {TERMINAL_COUNTER_BUCKETS}::bigint)
+                            + {TERMINAL_COUNTER_BUCKETS}::bigint,
+                        {TERMINAL_COUNTER_BUCKETS}::bigint
+                    )::smallint AS counter_bucket,
                     count(*)::bigint
                 FROM {schema}.done_entries
-                GROUP BY ready_slot, queue, priority, enqueue_shard
+                GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
                 RETURNING 1
             )
             SELECT COALESCE(count(*), 0)::bigint FROM inserted

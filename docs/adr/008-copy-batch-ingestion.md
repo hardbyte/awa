@@ -133,14 +133,14 @@ and dispatchers handle duplicates gracefully.
 - **Staging overhead remains:** COPY still pays for staging and a final insert
   into the real Awa tables, so it is not automatically faster than chunked
   multi-row `INSERT` in every workload.
-- **Lane cursors remain online:** queue-storage enqueue still bumps
-  `queue_enqueue_heads.next_seq` once per touched lane and
-  transaction. Earlier iterations also maintained a
+- **Lane cursors remain online:** queue-storage enqueue still reserves
+  sequence values once per touched lane and transaction, with
+  `queue_enqueue_heads` retained as the lane registry. Earlier iterations
+  also maintained a
   `queue_lanes.available_count` cache on the same path; that cache
   has been dropped (see [ADR-019](019-queue-storage-redesign.md) §
   `lane_state` and segment cursor tables) and the dispatcher now
-  derives availability from the head-table difference, so the only
-  remaining hot-lane write on the enqueue path is the cursor bump.
+  derives availability from the enqueue/claim sequence cursor difference.
 
 ## Relationship to ADR-019
 

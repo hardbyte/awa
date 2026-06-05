@@ -3685,6 +3685,89 @@ async fn test_queue_storage_attempt_state_only_receipts_rescue_after_stale_heart
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_sequence_gap_uncommitted_enqueue";
+    let schema = "awa_qs_sequence_gap_uncommitted_enqueue";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let _job_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 7 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claimed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("initial claim should succeed");
+    assert_eq!(claimed.len(), 1);
+    assert_eq!(claimed[0].claim.lane_seq, 1);
+
+    let claim_cursor = || async {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT {schema}.sequence_next_value(seq_name)
+             FROM {schema}.queue_claim_heads
+             WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+        ))
+        .bind(queue)
+        .bind(2_i16)
+        .bind(0_i16)
+        .fetch_one(&pool)
+        .await
+        .expect("claim cursor")
+    };
+
+    assert_eq!(claim_cursor().await, 2);
+
+    let mut tx = pool.begin().await.expect("begin enqueue reservation");
+    let reserved: i64 = sqlx::query_scalar(&format!(
+        "SELECT {schema}.reserve_enqueue_seq($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .bind(1_i64)
+    .fetch_one(tx.as_mut())
+    .await
+    .expect("reserve enqueue sequence");
+    assert_eq!(reserved, 2);
+
+    let missed = store
+        .claim_runtime_batch(&pool, queue, 1, Duration::ZERO)
+        .await
+        .expect("claim against uncommitted enqueue reservation should not fail");
+    assert!(
+        missed.is_empty(),
+        "uncommitted enqueue reservation must not be claimable"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        2,
+        "claim cursor must not advance to an enqueue sequence reservation whose ready row is not committed"
+    );
+
+    tx.rollback().await.expect("rollback reservation holder");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_queue_storage_receipt_claims_rescue_after_grace_window() {
     let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
     let pool = setup_pool(10).await;
@@ -4385,16 +4468,17 @@ async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() 
 /// Drift-detection guard for the head-table-derived available count.
 ///
 /// `queue_counts_exact` (admin API) scans `ready_entries` with
-/// `lane_seq >= claim_seq`; the dispatcher hot path reads the cheaper
-/// `sum(next_seq - claim_seq)` from the two head tables. The two are
+/// `lane_seq >= claim_cursor`; the dispatcher hot path reads the cheaper
+/// `sum(enqueue_cursor - claim_cursor)` from the two head tables. The two are
 /// only equivalent when every lifecycle path that adds or removes a
 /// live ready row keeps the head tables honest:
 ///
-///   * enqueue → bumps queue_enqueue_heads.next_seq
-///   * claim   → bumps queue_claim_heads.claim_seq past the lane_seq
-///   * cancel / delete of an unclaimed head-lane → bumps claim_seq
-///   * cancel / delete of a non-head lane → leaves a gap that the
-///     dispatcher's gap-recovery branch in claim_ready_runtime closes
+///   * enqueue → bumps the lane's enqueue sequence
+///   * claim   → bumps the lane's claim sequence past the lane_seq
+///   * Rust cancel of an unclaimed head-lane → bumps the claim sequence after
+///     commit
+///   * SQL-compat deletes and non-head deletes → may leave a hot-path
+///     over-count until later committed rows on that lane are claimed
 ///
 /// A missed bump would persistently over-count and burn dispatcher
 /// claim attempts on phantom availability. This test pins the
@@ -4405,8 +4489,8 @@ async fn test_queue_storage_prepare_schema_drops_legacy_count_snapshots_table() 
 ///
 /// At every checkpoint:
 ///   - `store.queue_counts(...).available` (public API) ==
-///     `count(*) FROM ready_entries WHERE lane_seq >= claim_seq`
-///   - `sum(next_seq - claim_seq)` (hot-path approximation)
+///     `count(*) FROM ready_entries WHERE lane_seq >= claim_cursor`
+///   - `sum(enqueue_cursor - claim_cursor)` (hot-path approximation)
 ///     `>= scan` (never under-counts)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn test_available_count_matches_ready_entries_scan() {
@@ -4432,7 +4516,7 @@ async fn test_available_count_matches_ready_entries_scan() {
               AND claims.priority = ready.priority
               AND claims.enqueue_shard = ready.enqueue_shard
              WHERE ready.queue = $1
-               AND ready.lane_seq >= claims.claim_seq"
+               AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)"
         ))
         .bind(queue)
         .fetch_one(pool)
@@ -4441,15 +4525,14 @@ async fn test_available_count_matches_ready_entries_scan() {
 
         // There are two available-count formulations and they only
         // agree when no admin DELETE has punched a gap between
-        // claim_seq and next_seq:
+        // claim_cursor and enqueue_cursor:
         //
         // - Hot-path signal (queue_claimer_signal): cheap derived
-        //   `sum(next_seq - claim_seq)`. Two PK reads per lane.
+        //   `sum(enqueue_cursor - claim_cursor)`. Two PK reads per lane.
         //   Tolerates transient over-counts after admin DELETEs of
-        //   non-head lanes — the dispatcher's gap-recovery branch
-        //   absorbs the drift on the next claim attempt.
+        //   non-head lanes and in-flight sequence reservations.
         // - Admin API (queue_counts): exact, via a scan over
-        //   ready_entries with `lane_seq >= claim_seq`. Same
+        //   ready_entries with `lane_seq >= claim_cursor`. Same
         //   predicate as the ground-truth scan below.
         //
         // The test pins API == scan (the admin contract) and only
@@ -4458,7 +4541,11 @@ async fn test_available_count_matches_ready_entries_scan() {
         // of mid-ring deletes since the last claim on that lane.
         let derived_approx: i64 = sqlx::query_scalar(&format!(
             "SELECT COALESCE(
-                sum(GREATEST(qe.next_seq - qc.claim_seq, 0)),
+                sum(GREATEST(
+                    {schema}.sequence_next_value(qe.seq_name)
+                        - {schema}.sequence_next_value(qc.seq_name),
+                    0
+                )),
                 0
             )::bigint
              FROM {schema}.queue_enqueue_heads AS qe
@@ -4535,7 +4622,7 @@ async fn test_available_count_matches_ready_entries_scan() {
           AND claims.enqueue_shard = ready.enqueue_shard
          WHERE ready.queue = $1
            AND ready.priority = 2
-           AND ready.lane_seq >= claims.claim_seq
+           AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)
          ORDER BY ready.lane_seq ASC
          LIMIT 1"
     ))
@@ -4594,9 +4681,9 @@ async fn test_available_count_matches_ready_entries_scan() {
     assert_all_three_agree(&pool, &store, queue, "after canonical insert_job_compat").await;
 
     // ── checkpoint 8: canonical-side delete_job_compat ───────────────
-    // Same compat route in reverse — verifies delete_job_compat decrements
-    // the counter only for rows still satisfying lane_seq >= claim_seq
-    // (the same predicate the legacy scan used).
+    // Same compat route in reverse. The SQL function cannot safely move the
+    // non-transactional claim sequence before its caller's transaction commits,
+    // so this pins the exact API count and never-undercount hot-path contract.
     let compat_id: i64 = sqlx::query_scalar(&format!(
         "SELECT job_id
          FROM {schema}.ready_entries
@@ -5159,15 +5246,27 @@ async fn seed_terminal_rows_with_kind(
     sqlx::query(&format!(
         r#"
         INSERT INTO {schema}.queue_terminal_live_counts AS counts (
-            ready_slot, queue, priority, enqueue_shard, live_terminal_count
+            ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
         )
-        VALUES (0, $1, 2::smallint, 0::smallint, $2::bigint)
-        ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO UPDATE
+        SELECT
+            0,
+            $1,
+            2::smallint,
+            0::smallint,
+            bucket.counter_bucket,
+            count(*)::bigint
+        FROM (
+            SELECT mod(mod($2::bigint + g - 1, 256::bigint) + 256::bigint, 256::bigint)::smallint AS counter_bucket
+            FROM generate_series(1, $3::int) AS g
+        ) AS bucket
+        GROUP BY bucket.counter_bucket
+        ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
         SET live_terminal_count = counts.live_terminal_count + EXCLUDED.live_terminal_count
         "#
     ))
     .bind(queue)
-    .bind(n)
+    .bind(next_job_id)
+    .bind(n as i32)
     .execute(pool)
     .await
     .expect("seed live counter");
@@ -5270,8 +5369,10 @@ async fn test_queue_terminal_live_counts_rebuild_restores_invariant() {
     .await
     .expect("poison counter");
 
-    // Sanity-check the drift is present.
-    assert_eq!(live_count_sum(&pool, schema, queue).await, 999);
+    // Sanity-check the drift is present. With bucketed counters this
+    // poisons every bucket row for the queue, so the exact poisoned sum
+    // depends on how many buckets the seeded job_ids touched.
+    assert_ne!(live_count_sum(&pool, schema, queue).await, 7);
     assert_eq!(done_entries_count(&pool, schema, queue).await, 7);
 
     let rebuilt = store
@@ -7099,8 +7200,18 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
         .await
         .expect("post-rollback enqueue should self-heal via cache invalidation");
 
-    let next_seq: i64 = sqlx::query_scalar(&format!(
-        "SELECT next_seq FROM {schema}.queue_enqueue_heads WHERE queue = $1 AND priority = $2"
+    let (next_seq, ready_count, max_lane_seq): (i64, i64, Option<i64>) = sqlx::query_as(&format!(
+        "SELECT
+             {schema}.sequence_next_value(heads.seq_name),
+             count(ready.*)::bigint,
+             max(ready.lane_seq)
+         FROM {schema}.queue_enqueue_heads AS heads
+         LEFT JOIN {schema}.ready_entries AS ready
+           ON ready.queue = heads.queue
+          AND ready.priority = heads.priority
+          AND ready.enqueue_shard = heads.enqueue_shard
+         WHERE heads.queue = $1 AND heads.priority = $2
+         GROUP BY heads.seq_name"
     ))
     .bind(queue)
     .bind(4_i16)
@@ -7109,8 +7220,13 @@ async fn test_queue_storage_ensure_lane_cache_recovers_after_rollback() {
     .expect("queue_enqueue_heads row should exist after recovery");
 
     assert_eq!(
-        next_seq, 4,
-        "next_seq should reflect the three recovery jobs starting from a re-initialised head"
+        ready_count, 3,
+        "recovery enqueue should write all three replacement ready rows"
+    );
+    assert_eq!(
+        Some(next_seq - 1),
+        max_lane_seq,
+        "enqueue sequence should sit immediately after the recovered ready rows"
     );
 }
 
@@ -7541,8 +7657,8 @@ async fn test_queue_storage_multi_shard_claim_path_does_not_starve_shards() {
 
     let heads: Vec<(i16, i64, i64)> = sqlx::query_as(&format!(
         "SELECT claims.enqueue_shard,
-                claims.claim_seq,
-                enqueues.next_seq
+                {schema}.sequence_next_value(claims.seq_name) AS claim_seq,
+                {schema}.sequence_next_value(enqueues.seq_name) AS next_seq
          FROM {schema}.queue_claim_heads AS claims
          JOIN {schema}.queue_enqueue_heads AS enqueues
            ON enqueues.queue = claims.queue

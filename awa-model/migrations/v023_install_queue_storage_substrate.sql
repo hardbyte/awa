@@ -51,6 +51,7 @@ DECLARE
     v_slot           INT;
     v_initial_gen    BIGINT;
     v_claimed_cte    TEXT;
+    v_advance_claim_condition TEXT;
 BEGIN
     IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
         RAISE EXCEPTION 'install_queue_storage_substrate: schema name must match ^[a-z_][a-z0-9_]*$; got %',
@@ -305,6 +306,7 @@ BEGIN
             priority      SMALLINT NOT NULL,
             enqueue_shard SMALLINT NOT NULL DEFAULT 0,
             next_seq      BIGINT NOT NULL DEFAULT 1,
+            seq_name      TEXT,
             PRIMARY KEY (queue, priority, enqueue_shard)
         )
         $ddl$,
@@ -331,6 +333,7 @@ BEGIN
             priority      SMALLINT NOT NULL,
             enqueue_shard SMALLINT NOT NULL DEFAULT 0,
             claim_seq     BIGINT NOT NULL DEFAULT 1,
+            seq_name      TEXT,
             PRIMARY KEY (queue, priority, enqueue_shard)
         )
         $ddl$,
@@ -347,6 +350,342 @@ BEGIN
             autovacuum_vacuum_cost_delay = 2
         )
         $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_enqueue_heads ADD COLUMN IF NOT EXISTS seq_name TEXT',
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_claim_heads ADD COLUMN IF NOT EXISTS seq_name TEXT',
+        p_schema
+    );
+
+    --------------------------------------------------------------------
+    -- Sequence-backed lane cursors (#295 pulled into v0.6).
+    --
+    -- queue_enqueue_heads / queue_claim_heads remain as cold lane
+    -- registries and lock targets. The hot cursor movement happens via
+    -- PostgreSQL sequences, which are not MVCC heap tuples. This removes
+    -- the per-claim/per-enqueue UPDATE dead-tuple stream while preserving
+    -- the existing lane identity and SKIP LOCKED fairness shape.
+    --------------------------------------------------------------------
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_lane_sequence_name(
+            p_prefix TEXT,
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT
+        )
+        RETURNS TEXT
+        LANGUAGE sql
+        IMMUTABLE
+        SET search_path = pg_catalog
+        AS $func$
+            SELECT p_prefix || '_' ||
+                   substr(md5(p_queue || ':' || p_priority::text || ':' || p_enqueue_shard::text), 1, 32)
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.sequence_next_value(p_seq_name TEXT)
+        RETURNS BIGINT
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_last BIGINT;
+            v_is_called BOOLEAN;
+        BEGIN
+            IF p_seq_name IS NULL THEN
+                RAISE EXCEPTION 'lane sequence name is NULL'
+                    USING ERRCODE = '55000';
+            END IF;
+
+            EXECUTE format('SELECT last_value, is_called FROM %%I.%%I', %1$L, p_seq_name)
+            INTO v_last, v_is_called;
+
+            IF v_is_called THEN
+                RETURN v_last + 1;
+            END IF;
+            RETURN v_last;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next(p_seq_name TEXT, p_next BIGINT)
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        BEGIN
+            IF p_seq_name IS NULL THEN
+                RAISE EXCEPTION 'lane sequence name is NULL'
+                    USING ERRCODE = '55000';
+            END IF;
+
+            p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
+
+            IF p_next <= 1 THEN
+                EXECUTE format(
+                    'SELECT setval(%%L::regclass, 1, false)',
+                    format('%%I.%%I', %1$L, p_seq_name)
+                );
+            ELSE
+                EXECUTE format(
+                    'SELECT setval(%%L::regclass, %%s, true)',
+                    format('%%I.%%I', %1$L, p_seq_name),
+                    p_next - 1
+                );
+            END IF;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next_if(
+            p_seq_name TEXT,
+            p_next BIGINT,
+            p_enabled BOOLEAN
+        )
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        BEGIN
+            IF p_enabled THEN
+                PERFORM %1$I.set_sequence_next(p_seq_name, p_next);
+            END IF;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.ensure_lane_sequences(
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT
+        )
+        RETURNS VOID
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_enqueue_seq TEXT := %1$I.queue_lane_sequence_name(
+                'queue_enqueue_seq',
+                p_queue,
+                p_priority,
+                p_enqueue_shard
+            );
+            v_claim_seq TEXT := %1$I.queue_lane_sequence_name(
+                'queue_claim_seq',
+                p_queue,
+                p_priority,
+                p_enqueue_shard
+            );
+        BEGIN
+            EXECUTE format(
+                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                %1$L,
+                v_enqueue_seq
+            );
+            EXECUTE format(
+                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                %1$L,
+                v_claim_seq
+            );
+
+            UPDATE %1$I.queue_enqueue_heads
+            SET seq_name = v_enqueue_seq
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard
+              AND seq_name IS DISTINCT FROM v_enqueue_seq;
+
+            UPDATE %1$I.queue_claim_heads
+            SET seq_name = v_claim_seq
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard
+              AND seq_name IS DISTINCT FROM v_claim_seq;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.reserve_enqueue_seq(
+            p_queue TEXT,
+            p_priority SMALLINT,
+            p_enqueue_shard SMALLINT,
+            p_count BIGINT
+        )
+        RETURNS BIGINT
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT;
+            v_start BIGINT;
+        BEGIN
+            IF p_count <= 0 THEN
+                RETURN %1$I.sequence_next_value((
+                    SELECT seq_name
+                    FROM %1$I.queue_enqueue_heads
+                    WHERE queue = p_queue
+                      AND priority = p_priority
+                      AND enqueue_shard = p_enqueue_shard
+                ));
+            END IF;
+
+            PERFORM %1$I.ensure_lane_sequences(p_queue, p_priority, p_enqueue_shard);
+
+            SELECT seq_name
+            INTO v_seq_name
+            FROM %1$I.queue_enqueue_heads
+            WHERE queue = p_queue
+              AND priority = p_priority
+              AND enqueue_shard = p_enqueue_shard;
+
+            IF v_seq_name IS NULL THEN
+                RAISE EXCEPTION 'missing enqueue lane sequence for queue %%, priority %%, shard %%',
+                    p_queue, p_priority, p_enqueue_shard
+                    USING ERRCODE = '55000';
+            END IF;
+
+            EXECUTE format(
+                'SELECT min(nextval(%%L::regclass))::bigint FROM generate_series(1::bigint, $1)',
+                format('%%I.%%I', %1$L, v_seq_name)
+            )
+            INTO v_start
+            USING p_count;
+
+            RETURN v_start;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_enqueue_head_sequence_sync()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
+                'queue_enqueue_seq',
+                NEW.queue,
+                NEW.priority,
+                NEW.enqueue_shard
+            );
+            v_qualified_seq TEXT := format('%%I.%%I', %1$L, v_seq_name);
+            v_count BIGINT;
+            v_start BIGINT;
+        BEGIN
+            EXECUTE format(
+                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                %1$L,
+                v_seq_name
+            );
+            NEW.seq_name := v_seq_name;
+
+            IF TG_OP = 'UPDATE'
+               AND NEW.next_seq IS DISTINCT FROM OLD.next_seq
+               AND NEW.next_seq > OLD.next_seq
+            THEN
+                v_count := NEW.next_seq - OLD.next_seq;
+                EXECUTE format(
+                    'SELECT min(nextval(%%L::regclass))::bigint FROM generate_series(1::bigint, $1)',
+                    v_qualified_seq
+                )
+                INTO v_start
+                USING v_count;
+                NEW.next_seq := v_start + v_count;
+            ELSE
+                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
+            END IF;
+
+            RETURN NEW;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        CREATE OR REPLACE FUNCTION %1$I.queue_claim_head_sequence_sync()
+        RETURNS TRIGGER
+        LANGUAGE plpgsql
+        SET search_path = pg_catalog
+        AS $func$
+        DECLARE
+            v_seq_name TEXT := %1$I.queue_lane_sequence_name(
+                'queue_claim_seq',
+                NEW.queue,
+                NEW.priority,
+                NEW.enqueue_shard
+            );
+        BEGIN
+            EXECUTE format(
+                'CREATE SEQUENCE IF NOT EXISTS %%I.%%I AS bigint START WITH 1 MINVALUE 1 CACHE 1',
+                %1$L,
+                v_seq_name
+            );
+            NEW.seq_name := v_seq_name;
+
+            IF TG_OP = 'INSERT' THEN
+                PERFORM %1$I.set_sequence_next(v_seq_name, NEW.claim_seq);
+            END IF;
+
+            RETURN NEW;
+        END;
+        $func$
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'DROP TRIGGER IF EXISTS queue_enqueue_heads_sequence_sync ON %I.queue_enqueue_heads',
+        p_schema
+    );
+
+    EXECUTE format(
+        'CREATE TRIGGER queue_enqueue_heads_sequence_sync BEFORE INSERT OR UPDATE OF next_seq ON %I.queue_enqueue_heads FOR EACH ROW EXECUTE FUNCTION %I.queue_enqueue_head_sequence_sync()',
+        p_schema,
+        p_schema
+    );
+
+    EXECUTE format(
+        'DROP TRIGGER IF EXISTS queue_claim_heads_sequence_sync ON %I.queue_claim_heads',
+        p_schema
+    );
+
+    EXECUTE format(
+        'CREATE TRIGGER queue_claim_heads_sequence_sync BEFORE INSERT OR UPDATE OF claim_seq ON %I.queue_claim_heads FOR EACH ROW EXECUTE FUNCTION %I.queue_claim_head_sequence_sync()',
+        p_schema,
         p_schema
     );
 
@@ -440,6 +779,36 @@ BEGIN
 
     EXECUTE format(
         $ddl$
+        SELECT %1$I.ensure_lane_sequences(lanes.queue, lanes.priority, lanes.enqueue_shard)
+        FROM (
+            SELECT queue, priority, enqueue_shard FROM %1$I.queue_enqueue_heads
+            UNION
+            SELECT queue, priority, enqueue_shard FROM %1$I.queue_claim_heads
+        ) AS lanes
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        SELECT %1$I.set_sequence_next(seq_name, next_seq)
+        FROM %1$I.queue_enqueue_heads
+        WHERE seq_name IS NOT NULL
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        SELECT %1$I.set_sequence_next(seq_name, claim_seq)
+        FROM %1$I.queue_claim_heads
+        WHERE seq_name IS NOT NULL
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
         INSERT INTO %1$I.queue_terminal_rollups AS rollups (queue, priority, pruned_completed_count)
         SELECT queue, priority, pruned_completed_count
         FROM %1$I.queue_lanes
@@ -488,6 +857,20 @@ BEGIN
 
     EXECUTE format(
         $ddl$
+        ALTER TABLE %I.leases
+            ADD COLUMN IF NOT EXISTS state awa.job_state NOT NULL DEFAULT 'running',
+            ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS heartbeat_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS attempted_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS callback_id UUID,
+            ADD COLUMN IF NOT EXISTS callback_timeout_at TIMESTAMPTZ
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
         CREATE TABLE IF NOT EXISTS %I.lease_claims (
             claim_slot       INT NOT NULL,
             job_id           BIGINT NOT NULL,
@@ -509,9 +892,14 @@ BEGIN
         p_schema
     );
 
-    -- Idempotent column-add for upgrades from before deadline_at existed.
+    -- Idempotent column-add for upgrades from before receipts carried
+    -- shard/deadline metadata.
     EXECUTE format(
-        'ALTER TABLE %I.lease_claims ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ',
+        $ddl$
+        ALTER TABLE %I.lease_claims
+            ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS deadline_at TIMESTAMPTZ
+        $ddl$,
         p_schema
     );
 
@@ -660,6 +1048,23 @@ BEGIN
         p_schema
     );
 
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.done_entries
+            ADD COLUMN IF NOT EXISTS args JSONB,
+            ADD COLUMN IF NOT EXISTS state awa.job_state NOT NULL DEFAULT 'completed',
+            ADD COLUMN IF NOT EXISTS max_attempts SMALLINT,
+            ADD COLUMN IF NOT EXISTS enqueue_shard SMALLINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS run_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS attempted_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS unique_key BYTEA,
+            ADD COLUMN IF NOT EXISTS unique_states TEXT,
+            ADD COLUMN IF NOT EXISTS payload JSONB
+        $ddl$,
+        p_schema
+    );
+
     -- Narrow terminal history: see queue_storage.rs comment.
     EXECUTE format(
         $ddl$
@@ -733,6 +1138,24 @@ BEGIN
             payload       JSONB,
             CONSTRAINT deferred_jobs_state_check CHECK (state IN ('scheduled', 'retryable'))
         )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        ALTER TABLE %I.deferred_jobs
+            ADD COLUMN IF NOT EXISTS args JSONB NOT NULL DEFAULT '{}'::jsonb,
+            ADD COLUMN IF NOT EXISTS state awa.job_state NOT NULL DEFAULT 'scheduled',
+            ADD COLUMN IF NOT EXISTS attempt SMALLINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS run_lease BIGINT NOT NULL DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS max_attempts SMALLINT NOT NULL DEFAULT 25,
+            ADD COLUMN IF NOT EXISTS attempted_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ,
+            ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
+            ADD COLUMN IF NOT EXISTS unique_key BYTEA,
+            ADD COLUMN IF NOT EXISTS unique_states TEXT,
+            ADD COLUMN IF NOT EXISTS payload JSONB
         $ddl$,
         p_schema
     );
@@ -828,9 +1251,53 @@ BEGIN
             queue               TEXT NOT NULL,
             priority            SMALLINT NOT NULL,
             enqueue_shard       SMALLINT NOT NULL,
+            counter_bucket      SMALLINT NOT NULL DEFAULT 0,
             live_terminal_count BIGINT NOT NULL DEFAULT 0,
-            PRIMARY KEY (ready_slot, queue, priority, enqueue_shard)
+            PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, counter_bucket)
         )
+        $ddl$,
+        p_schema
+    );
+
+    EXECUTE format(
+        'ALTER TABLE %I.queue_terminal_live_counts ADD COLUMN IF NOT EXISTS counter_bucket SMALLINT NOT NULL DEFAULT 0',
+        p_schema
+    );
+
+    EXECUTE format(
+        $ddl$
+        DO $inner$
+        DECLARE
+            v_has_bucket_key BOOLEAN;
+        BEGIN
+            SELECT EXISTS (
+                SELECT 1
+                FROM pg_constraint AS c
+                JOIN pg_class AS t ON t.oid = c.conrelid
+                JOIN pg_namespace AS n ON n.oid = t.relnamespace
+                WHERE n.nspname = %1$L
+                  AND t.relname = 'queue_terminal_live_counts'
+                  AND c.contype = 'p'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM unnest(c.conkey) AS key(attnum)
+                      JOIN pg_attribute AS a
+                        ON a.attrelid = t.oid
+                       AND a.attnum = key.attnum
+                      WHERE a.attname = 'counter_bucket'
+                  )
+            )
+            INTO v_has_bucket_key;
+
+            IF NOT v_has_bucket_key THEN
+                ALTER TABLE %1$I.queue_terminal_live_counts
+                    DROP CONSTRAINT IF EXISTS queue_terminal_live_counts_pkey;
+                ALTER TABLE %1$I.queue_terminal_live_counts
+                    ADD CONSTRAINT queue_terminal_live_counts_pkey
+                    PRIMARY KEY (ready_slot, queue, priority, enqueue_shard, counter_bucket);
+            END IF;
+        END
+        $inner$
         $ddl$,
         p_schema
     );
@@ -857,12 +1324,21 @@ BEGIN
     EXECUTE format(
         $ddl$
         INSERT INTO %1$I.queue_terminal_live_counts AS counts (
-            ready_slot, queue, priority, enqueue_shard, live_terminal_count
+            ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
         )
-        SELECT ready_slot, queue, priority, enqueue_shard, count(*)::bigint
+        SELECT
+            ready_slot,
+            queue,
+            priority,
+            enqueue_shard,
+            mod(mod(job_id, 256::bigint) + 256::bigint, 256::bigint)::smallint AS counter_bucket,
+            count(*)::bigint
         FROM %1$I.done_entries
-        GROUP BY ready_slot, queue, priority, enqueue_shard
-        ON CONFLICT (ready_slot, queue, priority, enqueue_shard) DO NOTHING
+        WHERE NOT EXISTS (
+            SELECT 1 FROM %1$I.queue_terminal_live_counts LIMIT 1
+        )
+        GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+        ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO NOTHING
         $ddl$,
         p_schema
     );
@@ -934,6 +1410,8 @@ BEGIN
     -- receipts mode: receipts=TRUE writes into lease_claims (ADR-023),
     -- receipts=FALSE writes directly into the partitioned leases table.
     --------------------------------------------------------------------
+
+    v_advance_claim_condition := 'FALSE';
 
     IF p_lease_claim_receipts THEN
         v_claimed_cte := format(
@@ -1090,6 +1568,7 @@ BEGIN
         DECLARE
             v_lane_priority SMALLINT;
             v_lane_shard SMALLINT;
+            v_claim_seq_name TEXT;
             v_lane_claim_seq BIGINT;
             v_lane_next_seq BIGINT;
             v_claim_limit BIGINT;
@@ -1102,15 +1581,21 @@ BEGIN
             SELECT
                 claims.priority,
                 claims.enqueue_shard,
-                claims.claim_seq,
-                enqueues.next_seq
-            INTO v_lane_priority, v_lane_shard, v_lane_claim_seq, v_lane_next_seq
+                claims.seq_name,
+                cursors.claim_seq,
+                cursors.next_seq
+            INTO v_lane_priority, v_lane_shard, v_claim_seq_name, v_lane_claim_seq, v_lane_next_seq
             FROM %1$I.queue_claim_heads AS claims
             JOIN %1$I.queue_enqueue_heads AS enqueues
               ON enqueues.queue = claims.queue
              AND enqueues.priority = claims.priority
              AND enqueues.enqueue_shard = claims.enqueue_shard
-            JOIN LATERAL (
+            CROSS JOIN LATERAL (
+                SELECT
+                    %1$I.sequence_next_value(claims.seq_name) AS claim_seq,
+                    %1$I.sequence_next_value(enqueues.seq_name) AS next_seq
+            ) AS cursors
+            LEFT JOIN LATERAL (
                 SELECT
                     ready.ready_slot,
                     ready.ready_generation,
@@ -1128,7 +1613,7 @@ BEGIN
                 WHERE ready.queue = p_queue
                   AND ready.priority = claims.priority
                   AND ready.enqueue_shard = claims.enqueue_shard
-                  AND ready.lane_seq >= claims.claim_seq
+                  AND ready.lane_seq >= cursors.claim_seq
                 ORDER BY ready.lane_seq ASC
                 LIMIT 1
             ) AS candidate ON TRUE
@@ -1139,8 +1624,11 @@ BEGIN
                   WHERE meta.queue = p_queue
                     AND meta.paused = TRUE
               )
-              AND claims.claim_seq < enqueues.next_seq
-            ORDER BY candidate.effective_priority ASC, candidate.run_at ASC, claims.priority ASC
+              AND cursors.claim_seq < cursors.next_seq
+            ORDER BY
+                candidate.effective_priority ASC NULLS LAST,
+                candidate.run_at ASC NULLS LAST,
+                claims.priority ASC
             LIMIT 1
             FOR UPDATE OF claims SKIP LOCKED;
 
@@ -1159,11 +1647,13 @@ BEGIN
             LIMIT 1;
 
             IF NOT FOUND THEN
-                UPDATE %1$I.queue_claim_heads AS claims
-                SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
-                WHERE claims.queue = p_queue
-                  AND claims.priority = v_lane_priority
-                  AND claims.enqueue_shard = v_lane_shard;
+                -- The enqueue cursor is sequence-backed and can include
+                -- uncommitted reservations. If no committed ready row is
+                -- visible yet, do not advance the claim cursor to the enqueue
+                -- cursor: that can skip a ready row when the enqueue
+                -- transaction commits moments later. True gaps from admin
+                -- deletes are harmless over-count drift and close naturally
+                -- when a later committed row on the lane is claimed.
                 RETURN;
             END IF;
 
@@ -1223,15 +1713,14 @@ BEGIN
                 LIMIT v_claim_limit
             ),
             advanced AS (
-                UPDATE %1$I.queue_claim_heads AS claims
-                SET claim_seq = COALESCE(
+                SELECT %1$I.set_sequence_next_if(
+                    v_claim_seq_name,
+                    COALESCE(
                         (SELECT max(selected.lane_seq) + 1 FROM selected),
-                        claims.claim_seq
-                    )
-                WHERE claims.queue = p_queue
-                  AND claims.priority = v_lane_priority
-                  AND claims.enqueue_shard = v_lane_shard
-                RETURNING claims.priority
+                        v_lane_claim_seq
+                    ),
+                    %3$s
+                )
             ),
             %2$s
             SELECT
@@ -1267,6 +1756,7 @@ BEGIN
                 selected.payload
             FROM claimed
             CROSS JOIN lease_ring
+            CROSS JOIN advanced
             JOIN selected
              ON selected.ready_slot = claimed.ready_slot
              AND selected.ready_generation = claimed.ready_generation
@@ -1277,17 +1767,18 @@ BEGIN
 
             GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
 
+            -- If a target ready row existed but the claim CTE produced no
+            -- rows, leave the sequence cursor untouched. The earlier
+            -- NOT FOUND branch handles true gaps. Advancing here can skip a
+            -- live retry/rescue row because sequence movement is
+            -- non-transactional and cannot be recovered by rollback.
             IF v_claimed_count = 0 THEN
-                UPDATE %1$I.queue_claim_heads AS claims
-                SET claim_seq = GREATEST(claims.claim_seq, v_lane_next_seq)
-                WHERE claims.queue = p_queue
-                  AND claims.priority = v_lane_priority
-                  AND claims.enqueue_shard = v_lane_shard;
+                RETURN;
             END IF;
         END;
         $func$
         $create_runtime$,
-        p_schema, v_claimed_cte
+        p_schema, v_claimed_cte, v_advance_claim_condition
     );
 
     --------------------------------------------------------------------

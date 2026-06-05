@@ -286,8 +286,10 @@ The only operator-visible caveat is the per-runtime `enqueue_shards_cache`: a ru
 
    ```sql
    SELECT priority, enqueue_shard,
-          enqueues.next_seq, claims.claim_seq,
-          enqueues.next_seq - claims.claim_seq AS lag
+          <queue_storage_schema>.sequence_next_value(enqueues.seq_name) AS enqueue_cursor,
+          <queue_storage_schema>.sequence_next_value(claims.seq_name) AS claim_cursor,
+          <queue_storage_schema>.sequence_next_value(enqueues.seq_name)
+            - <queue_storage_schema>.sequence_next_value(claims.seq_name) AS lag
    FROM <queue_storage_schema>.queue_claim_heads AS claims
    JOIN <queue_storage_schema>.queue_enqueue_heads AS enqueues
      USING (queue, priority, enqueue_shard)

@@ -670,7 +670,7 @@ async fn overlap_reader(
                           AND claims.priority = ready.priority \
                           AND claims.enqueue_shard = ready.enqueue_shard \
                          WHERE ready.queue = $1 \
-                           AND ready.lane_seq >= claims.claim_seq\
+                           AND ready.lane_seq >= {schema}.sequence_next_value(claims.seq_name)\
                      ), pruned AS (\
                          SELECT COALESCE(sum(pruned_completed_count), 0)::bigint AS terminal_rollup \
                          FROM {schema}.queue_terminal_rollups \

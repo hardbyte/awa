@@ -182,10 +182,11 @@ BEGIN
                  WHERE counts.ready_slot     = $1
                    AND counts.queue          = $2
                    AND counts.priority       = $3
-                   AND counts.enqueue_shard  = $4',
+                   AND counts.enqueue_shard  = $4
+                   AND counts.counter_bucket = mod(mod($5, 256::bigint) + 256::bigint, 256::bigint)::smallint',
                 v_schema
             )
-            USING v_ready_slot, v_queue, v_priority, v_enqueue_shard;
+            USING v_ready_slot, v_queue, v_priority, v_enqueue_shard, p_id;
         END IF;
         PERFORM awa.release_queue_storage_unique_claim(
             p_id,

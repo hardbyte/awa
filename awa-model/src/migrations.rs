@@ -4,7 +4,7 @@ use sqlx::PgPool;
 use tracing::info;
 
 /// Current schema version.
-pub const CURRENT_VERSION: i32 = 26;
+pub const CURRENT_VERSION: i32 = 27;
 
 /// All migrations in order. SQL lives in `awa-model/migrations/*.sql`
 /// for easy inspection by users who run their own migration tooling.
@@ -118,6 +118,11 @@ const MIGRATIONS: &[(i32, &str, &[&str])] = &[
         "Add paused_at + paused_by to cron_jobs for per-schedule pause",
         &[V26_UP],
     ),
+    (
+        27,
+        "Move lane cursors to sequences and stripe terminal counters",
+        &[V23_UP, V22_UP, V27_UP],
+    ),
 ];
 
 const V1_UP: &str = include_str!("../migrations/v001_canonical_schema.sql");
@@ -145,6 +150,7 @@ const V23_UP: &str = include_str!("../migrations/v023_install_queue_storage_subs
 const V24_UP: &str = include_str!("../migrations/v024_receipt_plane_fillfactor.sql");
 const V25_UP: &str = include_str!("../migrations/v025_drop_leases_state_hb_index.sql");
 const V26_UP: &str = include_str!("../migrations/v026_cron_jobs_pause.sql");
+const V27_UP: &str = include_str!("../migrations/v027_sequence_lane_cursors.sql");
 
 /// Old version numbers from pre-0.4 releases that used V3/V4/V5 numbering.
 /// Also tolerates the unreleased inline-V6 branch numbering used during review.
