@@ -105,6 +105,31 @@ fn bench_env_usize(name: &str, default: usize) -> usize {
         .unwrap_or(default)
 }
 
+async fn lane_available_count(pool: &PgPool, schema: &str, queues: Vec<String>) -> i64 {
+    sqlx::query_scalar(&format!(
+        r#"
+        SELECT COALESCE(
+            sum(GREATEST(
+                {schema}.sequence_next_value(qe.seq_name)
+                  - {schema}.sequence_next_value(qc.seq_name),
+                0
+            )),
+            0
+        )::bigint
+        FROM {schema}.queue_enqueue_heads AS qe
+        JOIN {schema}.queue_claim_heads AS qc
+          ON qc.queue = qe.queue
+         AND qc.priority = qe.priority
+         AND qc.enqueue_shard = qe.enqueue_shard
+        WHERE qe.queue = ANY($1)
+        "#
+    ))
+    .bind(queues)
+    .fetch_one(pool)
+    .await
+    .expect("count lane availability")
+}
+
 #[tokio::test]
 async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
     let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
@@ -206,22 +231,8 @@ async fn queue_storage_copy_enqueues_ready_and_deferred_rows() {
     .expect("count deferred rows");
     assert_eq!(deferred_count, 1);
 
-    // Available count is derived from queue_enqueue_heads.next_seq -
-    // queue_claim_heads.claim_seq.
-    let available_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT GREATEST(qe.next_seq - qc.claim_seq, 0)
-         FROM {schema}.queue_enqueue_heads AS qe
-         JOIN {schema}.queue_claim_heads AS qc
-           ON qc.queue = qe.queue
-          AND qc.priority = qe.priority
-          AND qc.enqueue_shard = qe.enqueue_shard
-         WHERE qe.queue = $1 AND qe.priority = 1",
-        schema = store.schema()
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("read lane count");
+    let available_count =
+        lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
     assert_eq!(available_count, 2);
 }
 
@@ -268,14 +279,7 @@ async fn queue_storage_copy_rolls_back_on_unique_conflict() {
     .expect("count ready rows");
     assert_eq!(ready_count, 0);
 
-    let lane_available: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
-        store.schema()
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("count lane availability");
+    let lane_available = lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
     assert_eq!(lane_available, 0);
 }
 
@@ -322,14 +326,7 @@ async fn queue_storage_batch_rolls_back_on_batched_unique_conflict() {
     .expect("count ready rows");
     assert_eq!(ready_count, 0);
 
-    let lane_available: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
-        store.schema()
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("count lane availability");
+    let lane_available = lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
     assert_eq!(lane_available, 0);
 }
 
@@ -376,14 +373,7 @@ async fn queue_storage_copy_rolls_back_on_existing_unique_conflict() {
     .expect("count ready rows");
     assert_eq!(ready_count, 1);
 
-    let lane_available: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
-        store.schema()
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("count lane availability");
+    let lane_available = lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
     assert_eq!(lane_available, 1);
 }
 
@@ -440,14 +430,8 @@ async fn queue_storage_copy_concurrent_lane_seq_is_dense() {
         assert_eq!(actual_seq, first_seq + offset as i64);
     }
 
-    let available_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = $1",
-        store.schema()
-    ))
-    .bind(queue)
-    .fetch_one(&pool)
-    .await
-    .expect("read available count");
+    let available_count =
+        lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
     assert_eq!(available_count, expected);
 }
 
@@ -485,14 +469,12 @@ async fn queue_storage_copy_distributes_across_stripes() {
         assert_eq!(seqs[1], seqs[0] + 1, "unexpected lane seqs for {physical}");
     }
 
-    let available_count: i64 = sqlx::query_scalar(&format!(
-        "SELECT COALESCE(sum(GREATEST(qe.next_seq - qc.claim_seq, 0)), 0)::bigint FROM {0}.queue_enqueue_heads qe JOIN {0}.queue_claim_heads qc ON qc.queue = qe.queue AND qc.priority = qe.priority AND qc.enqueue_shard = qe.enqueue_shard WHERE qe.queue = ANY($1)",
-        store.schema()
-    ))
-    .bind((0..4).map(|stripe| format!("{queue}#{stripe}")).collect::<Vec<_>>())
-    .fetch_one(&pool)
-    .await
-    .expect("read striped available count");
+    let available_count = lane_available_count(
+        &pool,
+        store.schema(),
+        (0..4).map(|stripe| format!("{queue}#{stripe}")).collect(),
+    )
+    .await;
     assert_eq!(available_count, 8);
 }
 

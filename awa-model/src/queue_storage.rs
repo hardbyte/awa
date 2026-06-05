@@ -2732,13 +2732,34 @@ impl QueueStorage {
     ) -> Result<(), AwaError> {
         // Fast path: this store has previously written the three lane
         // rows for this `(queue, priority, shard)` triple. The cache is
-        // optimistic — if that earlier transaction rolled back, the head
-        // row is missing even though the cache says it exists.
-        // `advance_enqueue_head` detects that case via the empty reserve
-        // result, invalidates the cache entry, and re-runs
-        // `ensure_lane_inserts` directly (bypassing this fast path).
+        // optimistic: another transaction may have marked the lane before
+        // commit, or the marking transaction may later roll back. Verify the
+        // head row is visible in this transaction before trusting the cache.
         if self.lane_is_cached(queue, priority, enqueue_shard) {
-            return Ok(());
+            let schema = self.schema();
+            let visible: bool = sqlx::query_scalar(&format!(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1
+                    FROM {schema}.queue_enqueue_heads
+                    WHERE queue = $1
+                      AND priority = $2
+                      AND enqueue_shard = $3
+                )
+                "#
+            ))
+            .bind(queue)
+            .bind(priority)
+            .bind(enqueue_shard)
+            .fetch_one(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
+            if visible {
+                return Ok(());
+            }
+
+            self.invalidate_cached_lane(queue, priority, enqueue_shard);
         }
 
         self.ensure_lane_inserts(tx, queue, priority, enqueue_shard)
@@ -2758,6 +2779,13 @@ impl QueueStorage {
         enqueue_shard: i16,
     ) -> Result<(), AwaError> {
         let schema = self.schema();
+        let lane_lock_key = format!("{schema}:{queue}:{priority}:{enqueue_shard}");
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(lane_lock_key)
+            .execute(tx.as_mut())
+            .await
+            .map_err(map_sqlx_error)?;
+
         sqlx::query(&format!(
             r#"
             INSERT INTO {schema}.queue_lanes (queue, priority)
@@ -3312,17 +3340,12 @@ impl QueueStorage {
         let mut job_id_iter = job_ids.into_iter();
 
         let mut ready_rows = Vec::with_capacity(total_rows);
+        let mut lane_ranges = Vec::with_capacity(grouped.len());
 
         for ((queue, priority, enqueue_shard), lane_rows) in grouped {
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
-                .await?;
+            let range_start = ready_rows.len();
 
-            let count = lane_rows.len() as i64;
-            let start_seq = self
-                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
-                .await?;
-
-            for (offset, row) in lane_rows.into_iter().enumerate() {
+            for row in lane_rows {
                 let job_id = job_id_iter.next().ok_or_else(|| {
                     AwaError::Validation("queue storage job id allocation underflow".to_string())
                 })?;
@@ -3337,7 +3360,7 @@ impl QueueStorage {
                     max_attempts: row.max_attempts,
                     run_at: row.run_at,
                     attempted_at: row.attempted_at,
-                    lane_seq: start_seq + offset as i64,
+                    lane_seq: 0,
                     enqueue_shard,
                     created_at: row.created_at,
                     unique_key: row.unique_key,
@@ -3345,10 +3368,30 @@ impl QueueStorage {
                     payload: row.payload,
                 });
             }
+            lane_ranges.push((
+                queue,
+                priority,
+                enqueue_shard,
+                range_start,
+                ready_rows.len(),
+            ));
         }
 
         self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
             .await?;
+        for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
+            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+                .await?;
+
+            let count = (range_end - range_start) as i64;
+            let start_seq = self
+                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
+                .await?;
+
+            for (offset, row) in ready_rows[range_start..range_end].iter_mut().enumerate() {
+                row.lane_seq = start_seq + offset as i64;
+            }
+        }
         self.execute_ready_inserts_tx(tx, &ready_rows).await?;
         Ok(total_rows)
     }
@@ -3437,17 +3480,12 @@ impl QueueStorage {
         let mut job_id_iter = job_ids.into_iter();
 
         let mut ready_rows = Vec::with_capacity(total_rows);
+        let mut lane_ranges = Vec::with_capacity(grouped.len());
 
         for ((queue, priority, enqueue_shard), lane_rows) in grouped {
-            self.ensure_lane(tx, &queue, priority, enqueue_shard)
-                .await?;
+            let range_start = ready_rows.len();
 
-            let count = lane_rows.len() as i64;
-            let start_seq = self
-                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
-                .await?;
-
-            for (offset, row) in lane_rows.into_iter().enumerate() {
+            for row in lane_rows {
                 let job_id = job_id_iter.next().ok_or_else(|| {
                     AwaError::Validation("queue storage job id allocation underflow".to_string())
                 })?;
@@ -3462,7 +3500,7 @@ impl QueueStorage {
                     max_attempts: row.max_attempts,
                     run_at: row.run_at,
                     attempted_at: row.attempted_at,
-                    lane_seq: start_seq + offset as i64,
+                    lane_seq: 0,
                     enqueue_shard,
                     created_at: row.created_at,
                     unique_key: row.unique_key,
@@ -3470,10 +3508,30 @@ impl QueueStorage {
                     payload: row.payload,
                 });
             }
+            lane_ranges.push((
+                queue,
+                priority,
+                enqueue_shard,
+                range_start,
+                ready_rows.len(),
+            ));
         }
 
         self.sync_ready_enqueue_unique_claims(tx, &ready_rows)
             .await?;
+        for (queue, priority, enqueue_shard, range_start, range_end) in lane_ranges {
+            self.ensure_lane(tx, &queue, priority, enqueue_shard)
+                .await?;
+
+            let count = (range_end - range_start) as i64;
+            let start_seq = self
+                .advance_enqueue_head(tx, &queue, priority, enqueue_shard, count)
+                .await?;
+
+            for (offset, row) in ready_rows[range_start..range_end].iter_mut().enumerate() {
+                row.lane_seq = start_seq + offset as i64;
+            }
+        }
         self.execute_ready_copy_tx(tx, &ready_rows).await?;
         Ok(total_rows)
     }
