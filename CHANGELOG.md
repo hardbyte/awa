@@ -5,6 +5,16 @@ transitions live in [`docs/upgrade-0.5-to-0.6.md`](docs/upgrade-0.5-to-0.6.md).
 
 ## Unreleased
 
+- **Cron schedule pause / resume.** `cron_jobs` carries `paused_at` and
+  `paused_by` columns; `POST /api/cron/{name}/pause` and `/resume` toggle
+  the state. The evaluator skips paused rows and the `atomic_enqueue`
+  CTE re-checks `paused_at IS NULL` so a pause asserted between the
+  leader's read and CAS still takes effect. `last_enqueued_at` is left
+  untouched while paused, so the schedule's `missed_fire_policy` decides
+  catch-up behaviour on resume. Manual `trigger_cron_job` bypasses pause.
+  The `/cron` UI page gains Pause/Resume controls and shows a
+  "queue paused" badge when the target queue is itself paused.
+
 ## [0.6.0-beta.1] — 2026-05-19
 
 First beta of the 0.6 line. Frames the user-facing diff between

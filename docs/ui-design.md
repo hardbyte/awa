@@ -67,6 +67,8 @@ GET  /api/stats/queues                  Distinct queues
 
 GET  /api/cron
 POST /api/cron/:name/trigger
+POST /api/cron/:name/pause              { paused_by? }
+POST /api/cron/:name/resume
 
 GET  /api/dlq?kind=&queue=&tag=&limit=&before_id=&before_dlq_at=
 GET  /api/dlq/:id
@@ -121,6 +123,10 @@ Cluster overview: instance count, liveness, leader status, and an attention pane
 ### Cron (`/cron`)
 
 Accordion list of registered periodic job schedules. Each entry shows the cron expression, job kind, target queue, priority, next fire time (countdown), and last run. Expandable to see full details including arguments and tags. "Trigger now" fires the job immediately without affecting the next scheduled run.
+
+Paused schedules render with a "paused" badge and the `paused_by` label. Pause/Resume controls sit next to "Trigger now"; a manual trigger is allowed on a paused schedule, which is called out in the expanded detail so operators understand pause stops automatic fires only. Pausing leaves `last_enqueued_at` untouched, so resume respects the schedule's existing missed-fire policy.
+
+When the target queue is itself paused, the row shows a "queue paused" badge alongside the queue name and the expanded detail explains that fires continue to enqueue jobs into the paused queue but those jobs dispatch only after the queue is resumed. Cron pause and queue pause are independent — one is "stop scheduling," the other is "stop dispatching."
 
 ### Dead Letter Queue (`/dlq`, `/dlq/:id`)
 

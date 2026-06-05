@@ -1,13 +1,19 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import {
   useQuery,
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { fetchCronJobs, triggerCronJob } from "@/lib/api";
+import {
+  fetchCronJobs,
+  fetchQueues,
+  pauseCronJob,
+  resumeCronJob,
+  triggerCronJob,
+} from "@/lib/api";
 import { useReadOnly } from "@/hooks/use-read-only";
 import { toast } from "@/components/ui/toast";
-import type { CronJobRow } from "@/lib/api";
+import type { CronJobRow, QueueOverview } from "@/lib/api";
 import { Heading } from "@/components/ui/heading";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -25,8 +31,27 @@ export function CronPage() {
   const cronQuery = useQuery<CronJobRow[]>({
     queryKey: ["cron"],
     queryFn: fetchCronJobs,
-    refetchInterval: poll.interval, staleTime: poll.staleTime,
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
   });
+
+  const queuesQuery = useQuery<QueueOverview[]>({
+    queryKey: ["queues"],
+    queryFn: fetchQueues,
+    refetchInterval: poll.interval,
+    staleTime: poll.staleTime,
+  });
+
+  const pausedQueues = useMemo(() => {
+    const set = new Set<string>();
+    for (const q of queuesQuery.data ?? []) {
+      if (q.paused) set.add(q.queue);
+    }
+    return set;
+  }, [queuesQuery.data]);
+
+  const invalidateCron = () =>
+    queryClient.invalidateQueries({ queryKey: ["cron"] });
 
   const triggerMutation = useMutation({
     mutationFn: (name: string) => triggerCronJob(name),
@@ -36,6 +61,28 @@ export function CronPage() {
     },
     onError: () => {
       toast.error("Failed to trigger cron job");
+    },
+  });
+
+  const pauseMutation = useMutation({
+    mutationFn: (name: string) => pauseCronJob(name),
+    onSuccess: (_data, name) => {
+      void invalidateCron();
+      toast.success(`Paused "${name}"`);
+    },
+    onError: () => {
+      toast.error("Failed to pause cron job");
+    },
+  });
+
+  const resumeMutation = useMutation({
+    mutationFn: (name: string) => resumeCronJob(name),
+    onSuccess: (_data, name) => {
+      void invalidateCron();
+      toast.success(`Resumed "${name}"`);
+    },
+    onError: () => {
+      toast.error("Failed to resume cron job");
     },
   });
 
@@ -61,6 +108,10 @@ export function CronPage() {
               cj.metadata != null &&
               typeof cj.metadata === "object" &&
               Object.keys(cj.metadata as Record<string, unknown>).length > 0;
+            const isPaused = cj.paused_at != null;
+            const targetQueuePaused = pausedQueues.has(cj.queue);
+            const mutating =
+              pauseMutation.isPending || resumeMutation.isPending;
 
             return (
               <div
@@ -94,6 +145,11 @@ export function CronPage() {
                     </svg>
 
                     <span className="font-medium">{cj.name}</span>
+                    {isPaused && (
+                      <Badge intent="warning" className="text-[10px]">
+                        paused
+                      </Badge>
+                    )}
                     <CronExpr expr={cj.cron_expr} />
                     {cj.timezone !== "UTC" && (
                       <span className="text-xs text-muted-fg">
@@ -102,7 +158,14 @@ export function CronPage() {
                     )}
 
                     <span className="text-sm text-muted-fg">{cj.kind}</span>
-                    <span className="text-sm text-muted-fg">&rarr; {cj.queue}</span>
+                    <span className="text-sm text-muted-fg">
+                      &rarr; {cj.queue}
+                    </span>
+                    {targetQueuePaused && (
+                      <Badge intent="warning" className="text-[10px]">
+                        queue paused
+                      </Badge>
+                    )}
 
                     {cj.priority !== 2 && (
                       <Badge
@@ -114,7 +177,7 @@ export function CronPage() {
                     )}
 
                     <span className="ml-auto flex items-center gap-3 text-sm text-muted-fg">
-                      {cj.next_fire_at && (
+                      {cj.next_fire_at && !isPaused && (
                         <span
                           className="text-success"
                           title={formatInTimezone(cj.next_fire_at, cj.timezone)}
@@ -131,6 +194,30 @@ export function CronPage() {
                       )}
                     </span>
                   </button>
+
+                  {isPaused ? (
+                    <Button
+                      intent="outline"
+                      size="xs"
+                      onPress={() => {
+                        resumeMutation.mutate(cj.name);
+                      }}
+                      isDisabled={readOnly || mutating}
+                    >
+                      Resume
+                    </Button>
+                  ) : (
+                    <Button
+                      intent="outline"
+                      size="xs"
+                      onPress={() => {
+                        pauseMutation.mutate(cj.name);
+                      }}
+                      isDisabled={readOnly || mutating}
+                    >
+                      Pause
+                    </Button>
+                  )}
 
                   <Button
                     intent="outline"
@@ -151,6 +238,39 @@ export function CronPage() {
                     aria-labelledby={summaryId}
                     className="border-t px-4 py-3 space-y-3"
                   >
+                    {isPaused && (
+                      <div className="rounded-md bg-warning/10 border border-warning/30 px-3 py-2 text-sm">
+                        <span className="font-medium">Paused</span>
+                        {cj.paused_at && (
+                          <>
+                            {" "}
+                            <span className="text-muted-fg">
+                              since {new Date(cj.paused_at).toLocaleString()}
+                            </span>
+                          </>
+                        )}
+                        {cj.paused_by && (
+                          <>
+                            {" by "}
+                            <span className="font-mono">{cj.paused_by}</span>
+                          </>
+                        )}
+                        <span className="text-muted-fg">
+                          {" "}— manual triggers still work; resume to restart automatic fires.
+                        </span>
+                      </div>
+                    )}
+                    {targetQueuePaused && (
+                      <div className="rounded-md bg-warning/10 border border-warning/30 px-3 py-2 text-sm">
+                        <span className="font-medium">Target queue paused.</span>
+                        <span className="text-muted-fg">
+                          {" "}Fires continue to enqueue jobs into{" "}
+                          <span className="font-mono">{cj.queue}</span>; they
+                          dispatch when the queue is resumed.
+                        </span>
+                      </div>
+                    )}
+
                     <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm sm:grid-cols-4">
                       <div>
                         <dt className="text-muted-fg">Kind</dt>
@@ -199,7 +319,9 @@ export function CronPage() {
 
                     {cj.next_fire_at && (
                       <div>
-                        <dt className="text-sm text-muted-fg">Next fire</dt>
+                        <dt className="text-sm text-muted-fg">
+                          {isPaused ? "Next fire (if resumed)" : "Next fire"}
+                        </dt>
                         <dd className="font-medium">
                           {formatInTimezone(cj.next_fire_at, cj.timezone)}
                           <span className="ml-2 text-muted-fg font-normal">

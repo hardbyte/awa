@@ -355,6 +355,9 @@ table for failed snapshots that need operator action.
 Periodic jobs are declared by worker code and synchronized to `cron_jobs`.
 Only the maintenance leader evaluates due schedules. Enqueue is atomic, so a
 crash between evaluation and insert cannot create half-visible work.
+Schedules carry a `paused_at` flag; the evaluator skips paused rows and the
+atomic enqueue CTE re-checks the flag inside the same UPDATE, so a pause
+asserted between the leader's read and its enqueue still takes effect.
 
 ## Observability And Correctness
 

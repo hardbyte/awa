@@ -872,6 +872,10 @@ impl MaintenanceService {
         let now = Utc::now();
 
         for row in &cron_rows {
+            if row.is_paused() {
+                debug!(cron_name = %row.name, "Skipping paused cron schedule");
+                continue;
+            }
             let fire_times = compute_fire_times(row, now, CRON_CATCH_UP_LIMIT);
             if fire_times.is_empty() {
                 continue;
@@ -2295,6 +2299,8 @@ mod tests {
             last_enqueued_at,
             created_at,
             updated_at: created_at,
+            paused_at: None,
+            paused_by: None,
         }
     }
 

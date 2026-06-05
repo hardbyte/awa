@@ -17,7 +17,7 @@ without Redis or RabbitMQ, Awa is built for you.
 - **Unique jobs** — declare uniqueness by kind/queue/args; cancel by unique key without storing job IDs.
 - **Priorities, retries, snoozes** — exponential backoff with jitter; priority aging for fairness.
 - **Dead Letter Queue** — first-class DLQ with per-queue opt-in, retention, and operator retry/purge.
-- **Periodic/cron jobs** — leader-elected scheduler with timezone support and atomic enqueue.
+- **Periodic/cron jobs** — leader-elected scheduler with timezone support, atomic enqueue, and per-schedule pause/resume.
 - **Sequential callbacks** — `wait_for_callback()` / `resume_external()` for multi-step orchestration within a single handler.
 - **Webhook callbacks** — park jobs for external completion with optional CEL-expression filtering.
 

@@ -177,6 +177,8 @@ export interface CronJobRow {
   next_fire_at: string | null;
   created_at: string;
   updated_at: string;
+  paused_at: string | null;
+  paused_by: string | null;
 }
 
 export type StateCounts = Record<string, number>;
@@ -412,6 +414,22 @@ export function fetchCronJobs(): Promise<CronJobRow[]> {
 
 export function triggerCronJob(name: string): Promise<JobRow> {
   return apiFetch(`/cron/${encodeURIComponent(name)}/trigger`, {
+    method: "POST",
+  });
+}
+
+export function pauseCronJob(
+  name: string,
+  pausedBy?: string,
+): Promise<{ ok: boolean }> {
+  return apiFetch(`/cron/${encodeURIComponent(name)}/pause`, {
+    method: "POST",
+    body: JSON.stringify({ paused_by: pausedBy ?? null }),
+  });
+}
+
+export function resumeCronJob(name: string): Promise<{ ok: boolean }> {
+  return apiFetch(`/cron/${encodeURIComponent(name)}/resume`, {
     method: "POST",
   });
 }

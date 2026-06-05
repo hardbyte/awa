@@ -48,6 +48,66 @@ test.describe("Cron page", () => {
 
     await expect(firstCronSummary(page, cronJobs[0].name)).toBeVisible();
     await expect(page.getByRole("button", { name: "Trigger now" }).first()).toBeVisible();
+    // Every row shows either a Pause or a Resume action.
+    const hasPauseOrResume =
+      (await page.getByRole("button", { name: /Pause|Resume/ }).count()) > 0;
+    expect(hasPauseOrResume).toBe(true);
+  });
+
+  test("pause and resume buttons round-trip a schedule", async ({ page }) => {
+    const cronJobs = await loadCronPage(page);
+    if (cronJobs.length === 0) {
+      test.skip();
+      return;
+    }
+
+    const target = cronJobs[0];
+    const summary = firstCronSummary(page, target.name);
+    const row = summary.locator("xpath=ancestor::div[contains(@class, 'rounded-lg')][1]");
+
+    const pauseBtn = row.getByRole("button", { name: "Pause" });
+    const resumeBtn = row.getByRole("button", { name: "Resume" });
+
+    // Start state may be either paused or active; normalise to active.
+    if ((await resumeBtn.count()) > 0) {
+      const [resumeRes] = await Promise.all([
+        page.waitForResponse(
+          (r) =>
+            r.ok() &&
+            r.request().method() === "POST" &&
+            new URL(r.url()).pathname === `/api/cron/${target.name}/resume`,
+        ),
+        resumeBtn.click(),
+      ]);
+      expect(resumeRes.ok()).toBeTruthy();
+      await expect(pauseBtn).toBeVisible();
+    }
+
+    // Pause.
+    const [pauseRes] = await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          r.ok() &&
+          r.request().method() === "POST" &&
+          new URL(r.url()).pathname === `/api/cron/${target.name}/pause`,
+      ),
+      pauseBtn.click(),
+    ]);
+    expect(pauseRes.ok()).toBeTruthy();
+    await expect(row.getByText(/^paused$/)).toBeVisible();
+    await expect(row.getByRole("button", { name: "Resume" })).toBeVisible();
+
+    // Resume to restore initial state.
+    await Promise.all([
+      page.waitForResponse(
+        (r) =>
+          r.ok() &&
+          r.request().method() === "POST" &&
+          new URL(r.url()).pathname === `/api/cron/${target.name}/resume`,
+      ),
+      row.getByRole("button", { name: "Resume" }).click(),
+    ]);
+    await expect(row.getByRole("button", { name: "Pause" })).toBeVisible();
   });
 
   test("clicking cron row toggles expand/collapse", async ({ page }) => {
