@@ -25,7 +25,9 @@ application.
   the **storage-transition card** when the cluster is mid-migration:
   prepared / mixed / finalized state, drain progress, and the gates
   blocking finalization.
-- **Cron** — registered periodic schedules with next-run preview.
+- **Cron** — registered periodic schedules with next-run preview,
+  per-schedule pause / resume / trigger controls, and a target-queue
+  paused indicator.
 - **DLQ** (`/dlq`) — Dead Letter Queue browser with kind / queue /
   tag filters, single and bulk retry, move, and purge actions. The
   DLQ tab is reachable from the Jobs tab via the row links on

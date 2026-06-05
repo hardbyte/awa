@@ -270,6 +270,19 @@ pub struct CronJobRow {
     pub last_enqueued_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// When the schedule was paused, or NULL if active. While paused,
+    /// the evaluator skips this row and `atomic_enqueue` refuses to
+    /// fire. `last_enqueued_at` is preserved across pause, so the
+    /// existing `missed_fire_policy` decides catch-up on resume.
+    pub paused_at: Option<DateTime<Utc>>,
+    pub paused_by: Option<String>,
+}
+
+impl CronJobRow {
+    /// Whether the schedule is currently paused.
+    pub fn is_paused(&self) -> bool {
+        self.paused_at.is_some()
+    }
 }
 
 /// Upsert a periodic job schedule into `awa.cron_jobs`.
@@ -360,6 +373,58 @@ where
     Ok(result.rows_affected() > 0)
 }
 
+/// Pause a cron schedule. The evaluator skips paused schedules and
+/// `atomic_enqueue` refuses to fire while `paused_at IS NOT NULL`.
+///
+/// `last_enqueued_at` is left untouched so the schedule's existing
+/// `missed_fire_policy` decides catch-up behaviour on resume.
+///
+/// Pausing an already-paused schedule refreshes `paused_at` and
+/// `paused_by`. Returns `true` if a row was updated.
+pub async fn pause_cron_job<'e, E>(
+    executor: E,
+    name: &str,
+    paused_by: Option<&str>,
+) -> Result<bool, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.cron_jobs
+        SET paused_at = now(), paused_by = $2, updated_at = now()
+        WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .bind(paused_by)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Resume a paused cron schedule. Clears `paused_at` and `paused_by`.
+///
+/// Resuming an already-active schedule is a no-op at the row level
+/// (the UPDATE matches but the columns are already NULL). Returns
+/// `true` if a row was updated.
+pub async fn resume_cron_job<'e, E>(executor: E, name: &str) -> Result<bool, AwaError>
+where
+    E: PgExecutor<'e>,
+{
+    let result = sqlx::query(
+        r#"
+        UPDATE awa.cron_jobs
+        SET paused_at = NULL, paused_by = NULL, updated_at = now()
+        WHERE name = $1
+        "#,
+    )
+    .bind(name)
+    .execute(executor)
+    .await?;
+    Ok(result.rows_affected() > 0)
+}
+
 /// Atomically mark a cron job as enqueued AND insert the resulting job.
 ///
 /// Uses a single CTE so that both the UPDATE and INSERT happen in one
@@ -385,6 +450,7 @@ where
             SET last_enqueued_at = $2, updated_at = now()
             WHERE name = $1
               AND (last_enqueued_at IS NOT DISTINCT FROM $3)
+              AND paused_at IS NULL
             RETURNING name, kind, queue, args, priority, max_attempts, tags, metadata
         )
         SELECT inserted.*
@@ -417,7 +483,8 @@ where
 ///
 /// Reads the cron job config from `awa.cron_jobs` and inserts a new job
 /// directly. Does NOT update `last_enqueued_at` so the normal schedule
-/// is unaffected.
+/// is unaffected. Works on paused schedules — pause stops *automatic*
+/// fires; manual trigger is an explicit operator action.
 pub async fn trigger_cron_job<'e, E>(executor: E, name: &str) -> Result<JobRow, AwaError>
 where
     E: PgExecutor<'e>,

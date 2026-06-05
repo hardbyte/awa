@@ -3,7 +3,10 @@
 //! Set DATABASE_URL=postgres://postgres:test@localhost:15432/awa_test
 
 use awa::model::{
-    cron::{atomic_enqueue, delete_cron_job, list_cron_jobs, upsert_cron_job},
+    cron::{
+        atomic_enqueue, delete_cron_job, list_cron_jobs, pause_cron_job, resume_cron_job,
+        trigger_cron_job, upsert_cron_job,
+    },
     migrations,
 };
 use awa::{
@@ -493,4 +496,279 @@ async fn test_cron_job_with_tags_and_metadata() {
         job_row.metadata.get("cron_name").and_then(|v| v.as_str()),
         Some("tagged_job")
     );
+}
+
+// -- Pause / resume --
+
+#[tokio::test]
+async fn test_pause_sets_paused_at_and_paused_by() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["pause_sets_fields"]).await;
+
+    let job = PeriodicJob::builder("pause_sets_fields", "* * * * *")
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+
+    let updated = pause_cron_job(&pool, "pause_sets_fields", Some("alice"))
+        .await
+        .unwrap();
+    assert!(updated, "pause should report row updated");
+
+    let row = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "pause_sets_fields")
+        .unwrap();
+    assert!(row.is_paused(), "row should report paused");
+    assert_eq!(row.paused_by.as_deref(), Some("alice"));
+    assert!(row.paused_at.is_some());
+}
+
+#[tokio::test]
+async fn test_pause_unknown_returns_false() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["pause_unknown"]).await;
+
+    let updated = pause_cron_job(&pool, "pause_unknown", None).await.unwrap();
+    assert!(
+        !updated,
+        "pause on a non-existent schedule should report no row updated"
+    );
+}
+
+#[tokio::test]
+async fn test_atomic_enqueue_refuses_while_paused() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["pause_blocks_enqueue"]).await;
+    let queue = "cron_pause_blocks";
+    clean_queue(&pool, queue).await;
+
+    let job = PeriodicJob::builder("pause_blocks_enqueue", "* * * * *")
+        .queue(queue)
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+
+    pause_cron_job(&pool, "pause_blocks_enqueue", Some("bob"))
+        .await
+        .unwrap();
+
+    let fire_time = Utc::now();
+    let result = atomic_enqueue(&pool, "pause_blocks_enqueue", fire_time, None)
+        .await
+        .unwrap();
+    assert!(
+        result.is_none(),
+        "atomic_enqueue must return None while the schedule is paused"
+    );
+
+    // last_enqueued_at must stay NULL — the paused row was not marked.
+    let row = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "pause_blocks_enqueue")
+        .unwrap();
+    assert!(
+        row.last_enqueued_at.is_none(),
+        "last_enqueued_at must not advance while paused"
+    );
+}
+
+#[tokio::test]
+async fn test_resume_re_enables_enqueue() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["resume_enables"]).await;
+    let queue = "cron_resume_enables";
+    clean_queue(&pool, queue).await;
+
+    let job = PeriodicJob::builder("resume_enables", "* * * * *")
+        .queue(queue)
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+
+    pause_cron_job(&pool, "resume_enables", None).await.unwrap();
+    let updated = resume_cron_job(&pool, "resume_enables").await.unwrap();
+    assert!(updated, "resume should report row updated");
+
+    let fire_time = Utc::now();
+    let result = atomic_enqueue(&pool, "resume_enables", fire_time, None)
+        .await
+        .unwrap();
+    assert!(
+        result.is_some(),
+        "atomic_enqueue should succeed after resume"
+    );
+
+    let row = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "resume_enables")
+        .unwrap();
+    assert!(!row.is_paused());
+    assert!(row.paused_at.is_none());
+    assert!(row.paused_by.is_none());
+}
+
+#[tokio::test]
+async fn test_pause_preserves_last_enqueued_at() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["pause_preserves"]).await;
+    let queue = "cron_pause_preserves";
+    clean_queue(&pool, queue).await;
+
+    let job = PeriodicJob::builder("pause_preserves", "* * * * *")
+        .queue(queue)
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+
+    // First fire sets last_enqueued_at
+    let fire_time = Utc::now();
+    atomic_enqueue(&pool, "pause_preserves", fire_time, None)
+        .await
+        .unwrap()
+        .expect("first enqueue should succeed");
+
+    let before = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "pause_preserves")
+        .unwrap();
+    let last_before = before.last_enqueued_at.expect("should be set after fire");
+
+    pause_cron_job(&pool, "pause_preserves", None)
+        .await
+        .unwrap();
+    resume_cron_job(&pool, "pause_preserves").await.unwrap();
+
+    let after = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "pause_preserves")
+        .unwrap();
+    assert_eq!(
+        after.last_enqueued_at,
+        Some(last_before),
+        "last_enqueued_at must survive a pause/resume cycle so missed_fire_policy decides catch-up"
+    );
+}
+
+#[tokio::test]
+async fn test_upsert_preserves_pause_state() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["upsert_preserves_pause"]).await;
+
+    let job = PeriodicJob::builder("upsert_preserves_pause", "0 9 * * *")
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+
+    pause_cron_job(&pool, "upsert_preserves_pause", Some("ops"))
+        .await
+        .unwrap();
+
+    // Simulate a deploy re-registering the schedule
+    let job_v2 = PeriodicJob::builder("upsert_preserves_pause", "30 8 * * *")
+        .build_raw(
+            "pause_test".to_string(),
+            serde_json::json!({"version": "v2"}),
+        )
+        .unwrap();
+    upsert_cron_job(&pool, &job_v2).await.unwrap();
+
+    let row = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "upsert_preserves_pause")
+        .unwrap();
+    assert!(
+        row.is_paused(),
+        "upsert must not clear paused state — operators expect pause to survive deploys"
+    );
+    assert_eq!(row.paused_by.as_deref(), Some("ops"));
+    assert_eq!(row.cron_expr, "30 8 * * *");
+    assert_eq!(row.args, serde_json::json!({"version": "v2"}));
+}
+
+#[tokio::test]
+async fn test_trigger_works_on_paused_schedule() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["trigger_on_paused"]).await;
+    let queue = "cron_trigger_paused";
+    clean_queue(&pool, queue).await;
+
+    let job = PeriodicJob::builder("trigger_on_paused", "0 9 * * *")
+        .queue(queue)
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+
+    pause_cron_job(&pool, "trigger_on_paused", None)
+        .await
+        .unwrap();
+
+    // Manual trigger is an explicit operator action; pause only blocks
+    // *automatic* fires.
+    let job_row = trigger_cron_job(&pool, "trigger_on_paused").await.unwrap();
+    assert_eq!(job_row.queue, queue);
+    assert_eq!(
+        job_row
+            .metadata
+            .get("triggered_manually")
+            .and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    // Pause state must be unchanged.
+    let row = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.name == "trigger_on_paused")
+        .unwrap();
+    assert!(row.is_paused());
+}
+
+#[tokio::test]
+async fn test_resume_unknown_returns_false() {
+    let pool = setup().await;
+    clean_cron_names(&pool, &["resume_unknown"]).await;
+
+    let updated = resume_cron_job(&pool, "resume_unknown").await.unwrap();
+    assert!(
+        !updated,
+        "resume on a non-existent schedule should report no row updated"
+    );
+}
+
+#[tokio::test]
+async fn test_delete_clears_paused_row() {
+    // Pause then delete must work — delete_cron_job is name-keyed and
+    // doesn't care about pause state.
+    let pool = setup().await;
+    clean_cron_names(&pool, &["delete_paused"]).await;
+
+    let job = PeriodicJob::builder("delete_paused", "0 9 * * *")
+        .build_raw("pause_test".to_string(), serde_json::json!({}))
+        .unwrap();
+    upsert_cron_job(&pool, &job).await.unwrap();
+    pause_cron_job(&pool, "delete_paused", None).await.unwrap();
+
+    let deleted = delete_cron_job(&pool, "delete_paused").await.unwrap();
+    assert!(deleted);
+
+    let still_there = list_cron_jobs(&pool)
+        .await
+        .unwrap()
+        .into_iter()
+        .any(|r| r.name == "delete_paused");
+    assert!(!still_there);
 }

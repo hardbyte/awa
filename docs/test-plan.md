@@ -165,6 +165,7 @@ Rust worker.
 |---|------|------|----|
 | T34-T46 | Cron: migration, upsert, atomic CTE, dedup, backfill, DST | ✓ | |
 | T40-T41 | End-to-end periodic + metadata propagation | ✓ | |
+| CRP1-CRP9 | Cron pause / resume: state transitions, CTE guard, upsert preserves pause, manual trigger bypass, queue interaction | ✓ | |
 
 ### COPY Batch Ingestion
 
@@ -237,7 +238,7 @@ Concurrent lifecycle benchmark (1 queue × 128 workers, 20K jobs):
 | TLA1 | AwaCore | Lease-guarded finalization, stale completion rejected |
 | TLA2 | AwaExtended | Shutdown/rescue/permit/fairness protocol |
 | TLA3 | AwaCbk | At-most-once callback resolution, sequential resume |
-| TLA4 | AwaCron | No duplicate fire under leader failover |
+| TLA4 | AwaCron | No duplicate fire under leader failover; paused schedules block enqueue across a snapshot-pause-CAS race; liveness preserved under fair Resume |
 | TLA5 | AwaBatcher | At-most-once completion, DirectCompleteFail recovery |
 | TLA6 | AwaDispatchClaim with NewClaim config | Dispatch claim safety |
 | TLA7 | AwaSegmentedStorage | Segmented storage safety, waiting flow, optional attempt-state, prune safety |

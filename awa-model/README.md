@@ -30,7 +30,9 @@ against the admin API.
 - **Dead Letter Queue** (`dlq`) — `DlqRow`, `DlqMetadata`,
   `ListDlqFilter`, `RetryFromDlqOpts`, list / retry / move / purge
   helpers backing the `awa dlq` CLI and the DLQ admin UI tab.
-- **Cron** (`cron`) — `PeriodicJob`, `PeriodicJobBuilder`, `CronJobRow`.
+- **Cron** (`cron`) — `PeriodicJob`, `PeriodicJobBuilder`, `CronJobRow`
+  plus `pause_cron_job` / `resume_cron_job` operating on the
+  `paused_at` / `paused_by` columns.
 - **Queue storage** (`queue_storage`) — `QueueStorage`,
   `QueueStorageConfig`, `ClaimedRuntimeJob`, `RotateOutcome`,
   `PruneOutcome`. The vacuum-aware engine introduced in 0.6.

@@ -90,6 +90,8 @@ pub async fn router_with(
             "/cron/{name}/trigger",
             post(handlers::cron::trigger_cron_job),
         )
+        .route("/cron/{name}/pause", post(handlers::cron::pause_cron_job))
+        .route("/cron/{name}/resume", post(handlers::cron::resume_cron_job))
         // Stats
         .route("/stats", get(handlers::stats::get_stats))
         .route("/stats/timeseries", get(handlers::stats::get_timeseries))
