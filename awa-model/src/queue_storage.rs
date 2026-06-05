@@ -1396,7 +1396,7 @@ impl DlqJobRow {
             args: self.args,
             priority,
             attempt: 0,
-            run_lease: 0,
+            run_lease: self.run_lease,
             max_attempts: self.max_attempts,
             run_at,
             attempted_at: None,
@@ -1422,7 +1422,7 @@ impl DlqJobRow {
             state: JobState::Scheduled,
             priority,
             attempt: 0,
-            run_lease: 0,
+            run_lease: self.run_lease,
             max_attempts: self.max_attempts,
             run_at,
             attempted_at: None,
@@ -6145,7 +6145,6 @@ impl QueueStorage {
             )?;
             let ready_row = ExistingReadyRow {
                 attempt: 0,
-                run_lease: 0,
                 run_at: Utc::now(),
                 attempted_at: None,
                 ..waiting.clone().into_ready_row(Utc::now(), ready_payload)
@@ -6218,7 +6217,7 @@ impl QueueStorage {
                 args: terminal.args,
                 priority: terminal.priority,
                 attempt: 0,
-                run_lease: 0,
+                run_lease: terminal.run_lease,
                 max_attempts: terminal.max_attempts,
                 run_at: Utc::now(),
                 attempted_at: None,
