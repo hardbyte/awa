@@ -1298,6 +1298,24 @@ BEGIN
         p_schema
     );
 
+    -- If an upgraded schema already had live-counter rows before
+    -- counter_bucket existed, every aggregate row received DEFAULT 0.
+    -- The aggregate table has no job_id, so the installer cannot rebucket
+    -- those rows in place. Mark the counter untrusted here; v027's schema
+    -- rewalker rebuilds it from done_entries immediately after calling this
+    -- helper, and operator-initiated prepare_schema() remains honest even if
+    -- run outside the migration path.
+    EXECUTE format(
+        $ddl$
+        UPDATE %1$I.queue_ring_state
+        SET terminal_counter_trusted_at = NULL
+        WHERE singleton = TRUE
+          AND EXISTS (SELECT 1 FROM %1$I.queue_terminal_live_counts LIMIT 1)
+          AND EXISTS (SELECT 1 FROM %1$I.done_entries LIMIT 1)
+        $ddl$,
+        p_schema
+    );
+
     -- Backfill from existing done_entries (no-op on fresh installs).
     EXECUTE format(
         $ddl$

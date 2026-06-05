@@ -552,6 +552,49 @@ mod ring_slot_tests {
     }
 }
 
+#[cfg(test)]
+mod claim_cursor_advance_tests {
+    use super::{ClaimCursorAdvance, QueueStorage};
+
+    fn advance(next_seq: i64, only_if_current: Option<i64>) -> ClaimCursorAdvance {
+        ClaimCursorAdvance {
+            queue: "queue".to_string(),
+            priority: 2,
+            enqueue_shard: 0,
+            next_seq,
+            only_if_current,
+        }
+    }
+
+    #[test]
+    fn normalize_claim_cursor_advances_sorts_conditional_lane_updates() {
+        let normalized = QueueStorage::normalize_claim_cursor_advances(&[
+            advance(7, Some(6)),
+            advance(6, Some(5)),
+            advance(8, Some(7)),
+        ]);
+
+        let ordered: Vec<(i64, i64)> = normalized
+            .iter()
+            .map(|advance| (advance.only_if_current.unwrap(), advance.next_seq))
+            .collect();
+        assert_eq!(ordered, vec![(5, 6), (6, 7), (7, 8)]);
+    }
+
+    #[test]
+    fn normalize_claim_cursor_advances_coalesces_unconditional_lane_updates() {
+        let normalized = QueueStorage::normalize_claim_cursor_advances(&[
+            advance(3, None),
+            advance(5, None),
+            advance(4, Some(3)),
+        ]);
+
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].next_seq, 5);
+        assert_eq!(normalized[0].only_if_current, None);
+    }
+}
+
 fn default_payload_metadata() -> serde_json::Value {
     serde_json::json!({})
 }
@@ -3045,16 +3088,85 @@ impl QueueStorage {
             .collect()
     }
 
+    fn normalize_claim_cursor_advances(advances: &[ClaimCursorAdvance]) -> Vec<ClaimCursorAdvance> {
+        let mut grouped: BTreeMap<(String, i16, i16), (Option<i64>, BTreeMap<i64, i64>)> =
+            BTreeMap::new();
+
+        for advance in advances {
+            let key = (
+                advance.queue.clone(),
+                advance.priority,
+                advance.enqueue_shard,
+            );
+            let (unconditional, conditional) = grouped.entry(key).or_default();
+            if let Some(only_if_current) = advance.only_if_current {
+                conditional
+                    .entry(only_if_current)
+                    .and_modify(|next| *next = (*next).max(advance.next_seq))
+                    .or_insert(advance.next_seq);
+            } else {
+                *unconditional = Some(
+                    unconditional
+                        .map(|next| next.max(advance.next_seq))
+                        .unwrap_or(advance.next_seq),
+                );
+            }
+        }
+
+        let mut normalized = Vec::with_capacity(advances.len());
+        for ((queue, priority, enqueue_shard), (unconditional, conditional)) in grouped {
+            if let Some(next_seq) = unconditional {
+                normalized.push(ClaimCursorAdvance {
+                    queue,
+                    priority,
+                    enqueue_shard,
+                    next_seq,
+                    only_if_current: None,
+                });
+                continue;
+            }
+
+            for (only_if_current, next_seq) in conditional {
+                normalized.push(ClaimCursorAdvance {
+                    queue: queue.clone(),
+                    priority,
+                    enqueue_shard,
+                    next_seq,
+                    only_if_current: Some(only_if_current),
+                });
+            }
+        }
+
+        normalized
+    }
+
     async fn advance_claim_cursors(&self, pool: &PgPool, advances: &[ClaimCursorAdvance]) {
+        let advances = Self::normalize_claim_cursor_advances(advances);
         // PostgreSQL sequence state is not rolled back with the surrounding
         // transaction. Keep claim cursors lagging rather than risking a cursor
         // that gets ahead of ready rows whose claim/cancel transaction aborts.
-        if let Err(err) = self.advance_claim_cursors_strict(pool, advances).await {
-            tracing::warn!(
-                error = ?err,
-                lanes = advances.len(),
-                "failed to advance queue-storage claim cursors after committed state change"
-            );
+        for attempt in 1..=3 {
+            match self.advance_claim_cursors_strict(pool, &advances).await {
+                Ok(()) => return,
+                Err(err) if attempt < 3 => {
+                    tracing::warn!(
+                        error = ?err,
+                        lanes = advances.len(),
+                        attempt,
+                        "failed to advance queue-storage claim cursors after committed state change; retrying"
+                    );
+                    tokio::time::sleep(Duration::from_millis(25 * attempt as u64)).await;
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        error = ?err,
+                        lanes = advances.len(),
+                        attempts = attempt,
+                        "failed to advance queue-storage claim cursors after committed state change"
+                    );
+                    return;
+                }
+            }
         }
     }
 
