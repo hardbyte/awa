@@ -697,6 +697,78 @@ async fn test_v023_migrates_legacy_default_queue_storage_tables() {
     }
 }
 
+#[tokio::test]
+async fn test_v027_rebuckets_existing_terminal_live_counts() {
+    let _guard = acquire_migration_guard().await;
+    let pool = pool().await;
+    reset_schema(&pool).await;
+
+    for (_version, _desc, sql) in migrations::migration_sql_range(0, 26) {
+        sqlx::raw_sql(&sql).execute(&pool).await.unwrap();
+    }
+
+    sqlx::raw_sql(
+        r#"
+        INSERT INTO awa.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) VALUES
+            (0, 0, 1001, 'migration_job', 'v27_rebucket', 'completed'::awa.job_state,
+             2::smallint, 1::smallint, 1::bigint, 1::bigint, 0::smallint,
+             now(), now(), '{}'::jsonb),
+            (0, 0, 1002, 'migration_job', 'v27_rebucket', 'completed'::awa.job_state,
+             2::smallint, 1::smallint, 1::bigint, 2::bigint, 0::smallint,
+             now(), now(), '{}'::jsonb);
+
+        TRUNCATE TABLE awa.queue_terminal_live_counts;
+        INSERT INTO awa.queue_terminal_live_counts (
+            ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
+        ) VALUES (
+            0, 'v27_rebucket', 2::smallint, 0::smallint, 0::smallint, 2::bigint
+        );
+
+        UPDATE awa.queue_ring_state
+        SET terminal_counter_trusted_at = now()
+        WHERE singleton = TRUE;
+        "#,
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    migrations::run(&pool).await.unwrap();
+
+    let buckets: Vec<(i16, i64)> = sqlx::query_as(
+        r#"
+        SELECT counter_bucket, live_terminal_count
+        FROM awa.queue_terminal_live_counts
+        WHERE queue = 'v27_rebucket'
+        ORDER BY counter_bucket
+        "#,
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(
+        buckets,
+        vec![(233_i16, 1), (234_i16, 1)],
+        "v27 should rebuild existing terminal live counters into job_id buckets"
+    );
+
+    let trusted: bool = sqlx::query_scalar(
+        "SELECT terminal_counter_trusted_at IS NOT NULL FROM awa.queue_ring_state WHERE singleton = TRUE",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        trusted,
+        "v27 rebuild should leave the rebuilt counter trusted"
+    );
+}
+
 // ── Legacy version upgrade (0.3.x → 0.4.x) ─────────────────────
 
 #[tokio::test]

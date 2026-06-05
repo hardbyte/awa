@@ -77,6 +77,38 @@ BEGIN
             v_claim_slots,
             v_lease_claim_receipts
         );
+
+        -- Existing #290 deployments may already have
+        -- queue_terminal_live_counts rows from the pre-striped shape. Adding
+        -- counter_bucket gives those rows DEFAULT 0, while v27 delete/retry
+        -- paths decrement by job_id % 256. Rebuild the counter once during
+        -- the v27 rewalk so upgraded schemas do not keep an inflated bucket-0
+        -- aggregate.
+        EXECUTE format('TRUNCATE TABLE %I.queue_terminal_live_counts', v_schema);
+        EXECUTE format(
+            $sql$
+            INSERT INTO %1$I.queue_terminal_live_counts AS counts (
+                ready_slot, queue, priority, enqueue_shard, counter_bucket, live_terminal_count
+            )
+            SELECT
+                ready_slot,
+                queue,
+                priority,
+                enqueue_shard,
+                mod(mod(job_id, 256::bigint) + 256::bigint, 256::bigint)::smallint AS counter_bucket,
+                count(*)::bigint
+            FROM %1$I.done_entries
+            GROUP BY ready_slot, queue, priority, enqueue_shard, counter_bucket
+            ON CONFLICT (ready_slot, queue, priority, enqueue_shard, counter_bucket) DO UPDATE
+            SET live_terminal_count = EXCLUDED.live_terminal_count
+            $sql$,
+            v_schema
+        );
+
+        EXECUTE format(
+            'UPDATE %I.queue_ring_state SET terminal_counter_trusted_at = now() WHERE singleton = TRUE',
+            v_schema
+        );
     END LOOP;
 END
 $$;

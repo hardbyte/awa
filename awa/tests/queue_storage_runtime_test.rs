@@ -3734,7 +3734,6 @@ async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence
         .await
         .expect("claim cursor")
     };
-
     assert_eq!(claim_cursor().await, 2);
 
     let mut tx = pool.begin().await.expect("begin enqueue reservation");
@@ -3765,6 +3764,236 @@ async fn test_queue_storage_claim_gap_does_not_skip_uncommitted_enqueue_sequence
     );
 
     tx.rollback().await.expect("rollback reservation holder");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn test_queue_storage_receipt_claim_dedupes_when_post_commit_cursor_advance_is_lost() {
+    let _guard = QUEUE_STORAGE_RUNTIME_LOCK.lock().await;
+    let pool = setup_pool(10).await;
+    let queue = "qs_receipt_claim_lost_cursor_advance";
+    let schema = "awa_qs_receipt_claim_lost_cursor_advance";
+    let store = create_store_with_config(
+        &pool,
+        QueueStorageConfig {
+            schema: schema.to_string(),
+            queue_slot_count: 4,
+            lease_slot_count: 2,
+            queue_stripe_count: 1,
+            lease_claim_receipts: true,
+            claim_slot_count: 2,
+        },
+    )
+    .await;
+
+    let job_id = enqueue_job(
+        &pool,
+        &store,
+        &HeartbeatRescueJob { id: 8 },
+        InsertOpts {
+            queue: queue.to_string(),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let claim_cursor = || async {
+        sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT {schema}.sequence_next_value(seq_name)
+             FROM {schema}.queue_claim_heads
+             WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+        ))
+        .bind(queue)
+        .bind(2_i16)
+        .bind(0_i16)
+        .fetch_one(&pool)
+        .await
+        .expect("claim cursor")
+    };
+    let claim_seq_name: String = sqlx::query_scalar(&format!(
+        "SELECT seq_name
+         FROM {schema}.queue_claim_heads
+         WHERE queue = $1 AND priority = $2 AND enqueue_shard = $3"
+    ))
+    .bind(queue)
+    .bind(2_i16)
+    .bind(0_i16)
+    .fetch_one(&pool)
+    .await
+    .expect("claim sequence name");
+
+    let first: Vec<(i32, i64, i64, i16, i16, i64, i64, i32)> = sqlx::query_as(&format!(
+        "SELECT ready_slot, ready_generation, job_id, priority, attempt, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(1_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("first raw receipt claim");
+
+    assert_eq!(first, vec![(0, 0, job_id, 2, 1, 1, 1, 0)]);
+    assert_eq!(
+        claim_cursor().await,
+        1,
+        "raw claim intentionally leaves the post-commit claim cursor advance unsent"
+    );
+
+    match store.rotate_claims(&pool).await.expect("rotate claims") {
+        RotateOutcome::Rotated { slot, .. } => assert_eq!(slot, 1),
+        other => panic!("expected claim ring to rotate to slot 1, got {other:?}"),
+    }
+
+    let second: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(1_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("second raw receipt claim with stale cursor");
+
+    assert!(
+        second.is_empty(),
+        "stale claim cursor plus claim-ring rotation must not emit a second open receipt"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        2,
+        "spent receipt evidence should advance the stale claim cursor over the emitted attempt"
+    );
+
+    let receipt_rows: i64 = sqlx::query_scalar(&format!(
+        "SELECT count(*)::bigint
+         FROM {schema}.lease_claims
+         WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(1_i64)
+    .fetch_one(&pool)
+    .await
+    .expect("count receipt rows");
+    assert_eq!(
+        receipt_rows, 1,
+        "there must be only one receipt row for the claimed attempt across claim partitions"
+    );
+
+    assert_eq!(
+        open_receipt_claim_count(&pool, &store).await,
+        1,
+        "the original receipt remains open for completion or rescue"
+    );
+
+    sqlx::query("SELECT setval(format('%I.%I', $1, $2)::regclass, $3, $4)")
+        .bind(schema)
+        .bind(&claim_seq_name)
+        .bind(1_i64)
+        .bind(false)
+        .execute(&pool)
+        .await
+        .expect("reset claim cursor for closed-receipt phase");
+
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.lease_claim_closures (claim_slot, job_id, run_lease, outcome)
+         VALUES ($1, $2, $3, 'completed')"
+    ))
+    .bind(0_i32)
+    .bind(job_id)
+    .bind(1_i64)
+    .execute(&pool)
+    .await
+    .expect("close first receipt");
+
+    let after_closure: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(1_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("raw receipt claim after closure with stale cursor");
+
+    assert!(
+        after_closure.is_empty(),
+        "a closed receipt still marks the attempt as spent while the claim cursor is stale"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        2,
+        "closed receipt evidence should also advance the stale claim cursor"
+    );
+
+    sqlx::query("SELECT setval(format('%I.%I', $1, $2)::regclass, $3, $4)")
+        .bind(schema)
+        .bind(&claim_seq_name)
+        .bind(1_i64)
+        .bind(false)
+        .execute(&pool)
+        .await
+        .expect("reset claim cursor for terminal-evidence phase");
+
+    sqlx::query(&format!(
+        "INSERT INTO {schema}.done_entries (
+            ready_slot, ready_generation, job_id, kind, queue, state,
+            priority, attempt, run_lease, lane_seq, enqueue_shard,
+            attempted_at, finalized_at, payload
+        ) VALUES (
+            0, 0, $1, 'heartbeat_rescue_job', $2, 'completed'::awa.job_state,
+            2::smallint, 1::smallint, 1::bigint, 1::bigint, 0::smallint,
+            now(), now(), '{{}}'::jsonb
+        )"
+    ))
+    .bind(job_id)
+    .bind(queue)
+    .execute(&pool)
+    .await
+    .expect("seed terminal evidence");
+
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.lease_claim_closures WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(1_i64)
+    .execute(&pool)
+    .await
+    .expect("remove closure evidence");
+    sqlx::query(&format!(
+        "DELETE FROM {schema}.lease_claims WHERE job_id = $1 AND run_lease = $2"
+    ))
+    .bind(job_id)
+    .bind(1_i64)
+    .execute(&pool)
+    .await
+    .expect("remove claim evidence");
+
+    let after_receipt_prune: Vec<(i64, i64, i64, i32)> = sqlx::query_as(&format!(
+        "SELECT job_id, run_lease, lane_seq, claim_slot
+         FROM {schema}.claim_ready_runtime($1, $2, $3, $4)"
+    ))
+    .bind(queue)
+    .bind(1_i64)
+    .bind(0.0_f64)
+    .bind(0.0_f64)
+    .fetch_all(&pool)
+    .await
+    .expect("raw receipt claim after receipt evidence is gone");
+
+    assert!(
+        after_receipt_prune.is_empty(),
+        "terminal evidence must also prevent re-emitting a spent attempt after receipt partitions are pruned"
+    );
+    assert_eq!(
+        claim_cursor().await,
+        2,
+        "terminal evidence should advance the stale claim cursor after receipt evidence is gone"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -51,7 +51,6 @@ DECLARE
     v_slot           INT;
     v_initial_gen    BIGINT;
     v_claimed_cte    TEXT;
-    v_advance_claim_condition TEXT;
 BEGIN
     IF p_schema IS NULL OR p_schema !~ '^[a-z_][a-z0-9_]*$' THEN
         RAISE EXCEPTION 'install_queue_storage_substrate: schema name must match ^[a-z_][a-z0-9_]*$; got %',
@@ -448,27 +447,6 @@ BEGIN
                     format('%%I.%%I', %1$L, p_seq_name),
                     p_next - 1
                 );
-            END IF;
-        END;
-        $func$
-        $ddl$,
-        p_schema
-    );
-
-    EXECUTE format(
-        $ddl$
-        CREATE OR REPLACE FUNCTION %1$I.set_sequence_next_if(
-            p_seq_name TEXT,
-            p_next BIGINT,
-            p_enabled BOOLEAN
-        )
-        RETURNS VOID
-        LANGUAGE plpgsql
-        SET search_path = pg_catalog
-        AS $func$
-        BEGIN
-            IF p_enabled THEN
-                PERFORM %1$I.set_sequence_next(p_seq_name, p_next);
             END IF;
         END;
         $func$
@@ -1411,8 +1389,6 @@ BEGIN
     -- receipts=FALSE writes directly into the partitioned leases table.
     --------------------------------------------------------------------
 
-    v_advance_claim_condition := 'FALSE';
-
     IF p_lease_claim_receipts THEN
         v_claimed_cte := format(
             $cte$
@@ -1449,8 +1425,9 @@ BEGIN
                     selected.lane_seq,
                     v_lane_shard,
                     v_deadline_at
-                FROM selected
+                FROM selected_with_spent AS selected
                 CROSS JOIN claim_ring
+                WHERE NOT selected.attempt_spent
                 RETURNING
                     claim_rows.claim_slot,
                     claim_rows.ready_slot,
@@ -1505,8 +1482,9 @@ BEGIN
                     v_claimed_at,
                     v_deadline_at,
                     v_claimed_at
-                FROM selected
+                FROM selected_with_spent AS selected
                 CROSS JOIN lease_ring
+                WHERE NOT selected.attempt_spent
                 RETURNING
                     0::int AS claim_slot,
                     lease_rows.ready_slot,
@@ -1577,6 +1555,7 @@ BEGIN
             v_target_generation BIGINT;
             v_claimed_at TIMESTAMPTZ;
             v_deadline_at TIMESTAMPTZ;
+            v_spent_next_seq BIGINT;
         BEGIN
             SELECT
                 claims.priority,
@@ -1669,6 +1648,76 @@ BEGIN
                 v_deadline_at := NULL::timestamptz;
             END IF;
 
+            WITH selected AS (
+                SELECT
+                    ready.job_id,
+                    ready.run_lease,
+                    ready.lane_seq
+                FROM %1$I.ready_entries AS ready
+                WHERE ready.queue = p_queue
+                  AND ready.priority = v_lane_priority
+                  AND ready.enqueue_shard = v_lane_shard
+                  AND ready.ready_slot = v_target_slot
+                  AND ready.ready_generation = v_target_generation
+                  AND ready.lane_seq >= v_lane_claim_seq
+                ORDER BY ready.lane_seq ASC
+                LIMIT v_claim_limit
+            ),
+            selected_with_spent AS (
+                SELECT
+                    selected.*,
+                    (
+                        EXISTS (
+                            SELECT 1
+                            FROM %1$I.lease_claims AS existing_claims
+                            WHERE existing_claims.job_id = selected.job_id
+                              AND existing_claims.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.leases AS existing_leases
+                            WHERE existing_leases.job_id = selected.job_id
+                              AND existing_leases.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.done_entries AS existing_done
+                            WHERE existing_done.job_id = selected.job_id
+                              AND existing_done.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.deferred_jobs AS existing_deferred
+                            WHERE existing_deferred.job_id = selected.job_id
+                              AND existing_deferred.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.dlq_entries AS existing_dlq
+                            WHERE existing_dlq.job_id = selected.job_id
+                              AND existing_dlq.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.ready_entries AS existing_ready
+                            WHERE existing_ready.job_id = selected.job_id
+                              AND existing_ready.run_lease = selected.run_lease + 1
+                        )
+                    ) AS attempt_spent
+                FROM selected
+            )
+            SELECT max(selected_with_spent.lane_seq) + 1
+            INTO v_spent_next_seq
+            FROM selected_with_spent
+            WHERE attempt_spent;
+
+            IF v_spent_next_seq IS NOT NULL THEN
+                -- Safe in-transaction sequence movement: this only skips
+                -- attempts with already-committed evidence. Newly emitted
+                -- claims still advance post-commit.
+                PERFORM %1$I.set_sequence_next(v_claim_seq_name, v_spent_next_seq);
+            END IF;
+
             RETURN QUERY
             WITH lease_ring AS (
                 SELECT current_slot AS lease_slot, generation AS lease_generation
@@ -1712,15 +1761,63 @@ BEGIN
                 ORDER BY ready.lane_seq ASC
                 LIMIT v_claim_limit
             ),
-            advanced AS (
-                SELECT %1$I.set_sequence_next_if(
-                    v_claim_seq_name,
-                    COALESCE(
-                        (SELECT max(selected.lane_seq) + 1 FROM selected),
-                        v_lane_claim_seq
-                    ),
-                    %3$s
-                )
+            selected_with_spent AS (
+                SELECT
+                    selected.*,
+                    (
+                        -- Claim cursor advancement is deliberately
+                        -- post-commit for newly emitted attempts: PostgreSQL
+                        -- sequence movement is non-transactional, so advancing
+                        -- inside the claim transaction could skip committed
+                        -- work if that transaction later aborts. If the
+                        -- post-commit advance is lost, the cursor may lag and
+                        -- this ready row can be selected again after ring
+                        -- rotation.
+                        --
+                        -- Treat the next run_lease as an idempotency key.
+                        -- Once committed evidence exists for (job_id,
+                        -- run_lease), the attempt has already been emitted.
+                        -- Legitimate retries re-enter ready/deferred state
+                        -- with selected.run_lease advanced, so they target a
+                        -- new idempotency key.
+                        EXISTS (
+                            SELECT 1
+                            FROM %1$I.lease_claims AS existing_claims
+                            WHERE existing_claims.job_id = selected.job_id
+                              AND existing_claims.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.leases AS existing_leases
+                            WHERE existing_leases.job_id = selected.job_id
+                              AND existing_leases.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.done_entries AS existing_done
+                            WHERE existing_done.job_id = selected.job_id
+                              AND existing_done.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.deferred_jobs AS existing_deferred
+                            WHERE existing_deferred.job_id = selected.job_id
+                              AND existing_deferred.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.dlq_entries AS existing_dlq
+                            WHERE existing_dlq.job_id = selected.job_id
+                              AND existing_dlq.run_lease = selected.run_lease + 1
+                        )
+                        OR EXISTS (
+                            SELECT 1
+                            FROM %1$I.ready_entries AS existing_ready
+                            WHERE existing_ready.job_id = selected.job_id
+                              AND existing_ready.run_lease = selected.run_lease + 1
+                        )
+                    ) AS attempt_spent
+                FROM selected
             ),
             %2$s
             SELECT
@@ -1756,7 +1853,6 @@ BEGIN
                 selected.payload
             FROM claimed
             CROSS JOIN lease_ring
-            CROSS JOIN advanced
             JOIN selected
              ON selected.ready_slot = claimed.ready_slot
              AND selected.ready_generation = claimed.ready_generation
@@ -1768,17 +1864,19 @@ BEGIN
             GET DIAGNOSTICS v_claimed_count = ROW_COUNT;
 
             -- If a target ready row existed but the claim CTE produced no
-            -- rows, leave the sequence cursor untouched. The earlier
-            -- NOT FOUND branch handles true gaps. Advancing here can skip a
-            -- live retry/rescue row because sequence movement is
-            -- non-transactional and cannot be recovered by rollback.
+            -- rows, the spent-attempt pre-pass may still have moved the
+            -- sequence cursor over committed spent attempts. It deliberately
+            -- does not advance over unspent rows: newly emitted claims still
+            -- move the sequence only after the surrounding transaction
+            -- commits, because sequence movement is non-transactional and
+            -- cannot be recovered by rollback.
             IF v_claimed_count = 0 THEN
                 RETURN;
             END IF;
         END;
         $func$
         $create_runtime$,
-        p_schema, v_claimed_cte, v_advance_claim_condition
+        p_schema, v_claimed_cte
     );
 
     --------------------------------------------------------------------
