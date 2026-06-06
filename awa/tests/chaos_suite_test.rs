@@ -1060,6 +1060,11 @@ impl Worker for MixedFleetRustWorker {
         let args: ChaosProbe = serde_json::from_value(ctx.job.args.clone()).map_err(|err| {
             JobError::terminal(format!("failed to decode mixed fleet args: {err}"))
         })?;
+        if args.marker.starts_with("python-") {
+            // Keep the mixed-language smoke deterministic: wrong-language
+            // claims yield the job back without burning an attempt.
+            return Ok(JobResult::Snooze(Duration::from_millis(50)));
+        }
         tokio::time::sleep(Duration::from_millis(20)).await;
         self.tx
             .send(args.marker)
@@ -1577,16 +1582,13 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
             .expect("Failed to insert Rust-enqueued ChaosProbe");
         }
 
-        let expected_completed = batch_size * 2;
         let deadline = tokio::time::sleep(scaled_timeout(Duration::from_secs(20)));
         tokio::pin!(deadline);
         let mut rust_completed = 0_i64;
         let mut python_completed = 0_i64;
-        let mut first_rust_marker: Option<String> = None;
-        let mut first_python_line: Option<String> = None;
 
         loop {
-            if rust_completed + python_completed == expected_completed {
+            if rust_completed == batch_size && python_completed == batch_size {
                 break;
             }
 
@@ -1594,39 +1596,28 @@ async fn test_mixed_rust_and_python_workers_share_same_queue() {
                 marker = rx.recv() => {
                     let marker = marker.expect("Rust mixed-fleet receiver closed unexpectedly");
                     assert!(
-                        marker.starts_with("python-") || marker.starts_with("rust-"),
+                        marker.starts_with("rust-"),
                         "Unexpected marker processed by Rust worker: {marker}"
                     );
-                    first_rust_marker.get_or_insert(marker);
                     rust_completed += 1;
                 }
                 line = python_worker.stdout_lines.recv() => {
                     let line = line.expect("Python mixed-fleet worker stdout closed unexpectedly");
                     if line.contains("COMPLETE mode=worker_chaos_probe") {
                         assert!(
-                            line.contains("marker=python-") || line.contains("marker=rust-"),
+                            line.contains("marker=python-"),
                             "Unexpected python worker completion line: {line}"
                         );
-                        first_python_line.get_or_insert(line);
                         python_completed += 1;
                     }
                 }
                 () = &mut deadline => {
                     panic!(
-                        "Timed out waiting for mixed-fleet completions; rust_completed={rust_completed}, python_completed={python_completed}, expected={expected_completed}"
+                        "Timed out waiting for mixed-fleet completions; rust_completed={rust_completed}, python_completed={python_completed}, expected_per_language={batch_size}"
                     );
                 }
             }
         }
-
-        assert!(
-            first_rust_marker.is_some(),
-            "Rust worker did not process any mixed-fleet jobs"
-        );
-        assert!(
-            first_python_line.is_some(),
-            "Python worker did not process any mixed-fleet jobs"
-        );
 
         python_worker.stop().await;
     }
