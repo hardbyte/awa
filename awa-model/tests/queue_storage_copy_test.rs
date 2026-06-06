@@ -7,7 +7,7 @@ use sqlx::PgPool;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Barrier, Mutex};
 
 static QUEUE_STORAGE_COPY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
@@ -433,6 +433,186 @@ async fn queue_storage_copy_concurrent_lane_seq_is_dense() {
     let available_count =
         lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
     assert_eq!(available_count, expected);
+}
+
+#[tokio::test]
+async fn queue_storage_copy_independent_stores_keep_lane_seq_unique() {
+    let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
+    let config = QueueStorageConfig {
+        schema: "awa_qs_copy_independent_stores".to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        ..Default::default()
+    };
+    let (pool, store) = setup_store_with_config(config.clone(), 4).await;
+    let queue = "qs_copy_independent_stores";
+    let task_count = 12_i64;
+    let jobs_per_task = 48_i64;
+    let start = Arc::new(Barrier::new(task_count as usize));
+
+    let mut handles = Vec::new();
+    for task in 0..task_count {
+        let config = config.clone();
+        let start = Arc::clone(&start);
+        handles.push(tokio::spawn(async move {
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&database_url())
+                .await
+                .expect("connect independent pool");
+            let store = QueueStorage::new(config).expect("create independent store");
+            let jobs: Vec<_> = (0..jobs_per_task)
+                .map(|idx| copy_job("copy_independent_stores", queue, task * jobs_per_task + idx))
+                .collect();
+
+            start.wait().await;
+            store.enqueue_params_copy(&pool, &jobs).await
+        }));
+    }
+
+    for handle in handles {
+        assert_eq!(
+            handle
+                .await
+                .expect("join independent copy task")
+                .expect("independent copy task"),
+            jobs_per_task as usize
+        );
+    }
+
+    let lane_seqs: Vec<i64> = sqlx::query_scalar(&format!(
+        "SELECT lane_seq FROM {}.ready_entries WHERE queue = $1 ORDER BY lane_seq",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_all(&pool)
+    .await
+    .expect("read independent lane seqs");
+    let expected = task_count * jobs_per_task;
+    assert_eq!(lane_seqs.len(), expected as usize);
+    for (offset, actual_seq) in lane_seqs.into_iter().enumerate() {
+        assert_eq!(actual_seq, 1 + offset as i64);
+    }
+
+    let available_count =
+        lane_available_count(&pool, store.schema(), vec![queue.to_string()]).await;
+    assert_eq!(available_count, expected);
+}
+
+#[tokio::test]
+async fn queue_storage_sequence_sync_does_not_rewind_hot_reservations() {
+    let _guard = QUEUE_STORAGE_COPY_LOCK.lock().await;
+    let config = QueueStorageConfig {
+        schema: "awa_qs_copy_sequence_sync_hot".to_string(),
+        queue_slot_count: 4,
+        lease_slot_count: 2,
+        claim_slot_count: 2,
+        ..Default::default()
+    };
+    let (pool, store) = setup_store_with_config(config.clone(), 4).await;
+    let queue = "qs_copy_sequence_sync_hot";
+    store
+        .enqueue_params_copy(&pool, &[copy_job("copy_sequence_sync_seed", queue, 0)])
+        .await
+        .expect("seed lane");
+
+    let seq_name: String = sqlx::query_scalar(&format!(
+        "SELECT seq_name FROM {}.queue_enqueue_heads WHERE queue = $1 AND priority = 2 AND enqueue_shard = 0",
+        store.schema()
+    ))
+    .bind(queue)
+    .fetch_one(&pool)
+    .await
+    .expect("read enqueue sequence name");
+
+    sqlx::query(&format!(
+        "CREATE TABLE {}.sequence_sync_seen (lane_seq BIGINT PRIMARY KEY)",
+        store.schema()
+    ))
+    .execute(&pool)
+    .await
+    .expect("create sequence seen table");
+
+    let reserver_count = 8_i64;
+    let rounds = 24_i64;
+    let values_per_round = 16_i64;
+    let start = Arc::new(Barrier::new(reserver_count as usize + 1));
+
+    let sync_schema = store.schema().to_string();
+    let sync_start = Arc::clone(&start);
+    let sync_task = tokio::spawn(async move {
+        let pool = PgPoolOptions::new()
+            .max_connections(2)
+            .connect(&database_url())
+            .await
+            .expect("connect sync pool");
+        sync_start.wait().await;
+        for _ in 0..(reserver_count * rounds) {
+            sqlx::query(&format!(
+                "SELECT {}.set_sequence_next($1, 1::bigint)",
+                sync_schema
+            ))
+            .bind(&seq_name)
+            .execute(&pool)
+            .await
+            .expect("set_sequence_next should not race reservations");
+        }
+    });
+
+    let mut reservers = Vec::new();
+    for _ in 0..reserver_count {
+        let schema = store.schema().to_string();
+        let queue = queue.to_string();
+        let start = Arc::clone(&start);
+        reservers.push(tokio::spawn(async move {
+            let pool = PgPoolOptions::new()
+                .max_connections(4)
+                .connect(&database_url())
+                .await
+                .expect("connect reserver pool");
+
+            start.wait().await;
+            for _ in 0..rounds {
+                let mut tx = pool.begin().await.expect("begin reserve tx");
+                let range_start: i64 = sqlx::query_scalar(&format!(
+                    "SELECT {}.reserve_enqueue_seq($1, 2::smallint, 0::smallint, $2::bigint)",
+                    schema
+                ))
+                .bind(&queue)
+                .bind(values_per_round)
+                .fetch_one(tx.as_mut())
+                .await
+                .expect("reserve enqueue sequence range");
+                sqlx::query(&format!(
+                    "INSERT INTO {}.sequence_sync_seen (lane_seq) SELECT generate_series($1::bigint, $2::bigint)",
+                    schema
+                ))
+                .bind(range_start)
+                .bind(range_start + values_per_round - 1)
+                .execute(tx.as_mut())
+                .await
+                .expect("record reserved sequence values");
+                tx.commit().await.expect("commit reserve tx");
+            }
+        }));
+    }
+
+    sync_task.await.expect("join sync task");
+    for reserver in reservers {
+        reserver.await.expect("join reserver task");
+    }
+
+    let (seen, distinct_seen): (i64, i64) = sqlx::query_as(&format!(
+        "SELECT count(*)::bigint, count(DISTINCT lane_seq)::bigint FROM {}.sequence_sync_seen",
+        store.schema()
+    ))
+    .fetch_one(&pool)
+    .await
+    .expect("count reserved sequence values");
+    let expected = reserver_count * rounds * values_per_round;
+    assert_eq!(seen, expected);
+    assert_eq!(distinct_seen, expected);
 }
 
 #[tokio::test]

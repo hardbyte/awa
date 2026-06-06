@@ -428,26 +428,40 @@ BEGIN
         LANGUAGE plpgsql
         SET search_path = pg_catalog
         AS $func$
+        DECLARE
+            v_lock_key TEXT;
         BEGIN
             IF p_seq_name IS NULL THEN
                 RAISE EXCEPTION 'lane sequence name is NULL'
                     USING ERRCODE = '55000';
             END IF;
 
-            p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
+            v_lock_key := format('%%I.%%I', %1$L, p_seq_name);
 
-            IF p_next <= 1 THEN
-                EXECUTE format(
-                    'SELECT setval(%%L::regclass, 1, false)',
-                    format('%%I.%%I', %1$L, p_seq_name)
-                );
-            ELSE
-                EXECUTE format(
-                    'SELECT setval(%%L::regclass, %%s, true)',
-                    format('%%I.%%I', %1$L, p_seq_name),
-                    p_next - 1
-                );
-            END IF;
+            -- `setval` is not a compare-and-swap. Serialize it against
+            -- reservation-side block allocation so this helper's "move to at
+            -- least p_next" contract cannot rewind a hot enqueue sequence.
+            PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
+            BEGIN
+                p_next := GREATEST(p_next, %1$I.sequence_next_value(p_seq_name));
+
+                IF p_next <= 1 THEN
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, 1, false)',
+                        format('%%I.%%I', %1$L, p_seq_name)
+                    );
+                ELSE
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, %%s, true)',
+                        format('%%I.%%I', %1$L, p_seq_name),
+                        p_next - 1
+                    );
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+                RAISE;
+            END;
+            PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
         END;
         $func$
         $ddl$,
@@ -523,6 +537,7 @@ BEGIN
         AS $func$
         DECLARE
             v_seq_name TEXT;
+            v_lock_key TEXT;
             v_start BIGINT;
         BEGIN
             IF p_count <= 0 THEN
@@ -550,12 +565,27 @@ BEGIN
                     USING ERRCODE = '55000';
             END IF;
 
-            EXECUTE format(
-                'SELECT min(nextval(%%L::regclass))::bigint FROM generate_series(1::bigint, $1)',
-                format('%%I.%%I', %1$L, v_seq_name)
-            )
-            INTO v_start
-            USING p_count;
+            v_lock_key := format('%%I.%%I', %1$L, v_seq_name);
+            PERFORM pg_advisory_lock(hashtextextended(v_lock_key, 0));
+            BEGIN
+                EXECUTE format(
+                    'SELECT nextval(%%L::regclass)::bigint',
+                    format('%%I.%%I', %1$L, v_seq_name)
+                )
+                INTO v_start;
+
+                IF p_count > 1 THEN
+                    EXECUTE format(
+                        'SELECT setval(%%L::regclass, %%s, true)',
+                        format('%%I.%%I', %1$L, v_seq_name),
+                        v_start + p_count - 1
+                    );
+                END IF;
+            EXCEPTION WHEN OTHERS THEN
+                PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
+                RAISE;
+            END;
+            PERFORM pg_advisory_unlock(hashtextextended(v_lock_key, 0));
 
             RETURN v_start;
         END;
@@ -594,12 +624,26 @@ BEGIN
                AND NEW.next_seq > OLD.next_seq
             THEN
                 v_count := NEW.next_seq - OLD.next_seq;
-                EXECUTE format(
-                    'SELECT min(nextval(%%L::regclass))::bigint FROM generate_series(1::bigint, $1)',
-                    v_qualified_seq
-                )
-                INTO v_start
-                USING v_count;
+                PERFORM pg_advisory_lock(hashtextextended(v_qualified_seq, 0));
+                BEGIN
+                    EXECUTE format(
+                        'SELECT nextval(%%L::regclass)::bigint',
+                        v_qualified_seq
+                    )
+                    INTO v_start;
+
+                    IF v_count > 1 THEN
+                        EXECUTE format(
+                            'SELECT setval(%%L::regclass, %%s, true)',
+                            v_qualified_seq,
+                            v_start + v_count - 1
+                        );
+                    END IF;
+                EXCEPTION WHEN OTHERS THEN
+                    PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
+                    RAISE;
+                END;
+                PERFORM pg_advisory_unlock(hashtextextended(v_qualified_seq, 0));
                 NEW.next_seq := v_start + v_count;
             ELSE
                 PERFORM %1$I.set_sequence_next(v_seq_name, NEW.next_seq);
